@@ -931,6 +931,15 @@ async fn buffer_for_working_file(
         ctx,
         BufferOpenParams {
             absolute_path: Some(absolute_path.to_string_lossy().into_owned()),
+            // Transient: this buffer exists because a **view** windows it, not because anyone asked
+            // for the file. Opened permanent, `Space g w` on a busy tree quietly added every changed
+            // file to the buffers picker, and they stayed after the view was gone.
+            //
+            // Nothing is lost by it. The flag only decides whether the buffer survives being
+            // *hidden*, an edit or a save promotes it (so a hunk you type in stops being a preview),
+            // and re-opening an already-permanent buffer never demotes it — `pin_buffer_if_requested`
+            // only ever promotes. So a file you already had open stays exactly as you left it.
+            transient: Some(true),
             ..Default::default()
         },
         OpenIntent::Bind,

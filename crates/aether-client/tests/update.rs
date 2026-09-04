@@ -4050,6 +4050,7 @@ fn jumplist_step_adopts_the_opened_entry() {
             index: 3,
             total: 17,
             opened: Some(open),
+            seat: None,
         }))),
         Direction::Forward,
         aether_protocol::jumplist::JumplistStepScope::Full,
@@ -11535,7 +11536,7 @@ fn read_table_contains_no_editing_action() {
                     | Action::ReadStepLink(_)
                     | Action::ReadShowTarget
                     | Action::ReadActivateNewWindow
-                    | Action::ReadStepHeading(_)
+                    | Action::NavUnit(_)
                     | Action::PageMotion { .. }
                     | Action::PlaceCursor(_)
                     | Action::MotionUndo
@@ -11732,6 +11733,7 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
                 index: 1,
                 total: 2,
                 opened: Some(opened(buffer_id, path)),
+                seat: None,
             }))),
             Direction::Forward,
             JumplistStepScope::Full,
@@ -13013,4 +13015,149 @@ fn closing_a_composed_view_asks_about_unsaved_edits_in_any_element() {
         ),
         other => panic!("expected a discard-on-close confirm, got {other:?}"),
     }
+}
+
+/// `Enter` in a composed view opens the file the focused element windows.
+///
+/// One verb, several resolvers, chosen by what the cursor is *in*. In a working-changes view the
+/// cursor is already inside the real file's document, so the most-wanted destination is that file —
+/// and promoting it needs no new operation, because the buffer is already open: opening it *as the
+/// view* is an ordinary `buffer/open`.
+///
+/// The test is structural rather than a kind flag: "the buffer I am editing is not the one I
+/// opened" is what composed means, and it is the same predicate the breadcrumb uses.
+///
+/// **This knowingly spends `Enter` on the file rather than on go-to-definition.** Inside a patch,
+/// go-to-definition genuinely works — the element is a real buffer with a real language server —
+/// which is what makes the trade affordable: `Enter` twice gets you there.
+#[test]
+fn enter_in_a_composed_view_opens_the_focused_elements_file() {
+    let mut s = session();
+    s.adopt_subscribe(subscribe_over(9, Some(focus_on(0, 9, 17))));
+    let view_buffer = s.view.view_id.presenting_buffer();
+    assert_ne!(
+        s.view.buffer.buffer_id, view_buffer,
+        "the fixture must be composed, or this proves nothing"
+    );
+
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(
+        find_request(&fx, "lsp/goto_definition").is_none(),
+        "the file wins over go-to-definition here"
+    );
+    let open = find_request(&fx, "buffer/open").expect("Enter promotes the element to a view");
+    assert_eq!(
+        open["buffer_id"],
+        json!(s.view.buffer.buffer_id),
+        "it opens the buffer the element windows"
+    );
+    assert_eq!(
+        open["record_nav_from"],
+        json!(view_buffer),
+        "nav history records the *view*, so Backspace returns to the review"
+    );
+}
+
+/// An ordinary view is untouched: `Enter` is still go-to-definition, which is the whole point of
+/// defining the verb at view level — it degenerates to what it always did when the view has one
+/// element.
+#[test]
+fn enter_in_an_ordinary_view_still_goes_to_the_definition() {
+    let mut s = session();
+    let bound = s.view.buffer.buffer_id;
+    s.adopt_subscribe(subscribe_over(bound, None));
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    assert!(
+        find_request(&fx, "lsp/goto_definition").is_some(),
+        "one element, so nothing to promote"
+    );
+    assert!(find_request(&fx, "buffer/open").is_none());
+}
+
+/// `o`/`Alt-o` in the reading view is the **same** symbol navigation the editor uses.
+///
+/// One outline per view, whatever is looking at it: the breadcrumb, `Space o` and this key all read
+/// the language server's document symbols, and for a markdown file those symbols *are* its headings.
+/// It used to be a third, client-side implementation walking the parsed AST — a reading-flavoured
+/// twin that happened to agree, rather than the same thing.
+#[test]
+fn read_mode_headings_use_the_same_outline_as_the_editor() {
+    let mut s = read_session();
+    let fx = s.on_key(KeyCode::Char('o'), Mods::NONE, Some("o".into()), ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(
+        method, "element/move",
+        "the reading view asks the server to step the outline, not its own parse"
+    );
+    assert_eq!(params["motion"]["kind"], json!("next_navigation_unit"));
+
+    let fx = s.on_key(KeyCode::Char('o'), Mods::ALT, Some("o".into()), ROWS);
+    let (_t, method, params) = the_request(&fx);
+    assert_eq!(method, "element/move");
+    assert_eq!(params["motion"]["kind"], json!("prev_navigation_unit"));
+}
+
+/// Selecting an outline row focuses its element *and* lands the cursor — in that order.
+///
+/// A composed view draws its cursor only inside the **focused** element. Moving it into another
+/// element without focusing there puts it outside the window that renders it, so the jump resolved,
+/// travelled, was applied, and nothing moved on screen. The order matters as much as the pair: the
+/// server resolves a cursor against whichever element holds focus, so setting first would apply the
+/// line to a different file.
+///
+/// The same pair, in the same order, that a click already uses.
+#[test]
+fn selecting_a_view_row_focuses_its_element_then_sets_the_cursor() {
+    use aether_protocol::picker::PickerSelectResult;
+
+    let mut s = session();
+    s.adopt_subscribe(subscribe_over(9, Some(focus_on(0, 9, 17))));
+
+    // Drive a real select and answer it with a `ViewElement`. The picker's kind is irrelevant — the
+    // client dispatches on the *result*, which is the point of the variant.
+    grep_with_groups(&mut s);
+    s.picker.as_mut().unwrap().selected = 0;
+    let accept = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let token = accept
+        .0
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { token, method, .. } if *method == "picker/select" => Some(*token),
+            _ => None,
+        })
+        .expect("Enter selects the row");
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "kind": "view_element",
+            "element": 1,
+            "buffer_id": 11,
+            "position": { "line": 42, "col": 0 },
+        })),
+    );
+    let _ = PickerSelectResult::ViewElement {
+        element: 1,
+        buffer_id: 11,
+        position: aether_protocol::LogicalPosition { line: 42, col: 0 },
+        open: None,
+    };
+
+    let methods: Vec<&str> = fx
+        .0
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Request { method, .. } => Some(*method),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        vec!["view/focus_element", "element/set"],
+        "focus first, then the cursor — the other order applies the line to whichever element \
+         happens to hold focus"
+    );
+
+    let set = find_request(&fx, "element/set").expect("the cursor is set");
+    assert_eq!(set["buffer_id"], json!(11), "on the element's own buffer");
+    assert_eq!(set["position"]["line"], json!(42));
 }

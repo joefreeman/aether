@@ -174,6 +174,15 @@ pub struct GitChangeCandidate {
 #[derive(Debug, Clone)]
 pub struct PatchRowTarget {
     pub buffer: BufferId,
+    /// The **same place, addressed as a real file line** — the element that windows it and the line
+    /// within that element's buffer. `None` for a row over generated text with no file behind it (a
+    /// deletion, a binary swap), which can only be addressed as a patch line.
+    ///
+    /// Carried because a patch line is the wrong coordinate for almost everything that acts on a
+    /// row. A *bound* view's cursor lives in its elements, so a jump addressed at the patch document
+    /// lands wherever that line happens to fall in whichever element — which is why every jumplist
+    /// entry captured from a patch took you to the same place.
+    pub file: Option<(aether_protocol::viewport::FieldId, BufferId, u32)>,
     /// Buffer line of each entry in [`GitChangeCandidate::lines`], parallel to it. Explicit rather
     /// than `line + i` because in a patch both sides are ordinary buffer lines with context
     /// sitting between them — so a query matching a *removed* line still lands on it, where in a
@@ -1349,8 +1358,16 @@ impl PickerCandidates {
                     (Some(path), None) => PickerSelectResult::File {
                         path: path.to_string(),
                     },
-                    // Pathless: a captured scratch buffer, attached by id.
-                    (None, _) => PickerSelectResult::Buffer {
+                    // Pathless *with* a position: a captured scratch buffer, or a change captured
+                    // from a patch — attached by id and jumped to. Dropping the position here made
+                    // selecting one a plain attach, which the client discards outright when the
+                    // buffer is the one already focused: the row did nothing at all.
+                    (None, Some(position)) => PickerSelectResult::BufferAt {
+                        buffer_id: e.target.buffer_id()?,
+                        position,
+                    },
+                    // Pathless whole-target: attach and land wherever the cursor last sat.
+                    (None, None) => PickerSelectResult::Buffer {
                         buffer_id: e.target.buffer_id()?,
                     },
                 })
@@ -1369,10 +1386,26 @@ fn git_change_select(c: &GitChangeCandidate, re: Option<&regex::Regex>) -> Picke
     };
     match &c.patch {
         // A patch buffer was materialised, not loaded: there is no path to reopen, so the jump
-        // addresses the buffer itself.
-        Some(p) => PickerSelectResult::BufferAt {
-            buffer_id: p.buffer,
-            position,
+        // addresses a buffer rather than a file.
+        //
+        // **The element's buffer where there is one.** A bound view's cursor lives in its elements,
+        // so a jump addressed at the generated document set a cursor nothing displays and
+        // `seat_cursor_in_element` immediately overwrote it — the selection resolved, travelled, and
+        // was discarded. The row knows which file it is in; use it.
+        Some(p) => match p.file {
+            // Inside the view: focus the element and land there. A cursor moved into an element the
+            // view is not focused on is not drawn at all.
+            Some((element, buffer_id, line)) => PickerSelectResult::ViewElement {
+                element,
+                buffer_id,
+                position: LogicalPosition { line, col: 0 },
+                open: None, // the view is the one on screen; nothing to reopen
+            },
+            // Generated text with no file behind it — the patch itself is the only address.
+            None => PickerSelectResult::BufferAt {
+                buffer_id: p.buffer,
+                position,
+            },
         },
         None => PickerSelectResult::FileAt {
             path: c.abs_path.clone(),
@@ -2445,6 +2478,39 @@ impl PickerState {
                 expanded.push(self.expansion.is_expanded(key));
             }
             runs.last_mut().expect("just pushed").len += 1;
+        }
+        // **A group key must not appear in two runs.** A run is a *contiguous* slice of `ranked`,
+        // and groups are addressed on the wire by their header — so a key split across two runs
+        // renders the same header twice and makes `run_of_key` resolve every reference to the first
+        // of them: expanding, collapsing and focusing all land on one, and the rows under the other
+        // become unreachable.
+        //
+        // It cannot be repaired here. Merging two runs would mean moving their items together, and
+        // `GroupRun { start, len }` is an index range into `ranked` — the fix belongs in whatever
+        // produced that order.
+        //
+        // **Logged, not asserted.** This was a `debug_assert`, which took the editor down mid-session
+        // when a capture produced entries the invariant did not hold for. The invariant is violated
+        // by *data* as well as by static producer code, so it can be reached by inputs no test
+        // covered — and a duplicated header is a far better outcome than a panicking worker. Tests
+        // that care assert it explicitly.
+        if cfg!(debug_assertions) {
+            let mut keys: Vec<Option<(u32, &str)>> = runs
+                .iter()
+                .map(|r| self.group_key_at(self.ranked[r.start as usize] as usize))
+                .collect();
+            let before = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            if keys.len() != before {
+                tracing::error!(
+                    kind = ?self.kind,
+                    runs = before,
+                    distinct = keys.len(),
+                    "two group runs share a key: equal group keys must be adjacent in `ranked`, \
+                     or the header addresses two runs and only the first is reachable"
+                );
+            }
         }
         // Header rows as a running total: one row per header, plus the items of every expanded run
         // above it.
@@ -3936,6 +4002,7 @@ mod tests {
         use aether_protocol::picker::{GroupHeader, PickerFilters, ScopedPath};
         let entry = |rel: Option<&str>, abs: &str, line: u32, display: &str| {
             crate::jumplist::JumplistEntry {
+                view: None,
                 target: crate::jumplist::JumplistTarget::File {
                     path_index: rel.map(|_| 0),
                     relative_path: rel.map(str::to_string),

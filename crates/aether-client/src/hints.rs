@@ -248,7 +248,7 @@ pub static CURRICULUM: &[HintDef] = &[
         trigger: Trigger::Action(|a| matches!(a, Action::OpenPicker(PickerKind::Explorer))),
         text: "Use {} to browse files as a tree" },
     HintDef { id: "goto-def", tier: 3, contexts: &[C::Normal], keys: "Enter",
-        trigger: Trigger::Action(|a| matches!(a, Action::GotoDefinition)),
+        trigger: Trigger::Action(|a| matches!(a, Action::Activate)),
         text: "Use {} to go to the definition" },
     HintDef { id: "hover", tier: 3, contexts: &[C::Normal], keys: "Space t",
         trigger: Trigger::Action(|a| matches!(a, Action::Hover)),
@@ -302,8 +302,10 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "read-back", tier: 3, contexts: &[C::Read], keys: "Backspace",
         trigger: Trigger::Action(|a| matches!(a, Action::NavBack)),
         text: "Use {} to jump back after following a link" },
+    // Id kept across the action rename — hint ids are a persistence contract, and the gesture has
+    // not moved. Context-scoped to Read, so it does not fire for the editor's own `o`.
     HintDef { id: "read-headings", tier: 3, contexts: &[C::Read], keys: "o/Alt-o",
-        trigger: Trigger::Action(|a| matches!(a, Action::ReadStepHeading(_))),
+        trigger: Trigger::Action(|a| matches!(a, Action::NavUnit(_))),
         text: "Use {} to jump between headings" },
     HintDef { id: "read-copy", tier: 3, contexts: &[C::Read], keys: "Ctrl-c",
         trigger: Trigger::Action(|a| matches!(a, Action::ReadCopy)),
@@ -1676,7 +1678,7 @@ mod tests {
             "read-follow" => Action::ReadActivate,
             "read-peek" => Action::ReadShowTarget,
             "read-back" => Action::NavBack,
-            "read-headings" => Action::ReadStepHeading(Direction::Forward),
+            "read-headings" => Action::NavUnit(Direction::Forward),
             "read-copy" => Action::ReadCopy,
             other => panic!("no test action mapped for hint {other}"),
         }

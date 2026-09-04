@@ -144,9 +144,12 @@ export interface BaselineRow {
 /** A view's content: what it is composed of, in order.
  *
  *  Named `ViewNode`, not `Element`: the DOM has a global of that name and this file is read in a
- *  browser context. Mirrors `aether_protocol::ui::Element` — **one** vocabulary for both axes now,
- *  so an editor may sit inside a row. An ordinary buffer is a single `editor`; a generated patch
- *  interleaves chrome and hunks. */
+ *  browser context. Mirrors `aether_protocol::ui::Element` — **one** vocabulary for both axes now.
+ *  An ordinary buffer is a single `editor`; a generated patch interleaves chrome and hunks.
+ *
+ *  An `editor` inside a `row` is representable and *not* renderable: a view is laid out as a flat
+ *  top-to-bottom list of rows, which cannot express two editors sharing rows. Side-by-side diff
+ *  needs a different row model. Until then an editor is expected to be a child of a `stack`. */
 export type ViewNode =
   | { node: "stack"; children: ViewNode[] }
   | { node: "row"; children: ViewNode[] }
@@ -186,7 +189,10 @@ export function rowItems(root: ViewNode): RowItem[] {
     if (n.node === "stack") n.children.forEach(walk);
     else if (n.node === "editor")
       for (const line of n.lines) out.push({ kind: "line", element: n.element, line });
-    // Chrome, or any inline element standing on its own: one screen row, no cursor position.
+    // A row/chrome group is one screen row — its children share it — as is any inline element
+    // standing on its own. An editor nested in one would be drawn as a single chrome row while
+    // `nodeLines` still counted its lines; the Rust builder asserts against that shape, and this
+    // mirror inherits the same expectation rather than re-deriving it.
     else out.push({ kind: "chrome" });
   };
   walk(root);
@@ -203,7 +209,11 @@ export function itemRows(i: RowItem): number {
 /** Every rendered line of a view, in order — for the paths that want lines and no structure. */
 export function nodeLines(n: ViewNode): LogicalLineRender[] {
   if (n.node === "editor") return n.lines;
-  if (n.node === "stack") return n.children.flatMap(nodeLines);
+  // Descends into `row` and `chrome` as well as `stack`, matching `Element::lines`'s walk. It only
+  // matters for a shape nothing produces yet, but a mirror that stops one level shallower than the
+  // thing it mirrors is a difference waiting to be discovered the hard way.
+  if (n.node === "stack" || n.node === "row" || n.node === "chrome")
+    return n.children.flatMap(nodeLines);
   return [];
 }
 

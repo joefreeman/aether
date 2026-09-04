@@ -1008,25 +1008,16 @@ impl ViewState {
 
     /// The status bar's breadcrumb: the path from the view's root down to the cursor.
     ///
-    /// For a **composed** view that is the focused element's file followed by the symbol chain
-    /// inside it (`b.rs › impl Foo › fn bar`), because the file slot to the left names the *view*
-    /// and nothing else would say which file you are in. For an ordinary view it is the symbol chain
-    /// alone — the file slot already names the file, and printing it in both slots says the same
-    /// thing twice.
+    /// Server-composed, whole. For an ordinary view it is the document-symbol chain; for a composed
+    /// one it is the path through the *view's own outline* — the file, then the label of the change
+    /// the cursor is in — which is what `Space o` lists and `o`/`Alt-o` steps.
     ///
-    /// Composed here rather than in each shell so the three cannot disagree about it, and expressed
-    /// as crumbs rather than a string so the truncation ladder still sees the segments.
+    /// The client used to prepend a file crumb of its own for composed views. That produced the
+    /// right *shape* by a second route, and a second route is exactly what stops the breadcrumb and
+    /// the outline agreeing: they would name the same position in different words as soon as either
+    /// changed. One source, three consumers.
     pub fn breadcrumb(&self) -> Vec<SymbolCrumb> {
-        if self.buffer.buffer_id == self.view_id.presenting_buffer() {
-            return self.symbol_path.clone();
-        }
-        let mut crumbs = Vec::with_capacity(self.symbol_path.len() + 1);
-        crumbs.push(SymbolCrumb {
-            name: self.buffer.label.clone(),
-            kind: aether_protocol::picker::SymbolKind::File,
-        });
-        crumbs.extend(self.symbol_path.iter().cloned());
-        crumbs
+        self.symbol_path.clone()
     }
 
     /// Rename the focused buffer, carrying the view's own label with it when the two are the same

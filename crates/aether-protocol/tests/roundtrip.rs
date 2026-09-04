@@ -4488,6 +4488,25 @@ fn picker_select_result_file_at_is_tagged() {
             "anchor": {"line": 3, "col": 4},
         })
     );
+
+    // A place *inside* a composed view: which element to focus and the buffer it windows — the
+    // cursor is set on that buffer, never on the view's own document. `open` is absent while the
+    // view is already showing, which is the ordinary case.
+    let r = PickerSelectResult::ViewElement {
+        element: 3,
+        buffer_id: 9,
+        position: LogicalPosition { line: 42, col: 0 },
+        open: None,
+    };
+    assert_eq!(
+        to_value(&r).unwrap(),
+        json!({
+            "kind": "view_element",
+            "element": 3,
+            "buffer_id": 9,
+            "position": {"line": 42, "col": 0},
+        })
+    );
 }
 
 #[test]
@@ -5436,6 +5455,7 @@ fn jumplist_wire_shapes() {
         index: 3,
         total: 17,
         opened: None,
+        seat: None,
     };
     let v = to_value(JumplistStepResult::Moved(Box::new(t))).unwrap();
     assert_eq!(
@@ -5449,6 +5469,35 @@ fn jumplist_wire_shapes() {
             "total": 17,
         })
     );
+    // Captured from a composed view still open: the element rides alongside the buffer and line,
+    // so `]` seats the cursor in the view's window onto that file rather than opening the file over
+    // the view. Absent on the wire when there is no element to seat in.
+    use aether_protocol::viewport::ViewSeat;
+    let seated = JumplistStepTarget {
+        path: None,
+        buffer_id: Some(9),
+        position: Some(LogicalPosition { line: 42, col: 0 }),
+        anchor: None,
+        index: 2,
+        total: 4,
+        opened: None,
+        seat: Some(ViewSeat {
+            element: 3,
+            buffer_id: 9,
+        }),
+    };
+    assert_eq!(
+        to_value(JumplistStepResult::Moved(Box::new(seated))).unwrap(),
+        json!({
+            "status": "moved",
+            "buffer_id": 9,
+            "position": {"line": 42, "col": 0},
+            "index": 2,
+            "total": 4,
+            "seat": {"element": 3, "buffer_id": 9},
+        })
+    );
+
     // A whole-target step (a captured file or buffer): no position on the wire, and a pathless one
     // identifies by `buffer_id` instead — exactly one of the two is present.
     let whole_file = JumplistStepTarget {
@@ -5459,6 +5508,7 @@ fn jumplist_wire_shapes() {
         index: 1,
         total: 4,
         opened: None,
+        seat: None,
     };
     assert_eq!(
         to_value(JumplistStepResult::Moved(Box::new(whole_file))).unwrap(),
@@ -5477,6 +5527,7 @@ fn jumplist_wire_shapes() {
         index: 2,
         total: 4,
         opened: None,
+        seat: None,
     };
     assert_eq!(
         to_value(JumplistStepResult::Moved(Box::new(scratch))).unwrap(),

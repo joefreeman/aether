@@ -131,7 +131,8 @@ use aether_protocol::sneak::{
 };
 use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
 use aether_protocol::viewport::{
-    DiagnosticSeverity, FocusStep, FocusTarget, ViewportFocusElement, ViewportFocusElementParams,
+    DiagnosticSeverity, FocusStep, FocusTarget, NavigateGrain, ViewportFocusElement,
+    ViewportFocusElementParams,
     ViewportFocusElementResult, ViewportLinesChanged, ViewportLinesChangedParams,
     ViewportNavigateChange, ViewportNavigateChangeParams, ViewportSubscribeResult,
     ViewportWindowResult, Window, WrapMode,
@@ -910,6 +911,23 @@ impl Session {
             }
             Event::JumplistCaptured(Err(e), _) => Effects::error_detail("Capture failed", e),
 
+            // Captured from a view that is still open: land *in* it, exactly as selecting the same
+            // row in the picker that captured it does. `element` is only ever set when the server
+            // still holds a viewport on that view, so there is nothing to open — the file is
+            // already on screen, as one of the view's windows onto it.
+            Event::JumplistStepped(Ok(JumplistStepResult::Moved(t)), _, _)
+                if t.seat.is_some() && t.position.is_some() =>
+            {
+                let t = *t;
+                let (seat, position) = (t.seat.unwrap(), t.position.unwrap());
+                self.seat_in_view_element(
+                    t.opened,
+                    seat.element,
+                    seat.buffer_id,
+                    position,
+                    t.anchor,
+                )
+            }
             Event::JumplistStepped(Ok(JumplistStepResult::Moved(t)), _, _) => match t.opened {
                 Some(open) => {
                     // A step is jump-shaped exactly when its entry carries a position — the same
@@ -2020,6 +2038,24 @@ impl Session {
                 // you're already reading — `Space c` lists that patch's own hunks — which makes
                 // this a jump rather than a switch, and no nav-history entry: browser history is
                 // for moving *between* files, and the jumplist already covers moving within one.
+                // Inside the view already open: focus the element, then land the cursor in it —
+                // the same pair, in the same order, that a click uses. Focus first because the
+                // server resolves a cursor against whichever element holds it, so setting first
+                // would apply the line to a different file; and a cursor in an *unfocused* element
+                // is not drawn at all, which is how a jump that resolved and travelled correctly
+                // still looked like nothing happening.
+                PickerSelectResult::ViewElement {
+                    element,
+                    buffer_id,
+                    position,
+                    open,
+                } => self.seat_in_view_element(
+                    open.map(|o| *o),
+                    element,
+                    buffer_id,
+                    position,
+                    None,
+                ),
                 PickerSelectResult::BufferAt {
                     buffer_id,
                     position,
@@ -3315,6 +3351,61 @@ impl Session {
     ///
     /// A click names an element, and setting the cursor without moving focus first would apply the
     /// clicked *line number* to whatever buffer is focused — in a patch, a different file.
+    /// Land the cursor at `position` inside `element` of the view already on screen.
+    ///
+    /// The landing for everything that resolves to a place *within* a composed view — the picker's
+    /// `ViewElement`, and a jumplist step whose entry was captured from a view still open. Focusing
+    /// first is the load-bearing half: cursors are per `(client, buffer)`, and a cursor moved into
+    /// an element the view is not focused on is not drawn at all, which is how a jump that resolved
+    /// and travelled correctly still looked like nothing happening.
+    fn seat_in_view_element(
+        &mut self,
+        open: Option<BufferOpenResult>,
+        element: aether_protocol::viewport::FieldId,
+        buffer_id: BufferId,
+        position: LogicalPosition,
+        anchor: Option<LogicalPosition>,
+    ) -> Effects {
+        // The view may have had to be reopened to land in — adopt it first, because an element is
+        // an index into *that* view's tree and focusing it means nothing until it is on screen.
+        // Absent whenever the view was already showing, which is the ordinary case.
+        let adopt = match open {
+            Some(open) => {
+                self.open_route_jumped = true;
+                self.adopt_navigation(open)
+            }
+            None => Effects::none(),
+        };
+        adopt.and(self.seat_in_focused_view(element, buffer_id, position, anchor))
+    }
+
+    fn seat_in_focused_view(
+        &mut self,
+        element: aether_protocol::viewport::FieldId,
+        buffer_id: BufferId,
+        position: LogicalPosition,
+        anchor: Option<LogicalPosition>,
+    ) -> Effects {
+        tracing::debug!(
+            element,
+            buffer_id,
+            line = position.line,
+            col = position.col,
+            focused_before = self.view.focused_element,
+            "seat in view element"
+        );
+        let focus = self.focus_clicked_element(element);
+        focus.and(self.request_str::<CursorSet>(
+            CursorSetParams {
+                buffer_id,
+                position,
+                anchor: anchor.unwrap_or(position),
+                granularity: Granularity::Char,
+            },
+            Event::CursorJump,
+        ))
+    }
+
     pub fn focus_clicked_element(
         &mut self,
         element: aether_protocol::viewport::FieldId,
@@ -3982,11 +4073,8 @@ impl Session {
                 // rather than for the hunk the cursor is in. Only these two: the other kinds that
                 // take a buffer want the focused one (a repo to resolve, a path, a selection to
                 // slice), and handing them a view id would answer a different question.
-                view_id: matches!(
-                    kind,
-                    PickerKind::Diagnostics | PickerKind::GitChangesFile
-                )
-                .then_some(self.view.view_id),
+                view_id: matches!(kind, PickerKind::Diagnostics | PickerKind::DocumentSymbols)
+                    .then_some(self.view.view_id),
                 from_selection,
                 filters: seed_filters,
                 // The binding tables live here in the client core, so a fresh Keybindings open
@@ -9220,6 +9308,29 @@ impl Session {
                     extend,
                 )
             }
+            // `o`/`Alt-o` step the **outline**, and which outline that is depends on the view: an
+            // ordinary buffer's is its document symbols, a composed view's is its files. The same
+            // split `Space o` makes, and deliberately the same source — `view/navigate_change` at
+            // file grain reads the index the outline picker lists, so the key and the picker cannot
+            // disagree about what the stops are.
+            A::NavUnit(dir) if self.view.view_is_patch => {
+                let Some(viewport_id) = self.view.viewport_id else {
+                    return Effects::none();
+                };
+                self.request_str::<ViewportNavigateChange>(
+                    ViewportNavigateChangeParams {
+                        viewport_id,
+                        direction: if dir == Direction::Forward {
+                            FocusStep::Next
+                        } else {
+                            FocusStep::Previous
+                        },
+                        count: Some(count),
+                        grain: NavigateGrain::Outline,
+                    },
+                    Event::ElementFocused,
+                )
+            }
             A::NavUnit(Direction::Forward) => {
                 self.move_motion(Motion::NextNavigationUnit { count }, extend)
             }
@@ -9707,6 +9818,7 @@ impl Session {
                                 FocusStep::Previous
                             },
                             count: Some(count),
+                            grain: NavigateGrain::Change,
                         },
                         Event::ElementFocused,
                     );
@@ -9908,15 +10020,49 @@ impl Session {
             A::OpenExplorerAtRoot => self.open_explorer(true),
 
             // ---- LSP ----
-            // `Enter` means "follow what's under the cursor". In a generated patch that's the file
-            // the line came from, resolved through the patch index rather than a language server —
-            // the same gesture, a different resolver, exactly as it is in the reading view.
-            A::GotoDefinition if self.view.buffer.is_patch => self
+            // `Enter` means "follow what's under the cursor", and which resolver answers depends on
+            // what the cursor is *in*, not on what kind of view is open.
+            //
+            // **Composed view, cursor in a bound element** — the element windows a real file and the
+            // cursor is already inside that file's document, so the most-wanted destination is the
+            // file itself: promote it to its own view. No new operation is needed for that, which is
+            // the pleasant part — the buffer is open, the cursor is in it, so opening it *as the
+            // view* is an ordinary `buffer/open`. The test is structural rather than a kind flag:
+            // "the buffer I am editing is not the one I opened" is exactly what composed means.
+            //
+            // This spends `Enter` on the file rather than on go-to-definition, knowingly. Inside a
+            // patch, go-to-definition genuinely works (the element is a real buffer with a real
+            // language server), which is what makes the trade affordable — `Enter` twice gets you
+            // there, and `Ctrl-Enter` is not available as a shortcut because it already means
+            // "activate in a new window" in the reading view.
+            A::Activate if self.view.buffer.buffer_id != self.view.view_id.presenting_buffer() => {
+                // Not transient: you asked for this file, so it stays. `record_nav_from` is the
+                // view, so `Backspace` returns to the review rather than to the file you were
+                // already in.
+                let from = self.view.view_id.presenting_buffer();
+                self.request_str::<BufferOpen>(
+                    BufferOpenParams {
+                        buffer_id: Some(self.view.buffer.buffer_id),
+                        record_nav_from: Some(from),
+                        ..Default::default()
+                    },
+                    Event::Switched,
+                )
+            }
+            // **Generated text** — a deletion, a binary swap, the metadata block: there is no
+            // element to promote because there is no file to window, so the patch's own line index
+            // is the only thing that can say where the line came from.
+            //
+            // `is_patch` is the one kind-flag left in this dispatch, and it is here because the
+            // alternative costs a round trip on every ordinary `Enter`: `git/follow_patch_line`
+            // already answers "not a patch" server-side, but asking it first would make every
+            // go-to-definition wait for that answer.
+            A::Activate if self.view.buffer.is_patch => self
                 .request_str::<GitFollowPatchLine>(
                     GitFollowPatchLineParams { buffer_id },
                     Event::PatchLineFollowed,
                 ),
-            A::GotoDefinition => self
+            A::Activate => self
                 .request_str::<LspGotoDefinition>(LspBufferParams { buffer_id }, Event::Definition),
             // One verb, "tell me about the thing under the cursor", resolved against the mode:
             // over source that's the language server's hover, over the reading view it's the target
@@ -9965,11 +10111,6 @@ impl Session {
             ),
             A::ReadStepLink(dir) => self.read_step_link_in_block(dir == Direction::Forward, count),
             A::ReadShowTarget => self.read_show_target(),
-            A::ReadStepHeading(dir) => {
-                self.read_step(dir == Direction::Forward, count, extend, |e| {
-                    matches!(e, crate::markdown::Stop::Heading { .. })
-                })
-            }
             A::ReadSelectBlock(dir) => {
                 self.read_select_block(dir == Direction::Forward, count, extend)
             }

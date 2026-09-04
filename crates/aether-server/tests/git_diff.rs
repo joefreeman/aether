@@ -2897,6 +2897,7 @@ async fn hunk_navigation_steps_a_patchs_own_changes() {
         let step: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
             &mut ws,
             &ViewportNavigateChangeParams {
+                    grain: Default::default(),
                 viewport_id: sub.viewport_id,
                 direction: FocusStep::Next,
                 count: None,
@@ -2953,6 +2954,7 @@ async fn hunk_navigation_steps_a_patchs_own_changes() {
     let back: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
         &mut ws,
         &ViewportNavigateChangeParams {
+                grain: Default::default(),
             viewport_id: sub.viewport_id,
             direction: FocusStep::Previous,
             count: None,
@@ -6643,6 +6645,7 @@ async fn enter_on_a_patch_leads_to_the_working_file() {
     let at: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
         &mut ws,
         &ViewportNavigateChangeParams {
+                grain: Default::default(),
             viewport_id: sub.viewport_id,
             direction: FocusStep::Next,
             count: None,
@@ -7135,6 +7138,7 @@ async fn typing_in_a_working_changes_hunk_edits_the_file() {
     let at: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
         &mut ws,
         &ViewportNavigateChangeParams {
+                grain: Default::default(),
             viewport_id: sub.viewport_id,
             direction: FocusStep::Next,
             count: None,
@@ -7233,6 +7237,7 @@ async fn staging_through_a_focused_element_stages_that_files_block() {
     let at: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
         &mut ws,
         &ViewportNavigateChangeParams {
+                grain: Default::default(),
             viewport_id: sub.viewport_id,
             direction: FocusStep::Next,
             count: None,
@@ -7336,6 +7341,7 @@ async fn a_hunk_grows_when_you_type_a_line_into_it() {
     let at: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
         &mut ws,
         &ViewportNavigateChangeParams {
+                grain: Default::default(),
             viewport_id: sub.viewport_id,
             direction: FocusStep::Next,
             count: None,
@@ -7436,6 +7442,7 @@ async fn moving_past_a_hunks_end_stays_within_the_view() {
     let at: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
         &mut ws,
         &ViewportNavigateChangeParams {
+                grain: Default::default(),
             viewport_id: sub.viewport_id,
             direction: FocusStep::Next,
             count: None,
@@ -7904,6 +7911,7 @@ async fn a_counted_change_step_past_the_last_change_refuses() {
         send_request::<ViewportNavigateChange>(
             ws,
             &ViewportNavigateChangeParams {
+                    grain: Default::default(),
                 viewport_id,
                 direction: FocusStep::Next,
                 count,
@@ -7926,6 +7934,7 @@ async fn a_counted_change_step_past_the_last_change_refuses() {
     let back: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
         &mut ws,
         &ViewportNavigateChangeParams {
+                grain: Default::default(),
             viewport_id: sub.viewport_id,
             direction: FocusStep::Previous,
             count: None,
@@ -8030,3 +8039,1658 @@ async fn staging_from_inside_an_element_never_touches_the_patch_index() {
 
     drop(server);
 }
+
+/// Opening working changes does not turn every changed file into a row in `Space b`.
+///
+/// The buffers picker switches between **views**. A file a composed view happens to window is an
+/// *element* of one, not a view of its own — it was never opened by name and switching to it is not
+/// what the key is for. `Space g w` on a busy tree used to add a row per changed file, and they
+/// stayed after the view was gone, because the binds also opened permanent.
+#[tokio::test]
+async fn opening_working_changes_does_not_list_its_files_as_buffers() {
+    use aether_protocol::picker::{PickerItem, PickerKind, PickerView, PickerViewParams,
+        PickerViewResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    for name in ["one.rs", "two.rs", "three.rs"] {
+        commit_file(&repo, name, "fn a() {}\n");
+        std::fs::write(root.join(name), "fn CHANGED() {}\n").unwrap();
+    }
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+
+    let view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            limit: 50,
+            ..view_params(PickerKind::Buffers)
+        },
+    )
+    .await;
+    let rows: Vec<(u64, String)> = view
+        .update
+        .map(|u| {
+            u.items()
+                .iter()
+                .filter_map(|i| match i {
+                    PickerItem::Buffer {
+                        buffer_id, display, ..
+                    } => Some((*buffer_id, display.clone())),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    assert_eq!(
+        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![patch.buffer_id],
+        "the view is a row; the three files it windows are not — got {rows:?}"
+    );
+
+    drop(server);
+}
+
+/// Navigating away from a composed view collects **everything** it was keeping alive.
+///
+/// The transient GC took its candidates from the focused element's buffer, which for a patch is one
+/// of the files and never the patch itself — so the generated document and every unfocused
+/// element's buffer were left behind, unreferenced and unlooked-for. Now the departing viewport
+/// names every buffer it was showing.
+#[tokio::test]
+async fn leaving_a_composed_view_collects_the_patch_and_its_elements() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    for name in ["one.rs", "two.rs"] {
+        commit_file(&repo, name, "fn a() {}\n");
+        std::fs::write(root.join(name), "fn CHANGED() {}\n").unwrap();
+    }
+    commit_file(&repo, "elsewhere.rs", "fn unrelated() {}\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let bound = sub
+        .focus
+        .as_ref()
+        .expect("a composed view says which element")
+        .buffer
+        .buffer_id;
+    assert_ne!(bound, patch.buffer_id, "the element windows a real file");
+
+    // Navigate away: open an unrelated file and subscribe to it, which supersedes the viewport.
+    let other: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("elsewhere.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(other.buffer_id),
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Both are gone: asking for either buffer's content now fails.
+    // Both are gone: asking for either buffer's content is now an error, not an answer.
+    for (id, what) in [
+        (patch.buffer_id, "the patch document"),
+        (bound, "its element's file"),
+    ] {
+        let e = send_request_expect_error::<BufferContent>(
+            &mut ws,
+            &BufferContentParams { buffer_id: id },
+        )
+        .await;
+        assert!(
+            !e.is_null(),
+            "{what} (buffer {id}) survived navigating away from the view that opened it"
+        );
+    }
+
+    drop(server);
+}
+
+/// `Space o` in a patch outlines the **patch**: a row per change, grouped by file, labelled by the
+/// enclosing signature git records in the hunk header.
+///
+/// It used to resolve document symbols for whichever file the cursor was in — an outline of one
+/// hunk's file, describing nothing about the review. The label is *where the change is*, not what it
+/// says, which is what makes this an outline rather than a second changes picker.
+#[tokio::test]
+async fn the_outline_of_a_patch_is_its_changes_grouped_by_file() {
+    use aether_protocol::picker::{GroupHeader, PickerKind, PickerView, PickerViewParams,
+        PickerViewResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // A change *inside* a function, with enough context above it that the hunk starts below the
+    // signature — otherwise git has nothing to name the hunk after.
+    let body = |marker: &str| {
+        let mut out = String::from("fn outer() {\n");
+        for i in 0..20 {
+            out.push_str(&format!("    let v{i} = {};\n", if i == 10 { marker } else { "0" }));
+        }
+        out.push_str("}\n");
+        out
+    };
+    commit_file(&repo, "one.rs", &body("0"));
+    std::fs::write(root.join("one.rs"), body("999")).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    // The outline is a fact about a *view*: an entry's line is a line of the element's buffer, so
+    // it needs the viewport that says which buffer each element windows.
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let rows = view.update.map(|u| u.items().to_vec()).unwrap_or_default();
+
+    let groups: Vec<String> = rows
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Group {
+                header: GroupHeader::Label { label },
+                ..
+            } => Some(label.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        groups,
+        vec!["one.rs".to_string()],
+        "grouped by file, not by directory: {rows:?}"
+    );
+
+    // The row's label is the enclosing signature, which is what makes it an outline.
+    let labelled = rows.iter().any(|i| match i {
+        PickerItem::GitChange { preview, .. } => preview.contains("fn outer"),
+        _ => false,
+    });
+    assert!(
+        labelled || rows.len() == 1,
+        "the change's row is labelled by its enclosing function: {rows:?}"
+    );
+
+    drop(server);
+}
+
+/// A scroll refetch does not wipe the patch outline.
+///
+/// The picker refetches when the selection reaches the edge of the fetched window — stepping onto
+/// the last row does it — and that re-view carries no `view_id`, so the outline cannot be rebuilt
+/// from it and arrives as the empty *symbols* placeholder instead. Read as a result rather than as
+/// "no rebuild", it replaced the outline with nothing: the picker reset under the cursor.
+#[tokio::test]
+async fn scrolling_the_patch_outline_keeps_its_rows() {
+    use aether_protocol::picker::{PickerKind, PickerReset, PickerView, PickerViewParams,
+        PickerViewResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    for name in ["aaa.rs", "zzz.rs"] {
+        commit_file(&repo, name, &base);
+        std::fs::write(
+            root.join(name),
+            base.replace("fn line5() {}", "fn EARLY() {}")
+                .replace("fn line45() {}", "fn LATE() {}"),
+        )
+        .unwrap();
+    }
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let opened: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let groups = opened
+        .update
+        .map(|u| u.items().len())
+        .expect("the outline opens with rows");
+    assert!(groups > 0);
+
+    // The refetch: no `view_id`, no `buffer_id`, `Keep` — exactly what a scroll sends.
+    let scrolled: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: None,
+            buffer_id: None,
+            limit: 50,
+            reset: PickerReset::Keep,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    assert_eq!(
+        scrolled.update.map(|u| u.items().len()).unwrap_or(0),
+        groups,
+        "the outline survives the refetch that stepping onto its last row triggers"
+    );
+
+    drop(server);
+}
+
+/// Every outline row selects **its own** hunk top — distinct rows, distinct targets.
+///
+/// The weaker property (a row resolves "to somewhere") was already covered, and it holds even when
+/// every row resolves to the *same* somewhere. That is the shape the bug actually took: selecting
+/// any row appeared to do nothing, because the target it produced was one the view was already
+/// showing. So this asserts the identities — each row's `(element, buffer, line)` equals the hunk
+/// the row names, and no two rows share a target — rather than counting rows that resolved.
+#[tokio::test]
+async fn each_outline_row_selects_its_own_hunk_top() {
+    use aether_protocol::picker::{GroupHeader, PickerGroupAction, PickerKind, PickerSelect,
+        PickerSelectParams, PickerSelectResult, PickerSetGroup, PickerSetGroupParams,
+        PickerReset, PickerSetGroupResult, PickerView, PickerViewParams, PickerViewResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Two files, two well-separated changes each: four hunks, so "every row lands on row 0's
+    // target" and "every row lands on its file's first hunk" are both distinguishable failures.
+    let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    for name in ["aaa.rs", "zzz.rs"] {
+        commit_file(&repo, name, &base);
+        std::fs::write(
+            root.join(name),
+            base.replace("fn line5() {}", "fn EARLY() {}")
+                .replace("fn line45() {}", "fn LATE() {}"),
+        )
+        .unwrap();
+    }
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    // An outline entry's line is a line of its *element's* buffer, so the picker needs the viewport
+    // that says which buffer each element windows.
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let _view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            limit: 100,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    // Groups start collapsed, so the change rows only exist once both files are open.
+    for label in ["aaa.rs", "zzz.rs"] {
+        let _: PickerSetGroupResult = send_request::<PickerSetGroup>(
+            &mut ws,
+            &PickerSetGroupParams {
+                kind: PickerKind::DocumentSymbols,
+                action: PickerGroupAction::Expand {
+                    header: GroupHeader::Label {
+                        label: label.to_string(),
+                    },
+                },
+            },
+        )
+        .await;
+    }
+    let view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            limit: 100,
+            reset: PickerReset::Keep, // a default re-view resets the expansion we just set
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let rows = view.update.map(|u| u.items().to_vec()).unwrap_or_default();
+    let changes: Vec<PickerItem> = rows
+        .iter()
+        .filter(|i| matches!(i, PickerItem::GitChange { .. }))
+        .cloned()
+        .collect();
+    assert!(
+        changes.len() >= 4,
+        "two files x two changes should each get an outline row: {rows:?}"
+    );
+
+    let mut targets = Vec::new();
+    for item in changes {
+        let PickerItem::GitChange {
+            relative_path,
+            hunk_index,
+            line,
+            ..
+        } = item.clone()
+        else {
+            unreachable!()
+        };
+        let selected: PickerSelectResult = send_request::<PickerSelect>(
+            &mut ws,
+            &PickerSelectParams {
+                kind: PickerKind::DocumentSymbols,
+                item,
+            },
+        )
+        .await;
+        let PickerSelectResult::ViewElement {
+            element,
+            buffer_id,
+            position,
+            ..
+        } = selected
+        else {
+            panic!("a row inside the view resolves to an element of it, got {selected:?}");
+        };
+        // The row advertises the line it will jump to; selecting it must honour that. A row whose
+        // select lands somewhere other than its own advertised anchor is the picker lying.
+        // The row's `line` and the select's position are in *different spaces*, and that is the
+        // whole trap: `line` counts patch display rows (0, 8, 16, 24 — eight rows per hunk here),
+        // while the cursor lands in the element's own file buffer. Reading the row's line as a
+        // jump target puts the cursor eight lines into the wrong file.
+        assert_ne!(
+            buffer_id, patch.buffer_id,
+            "{relative_path} hunk {hunk_index}: the target is the element's file buffer, not the \
+             patch's"
+        );
+        targets.push((relative_path, hunk_index, element, buffer_id, position.line, line));
+    }
+
+    // Each hunk is its own element, and each lands on its own hunk *top*: the changes sit at lines
+    // 5 and 45, and a hunk opens three context lines above its change. Named constants rather than
+    // "four distinct values", because every row resolving to a distinct-but-wrong line is the
+    // failure this is here to catch.
+    let landed: Vec<(String, u32, aether_protocol::viewport::FieldId, u32)> = targets
+        .iter()
+        .map(|(path, hunk, element, _, pos, _)| (path.clone(), *hunk, *element, *pos))
+        .collect();
+    assert_eq!(
+        landed,
+        vec![
+            ("aaa.rs".to_string(), 0, 0, 2),
+            ("aaa.rs".to_string(), 1, 1, 42),
+            ("zzz.rs".to_string(), 2, 2, 2),
+            ("zzz.rs".to_string(), 3, 3, 42),
+        ],
+        "each row selects its own element at its own hunk top"
+    );
+
+    drop(server);
+}
+
+/// Capturing a patch picker into the jumplist yields **buffer** targets, not files.
+///
+/// A patch was materialised, not loaded: it has no path to reopen, and its rows' `relative_path` is
+/// a display label — the file for the changes picker, the *directory* for the outline. Captured as
+/// `File` targets they produced entries naming directories, and jumping to one asked the editor to
+/// open a directory as a file.
+#[tokio::test]
+async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
+    use aether_protocol::jumplist::{JumplistCapture, JumplistCaptureParams};
+    use aether_protocol::picker::{GroupHeader, PickerKind, PickerSelect, PickerSelectParams,
+        PickerSelectResult, PickerView, PickerViewParams, PickerViewResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    // Several files, several changes each — the shape a real review has, and the one where the
+    // captured entries can interleave.
+    let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    for name in ["src/aaa.rs", "top.rs"] {
+        commit_file(&repo, name, &base);
+        std::fs::write(
+            root.join(name),
+            base.replace("fn line5() {}", "fn A() {}")
+                .replace("fn line45() {}", "fn B() {}"),
+        )
+        .unwrap();
+    }
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    // The outline is a fact about a view, so it needs the viewport.
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let item = view
+        .update
+        .map(|u| u.items().to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .expect("the outline has rows");
+    let captured = send_request::<JumplistCapture>(
+        &mut ws,
+        &JumplistCaptureParams {
+            kind: PickerKind::DocumentSymbols,
+            item,
+        },
+    )
+    .await
+    .expect("the outline captures");
+    assert_eq!(captured.total, 4, "one entry per change in the outline");
+
+    // The captured entries must not be file-shaped: a directory in a `File` target is what made a
+    // later jump try to open one.
+    let jl: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            limit: 50,
+            ..view_params(PickerKind::Jumplist)
+        },
+    )
+    .await;
+    let headers: Vec<GroupHeader> = jl
+        .update
+        .map(|u| {
+            u.items()
+                .iter()
+                .filter_map(|i| match i {
+                    PickerItem::Group { header, .. } => Some(header.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // The invariant the picker's row layout needs: a group key appears in exactly one run. It is
+    // logged rather than asserted in the layout itself (a panicking worker is worse than a
+    // duplicated header), so the tests that care assert it.
+    let mut unique = headers.clone();
+    unique.sort_by_key(|h| format!("{h:?}"));
+    unique.dedup_by_key(|h| format!("{h:?}"));
+    assert_eq!(
+        headers.len(),
+        unique.len(),
+        "each file groups once: {headers:?}"
+    );
+    for h in &headers {
+        assert!(
+            matches!(h, GroupHeader::Label { .. }),
+            "a patch row has no file on disk to group under, so its entry groups by label — got \
+             {h:?}, which means it was captured as a path"
+        );
+    }
+    assert!(!headers.is_empty(), "the jumplist has the captured entries");
+
+    // **An entry addresses the file its change is in, at that file's own line.** Checked by
+    // stepping, which is what `]` does. Addressed at the patch document instead — as they were —
+    // every entry shared one buffer and carried a *patch* line, so each step landed wherever that
+    // line happened to fall in whichever element: the same place every time, whichever row you
+    // picked.
+    use aether_protocol::jumplist::{JumplistStep, JumplistStepParams, JumplistStepResult,
+        JumplistStepScope};
+    let stepped: JumplistStepResult = send_request::<JumplistStep>(
+        &mut ws,
+        &JumplistStepParams {
+            buffer_id: patch.buffer_id,
+            direction: aether_protocol::cursor::Direction::Forward,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: false,
+        },
+    )
+    .await;
+    let landed = stepped.moved().expect("the captured list steps");
+    assert_ne!(
+        landed.buffer_id,
+        Some(patch.buffer_id),
+        "the entry names the file its change is in, not the patch document it was read from"
+    );
+    // And it names it by **path**: a view's element buffers are transient, so an id captured while
+    // the view was open is dead as soon as anything else is opened over it.
+    assert!(
+        landed.path.is_some(),
+        "the entry addresses the file durably, got {landed:?}"
+    );
+    // And it is one of the files the view windows, at a line inside that file.
+    assert!(
+        landed
+            .path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("aaa.rs") || p.ends_with("top.rs")),
+        "and it names one of the view's own files — got {:?}",
+        landed.path
+    );
+
+    // **A jump behaves like the picker that captured it.** The entry addresses the file so it stays
+    // valid when the view is gone, but while the view is open both `]` and Enter on the jumplist
+    // row must seat the cursor in the *element*, as selecting the outline row does. They were
+    // resolved separately and disagreed: the picker moved within the view, the jump pulled the bare
+    // file up over it.
+
+    let seat = landed
+        .seat
+        .expect("a step into a live view names where to seat the cursor in it");
+
+    // **A seated step does not open the file.** `open: true` rides every step the client sends, but
+    // opening the target while its view is on screen replaces that view with a plain editor of the
+    // file — so `]` walked out of the working changes and never came back, whichever row it landed
+    // on. Repeatedly: the second press must still be seated, which it cannot be if the first press
+    // pushed an editor over the view.
+    for press in 1..=2 {
+        let seated = send_request::<JumplistStep>(
+            &mut ws,
+            &JumplistStepParams {
+                buffer_id: patch.buffer_id,
+                direction: aether_protocol::cursor::Direction::Forward,
+                count: press,
+                scope: JumplistStepScope::Full,
+                open: true,
+            },
+        )
+        .await
+        .moved()
+        .expect("stepping inside the view is a move");
+        assert!(
+            seated.seat.is_some(),
+            "press {press} stays in the view: {seated:?}"
+        );
+        assert!(
+            seated.opened.is_none(),
+            "press {press} must not open the file over the view it is seating in: {seated:?}"
+        );
+    }
+
+    // **Repeated presses make progress.** Stepping is cursor-relative, so a step only advances if
+    // the entry the cursor is now sitting on is one the walk can *find*: a patch row addresses the
+    // element's file buffer, and while the location described the current buffer by path alone,
+    // nothing matched and every press answered with entry 0 again. Move the cursor where the step
+    // put it — what the client does on landing — and press again.
+    // The buffer comes from the seat: the entry addresses the file, and the seat says which buffer
+    // the view currently windows it as.
+    let (landed_buffer, landed_at) = (seat.buffer_id, landed.position.unwrap());
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: landed_buffer,
+            position: landed_at,
+            anchor: landed_at,
+        },
+    )
+    .await;
+    let again = send_request::<JumplistStep>(
+        &mut ws,
+        &JumplistStepParams {
+            buffer_id: landed_buffer,
+            direction: aether_protocol::cursor::Direction::Forward,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: false,
+        },
+    )
+    .await
+    .moved()
+    .expect("a second step from where the first landed");
+    assert_eq!(
+        (again.index, landed.index),
+        (2, 1),
+        "the second press advances to entry 2 instead of answering with the first again"
+    );
+    assert_ne!(
+        (again.buffer_id, again.position),
+        (landed.buffer_id, landed.position),
+        "and lands somewhere else"
+    );
+
+    let row = jumplist_rows(&mut ws).await.remove(0);
+    let selected: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        &PickerSelectParams {
+            kind: PickerKind::Jumplist,
+            item: row,
+        },
+    )
+    .await;
+    let PickerSelectResult::ViewElement {
+        element: picked_element,
+        buffer_id: picked_buffer,
+        position: picked_position,
+        ..
+    } = selected
+    else {
+        panic!("a jumplist row captured from a live view selects into it, got {selected:?}");
+    };
+    assert_eq!(
+        (picked_element, picked_buffer, Some(picked_position)),
+        (seat.element, seat.buffer_id, landed.position),
+        "selecting the jumplist row and stepping to it land in the same element"
+    );
+
+    drop(server);
+}
+
+/// A jumplist captured from a patch still works **from another editor**.
+///
+/// Capture in the working-changes view, then go and look at something else — which is most of what
+/// a jumplist is *for*. Both routes have to keep working with the view no longer on screen: the
+/// element cannot be seated (nothing is showing it), so each must fall back to the entry's own
+/// durable file target rather than doing nothing.
+#[tokio::test]
+async fn a_patch_jumplist_steps_from_another_editor() {
+    use aether_protocol::jumplist::{JumplistCapture, JumplistCaptureParams, JumplistStep,
+        JumplistStepParams, JumplistStepScope};
+    use aether_protocol::picker::{PickerKind, PickerSelect, PickerSelectParams, PickerSelectResult,
+        PickerView, PickerViewParams, PickerViewResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    for name in ["aaa.rs", "zzz.rs"] {
+        commit_file(&repo, name, &base);
+        std::fs::write(
+            root.join(name),
+            base.replace("fn line5() {}", "fn EARLY() {}")
+                .replace("fn line45() {}", "fn LATE() {}"),
+        )
+        .unwrap();
+    }
+    // An unrelated file to be looking at afterwards — untouched, so it owns no entry.
+    commit_file(&repo, "elsewhere.rs", "fn elsewhere() {}\n");
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let item = view
+        .update
+        .map(|u| u.items().to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .expect("the outline has rows");
+    let captured = send_request::<JumplistCapture>(
+        &mut ws,
+        &JumplistCaptureParams {
+            kind: PickerKind::DocumentSymbols,
+            item,
+        },
+    )
+    .await
+    .expect("the outline captures");
+    assert_eq!(captured.total, 4);
+
+    // Now go and look at something else: opening a file supersedes the client's viewport, so the
+    // patch view is no longer on screen.
+    let other: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("elsewhere.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _resub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(other.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // `]` from the unrelated file: the list is entered from outside, and the step goes **back to
+    // the working changes** — the view the rows were captured from — not to a bare editor of the
+    // file the change is in. That is what makes a jumplist row behave like the picker row it came
+    // from, and it works with the view *closed* because the entry names it by key.
+    let stepped = send_request::<JumplistStep>(
+        &mut ws,
+        &JumplistStepParams {
+            buffer_id: other.buffer_id,
+            direction: aether_protocol::cursor::Direction::Forward,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: true,
+        },
+    )
+    .await;
+    let landed = stepped
+        .moved()
+        .expect("stepping into the list from an unrelated file is a move");
+    let opened = landed
+        .opened
+        .as_ref()
+        .expect("the step reopens something to land in");
+    assert!(
+        opened.is_patch,
+        "it reopens the working-changes view, not the file: {opened:?}"
+    );
+    let seat = landed
+        .seat
+        .expect("and names where in the freshly reopened view to land");
+    assert_ne!(
+        seat.buffer_id, opened.buffer_id,
+        "seated in an element windowing the file, not in the patch document itself"
+    );
+    // **And the reopen is framed on that seat.** A subscribe picks its focused element from the
+    // line the view is scrolled to, so a reopen framed at the top focuses element 0 and undoes the
+    // focus a moment later — the view comes up, but on the wrong editor, and it takes a second `]`
+    // to land. The scroll has to name a view line inside the seated element.
+    let scroll = opened
+        .scroll
+        .expect("a reopen for a jump says where to frame the view");
+    assert!(
+        scroll.logical_line.get() > 0,
+        "framed on the entry, not at the top of the patch: {scroll:?}"
+    );
+
+    // `[` too. It used to answer `AtEnd` forever: patch entries address buffers, buffers sort after
+    // every file, and a *file* location can never find anything below them.
+    let back = send_request::<JumplistStep>(
+        &mut ws,
+        &JumplistStepParams {
+            buffer_id: other.buffer_id,
+            direction: aether_protocol::cursor::Direction::Backward,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: true,
+        },
+    )
+    .await;
+    let back_desc = format!("{back:?}");
+    assert!(
+        back.moved().is_some(),
+        "stepping backward into the list from outside is a move too, got {back_desc}"
+    );
+
+    // And selecting a row in the Jumplist picker opens the file at the same place.
+    let row = jumplist_rows(&mut ws).await.remove(0);
+    let selected: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        &PickerSelectParams {
+            kind: PickerKind::Jumplist,
+            item: row,
+        },
+    )
+    .await;
+    // Selecting resolves to exactly what stepping did: the reopened view, plus the element in it to
+    // seat the cursor in. The two routes share one resolution, so this is the same answer `]` gave
+    // above rather than a second derivation that happens to agree.
+    let PickerSelectResult::ViewElement {
+        buffer_id,
+        position,
+        open,
+        ..
+    } = selected
+    else {
+        panic!("a row captured from a view reopens that view and seats in it, got {selected:?}");
+    };
+    let reopened = open.expect("nothing was showing the view, so selecting reopens it");
+    assert!(
+        reopened.is_patch,
+        "it is the working-changes view that comes back: {reopened:?}"
+    );
+    assert_ne!(
+        buffer_id, other.buffer_id,
+        "and the cursor lands in the view's window onto the changed file, not in the editor it was \
+         viewed from"
+    );
+    assert_eq!(position.line, 2, "at the row's own hunk top");
+
+    drop(server);
+}
+
+/// A jumplist captured from a **commit** patch goes back to that commit.
+///
+/// Same requirement as the working-changes outline, and it has to hold for the same reason: the row
+/// came from that view. But a commit patch's elements are `OwnDocument` — they window the generated
+/// text, not the working tree — so its rows have no file behind them at all, and every address the
+/// working-changes path relies on (a real path, a file line) is absent. The durable address left is
+/// the view's own key plus the patch line, and the content is immutable, so that line keeps meaning
+/// the same thing forever.
+#[tokio::test]
+async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
+    use aether_protocol::jumplist::{JumplistCapture, JumplistCaptureParams, JumplistStep,
+        JumplistStepParams, JumplistStepScope};
+    use aether_protocol::picker::{PickerKind, PickerView, PickerViewParams, PickerViewResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    for name in ["aaa.rs", "zzz.rs"] {
+        commit_file(&repo, name, &base);
+    }
+    // A second commit touching both files, in two places each — the patch the outline describes.
+    for name in ["aaa.rs", "zzz.rs"] {
+        commit_file(
+            &repo,
+            name,
+            &base
+                .replace("fn line5() {}", "fn EARLY() {}")
+                .replace("fn line45() {}", "fn LATE() {}"),
+        );
+    }
+    commit_file(&repo, "elsewhere.rs", "fn elsewhere() {}\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .parent(0)
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head.clone() },
+            focus_path: None,
+        },
+    )
+    .await;
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let item = view
+        .update
+        .map(|u| u.items().to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .expect("the commit's outline has rows");
+    let captured = send_request::<JumplistCapture>(
+        &mut ws,
+        &JumplistCaptureParams {
+            kind: PickerKind::DocumentSymbols,
+            item,
+        },
+    )
+    .await
+    .expect("the commit outline captures");
+    assert!(captured.total >= 2, "one entry per hunk in the commit");
+
+    // Go and look at something else, which closes the commit patch (it is transient).
+    let other: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            path_index: Some(0),
+            relative_path: Some("elsewhere.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _resub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(other.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // `]` goes back to the commit, not to a bare editor of anything.
+    let landed = send_request::<JumplistStep>(
+        &mut ws,
+        &JumplistStepParams {
+            buffer_id: other.buffer_id,
+            direction: aether_protocol::cursor::Direction::Forward,
+            count: 1,
+            scope: JumplistStepScope::Full,
+            open: true,
+        },
+    )
+    .await
+    .moved()
+    .expect("stepping into the captured commit is a move");
+    let opened = landed
+        .opened
+        .as_ref()
+        .expect("it reopens the commit patch");
+    assert!(
+        opened.is_patch,
+        "the commit patch comes back, not one of its files: {opened:?}"
+    );
+    assert_eq!(
+        opened.title.as_deref().map(|t| t.contains(&head[..7])),
+        Some(true),
+        "and it is *that* commit: {:?}",
+        opened.title
+    );
+
+    drop(server);
+}
+
+/// The Jumplist picker's rows, in order — the entry rows only.
+///
+/// Opens every group first: groups start collapsed, so a freshly viewed picker's rows are all
+/// headers and a test that reads `items()` straight off sees no entries at all.
+async fn jumplist_rows(ws: &mut Ws) -> Vec<PickerItem> {
+    use aether_protocol::picker::{PickerGroupAction, PickerKind, PickerReset, PickerSetGroup,
+        PickerSetGroupParams, PickerSetGroupResult, PickerView, PickerViewParams, PickerViewResult};
+    let _open: PickerViewResult = send_request::<PickerView>(
+        ws,
+        &PickerViewParams {
+            limit: 50,
+            ..view_params(PickerKind::Jumplist)
+        },
+    )
+    .await;
+    let _: PickerSetGroupResult = send_request::<PickerSetGroup>(
+        ws,
+        &PickerSetGroupParams {
+            kind: PickerKind::Jumplist,
+            action: PickerGroupAction::ToggleAll,
+        },
+    )
+    .await;
+    let jl: PickerViewResult = send_request::<PickerView>(
+        ws,
+        &PickerViewParams {
+            limit: 50,
+            reset: PickerReset::Keep, // a default re-view throws the expansion away
+            ..view_params(PickerKind::Jumplist)
+        },
+    )
+    .await;
+    jl.update
+        .map(|u| {
+            u.items()
+                .iter()
+                .filter(|i| matches!(i, PickerItem::JumplistEntry { .. }))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `Space o`, `o`/`Alt-o` and the breadcrumb all name the same stop, in the same words.
+///
+/// The property the outline exists for. They each used to ask something different — the picker and
+/// the motion asked the focused file's language server, the breadcrumb composed a file label with an
+/// LSP symbol chain — so the same cursor position had up to three descriptions. All three now read
+/// `view_outline`, and this asserts they agree rather than asserting each is individually plausible.
+#[tokio::test]
+async fn the_outline_the_motion_and_the_breadcrumb_agree() {
+    use aether_protocol::picker::{PickerKind, PickerView, PickerViewParams, PickerViewResult};
+    use aether_protocol::viewport::{
+        FocusStep, NavigateGrain, ViewportFocusElementResult, ViewportNavigateChange,
+        ViewportNavigateChangeParams,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let body = |marker: &str| {
+        let mut out = String::from("fn outer() {\n");
+        for i in 0..20 {
+            out.push_str(&format!(
+                "    let v{i} = {};\n",
+                if i == 10 { marker } else { "0" }
+            ));
+        }
+        out.push_str("}\n");
+        out
+    };
+    commit_file(&repo, "one.rs", &body("0"));
+    std::fs::write(root.join("one.rs"), body("999")).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // What the picker says.
+    let view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let _ = view;
+    // Groups open collapsed, so query to surface the change rows themselves.
+    use aether_protocol::picker::{PickerQuery, PickerQueryParams};
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        &PickerQueryParams {
+            kind: PickerKind::DocumentSymbols,
+            query: "outer".into(),
+            generation: 1,
+            filters: Default::default(),
+        },
+    )
+    .await;
+    // Groups open collapsed, so the change rows only appear once one is expanded.
+    use aether_protocol::picker::{GroupHeader, PickerGroupAction, PickerSetGroup,
+        PickerSetGroupParams, PickerSetGroupResult};
+    let _: PickerSetGroupResult = send_request::<PickerSetGroup>(
+        &mut ws,
+        &PickerSetGroupParams {
+            kind: PickerKind::DocumentSymbols,
+            action: PickerGroupAction::Expand {
+                header: GroupHeader::Label {
+                    label: "one.rs".into(),
+                },
+            },
+        },
+    )
+    .await;
+    // The query's results arrive as a push; re-view (without wiping) to read the current window.
+    let narrowed: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            reset: aether_protocol::picker::PickerReset::Keep,
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let rows = narrowed.update.map(|u| u.items().to_vec()).unwrap_or_default();
+    let picker_label = rows
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::GitChange { preview, .. } => Some(preview.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the outline has a change row, got {rows:?}"));
+
+    // What the motion does — step to that same change.
+    let stepped: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
+        &mut ws,
+        &ViewportNavigateChangeParams {
+            viewport_id: sub.viewport_id,
+            direction: FocusStep::Next,
+            count: None,
+            grain: NavigateGrain::Outline,
+        },
+    )
+    .await;
+
+    // What the breadcrumb says once we are there.
+    let crumbs: Vec<String> = stepped
+        .buffer_status
+        .symbol_path
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+
+    assert_eq!(
+        crumbs.first().map(String::as_str),
+        Some("one.rs"),
+        "the breadcrumb leads with the file the outline grouped under: {crumbs:?}"
+    );
+    assert_eq!(
+        crumbs.get(1),
+        Some(&picker_label),
+        "and names the change in the *same words* the picker used — {crumbs:?} vs {picker_label:?}"
+    );
+
+    drop(server);
+}
+
+/// Opening the outline lands on the change the cursor is in, not at the top.
+///
+/// Resolved by the same `outline_entry_at` the breadcrumb uses, so the row the picker opens on is
+/// the one the status bar is already naming — the picker and the status bar cannot disagree about
+/// where you are.
+#[tokio::test]
+async fn the_outline_opens_on_the_change_the_cursor_is_in() {
+    use aether_protocol::picker::{PickerKind, PickerView, PickerViewParams, PickerViewResult};
+    use aether_protocol::viewport::{
+        FocusStep, NavigateGrain, ViewportFocusElementResult, ViewportNavigateChange,
+        ViewportNavigateChangeParams,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // Two well-separated changes in one file, so "the second one" is a distinct answer from "the
+    // first" and centring on the top would be visibly wrong.
+    let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    commit_file(&repo, "one.rs", &base);
+    std::fs::write(
+        root.join("one.rs"),
+        base.replace("fn line5() {}", "fn A() {}")
+            .replace("fn line45() {}", "fn B() {}"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Step to the *second* change, so the cursor is somewhere other than the top of the outline.
+    let mut at: Option<ViewportFocusElementResult> = None;
+    for _ in 0..2 {
+        at = Some(
+            send_request::<ViewportNavigateChange>(
+                &mut ws,
+                &ViewportNavigateChangeParams {
+                    viewport_id: sub.viewport_id,
+                    direction: FocusStep::Next,
+                    count: None,
+                    grain: NavigateGrain::Change,
+                },
+            )
+            .await,
+        );
+    }
+    let at = at.expect("two steps");
+    let focused_buffer = at.buffer.buffer_id;
+
+    let view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            // What the client sends for a cursor-anchored kind: the buffer the cursor is in.
+            center_on_cursor: Some(focused_buffer),
+            limit: 50,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+
+    let centred = view
+        .effective_center_on
+        .as_ref()
+        .expect("the outline resolves an opening row from the cursor");
+    let PickerItem::GitChange { hunk_index, .. } = centred else {
+        panic!("the outline's rows are change rows, got {centred:?}");
+    };
+    assert_eq!(
+        *hunk_index, 1,
+        "the cursor is in the second change, so that is the row to open on — not the first"
+    );
+
+    // And selecting that row resolves to somewhere: the element's own buffer at its own line.
+    use aether_protocol::picker::{PickerSelect, PickerSelectParams, PickerSelectResult};
+    let selected: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        &PickerSelectParams {
+            kind: PickerKind::DocumentSymbols,
+            item: centred.clone(),
+        },
+    )
+    .await;
+    match selected {
+        // Inside the view: the element to focus, and where to land in its buffer. A cursor moved
+        // into an unfocused element is not drawn, so the element is part of the answer.
+        PickerSelectResult::ViewElement {
+            buffer_id, element, ..
+        } => {
+            assert_eq!(
+                buffer_id, focused_buffer,
+                "the row resolves to the file its change is in, not the patch document"
+            );
+            assert_eq!(element, at.element, "and to the element that windows it");
+        }
+        other => panic!("an outline row selects to a place in the view, got {other:?}"),
+    }
+
+    drop(server);
+}
+
+/// `o`/`Alt-o` in a patch step **hunks** — one stop per row `Space o` lists.
+///
+/// The key and the picker are two views of one outline and read one source (`view_outline`), which
+/// is also what the breadcrumb names. `o` briefly stepped file to file, back when the outline's rows
+/// were files; the rows became changes and this followed them without being told to, which is what
+/// the shared source buys.
+///
+/// It therefore coincides with `c`/`Alt-c` in a patch. Not a redundancy to remove blindly: the two
+/// come from different sources — `view_outline` walks the index's change blocks, `change_anchors`
+/// walks the elements' diff markers — and can differ, since a pure deletion is a change block with
+/// no marked line of its own.
+#[tokio::test]
+async fn stepping_the_outline_of_a_patch_visits_each_change() {
+    use aether_protocol::viewport::{
+        FocusStep, NavigateGrain, ViewportFocusElementResult, ViewportNavigateChange,
+        ViewportNavigateChangeParams,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    // **Two changes close enough to share one hunk.** Git's three lines of context merge lines 5
+    // and 8 into a single hunk holding two change blocks — which is the only fixture that can tell
+    // `o` (hunks) from `c` (changes). Well-separated changes give one hunk each and the two keys
+    // agree, which is how a weaker fixture would pass while the grain was wrong.
+    let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    commit_file(&repo, "one.rs", &base);
+    commit_file(&repo, "two.rs", &base);
+    std::fs::write(
+        root.join("one.rs"),
+        base.replace("fn line5() {}", "fn A() {}")
+            .replace("fn line8() {}", "fn B() {}"),
+    )
+    .unwrap();
+    std::fs::write(root.join("two.rs"), base.replace("fn line5() {}", "fn C() {}")).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Focus element 0 first so each walk starts from the same place: the cursor is per
+    // `(client, buffer)` and persists, so a second walk would otherwise resume where the first
+    // stopped and count short. The seat itself is the element's first line — a context line, not a
+    // stop — so it is discarded.
+    async fn visit(
+        ws: &mut Ws,
+        viewport_id: aether_protocol::ViewportId,
+        grain: NavigateGrain,
+    ) -> Vec<(u32, u32)> {
+        use aether_protocol::viewport::{
+            FocusTarget, ViewportFocusElement, ViewportFocusElementParams,
+        };
+        let seat: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
+            ws,
+            &ViewportFocusElementParams {
+                viewport_id,
+                target: FocusTarget::Element { element: 0 },
+            },
+        )
+        .await;
+        // Focusing alone is not a reset: `seat_cursor_in_element` keeps a cursor already inside the
+        // element, and cursors are per *buffer*, so the previous walk's position survives. Put it
+        // back above every change explicitly.
+        set_cursor(ws, seat.buffer.buffer_id, 0, 0).await;
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        for _ in 0..8u32 {
+            let r: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
+                ws,
+                &ViewportNavigateChangeParams {
+                    viewport_id,
+                    direction: FocusStep::Next,
+                    count: None,
+                    grain,
+                },
+            )
+            .await;
+            let at = (r.element, r.buffer.cursor.position.line);
+            if out.last() == Some(&at) {
+                break;
+            }
+            out.push(at);
+        }
+        out
+    }
+
+    let by_hunk = visit(&mut ws, sub.viewport_id, NavigateGrain::Outline).await;
+    let by_change = visit(&mut ws, sub.viewport_id, NavigateGrain::Change).await;
+
+    // one.rs's two changes share a hunk, so `o` visits that element once and `c` visits it twice.
+    // Positions, not counts. The cursor cannot start above the element's first line —
+    // `element/set` clamps into the scope — and that line *is* the first hunk's anchor, so a walk
+    // begins already standing on stop one. Asserting where the steps land says what the keys do
+    // without depending on where they start.
+    //
+    // two.rs's hunk starts at line 2 and its change is at line 5, which is the whole point: `o`
+    // lands on 2, `c` on 5.
+    assert_eq!(
+        by_hunk,
+        vec![(1, 2)],
+        "`o` lands on the hunk's **top**, context included — not on its first change"
+    );
+    assert_eq!(
+        by_change,
+        vec![(0, 5), (0, 8), (1, 5)],
+        "`c` lands on the changes themselves — both of one.rs's, which share a single hunk"
+    );
+    // Which is the distinction: one hunk, two changes.
+    assert_eq!(
+        by_change.iter().filter(|(e, _)| *e == 0).count(),
+        2,
+        "two changes inside one.rs's single hunk"
+    );
+    assert!(
+        !by_hunk.iter().any(|(e, _)| *e == 0),
+        "and `o` does not stop again inside a hunk it is already standing at the top of"
+    );
+
+    drop(server);
+}
+

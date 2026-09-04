@@ -143,9 +143,29 @@ pub fn row_items_of(root: &Element) -> Vec<RowItem<'_>> {
                     line,
                 }))
             }
-            // A row of generated presentation: chrome, or — now that one vocabulary describes both
-            // axes — any inline element standing on its own. One screen row, no cursor position.
-            _ => out.push(RowItem::Chrome),
+            // A horizontal group is **one** screen row: its children share it, so it contributes a
+            // single item however many of them there are. Correct for everything produced today,
+            // where a `Row` is chrome and its children are `Text`/`Space`/`Fill`.
+            //
+            // An `Editor` nested inside one is *representable and not renderable*. `RowItem` is a
+            // flat top-to-bottom list, so it has no way to say "these two editors share these
+            // rows" — side-by-side diff needs a different row model, not a deeper walk here. Worth
+            // asserting rather than dropping silently, because `Element::walk` **does** descend
+            // into rows: `lines()` and `editors()` would count such an editor while this draws it
+            // as one chrome row, and two traversals of one tree disagreeing is the kind of thing
+            // that shows up as a cursor in the wrong place three layers away.
+            Element::Row { children } | Element::Chrome { children, .. } => {
+                debug_assert!(
+                    !children.iter().any(|c| !c.editors().is_empty()),
+                    "an Editor inside a Row/Chrome: representable, but the row model cannot give \
+                     it rows of its own — see the module docs on `ui::Element`"
+                );
+                out.push(RowItem::Chrome);
+            }
+            // A bare inline element standing on its own: one row, no cursor position.
+            Element::Text { .. } | Element::Space { .. } | Element::Fill { .. } => {
+                out.push(RowItem::Chrome)
+            }
         }
     }
     let mut out = Vec::new();
@@ -1584,6 +1604,75 @@ mod tests {
             rail: RailJoin::Opens,
             children: vec![Element::text(text, Vec::new())],
         }
+    }
+
+    /// An `Editor` nested in a `Row` is loud, not silently drawn as one chrome row.
+    ///
+    /// The shape nothing produces — and the one that would quietly lose an editor's lines if the
+    /// row builder kept its old catch-all. `debug_assertions`-gated because the guard is a
+    /// `debug_assert`: it is a producer bug, caught where producers are written, not a condition to
+    /// pay for in a release render loop.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "an Editor inside a Row")]
+    fn an_editor_nested_in_a_row_is_refused_rather_than_dropped() {
+        let mut w = window(0, 0, vec![]);
+        w.root = Element::Row {
+            children: vec![Element::Editor {
+                element: 0,
+                buffer: 1,
+                rows: 1,
+                first_buffer_line: 0,
+                lines: vec![line(0, vec![row(0, 0, "a")])],
+            }],
+        };
+        let _ = row_items(&w);
+    }
+
+    /// The row layout and the tree walk must agree about how many lines a view has.
+    ///
+    /// `Element::walk` — and so `lines()` and `editors()` — descends into `Row` and `Chrome`, while
+    /// the row layout treats each as a single screen row. That is the right answer for everything
+    /// produced today (a `Row` is chrome, and its children are text), and it silently stops being
+    /// the right answer the moment anything nests an `Editor` in one: the tree would count its
+    /// lines and the layout would draw one chrome row instead. Nothing produces that shape, which
+    /// is exactly why it needs a test rather than a reader noticing.
+    #[test]
+    fn the_row_layout_accounts_for_every_line_the_tree_walk_finds() {
+        let mut w = window(0, 0, vec![]);
+        w.root = Element::Stack {
+            children: vec![
+                chrome("a.rs"),
+                Element::Editor {
+                    element: 0,
+                    buffer: 1,
+                    rows: 2,
+                    first_buffer_line: 0,
+                    lines: vec![line(0, vec![row(0, 0, "a")]), line(1, vec![row(0, 0, "b")])],
+                },
+                // A row of pure chrome: one screen row, no lines — the shape that exists today.
+                Element::Row {
+                    children: vec![
+                        Element::text("left", Vec::new()),
+                        Element::Fill { glyph: '─' },
+                    ],
+                },
+                chrome("closing"),
+            ],
+        };
+
+        let painted = row_items(&w)
+            .iter()
+            .filter(|i| matches!(i, RowItem::Line { .. }))
+            .count();
+        assert_eq!(
+            painted,
+            w.root.lines().len(),
+            "the layout paints {painted} lines while the tree walk finds {} — the two traversals \
+             disagree about what the view contains",
+            w.root.lines().len()
+        );
+        assert_eq!(painted, 2, "and the fixture must actually contain lines");
     }
 
     /// The whole point of the shared layout: chrome, phantoms and wrapped rows all occupy rows, and

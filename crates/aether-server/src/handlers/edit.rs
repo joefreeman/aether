@@ -557,7 +557,9 @@ fn with_jumplist_position(
         .canonical_path
         .as_deref()
         .map(|p| p.to_string_lossy().into_owned());
-    let location = crate::jumplist::location_of(current_abs.as_deref(), buffer_id);
+    let view_key = crate::handlers::viewport::view_key_of(s, aether_protocol::ViewId(buffer_id));
+    let location =
+        crate::jumplist::location_of(current_abs.as_deref(), buffer_id, view_key.as_deref());
     // Compare in char-index space so multi-byte content stays on char boundaries (mirrors
     // `match_index_for_cursor`). Entry coordinates may be stale after edits; `pos_to_char`
     // clamps, same acceptance as jumping to a stale entry.

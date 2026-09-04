@@ -304,7 +304,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
             .viewports
             .values()
             .filter(|v| v.client_id == client_id)
-            .map(|v| v.buffer_id())
+            .flat_map(|v| v.shown_buffers())
             .collect();
         s.drop_viewports_for_client(client_id);
         let (closed, _stopped) = s.close_orphaned_transients(viewed);
@@ -396,6 +396,12 @@ async fn process_request(
     let id = request.id;
     let method = request.method.clone();
     let params = request.params.unwrap_or(Value::Null);
+
+    // Every request that arrives, at `trace` — the one place that can say whether a client actually
+    // sent something. Errors already log at `debug`; a *successful* request left no trace at all,
+    // which makes "the client emitted it" and "the server received it" indistinguishable from a
+    // log, and those are exactly the two halves worth telling apart when a gesture does nothing.
+    tracing::trace!(%method, "request");
 
     let result = dispatch(state, ctx, &method, params).await;
 

@@ -1654,7 +1654,16 @@ impl Shell {
         let line = self.session.view.buffer.cursor.position.line;
         // Per element: a cursor line is a line of *its element's* buffer, and comparing it against
         // the window's view-line range says "not loaded" for a line sitting in plain sight.
-        if !aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line) {
+        let loaded = aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line);
+        tracing::debug!(
+            ?style,
+            line,
+            element = self.session.view.focused_element,
+            loaded,
+            top = self.top_visual_row.get(),
+            "reveal requested"
+        );
+        if !loaded {
             self.pending_reveal.owe_reveal(style);
             self.fetch_cursor_window();
             return;
@@ -1693,6 +1702,7 @@ impl Shell {
     fn settle_chased_reveal(&mut self) -> bool {
         let mut pending = std::mem::take(&mut self.pending_reveal);
         let settled = pending.settle_chase(self);
+        tracing::debug!(?settled, "settle chased reveal");
         self.pending_reveal = pending;
         settled != Settled::Nothing
     }
@@ -1771,14 +1781,29 @@ impl Shell {
         let Some(window) = &self.session.view.window else {
             return false;
         };
-        let Some(row) = cursor_visual_row(
+        let resolved = cursor_visual_row(
             window,
             self.session.view.focused_element,
             self.session.view.buffer.cursor.position,
-        ) else {
+        );
+        let (wf, wl) = (
+            window.first_view_line.get(),
+            window.last_view_line_exclusive.get(),
+        );
+        let visible = self.visible_rows();
+        tracing::debug!(
+            element = self.session.view.focused_element,
+            line = self.session.view.buffer.cursor.position.line,
+            ?resolved,
+            top = self.top_visual_row.get(),
+            visible,
+            window_first = wf,
+            window_last = wl,
+            "reveal jump"
+        );
+        let Some(row) = resolved else {
             return false;
         };
-        let visible = self.visible_rows();
         if row >= self.top_visual_row && row < self.top_visual_row.saturating_add(visible) {
             self.maybe_fetch(); // already visible — don't disturb the view
             return true;

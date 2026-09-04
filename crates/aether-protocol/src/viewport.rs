@@ -558,6 +558,18 @@ pub enum FocusStep {
     Previous,
 }
 
+/// A place *inside* a composed view: the element to focus and the buffer it currently windows.
+///
+/// Two fields because both are needed and neither implies the other: focusing is what makes the
+/// cursor visible (a cursor in an unfocused element is not drawn), and the cursor itself is set per
+/// `(client, buffer)`. The buffer rides along rather than being remembered by the caller because a
+/// view's element buffers are transient — the same file can come back as a different buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewSeat {
+    pub element: FieldId,
+    pub buffer_id: crate::BufferId,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ViewportFocusElementResult {
     /// Where focus ended up — unchanged at the ends, which is what makes repeated presses stop
@@ -611,6 +623,36 @@ pub struct ViewportNavigateChangeParams {
     pub direction: FocusStep,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
+    /// How coarsely to step. Both grains are the same operation over the same index — "move focus
+    /// to the next anchor in the view" — so they share a method rather than growing a second one
+    /// whose result type would be identical.
+    #[serde(default, skip_serializing_if = "NavigateGrain::is_default")]
+    pub grain: NavigateGrain,
+}
+
+/// The unit `view/navigate_change` steps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigateGrain {
+    /// One change block — `c`/`Alt-c`, and what the changes picker lists.
+    #[default]
+    Change,
+    /// One **outline entry** — `o`/`Alt-o`, and one stop per row the outline picker lists.
+    ///
+    /// The reason it belongs here rather than in a motion: a view's outline is known to the view,
+    /// not to any buffer. `o` over an ordinary buffer steps document symbols, which is the same
+    /// idea — the structure of what you are reading, above the grain of its lines.
+    ///
+    /// A composed view's outline is its *changes*, so this steps hunk to hunk. It stepped file to
+    /// file while the outline's rows were files; the rows moved and this followed them, which is
+    /// the point of the two reading one source.
+    Outline,
+}
+
+impl NavigateGrain {
+    fn is_default(&self) -> bool {
+        matches!(self, NavigateGrain::Change)
+    }
 }
 
 // ---- viewport/scroll_to_row ---------------------------------------------------------------------

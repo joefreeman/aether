@@ -1503,7 +1503,9 @@ impl ServerState {
         self.view_layouts.remove(&id);
         self.view_layouts
             .retain(|_, layout| !layout.iter().any(|e| e.extent.bound_to() == Some(id)));
-        self.viewports.retain(|_, v| !v.binds(id));
+        // `shows`: a viewport *presenting* a patch binds no element of it, so a `binds` test left
+        // it alive with a `view_id` pointing at a buffer that no longer exists.
+        self.viewports.retain(|_, v| !v.shows(id));
         self.cursors.retain(|(_, b), _| *b != id);
         self.motion_history.retain(|(_, b), _| *b != id);
         self.virtual_col.retain(|(_, b), _| *b != id);
@@ -1552,7 +1554,11 @@ impl ServerState {
             });
             let eligible = self.buffers.get(&id).is_some_and(|b| b.transient)
                 && (has_sibling || !self.try_doc_of(id).is_some_and(|d| d.dirty))
-                && !self.viewports.values().any(|v| v.binds(id));
+                // `shows`, not `binds`: a patch's viewers are watching the *view*, and no element
+                // windows it, so asking only about bindings said "nothing is showing this" about
+                // the document on screen. The GC and the push fan-out now ask the same question —
+                // a buffer that is live enough to receive notifications is live enough to keep.
+                && !self.viewports.values().any(|v| v.shows(id));
             if !eligible {
                 continue;
             }
@@ -1944,11 +1950,14 @@ impl ServerState {
             .filter_map(|(id, name)| (name == workspace_name).then_some(*id))
             .collect();
 
+        // Every buffer the departing viewports were showing, filtered to this workspace's. A
+        // composed view holds several, and only naming the focused one left the rest behind.
         let viewed: Vec<BufferId> = self
             .viewports
             .values()
             .filter(|v| v.client_id == client_id && workspace_buffers.contains(&v.buffer_id()))
-            .map(|v| v.buffer_id())
+            .flat_map(|v| v.shown_buffers())
+            .filter(|b| workspace_buffers.contains(b))
             .collect();
         self.viewports.retain(|_, v| {
             !(v.client_id == client_id && workspace_buffers.contains(&v.buffer_id()))
@@ -3396,6 +3405,24 @@ impl Viewport {
     /// because a patch's viewers are watching the view even though no element windows it.
     pub fn shows(&self, id: BufferId) -> bool {
         self.view_id.presenting_buffer() == id || self.binds(id)
+    }
+
+    /// Every buffer this viewport shows, each named once — [`Self::shows`] enumerated rather than
+    /// asked.
+    ///
+    /// What a viewport being torn down was keeping alive, and so what the transient GC must
+    /// consider. Its callers used to build that list from [`Self::buffer_id`], the *focused
+    /// element's* buffer — which for a composed view is one of the files and never the patch, so
+    /// navigating away from working changes left the patch document and every unfocused element's
+    /// buffer behind with nothing showing them and nothing looking for them.
+    pub fn shown_buffers(&self) -> Vec<BufferId> {
+        let mut out = vec![self.view_id.presenting_buffer()];
+        for e in &self.elements {
+            if !out.contains(&e.buffer_id) {
+                out.push(e.buffer_id);
+            }
+        }
+        out
     }
 
     /// This viewport's wrap-layout inputs for its focused element, bundled for the motion/render

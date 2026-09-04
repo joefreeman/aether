@@ -281,6 +281,13 @@ pub struct PatchHunk {
     pub old_lines: u32,
     pub new_start: u32,
     pub new_lines: u32,
+    /// The enclosing signature git prints after the second `@@` — "where you are" in the file.
+    ///
+    /// Already rendered as this hunk's [`ChromeKind::HunkHeader`]; kept here as well because it is
+    /// the **outline's** label for every change in the hunk, and an outline that read it back out of
+    /// the rendered chrome would be parsing its own output. Empty when git offers none (the top of
+    /// a file, a non-code file), which the outline falls back from.
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1395,6 +1402,7 @@ fn emit_hunk(
     b.file_mut(file_idx).hunks.push(PatchHunk {
         start_line,
         end_line,
+        signature: signature.to_string(),
         old_start: hunk.old_start(),
         old_lines: hunk.old_lines(),
         new_start: hunk.new_start(),

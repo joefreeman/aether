@@ -63,13 +63,24 @@ fn build_buffer_candidates(
         out.push(buffer_candidate(buf, doc, &roots));
         seen.insert(id);
     }
-    // Append any workspace buffers not in the MRU yet so the picker still surfaces them. Stable
-    // order (by id) so the tail is deterministic.
+    // Append any workspace buffers not in the MRU yet so the picker still surfaces them — one
+    // opened by another client of the same workspace, say. Stable order (by id) so the tail is
+    // deterministic.
+    //
+    // **Transient ones are skipped here, and only here.** A buffer that has never been in the MRU
+    // and is transient was never *opened* by anybody: it exists because something else needed it —
+    // in practice because a composed view windows it. Those are elements, not views, and this
+    // picker switches between views. Listing them meant `Space g w` on a busy tree quietly added a
+    // row per changed file to `Space b`.
+    //
+    // A transient buffer you really did visit — a picker preview — is in the MRU and still shows,
+    // which is why the filter belongs on this sweep rather than on the candidate as a whole.
     let mut leftovers: Vec<BufferId> = s
         .buffers
         .keys()
         .copied()
         .filter(|id| belongs(id) && !seen.contains(id))
+        .filter(|id| !s.buffers[id].transient)
         .collect();
     leftovers.sort_unstable();
     for id in leftovers {
@@ -1096,6 +1107,60 @@ fn build_file_git_status(
 /// `Space c` means "the changes in this buffer" either way. In a patch that happens to span
 /// several files, so the rows carry group headers where a single file's rows wouldn't — the
 /// grouping is a consequence of the scope, not a different picker.
+/// The **outline** of a composed view: a row per change, grouped by file, labelled by the enclosing
+/// signature git records in the hunk header.
+///
+/// Built from [`view_outline`], which `o`/`Alt-o` and the status bar's breadcrumb also read — so the
+/// three cannot disagree about what the stops are or what they are called. It used to resolve
+/// document symbols for whichever file the cursor was in: an outline of one hunk's file, describing
+/// nothing about the review.
+///
+/// The label is *where the change is*, not what it says — which is what makes this an outline and
+/// not a second changes picker. Where git offers no signature (the top of a file, a non-code file)
+/// the changed text stands in, because a row with no label at all cannot be picked out of a list.
+fn build_outline_candidates(
+    s: &ServerState,
+    vp: &crate::state::Viewport,
+    text: &ropey::Rope,
+) -> Vec<crate::picker::GitChangeCandidate> {
+    let view_buffer = vp.view_id.presenting_buffer();
+    crate::handlers::viewport::view_outline(s, vp)
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let label = if e.label.is_empty() {
+                text.line(e.patch_line as usize)
+                    .chunks()
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            } else {
+                e.label.clone()
+            };
+            // The element's own buffer and line, when it windows a real file — what everything
+            // acting on this row actually wants.
+            let file = vp
+                .elements
+                .get(e.element as usize)
+                .filter(|b| b.buffer_id != view_buffer)
+                .map(|b| (e.element, b.buffer_id, e.line));
+            crate::picker::GitChangeCandidate::for_patch(
+                crate::picker::PatchRowTarget {
+                    buffer: view_buffer,
+                    file,
+                    line_of: vec![e.patch_line],
+                },
+                e.file,
+                i as u32,
+                e.patch_line,
+                0,
+                0,
+                vec![label],
+            )
+        })
+        .collect()
+}
+
 fn build_patch_change_candidates(
     buffer_id: BufferId,
     generated: &crate::patch::GeneratedPatch,
@@ -1145,6 +1210,9 @@ fn build_patch_change_candidates(
             out.push(crate::picker::GitChangeCandidate::for_patch(
                 crate::picker::PatchRowTarget {
                     buffer: buffer_id,
+                    // No viewport here, so no element to resolve against: this builder runs for a
+                    // cursor that has not entered one.
+                    file: None,
                     line_of,
                 },
                 file.path().to_string(),
@@ -1362,12 +1430,21 @@ struct CursorCentering {
     /// The buffer's absolute path — the jumplist keys entries by it, since its files can sit
     /// outside every root. `None` for a scratch buffer, which `buffer_id` then identifies.
     abs_path: Option<String>,
+    /// The view key, when the cursor sits in a materialised view — a commit's patch, the working
+    /// changes. A jumplist entry captured from one matches on this rather than on the buffer id,
+    /// which does not survive the view being closed and reopened.
+    view_key: Option<String>,
     /// The buffer itself — the jumplist's identity for a pathless (scratch) buffer, which can be
     /// a captured target in its own right (`crate::jumplist::location_of`).
     buffer_id: BufferId,
     /// The revision this buffer *is*, for a `git/show` virtual buffer — the log picker's "where
     /// you are". `None` for an ordinary file buffer.
     revision: Option<String>,
+    /// Index of the **outline** entry the cursor is in, for a composed view. Resolved here, beside
+    /// the other "where you are" answers, because it needs the viewport — and resolved by the same
+    /// function the breadcrumb uses, so the row the picker opens on is the one the status bar is
+    /// already naming.
+    outline_index: Option<usize>,
 }
 
 pub async fn picker_view(
@@ -1513,7 +1590,30 @@ pub async fn picker_view(
         // DocumentSymbols also resolves asynchronously (a `textDocument/documentSymbol` round-trip),
         // so it opens empty and the spawned task (below) fills it; resume/scroll re-views preserve
         // the prior snapshot via `preserve_existing`.
-        PickerKind::DocumentSymbols => picker_state::PickerCandidates::Symbols(Vec::new()),
+        // A composed view's outline is its **files**; an ordinary buffer's is its document symbols,
+        // which arrive asynchronously (hence the empty open). Asked of the *view*, because the
+        // outline describes what is on screen — the focused element's symbols describe one hunk's
+        // file and nothing else about the review.
+        PickerKind::DocumentSymbols => {
+            // Needs the *viewport*, not just the view: an outline entry's line is a line of the
+            // element's buffer, and only the viewport knows which buffer each element windows.
+            let outline = match params.view_id.map(|v| v.presenting_buffer()) {
+                Some(view_buffer) => {
+                    let s = state.lock().await;
+                    let vp = s
+                        .viewports
+                        .values()
+                        .find(|v| v.client_id == client_id && v.shows(view_buffer));
+                    vp.filter(|_| s.try_doc_of(view_buffer).is_some_and(|d| d.generated.is_some()))
+                        .map(|v| build_outline_candidates(&s, v, &s.doc_of(view_buffer).text))
+                }
+                None => None,
+            };
+            match outline {
+                Some(rows) => picker_state::PickerCandidates::GitChanges(rows),
+                None => picker_state::PickerCandidates::Symbols(Vec::new()),
+            }
+        }
         // Workspace symbols are query-driven: the picker opens empty and each `picker/query` fans
         // out afresh, exactly as Grep does.
         PickerKind::WorkspaceSymbols => {
@@ -1594,13 +1694,13 @@ pub async fn picker_view(
             // working-changes view is one of the *files*, so `Space c` there listed that file's
             // hunks and called it "here". The view's own document is the patch, and its changes are
             // the whole review — which is the view-wide answer, from rows that already existed.
-            let patch_rows = match params.view_id.map(|v| v.presenting_buffer()) {
-                Some(view_buffer) => {
+            let patch_rows = match params.buffer_id {
+                Some(buffer_id) => {
                     let s = state.lock().await;
-                    s.try_doc_of(view_buffer).and_then(|d| {
+                    s.try_doc_of(buffer_id).and_then(|d| {
                         d.generated
                             .as_ref()
-                            .map(|g| build_patch_change_candidates(view_buffer, g, &d.text))
+                            .map(|g| build_patch_change_candidates(buffer_id, g, &d.text))
                     })
                 }
                 None => None,
@@ -1863,11 +1963,22 @@ pub async fn picker_view(
                     .and_then(|d| d.virtual_source.as_ref())
                     .and_then(|v| v.target.rev())
                     .map(str::to_string);
+                let view_key =
+                    crate::handlers::viewport::view_key_of(&s, aether_protocol::ViewId(buffer_id));
                 Some(CursorCentering {
                     leading_edge,
                     abs_path: current_abs,
+                    view_key,
                     buffer_id,
                     revision,
+                    // Only meaningful for the outline, and only over a composed view; `None`
+                    // everywhere else, which is what the centring arm below keys off.
+                    outline_index: (kind == PickerKind::DocumentSymbols)
+                        .then(|| {
+                            crate::handlers::viewport::outline_entry_at(&s, client_id, buffer_id)
+                                .map(|(i, _)| i)
+                        })
+                        .flatten(),
                 })
             }
             _ => None,
@@ -1957,6 +2068,20 @@ pub async fn picker_view(
                     picker_state::PickerCandidates::Symbols(_),
                     picker_state::PickerCandidates::Symbols(_),
                 ) => true,
+                // ...and keep a **patch outline** across them too. It lives under the same kind but
+                // as `GitChanges` candidates, and a scroll re-view carries no `view_id` to rebuild
+                // it from — so it arrives as the *symbols* placeholder and the variant pair stops
+                // matching. The placeholder means "no rebuild", never "the outline is empty":
+                // treating it as the latter wiped the list the moment a scroll refetch fired, which
+                // is what stepping onto the last row does.
+                //
+                // (That this is decided by enumerating variant *pairs* is the fragile part — an
+                // unlisted combination silently means "replace". The rule it is groping towards is
+                // that a re-view never replaces a snapshot, only a fresh open does.)
+                (
+                    picker_state::PickerCandidates::GitChanges(_),
+                    picker_state::PickerCandidates::Symbols(placeholder),
+                ) if params.kind == PickerKind::DocumentSymbols && placeholder.is_empty() => true,
                 // WorkspaceSymbols: the accumulated fan-out results *are* the search, like Grep's —
                 // a scroll/resume re-view must not wipe what the servers have answered so far. A
                 // genuinely new search comes from `picker/query`, which clears them itself.
@@ -2064,6 +2189,18 @@ pub async fn picker_view(
     // remember what to spawn once the lock is released — the picker is pushed empty + `ticking`
     // now, and the spawned task fills it.
     let async_resolve: Option<(PickerKind, BufferId, u64)> = match (params.kind, params.buffer_id) {
+        // A patch outline is already built — it came from the view's own index, not a language
+        // server — so there is nothing to resolve. Kicking off the LSP load anyway would mark the
+        // picker loading and then overwrite the file rows with the focused file's symbols, which is
+        // the very thing the outline is not.
+        (PickerKind::DocumentSymbols, _)
+            if matches!(
+                picker.candidates,
+                picker_state::PickerCandidates::GitChanges(_)
+            ) =>
+        {
+            None
+        }
         (PickerKind::References | PickerKind::DocumentSymbols, Some(buffer_id)) => {
             let epoch = next_async_load_epoch();
             picker.pending_async_load = Some(epoch);
@@ -2078,6 +2215,16 @@ pub async fn picker_view(
     // The resolution is echoed back via `effective_center_on` so the client knows what to highlight.
     let cursor_resolved_item: Option<PickerItem> =
         match (cursor_centering_info.as_ref(), &picker.candidates) {
+            // The outline: open on the entry the cursor is in — the same entry the breadcrumb is
+            // already naming, resolved by the same function, so the picker and the status bar
+            // cannot disagree about where you are.
+            (
+                Some(CursorCentering {
+                    outline_index: Some(i),
+                    ..
+                }),
+                picker_state::PickerCandidates::GitChanges(c),
+            ) if *i < c.len() => Some(picker.candidates.make_item(*i, Vec::new())),
             // The log: land on the commit the active buffer *is*, so opening the log from a
             // `git/show` buffer shows you where that commit sits in history. Nothing to resolve
             // from an ordinary buffer — the list then opens at the top, which is the newest commit.
@@ -2144,11 +2291,13 @@ pub async fn picker_view(
                     leading_edge,
                     abs_path,
                     buffer_id,
+                    view_key,
                     ..
                 }),
                 picker_state::PickerCandidates::Jumplist(entries),
             ) if !entries.is_empty() => {
-                let location = crate::jumplist::location_of(abs_path.as_deref(), *buffer_id);
+                let location =
+                    crate::jumplist::location_of(abs_path.as_deref(), *buffer_id, view_key.as_deref());
                 let idx = crate::jumplist::nearest_index(entries, location, *leading_edge);
                 Some(picker.candidates.make_item(idx, Vec::new()))
             }
@@ -2546,13 +2695,131 @@ pub async fn picker_select(
             "no active picker for this client",
         )
     })?;
-    picker_state::resolve_select(picker, &params.item).ok_or_else(|| {
+    // Two answers, in order of preference. A jumplist row captured from a composed view belongs
+    // *in* that view — resolved from the **entry**, not from the ordinary select result, because a
+    // view-addressed row has no path and no live buffer id and so has no ordinary result at all.
+    let landing = jumplist_landing(picker, &params.item);
+    let ordinary = picker_state::resolve_select(picker, &params.item);
+    drop(s);
+    if let Some((view_key, identity, position)) = landing {
+        if let Some((open, seat)) = land_in_captured_view(
+            state,
+            ctx,
+            client_id,
+            &view_key,
+            &identity,
+            position.line,
+            true, // Enter on a row is a request to go there; reopening the view is how
+        )
+        .await?
+        {
+            return Ok(PickerSelectResult::ViewElement {
+                element: seat.element,
+                buffer_id: seat.buffer_id,
+                position,
+                open: open.map(Box::new),
+            });
+        }
+    }
+    ordinary.ok_or_else(|| {
         RpcError::invalid_params(
             "selected item is not in the picker's candidate set, or is not selectable",
         )
     })
 }
 
+/// What a jumplist row needs in order to land in the view it was captured from: that view's key,
+/// how the row names its element's buffer, and where in it.
+fn jumplist_landing(
+    picker: &crate::picker::PickerState,
+    item: &PickerItem,
+) -> Option<(String, String, LogicalPosition)> {
+    let PickerItem::JumplistEntry { index, .. } = item else {
+        return None;
+    };
+    let crate::picker::PickerCandidates::Jumplist(entries) = &picker.candidates else {
+        return None;
+    };
+    let entry = entries.get(*index as usize)?;
+    Some((
+        entry.view.clone()?,
+        entry.target.identity()?.to_string(),
+        entry.position?,
+    ))
+}
+
+
+/// Where a jumplist row captured from a composed view lands — reopening that view when nothing is
+/// showing it.
+///
+/// **The one decision.** Enter on the row and `]` onto it must land in the same place, and they used
+/// to work it out separately: one named an element, the other a patch line, and each had its own
+/// idea of what to do when the view was gone. Two derivations of "where does this row land" is what
+/// every bug in this area has been, so there is now one, and both routes call it.
+///
+/// `Ok(None)` when the row names no view, when reopening is not allowed here, or when the view can
+/// no longer be materialised — the caller then falls back to the entry's own file target, which is
+/// the same place reached the only other way there is.
+///
+/// `reopen` is the caller's licence to materialise: a step that was told not to open anything still
+/// wants a seat if the view happens to be on screen, but must not conjure it back otherwise.
+async fn land_in_captured_view(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    client_id: ClientId,
+    view_key: &str,
+    identity: &str,
+    line: u32,
+    reopen: bool,
+) -> Result<Option<(Option<BufferOpenResult>, aether_protocol::viewport::ViewSeat)>, RpcError> {
+    {
+        let s = state.lock().await;
+        if let Some(seat) =
+            crate::handlers::viewport::element_holding(&s, client_id, view_key, identity, line)
+        {
+            return Ok(Some((None, seat))); // already on screen: nothing to open
+        }
+    }
+    if !reopen {
+        return Ok(None);
+    }
+    let Some(mut opened) = crate::handlers::nav::materialise_virtual_key(state, ctx, view_key)
+        .await
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    // The elements are rebuilt with the view, which is why the entry stores a key and a path and
+    // never an element id.
+    let s = state.lock().await;
+    let Some(seat) = crate::handlers::viewport::seat_in_fresh_view(&s, opened.buffer_id, identity, line)
+    else {
+        return Ok(None);
+    };
+    // **Frame the reopen on the seat.** The client subscribes to the view it has just adopted, and
+    // a subscribe derives its focused element from the line the view is scrolled to — so a reopen
+    // framed at the top focuses element 0 and quietly undoes the focus this jump asked for. That is
+    // what "the first `]` takes me to the view but not to the entry" was: the seat was correct and
+    // then overwritten a moment later by the client's own subscribe.
+    if let Some(view_line) =
+        crate::handlers::viewport::view_line_in_fresh_view(&s, opened.buffer_id, seat.element, line)
+    {
+        opened.scroll = Some(aether_protocol::viewport::ScrollPosition {
+            logical_line: view_line,
+            sub_row: 0.0,
+        });
+    }
+    Ok(Some((Some(opened), seat)))
+}
+
+/// Re-seat a jumplist jump inside the view it was captured from.
+///
+/// A jumplist entry addresses the element's *file* buffer, which is what makes it durable across
+/// the patch being rebuilt. But the picker it was captured from resolves the same row to a
+/// `ViewElement`, and a jump that behaves differently from the picker that populated it is the
+/// thing the two are supposed to agree on. So while the source view is still open, upgrade the
+/// jump the same way — and when it isn't, the `BufferAt` underneath is a real address that opens
+/// the file at the same line.
 pub async fn picker_hide(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -2758,10 +3025,59 @@ pub async fn jumplist_capture(
             RpcError::invalid_params("selected item is not in the picker's candidate set")
         })?,
     } as u32;
+    // The view these rows are rows *of*, taken while it is still open — every patch row names it,
+    // and they all name the same one. Read before the capture, which ends the picker borrow.
+    let patch_view = match &picker.candidates {
+        crate::picker::PickerCandidates::GitChanges(v) => v
+            .iter()
+            .find_map(|c| c.patch.as_ref().map(|p| aether_protocol::ViewId(p.buffer))),
+        _ => None,
+    };
     let Some((mut list, candidate_indices)) = crate::jumplist::capture(picker, &mut s.matcher)
     else {
         return Ok(None);
     };
+    // **A buffer id is not a durable address for a file.** A patch row addresses the element's
+    // buffer, because the patch itself was materialised and has no path to reopen — but those
+    // element buffers are *transient*: opening any other editor hides the view and closes them, and
+    // every entry captured from it then named a buffer that no longer existed (`unknown buffer_id`
+    // on the step, which is what "the jumplist stops working once you look at something else" was).
+    //
+    // So give any entry whose buffer has a path the path instead. This restores the invariant the
+    // rest of the jumplist already keeps — a `Buffer` target means *pathless* (the Buffers picker
+    // captures pathed rows as `File` for exactly this reason) — which is also what `location_of`
+    // assumes when it decides how the current buffer identifies itself.
+    // The view each row came from, named durably. Taken from the picker's own view rather than the
+    // rows: every row of a patch picker is a row *of that view*.
+    let view_key = patch_view.and_then(|v| crate::handlers::viewport::view_key_of(s, v));
+    for entry in &mut list.entries {
+        let Some(buffer_id) = entry.target.buffer_id() else {
+            continue;
+        };
+        // Only the rows that had a buffer behind them came from inside a view.
+        entry.view = view_key.clone();
+        let doc = s.try_doc_of(buffer_id);
+        let abs_path = doc
+            .and_then(|d| d.canonical_path.as_ref())
+            .map(|p| p.to_string_lossy().into_owned());
+        // A **virtual** buffer — a commit's patch, a file at a revision — has no path either, and
+        // its id is just as transient. Its durable address is the view it *is*, and `position` is
+        // already a line of that view's own document. This is what a jumplist captured from a
+        // commit patch's outline needs: those rows have no working-tree file behind them at all.
+        let virtual_key = doc
+            .and_then(|d| d.virtual_source.as_ref())
+            .map(|src| src.target.key());
+        entry.target = match (abs_path, virtual_key) {
+            (Some(abs_path), _) => crate::jumplist::JumplistTarget::File {
+                path_index: None,
+                relative_path: None,
+                abs_path,
+            },
+            (None, Some(key)) => crate::jumplist::JumplistTarget::View { key },
+            // Genuinely pathless and not a view (a scratch buffer): the id is the only address.
+            (None, None) => continue,
+        };
+    }
     // Give every entry its file identity: derive workspace-relative parts from `abs_path` (so the
     // open resolves the file rather than the root directory) and a group header for the headerless
     // buffer-scoped sources (so the picker shows which file each row belongs to). Runs even with
@@ -2869,7 +3185,7 @@ pub async fn jumplist_step(
     params: JumplistStepParams,
 ) -> Result<JumplistStepResult, RpcError> {
     let client_id = ctx.client_id;
-    let (mut target, open_params) = {
+    let (mut target, open_params, landing) = {
         let s = state.lock().await;
         let buffer = s
             .try_doc_of(params.buffer_id)
@@ -2884,7 +3200,13 @@ pub async fn jumplist_step(
             .canonical_path
             .as_deref()
             .map(|p| p.to_string_lossy().into_owned());
-        let location = crate::jumplist::location_of(current_abs.as_deref(), params.buffer_id);
+        let current_view =
+            crate::handlers::viewport::view_key_of(&s, aether_protocol::ViewId(params.buffer_id));
+        let location = crate::jumplist::location_of(
+            current_abs.as_deref(),
+            params.buffer_id,
+            current_view.as_deref(),
+        );
         // Use the outer edge of the cursor's selection so an entry the cursor currently sits
         // on is treated as "current" and skipped. Without this, `[` from a freshly-jumped
         // entry (where the selection covers its span) would land back on the same entry
@@ -2933,6 +3255,17 @@ pub async fn jumplist_step(
             },
         };
         let entry = &list.entries[idx];
+        // What this entry needs in order to land in the view it was captured from. Resolved after
+        // the lock by `land_in_captured_view` — the same call the picker's own Enter makes, so the
+        // two cannot disagree about where a row goes.
+        // Which element of the view to land in, named the way the view itself names its elements'
+        // buffers: a path for a working-tree file, a virtual key for a file at a revision.
+        let landing = match (entry.view.clone(), entry.target.identity(), entry.position) {
+            (Some(view), Some(identity), Some(position)) => {
+                Some((view, identity.to_string(), position.line))
+            }
+            _ => None,
+        };
         let target = JumplistStepTarget {
             path: entry.abs_path().map(str::to_string),
             buffer_id: entry.target.buffer_id(),
@@ -2941,16 +3274,50 @@ pub async fn jumplist_step(
             index: idx as u32 + 1,
             total: list.entries.len() as u32,
             opened: None,
+            seat: None,
         };
-        let open_params = params
-            .open
+        // Built whether or not it is used: it only describes the entry, and whether the view can be
+        // landed in is not known until the lock is gone.
+        // Not for a view-addressed entry: it names no file, and `jumplist_open_params` answers a
+        // pathless, id-less target with a *scratch* buffer — which is what a commit-patch step
+        // opened once its dead buffer id stopped erroring.
+        let open_params = (params.open && entry.target.view_key().is_none())
             .then(|| jumplist_open_params(&s, client_id, entry, params.buffer_id));
-        (target, open_params)
+        (target, open_params, landing)
     };
-    // Composite post-step: open the entry — transient, landed like a picker select, jump origin
-    // recorded — in the same round-trip.
-    if let Some(open_params) = open_params {
-        target.opened = Some(buffer_open(state, ctx, open_params).await?);
+    // Composite post-step. Landing in the view the row came from wins: that is where the row *is*,
+    // and its file is reached through the view, as one of the windows onto it. `params.open` is the
+    // licence to reopen a view that has gone — without it a step still seats in one already on
+    // screen, but conjures nothing back.
+    let landed = match landing {
+        Some((view_key, identity, line)) => {
+            match land_in_captured_view(
+                state,
+                ctx,
+                client_id,
+                &view_key,
+                &identity,
+                line,
+                params.open,
+            )
+                .await?
+            {
+                Some((open, seat)) => {
+                    target.seat = Some(seat);
+                    target.opened = open;
+                    true
+                }
+                None => false,
+            }
+        }
+        None => false,
+    };
+    // Only when there was no view to land in. Opening the file is the fallback, and doing it as
+    // well would drop a bare editor over the view just seated in — which is what `]` used to do.
+    if !landed {
+        if let Some(open_params) = open_params {
+            target.opened = Some(buffer_open(state, ctx, open_params).await?);
+        }
     }
     Ok(JumplistStepResult::Moved(Box::new(target)))
 }

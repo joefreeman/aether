@@ -15,8 +15,16 @@
 //! framework exists to allow (side-by-side diff, splits, a notebook cell with a margin) and meant
 //! two enums, two walks and two TypeScript mirrors for what is one idea.
 //!
-//! So [`Element`] is both. `Stack` arranges top to bottom, `Row` left to right, and any element may
-//! appear in either.
+//! So [`Element`] is both. `Stack` arranges top to bottom, `Row` left to right.
+//!
+//! **One thing the type allows that the renderers do not yet draw:** an [`Element::Editor`] inside a
+//! `Row`. Every client lays a view out as a flat top-to-bottom list of rows, which has no way to
+//! express "these two editors share these rows" — so side-by-side diff and splits need a different
+//! row model, not merely a deeper walk. Until that exists, an editor is expected to be a child of a
+//! `Stack`; the row builders assert it rather than silently drawing the editor as one chrome row,
+//! because [`Element::walk`] *does* descend into rows and the two would then disagree about how many
+//! lines the view has. The vocabulary being merged is what makes that future change possible; it is
+//! not the claim that it has already happened.
 //!
 //! # What belongs here, and what doesn't
 //!

@@ -538,7 +538,15 @@ pub enum Action {
     FocusPrevElement,
 
     // ---- LSP ----
-    GotoDefinition,
+    /// `Enter` — **follow what is under the cursor**, resolved against what the cursor is *in*
+    /// rather than against a view kind.
+    ///
+    /// One verb with several resolvers, which is what it always was: over source it is the language
+    /// server's definition; on a patch's generated text it is the file that line came from; in a
+    /// composed view it is the file the focused element windows. Naming it `Activate` rather than
+    /// `GotoDefinition` says that out loud — the old name described one of its three answers and
+    /// made the other two read as special cases.
+    Activate,
     NextDiagnostic,
     PrevDiagnostic,
     Hover,
@@ -604,8 +612,6 @@ pub enum Action {
     /// image's source, a footnote's definition text (the editor's Tab-reveals-hover, at
     /// reading grain).
     ReadShowTarget,
-    /// `o`/`Alt-o` — next/previous heading (AST-resolved; the reading sibling of symbol nav).
-    ReadStepHeading(Direction),
     /// `g`/`Alt-g` — first/last element (the reading form of the editor's buffer-start/end pair).
     ReadEnds {
         last: bool,
@@ -1005,7 +1011,7 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('o'), IgnoreShift(Mods::ALT), A::NavUnit(Direction::Backward), "Navigation", "Previous symbol"),
     bind!(N, ch('g'), IgnoreShift(Mods::ALT), A::GotoLine { last: true }, "Motion", "Go to line from end (count, default last)"),
     bind!(N, ch('g'), IgnoreShift(Mods::NONE), A::GotoLine { last: false }, "Motion", "Go to line (count, default 1)"),
-    bind!(N, KeyCode::Enter, Exact(Mods::NONE), A::GotoDefinition, "Code", "Go to definition"),
+    bind!(N, KeyCode::Enter, Exact(Mods::NONE), A::Activate, "Code", "Go to definition"),
     // Reserved for this since the element tree landed; `Tab` still indents in Insert, where there
     // is no element to move between.
     bind!(N, KeyCode::Tab, Exact(Mods::NONE), A::FocusNextElement, "Motion", "Focus the next editor element"),
@@ -1184,7 +1190,7 @@ static SEARCH: &[Binding] = &[
 ];
 
 /// The markdown reading view's keys. Where the editor already has a key for the concept, Read
-/// reuses it — `o` heading-steps like symbol nav, `g`/`Alt-g` are the ends pair, `j`/`k` move the
+/// reuses it — `o` *is* symbol nav (same action, same outline), `g`/`Alt-g` are the ends pair, `j`/`k` move the
 /// (reading) cursor while the arrows scroll, `Ctrl-c` copies (the editor's clipboard chord — acting
 /// on the focused element, since Read has no selection), search and jumplist keys are verbatim.
 /// Deliberately contains no editing action (see [`KeyContext::Read`]).
@@ -1205,8 +1211,12 @@ static READ: &[Binding] = &[
     bind!(R, ch('k'), IgnoreShift(Mods::ALT), A::ReadStep(Direction::Backward)),
     bind!(R, ch('l'), IgnoreShift(Mods::NONE), A::ReadStepLink(Direction::Forward), "Read", "Focus next link in block"),
     bind!(R, ch('h'), IgnoreShift(Mods::NONE), A::ReadStepLink(Direction::Backward), "Read", "Focus previous link in block"),
-    bind!(R, ch('o'), IgnoreShift(Mods::NONE), A::ReadStepHeading(Direction::Forward), "Read", "Next heading"),
-    bind!(R, ch('o'), IgnoreShift(Mods::ALT), A::ReadStepHeading(Direction::Backward), "Read", "Previous heading"),
+    // The **same** action Normal mode binds, not a reading-flavoured twin: one outline, whatever
+    // view is looking at it. A markdown file's document symbols *are* its headings, so this lands
+    // where the old AST walk did — and the breadcrumb, `Space o` and this key now agree by
+    // construction rather than by three implementations happening to say the same thing.
+    bind!(R, ch('o'), IgnoreShift(Mods::NONE), A::NavUnit(Direction::Forward), "Read", "Next heading"),
+    bind!(R, ch('o'), IgnoreShift(Mods::ALT), A::NavUnit(Direction::Backward), "Read", "Previous heading"),
     bind!(R, ch('g'), IgnoreShift(Mods::NONE), A::ReadEnds { last: false }, "Read", "First element"),
     bind!(R, ch('g'), IgnoreShift(Mods::ALT), A::ReadEnds { last: true }, "Read", "Last element"),
     bind!(R, KeyCode::Enter, Exact(Mods::NONE), A::ReadActivate, "Read", "Follow link / open image / jump to footnote"),
@@ -1885,7 +1895,7 @@ mod tests {
         // `Alt-d` the current buffer's.
         assert!(matches!(
             lookup(KeyContext::Normal, KeyCode::Enter, Mods::NONE).map(|b| b.action),
-            Some(Action::GotoDefinition)
+            Some(Action::Activate)
         ));
         // Plain leader is buffer-scoped, Alt widens to the workspace (diagnostics + git changes).
         assert!(matches!(

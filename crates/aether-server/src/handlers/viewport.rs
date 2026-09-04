@@ -116,8 +116,14 @@ pub async fn viewport_subscribe(
         let mut buffers: Vec<BufferId> = Vec::new();
         for id in stale {
             if let Some(v) = s.viewports.remove(&id) {
-                if v.buffer_id() != buffer_id && !buffers.contains(&v.buffer_id()) {
-                    buffers.push(v.buffer_id());
+                // Everything that viewport was showing, not just the element under its cursor. A
+                // composed view keeps its own document *and* a buffer per element alive; naming
+                // only the focused one meant navigating away from working changes left the patch
+                // and every other file it had opened behind, unreferenced and uncollected.
+                for shown in v.shown_buffers() {
+                    if shown != buffer_id && !buffers.contains(&shown) {
+                        buffers.push(shown);
+                    }
                 }
             }
         }
@@ -458,6 +464,306 @@ fn change_anchors(
     out
 }
 
+/// One entry of a composed view's **outline**: a change, where it is, and what to call it.
+#[derive(Clone)]
+pub struct OutlineEntry {
+    /// The element the change lives in.
+    pub element: aether_protocol::viewport::FieldId,
+    /// Its first line **in that element's buffer** — a file line for a bound element, a line of the
+    /// generated document for one with no file behind it. This is the coordinate every consumer
+    /// needs, and the one the patch's own index does *not* store: the index speaks patch lines.
+    pub line: u32,
+    /// Repo-relative path of the file the change is in — the outline's group.
+    pub file: String,
+    /// What to call the change: git's enclosing signature for its hunk, which is the same thing the
+    /// hunk header renders. Empty when git offered none.
+    pub label: String,
+    /// The change's line in the **patch document**, for the callers that address the patch itself.
+    pub patch_line: u32,
+}
+
+/// Which element of the view named by `view_key` holds `(abs_path, line)`, and the buffer that
+/// element currently windows — where a jumplist entry captured from that view should be seated.
+///
+/// Keyed by [`crate::state::VirtualSource::key`] rather than a `ViewId`, because a view id is a
+/// buffer id and dies with the view; the key still names it after it has been reopened.
+///
+/// Resolved by asking [`view_outline`] rather than by walking the elements independently, so a jump
+/// lands exactly where the picker row it was captured from lands. The two used to be separate
+/// derivations and drifted: the picker seated the cursor in the element while the jump addressed
+/// the bare file, so `]` yanked the file up instead of moving within the view.
+///
+/// `None` when the view has no viewport for this client — a subscribe supersedes the client's
+/// previous one, so that means it is not on screen — or when it holds no element for that line any
+/// more (the patch was rebuilt over it). Both mean the caller should fall back to the entry's own
+/// durable file target, which is the whole reason the entry keeps one.
+pub fn element_holding(
+    s: &ServerState,
+    client_id: ClientId,
+    view_key: &str,
+    identity: &str,
+    line: u32,
+) -> Option<aether_protocol::viewport::ViewSeat> {
+    let vp = s
+        .viewports
+        .values()
+        .find(|vp| vp.client_id == client_id && view_key_of(s, vp.view_id) == Some(view_key.into()))?;
+    seat_in(s, vp.view_id.presenting_buffer(), &vp.elements, identity, line)
+}
+
+/// The [`crate::state::VirtualSource::key`] of a view, when it is a materialised one.
+pub fn view_key_of(s: &ServerState, view: ViewId) -> Option<String> {
+    s.try_doc_of(view.presenting_buffer())?
+        .virtual_source
+        .as_ref()
+        .map(|src| src.target.key())
+}
+
+/// Which element of an already-built element list holds `(abs_path, line)`.
+///
+/// Addressed by **path**, not by the buffer id an entry was captured against: a view's element
+/// buffers are transient, so by the time anything jumps back the same file may be a different
+/// buffer — or the id may name nothing at all.
+pub fn seat_in(
+    s: &ServerState,
+    view_buffer: BufferId,
+    elements: &[crate::state::ElementBinding],
+    identity: &str,
+    line: u32,
+) -> Option<aether_protocol::viewport::ViewSeat> {
+    view_outline_of(s, view_buffer, elements)
+        .into_iter()
+        .find_map(|e| {
+            if e.line != line {
+                return None;
+            }
+            let buffer_id = elements.get(e.element as usize).map(|b| b.buffer_id)?;
+            (buffer_identity(s, buffer_id).as_deref() == Some(identity)).then_some(
+                aether_protocol::viewport::ViewSeat {
+                    element: e.element,
+                    buffer_id,
+                },
+            )
+        })
+}
+
+/// How a buffer is named **durably**: its canonical path, or — for a materialised one — its
+/// [`crate::state::VirtualSource::key`]. `None` only for a scratch, which has neither.
+///
+/// One function because a view's elements window both kinds and a jumplist entry must be able to
+/// name either. The working changes bind their elements to working-tree files (paths); a commit's
+/// patch binds them to that file *at that revision*, which is a virtual buffer with no path at all
+/// — so keying on the path alone left every commit-patch row unable to find its element.
+pub fn buffer_identity(s: &ServerState, buffer_id: BufferId) -> Option<String> {
+    let doc = s.try_doc_of(buffer_id)?;
+    if let Some(path) = doc.canonical_path.as_ref() {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    doc.virtual_source.as_ref().map(|src| src.target.key())
+}
+
+/// The **view line** an element's buffer line sits at, in a freshly materialised view.
+///
+/// What a reopen has to be scrolled to. A subscribe derives its focused element from the line the
+/// view is scrolled to (see [`viewport_subscribe`]), so a reopen framed anywhere else focuses
+/// whatever element covers *that* line — undoing the focus the jump asked for, and leaving the
+/// caller looking at the right view with the wrong editor active.
+pub fn view_line_in_fresh_view(
+    s: &ServerState,
+    view_buffer: BufferId,
+    element: aether_protocol::viewport::FieldId,
+    line: u32,
+) -> Option<ViewLine> {
+    let elements = element_bindings(s, view_buffer, 120, 0);
+    crate::state::ViewLayout::of(&elements, |id| s.doc_of(id).line_count()).to_view(element, line)
+}
+
+/// Where `(abs_path, line)` sits in a **freshly materialised** view — one no viewport exists for
+/// yet, because the jump had to reopen it.
+///
+/// `cols` is nominal: it decides how the elements *wrap*, never how many there are, and a `FieldId`
+/// indexes that list. So the element named here is the one the client's own subscribe will produce.
+pub fn seat_in_fresh_view(
+    s: &ServerState,
+    view_buffer: BufferId,
+    identity: &str,
+    line: u32,
+) -> Option<aether_protocol::viewport::ViewSeat> {
+    let elements = element_bindings(s, view_buffer, 120, 0);
+    seat_in(s, view_buffer, &elements, identity, line)
+}
+
+/// A composed view's outline: its changes, in reading order, each with its file and label.
+///
+/// **The one source.** `Space o` lists it, `o`/`Alt-o` steps it, and the status bar's breadcrumb is
+/// the path through it to the cursor — so the three cannot disagree about what the stops are or what
+/// they are called. They previously each asked something different: the picker asked the focused
+/// file's language server, the motion asked the same, and the breadcrumb composed a file label with
+/// an LSP symbol path.
+///
+/// Returns empty for an ordinary view, which has no outline of this kind — its outline is the
+/// document symbols of the one buffer it shows, and that is answered elsewhere.
+pub fn view_outline(s: &ServerState, vp: &Viewport) -> Vec<OutlineEntry> {
+    view_outline_of(s, vp.view_id.presenting_buffer(), &vp.elements)
+}
+
+/// [`view_outline`] for a view **nobody is subscribed to yet** — the state a jumplist entry finds
+/// its view in when it has to reopen it before it can land.
+///
+/// Takes the element bindings rather than a viewport because a `FieldId` indexes the element list,
+/// which comes from the document's own layout: `cols` changes how those elements *wrap*, never how
+/// many there are or what they window. So an element resolved here is the same element the client's
+/// own subscribe will produce.
+pub fn view_outline_of(
+    s: &ServerState,
+    view_buffer: BufferId,
+    elements: &[crate::state::ElementBinding],
+) -> Vec<OutlineEntry> {
+    let Some(generated) = s.doc_of(view_buffer).generated.as_ref() else {
+        return Vec::new();
+    };
+    // Which element a *patch* line falls in. Read from the regions the patch was rendered into —
+    // `decorations.elements` is parallel to the elements a driver built from them — because an
+    // element's own `start_line` is a **file** line once it is bound, and comparing that with a
+    // patch line is the mistake this module exists to make hard.
+    let region_of = |patch_line: u32| -> aether_protocol::viewport::FieldId {
+        generated
+            .decorations
+            .elements
+            .iter()
+            .rposition(|r| r.start_line <= patch_line)
+            .unwrap_or(0) as aether_protocol::viewport::FieldId
+    };
+    // One entry per **hunk**, not per change block. A hunk is the display region git names in its
+    // header; a change block is a maximal run of `+`/`-` lines, and one hunk routinely holds several
+    // (see `PatchChangeBlock`). Outlining the blocks gave several rows per hunk all carrying the
+    // *same* signature — the hunk's — which is a list that cannot be read.
+    //
+    // It is also what separates `o` from `c`: `o` steps the structure (hunks), `c` steps the things
+    // you act on (changes). Different keys because they are different questions.
+    let mut out = Vec::new();
+    for file in &generated.index.files {
+        // A delta with no hunks — a binary swap, a bare mode change, a deletion with nothing to
+        // show — still gets a row, over its placeholder line. Dropping it would leave the outline
+        // disagreeing with the view about what is in the review.
+        let spans: Vec<(u32, u32, &str)> = if file.hunks.is_empty() {
+            vec![(file.start_line, file.end_line, "")]
+        } else {
+            file.hunks
+                .iter()
+                .map(|h| (h.start_line, h.end_line, h.signature.as_str()))
+                .collect()
+        };
+        for (start, end, signature) in spans {
+            // The hunk's **top**, context included — not its first change.
+            //
+            // `o` and the picker land in the same place because they read this one number, and the
+            // top is the right one: it is where the hunk's heading is, so you arrive at the change
+            // *with the context that makes it readable* rather than partway into it. It also makes
+            // "which entry is the cursor in" answerable for the context lines themselves, which
+            // otherwise resolved to the hunk above. `c`/`Alt-c` still land on the changes.
+            let anchor = start;
+            let _ = end;
+            let element = region_of(anchor);
+            let bound = elements
+                .get(element as usize)
+                .is_some_and(|e| e.buffer_id != view_buffer);
+            // A bound element windows the real file, so the entry's line must be a *file* line —
+            // the index is what maps between the two spaces. An unbound one windows the generated
+            // text itself, where the patch line already is the buffer line.
+            let line = if bound {
+                let mut found = None;
+                for i in anchor..end.max(anchor + 1) {
+                    if let Some(Some(info)) = generated.index.lines.get(i as usize) {
+                        if let Some(n) = info.new_lineno {
+                            found = Some(n.saturating_sub(1));
+                            break;
+                        }
+                    }
+                }
+                // A pure removal has no new-side line of its own; it sits above whatever survived,
+                // which is where the element's own start is.
+                found.unwrap_or_else(|| elements.get(element as usize).map_or(0, |e| e.start_line))
+            } else {
+                anchor
+            };
+            out.push(OutlineEntry {
+                element,
+                line,
+                file: file.path().to_string(),
+                label: signature.to_string(),
+                patch_line: anchor,
+            });
+        }
+    }
+    out
+}
+
+/// The breadcrumb for a **composed** view: the path through its outline to the cursor.
+///
+/// `file.rs › fn outer` — the file the cursor is in, then the label of the change it is inside, both
+/// read from [`view_outline`]. `None` for an ordinary view, which has no outline of this kind and
+/// whose breadcrumb is its document symbols.
+///
+/// The third consumer of the one source, and the reason it exists: `Space o` lists these entries,
+/// `o`/`Alt-o` steps them, and this names the one you are in. Composed from a *file* crumb plus the
+/// entry's own label rather than the language server's chain, so the three cannot describe the same
+/// position in different words.
+/// **Where the cursor is in the outline**: the entry it sits in, and that entry's index.
+///
+/// The one question both the breadcrumb and the picker's opening selection ask, so they ask it once.
+/// Answered against the *focused element* first: entries of other elements are other files, and
+/// being "past" one of those says nothing about where the cursor is.
+pub fn outline_entry_at(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Option<(usize, OutlineEntry)> {
+    let vp = s
+        .viewports
+        .values()
+        .find(|v| v.client_id == client_id && v.binds(buffer_id))?;
+    let entries = view_outline(s, vp);
+    if entries.is_empty() {
+        return None;
+    }
+    let focused = vp.focused;
+    let line = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .map_or(0, |c| c.position.line);
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.element == focused && e.line <= line)
+        .next_back()
+        // Before the element's first change — still in its file, which is the answer that matters.
+        .or_else(|| entries.iter().enumerate().find(|(_, e)| e.element == focused))
+        .map(|(i, e)| (i, e.clone()))
+}
+
+pub fn outline_breadcrumb(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Option<Vec<aether_protocol::lsp::SymbolCrumb>> {
+    use aether_protocol::lsp::SymbolCrumb;
+    use aether_protocol::picker::SymbolKind;
+
+    let (_, here) = outline_entry_at(s, client_id, buffer_id)?;
+    let mut path = vec![SymbolCrumb {
+        name: here.file.clone(),
+        kind: SymbolKind::File,
+    }];
+    if !here.label.is_empty() {
+        path.push(SymbolCrumb {
+            name: here.label.clone(),
+            kind: SymbolKind::Function,
+        });
+    }
+    Some(path)
+}
+
 /// `viewport/navigate_change`: step between a composed view's changes, crossing elements — and so
 /// buffers — as needed.
 pub async fn viewport_navigate_change(
@@ -472,7 +778,16 @@ pub async fn viewport_navigate_change(
     // Check ownership up front, then read: the anchors need the state alongside the viewport.
     require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     let vp = &s.viewports[&params.viewport_id];
-    let anchors = change_anchors(&s, vp);
+    let anchors = match params.grain {
+        aether_protocol::viewport::NavigateGrain::Change => change_anchors(&s, vp),
+        // One stop per **outline entry** — which is one per change, since that is what the outline's
+        // rows are. Same source as the picker, so `o` and `Space o` cannot disagree about the stops
+        // or their order.
+        aether_protocol::viewport::NavigateGrain::Outline => view_outline(&s, vp)
+            .into_iter()
+            .map(|e| (e.element, e.line))
+            .collect(),
+    };
     let (focused, here) = (vp.focused, vp.buffer_id());
     let from = s
         .cursors

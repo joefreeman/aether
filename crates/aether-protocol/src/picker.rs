@@ -327,7 +327,11 @@ impl PickerKind {
     pub fn centers_on_cursor(self) -> bool {
         matches!(
             self,
-            PickerKind::Jumplist
+            // The outline: land on the entry the cursor is *in*. Over a composed view that is the
+            // change you are reading; over an ordinary buffer the enclosing symbol, resolved the
+            // same way every other cursor-anchored kind resolves.
+            PickerKind::DocumentSymbols
+                | PickerKind::Jumplist
                 | PickerKind::GitLog
                 | PickerKind::GitLogFile
                 | PickerKind::GitStash
@@ -1434,6 +1438,28 @@ pub enum PickerSelectResult {
         /// symbol's identifier selected.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         anchor: Option<LogicalPosition>,
+    },
+    /// A place inside the view **already open**: focus this element, and land the cursor in it.
+    ///
+    /// Distinct from [`Self::BufferAt`] because a composed view's cursor is only drawn inside the
+    /// *focused* element. Moving it into another element without focusing there puts it outside the
+    /// window that renders it: the jump resolves, travels, is applied — and nothing moves on screen,
+    /// which is precisely how this presented.
+    ///
+    /// The client does the focus-then-set-cursor pair it already does for a click, and for the same
+    /// reason: setting a cursor without focusing first applies the line to whichever element holds
+    /// focus, which in a patch is a different file.
+    ViewElement {
+        element: crate::viewport::FieldId,
+        /// The buffer that element windows — the cursor is set on it, not on the view's document.
+        buffer_id: BufferId,
+        position: LogicalPosition,
+        /// The view, reopened, when nothing was showing it. The client adopts this *before* seating
+        /// — the element is an index into that view's tree, so focusing it means nothing until the
+        /// view is on screen. Absent when the view was already showing, which is the common case
+        /// and the only one that used to exist.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open: Option<Box<crate::buffer::BufferOpenResult>>,
     },
     /// Attach to an already-open buffer *and* land the cursor somewhere in it — [`Self::Buffer`]
     /// with a position, and the pathless counterpart of [`Self::FileAt`].

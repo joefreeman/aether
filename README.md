@@ -156,6 +156,10 @@ both following the file's own indent style. `Alt-←`/`Alt-→` move by word, an
 code fences — as a read-only view with its own keys. The reading position *is* the cursor, so
 toggling back lands where you were reading.
 
+`o`/`Alt-o` step the document outline — the same outline the breadcrumb and `Space o` show, which
+comes from the language server. Heading navigation therefore needs a Markdown language server
+configured; the rest of the reading view works without one.
+
 | Key | Action |
 | --- | --- |
 | `Space v` | Toggle the reading view |
@@ -236,7 +240,7 @@ scopes — plain takes the change under the cursor (or the selected lines), Alt 
 | Chord | Action |
 | --- | --- |
 | `Space t` | Hover (type & docs, or a link's target) |
-| `Enter` | Go to definition |
+| `Enter` | Follow what's under the cursor: the definition — or, in a patch, the file that line came from |
 | `Space r` | Go to references |
 | `d`/`Alt-d` | Next/previous diagnostic |
 | `Space n` | Diagnostic at cursor |

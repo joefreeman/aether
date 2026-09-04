@@ -17,6 +17,7 @@ use crate::buffer::BufferOpenResult;
 use crate::cursor::Direction;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::picker::{PickerItem, PickerKind};
+use crate::viewport::ViewSeat;
 use crate::{BufferId, LogicalPosition};
 use serde::{Deserialize, Serialize};
 
@@ -249,4 +250,11 @@ pub struct JumplistStepTarget {
     /// With `open`: the target, fully opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened: Option<BufferOpenResult>,
+    /// Where to land *inside* a composed view, when the entry was captured from one that is **still
+    /// on screen**. `path`/`position` already name the file and line; this says which of the view's
+    /// windows onto that file to seat the cursor in, so `]` lands where selecting the same row in
+    /// the picker that captured it lands. `None` means jump the ordinary way — the view is not
+    /// showing, or the entry never came from one — and the fields above are then the whole answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<ViewSeat>,
 }

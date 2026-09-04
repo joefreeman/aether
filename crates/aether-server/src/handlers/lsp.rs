@@ -427,6 +427,16 @@ pub fn symbol_path_for(
     client_id: ClientId,
     buffer_id: BufferId,
 ) -> Vec<SymbolCrumb> {
+    // A **composed** view has an outline of its own — its changes, grouped by file and labelled by
+    // the enclosing signature — and the breadcrumb is the path through *that* to the cursor. Asking
+    // the language server instead would describe the focused file in terms the outline never uses,
+    // so `Space o`, `o`/`Alt-o` and the status bar would each name the same position differently.
+    //
+    // Checked before the LSP path rather than after: the composed answer is the whole answer there,
+    // not a prefix to decorate one with.
+    if let Some(path) = crate::handlers::viewport::outline_breadcrumb(s, client_id, buffer_id) {
+        return path;
+    }
     let (Some(symbols), Some(cursor)) = (
         s.document_symbols.get(&buffer_id),
         s.cursors.get(&(client_id, buffer_id)),

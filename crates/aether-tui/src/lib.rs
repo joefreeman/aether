@@ -18,6 +18,7 @@ mod stderr_capture;
 mod text_input;
 mod ui;
 
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -50,13 +51,30 @@ pub async fn run(
     // this function.
     let _stderr_capture = stderr_capture::StderrCapture::install().ok();
 
-    // Tracing writes to (captured) stderr. The user sees logs after the editor exits.
+    // Tracing writes to (captured) stderr, so the user sees logs only after the editor exits.
+    // `AETHER_LOG_FILE` redirects them to a path instead, where they can be read *while* the
+    // editor runs — the only way to watch the client live, since the TUI owns the terminal and a
+    // stray line would land mid-frame. This is the client's single subscriber install: adding a
+    // second one anywhere upstream panics on the global dispatcher, so route new sinks here.
+    let log_file =
+        std::env::var_os("AETHER_LOG_FILE").and_then(|path| std::fs::File::create(path).ok());
+    let to_file = log_file.is_some();
+    let writer = match log_file {
+        Some(file) => BoxMakeWriter::new(std::sync::Mutex::new(file)),
+        None => BoxMakeWriter::new(std::io::stderr),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("aether_tui=info,warn")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(if to_file {
+                    "aether_tui=debug,aether_client=debug,warn"
+                } else {
+                    "aether_tui=info,warn"
+                })
+            }),
         )
-        .with_writer(std::io::stderr)
+        .with_ansi(!to_file)
+        .with_writer(writer)
         .init();
 
     let mut terminal = setup_terminal()?;
