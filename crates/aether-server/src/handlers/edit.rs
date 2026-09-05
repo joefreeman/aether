@@ -551,20 +551,16 @@ fn with_jumplist_position(
     let Some(buf) = s.try_doc_of(buffer_id) else {
         return cursor;
     };
-    let current_abs = buf
-        .canonical_path
-        .as_deref()
-        .map(|p| p.to_string_lossy().into_owned());
-    let view_key = crate::handlers::viewport::view_key_of(s, aether_protocol::ViewId(buffer_id));
-    let location =
-        crate::jumplist::location_of(current_abs.as_deref(), buffer_id, view_key.as_deref());
+    let Some(here) = crate::handlers::step_location(s, client_id, buffer_id) else {
+        return cursor;
+    };
+    let location = here.as_location();
     // Compare in char-index space so multi-byte content stays on char boundaries (mirrors
     // `match_index_for_cursor`). Entry coordinates may be stale after edits; `pos_to_char`
-    // clamps, same acceptance as jumping to a stale entry.
-    let anchor_char = motion::pos_to_char(buf, cursor.anchor);
-    let pos_char = motion::pos_to_char(buf, cursor.position);
-    let sel_start_char = anchor_char.min(pos_char);
-    let sel_end_char = anchor_char.max(pos_char);
+    // clamps, same acceptance as jumping to a stale entry. A place translated out of the patch
+    // document is compared as lines and columns: its coordinates are the file's, and the patch's
+    // text cannot index them.
+    let (sel_start, sel_end) = here.ordered();
     let total = list.entries.len() as u32;
     if let Some(idx) = list.entries.iter().position(|e| {
         if !e.matches_location(location) {
@@ -573,6 +569,12 @@ fn with_jumplist_position(
         let (Some(start), Some(position)) = (e.start(), e.position) else {
             return true; // whole-target: the buffer alone identifies it
         };
+        if here.translated {
+            return (sel_start.line, sel_start.col) == (start.line, start.col)
+                && (sel_end.line, sel_end.col) == (position.line, position.col);
+        }
+        let sel_start_char = motion::pos_to_char(buf, sel_start);
+        let sel_end_char = motion::pos_to_char(buf, sel_end);
         let e_start_char = motion::pos_to_char(buf, start);
         let e_end_char = motion::pos_to_char(buf, position).max(e_start_char);
         sel_start_char == e_start_char && sel_end_char == e_end_char

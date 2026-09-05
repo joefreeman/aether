@@ -509,6 +509,8 @@ pub struct App {
     // these). Grid last sent, the scroll a subscribe asked for, and the fetch-coordination flags.
     sent_grid: Option<(u32, u32)>,
     subscribe_scroll: ScrollPosition,
+    /// What this shell has measured of the elements it lays out itself — none yet.
+    measured: grid::Measured,
     fetch_in_flight: bool,
     refetch_queued: bool,
     /// The cursor reveal owed to the viewport: armed when a cursor move lands outside the loaded
@@ -620,6 +622,7 @@ impl App {
             scroll_anchor: None,
             sent_grid: None,
             subscribe_scroll: ScrollPosition::default(),
+            measured: grid::Measured::default(),
             fetch_in_flight: false,
             refetch_queued: false,
             pending_reveal: PendingReveal::default(),
@@ -1086,7 +1089,7 @@ impl App {
                 tracing::debug!(
                     viewport_id = res.viewport_id,
                     lines = aether_client::grid::window_lines(&res.window).len(),
-                    total_rows = grid::total_rows(&res.window.root),
+                    total_rows = grid::total_rows(&res.window.root, &self.measured),
                     "viewport subscribed"
                 );
                 // Position the view at the scroll the subscribe asked for (restored or
@@ -1100,14 +1103,15 @@ impl App {
                     // goes back to that row; a line the server clamped away leaves the element it
                     // named as where the view opens.
                     let row = if scroll.sub_row > 0.0 {
-                        grid::line_top_row(w, scroll.element, scroll.line)
+                        grid::line_top_row(w, scroll.element, scroll.line, &self.measured)
                             .map(|r| r.get() as f32 + scroll.sub_row)
                     } else {
-                        grid::line_block_start(w, scroll.element, scroll.line)
+                        grid::line_block_start(w, scroll.element, scroll.line, &self.measured)
                             .map(|r| r.get() as f32)
                     };
                     if let Some(row) = row.or_else(|| {
-                        grid::element_start_row(w, scroll.element).map(|r| r.get() as f32)
+                        grid::element_start_row(w, scroll.element, &self.measured)
+                            .map(|r| r.get() as f32)
                     }) {
                         self.scroll_px = row * cell.height;
                     }
@@ -1551,8 +1555,11 @@ impl App {
                     if let Some(cell) = self.cell {
                         let top_row =
                             VisualRow((self.scroll_px / cell.height).round().max(0.0) as u32);
-                        self.session
-                            .capture_scroll_anchor(top_row, self.visible_rows());
+                        self.session.capture_scroll_anchor(
+                            top_row,
+                            self.visible_rows(),
+                            &self.measured,
+                        );
                     }
                 }
                 Effect::ShowHover(content) => {
@@ -1807,7 +1814,9 @@ impl App {
                 let Some(window) = &self.session.view.window else {
                     return Task::none();
                 };
-                let Some((element, pos)) = grid::hit_test(window, row, dcol, TAB_WIDTH) else {
+                let Some((element, pos)) =
+                    grid::hit_test(window, row, dcol, TAB_WIDTH, &self.measured)
+                else {
                     return Task::none();
                 };
                 let granularity = match kind {
@@ -1825,7 +1834,9 @@ impl App {
                 let Some(window) = &self.session.view.window else {
                     return Task::none();
                 };
-                let Some((_element, pos)) = grid::hit_test(window, row, dcol, TAB_WIDTH) else {
+                let Some((_element, pos)) =
+                    grid::hit_test(window, row, dcol, TAB_WIDTH, &self.measured)
+                else {
                     return Task::none();
                 };
                 let fx = self.session.pointer_drag(pos);
@@ -1898,7 +1909,8 @@ impl App {
         // pixel scroll). `scroll_px / cell.height` is the absolute top visual row.
         if let Some(cell) = self.cell {
             let top_row = VisualRow((self.scroll_px / cell.height).round().max(0.0) as u32);
-            self.session.set_visible_lines(top_row, visible_rows);
+            self.session
+                .set_visible_lines(top_row, visible_rows, &self.measured);
         }
         let fx = self.session.on_key(code, mods, text, visible_rows);
         let mut task = self.run_core(fx);
@@ -2424,7 +2436,7 @@ impl App {
     /// then falls back to clamp + reveal-cursor.
     fn resolve_anchor_px(&mut self) -> Option<f32> {
         let cell = self.cell?;
-        let row = self.session.resolve_scroll_anchor()?;
+        let row = self.session.resolve_scroll_anchor(&self.measured)?;
         Some(row.get() as f32 * cell.height)
     }
 
@@ -2440,7 +2452,8 @@ impl App {
 
     fn max_scroll_px(&self) -> f32 {
         match (&self.session.view.window, self.cell) {
-            (Some(w), Some(cell)) => (PAD * 2.0 + grid::total_rows(&w.root) as f32 * cell.height
+            (Some(w), Some(cell)) => (PAD * 2.0
+                + grid::total_rows(&w.root, &self.measured) as f32 * cell.height
                 - self.view_size.height)
                 .max(0.0),
             _ => 0.0,
@@ -2540,7 +2553,7 @@ impl App {
         // half-screen of scrolling asks nothing — and the server answers with the lines they are.
         // The check itself allows a half-screen margin, so the fetch lands before the scroll
         // reaches rows nothing is loaded at.
-        let needed = grid::slices_for(&window.root, top_row, visible, visible / 2);
+        let needed = grid::slices_for(&window.root, top_row, visible, visible / 2, &self.measured);
         if grid::loaded_covers(&window.root, &needed) {
             return Task::none();
         }
@@ -2549,8 +2562,8 @@ impl App {
             return Task::none();
         }
         self.fetch_in_flight = true;
-        let slices = grid::slices_for(&window.root, top_row, visible, visible);
-        let anchor = grid::anchor_at(window, top_row);
+        let slices = grid::slices_for(&window.root, top_row, visible, visible, &self.measured);
+        let anchor = grid::anchor_at(window, top_row, &self.measured);
         self.rpc::<ViewportWindow>(
             ViewportWindowParams {
                 viewport_id,
@@ -2663,6 +2676,7 @@ impl App {
             self.session.view.focused_element,
             self.session.view.buffer.cursor.position,
             TAB_WIDTH,
+            &self.measured,
         ) else {
             return false;
         };
@@ -2686,6 +2700,7 @@ impl App {
             self.session.view.focused_element,
             self.session.view.buffer.cursor.position,
             TAB_WIDTH,
+            &self.measured,
         ) else {
             return false;
         };
@@ -2749,6 +2764,7 @@ impl App {
             self.session.view.focused_element,
             self.session.view.buffer.cursor.position,
             TAB_WIDTH,
+            &self.measured,
         ) else {
             return false;
         };
@@ -2819,6 +2835,7 @@ impl App {
                             .flatten()
                             .map(|(line, b)| (*line, aether_client::labels::format_blame(b))),
                         tab_width: TAB_WIDTH,
+                        measured: &self.measured,
                         ligatures: self.session.ligatures,
                         font_size: self.session.buffer_font_size as f32,
                     },
@@ -4164,6 +4181,7 @@ impl App {
                 self.session.view.focused_element,
                 self.session.view.buffer.cursor.position,
                 TAB_WIDTH,
+                &self.measured,
             );
             // Horizontal anchor: refreshed while the cursor is in the loaded window, and retained
             // when it scrolls out of range so the popover keeps its column instead of jumping left.

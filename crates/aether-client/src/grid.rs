@@ -9,11 +9,13 @@
 //! continuation indent, same as the web client.
 
 use aether_protocol::coords::{ElementRow, VisualRow};
+use aether_protocol::ui::LayoutOwner;
 use aether_protocol::viewport::{
     BaselineRow, Element, FieldId, LogicalLineRender, ScrollPosition, SliceRequest, Window,
     WrappedRow,
 };
 use aether_protocol::LogicalPosition;
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
 /// Display cols the "↪ " wrap marker occupies on continuation rows (mirrors the web client's
@@ -127,15 +129,138 @@ impl ElementLine {
 // a loaded slice sits `first_row` rows into its editor. Everything below is arithmetic over that
 // one walk — the total height, where an element starts, which slices a viewport reaches, and where
 // each painted row lands — so the three shells cannot disagree about any of it.
+//
+// One height in the walk is not the tree's to give: an element the **client** lays out. The
+// server sends its lines unwrapped and counts one row per line, which is an estimate; how tall it
+// really is, and where each line sits within it, is whatever the shell measured — and the shell
+// says so through [`Measured`], which every function here takes. The tree's numbers are the answer
+// wherever the shell has none.
 
-/// Rows the whole view occupies: chrome, one row each, and every editor's height.
+/// What a shell that laid an element out **itself** tells the grid about it — the one input to the
+/// view's vertical layout that does not come from the tree.
+///
+/// An editor the server laid out has a height the server computed: its wrapped rows and phantoms.
+/// An element the client lays out — prose it wraps and renders from source — has no height the
+/// server could know. So the server sends such an element's lines unwrapped, one row per line on
+/// the wire, and the shell measures it: how tall it is, and the row each loaded line starts on.
+/// Absent from here, the element is taken at one row per line, which is what the server counted
+/// and a serviceable estimate until the shell has measured.
+///
+/// Rows are the unit throughout, in every shell. A pixel shell reports a prose element's height
+/// rounded up to whole rows and positions its blocks at pixel precision inside that; the slack is
+/// at most a row at the element's foot, and the scroll model stays one arithmetic in one unit.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Measured {
+    pub elements: std::collections::HashMap<FieldId, MeasuredElement>,
+}
+
+/// One client-laid-out element as measured: where each loaded line starts within it, and where
+/// the loaded slice ends. Lines outside the loaded slice — which the shell has not seen — count one
+/// row each, exactly as the tree counts them, so the rows above the slice are `first_row` rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasuredElement {
+    /// The wire row of the first loaded line: the editor's `first_row`.
+    pub first_row: ElementRow,
+    /// For each loaded line, the row within the element it starts on, ascending. The first is
+    /// `first_row` — the unloaded lines above it are one row each.
+    pub starts: Vec<u32>,
+    /// The row after the last loaded line's last row.
+    pub end: u32,
+}
+
+impl MeasuredElement {
+    /// The element's height in rows, given its line count (`rows` as the server sent it): the
+    /// unloaded lines at one row each, the loaded ones as measured.
+    pub fn rows(&self, lines: u32) -> u32 {
+        let loaded = self.starts.len() as u32;
+        let before = self.first_row.get();
+        let measured = self
+            .end
+            .saturating_sub(self.starts.first().copied().unwrap_or(before));
+        before + measured + lines.saturating_sub(before + loaded)
+    }
+
+    /// The wire row sitting `offset` rows into the element.
+    fn row_at(&self, offset: u32) -> ElementRow {
+        let first = self.first_row.get();
+        let Some(&start) = self.starts.first() else {
+            return ElementRow(offset);
+        };
+        if offset < start {
+            return ElementRow(offset);
+        }
+        if offset >= self.end {
+            return ElementRow(first + self.starts.len() as u32 + (offset - self.end));
+        }
+        let idx = self
+            .starts
+            .partition_point(|s| *s <= offset)
+            .saturating_sub(1);
+        ElementRow(first + idx as u32)
+    }
+
+    /// The row within the element that wire row `row` starts on.
+    fn offset_of(&self, row: ElementRow) -> u32 {
+        let first = self.first_row.get();
+        let Some(i) = row.get().checked_sub(first) else {
+            return row.get();
+        };
+        match self.starts.get(i as usize) {
+            Some(start) => *start,
+            None => self.end + (i - self.starts.len() as u32),
+        }
+    }
+}
+
+impl Measured {
+    /// The measurement for `node`, when it is an element the client lays out and the shell has
+    /// measured.
+    fn of(&self, node: &Element) -> Option<&MeasuredElement> {
+        match node {
+            Element::Editor {
+                element,
+                laid_out_by: LayoutOwner::Client,
+                ..
+            } => self.elements.get(element),
+            _ => None,
+        }
+    }
+
+    /// Rows `node` occupies: the tree's count, or the measured height for an element the client
+    /// laid out.
+    pub fn height(&self, node: &Element) -> u32 {
+        match (node, self.of(node)) {
+            (Element::Editor { rows, .. }, Some(m)) => m.rows(*rows),
+            (Element::Editor { rows, .. }, None) => *rows,
+            (Element::Stack { .. }, _) => 0,
+            _ => 1,
+        }
+    }
+
+    /// Which wire row of `node` sits `offset` rows into it — the row the server numbers, which is
+    /// the row a fetch is asked by.
+    pub fn row_at(&self, node: &Element, offset: u32) -> ElementRow {
+        self.of(node)
+            .map_or(ElementRow(offset), |m| m.row_at(offset))
+    }
+
+    /// The row within `node` that wire row `row` starts on.
+    pub fn offset_of(&self, node: &Element, row: ElementRow) -> u32 {
+        self.of(node).map_or(row.get(), |m| m.offset_of(row))
+    }
+}
+
+/// Rows the whole view occupies: chrome, one row each, every server-laid-out editor's height, and
+/// every client-laid-out element as measured.
 ///
 /// What a scroller is sized to and what the scroll limit is taken from. The server used to send
 /// this; it cannot once a view holds an element the client laid out, and it never needed to — the
-/// tree says it.
-pub fn total_rows(root: &Element) -> u32 {
+/// tree says it, where the shell does not.
+pub fn total_rows(root: &Element, measured: &Measured) -> u32 {
     let mut total = 0u32;
-    walk_rows(root, &mut |_, rows| total = total.saturating_add(rows));
+    walk_rows(root, measured, &mut |_, rows| {
+        total = total.saturating_add(rows)
+    });
     total
 }
 
@@ -145,15 +270,23 @@ pub fn total_rows(root: &Element) -> u32 {
 /// or not its lines are in the window. That is what makes it the right target for revealing an
 /// element you have just focused — the cursor's own line cannot be located, because the element it
 /// moved to has no lines loaded yet.
-pub fn element_start_row(window: &Window, element: FieldId) -> Option<VisualRow> {
-    element_start_row_of(&window.root, element)
+pub fn element_start_row(
+    window: &Window,
+    element: FieldId,
+    measured: &Measured,
+) -> Option<VisualRow> {
+    element_start_row_of(&window.root, element, measured)
 }
 
 /// [`element_start_row`] over a bare tree.
-pub fn element_start_row_of(root: &Element, element: FieldId) -> Option<VisualRow> {
+pub fn element_start_row_of(
+    root: &Element,
+    element: FieldId,
+    measured: &Measured,
+) -> Option<VisualRow> {
     let mut at = 0u32;
     let mut found = None;
-    walk_rows(root, &mut |node, rows| {
+    walk_rows(root, measured, &mut |node, rows| {
         if found.is_none() {
             if let Element::Editor { element: id, .. } = node {
                 if *id == element {
@@ -171,21 +304,30 @@ pub fn element_start_row_of(root: &Element, element: FieldId) -> Option<VisualRo
 ///
 /// This is the request a client makes while scrolling. It knows where every editor starts from the
 /// tree; what it cannot know is which *lines* a row range is, since that depends on how the lines
-/// above wrapped — so it asks by row and the server answers with lines.
-pub fn slices_for(root: &Element, top: VisualRow, rows: u32, overscan: u32) -> Vec<SliceRequest> {
+/// above wrapped — so it asks by row and the server answers with lines. For an element the client
+/// laid out the rows are its own, so the request names the wire rows its measurement puts there.
+pub fn slices_for(
+    root: &Element,
+    top: VisualRow,
+    rows: u32,
+    overscan: u32,
+    measured: &Measured,
+) -> Vec<SliceRequest> {
     let lo = top.get().saturating_sub(overscan);
     let hi = top.get().saturating_add(rows).saturating_add(overscan);
     let mut out = Vec::new();
     let mut at = 0u32;
-    walk_rows(root, &mut |node, height| {
+    walk_rows(root, measured, &mut |node, height| {
         if let Element::Editor { element, .. } = node {
             let (start, end) = (at, at.saturating_add(height));
             let (a, b) = (lo.max(start), hi.min(end));
             if a < b {
+                let from = measured.row_at(node, a - start);
+                let to = measured.row_at(node, b - start);
                 out.push(SliceRequest {
                     element: *element,
-                    from_row: ElementRow(a - start),
-                    rows: b - a,
+                    from_row: from,
+                    rows: to.get().saturating_sub(from.get()).max(1),
                 });
             }
         }
@@ -215,7 +357,7 @@ pub fn loaded_covers(root: &Element, wanted: &[SliceRequest]) -> bool {
 }
 
 /// One pass over the tree in painting order, telling `f` each node's row count: 1 for chrome and
-/// for any inline element standing on its own, an editor's `rows`, nothing for a container.
+/// for any inline element standing on its own, an editor's height, nothing for a container.
 ///
 /// A horizontal group is **one** screen row: its children share it. An `Editor` nested inside one
 /// is representable and not renderable — this row model is a flat top-to-bottom list with no way to
@@ -224,10 +366,10 @@ pub fn loaded_covers(root: &Element, wanted: &[SliceRequest]) -> bool {
 /// *does* descend into rows: `lines()` and `editors()` would count such an editor while this drew
 /// it as one chrome row, and two traversals of one tree disagreeing is the kind of thing that shows
 /// up as a cursor in the wrong place three layers away.
-fn walk_rows<'a>(node: &'a Element, f: &mut impl FnMut(&'a Element, u32)) {
+fn walk_rows<'a>(node: &'a Element, measured: &Measured, f: &mut impl FnMut(&'a Element, u32)) {
     match node {
-        Element::Stack { children } => children.iter().for_each(|c| walk_rows(c, f)),
-        Element::Editor { rows, .. } => f(node, *rows),
+        Element::Stack { children } => children.iter().for_each(|c| walk_rows(c, measured, f)),
+        Element::Editor { .. } => f(node, measured.height(node)),
         Element::Row { children } | Element::Chrome { children, .. } => {
             debug_assert!(
                 !children.iter().any(|c| !c.editors().is_empty()),
@@ -319,6 +461,10 @@ pub enum PaintedRow<'a> {
         row: &'a BaselineRow,
     },
     /// One (possibly wrapped) row of real buffer text — the only kind the cursor can land on.
+    ///
+    /// For an element the client lays out, one per line, on the row the shell measured the line
+    /// as starting on: the line's whole unwrapped text, which a shell with no layout of its own for
+    /// the element paints as it is, and a shell that laid it out paints from that layout instead.
     Text {
         element: FieldId,
         line: &'a LogicalLineRender,
@@ -339,17 +485,23 @@ pub enum PaintedRow<'a> {
 /// the rest of its height is unloaded — those rows are simply absent here, so consecutive entries
 /// are not necessarily consecutive rows. A painter draws what it finds at each row and blank
 /// elsewhere.
-pub fn painted_rows(window: &Window) -> Vec<(VisualRow, PaintedRow<'_>)> {
-    painted_rows_of(&window.root)
+pub fn painted_rows<'a>(
+    window: &'a Window,
+    measured: &Measured,
+) -> Vec<(VisualRow, PaintedRow<'a>)> {
+    painted_rows_of(&window.root, measured)
 }
 
 /// [`painted_rows`] over a bare tree, for shells that keep the root rather than the whole window.
-pub fn painted_rows_of(root: &Element) -> Vec<(VisualRow, PaintedRow<'_>)> {
+pub fn painted_rows_of<'a>(
+    root: &'a Element,
+    measured: &Measured,
+) -> Vec<(VisualRow, PaintedRow<'a>)> {
     let total_lines: usize = root.lines().len();
     let mut out = Vec::new();
     let mut at = 0u32;
     let mut seen = 0usize;
-    walk_rows(root, &mut |node, height| {
+    walk_rows(root, measured, &mut |node, height| {
         match node {
             Element::Editor {
                 element,
@@ -357,8 +509,22 @@ pub fn painted_rows_of(root: &Element) -> Vec<(VisualRow, PaintedRow<'_>)> {
                 lines,
                 ..
             } => {
+                let client_laid_out = measured.of(node).is_some()
+                    || matches!(
+                        node,
+                        Element::Editor {
+                            laid_out_by: LayoutOwner::Client,
+                            ..
+                        }
+                    );
                 let mut row = at.saturating_add(first_row.get());
-                for line in lines {
+                for (i, line) in lines.iter().enumerate() {
+                    if client_laid_out {
+                        // Where the shell put the line — or, unmeasured, one row per line.
+                        row = at.saturating_add(
+                            measured.offset_of(node, first_row.saturating_add(i as u32)),
+                        );
+                    }
                     for (index, baseline) in line.baseline_above.iter().enumerate() {
                         out.push((
                             VisualRow(row),
@@ -396,8 +562,13 @@ pub fn painted_rows_of(root: &Element) -> Vec<(VisualRow, PaintedRow<'_>)> {
 
 /// The first painted row of a line: its first phantom row if it has any, else its first text row.
 /// `None` when the line isn't loaded.
-pub fn line_top_row(window: &Window, element: FieldId, logical_line: u32) -> Option<VisualRow> {
-    painted_rows(window)
+pub fn line_top_row(
+    window: &Window,
+    element: FieldId,
+    logical_line: u32,
+    measured: &Measured,
+) -> Option<VisualRow> {
+    painted_rows(window, measured)
         .into_iter()
         .find_map(|(at, item)| match item {
             PaintedRow::Baseline {
@@ -418,8 +589,13 @@ pub fn line_top_row(window: &Window, element: FieldId, logical_line: u32) -> Opt
 /// first row of that run, not the line's own text row. Positioning a viewport with
 /// [`line_top_row`] instead puts the text at the top and the heading above the fold — which is
 /// why a patch opened at its first line hid the very file heading that introduces it.
-pub fn line_block_start(window: &Window, element: FieldId, logical_line: u32) -> Option<VisualRow> {
-    let rows = painted_rows(window);
+pub fn line_block_start(
+    window: &Window,
+    element: FieldId,
+    logical_line: u32,
+    measured: &Measured,
+) -> Option<VisualRow> {
+    let rows = painted_rows(window, measured);
     let idx = rows.iter().position(|(_, item)| match item {
         PaintedRow::Baseline {
             element: e, line, ..
@@ -431,7 +607,7 @@ pub fn line_block_start(window: &Window, element: FieldId, logical_line: u32) ->
     })?;
     // Walk back over chrome immediately above, but only if the line is the first row of its element
     // — chrome above an element belongs to the element, not to a line in its middle.
-    let starts_element = element_start_row(window, element) == Some(rows[idx].0);
+    let starts_element = element_start_row(window, element, measured) == Some(rows[idx].0);
     let mut start = idx;
     if starts_element {
         while start > 0
@@ -450,8 +626,12 @@ pub fn line_block_start(window: &Window, element: FieldId, logical_line: u32) ->
 /// first loaded line after it.
 ///
 /// Resolved from [`painted_rows`], so it cannot disagree with what a shell draws.
-pub fn line_at_row(window: &Window, abs_row: VisualRow) -> (FieldId, u32, u32) {
-    let rows = painted_rows(window);
+pub fn line_at_row(
+    window: &Window,
+    abs_row: VisualRow,
+    measured: &Measured,
+) -> (FieldId, u32, u32) {
+    let rows = painted_rows(window, measured);
     let content = |item: &PaintedRow<'_>| -> Option<(FieldId, u32, u32)> {
         match item {
             PaintedRow::Chrome(_) => None,
@@ -520,8 +700,8 @@ pub fn line_at_row(window: &Window, abs_row: VisualRow) -> (FieldId, u32, u32) {
 
 /// Where a viewport's top row is, as content — what a window request reports so the server can
 /// restore the view there. The line at the row and how far into its rows the top sits.
-pub fn anchor_at(window: &Window, top: VisualRow) -> ScrollPosition {
-    let (element, line, sub_row) = line_at_row(window, top);
+pub fn anchor_at(window: &Window, top: VisualRow, measured: &Measured) -> ScrollPosition {
+    let (element, line, sub_row) = line_at_row(window, top, measured);
     ScrollPosition {
         element,
         line,
@@ -579,15 +759,16 @@ pub fn capture_scroll_anchor(
     element: FieldId,
     cursor: LogicalPosition,
     tab_width: u32,
+    measured: &Measured,
 ) -> ScrollAnchor {
-    if let Some((cursor_row, _, _)) = position_cell(window, element, cursor, tab_width) {
+    if let Some((cursor_row, _, _)) = position_cell(window, element, cursor, tab_width, measured) {
         if cursor_row >= top_row && cursor_row < top_row.saturating_add(viewport_rows) {
             return ScrollAnchor::Cursor {
                 screen_row_offset: top_row.distance_to(cursor_row),
             };
         }
     }
-    let (element, logical_line, sub_row) = line_at_row(window, top_row);
+    let (element, logical_line, sub_row) = line_at_row(window, top_row, measured);
     ScrollAnchor::Line {
         element,
         logical_line,
@@ -603,12 +784,13 @@ pub fn resolve_scroll_anchor(
     element: FieldId,
     cursor: LogicalPosition,
     tab_width: u32,
+    measured: &Measured,
 ) -> VisualRow {
     match anchor {
         ScrollAnchor::Cursor { screen_row_offset } => {
-            let cursor_row = position_cell(window, element, cursor, tab_width)
+            let cursor_row = position_cell(window, element, cursor, tab_width, measured)
                 .map(|(row, _, _)| row)
-                .unwrap_or_else(|| first_loaded_row(window));
+                .unwrap_or_else(|| first_loaded_row(window, measured));
             cursor_row.saturating_sub(screen_row_offset)
         }
         ScrollAnchor::Line {
@@ -616,8 +798,8 @@ pub fn resolve_scroll_anchor(
             logical_line,
             sub_row,
         } => {
-            let Some(top) = line_top_row(window, anchored, logical_line) else {
-                return first_loaded_row(window);
+            let Some(top) = line_top_row(window, anchored, logical_line, measured) else {
+                return first_loaded_row(window, measured);
             };
             // Wrap may have shrunk the line; clamp the sub-row into its new height.
             let height = window_lines(window)
@@ -632,8 +814,8 @@ pub fn resolve_scroll_anchor(
 
 /// The first row anything is loaded at, or row 0 with nothing loaded — the fallback a placement
 /// takes when the content it was pinned to is gone.
-fn first_loaded_row(window: &Window) -> VisualRow {
-    painted_rows(window)
+fn first_loaded_row(window: &Window, measured: &Measured) -> VisualRow {
+    painted_rows(window, measured)
         .into_iter()
         .find_map(|(at, item)| match item {
             PaintedRow::Chrome(_) => None,
@@ -650,9 +832,10 @@ pub fn position_cell(
     element: FieldId,
     pos: LogicalPosition,
     tab_width: u32,
+    measured: &Measured,
 ) -> Option<(VisualRow, u32, u32)> {
     // The line's text rows, with their absolute rows — the cursor never lands on phantom rows.
-    let rows: Vec<(VisualRow, &WrappedRow)> = painted_rows(window)
+    let rows: Vec<(VisualRow, &WrappedRow)> = painted_rows(window, measured)
         .into_iter()
         .filter_map(|(at, item)| match item {
             PaintedRow::Text {
@@ -699,9 +882,11 @@ pub fn hit_test(
     abs_row: i64,
     dcol: u32,
     tab_width: u32,
+    measured: &Measured,
 ) -> Option<(FieldId, LogicalPosition)> {
-    let (element, logical_line, sub_row) = line_at_row(window, VisualRow(abs_row.max(0) as u32));
-    let rows = painted_rows(window);
+    let (element, logical_line, sub_row) =
+        line_at_row(window, VisualRow(abs_row.max(0) as u32), measured);
+    let rows = painted_rows(window, measured);
     let text_rows: Vec<&WrappedRow> = rows
         .iter()
         .filter_map(|(_, item)| match item {
@@ -861,6 +1046,7 @@ mod tests {
                 buffer: 0,
                 rows: first_row + loaded,
                 first_row: ElementRow(first_row),
+                laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                 first_buffer_line: first_logical,
                 lines,
             },
@@ -874,6 +1060,7 @@ mod tests {
             buffer: element as u64 + 1,
             rows,
             first_row: ElementRow(first_row),
+            laid_out_by: aether_protocol::ui::LayoutOwner::Server,
             first_buffer_line,
             lines,
         }
@@ -931,20 +1118,46 @@ mod tests {
             ],
         );
         // Col 12 lives on line 10's continuation row (byte 10 + 2), abs row 21.
-        let (abs, dcol, width) =
-            position_cell(&w, 0, LogicalPosition { line: 10, col: 12 }, 4).unwrap();
+        let (abs, dcol, width) = position_cell(
+            &w,
+            0,
+            LogicalPosition { line: 10, col: 12 },
+            4,
+            &Measured::default(),
+        )
+        .unwrap();
         assert_eq!(abs, VisualRow(21));
         assert_eq!(dcol, CONTINUATION_MARKER_COLS + 2);
         assert_eq!(width, 1);
         // Line 11 starts after line 10's two rows.
-        let (abs, dcol, _) = position_cell(&w, 0, LogicalPosition { line: 11, col: 0 }, 4).unwrap();
+        let (abs, dcol, _) = position_cell(
+            &w,
+            0,
+            LogicalPosition { line: 11, col: 0 },
+            4,
+            &Measured::default(),
+        )
+        .unwrap();
         assert_eq!((abs, dcol), (VisualRow(22), 0));
         // Past EOL → virtual cell after the text.
-        let (_, dcol, width) =
-            position_cell(&w, 0, LogicalPosition { line: 11, col: 5 }, 4).unwrap();
+        let (_, dcol, width) = position_cell(
+            &w,
+            0,
+            LogicalPosition { line: 11, col: 5 },
+            4,
+            &Measured::default(),
+        )
+        .unwrap();
         assert_eq!((dcol, width), (5, 1));
         // Outside the window → None.
-        assert!(position_cell(&w, 0, LogicalPosition { line: 9, col: 0 }, 4).is_none());
+        assert!(position_cell(
+            &w,
+            0,
+            LogicalPosition { line: 9, col: 0 },
+            4,
+            &Measured::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -961,25 +1174,25 @@ mod tests {
         // with position_cell. A click on the marker itself (col < prefix) lands on the row's
         // first char.
         assert_eq!(
-            hit_test(&w, 21, 4, 4),
+            hit_test(&w, 21, 4, 4, &Measured::default()),
             Some((0, LogicalPosition { line: 10, col: 12 }))
         );
         assert_eq!(
-            hit_test(&w, 21, 0, 4),
+            hit_test(&w, 21, 0, 4, &Measured::default()),
             Some((0, LogicalPosition { line: 10, col: 10 }))
         );
         // Click past a row's end → just past its last char.
         assert_eq!(
-            hit_test(&w, 22, 40, 4),
+            hit_test(&w, 22, 40, 4, &Measured::default()),
             Some((0, LogicalPosition { line: 11, col: 5 }))
         );
         // Above the loaded rows snaps to their first; far below to their last.
         assert_eq!(
-            hit_test(&w, 3, 0, 4),
+            hit_test(&w, 3, 0, 4, &Measured::default()),
             Some((0, LogicalPosition { line: 10, col: 0 }))
         );
         assert_eq!(
-            hit_test(&w, 999, 0, 4),
+            hit_test(&w, 999, 0, 4, &Measured::default()),
             Some((0, LogicalPosition { line: 11, col: 0 }))
         );
     }
@@ -1009,23 +1222,36 @@ mod tests {
         l10.baseline_above = vec![deleted("removed 1"), deleted("removed 2")];
         let w = window(10, 20, vec![l10, line(11, vec![row(0, 0, "next")])]);
         // Line 11 starts after line 10's block: 2 phantoms + 1 content row.
-        assert_eq!(line_top_row(&w, 0, 11), Some(VisualRow(23)));
+        assert_eq!(
+            line_top_row(&w, 0, 11, &Measured::default()),
+            Some(VisualRow(23))
+        );
         // And line 10's own top is its first phantom.
-        assert_eq!(line_top_row(&w, 0, 10), Some(VisualRow(20)));
+        assert_eq!(
+            line_top_row(&w, 0, 10, &Measured::default()),
+            Some(VisualRow(20))
+        );
         // The cursor's cell skips the phantoms: line 10 col 0 sits at abs row 22.
-        let (abs, dcol, _) = position_cell(&w, 0, LogicalPosition { line: 10, col: 0 }, 4).unwrap();
+        let (abs, dcol, _) = position_cell(
+            &w,
+            0,
+            LogicalPosition { line: 10, col: 0 },
+            4,
+            &Measured::default(),
+        )
+        .unwrap();
         assert_eq!((abs, dcol), (VisualRow(22), 0));
         // Clicking a phantom row snaps to the line's first content row, keeping the column.
         assert_eq!(
-            hit_test(&w, 20, 3, 4),
+            hit_test(&w, 20, 3, 4, &Measured::default()),
             Some((0, LogicalPosition { line: 10, col: 3 }))
         );
         assert_eq!(
-            hit_test(&w, 22, 2, 4),
+            hit_test(&w, 22, 2, 4, &Measured::default()),
             Some((0, LogicalPosition { line: 10, col: 2 }))
         );
         assert_eq!(
-            hit_test(&w, 23, 0, 4),
+            hit_test(&w, 23, 0, 4, &Measured::default()),
             Some((0, LogicalPosition { line: 11, col: 0 }))
         );
     }
@@ -1113,14 +1339,32 @@ mod tests {
                 line(7, vec![row(0, 0, "d"), row(1, 0, "e"), row(2, 0, "f")]),
             ],
         );
-        assert_eq!(line_at_row(&w, VisualRow(100)), (0, 5, 0));
-        assert_eq!(line_at_row(&w, VisualRow(101)), (0, 5, 1)); // 2nd row of line 5
-        assert_eq!(line_at_row(&w, VisualRow(102)), (0, 6, 0));
-        assert_eq!(line_at_row(&w, VisualRow(104)), (0, 7, 1)); // 2nd row of line 7
-                                                                // Past the loaded rows resolves to the nearest loaded row above; before them, to the
-                                                                // first loaded row.
-        assert_eq!(line_at_row(&w, VisualRow(999)), (0, 7, 2));
-        assert_eq!(line_at_row(&w, VisualRow(3)), (0, 5, 0));
+        assert_eq!(
+            line_at_row(&w, VisualRow(100), &Measured::default()),
+            (0, 5, 0)
+        );
+        assert_eq!(
+            line_at_row(&w, VisualRow(101), &Measured::default()),
+            (0, 5, 1)
+        ); // 2nd row of line 5
+        assert_eq!(
+            line_at_row(&w, VisualRow(102), &Measured::default()),
+            (0, 6, 0)
+        );
+        assert_eq!(
+            line_at_row(&w, VisualRow(104), &Measured::default()),
+            (0, 7, 1)
+        ); // 2nd row of line 7
+           // Past the loaded rows resolves to the nearest loaded row above; before them, to the
+           // first loaded row.
+        assert_eq!(
+            line_at_row(&w, VisualRow(999), &Measured::default()),
+            (0, 7, 2)
+        );
+        assert_eq!(
+            line_at_row(&w, VisualRow(3), &Measured::default()),
+            (0, 5, 0)
+        );
     }
 
     #[test]
@@ -1137,14 +1381,14 @@ mod tests {
         // Cursor on line 6 (visual row 102), viewport [100, 105): visible → Cursor anchor at offset 2.
         let cursor = LogicalPosition { line: 6, col: 0 };
         assert_eq!(
-            capture_scroll_anchor(&w, VisualRow(100), 5, 0, cursor, 4),
+            capture_scroll_anchor(&w, VisualRow(100), 5, 0, cursor, 4, &Measured::default()),
             ScrollAnchor::Cursor {
                 screen_row_offset: 2
             }
         );
         // Cursor off-screen (viewport [100, 101)) → pin the top line + sub-row.
         assert_eq!(
-            capture_scroll_anchor(&w, VisualRow(101), 1, 0, cursor, 4),
+            capture_scroll_anchor(&w, VisualRow(101), 1, 0, cursor, 4, &Measured::default()),
             ScrollAnchor::Line {
                 element: 0,
                 logical_line: 5,
@@ -1187,6 +1431,7 @@ mod tests {
             0,
             cursor,
             4,
+            &Measured::default(),
         );
         assert_eq!(row, VisualRow(101));
         // Line anchor for line 6 → its first row (103), sub-row clamped into the line.
@@ -1201,6 +1446,7 @@ mod tests {
                 0,
                 cursor,
                 4,
+                &Measured::default()
             ),
             VisualRow(103)
         );
@@ -1217,10 +1463,16 @@ mod tests {
         let lines: Vec<LogicalLineRender> =
             (16..20).map(|i| line(i, vec![row(0, 0, "x")])).collect();
         let w = window(16, 0, lines);
-        assert_eq!(line_at_row(&w, VisualRow(0)), (0, 16, 0));
-        assert_eq!(line_at_row(&w, VisualRow(2)), (0, 18, 0));
         assert_eq!(
-            line_at_row(&w, VisualRow(9)),
+            line_at_row(&w, VisualRow(0), &Measured::default()),
+            (0, 16, 0)
+        );
+        assert_eq!(
+            line_at_row(&w, VisualRow(2), &Measured::default()),
+            (0, 18, 0)
+        );
+        assert_eq!(
+            line_at_row(&w, VisualRow(9), &Measured::default()),
             (0, 19, 0),
             "past the end is the nearest loaded row, not a wrapped-around index"
         );
@@ -1246,20 +1498,26 @@ mod tests {
         };
 
         assert_eq!(
-            line_top_row(&w, 0, 0),
+            line_top_row(&w, 0, 0, &Measured::default()),
             Some(VisualRow(1)),
             "after the chrome above line 0"
         );
         assert_eq!(
-            line_top_row(&w, 1, 1),
+            line_top_row(&w, 1, 1, &Measured::default()),
             Some(VisualRow(3)),
             "chrome, line 0, chrome — summing line heights alone would say 1"
         );
         // And the inverse agrees, reporting which element the row landed in.
-        assert_eq!(line_at_row(&w, VisualRow(1)), (0, 0, 0));
-        assert_eq!(line_at_row(&w, VisualRow(3)), (1, 1, 0));
         assert_eq!(
-            total_rows(&w.root),
+            line_at_row(&w, VisualRow(1), &Measured::default()),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            line_at_row(&w, VisualRow(3), &Measured::default()),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            total_rows(&w.root, &Measured::default()),
             4,
             "two chrome rows and two content rows"
         );
@@ -1300,15 +1558,22 @@ mod tests {
     #[test]
     fn a_buffer_line_has_its_own_row_in_each_element() {
         let w = colliding_elements();
-        assert_eq!(line_top_row(&w, 0, 11), Some(VisualRow(1)));
         assert_eq!(
-            line_top_row(&w, 1, 11),
+            line_top_row(&w, 0, 11, &Measured::default()),
+            Some(VisualRow(1))
+        );
+        assert_eq!(
+            line_top_row(&w, 1, 11, &Measured::default()),
             Some(VisualRow(3)),
             "the same buffer line, two rows down"
         );
         // A line no element carries has no row — and a caller must fetch rather than guess.
-        assert_eq!(line_top_row(&w, 0, 99), None);
-        assert_eq!(line_top_row(&w, 9, 11), None, "no such element");
+        assert_eq!(line_top_row(&w, 0, 99, &Measured::default()), None);
+        assert_eq!(
+            line_top_row(&w, 9, 11, &Measured::default()),
+            None,
+            "no such element"
+        );
     }
 
     /// "Scroll to this line" means the top of its **block**: a heading comes with the line it
@@ -1340,41 +1605,43 @@ mod tests {
         // Rows: 0 "a.rs", 1 "@@ hunk", 2 line 10, 3 its wrap, 4 line 11, 5 "b.rs", 6 line 10 of
         // the second element.
         assert_eq!(
-            line_block_start(&w, 0, 10),
+            line_block_start(&w, 0, 10, &Measured::default()),
             Some(VisualRow(0)),
             "the first line's block starts at its headings, not below them"
         );
         assert_eq!(
-            line_top_row(&w, 0, 10),
+            line_top_row(&w, 0, 10, &Measured::default()),
             Some(VisualRow(2)),
             "…which is exactly what asking for the line's own row answers differently"
         );
         assert_eq!(
-            line_block_start(&w, 0, 11),
+            line_block_start(&w, 0, 11, &Measured::default()),
             Some(VisualRow(4)),
             "a line in the middle of its element has no chrome of its own"
         );
         assert_eq!(
-            line_block_start(&w, 1, 10),
+            line_block_start(&w, 1, 10, &Measured::default()),
             Some(VisualRow(5)),
             "the second element's block starts at its own heading"
         );
-        assert_eq!(line_block_start(&w, 0, 99), None);
+        assert_eq!(line_block_start(&w, 0, 99, &Measured::default()), None);
         // And it inverts the row→line direction: a chrome row resolves to the line it introduces,
         // whose block starts back at that chrome; a content row resolves to its line, whose own
         // rows the sub-row counts from.
         for r in [0u32, 1, 5] {
-            let (e, l, sub) = line_at_row(&w, VisualRow(r));
+            let (e, l, sub) = line_at_row(&w, VisualRow(r), &Measured::default());
             assert_eq!(sub, 0, "row {r}");
             assert!(
-                line_block_start(&w, e, l).unwrap() <= VisualRow(r),
+                line_block_start(&w, e, l, &Measured::default()).unwrap() <= VisualRow(r),
                 "row {r}"
             );
         }
         for r in [2u32, 3, 4, 6] {
-            let (e, l, sub) = line_at_row(&w, VisualRow(r));
+            let (e, l, sub) = line_at_row(&w, VisualRow(r), &Measured::default());
             assert_eq!(
-                line_top_row(&w, e, l).unwrap().saturating_add(sub),
+                line_top_row(&w, e, l, &Measured::default())
+                    .unwrap()
+                    .saturating_add(sub),
                 VisualRow(r),
                 "row {r} → line {e}/{l} + {sub}"
             );
@@ -1393,7 +1660,7 @@ mod tests {
     /// A compact reading of a view's row layout: one string per loaded visual row, tagged by kind,
     /// so a test can state the whole expected column at once.
     fn painted(w: &Window) -> Vec<String> {
-        painted_rows(w)
+        painted_rows(w, &Measured::default())
             .into_iter()
             .map(|(at, item)| match item {
                 PaintedRow::Chrome(n) => format!("{at} chrome {}", chrome_text(n)),
@@ -1446,7 +1713,7 @@ mod tests {
         w.root = Element::Row {
             children: vec![editor(0, 0, 1, vec![line(0, vec![row(0, 0, "a")])])],
         };
-        let _ = painted_rows(&w);
+        let _ = painted_rows(&w, &Measured::default());
     }
 
     /// The row layout and the tree walk must agree about how many lines a view has.
@@ -1480,7 +1747,7 @@ mod tests {
             ],
         };
 
-        let painted = painted_rows(&w)
+        let painted = painted_rows(&w, &Measured::default())
             .iter()
             .filter(|(_, i)| matches!(i, PaintedRow::Text { row_index: 0, .. }))
             .count();
@@ -1492,7 +1759,11 @@ mod tests {
             w.root.lines().len()
         );
         assert_eq!(painted, 2, "and the fixture must actually contain lines");
-        assert_eq!(total_rows(&w.root), 5, "chrome, two lines, a row, chrome");
+        assert_eq!(
+            total_rows(&w.root, &Measured::default()),
+            5,
+            "chrome, two lines, a row, chrome"
+        );
     }
 
     /// The whole point of the shared layout: chrome, phantoms and wrapped rows all occupy rows, and
@@ -1569,23 +1840,32 @@ mod tests {
             ],
             "rows 1..8 and 10 of the first element and all of the second are unloaded"
         );
-        assert_eq!(total_rows(&w.root), 19);
-        assert_eq!(element_start_row(&w, 1), Some(VisualRow(12)));
-        assert_eq!(element_start_row(&w, 2), Some(VisualRow(18)));
+        assert_eq!(total_rows(&w.root, &Measured::default()), 19);
         assert_eq!(
-            line_block_start(&w, 0, 40),
+            element_start_row(&w, 1, &Measured::default()),
+            Some(VisualRow(12))
+        );
+        assert_eq!(
+            element_start_row(&w, 2, &Measured::default()),
+            Some(VisualRow(18))
+        );
+        assert_eq!(
+            line_block_start(&w, 0, 40, &Measured::default()),
             Some(VisualRow(8)),
             "not the element's first row, so no chrome"
         );
         assert_eq!(
-            line_block_start(&w, 2, 0),
+            line_block_start(&w, 2, 0, &Measured::default()),
             Some(VisualRow(17)),
             "the element's first row: its heading comes too"
         );
         // A row nothing is loaded at resolves to the nearest loaded row above it.
-        assert_eq!(line_at_row(&w, VisualRow(14)), (0, 41, 0));
         assert_eq!(
-            hit_test(&w, 14, 0, 4),
+            line_at_row(&w, VisualRow(14), &Measured::default()),
+            (0, 41, 0)
+        );
+        assert_eq!(
+            hit_test(&w, 14, 0, 4, &Measured::default()),
             Some((0, LogicalPosition { line: 41, col: 0 }))
         );
     }
@@ -1604,7 +1884,7 @@ mod tests {
         };
         // Rows: 0 chrome, 1..6 e0, 6 chrome, 7..17 e1.
         assert_eq!(
-            slices_for(&root, VisualRow(4), 6, 0),
+            slices_for(&root, VisualRow(4), 6, 0, &Measured::default()),
             vec![
                 SliceRequest {
                     element: 0,
@@ -1619,7 +1899,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            slices_for(&root, VisualRow(4), 6, 2),
+            slices_for(&root, VisualRow(4), 6, 2, &Measured::default()),
             vec![
                 SliceRequest {
                     element: 0,
@@ -1635,12 +1915,12 @@ mod tests {
             "overscan reaches two rows further each way"
         );
         assert_eq!(
-            slices_for(&root, VisualRow(0), 1, 0),
+            slices_for(&root, VisualRow(0), 1, 0, &Measured::default()),
             vec![],
             "a viewport showing only chrome needs no lines"
         );
         assert_eq!(
-            slices_for(&root, VisualRow(40), 5, 0),
+            slices_for(&root, VisualRow(40), 5, 0, &Measured::default()),
             vec![],
             "past the end there is nothing to ask for"
         );
@@ -1694,7 +1974,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            anchor_at(&w, VisualRow(101)),
+            anchor_at(&w, VisualRow(101), &Measured::default()),
             ScrollPosition {
                 element: 0,
                 line: 5,
@@ -1765,7 +2045,7 @@ mod tests {
         };
         // Rows: 0 chrome, 1 "a", 2 "b", 3 chrome, 4 "c", 5 "d".
         let painted_at = |r: u32| {
-            painted_rows(&w)
+            painted_rows(&w, &Measured::default())
                 .into_iter()
                 .find(|(at, _)| *at == VisualRow(r))
                 .map(|(_, item)| match item {
@@ -1776,14 +2056,20 @@ mod tests {
         };
         assert_eq!(painted_at(4), "line 10", "the second file's first line");
         assert_eq!(
-            line_at_row(&w, VisualRow(4)),
+            line_at_row(&w, VisualRow(4), &Measured::default()),
             (1, 10, 0),
             "row 4 is the second element's first line"
         );
         // The chrome row belongs to the line it introduces.
-        assert_eq!(line_at_row(&w, VisualRow(3)), (1, 10, 0));
+        assert_eq!(
+            line_at_row(&w, VisualRow(3), &Measured::default()),
+            (1, 10, 0)
+        );
         // Without counting chrome, row 5 would have resolved past the end.
-        assert_eq!(line_at_row(&w, VisualRow(5)), (1, 11, 0));
+        assert_eq!(
+            line_at_row(&w, VisualRow(5), &Measured::default()),
+            (1, 11, 0)
+        );
     }
 
     /// `last_line` is what a closing rule hangs off, and it is positional. The second file's lines
@@ -1792,7 +2078,7 @@ mod tests {
     #[test]
     fn the_last_row_is_positional_not_a_line_number() {
         let w = colliding_elements();
-        let last = painted_rows(&w)
+        let last = painted_rows(&w, &Measured::default())
             .into_iter()
             .filter_map(|(at, item)| match item {
                 PaintedRow::Text {
@@ -1817,7 +2103,10 @@ mod tests {
             colliding_elements(),
             window(0, 0, vec![line(0, vec![row(0, 0, "x")])]),
         ] {
-            assert_eq!(total_rows(&w.root) as usize, painted_rows(&w).len());
+            assert_eq!(
+                total_rows(&w.root, &Measured::default()) as usize,
+                painted_rows(&w, &Measured::default()).len()
+            );
         }
     }
 
@@ -1830,9 +2119,174 @@ mod tests {
             buffer: 0,
             rows: 0,
             first_row: ElementRow::ZERO,
+            laid_out_by: aether_protocol::ui::LayoutOwner::Server,
             first_buffer_line: 7,
             lines: vec![],
         };
-        assert_eq!(line_at_row(&w, VisualRow(0)), (0, 7, 0));
+        assert_eq!(
+            line_at_row(&w, VisualRow(0), &Measured::default()),
+            (0, 7, 0)
+        );
+    }
+
+    // ---- elements the client lays out ----------------------------------------------------------
+
+    /// An element the client lays out: unwrapped lines on the wire, one row per line, with the
+    /// shell's measurements attached — every third loaded line laid out three rows tall.
+    fn prose(element: u32, first_row: u32, lines: u32, loaded: std::ops::Range<u32>) -> Element {
+        Element::Editor {
+            element,
+            buffer: element as u64 + 1,
+            rows: lines,
+            first_row: ElementRow(first_row),
+            laid_out_by: aether_protocol::ui::LayoutOwner::Client,
+            first_buffer_line: loaded.start,
+            lines: loaded.map(|n| line(n, vec![row(0, 0, "prose")])).collect(),
+        }
+    }
+
+    fn measured(element: u32, first_row: u32, heights: &[u32]) -> Measured {
+        let mut starts = Vec::new();
+        let mut at = first_row;
+        for h in heights {
+            starts.push(at);
+            at += h;
+        }
+        let mut m = Measured::default();
+        m.elements.insert(
+            element,
+            MeasuredElement {
+                first_row: ElementRow(first_row),
+                starts,
+                end: at,
+            },
+        );
+        m
+    }
+
+    /// Unmeasured, a client-laid-out element is what the server counted: one row per line. The
+    /// tree's estimate stands until the shell has laid the element out.
+    #[test]
+    fn an_unmeasured_client_element_is_one_row_per_line() {
+        let mut w = window(0, 0, vec![]);
+        w.root = Element::Stack {
+            children: vec![
+                chrome("a.md"),
+                prose(0, 2, 10, 2..5),
+                chrome("b.rs"),
+                editor(1, 0, 3, vec![]),
+            ],
+        };
+        let none = Measured::default();
+        assert_eq!(total_rows(&w.root, &none), 1 + 10 + 1 + 3);
+        assert_eq!(
+            painted(&w),
+            vec![
+                "0 chrome a.md",
+                "3 text e0 L2#0",
+                "4 text e0 L3#0",
+                "5 text e0 L4#0 last",
+                "11 chrome b.rs"
+            ]
+        );
+        assert_eq!(element_start_row(&w, 1, &none), Some(VisualRow(12)));
+    }
+
+    /// Measured, the shell's numbers are the element's: its height is the loaded lines as laid
+    /// out plus one row per unloaded line, everything below moves by the difference, and each
+    /// loaded line paints on the row the shell put it on.
+    #[test]
+    fn a_measured_client_element_is_as_tall_as_the_shell_says() {
+        let mut w = window(0, 0, vec![]);
+        // Ten lines, lines 2..5 loaded two rows in; the shell laid them out 1, 3 and 2 rows tall.
+        w.root = Element::Stack {
+            children: vec![
+                chrome("a.md"),
+                prose(0, 2, 10, 2..5),
+                chrome("b.rs"),
+                editor(1, 0, 3, vec![]),
+            ],
+        };
+        let m = measured(0, 2, &[1, 3, 2]);
+        // 2 rows above the slice, 6 measured, 5 unloaded lines below at one each.
+        assert_eq!(total_rows(&w.root, &m), 1 + (2 + 6 + 5) + 1 + 3);
+        assert_eq!(element_start_row(&w, 1, &m), Some(VisualRow(1 + 13 + 1)));
+        let rows: Vec<String> = painted_rows(&w, &m)
+            .into_iter()
+            .map(|(at, item)| match item {
+                PaintedRow::Chrome(n) => format!("{at} chrome {}", chrome_text(n)),
+                PaintedRow::Text { line, .. } => format!("{at} L{}", line.logical_line),
+                PaintedRow::Baseline { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec!["0 chrome a.md", "3 L2", "4 L3", "7 L4", "14 chrome b.rs"],
+            "line 3 starts at row 4 and takes three rows, so line 4 starts at row 7"
+        );
+    }
+
+    /// A row inside a tall line belongs to that line: the scroll anchor, a click and the cursor
+    /// all resolve through the shell's layout.
+    #[test]
+    fn rows_inside_a_measured_line_resolve_to_it() {
+        let mut w = window(0, 0, vec![]);
+        w.root = Element::Stack {
+            children: vec![chrome("a.md"), prose(0, 2, 10, 2..5)],
+        };
+        let m = measured(0, 2, &[1, 3, 2]);
+        // Absolute rows 4, 5 and 6 are all line 3's.
+        for r in 4..7 {
+            let (element, line, _) = line_at_row(&w, VisualRow(r), &m);
+            assert_eq!((element, line), (0, 3), "row {r}");
+        }
+        assert_eq!(anchor_at(&w, VisualRow(6), &m).line, 3);
+        assert_eq!(
+            hit_test(&w, 6, 0, 4, &m).map(|(e, p)| (e, p.line)),
+            Some((0, 3))
+        );
+        assert_eq!(
+            position_cell(&w, 0, LogicalPosition { line: 4, col: 0 }, 4, &m).map(|(r, _, _)| r),
+            Some(VisualRow(7)),
+            "the cursor on line 4 is drawn where the shell put line 4"
+        );
+        assert_eq!(line_top_row(&w, 0, 4, &m), Some(VisualRow(7)));
+    }
+
+    /// A fetch for a client-laid-out element asks by the rows the *server* numbers — lines —
+    /// which the shell's layout translates from the rows on screen.
+    #[test]
+    fn slices_through_a_measured_element_name_its_lines() {
+        let mut w = window(0, 0, vec![]);
+        w.root = Element::Stack {
+            children: vec![
+                chrome("a.md"),
+                prose(0, 2, 10, 2..5),
+                chrome("b.rs"),
+                editor(1, 0, 3, vec![]),
+            ],
+        };
+        let m = measured(0, 2, &[1, 3, 2]);
+        // A screen from absolute row 5 (inside line 3) to row 16 reaches line 3 through the last
+        // line, and then the editor below.
+        let slices = slices_for(&w.root, VisualRow(5), 11, 0, &m);
+        assert_eq!(
+            slices
+                .iter()
+                .map(|s| (s.element, s.from_row.get(), s.rows))
+                .collect::<Vec<_>>(),
+            vec![(0, 3, 7), (1, 0, 1)],
+            "from wire row 3 (line 3) through the element's ten lines"
+        );
+        // Unmeasured, the same request is one row per line: rows 4..10 of the element, then the
+        // editor's three.
+        let plain = slices_for(&w.root, VisualRow(5), 11, 0, &Measured::default());
+        assert_eq!(
+            plain
+                .iter()
+                .map(|s| (s.element, s.from_row.get(), s.rows))
+                .collect::<Vec<_>>(),
+            vec![(0, 4, 6), (1, 0, 3)]
+        );
     }
 }

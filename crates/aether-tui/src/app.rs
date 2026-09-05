@@ -543,6 +543,9 @@ pub struct EditorState {
     /// Rows the whole view occupies — chrome and every element's full height, loaded or not — off
     /// the tree. Drives the editor scrollbar's thumb size; `0` means unknown (no window yet).
     pub total_rows: u32,
+    /// What the shell has measured of elements it lays out itself — see
+    /// [`aether_client::grid::Measured`]. Empty while every element is server-laid-out.
+    pub measured: aether_client::grid::Measured,
     /// Absolute visual row at the top of the viewport. The editor scrollbar's thumb position.
     pub top_visual_row: VisualRow,
     pub wrap: WrapMode,
@@ -665,6 +668,7 @@ pub(crate) fn test_editor_state() -> EditorState {
             buffer: 0,
             rows: 0,
             first_row: aether_protocol::coords::ElementRow::ZERO,
+            laid_out_by: aether_protocol::ui::LayoutOwner::Server,
             first_buffer_line: 0,
             lines: Vec::new(),
         },
@@ -678,6 +682,7 @@ pub(crate) fn test_editor_state() -> EditorState {
         focused_element: 0,
         git_status: None,
         total_rows: 0,
+        measured: Default::default(),
         top_visual_row: VisualRow::ZERO,
         wrap: aether_protocol::viewport::WrapMode::None,
         diff_view: false,
@@ -1274,6 +1279,7 @@ mod tests {
                 buffer: 0,
                 rows: 0,
                 first_row: aether_protocol::coords::ElementRow::ZERO,
+                laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                 first_buffer_line: 0,
                 lines: Vec::new(),
             },
@@ -1287,6 +1293,7 @@ mod tests {
             focused_element: 0,
             git_status: None,
             total_rows: 0,
+            measured: Default::default(),
             top_visual_row: VisualRow::ZERO,
             wrap: aether_protocol::viewport::WrapMode::None,
             diff_view: false,

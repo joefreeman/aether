@@ -2184,6 +2184,7 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
         buffer: r.buffer,
         rows: r.rows,
         first_row: r.first_row,
+        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
         first_buffer_line: r.first_buffer_line,
         lines: r.lines,
     };

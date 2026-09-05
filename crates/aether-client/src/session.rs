@@ -1741,7 +1741,12 @@ impl Session {
     /// Capture a content scroll anchor for the current view, ahead of a wrap/diff re-layout. The
     /// shell supplies its current top visual row and viewport height (the only geometry the core
     /// lacks); the cursor and window come from the session. Pairs with [`resolve_scroll_anchor`].
-    pub fn capture_scroll_anchor(&mut self, top_row: VisualRow, viewport_rows: u32) {
+    pub fn capture_scroll_anchor(
+        &mut self,
+        top_row: VisualRow,
+        viewport_rows: u32,
+        measured: &crate::grid::Measured,
+    ) {
         let element = self.view.focused_element;
         self.view.relayout_anchor = self.view.window.as_ref().map(|w| {
             let cursor = self.view.buffer.cursor.position;
@@ -1752,6 +1757,7 @@ impl Session {
                 element,
                 cursor,
                 TAB_WIDTH,
+                measured,
             )
         });
     }
@@ -1759,13 +1765,13 @@ impl Session {
     /// Consume the anchor captured by [`capture_scroll_anchor`] and resolve it against the current
     /// (post-relayout) window into a new absolute top visual row. `None` when no anchor is pending
     /// (so the shell falls back to its usual clamp + reveal-cursor).
-    pub fn resolve_scroll_anchor(&mut self) -> Option<VisualRow> {
+    pub fn resolve_scroll_anchor(&mut self, measured: &crate::grid::Measured) -> Option<VisualRow> {
         let anchor = self.view.relayout_anchor.take()?;
         let element = self.view.focused_element;
         let w = self.view.window.as_ref()?;
         let cursor = self.view.buffer.cursor.position;
         Some(crate::grid::resolve_scroll_anchor(
-            w, anchor, element, cursor, TAB_WIDTH,
+            w, anchor, element, cursor, TAB_WIDTH, measured,
         ))
     }
 

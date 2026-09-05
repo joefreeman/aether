@@ -5599,7 +5599,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     // maths read the same list, so the three cannot disagree about which row shows what — the
     // painter walking the lines itself and summing chrome as it went is how they used to.
     let top = state.ed().paint_top.get();
-    let painted = aether_client::grid::painted_rows_of(&state.ed().root);
+    let painted = aether_client::grid::painted_rows_of(&state.ed().root, &state.ed().measured);
     let mut next = painted
         .iter()
         .position(|(at, _)| at.get() >= top)
@@ -7416,7 +7416,7 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
     // (a buffer line and a view line), and subtracting them indexed off the end of the list for any
     // view whose first element does not start at line 0.
     let ed = state.ed();
-    let Some(render) = aether_client::grid::painted_rows_of(&ed.root)
+    let Some(render) = aether_client::grid::painted_rows_of(&ed.root, &ed.measured)
         .into_iter()
         .find_map(|(_, item)| match item {
             aether_client::grid::PaintedRow::Text { element, line, .. }
@@ -7643,7 +7643,7 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
 
     // The pair, not the number: a logical line names a line only within its own element, so two
     // files' hunks both have a line 10 and the cursor would be drawn on whichever came first.
-    let rows = aether_client::grid::painted_rows_of(&ed.root);
+    let rows = aether_client::grid::painted_rows_of(&ed.root, &ed.measured);
     let (at, row) = rows.iter().find_map(|(at, item)| match item {
         aether_client::grid::PaintedRow::Text {
             element,
@@ -7734,7 +7734,7 @@ pub fn screen_to_logical(
     // `cursor_visual_position` does, off the same list, so the two cannot map a row differently.
     let top_row = ed.paint_top.get();
     let want = top_row + screen_row as u32;
-    let rows = aether_client::grid::painted_rows_of(&ed.root);
+    let rows = aether_client::grid::painted_rows_of(&ed.root, &ed.measured);
     for (at, item) in &rows {
         if at.get() < want {
             continue;
@@ -10370,6 +10370,7 @@ mod painter_tests {
                         buffer: 7,
                         rows: lines.len() as u32,
                         first_row: ElementRow::ZERO,
+                        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                         first_buffer_line: 16,
                         lines: lines.clone(),
                     },
@@ -10383,7 +10384,7 @@ mod painter_tests {
     /// row `top`.
     fn editor_over(root: Element, top: u32) -> crate::app::EditorState {
         let mut ed = crate::app::test_editor_state();
-        ed.total_rows = aether_client::grid::total_rows(&root);
+        ed.total_rows = aether_client::grid::total_rows(&root, &ed.measured);
         ed.paint_top = VisualRow(top);
         ed.top_visual_row = VisualRow(top);
         ed.root = root;
@@ -10433,6 +10434,7 @@ mod painter_tests {
                         buffer: 7,
                         rows: 1,
                         first_row: ElementRow::ZERO,
+                        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                         first_buffer_line: 10,
                         lines: vec![line(10, "from alpha")],
                     },
@@ -10442,6 +10444,7 @@ mod painter_tests {
                         buffer: 8,
                         rows: 1,
                         first_row: ElementRow::ZERO,
+                        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                         first_buffer_line: 10,
                         lines: vec![line(10, "from beta")],
                     },
@@ -10485,6 +10488,7 @@ mod painter_tests {
                         buffer: 7,
                         rows: 2,
                         first_row: ElementRow::ZERO,
+                        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                         first_buffer_line: 10,
                         lines: vec![line(10, "alpha ten"), line(11, "alpha eleven")],
                     },
@@ -10494,6 +10498,7 @@ mod painter_tests {
                         buffer: 8,
                         rows: 2,
                         first_row: ElementRow::ZERO,
+                        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                         first_buffer_line: 10,
                         lines: vec![line(10, "beta ten"), line(11, "beta eleven")],
                     },
@@ -10560,6 +10565,7 @@ mod painter_tests {
                         buffer: 7,
                         rows: 4,
                         first_row: ElementRow::ZERO,
+                        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                         first_buffer_line: 16,
                         lines: a,
                     },
@@ -10570,6 +10576,7 @@ mod painter_tests {
                         buffer: 8,
                         rows: 3,
                         first_row: ElementRow::ZERO,
+                        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                         first_buffer_line: 0,
                         lines: b,
                     },
@@ -10725,7 +10732,7 @@ mod painter_tests {
             rail: RailJoin::Closes,
             children: vec![UiElement::fill('═')],
         });
-        ed.total_rows = aether_client::grid::total_rows(&ed.root);
+        ed.total_rows = aether_client::grid::total_rows(&ed.root, &ed.measured);
         let state = crate::app::test_state(ed);
         let rows = painted(&state);
         let last_text = rows

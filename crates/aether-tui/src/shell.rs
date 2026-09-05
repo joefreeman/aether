@@ -195,6 +195,9 @@ pub struct Shell {
     // fetch-coordination flags that gate `maybe_fetch`.
     sent_grid: Option<(u32, u32)>,
     subscribe_scroll: ScrollPosition,
+    /// What this shell has measured of the elements it lays out itself — none yet: every element
+    /// the terminal shows is server-laid-out, so the tree's heights are the whole story.
+    measured: aether_client::grid::Measured,
     fetch_in_flight: bool,
     refetch_queued: bool,
     /// The cursor reveal owed to the viewport: armed when a cursor move lands outside the loaded
@@ -306,6 +309,7 @@ pub async fn run(
         scroll_col: 0,
         sent_grid: None,
         subscribe_scroll: ScrollPosition::default(),
+        measured: aether_client::grid::Measured::default(),
         fetch_in_flight: false,
         refetch_queued: false,
         pending_reveal: PendingReveal::default(),
@@ -560,9 +564,11 @@ impl Shell {
                         self.scroll_to_row(row);
                     }
                 }
-                Effect::SaveContentAnchor => self
-                    .session
-                    .capture_scroll_anchor(self.top_visual_row, self.visible_rows()),
+                Effect::SaveContentAnchor => self.session.capture_scroll_anchor(
+                    self.top_visual_row,
+                    self.visible_rows(),
+                    &self.measured,
+                ),
                 Effect::ShowHover(text) => {
                     let body = match text {
                         HoverText::Blocks(blocks) => HoverBody::Blocks(
@@ -583,7 +589,7 @@ impl Shell {
                 Effect::WindowAdopted => {
                     // Diff toggle re-layout: if a content anchor is pending, restore the view to
                     // it (keep the same content on screen); otherwise clamp + reveal as before.
-                    if let Some(row) = self.session.resolve_scroll_anchor() {
+                    if let Some(row) = self.session.resolve_scroll_anchor(&self.measured) {
                         self.top_visual_row = row;
                         self.clamp_scroll();
                         // The anchor positions the view itself; an owed reveal would only fight it
@@ -692,7 +698,7 @@ impl Shell {
                         // (keeping the same content on screen across the reflow). Otherwise
                         // position the top at the subscribe's scroll line and reveal the cursor
                         // as usual.
-                        if let Some(row) = self.session.resolve_scroll_anchor() {
+                        if let Some(row) = self.session.resolve_scroll_anchor(&self.measured) {
                             self.top_visual_row = row;
                             self.clamp_scroll();
                         } else {
@@ -706,6 +712,7 @@ impl Shell {
                                         w,
                                         scroll.element,
                                         scroll.line,
+                                        &self.measured,
                                     )
                                     .map(|r| r.saturating_add(scroll.sub_row as u32))
                                 } else {
@@ -713,12 +720,17 @@ impl Shell {
                                         w,
                                         scroll.element,
                                         scroll.line,
+                                        &self.measured,
                                     )
                                 };
                                 // The line may have been clamped away by the server; the element
                                 // it named is still where the view opens.
                                 if let Some(row) = row.or_else(|| {
-                                    aether_client::grid::element_start_row(w, scroll.element)
+                                    aether_client::grid::element_start_row(
+                                        w,
+                                        scroll.element,
+                                        &self.measured,
+                                    )
                                 }) {
                                     self.top_visual_row = row;
                                 }
@@ -1591,7 +1603,8 @@ impl Shell {
     fn max_scroll_row(&self) -> VisualRow {
         match &self.session.view.window {
             Some(w) => VisualRow(
-                aether_client::grid::total_rows(&w.root).saturating_sub(self.visible_rows()),
+                aether_client::grid::total_rows(&w.root, &self.measured)
+                    .saturating_sub(self.visible_rows()),
             ),
             None => VisualRow::ZERO,
         }
@@ -1626,7 +1639,13 @@ impl Shell {
         };
         let visible = self.visible_rows();
         let top_row = self.top_visual_row;
-        let needed = aether_client::grid::slices_for(&window.root, top_row, visible, visible / 2);
+        let needed = aether_client::grid::slices_for(
+            &window.root,
+            top_row,
+            visible,
+            visible / 2,
+            &self.measured,
+        );
         if aether_client::grid::loaded_covers(&window.root, &needed) {
             return;
         }
@@ -1635,8 +1654,14 @@ impl Shell {
             return;
         }
         self.fetch_in_flight = true;
-        let slices = aether_client::grid::slices_for(&window.root, top_row, visible, visible);
-        let anchor = aether_client::grid::anchor_at(window, top_row);
+        let slices = aether_client::grid::slices_for(
+            &window.root,
+            top_row,
+            visible,
+            visible,
+            &self.measured,
+        );
+        let anchor = aether_client::grid::anchor_at(window, top_row, &self.measured);
         let id = self.handle.send::<ViewportWindow>(ViewportWindowParams {
             viewport_id,
             anchor,
@@ -1762,6 +1787,7 @@ impl Shell {
             window,
             self.session.view.focused_element,
             self.session.view.buffer.cursor.position,
+            &self.measured,
         ) else {
             return false;
         };
@@ -1786,6 +1812,7 @@ impl Shell {
             window,
             self.session.view.focused_element,
             self.session.view.buffer.cursor.position,
+            &self.measured,
         );
         let visible = self.visible_rows();
         tracing::debug!(
@@ -1900,6 +1927,7 @@ impl Shell {
             window,
             self.session.view.focused_element,
             self.session.view.buffer.cursor.position,
+            &self.measured,
         ) else {
             return false;
         };
@@ -1978,7 +2006,7 @@ impl Shell {
         // Report the current on-screen line range to the core (it owns no pixel scroll), so sneak
         // scopes its labels to what's actually visible rather than the overscan-padded window.
         self.session
-            .set_visible_lines(self.top_visual_row, self.visible_rows());
+            .set_visible_lines(self.top_visual_row, self.visible_rows(), &self.measured);
         // Keep the shell-owned overlay editor in step with the focused field before projecting any
         // overlay state into the view model below.
         self.sync_overlay_edit();
@@ -2431,7 +2459,7 @@ impl Shell {
     fn paintable_row(&self, w: &Window) -> VisualRow {
         let top = self.top_visual_row.get();
         let visible = self.visible_rows();
-        let rows = aether_client::grid::painted_rows(w);
+        let rows = aether_client::grid::painted_rows(w, &self.measured);
         // The rows lines are loaded at. Chrome does not count as loaded: every element's chrome is
         // in the tree whether its lines are or not, and a heading over blank rows is not content.
         let is_content =
@@ -2495,6 +2523,7 @@ impl Shell {
             viewport_id: s.view.viewport_id.unwrap_or(0),
             cursor: s.view.buffer.cursor,
             paint_top,
+            measured: self.measured.clone(),
             focused_element: self.session.view.focused_element,
             root: window
                 .map(|w| w.root.clone())
@@ -2504,6 +2533,7 @@ impl Shell {
                     buffer: 0,
                     rows: 0,
                     first_row: aether_protocol::coords::ElementRow::ZERO,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                     first_buffer_line: 0,
                     lines: Vec::new(),
                 }),
@@ -2511,7 +2541,7 @@ impl Shell {
                 .and_then(|w| w.git_status.clone())
                 .or_else(|| prev.and_then(|p| p.git_status.clone())),
             total_rows: window
-                .map(|w| aether_client::grid::total_rows(&w.root))
+                .map(|w| aether_client::grid::total_rows(&w.root, &self.measured))
                 .or(prev.map(|p| p.total_rows))
                 .unwrap_or(0),
             // `top_visual_row` is absolute (whole-buffer) already; while a switch is in flight
@@ -2971,8 +3001,10 @@ fn cursor_visual_row(
     window: &Window,
     element: aether_protocol::viewport::FieldId,
     pos: aether_protocol::LogicalPosition,
+    measured: &aether_client::grid::Measured,
 ) -> Option<VisualRow> {
-    aether_client::grid::position_cell(window, element, pos, TAB_WIDTH).map(|(row, _, _)| row)
+    aether_client::grid::position_cell(window, element, pos, TAB_WIDTH, measured)
+        .map(|(row, _, _)| row)
 }
 
 /// crossterm key event → the core's `(KeyCode, Mods, typed text)`.
@@ -3412,6 +3444,7 @@ mod scroll_tests {
                 buffer: *buffer,
                 rows: *height,
                 first_row: aether_protocol::coords::ElementRow::ZERO,
+                laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                 first_buffer_line: *first,
                 lines: if loaded.contains(&i) {
                     (*first..*first + *height).map(line).collect()
@@ -3453,6 +3486,7 @@ mod scroll_tests {
             scroll_col: 0,
             sent_grid: None,
             subscribe_scroll: ScrollPosition::default(),
+            measured: aether_client::grid::Measured::default(),
             fetch_in_flight: false,
             refetch_queued: false,
             pending_reveal: PendingReveal::default(),
@@ -3514,9 +3548,12 @@ mod scroll_tests {
     fn tab_to_an_element_below_the_fold_rests_it_near_the_top() {
         // Element 0 is 60 lines, so element 1 starts well past a 24-row viewport.
         let mut sh = shell_with(window_of(&[(7, 0, 60), (8, 0, 100)], &[0, 1]), 0, 0);
-        let start =
-            aether_client::grid::element_start_row(sh.session.view.window.as_ref().unwrap(), 1)
-                .expect("element 1 is in the tree");
+        let start = aether_client::grid::element_start_row(
+            sh.session.view.window.as_ref().unwrap(),
+            1,
+            &sh.measured,
+        )
+        .expect("element 1 is in the tree");
         assert!(
             start.get() >= sh.visible_rows(),
             "the fixture wants the target off screen"
@@ -3551,9 +3588,12 @@ mod scroll_tests {
     fn tab_to_an_element_on_screen_leaves_the_view_alone() {
         // Element 1 starts at row 22 of a 24-row viewport: visible, if only just.
         let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]), 0, 0);
-        let start =
-            aether_client::grid::element_start_row(sh.session.view.window.as_ref().unwrap(), 1)
-                .expect("element 1 is in the tree");
+        let start = aether_client::grid::element_start_row(
+            sh.session.view.window.as_ref().unwrap(),
+            1,
+            &sh.measured,
+        )
+        .expect("element 1 is in the tree");
         assert!(
             start.get() < sh.visible_rows(),
             "the fixture wants it visible"
@@ -3726,10 +3766,10 @@ mod scroll_tests {
     fn scrolling_to_the_end_reaches_the_end() {
         let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]), 0, 0);
         let w = sh.session.view.window.as_ref().unwrap();
-        let total = aether_client::grid::total_rows(&w.root);
+        let total = aether_client::grid::total_rows(&w.root, &sh.measured);
         // Everything loaded, so every row of the view is a row the painter has.
         assert_eq!(
-            aether_client::grid::painted_rows(w).len() as u32,
+            aether_client::grid::painted_rows(w, &sh.measured).len() as u32,
             total,
             "the fixture is only honest if the tree is the view"
         );
@@ -3762,9 +3802,9 @@ mod scroll_tests {
         // Through the real path — what the painter is actually handed each frame.
         let ed = sh.editor_view();
         let w = sh.session.view.window.as_ref().unwrap();
-        let loaded_rows_here = aether_client::grid::painted_rows(w).len() as u32;
+        let loaded_rows_here = aether_client::grid::painted_rows(w, &sh.measured).len() as u32;
         let first_row = ed.paint_top.get();
-        let painted_from_there = aether_client::grid::painted_rows_of(&ed.root)
+        let painted_from_there = aether_client::grid::painted_rows_of(&ed.root, &sh.measured)
             .iter()
             .filter(|(at, _)| at.get() >= first_row && at.get() < first_row + sh.visible_rows())
             .count() as u32;

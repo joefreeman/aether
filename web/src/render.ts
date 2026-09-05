@@ -8,6 +8,7 @@ import { decodeRow, utf8ByteLen } from "./text";
 import type {
   BufferWindow,
   ConflictLine,
+  Measured,
   CursorState,
   DiagnosticSeverity,
   DiffStage,
@@ -639,6 +640,8 @@ export interface RenderOpts {
   contentTopPx: number;
   /** One row's height in px: what the rows nothing is loaded at are sized by. */
   rowHeightPx: number;
+  /** What the shell measured of elements it laid out itself — see `Measured`. */
+  measured: Measured;
   /** End-of-line git blame for the cursor line, or null. */
   blame: string | null;
   /** Inline diff view on — gates the line-background tint (the gutter change-bar is always on). */
@@ -661,6 +664,7 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
     spacerHeightPx,
     contentTopPx,
     rowHeightPx,
+    measured,
     blame,
     diffView,
     focusedElement,
@@ -681,7 +685,7 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
   // about where rows landed. Rows nothing is loaded at — an element the viewport has not reached,
   // a fetch still in flight — are a gap the same height, so everything below keeps its row.
   let next = 0;
-  for (const item of paintedRows(window.root)) {
+  for (const item of paintedRows(window.root, measured)) {
     if (item.at > next) {
       const gap = document.createElement("div");
       gap.className = "row-gap";

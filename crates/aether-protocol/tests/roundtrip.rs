@@ -5949,6 +5949,7 @@ fn sample_window() -> aether_protocol::viewport::Window {
             buffer: 7,
             rows: 130,
             first_row: ElementRow(5),
+            laid_out_by: aether_protocol::ui::LayoutOwner::Server,
             first_buffer_line: 4,
             lines: vec![LogicalLineRender {
                 logical_line: 4,
@@ -6080,6 +6081,42 @@ fn viewport_params_round_trip() {
             wrap: aether_protocol::viewport::WrapMode::Soft,
         },
         &["viewport_id", "wrap"],
+    );
+}
+
+/// Who lays an editor element out rides the wire only when it is the client — the ordinary
+/// server-wrapped editor is unchanged — and the browser mirror declares the key.
+#[test]
+fn an_editor_says_when_the_client_lays_it_out() {
+    use aether_protocol::ui::{Element, LayoutOwner};
+    let editor = |laid_out_by| Element::Editor {
+        element: 0,
+        buffer: 1,
+        rows: 4,
+        first_row: ElementRow(0),
+        laid_out_by,
+        first_buffer_line: 0,
+        lines: Vec::new(),
+    };
+    let server = to_value(editor(LayoutOwner::Server)).unwrap();
+    assert!(
+        server.get("laid_out_by").is_none(),
+        "the default stays off the wire"
+    );
+    let client = to_value(editor(LayoutOwner::Client)).unwrap();
+    assert_eq!(client["laid_out_by"], "client");
+    let back: Element = from_value(client).unwrap();
+    assert!(matches!(
+        back,
+        Element::Editor {
+            laid_out_by: LayoutOwner::Client,
+            ..
+        }
+    ));
+    let ts = include_str!("../../../web/src/protocol.ts");
+    assert!(
+        ts.contains("laid_out_by?:"),
+        "web/src/protocol.ts must declare the editor node's `laid_out_by`"
     );
 }
 
@@ -6281,6 +6318,7 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
             buffer: 1,
             rows: 1,
             first_row: ElementRow(0),
+            laid_out_by: aether_protocol::ui::LayoutOwner::Server,
             first_buffer_line: 0,
             lines: Vec::new(),
         },
@@ -6334,6 +6372,7 @@ fn every_subscribe_carries_the_focus_it_resolved() {
             buffer: 9,
             rows: 1,
             first_row: ElementRow(0),
+            laid_out_by: aether_protocol::ui::LayoutOwner::Server,
             first_buffer_line: 17,
             lines: vec![],
         },

@@ -95,6 +95,8 @@ pub struct Content<'a> {
     /// Owned: the label is formatted per view ("3w ago" needs a clock).
     pub blame: Option<(u32, String)>,
     pub tab_width: u32,
+    /// What the shell has measured of elements it lays out itself — see [`grid::Measured`].
+    pub measured: &'a grid::Measured,
     /// Coding ligatures on: code-text runs shape with [`text::Shaping::Advanced`] (forming `=>`,
     /// `!=`, … from the JetBrains Mono font); off uses `Basic` (no ligatures, same metrics).
     pub ligatures: bool,
@@ -431,7 +433,7 @@ where
         // rows above their line. The widget draws whatever is at each row, and nothing where
         // nothing is loaded. It no longer walks the lines counting chrome and phantoms as it goes
         // — the count the terminal, this shell and the browser each did differently.
-        for (abs_row, item) in grid::painted_rows(window) {
+        for (abs_row, item) in grid::painted_rows(window, self.content.measured) {
             let y = bounds.y + PAD + abs_row.get() as f32 * cell.height - scroll;
             if y + cell.height < bounds.y || y > bounds.y + bounds.height {
                 continue;
@@ -967,6 +969,7 @@ where
                             self.content.focused_element,
                             pos,
                             self.content.tab_width,
+                            self.content.measured,
                         ) {
                             if r == abs_row {
                                 fill_content(
@@ -1202,6 +1205,7 @@ where
             self.content.focused_element,
             cursor_pos,
             self.content.tab_width,
+            self.content.measured,
         ) {
             let y = bounds.y + PAD + row.get() as f32 * cell.height - scroll;
             if y + cell.height >= bounds.y && y <= bounds.y + bounds.height {
@@ -1307,7 +1311,8 @@ where
         // taller than the viewport. Geometry from the shared `scrollbar::thumb` (same as the TUI
         // and picker); appearance pulled from the theme's scrollable catalog — the exact style
         // the picker/popover scrollbars use, so they match including hover/drag highlighting.
-        let content_h = PAD * 2.0 + grid::total_rows(&window.root) as f32 * cell.height;
+        let content_h =
+            PAD * 2.0 + grid::total_rows(&window.root, self.content.measured) as f32 * cell.height;
         if let Some((thumb_y, thumb_h)) = crate::core::scrollbar::thumb(
             bounds.height as f64,
             content_h as f64,
@@ -1407,7 +1412,8 @@ impl<'a, Message> EditorView<'a, Message> {
     /// TUI and picker; this returns just the pieces the drag math needs.
     fn scrollbar_metrics(&self, state: &State, bounds: Rectangle) -> Option<(f32, f32)> {
         let (cell, window) = (state.cell?, self.content.window?);
-        let content_h = PAD * 2.0 + grid::total_rows(&window.root) as f32 * cell.height;
+        let content_h =
+            PAD * 2.0 + grid::total_rows(&window.root, self.content.measured) as f32 * cell.height;
         let (_, thumb_h) = crate::core::scrollbar::thumb(
             bounds.height as f64,
             content_h as f64,

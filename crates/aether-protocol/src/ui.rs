@@ -77,6 +77,9 @@ pub enum Element {
         first_row: crate::coords::ElementRow,
         first_buffer_line: u32,
         lines: Vec<LogicalLineRender>,
+        /// Whose arithmetic `rows` is — see [`LayoutOwner`]. Off the wire for the ordinary case.
+        #[serde(default, skip_serializing_if = "LayoutOwner::is_server")]
+        laid_out_by: LayoutOwner,
     },
     /// Literal text with role-styled runs over it. `highlights` are byte offsets into `text` and
     /// carry the same capture names buffer text does, so they resolve through the theme table a
@@ -96,6 +99,31 @@ pub enum Element {
     /// to the chrome kind it sits in, and inventing a capture name for it would have added a role
     /// to the syntax vocabulary — the one part of the palette with no cross-shell parity test.
     Fill { glyph: char },
+}
+
+/// Who lays an editor element's lines out — whose arithmetic its height is.
+///
+/// The server wraps monospace text and knows exactly how many rows that made; that is every
+/// ordinary editor, and the tree carries its height. Prose the client renders from source has no
+/// height the server could know, so the server sends its lines unwrapped — one row per line on
+/// the wire, `rows` the line count — and the client measures the rest. The grid reads the tree
+/// for the first and the shell's measurements for the second, and nothing else about scrolling
+/// changes between them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutOwner {
+    /// Wrapped by the server to the viewport's columns; `rows` counts the result.
+    #[default]
+    Server,
+    /// Laid out by the client; a row on the wire is a line, and the true height is the client's
+    /// (`aether_client::grid::Measured`).
+    Client,
+}
+
+impl LayoutOwner {
+    pub fn is_server(&self) -> bool {
+        matches!(self, LayoutOwner::Server)
+    }
 }
 
 impl Element {

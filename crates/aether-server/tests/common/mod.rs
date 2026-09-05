@@ -7,6 +7,7 @@
 //! both the re-exported protocol surface and the fixtures. Without these two allows, each
 //! binary would fail `clippy -D warnings` for the helpers its siblings need.
 #![allow(dead_code, unused_imports)]
+pub use aether_client::grid::Measured;
 pub use aether_protocol::coords::{ElementRow, VisualRow};
 
 pub use aether_protocol::buffer::{
@@ -1470,7 +1471,7 @@ pub fn chrome_nodes(window: &aether_protocol::viewport::Window) -> Vec<&Element>
 
 /// Rows the whole view occupies — chrome, one row each, and every editor's height.
 pub fn total_rows(window: &aether_protocol::viewport::Window) -> u32 {
-    aether_client::grid::total_rows(&window.root)
+    aether_client::grid::total_rows(&window.root, &Measured::default())
 }
 
 /// The lines the first editor carrying any has loaded, as `(first, last exclusive)`.
@@ -1492,7 +1493,7 @@ pub fn loaded_lines(window: &aether_protocol::viewport::Window) -> (u32, u32) {
 /// The absolute row the first loaded slice starts on — the element's start plus the slice's row
 /// within it.
 pub fn first_loaded_row(window: &aether_protocol::viewport::Window) -> u32 {
-    aether_client::grid::painted_rows(window)
+    aether_client::grid::painted_rows(window, &Measured::default())
         .into_iter()
         .find_map(|(at, item)| match item {
             aether_client::grid::PaintedRow::Chrome(_) => None,
@@ -1503,7 +1504,7 @@ pub fn first_loaded_row(window: &aether_protocol::viewport::Window) -> u32 {
 
 /// How many rows the loaded slices paint, chrome included — what a client can put on screen.
 pub fn painted_rows(window: &aether_protocol::viewport::Window) -> u32 {
-    aether_client::grid::painted_rows(window).len() as u32
+    aether_client::grid::painted_rows(window, &Measured::default()).len() as u32
 }
 
 /// Load the slices a client showing rows `top..top+rows` (with `overscan` each side) would ask for,
@@ -1516,8 +1517,14 @@ pub async fn window_at(
     rows: u32,
     overscan: u32,
 ) -> ViewportWindowResult {
-    let slices = aether_client::grid::slices_for(&current.root, VisualRow(top), rows, overscan);
-    let anchor = aether_client::grid::anchor_at(current, VisualRow(top));
+    let slices = aether_client::grid::slices_for(
+        &current.root,
+        VisualRow(top),
+        rows,
+        overscan,
+        &Measured::default(),
+    );
+    let anchor = aether_client::grid::anchor_at(current, VisualRow(top), &Measured::default());
     send_request::<ViewportWindow>(
         ws,
         &ViewportWindowParams {

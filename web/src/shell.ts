@@ -53,6 +53,7 @@ import type {
   WorkspaceActivateResult,
   WorkspaceInfo,
   WorkspaceListResult,
+  Measured,
   ScrollPosition,
   SliceRequest,
   ViewportWindowParams,
@@ -1254,6 +1255,10 @@ export class Shell {
    *  stale window — the robust guard against the reply/push interleaving + concurrent-jump races. */
   private viewportEpoch = 0;
   private fetchInFlight = false;
+  /** What this shell has measured of the elements it lays out itself — none yet: every element
+   *  the browser shows is server-laid-out. Handed to the core (`set_measured`) whenever it changes,
+   *  so the layout it scrolls and fetches by is the one painted. */
+  private measured: Measured = {};
   /** True while the markdown reading view owns the buffer element. */
   private readActive = false;
   /** The focus last revealed (`buffer:start:end`), so the view scrolls only on focus changes. */
@@ -3209,6 +3214,7 @@ export class Shell {
       spacerHeightPx: this.session.total_rows() * this.cell.h + BUFFER_PAD * 2,
       contentTopPx: BUFFER_PAD,
       rowHeightPx: this.cell.h,
+      measured: this.measured,
       // The blame data arrives via the server's `git/blame_changed` push (blame follow) and
       // rides the core view; format the label here — "3w ago" needs a wall clock. Shown on the
       // cursor line in Normal mode only, and only when the followed line is still the cursor's.

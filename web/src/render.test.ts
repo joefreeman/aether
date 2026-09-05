@@ -13,7 +13,8 @@
 
 import { describe, expect, it } from "vitest";
 import { renderBuffer } from "./render";
-import type { BufferWindow, CursorState, LogicalLineRender, ViewNode } from "./protocol";
+import { totalRows } from "./protocol";
+import type { BufferWindow, CursorState, LogicalLineRender, Measured, ViewNode } from "./protocol";
 
 const line = (n: number, text: string): LogicalLineRender => ({
   logical_line: n,
@@ -59,6 +60,7 @@ function painted(window: BufferWindow, opts: { cursor?: CursorState; focused?: n
     spacerHeightPx: 0,
     contentTopPx: 0,
     rowHeightPx: 0,
+    measured: {},
     blame: null,
     diffView: false,
     focusedElement: opts.focused ?? 0,
@@ -140,6 +142,7 @@ describe("the buffer painter", () => {
       spacerHeightPx: 0,
       contentTopPx: 0,
       rowHeightPx: 10,
+      measured: {},
       blame: null,
       diffView: false,
       focusedElement: 0,
@@ -150,6 +153,56 @@ describe("the buffer painter", () => {
     );
     // The heading on row 0; rows 1..3 are the element's first three, unloaded; the slice from row 4.
     expect(kinds).toEqual(["a.rs", "gap 30px", "f20", "f21"]);
+  });
+
+  /// An element the client lays out paints each line on the row the shell measured it as starting
+  /// on — a tall line pushes the next down — and, unmeasured, one line per row. Mirrors the Rust
+  /// `a_measured_client_element_is_as_tall_as_the_shell_says`.
+  it("paints a client-laid-out element's lines where the shell measured them", () => {
+    const prose: ViewNode = {
+      node: "editor",
+      element: 0,
+      buffer: 1,
+      rows: 10,
+      first_row: 2,
+      first_buffer_line: 2,
+      lines: [line(2, "two"), line(3, "three"), line(4, "four")],
+      laid_out_by: "client",
+    };
+    const w = windowOf({ node: "stack", children: [chrome("a.md"), prose] });
+    const paint = (measured: Measured) => {
+      const container = document.createElement("div");
+      renderBuffer(container, {
+        window: w,
+        cursor,
+        insertMode: false,
+        awaitingKey: false,
+        contentWidthPx: 0,
+        spacerHeightPx: 0,
+        contentTopPx: 0,
+        rowHeightPx: 10,
+        measured,
+        blame: null,
+        diffView: false,
+        focusedElement: 0,
+      });
+      const content = container.querySelector(".buffer-content")!;
+      return [...content.children].map((el) =>
+        el.classList.contains("row-gap") ? `gap ${(el as HTMLElement).style.height}` : el.textContent?.trim(),
+      );
+    };
+    // Unmeasured: one row per line, two rows into the element (row 1 is the heading).
+    expect(paint({})).toEqual(["a.md", "gap 20px", "two", "three", "four"]);
+    // Measured: line 3 laid out three rows tall, so line 4 moves down by two.
+    expect(paint({ 0: { first_row: 2, starts: [2, 3, 6], end: 8 } })).toEqual([
+      "a.md",
+      "gap 20px",
+      "two",
+      "three",
+      "gap 20px",
+      "four",
+    ]);
+    expect(totalRows(w.root, { 0: { first_row: 2, starts: [2, 3, 6], end: 8 } })).toBe(1 + 2 + 6 + 5);
   });
 
   /// The closing rule hangs off the *last rendered row*, not off a line number. Asking
@@ -201,6 +254,7 @@ describe("the buffer painter", () => {
       spacerHeightPx: 0,
       contentTopPx: 0,
       rowHeightPx: 0,
+      measured: {},
       blame: null,
       diffView: false,
       focusedElement: 1,
@@ -242,6 +296,7 @@ describe("the buffer painter", () => {
       spacerHeightPx: 0,
       contentTopPx: 0,
       rowHeightPx: 0,
+      measured: {},
       blame: null,
       diffView: false,
       focusedElement: 0,

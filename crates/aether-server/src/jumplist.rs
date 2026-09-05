@@ -30,7 +30,7 @@
 //!   collapsible groups.
 
 use crate::picker::{PickerCandidates, PickerState};
-use aether_protocol::cursor::Direction;
+use aether_protocol::cursor::{CursorState, Direction};
 use aether_protocol::picker::{GroupHeader, PickerKind};
 use aether_protocol::{BufferId, LogicalPosition};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -275,6 +275,53 @@ impl JumplistEntry {
 /// The step-origin identity of a buffer: its canonical path when it has one, else its id. The one
 /// place that decision is made, so stepping, framing and the status stamp can't disagree about
 /// what "the current target" means.
+/// Where a step, a picker's opening selection or the `k/N` stamp is being taken from: the buffer
+/// the client named, read as a place among the entries, with the cursor in that place's own
+/// coordinates.
+///
+/// The client names the buffer its cursor is in. Inside a composed view that is the focused
+/// element's buffer — a file, which entries name by path. Unless the element windows the view's
+/// own generated text (a deleted file's region, a hunk whose file could not be opened): then the
+/// buffer is the patch document, which no entry names, and a location read straight off it had no
+/// path at all — every `]` took the first entry and every `[` the last. The place is still known:
+/// the outline entry under the cursor says which file, and the patch index says which line of it
+/// the cursor's patch row is. `translated` says the cursor was mapped that way, so comparisons
+/// against it must be made in file coordinates rather than through the patch document's text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepLocation {
+    pub path: Option<String>,
+    pub buffer: BufferId,
+    pub view_key: Option<String>,
+    pub cursor: CursorState,
+    pub translated: bool,
+}
+
+impl StepLocation {
+    pub fn as_location(&self) -> Location<'_> {
+        location_of(self.path.as_deref(), self.buffer, self.view_key.as_deref())
+    }
+
+    /// The cursor's edge in `direction`'s way — the far end of a selection going forward, the near
+    /// end going back — so an entry the cursor sits on counts as current and is stepped off.
+    pub fn edge(&self, direction: Direction) -> LogicalPosition {
+        let (min_edge, max_edge) = self.ordered();
+        match direction {
+            Direction::Forward => max_edge,
+            Direction::Backward => min_edge,
+        }
+    }
+
+    /// The selection's ends, leading first.
+    pub fn ordered(&self) -> (LogicalPosition, LogicalPosition) {
+        let (a, p) = (self.cursor.anchor, self.cursor.position);
+        if (a.line, a.col) < (p.line, p.col) {
+            (a, p)
+        } else {
+            (p, a)
+        }
+    }
+}
+
 pub fn location_of<'a>(
     canonical_path: Option<&'a str>,
     buffer_id: BufferId,

@@ -6897,7 +6897,7 @@ async fn every_scrollable_row_comes_back_in_its_window() {
     let mut window = sub.window;
     for top in 0..=total.saturating_sub(rows) {
         let res = window_at(&mut ws, sub.viewport_id, &window, top, rows, rows).await;
-        let painted = aether_client::grid::painted_rows(&res.window);
+        let painted = aether_client::grid::painted_rows(&res.window, &Measured::default());
         for r in top..(top + rows).min(total) {
             assert!(
                 painted.iter().any(|(at, _)| at.get() == r),
@@ -6979,14 +6979,20 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
         top += 1;
         // `maybe_fetch`, the client's own rule: fetch when the slices the viewport reaches (with
         // its overscan) are not all loaded.
-        let wanted = aether_client::grid::slices_for(&window.root, VisualRow(top), rows, rows);
+        let wanted = aether_client::grid::slices_for(
+            &window.root,
+            VisualRow(top),
+            rows,
+            rows,
+            &Measured::default(),
+        );
         if !aether_client::grid::loaded_covers(&window.root, &wanted) {
             fetches += 1;
             window = window_at(&mut ws, sub.viewport_id, &window, top, rows, rows)
                 .await
                 .window;
         }
-        let painted = aether_client::grid::painted_rows(&window);
+        let painted = aether_client::grid::painted_rows(&window, &Measured::default());
         if let Some(r) =
             (top..(top + rows).min(total)).find(|r| !painted.iter().any(|(at, _)| at.get() == *r))
         {
@@ -7002,7 +7008,7 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
     // The last scroll position really is the view's last: the rows painted run out exactly where
     // the view does, rather than a few rows short of it.
     assert_eq!(
-        aether_client::grid::painted_rows(&window)
+        aether_client::grid::painted_rows(&window, &Measured::default())
             .last()
             .map(|(at, _)| at.get()),
         Some(total - 1),
@@ -7120,7 +7126,7 @@ async fn a_patch_ends_with_its_closing_rule() {
         painted_rows(&partial.window) < total,
         "four rows of a taller view leave rows unloaded"
     );
-    let painted = aether_client::grid::painted_rows(&partial.window);
+    let painted = aether_client::grid::painted_rows(&partial.window, &Measured::default());
     let (at, last) = painted.last().expect("the rule is painted");
     assert!(
         matches!(

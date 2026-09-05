@@ -30,6 +30,9 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 pub struct WasmSession {
     inner: Session,
+    /// What the shell has measured of elements it lays out itself — see
+    /// [`aether_client::grid::Measured`]; set through [`WasmSession::set_measured`].
+    measured: aether_client::grid::Measured,
 }
 
 #[wasm_bindgen]
@@ -74,6 +77,7 @@ impl WasmSession {
         install_panic_hook();
         WasmSession {
             inner: Session::placeholder(),
+            measured: aether_client::grid::Measured::default(),
         }
     }
 
@@ -113,6 +117,7 @@ impl WasmSession {
         let buffer = buffer_info(open, &workspace.paths);
         Ok(WasmSession {
             inner: Session::new(workspace, buffer),
+            measured: aether_client::grid::Measured::default(),
         })
     }
 
@@ -226,7 +231,7 @@ impl WasmSession {
         // The wasm boundary speaks plain numbers — JS has no newtypes — so the coordinate
         // spaces are named here, once, on the way in.
         self.inner
-            .set_visible_lines(VisualRow(top_visual_row), viewport_rows);
+            .set_visible_lines(VisualRow(top_visual_row), viewport_rows, &self.measured);
     }
 
     /// Pointer press at an already-resolved buffer position (the shell converts pixels → cell).
@@ -261,12 +266,20 @@ impl WasmSession {
         self.inner.pointer_release();
     }
 
+    /// What the shell has measured of the elements it lays out itself — the same table the shell
+    /// paints from, mirrored in `web/src/protocol.ts` as `Measured`. Empty until a view holds an
+    /// element the client lays out.
+    pub fn set_measured(&mut self, measured: JsValue) -> Result<(), JsValue> {
+        self.measured = from_js(measured)?;
+        Ok(())
+    }
+
     /// Capture a content scroll anchor before a wrap/diff re-layout (in response to the
     /// `SaveContentAnchor` effect). `top_row` is the absolute visual row at the top of the viewport
     /// (`(scrollTop - pad) / lineHeight`); `viewport_rows` its height in rows.
     pub fn capture_scroll_anchor(&mut self, top_row: u32, viewport_rows: u32) {
         self.inner
-            .capture_scroll_anchor(VisualRow(top_row), viewport_rows);
+            .capture_scroll_anchor(VisualRow(top_row), viewport_rows, &self.measured);
     }
 
     /// Resolve the anchor captured by [`WasmSession::capture_scroll_anchor`] against the new window
@@ -274,7 +287,9 @@ impl WasmSession {
     /// anchor is pending (the shell then reveals the cursor as usual). Call after adopting the
     /// re-laid-out window (wrap `set_wrap` result / diff `WindowAdopted`).
     pub fn resolve_scroll_anchor(&mut self) -> Option<u32> {
-        self.inner.resolve_scroll_anchor().map(VisualRow::get)
+        self.inner
+            .resolve_scroll_anchor(&self.measured)
+            .map(VisualRow::get)
     }
 
     /// Which element a re-subscribe should say holds the cursor — the one it already does, when
@@ -297,21 +312,19 @@ impl WasmSession {
         use aether_client::grid;
         let w = self.inner.view.window.as_ref()?;
         let row = if sub_row > 0.0 {
-            grid::line_top_row(w, element, line).map(|r| r.get() as f32 + sub_row)
+            grid::line_top_row(w, element, line, &self.measured).map(|r| r.get() as f32 + sub_row)
         } else {
-            grid::line_block_start(w, element, line).map(|r| r.get() as f32)
+            grid::line_block_start(w, element, line, &self.measured).map(|r| r.get() as f32)
         };
-        row.or_else(|| grid::element_start_row(w, element).map(|r| r.get() as f32))
+        row.or_else(|| grid::element_start_row(w, element, &self.measured).map(|r| r.get() as f32))
     }
 
     /// Rows the whole view occupies — chrome and every element's full height, loaded or not —
     /// off the tree. What sizes the scroller; `0` with no window.
     pub fn total_rows(&self) -> u32 {
-        self.inner
-            .view
-            .window
-            .as_ref()
-            .map_or(0, |w| aether_client::grid::total_rows(&w.root))
+        self.inner.view.window.as_ref().map_or(0, |w| {
+            aether_client::grid::total_rows(&w.root, &self.measured)
+        })
     }
 
     /// The absolute row of the cursor's cell, or `null` when its line isn't loaded — what a
@@ -323,6 +336,7 @@ impl WasmSession {
             self.inner.view.focused_element,
             self.inner.view.buffer.cursor.position,
             aether_client::session::TAB_WIDTH,
+            &self.measured,
         )
         .map(|(row, _, _)| row.get())
     }
@@ -345,12 +359,15 @@ impl WasmSession {
             return Ok(JsValue::NULL);
         };
         let top = VisualRow(top_row);
-        if grid::loaded_covers(&w.root, &grid::slices_for(&w.root, top, visible, margin)) {
+        if grid::loaded_covers(
+            &w.root,
+            &grid::slices_for(&w.root, top, visible, margin, &self.measured),
+        ) {
             return Ok(JsValue::NULL);
         }
         to_js(&json!({
-            "anchor": grid::anchor_at(w, top),
-            "slices": grid::slices_for(&w.root, top, visible, overscan),
+            "anchor": grid::anchor_at(w, top, &self.measured),
+            "slices": grid::slices_for(&w.root, top, visible, overscan, &self.measured),
         }))
     }
 

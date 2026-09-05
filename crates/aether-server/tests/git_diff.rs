@@ -2494,8 +2494,8 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
         .count();
     assert_eq!(unbound, 2, "the fixture wants aaa.rs's two hunks unbound");
 
-    // The first entry is aaa.rs's first hunk: seated in the review's own document, on the row that
-    // shows file line 2.
+    // The cursor sits at the top of aaa.rs's first hunk — that entry is current — so `]` is its
+    // second: seated in the review's own document, on the row that shows file line 42.
     let stepped: JumplistStepResult = send_request::<JumplistStep>(
         &mut ws,
         &JumplistStepParams {
@@ -2508,8 +2508,9 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
     )
     .await;
     let t = stepped.moved().expect("lands");
+    assert_eq!(t.index, 2, "{t:?}");
     let seat = t.seat.expect("in the review");
-    assert_eq!(seat.element, 0);
+    assert_eq!(seat.element, 1);
     assert_eq!(
         seat.buffer_id, patch.buffer_id,
         "the element windows the patch itself"
@@ -2531,8 +2532,8 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
         .nth(t.position.unwrap().line as usize)
         .unwrap_or("");
     assert_eq!(
-        row, "fn line2() {}",
-        "the seat is the patch row showing file line 2, not file line 2 of the patch"
+        row, "fn line42() {}",
+        "the seat is the patch row showing file line 42, not file line 42 of the patch"
     );
 
     drop(server);
@@ -7543,7 +7544,7 @@ async fn scrolled_out_elements_keep_their_place_in_the_tree() {
 
     // Into the second element: a client asks for the rows its viewport reaches, and the second
     // element starts where the tree says it does.
-    let top = aether_client::grid::element_start_row(&sub.window, 1)
+    let top = aether_client::grid::element_start_row(&sub.window, 1, &Measured::default())
         .expect("a second element")
         .get();
     let scrolled = window_at(&mut ws, sub.viewport_id, &sub.window, top, 60, 0).await;
@@ -8698,7 +8699,7 @@ async fn scrolling_to_the_end_of_a_patch_still_shows_content() {
     let mut window = sub.window;
     for top in (0..=total - 10).step_by(5) {
         let w = window_at(&mut ws, sub.viewport_id, &window, top, 10, 0).await;
-        let painted = aether_client::grid::painted_rows(&w.window);
+        let painted = aether_client::grid::painted_rows(&w.window, &Measured::default());
         for r in top..(top + 10).min(total) {
             assert!(
                 painted.iter().any(|(at, _)| at.get() == r),
@@ -8779,7 +8780,7 @@ async fn the_scroll_limit_reaches_the_last_line_of_a_patch() {
 
     // Scroll as far as the client permits itself: the view's height less a screen.
     let end = window_at(&mut ws, sub.viewport_id, &sub.window, total - ROWS, ROWS, 0).await;
-    let painted = aether_client::grid::painted_rows(&end.window);
+    let painted = aether_client::grid::painted_rows(&end.window, &Measured::default());
     for r in total - ROWS..total {
         assert!(
             painted.iter().any(|(at, _)| at.get() == r),
@@ -11279,6 +11280,219 @@ async fn restaging_rebinds_a_view_whose_hunks_all_window_files() {
         changed.change.stage(),
         DiffStage::Staged,
         "the pushed window carries the stage after the rebuild, not the one the view opened with"
+    );
+
+    drop(server);
+}
+
+/// A step from an element that windows the review's **own** text — a deleted file's region, which
+/// sorts first and is where a fresh subscribe leaves the cursor — reads the cursor's place in the
+/// view: the file the outline entry under it names, at that file's line. Read straight off the
+/// patch document, which no entry names, the step had no location: every `]` took the first
+/// entry and every `[` the last, and the jumplist picker could not tell which entry you were on.
+#[tokio::test]
+async fn stepping_from_an_unbound_element_reads_the_cursors_place_in_the_view() {
+    use aether_protocol::jumplist::{
+        JumplistCapture, JumplistCaptureParams, JumplistStep, JumplistStepParams, JumplistStepScope,
+    };
+    use aether_protocol::picker::{
+        PickerItem, PickerKind, PickerView, PickerViewParams, PickerViewResult,
+    };
+    use aether_protocol::viewport::{
+        FocusTarget, ViewportFocusElement, ViewportFocusElementParams, ViewportFocusElementResult,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (0..20).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        commit_file(&repo, name, &base);
+    }
+    // a.rs deleted: its region has no file behind it and comes first.
+    std::fs::remove_file(root.join("a.rs")).unwrap();
+    for name in ["b.rs", "c.rs"] {
+        std::fs::write(root.join(name), base.replace("fn line5() {}", "fn A() {}")).unwrap();
+    }
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 40,
+            overscan_rows: 0,
+            scroll: ScrollPosition::default(),
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        sub.focus.buffer.buffer_id, patch.buffer_id,
+        "the fixture wants the cursor in the review's own text"
+    );
+    let view: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            buffer_id: Some(patch.buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let item = view
+        .update
+        .map(|u| u.items().to_vec())
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .expect("rows");
+    let captured = send_request::<JumplistCapture>(
+        &mut ws,
+        &JumplistCaptureParams {
+            kind: PickerKind::DocumentSymbols,
+            item,
+        },
+    )
+    .await
+    .expect("captures");
+    assert_eq!(captured.total, 3);
+
+    async fn step(
+        ws: &mut Ws,
+        buffer_id: u64,
+        direction: aether_protocol::cursor::Direction,
+    ) -> aether_protocol::jumplist::JumplistStepTarget {
+        send_request::<JumplistStep>(
+            ws,
+            &JumplistStepParams {
+                buffer_id,
+                direction,
+                count: 1,
+                scope: JumplistStepScope::Full,
+                open: true,
+            },
+        )
+        .await
+        .moved()
+        .expect("a move")
+    }
+    // From the deleted file's region — a.rs's own entry — `]` is b.rs, not a.rs again.
+    let here = patch.buffer_id;
+    let t = step(&mut ws, here, aether_protocol::cursor::Direction::Forward).await;
+    assert_eq!(t.index, 2, "{t:?}");
+    assert!(t.path.as_deref().is_some_and(|p| p.ends_with("b.rs")));
+    let seat = t.seat.expect("in the review");
+    assert_ne!(
+        seat.buffer_id, patch.buffer_id,
+        "b.rs's element windows the file"
+    );
+
+    // Land as the client does, then on to c.rs, and back.
+    let _: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
+        &mut ws,
+        &ViewportFocusElementParams {
+            viewport_id: sub.viewport_id,
+            target: FocusTarget::Element {
+                element: seat.element,
+            },
+        },
+    )
+    .await;
+    let p = t.position.unwrap();
+    set_cursor(&mut ws, seat.buffer_id, p.line, p.col).await;
+    let t = step(
+        &mut ws,
+        seat.buffer_id,
+        aether_protocol::cursor::Direction::Forward,
+    )
+    .await;
+    assert_eq!(t.index, 3, "{t:?}");
+    let t = step(
+        &mut ws,
+        seat.buffer_id,
+        aether_protocol::cursor::Direction::Backward,
+    )
+    .await;
+    assert_eq!(
+        t.index, 1,
+        "back over b.rs, which the cursor is on, to a.rs: {t:?}"
+    );
+    let seat = t.seat.expect("in the review");
+    assert_eq!(
+        seat.buffer_id, patch.buffer_id,
+        "a.rs's region is the review's own text"
+    );
+
+    // Seated there — cursor in the review's document — the stamp says entry 1 of 3, and `]` moves
+    // on to b.rs rather than starting over.
+    let _: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
+        &mut ws,
+        &ViewportFocusElementParams {
+            viewport_id: sub.viewport_id,
+            target: FocusTarget::Element {
+                element: seat.element,
+            },
+        },
+    )
+    .await;
+    let p = t.position.unwrap();
+    let stamped: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id: patch.buffer_id,
+            position: p,
+            anchor: p,
+        },
+    )
+    .await;
+    assert_eq!(
+        stamped.jumplist_position.map(|j| (j.current, j.total)),
+        Some((1, 3)),
+        "the k/N stamp knows which entry the review's own row is"
+    );
+    let t = step(
+        &mut ws,
+        patch.buffer_id,
+        aether_protocol::cursor::Direction::Forward,
+    )
+    .await;
+    assert_eq!(t.index, 2, "{t:?}");
+
+    // And the jumplist picker opens on the entry the cursor is in.
+    let jl: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            buffer_id: Some(patch.buffer_id),
+            center_on_cursor: Some(patch.buffer_id),
+            limit: 50,
+            ..view_params(PickerKind::Jumplist)
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            jl.effective_center_on,
+            Some(PickerItem::JumplistEntry { index: 0, .. })
+        ),
+        "the picker centres on a.rs's entry: {:?}",
+        jl.effective_center_on
     );
 
     drop(server);

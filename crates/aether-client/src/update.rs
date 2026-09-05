@@ -3705,11 +3705,16 @@ impl Session {
     /// (the shell owns the pixel scroll). `top_visual_row` is absolute (whole-buffer); the core maps
     /// it through the loaded window to a logical-line range that scopes sneak candidates. Cheap —
     /// safe to call every render/scroll.
-    pub fn set_visible_lines(&mut self, top_visual_row: VisualRow, viewport_rows: u32) {
+    pub fn set_visible_lines(
+        &mut self,
+        top_visual_row: VisualRow,
+        viewport_rows: u32,
+        measured: &crate::grid::Measured,
+    ) {
         self.view.visible_lines = self.view.window.as_ref().map(|w| {
-            let (_, first, _) = crate::grid::line_at_row(w, top_visual_row);
+            let (_, first, _) = crate::grid::line_at_row(w, top_visual_row, measured);
             let bottom = top_visual_row.saturating_add(viewport_rows.saturating_sub(1));
-            let (_, last, _) = crate::grid::line_at_row(w, bottom);
+            let (_, last, _) = crate::grid::line_at_row(w, bottom, measured);
             (first, last.saturating_add(1))
         });
     }

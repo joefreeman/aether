@@ -1988,22 +1988,14 @@ pub async fn picker_view(
     let cursor_centering_info: Option<CursorCentering> =
         match (params.kind, params.center_on_cursor) {
             (kind, Some(buffer_id)) if kind.centers_on_cursor() => {
-                let cursor = s
-                    .cursors
-                    .get(&(client_id, buffer_id))
-                    .copied()
-                    .unwrap_or_default();
-                let leading_edge = if (cursor.anchor.line, cursor.anchor.col)
-                    <= (cursor.position.line, cursor.position.col)
-                {
-                    cursor.anchor
-                } else {
-                    cursor.position
-                };
-                let current_abs = s
-                    .try_doc_of(buffer_id)
-                    .and_then(|b| b.canonical_path.as_deref())
-                    .map(|p| p.to_string_lossy().into_owned());
+                // Where the client is, as a place the rows can be compared with — in a composed
+                // view, the file its focused element shows and the cursor's line in that file,
+                // whatever the element windows.
+                let here = step_location(&s, client_id, buffer_id);
+                let leading_edge = here
+                    .as_ref()
+                    .map_or(LogicalPosition::default(), |h| h.ordered().0);
+                let current_abs = here.as_ref().and_then(|h| h.path.clone());
                 // A virtual buffer's key is `<repo>@<rev>[:<path>]`; the rev is what the log
                 // picker centres on.
                 let revision = s
@@ -2011,8 +2003,7 @@ pub async fn picker_view(
                     .and_then(|d| d.virtual_source.as_ref())
                     .and_then(|v| v.target.rev())
                     .map(str::to_string);
-                let view_key =
-                    crate::handlers::viewport::view_key_of(&s, aether_protocol::ViewId(buffer_id));
+                let view_key = here.as_ref().and_then(|h| h.view_key.clone());
                 Some(CursorCentering {
                     leading_edge,
                     abs_path: current_abs,
@@ -3224,8 +3215,7 @@ pub async fn jumplist_step(
     let client_id = ctx.client_id;
     let (mut target, open_params, landing, idx) = {
         let s = state.lock().await;
-        let buffer = s
-            .try_doc_of(params.buffer_id)
+        let here = step_location(&s, client_id, params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
         let Some(list) = s.jumplist(client_id) else {
             return Ok(JumplistStepResult::Empty);
@@ -3233,37 +3223,12 @@ pub async fn jumplist_step(
         if list.entries.is_empty() {
             return Ok(JumplistStepResult::Empty);
         }
-        let current_abs = buffer
-            .canonical_path
-            .as_deref()
-            .map(|p| p.to_string_lossy().into_owned());
-        let current_view =
-            crate::handlers::viewport::view_key_of(&s, aether_protocol::ViewId(params.buffer_id));
-        let location = crate::jumplist::location_of(
-            current_abs.as_deref(),
-            params.buffer_id,
-            current_view.as_deref(),
-        );
+        let location = here.as_location();
         // Use the outer edge of the cursor's selection so an entry the cursor currently sits
         // on is treated as "current" and skipped. Without this, `[` from a freshly-jumped
         // entry (where the selection covers its span) would land back on the same entry
         // because the entry's start position is < the cursor's end position.
-        let cursor = s
-            .cursors
-            .get(&(client_id, params.buffer_id))
-            .copied()
-            .unwrap_or_default();
-        let (min_edge, max_edge) = if (cursor.anchor.line, cursor.anchor.col)
-            < (cursor.position.line, cursor.position.col)
-        {
-            (cursor.anchor, cursor.position)
-        } else {
-            (cursor.position, cursor.anchor)
-        };
-        let edge = match params.direction {
-            Direction::Forward => max_edge,
-            Direction::Backward => min_edge,
-        };
+        let edge = here.edge(params.direction);
         let count = params.count.max(1);
         let idx = match params.scope {
             JumplistStepScope::Full => match crate::jumplist::step_index(
@@ -3413,6 +3378,75 @@ pub async fn jumplist_step(
             }
         }
     }
+}
+
+/// Where the client is, as a place among the jumplist's entries — see
+/// [`crate::jumplist::StepLocation`]. `None` when the buffer is gone.
+pub fn step_location(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Option<crate::jumplist::StepLocation> {
+    let doc = s.try_doc_of(buffer_id)?;
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
+    let plain = crate::jumplist::StepLocation {
+        path: doc
+            .canonical_path
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned()),
+        buffer: buffer_id,
+        view_key: crate::handlers::viewport::view_key_of(s, ViewId(buffer_id)),
+        cursor,
+        translated: false,
+    };
+    let Some(generated) = doc.generated.as_ref() else {
+        return Some(plain);
+    };
+    // The patch document itself: the client's focused element windows generated text. Its place
+    // is the outline entry the cursor is in, in that entry's file.
+    let Some((_, entry)) = crate::handlers::viewport::outline_entry_at(s, client_id, buffer_id)
+    else {
+        return Some(plain);
+    };
+    let Some(identity) = entry.identity.clone() else {
+        return Some(plain);
+    };
+    // A patch row's line in the file: the new side's, or — on a row with none, a removed line
+    // or a header — the hunk's top.
+    let file_line = |patch_line: u32| -> u32 {
+        generated
+            .index
+            .lines
+            .get(patch_line as usize)
+            .copied()
+            .flatten()
+            .and_then(|info| info.new_lineno)
+            .map_or(entry.file_lines.start, |n| n.saturating_sub(1))
+    };
+    let map = |p: LogicalPosition| LogicalPosition {
+        line: file_line(p.line),
+        col: p.col,
+    };
+    let (path, view_key) = if identity.starts_with('/') {
+        (Some(identity), None)
+    } else {
+        (None, Some(identity))
+    };
+    Some(crate::jumplist::StepLocation {
+        path,
+        buffer: buffer_id,
+        view_key,
+        cursor: CursorState {
+            position: map(cursor.position),
+            anchor: map(cursor.anchor),
+            ..cursor
+        },
+        translated: true,
+    })
 }
 
 /// What landing on entry `idx` takes: how it names the view it came from (key, file identity, file
