@@ -2112,11 +2112,27 @@ fn viewport_subscribe_params_carry_sticky_diff_view() {
         continuation_marker_width: 0,
         tab_width: 4,
         diff_view: true,
+        kind: None,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["diff_view"], true);
     // A fresh open names no focus: the server takes it from the scroll's element.
     assert!(v.get("focus").is_none(), "focus: None stays off the wire");
+    // Nor a kind: the server presents the file as it last was, or as the setting says.
+    assert!(v.get("kind").is_none(), "kind: None stays off the wire");
+    // A route that decided says so, by name.
+    let asked = ViewportSubscribeParams {
+        kind: Some(aether_protocol::ui::ViewKind::Reader),
+        ..p
+    };
+    assert_eq!(to_value(&asked).unwrap()["kind"], "reader");
+    let back: ViewportSubscribeParams = from_value(json!({
+        "buffer_id": 1, "cols": 80, "rows": 24, "overscan_rows": 0,
+        "scroll": { "element": 0, "line": 0, "sub_row": 0.0 },
+        "wrap": "none", "continuation_marker_width": 0, "tab_width": 4, "kind": "editor",
+    }))
+    .unwrap();
+    assert_eq!(back.kind, Some(aether_protocol::ui::ViewKind::Editor));
     // Absent on the wire → defaults off (older clients that don't send the sticky toggle).
     let back: ViewportSubscribeParams = from_value(json!({
         "buffer_id": 1, "cols": 80, "rows": 24, "overscan_rows": 0,

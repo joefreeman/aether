@@ -178,6 +178,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -280,6 +281,7 @@ async fn buffer_open_restores_scroll_from_a_window_request() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -373,6 +375,7 @@ async fn buffer_open_jump_drops_saved_scroll() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -464,6 +467,7 @@ async fn buffer_open_isolates_scroll_per_client() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
+                kind: None,
             },
         )
         .await;
@@ -711,6 +715,7 @@ async fn viewport_subscribe_renders_window() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -780,6 +785,7 @@ async fn viewport_subscribe_wraps_long_line() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -863,6 +869,7 @@ async fn viewport_scroll_returns_new_window() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -938,6 +945,7 @@ async fn the_socket_logs_pushes_it_read_past() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;

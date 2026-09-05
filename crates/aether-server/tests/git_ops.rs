@@ -2313,6 +2313,7 @@ async fn git_status_of(ws: &mut Ws, rel: &str) -> aether_protocol::git::GitBuffe
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;

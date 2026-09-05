@@ -1523,6 +1523,7 @@ async fn input_text_inserts_and_pushes_notification() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1599,6 +1600,7 @@ async fn input_delete_backspace_removes_char_before_cursor() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1964,6 +1966,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2051,6 +2054,7 @@ async fn setup_deferred_parse_buffer() -> (
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2228,6 +2232,7 @@ async fn setup_deferred_git_buffer(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2752,6 +2757,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2824,6 +2830,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3159,6 +3166,7 @@ async fn cut_selection_deletes_and_returns_text() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3236,6 +3244,7 @@ async fn input_text_with_select_pasted_makes_selection() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3289,6 +3298,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3469,6 +3479,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3663,6 +3674,7 @@ async fn join_lines_deletes_break_and_indent() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3837,6 +3849,7 @@ async fn unjoin_parked_cursor_agrees_across_push_and_response() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3931,6 +3944,7 @@ async fn input_text_with_selection_replaces_it() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5059,6 +5073,7 @@ async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5104,6 +5119,7 @@ async fn visual_line_preserves_visual_column() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5176,6 +5192,7 @@ async fn visual_line_crosses_logical_line_boundary() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5234,6 +5251,7 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5288,6 +5306,7 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5345,6 +5364,7 @@ async fn viewport_set_wrap_changes_visible_rows() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5395,6 +5415,7 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5471,6 +5492,7 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5542,6 +5564,7 @@ async fn virtual_col_cleared_by_horizontal_motion() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5625,6 +5648,7 @@ async fn virtual_col_cleared_by_mutation() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5710,6 +5734,7 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5978,6 +6003,7 @@ async fn hunk_view(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -6309,6 +6335,7 @@ async fn moving_focus_rescopes_the_active_search() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -6508,6 +6535,7 @@ async fn subscribing_to_a_patch_reports_the_element_the_cursor_is_in() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -6588,6 +6616,7 @@ async fn a_patch_opened_on_a_file_focuses_that_files_element() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -6672,6 +6701,7 @@ async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -6774,6 +6804,7 @@ async fn a_views_reported_height_is_the_rows_it_ships() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
+            kind: None,
         },
     )
     .await;
@@ -6887,6 +6918,7 @@ async fn every_scrollable_row_comes_back_in_its_window() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
+            kind: None,
         },
     )
     .await;
@@ -6965,6 +6997,7 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: true,
+            kind: None,
         },
     )
     .await;
@@ -7064,6 +7097,7 @@ async fn a_patch_ends_with_its_closing_rule() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -7119,6 +7153,7 @@ async fn a_patch_ends_with_its_closing_rule() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -7611,6 +7646,7 @@ async fn extending_a_selection_cannot_anchor_outside_the_element() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -7719,6 +7755,7 @@ async fn moving_a_paragraph_cannot_reach_outside_the_hunk() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -7822,6 +7859,7 @@ async fn motion_undo_refuses_a_position_in_another_hunk() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;

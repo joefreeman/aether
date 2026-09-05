@@ -64,7 +64,8 @@ pub async fn settings_set(
 
     let changed = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
     let pushes: PendingPushes = {
-        let s = state.lock().await;
+        let mut s = state.lock().await;
+        s.app_settings = params.clone();
         s.clients
             .iter()
             .filter(|(id, _)| **id != ctx.client_id)

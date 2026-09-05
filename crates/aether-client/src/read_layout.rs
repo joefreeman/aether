@@ -1923,3 +1923,104 @@ mod tests {
         assert_eq!(text[1], "plain text");
     }
 }
+
+/// What the framework's grid needs of a laid-out document — see [`crate::grid::Measured`]: the
+/// row within the element each source line starts on, and the element's height, with `pad_top`
+/// blank rows above the document and `pad_bottom` below (the padded row space the painters
+/// scroll). `line_of` maps a byte of the source to its line.
+///
+/// A line takes the first row of the *innermost* block covering it, so a list item's lines resolve
+/// to the item and not to the list around it; lines no block covers — the blanks between blocks —
+/// start where the previous line did, so every line has a row and the rows never descend. Line 0
+/// starts at row 0, the top padding riding on it: the grid takes the first line's row as the
+/// element's first, and revealing the document's start is what shows the padding above it.
+pub fn measured_element(
+    rows: &[ReadRow],
+    elements: &[Stop],
+    line_of: impl Fn(u32) -> u32,
+    line_count: u32,
+    pad_top: u32,
+    pad_bottom: u32,
+) -> crate::grid::MeasuredElement {
+    let line_count = line_count.max(1) as usize;
+    // Per line: the span length of the innermost block seen so far, and that block's first row.
+    let mut innermost: Vec<Option<(u32, u32)>> = vec![None; line_count];
+    for (row, r) in rows.iter().enumerate() {
+        let Some(e) = r.element.and_then(|i| elements.get(i)) else {
+            continue;
+        };
+        let span = e.span();
+        let len = span.end.saturating_sub(span.start);
+        let first = line_of(span.start) as usize;
+        let last = line_of(span.end.saturating_sub(1).max(span.start)) as usize;
+        for slot in innermost.iter_mut().take(last + 1).skip(first) {
+            if slot.is_none_or(|(have, _)| len < have) {
+                *slot = Some((len, row as u32));
+            }
+        }
+    }
+    let mut starts = Vec::with_capacity(line_count);
+    let mut prev = 0u32;
+    for (line, slot) in innermost.iter().enumerate() {
+        let at = match slot {
+            _ if line == 0 => 0,
+            Some((_, row)) => row.saturating_add(pad_top).max(prev),
+            None => prev,
+        };
+        starts.push(at);
+        prev = at;
+    }
+    crate::grid::MeasuredElement {
+        first_row: aether_protocol::coords::ElementRow::ZERO,
+        starts,
+        end: (rows.len() as u32)
+            .saturating_add(pad_top)
+            .saturating_add(pad_bottom),
+    }
+}
+
+#[cfg(test)]
+mod measure_tests {
+    use super::*;
+
+    fn line_of_in(text: &str) -> impl Fn(u32) -> u32 + '_ {
+        move |byte| {
+            text[..(byte as usize).min(text.len())]
+                .matches('\n')
+                .count() as u32
+        }
+    }
+
+    /// Every source line gets the first row of the innermost block covering it; separators take
+    /// the row before them; the padding rides on line 0 and the height.
+    #[test]
+    fn lines_resolve_to_their_innermost_blocks_first_row() {
+        let text = "# Title\n\npara one\nstill one\n\n- item a\n- item b\n";
+        let blocks = crate::markdown::parse(text);
+        let elements = crate::markdown::stops(&blocks);
+        let rows = layout(&blocks, &elements, 40, &Default::default());
+        let m = measured_element(&rows, &elements, line_of_in(text), 8, 2, 2);
+        assert_eq!(m.first_row.get(), 0);
+        assert_eq!(m.end, rows.len() as u32 + 4);
+        assert_eq!(m.starts.len(), 8);
+        assert_eq!(m.starts[0], 0, "line 0 carries the top padding");
+        // The paragraph's two lines share its first row; the blank before it takes the heading's.
+        assert_eq!(m.starts[1], m.starts[0].max(m.starts[1]));
+        assert_eq!(m.starts[2], m.starts[3]);
+        assert!(m.starts[2] > m.starts[1]);
+        // Each list item resolves to its own row, not the list's.
+        assert!(m.starts[6] > m.starts[5], "item b starts below item a");
+        assert!(m.starts.windows(2).all(|w| w[0] <= w[1]), "ascending");
+        // The trailing empty line takes the last block's row.
+        assert_eq!(m.starts[7], m.starts[6]);
+    }
+
+    /// Nothing laid out — loading, or a document with no blocks — is the padding alone, and every
+    /// line starts at the top.
+    #[test]
+    fn an_empty_layout_is_the_padding() {
+        let m = measured_element(&[], &[], |_| 0, 3, 2, 2);
+        assert_eq!(m.starts, vec![0, 0, 0]);
+        assert_eq!(m.end, 4);
+    }
+}

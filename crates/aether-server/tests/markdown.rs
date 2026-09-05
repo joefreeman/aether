@@ -200,8 +200,16 @@ async fn out_of_window_edit_pushes_buffer_changed() {
     .await;
     let _: BufferOpenResult =
         send_request::<BufferOpen>(&mut ws2, &attach_open_params(buffer_id, None)).await;
-    let _: ViewportSubscribeResult =
-        send_request::<ViewportSubscribe>(&mut ws2, &transient_sub_params(buffer_id)).await;
+    // As the *editor*: presented as the reader the document is loaded whole and nothing is ever
+    // outside the window — see `a_markdown_file_is_presented_as_the_reader_by_default`.
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws2,
+        &ViewportSubscribeParams {
+            kind: Some(aether_protocol::ui::ViewKind::Editor),
+            ..transient_sub_params(buffer_id)
+        },
+    )
+    .await;
 
     // Client 1 edits far below client 2's window → client 2 gets the revision-only signal.
     let _: CursorState = send_request::<CursorMove>(
@@ -1503,6 +1511,7 @@ async fn symbol_path_seeds_the_subscribe_snapshot() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1515,4 +1524,247 @@ async fn symbol_path_seeds_the_subscribe_snapshot() {
     assert_eq!(names, vec!["fn solo"]);
 
     drop(server);
+}
+
+// ---- the reader as a view ------------------------------------------------------------------------
+
+/// A workspace holding `doc.md` — a heading, a line far wider than any test viewport, and a
+/// paragraph — and `a.txt`, with a client attached and the markdown file open.
+async fn setup_reader_workspace() -> (aether_server::ServerHandle, Ws, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let wide = "x".repeat(120);
+    std::fs::write(
+        dir.path().join("doc.md"),
+        format!("# Title\n\n{wide}\n\nSecond paragraph.\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("other.md"), "# Other\n").unwrap();
+    std::fs::write(dir.path().join("a.txt"), "plain\n").unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    server.keep_alive(dir);
+    let mut ws = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, &file_open_params("doc.md", None)).await;
+    (server, ws, open.buffer_id)
+}
+
+/// A narrow, soft-wrapped, two-row viewport over `buffer_id`, asking for `kind`.
+fn reader_sub_params(
+    buffer_id: u64,
+    kind: Option<aether_protocol::ui::ViewKind>,
+) -> ViewportSubscribeParams {
+    ViewportSubscribeParams {
+        buffer_id: aether_protocol::ViewId(buffer_id),
+        cols: 20,
+        rows: 2,
+        overscan_rows: 0,
+        scroll: ScrollPosition {
+            element: 0,
+            line: 0,
+            sub_row: 0.0,
+        },
+        focus: None,
+        wrap: WrapMode::Soft,
+        continuation_marker_width: 0,
+        tab_width: 4,
+        diff_view: false,
+        kind,
+    }
+}
+
+/// The one editor element of a window over an ordinary file: who lays it out, its height, and the
+/// lines it carries as `(line, visual rows)`.
+fn the_element(
+    window: &aether_protocol::viewport::Window,
+) -> (
+    aether_protocol::ui::LayoutOwner,
+    u32,
+    u32,
+    Vec<(u32, usize)>,
+) {
+    match &window.root {
+        aether_protocol::viewport::Element::Editor {
+            laid_out_by,
+            rows,
+            first_row,
+            lines,
+            ..
+        } => (
+            *laid_out_by,
+            *rows,
+            first_row.get(),
+            lines
+                .iter()
+                .map(|l| (l.logical_line, l.visual_rows.len()))
+                .collect(),
+        ),
+        other => panic!("one editor element, got {other:?}"),
+    }
+}
+
+/// A markdown file presented with no opinion — a plain open — is the reader, the app setting's
+/// default: one element the client lays out, sent **unwrapped** (a wire row is a line, however
+/// narrow the viewport) and **whole** (every line, however short the viewport).
+#[tokio::test]
+async fn a_markdown_file_is_presented_as_the_reader_by_default() {
+    let (_server, mut ws, buffer_id) = setup_reader_workspace().await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(buffer_id, None)).await;
+    let (owner, rows, first_row, lines) = the_element(&sub.window);
+    assert_eq!(owner, aether_protocol::ui::LayoutOwner::Client);
+    assert_eq!(rows, 6, "one wire row per line, six lines");
+    assert_eq!(first_row, 0);
+    assert_eq!(
+        lines,
+        (0..6).map(|l| (l, 1)).collect::<Vec<_>>(),
+        "every line, none of them wrapped, in a two-row viewport of twenty columns"
+    );
+}
+
+/// A window request into a reader's element answers with the whole element, whatever slice was
+/// asked for: a partial document is nothing the client could lay out.
+#[tokio::test]
+async fn a_window_request_loads_a_reader_element_whole() {
+    use aether_protocol::viewport::{SliceRequest, ViewportWindow, ViewportWindowParams};
+    let (_server, mut ws, buffer_id) = setup_reader_workspace().await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(buffer_id, None)).await;
+    let res: ViewportWindowResult = send_request::<ViewportWindow>(
+        &mut ws,
+        &ViewportWindowParams {
+            viewport_id: sub.viewport_id,
+            anchor: ScrollPosition {
+                element: 0,
+                line: 3,
+                sub_row: 0.0,
+            },
+            slices: vec![SliceRequest {
+                element: 0,
+                from_row: aether_protocol::coords::ElementRow(3),
+                rows: 1,
+            }],
+        },
+    )
+    .await;
+    let (owner, rows, first_row, lines) = the_element(&res.window);
+    assert_eq!(owner, aether_protocol::ui::LayoutOwner::Client);
+    assert_eq!(
+        (rows, first_row, lines.len()),
+        (6, 0, 6),
+        "whole, from the top"
+    );
+}
+
+/// `Space v` asks for the other kind, and the file remembers: a re-subscribe with no opinion
+/// keeps the view as it is, and so does a fresh open of the same file after a close — from any
+/// client. Asked for the reader again, it is the reader again.
+#[tokio::test]
+async fn re_presenting_a_file_is_remembered_across_a_close() {
+    use aether_protocol::ui::{LayoutOwner, ViewKind};
+    let (server, mut ws, buffer_id) = setup_reader_workspace().await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &reader_sub_params(buffer_id, Some(ViewKind::Editor)),
+    )
+    .await;
+    let (owner, _, _, lines) = the_element(&sub.window);
+    assert_eq!(owner, LayoutOwner::Server);
+    assert!(
+        lines.len() < 6,
+        "the editor loads a screen, not the document: {lines:?}"
+    );
+    // No opinion keeps it — a wrap toggle or a reconnect must not flip the view.
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(buffer_id, None)).await;
+    assert_eq!(the_element(&sub.window).0, LayoutOwner::Server);
+
+    // Close and reopen from another client: the file comes back as the editor.
+    let _: BufferCloseResult = send_request::<BufferClose>(
+        &mut ws,
+        &BufferCloseParams {
+            buffer_id: aether_protocol::ViewId(buffer_id),
+            open_next: false,
+        },
+    )
+    .await;
+    let mut ws2 = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let reopened: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws2, &file_open_params("doc.md", None)).await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws2, &reader_sub_params(reopened.buffer_id, None))
+            .await;
+    assert_eq!(
+        the_element(&sub.window).0,
+        LayoutOwner::Server,
+        "remembered as the editor"
+    );
+    // Asked for the reader, it is the reader.
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws2,
+        &reader_sub_params(reopened.buffer_id, Some(ViewKind::Reader)),
+    )
+    .await;
+    assert_eq!(the_element(&sub.window).0, LayoutOwner::Client);
+}
+
+/// The app setting decides for a file never presented; a file already presented keeps what it
+/// was; a file with no reader — anything but markdown — is the editor whatever is asked.
+#[tokio::test]
+async fn the_setting_decides_a_file_never_presented() {
+    use aether_protocol::ui::{LayoutOwner, ViewKind};
+    let (server, mut ws, buffer_id) = setup_reader_workspace().await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(buffer_id, None)).await;
+    assert_eq!(the_element(&sub.window).0, LayoutOwner::Client);
+
+    server.state.lock().await.app_settings.markdown_read = false;
+    let other: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, &file_open_params("other.md", None)).await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(other.buffer_id, None)).await;
+    assert_eq!(
+        the_element(&sub.window).0,
+        LayoutOwner::Server,
+        "never presented → the setting"
+    );
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(buffer_id, None)).await;
+    assert_eq!(
+        the_element(&sub.window).0,
+        LayoutOwner::Client,
+        "already presented → as it was"
+    );
+
+    let plain: BufferOpenResult =
+        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &reader_sub_params(plain.buffer_id, Some(ViewKind::Reader)),
+    )
+    .await;
+    assert_eq!(
+        the_element(&sub.window).0,
+        LayoutOwner::Server,
+        "no reader for a text file"
+    );
 }

@@ -1034,6 +1034,7 @@ async fn nav_open_file(ws: &mut Ws, file: &str, record_from: Option<u64>) -> (u6
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;

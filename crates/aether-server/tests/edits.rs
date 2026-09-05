@@ -2903,6 +2903,7 @@ async fn input_delete_line_removes_line_with_newline() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2952,6 +2953,7 @@ async fn input_change_line_blanks_content_keeps_newline() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3000,6 +3002,7 @@ async fn input_replace_line_swaps_content() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3054,6 +3057,7 @@ async fn subscribe_full(ws: &mut Ws, buffer_id: u64) -> ViewportSubscribeResult 
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await
@@ -3678,6 +3682,7 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3895,6 +3900,7 @@ async fn diff_view_carries_intraline_emphasis_on_modified_pairs() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
+            kind: None,
         },
     )
     .await;
@@ -3986,6 +3992,7 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -4017,6 +4024,7 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
+            kind: None,
         },
     )
     .await;
@@ -4090,6 +4098,7 @@ async fn git_status_counts_ride_the_window() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -4189,6 +4198,7 @@ async fn git_status_splits_staged_and_unstaged() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -4270,6 +4280,7 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -4329,6 +4340,7 @@ async fn setup_with_viewport(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;

@@ -490,6 +490,7 @@ pub async fn buffer_text(ws: &mut Ws, buffer_id: u64) -> String {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -979,6 +980,7 @@ pub async fn open_and_subscribe_with_lsp(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1171,6 +1173,7 @@ pub fn transient_sub_params(buffer_id: u64) -> ViewportSubscribeParams {
         continuation_marker_width: 0,
         tab_width: 4,
         diff_view: false,
+        kind: None,
     }
 }
 
@@ -1402,6 +1405,7 @@ async fn window_with_diff(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view,
+            kind: None,
         },
     )
     .await;

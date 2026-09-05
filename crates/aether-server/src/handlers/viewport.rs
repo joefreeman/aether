@@ -28,8 +28,9 @@ pub async fn viewport_subscribe(
     // first frame shows a clean gutter for a modified file and stays wrong until the next edit.
     rediff_git_for_buffer(&mut s, buffer_id);
 
-    // The view exists from the first presentation on; a driver's view is already there.
-    s.ensure_view(params.buffer_id);
+    // The view exists from the first presentation on, as the kind this presentation asks for; a
+    // driver's view is already there and is what it is.
+    s.present_view(params.buffer_id, params.kind);
     let geom = wrap::WrapGeometry {
         wrap: params.wrap,
         cols: params.cols,
@@ -48,7 +49,7 @@ pub async fn viewport_subscribe(
         let layout = s.layout_of(&view.elements);
         let binding = &view.elements[anchor_element as usize];
         let range = layout.element_range(anchor_element);
-        let phantoms = element_phantom_rows(&s, binding, params.diff_view);
+        let (geom, phantoms) = element_geometry(&s, binding, geom, params.diff_view);
         let doc = s.doc_of(binding.buffer_id);
         let line = params.scroll.line.clamp(
             range.start(),
@@ -56,17 +57,20 @@ pub async fn viewport_subscribe(
         );
         // A screen of the anchor's element from its line, less the overscan above — the same slice
         // the client would ask for once it has laid the view out, so the first frame needs no
-        // second round trip.
+        // second round trip. An element the client lays out is loaded whole: see
+        // `whole_if_client_laid_out`.
         let from_row = element_rows_before(doc, geom, &phantoms, range, line)
             .saturating_sub(params.overscan_rows);
-        let slice = slice_from(
-            doc,
-            geom,
-            &phantoms,
-            range,
-            from_row,
-            params.rows + 2 * params.overscan_rows,
-        );
+        let slice = whole_if_client_laid_out(binding, range, || {
+            slice_from(
+                doc,
+                geom,
+                &phantoms,
+                range,
+                from_row,
+                params.rows + 2 * params.overscan_rows,
+            )
+        });
         let mut loaded = vec![None; view.elements.len()];
         if !slice.is_empty() {
             loaded[anchor_element as usize] = Some(slice);
@@ -1028,15 +1032,17 @@ pub async fn viewport_window(
                 continue;
             };
             let range = layout.element_range(req.element);
-            let phantoms = element_phantom_rows(&s, binding, vp.diff_view);
-            let slice = slice_from(
-                s.doc_of(binding.buffer_id),
-                geom,
-                &phantoms,
-                range,
-                req.from_row,
-                req.rows,
-            );
+            let (geom, phantoms) = element_geometry(&s, binding, geom, vp.diff_view);
+            let slice = whole_if_client_laid_out(binding, range, || {
+                slice_from(
+                    s.doc_of(binding.buffer_id),
+                    geom,
+                    &phantoms,
+                    range,
+                    req.from_row,
+                    req.rows,
+                )
+            });
             if !slice.is_empty() {
                 loaded[req.element as usize] = Some(slice);
             }
@@ -1100,7 +1106,7 @@ pub async fn viewport_window_at_cursor(
             .get(&(client_id, binding.buffer_id))
             .copied()
             .unwrap_or_default();
-        let phantoms = element_phantom_rows(&s, binding, vp.diff_view);
+        let (geom, phantoms) = element_geometry(&s, binding, geom, vp.diff_view);
         let doc = s.doc_of(binding.buffer_id);
         // Clamped into the element: its extent is a claim about the buffer that a rebuild between
         // the ask and the answer could have outrun.
@@ -1110,14 +1116,16 @@ pub async fn viewport_window_at_cursor(
         );
         let from_row = element_rows_before(doc, geom, &phantoms, range, line)
             .saturating_sub(vp.rows / 3 + vp.overscan_rows);
-        let slice = slice_from(
-            doc,
-            geom,
-            &phantoms,
-            range,
-            from_row,
-            vp.rows + 2 * vp.overscan_rows,
-        );
+        let slice = whole_if_client_laid_out(binding, range, || {
+            slice_from(
+                doc,
+                geom,
+                &phantoms,
+                range,
+                from_row,
+                vp.rows + 2 * vp.overscan_rows,
+            )
+        });
         let mut loaded = vec![None; view.elements.len()];
         let anchor = ScrollPosition {
             element,
@@ -1227,7 +1235,11 @@ fn reseat_orphaned_slices(s: &mut ServerState, buffer_id: BufferId) {
                     return None;
                 }
                 let end = range.end_exclusive();
-                Some((idx, end.saturating_sub(want).max(range.start())..end))
+                let last_screen = end.saturating_sub(want).max(range.start())..end;
+                Some((
+                    idx,
+                    whole_if_client_laid_out(binding, range, || last_screen),
+                ))
             })
             .collect();
         let vp = s.viewports.get_mut(&id).expect("listed viewport");
@@ -2009,6 +2021,7 @@ struct RenderedElement {
     rows: u32,
     /// Where the loaded slice starts within the element.
     first_row: ElementRow,
+    laid_out_by: aether_protocol::ui::LayoutOwner,
     chrome_above: std::sync::Arc<Vec<Element>>,
     first_buffer_line: u32,
     lines: Vec<LogicalLineRender>,
@@ -2051,9 +2064,9 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
     // buffer's diff instead left a bound patch's height six rows short of the view it described —
     // the scroll bound stopped before the end, and the fetch that fills the viewport thought it had
     // already reached it, so the bottom of the screen went blank.
-    let phantom_rows: Vec<HashMap<u32, u32>> = elements
+    let geometry: Vec<(wrap::WrapGeometry, HashMap<u32, u32>)> = elements
         .iter()
-        .map(|binding| element_phantom_rows(s, binding, diff_view))
+        .map(|binding| element_geometry(s, binding, geom, diff_view))
         .collect();
 
     // Render each element's loaded slice, if it has one. An element with nothing loaded contributes
@@ -2072,9 +2085,11 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
             .cloned()
             .flatten()
             .and_then(|slice| layout.clip(element, slice));
+        let (geom, phantom_rows) = &geometry[idx];
+        let geom = *geom;
         let (first_row, first_buffer_line, lines) = match loaded {
             Some(r) => (
-                element_rows_before(doc, geom, &phantom_rows[idx], range, r.start()),
+                element_rows_before(doc, geom, phantom_rows, range, r.start()),
                 r.start(),
                 render_element_lines(
                     s,
@@ -2094,8 +2109,9 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
             buffer: binding.buffer_id,
             // The element's *whole* height, from the layout's clamped range rather than the raw
             // extents: the diff's account of a hunk can outlive the lines it described.
-            rows: element_visual_rows(doc, range, geom, &phantom_rows[idx]),
+            rows: element_visual_rows(doc, range, geom, phantom_rows),
             first_row,
+            laid_out_by: binding.laid_out_by,
             chrome_above: binding.chrome_above.clone(),
             first_buffer_line,
             lines,
@@ -2120,6 +2136,47 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         git_status: buffer_git_status(s, s.focused_buffer(vp)),
         other_elements_dirty: other_elements_dirty(s, elements, focused),
         root: compose_tree(rendered, trailing_chrome),
+    }
+}
+
+/// How an element's rows are counted: the viewport's wrapping and the element's phantom rows for
+/// one the server lays out; unwrapped and phantom-free for one the client lays out, where a wire
+/// row is a line and nothing the server could add to the count would survive the client's
+/// measure. Every path that counts an element's rows — the subscribe, a window request, a cursor
+/// window, the render — takes its geometry from here, so no path can wrap what another sent whole.
+fn element_geometry(
+    s: &ServerState,
+    binding: &ElementBinding,
+    geom: wrap::WrapGeometry,
+    diff_view: bool,
+) -> (wrap::WrapGeometry, HashMap<u32, u32>) {
+    match binding.laid_out_by {
+        aether_protocol::ui::LayoutOwner::Server => {
+            (geom, element_phantom_rows(s, binding, diff_view))
+        }
+        aether_protocol::ui::LayoutOwner::Client => (
+            wrap::WrapGeometry {
+                wrap: aether_protocol::viewport::WrapMode::None,
+                ..geom
+            },
+            HashMap::new(),
+        ),
+    }
+}
+
+/// The lines to load of an element: the whole of it for one the client lays out, whatever was
+/// asked, else what `screen` says. The client renders prose from the source entire — a block's
+/// shape depends on the lines around it — so a partial load is never a state it can use, and
+/// making the load whole here rather than trusting each request to ask for it is what keeps every
+/// push, reseat and re-render of the element whole too.
+fn whole_if_client_laid_out(
+    binding: &ElementBinding,
+    range: BufferRange,
+    screen: impl FnOnce() -> std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+    match binding.laid_out_by {
+        aether_protocol::ui::LayoutOwner::Client => range.lines(),
+        aether_protocol::ui::LayoutOwner::Server => screen(),
     }
 }
 
@@ -2184,7 +2241,7 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
         buffer: r.buffer,
         rows: r.rows,
         first_row: r.first_row,
-        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+        laid_out_by: r.laid_out_by,
         first_buffer_line: r.first_buffer_line,
         lines: r.lines,
     };
@@ -2697,6 +2754,7 @@ mod subscribe_snapshot_tests {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         }
     }
 
@@ -2774,6 +2832,7 @@ mod slice_tests {
             lines: ElementLines::Whole,
             decorations: None,
             chrome_above: Default::default(),
+            laid_out_by: aether_protocol::ui::LayoutOwner::Server,
         };
         ViewLayout::of(std::slice::from_ref(&binding), |_| doc.line_count()).element_range(0)
     }
@@ -2881,6 +2940,7 @@ mod tests {
                         },
                         decorations: None,
                         chrome_above: Default::default(),
+                        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                     })
                     .collect(),
             },
@@ -3128,6 +3188,7 @@ mod tests {
             },
             decorations: None,
             chrome_above: Default::default(),
+            laid_out_by: aether_protocol::ui::LayoutOwner::Server,
         };
         let vp = viewport_over(&mut s, vec![a, b]); // no generated view behind these plain buffers
         *elements_mut(&mut s, &vp) = vec![binding(a), binding(b)];

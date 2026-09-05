@@ -924,6 +924,7 @@ async fn a_buffer_in_a_bound_repo_reports_its_checkout_as_a_worktree() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
+                kind: None,
             },
         )
         .await;
@@ -1414,6 +1415,7 @@ async fn the_rebinding_client_lands_on_the_file_it_was_viewing() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
+                kind: None,
             },
         )
         .await;

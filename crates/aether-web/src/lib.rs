@@ -121,21 +121,30 @@ impl WasmSession {
         })
     }
 
-    /// Apply the markdown reading-view boot rules — call once after [`Self::bootstrap`]: boot
-    /// installs the session directly, never passing through `adopt_switch`, so the read-vs-edit
-    /// decision runs here. `jumped` = the URL carried a `#line:col` jump (jump-shaped opens land in
-    /// the editor). Returns `Effect[]` (the content fetch when the buffer opens as a reading view).
-    pub fn boot_read_presentation(&mut self, jumped: bool) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(self.inner.boot_read_presentation(jumped)))
+    /// Apply the markdown reading-view boot rules — call once after [`Self::bootstrap`] and
+    /// **before** the first subscribe: boot installs the session directly, never passing through
+    /// `adopt_switch`, so the read-vs-edit decision runs here, and it decides what that subscribe
+    /// asks for. `jumped` = the URL carried a `#line:col` jump (jump-shaped opens land in the
+    /// editor).
+    pub fn boot_read_presentation(&mut self, jumped: bool) {
+        self.inner.boot_read_presentation(jumped);
     }
 
     /// [`Self::boot_read_presentation`] with an explicit choice — the URL's `view=read|source`
     /// param, recorded by the shell so a refresh restores the presentation on screen (the
-    /// `#line:col` cursor restore in the same URL must not read as a jump). Returns `Effect[]`.
-    pub fn boot_read_presentation_explicit(&mut self, read: bool) -> Result<JsValue, JsValue> {
-        to_js(&effects_to_json(
-            self.inner.boot_read_presentation_explicit(read),
-        ))
+    /// `#line:col` cursor restore in the same URL must not read as a jump).
+    pub fn boot_read_presentation_explicit(&mut self, read: bool) {
+        self.inner.boot_read_presentation_explicit(read);
+    }
+
+    /// The kind the subscribe being issued asks for — `"editor"`, `"reader"`, or `undefined`
+    /// when this client's route has no opinion and the server presents the file as it last was.
+    /// Taken: a re-subscribe must not repeat it.
+    pub fn subscribe_kind(&mut self) -> Option<String> {
+        self.inner.subscribe_kind().map(|k| match k {
+            aether_protocol::ui::ViewKind::Editor => "editor".to_string(),
+            aether_protocol::ui::ViewKind::Reader => "reader".to_string(),
+        })
     }
 
     /// A click on a reading-view element: the shell resolves the clicked node's `data-espan`
@@ -209,19 +218,19 @@ impl WasmSession {
     }
 
     /// Adopt a `viewport/subscribe` result (a geometry RPC the shell issued).
-    /// The shell does its pixel positioning afterward, reading `view`.
-    ///
-    pub fn adopt_subscribe(&mut self, res: JsValue) -> Result<(), JsValue> {
+    /// The shell does its pixel positioning afterward, reading `view`. Returns `Effect[]` — the
+    /// reading view's, when the window presents one (its fence highlight requests, a followed
+    /// anchor's cursor move); run them.
+    pub fn adopt_subscribe(&mut self, res: JsValue) -> Result<JsValue, JsValue> {
         let res: ViewportSubscribeResult = from_js(res)?;
-        self.inner.adopt_subscribe(res);
-        Ok(())
+        to_js(&effects_to_json(self.inner.adopt_subscribe(res)))
     }
 
-    /// Adopt a window from a geometry RPC (`view/window`/`view/set_wrap`/`view/resize`).
-    pub fn adopt_window(&mut self, res: JsValue) -> Result<(), JsValue> {
+    /// Adopt a window from a geometry RPC (`view/window`/`view/set_wrap`/`view/resize`). Returns
+    /// `Effect[]`, as [`Self::adopt_subscribe`] does.
+    pub fn adopt_window(&mut self, res: JsValue) -> Result<JsValue, JsValue> {
         let res: ViewportWindowResult = from_js(res)?;
-        self.inner.adopt_window(res);
-        Ok(())
+        to_js(&effects_to_json(self.inner.adopt_window(res)))
     }
 
     /// Report the on-screen line range (the shell owns the pixel scroll) so sneak scopes its labels
@@ -297,6 +306,13 @@ impl WasmSession {
     /// or `null` on a fresh open, where the server decides from the place the view opens at.
     pub fn subscribe_focus(&self) -> Option<u32> {
         self.inner.subscribe_focus()
+    }
+
+    /// Where a pending content anchor (a wrap toggle, `Space v`) says the next subscribe should
+    /// open — a `ScrollPosition`, or `null` when none is pending. The subscribe loads a window
+    /// around it so `resolve_scroll_anchor` can place the view exactly once the window arrives.
+    pub fn relayout_anchor_position(&self) -> Result<JsValue, JsValue> {
+        to_js(&self.inner.relayout_anchor_position())
     }
 
     /// The absolute row a fresh subscribe's scroll lands the viewport on, or `null` when the

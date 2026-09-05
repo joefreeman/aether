@@ -9,6 +9,7 @@ use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
 use aether_protocol::lsp::SymbolCrumb;
 use aether_protocol::picker::{MatchOptions, PickerKind};
+use aether_protocol::ui::{LayoutOwner, ViewKind};
 use aether_protocol::viewport::{ScrollPosition, WrapMode};
 use aether_protocol::{BufferId, ClientId, LogicalPosition, Revision, ViewId, ViewportId};
 use std::time::{Duration, Instant};
@@ -158,6 +159,14 @@ pub struct ServerState {
     /// buffer recorded a patch's position against one of its files, which a plain open of that file
     /// then restored as if it were the file's own. Cleared on disconnect.
     pub last_scroll: HashMap<(ClientId, ViewId), ScrollPosition>,
+    /// The kind each file was last presented as — editor or reader — by canonical path, so the
+    /// choice outlives the buffer: close a document you were reading and it reopens in the reader,
+    /// whichever client opens it. Consulted only when a subscribe names no kind of its own; the
+    /// app setting decides for a file never presented.
+    pub last_view_kind: HashMap<PathBuf, ViewKind>,
+    /// The app settings as this server knows them: loaded from the profile at boot, replaced by
+    /// every `settings/set`. Tests never touch the profile's file, and start from the defaults.
+    pub app_settings: aether_protocol::settings::AppSettings,
     /// Per-`(client, kind)` picker state. Survives `picker/hide` (so resume restores query +
     /// ranking); cleared on disconnect.
     pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
@@ -657,6 +666,8 @@ impl ServerState {
             cursor_moved_tx: None,
             deferred: Arc::new(Deferred::default()),
             last_scroll: HashMap::new(),
+            last_view_kind: HashMap::new(),
+            app_settings: aether_protocol::settings::AppSettings::default(),
             pickers: HashMap::new(),
             nav_history: HashMap::new(),
             git_unstaged_hunks: HashMap::new(),
@@ -759,6 +770,63 @@ impl ServerState {
         if !self.views.contains_key(&id) {
             let view = self.default_view(id);
             self.views.insert(id, view);
+        }
+    }
+
+    /// Make sure `id`'s view exists **as the kind it is being presented as** — what a subscribe
+    /// does, and the one place a view's kind is decided.
+    ///
+    /// A driver's view is what it is. A markdown file's view is the kind asked for; asked for
+    /// nothing, the kind it already is (a re-subscribe, a second client), else the kind the file
+    /// was last presented as, else the app setting. Any other file has only the editor, whatever
+    /// was asked. Presenting a markdown file records its kind, so the next open of it — from any
+    /// client, after any close — finds it.
+    pub fn present_view(&mut self, id: ViewId, requested: Option<ViewKind>) {
+        let buffer_id = id.presenting_buffer();
+        let (is_markdown, path) = {
+            let doc = self.doc_of(buffer_id);
+            (
+                doc.language.as_deref() == Some("markdown"),
+                doc.canonical_path.clone(),
+            )
+        };
+        let existing = match self.views.get(&id) {
+            Some(view) => match view.kind() {
+                Some(kind) => Some(kind),
+                None => return, // a driver's view
+            },
+            None => match self.default_view(id).kind() {
+                Some(_) => None,
+                None => {
+                    // A generated document with regions of its own: presented as they are.
+                    self.ensure_view(id);
+                    return;
+                }
+            },
+        };
+        let kind = if !is_markdown {
+            ViewKind::Editor
+        } else {
+            requested
+                .or(existing)
+                .or_else(|| {
+                    path.as_ref()
+                        .and_then(|p| self.last_view_kind.get(p).copied())
+                })
+                .unwrap_or(if self.app_settings.markdown_read {
+                    ViewKind::Reader
+                } else {
+                    ViewKind::Editor
+                })
+        };
+        if existing != Some(kind) {
+            self.views.insert(id, View::of_kind(buffer_id, kind));
+            self.rebind_viewports_of(buffer_id);
+        }
+        if is_markdown {
+            if let Some(path) = path {
+                self.last_view_kind.insert(path, kind);
+            }
         }
     }
 
@@ -3320,7 +3388,45 @@ impl View {
                 lines: ElementLines::Whole,
                 decorations: None,
                 chrome_above: std::sync::Arc::new(Vec::new()),
+                laid_out_by: LayoutOwner::Server,
             }],
+        }
+    }
+
+    /// The reader over a markdown buffer: one element over the whole of it, laid out by the client
+    /// from the source it is sent unwrapped. Blocks, focus and the reading position are the
+    /// client's subdivision of that one element; the server sees a file, and the cursor in it.
+    pub fn reader(buffer_id: BufferId) -> Self {
+        View {
+            elements: vec![ElementBinding {
+                buffer_id,
+                lines: ElementLines::Whole,
+                decorations: None,
+                chrome_above: std::sync::Arc::new(Vec::new()),
+                laid_out_by: LayoutOwner::Client,
+            }],
+        }
+    }
+
+    /// The view a buffer presents, of the kinds a client can ask for.
+    pub fn of_kind(buffer_id: BufferId, kind: ViewKind) -> Self {
+        match kind {
+            ViewKind::Editor => View::whole(buffer_id),
+            ViewKind::Reader => View::reader(buffer_id),
+        }
+    }
+
+    /// Which of the two client-choosable kinds this view is — `None` for a view a driver built,
+    /// which is neither and cannot be re-presented as either.
+    pub fn kind(&self) -> Option<ViewKind> {
+        match &self.elements[..] {
+            [only] if only.lines == ElementLines::Whole && only.chrome_above.is_empty() => {
+                Some(match only.laid_out_by {
+                    LayoutOwner::Server => ViewKind::Editor,
+                    LayoutOwner::Client => ViewKind::Reader,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -3354,6 +3460,7 @@ impl View {
                             .cloned()
                             .unwrap_or_default(),
                     ),
+                    laid_out_by: LayoutOwner::Server,
                 })
                 .collect(),
         }
@@ -3473,6 +3580,7 @@ impl ElementLayout {
             },
             decorations: self.decorations.clone(),
             chrome_above: self.chrome_above.clone(),
+            laid_out_by: LayoutOwner::Server,
         }
     }
 }
@@ -3539,6 +3647,11 @@ pub struct ElementBinding {
     /// lookup was the last thing tying a view's structure to a document's line space. An element
     /// whose content comes from a real file has no line in the patch to anchor its heading to.
     pub chrome_above: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
+    /// Whose arithmetic the element's height is. A server-laid-out element is wrapped to the
+    /// viewport and shipped a screen at a time; a client-laid-out one is sent unwrapped and whole,
+    /// and the client measures it. Decided by the view's kind, never per viewport: two clients
+    /// presenting one view see the same elements.
+    pub laid_out_by: LayoutOwner,
 }
 
 impl ElementBinding {
@@ -3751,6 +3864,7 @@ mod view_layout_tests {
             },
             decorations: None,
             chrome_above: Default::default(),
+            laid_out_by: LayoutOwner::Server,
         };
         vec![binding(1), binding(2)]
     }

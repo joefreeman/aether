@@ -248,9 +248,10 @@ pub struct Shell {
     fatal: Option<String>,
     /// The (profile-resolved) WebSocket address every boot dial and reconnect dials.
     server_url: String,
-    /// Reading-view scroll: first visible row of the laid-out document — the reading sibling of
-    /// `top_visual_row` (read-mode scroll is shell-owned).
-    read_scroll: u16,
+    /// A window landed in a reading view this shell has not laid out yet, so its placement — the
+    /// content anchor of a `Space v`, or the subscribe's scroll — waits for `read_view` to measure
+    /// the document: a row cannot be found in rows nobody has counted.
+    read_place_pending: bool,
     /// The focus last revealed, so the view scrolls only when the focus *changes* (manual
     /// scrolling doesn't fight the reveal).
     read_last_focus: Option<usize>,
@@ -332,7 +333,7 @@ pub async fn run(
         boot_attempt: 0,
         fatal: None,
         server_url,
-        read_scroll: 0,
+        read_place_pending: false,
         read_last_focus: None,
         read_cache: None,
         read_hscroll: std::collections::HashMap::new(),
@@ -589,6 +590,11 @@ impl Shell {
                 Effect::WindowAdopted => {
                     // Diff toggle re-layout: if a content anchor is pending, restore the view to
                     // it (keep the same content on screen); otherwise clamp + reveal as before.
+                    // A reading view not yet laid out cannot be placed by rows: `read_view`
+                    // finishes the placement once it has measured.
+                    if self.defer_read_placement() {
+                        return;
+                    }
                     if let Some(row) = self.session.resolve_scroll_anchor(&self.measured) {
                         self.top_visual_row = row;
                         self.clamp_scroll();
@@ -693,7 +699,13 @@ impl Shell {
                 match crate::connection::parse_reply::<ViewportSubscribeResult>(method, result) {
                     Ok(res) => {
                         let scroll = self.subscribe_scroll;
-                        self.session.adopt_subscribe(res);
+                        let fx = self.session.adopt_subscribe(res);
+                        self.run_effects(fx);
+                        // A reading view not yet laid out cannot be placed by rows: `read_view`
+                        // finishes the placement once it has measured.
+                        if self.defer_read_placement() {
+                            return;
+                        }
                         // A wrap toggle left a content anchor pending: restore the view to it
                         // (keeping the same content on screen across the reflow). Otherwise
                         // position the top at the subscribe's scroll line and reveal the cursor
@@ -748,7 +760,11 @@ impl Shell {
                 match crate::connection::parse_reply::<ViewportWindowResult>(method, result) {
                     Ok(res) => {
                         self.fetch_in_flight = false;
-                        self.session.adopt_window(res);
+                        let fx = self.session.adopt_window(res);
+                        self.run_effects(fx);
+                        if self.defer_read_placement() {
+                            return;
+                        }
                         self.clamp_scroll();
                         // A reply to the cursor's own chase settles differently: if it can't place
                         // the cursor, nothing can, and chasing again is the loop that flickers.
@@ -824,11 +840,10 @@ impl Shell {
                     // Boot installs the session directly (no `adopt_switch`), so the markdown
                     // reading-view default is applied here; an `ae file:line` launch is jump-shaped
                     // and lands in the editor.
-                    let read_fx = self.session.boot_read_presentation(jumped);
+                    self.session.boot_read_presentation(jumped);
                     self.sent_grid = Some(self.grid());
                     self.subscribe();
                     self.run_effects(b.startup);
-                    self.run_effects(read_fx);
                 }
                 // Daemon not up yet — keep dialing (the whole point of launching first).
                 Err(ReconnectError::NotUp) => {
@@ -1300,8 +1315,8 @@ impl Shell {
                     let e = self.read_element_at_row(m.row);
                     self.read_hscroll_by(e, 6);
                 }
-                MouseEventKind::ScrollUp => self.read_scroll_by(-3),
-                MouseEventKind::ScrollDown => self.read_scroll_by(3),
+                MouseEventKind::ScrollUp => self.scroll_by(-3),
+                MouseEventKind::ScrollDown => self.scroll_by(3),
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some((byte, interactive)) = self.read_hit(m.row, m.column) {
                         // A click ON a link/footnote-ref span follows it like Enter (the
@@ -1463,8 +1478,8 @@ impl Shell {
                 // this is a clamped no-op anywhere else).
                 if self.session.view.read.is_some() {
                     match dir {
-                        ScrollDir::Up => self.read_scroll_by(-(delta as i32)),
-                        ScrollDir::Down => self.read_scroll_by(delta as i32),
+                        ScrollDir::Up => self.scroll_by(-delta),
+                        ScrollDir::Down => self.scroll_by(delta),
                         ScrollDir::Left | ScrollDir::Right => {
                             let (content_cols, _) =
                                 crate::ui::read_measure(self.term.0, self.session.markdown_width);
@@ -1593,6 +1608,7 @@ impl Shell {
                 continuation_marker_width: 2,
                 tab_width: TAB_WIDTH,
                 diff_view: self.session.diff_view,
+                kind: self.session.subscribe_kind(),
             });
         self.inflight.insert(id, Continuation::Subscribed);
         self.pending_subscribe = Some(id);
@@ -1673,6 +1689,13 @@ impl Shell {
     /// After a cursor move: fetch around the cursor when it left the loaded window,
     /// otherwise scroll the minimum to reveal it.
     fn ensure_cursor_visible(&mut self, style: RevealStyle) {
+        // The reading view reveals its *block*, at block grain and on focus changes only
+        // (`read_view`); the cursor's line is not what it shows, and a reveal owed against it
+        // would fight the reader's own on every window.
+        if self.session.view.read.is_some() {
+            self.pending_reveal.abandon();
+            return;
+        }
         let Some(window) = &self.session.view.window else {
             return;
         };
@@ -1779,6 +1802,9 @@ impl Shell {
     /// Minimal vertical reveal: scroll just enough to bring the cursor on-screen, leaving it where
     /// it already is when visible. The follow behaviour for ordinary motions.
     fn reveal_cursor(&mut self) -> bool {
+        if self.session.view.read.is_some() {
+            return true; // the reader's reveal is its own — nothing owed here
+        }
         self.reveal_cursor_col();
         let Some(window) = &self.session.view.window else {
             return false;
@@ -1804,6 +1830,9 @@ impl Shell {
     /// Jump reveal: if the cursor is already visible, leave the view; otherwise rest it near the top
     /// of the viewport (more context below). The TUI snaps — only the GUI/web animate.
     fn reveal_cursor_jump(&mut self) -> bool {
+        if self.session.view.read.is_some() {
+            return true;
+        }
         self.reveal_cursor_col();
         let Some(window) = &self.session.view.window else {
             return false;
@@ -1891,7 +1920,8 @@ impl Shell {
                 ViewportPlace::Upper => first as f32 + pad - gap,
                 ViewportPlace::Lower => (last + 1) as f32 + pad - (visible - gap),
             };
-            self.read_scroll = target.max(0.0) as u16;
+            self.top_visual_row = VisualRow(target.max(0.0) as u32);
+            self.clamp_scroll();
             return;
         }
         let line = self.session.view.buffer.cursor.position.line;
@@ -2224,11 +2254,35 @@ impl Shell {
         });
     }
 
+    /// Whether a window just adopted needs the reader's layout before it can be placed: the view
+    /// has an element this shell lays out and has not measured. Arms `read_view` to finish the
+    /// placement — the content anchor if one is pending, else the subscribe's scroll — and answers
+    /// `true` so the caller leaves the scroll alone meanwhile.
+    fn defer_read_placement(&mut self) -> bool {
+        let Some(w) = self.session.view.window.as_ref() else {
+            return false;
+        };
+        aether_client::grid::prune_measured(&mut self.measured, &w.root);
+        if aether_client::grid::awaits_measure(&w.root, &self.measured) {
+            self.read_place_pending = true;
+            self.pending_reveal.abandon();
+            return true;
+        }
+        false
+    }
+
     /// Build the reading-view render model: lay the document out at the current width (cached by
-    /// `(buffer, revision, cols)`), derive the focused element from the server cursor, reveal it
-    /// when the focus changed, and clamp the scroll.
+    /// `(buffer, revision, cols)`), tell the grid how tall that made the element, derive the
+    /// focused element from the server cursor, reveal it when the focus changed, and clamp the
+    /// scroll — which is the viewport's own `top_visual_row`, in the padded row space the painter
+    /// draws.
     fn read_view(&mut self) -> Option<crate::app::ReadViewState> {
-        let read = self.session.view.read.as_ref()?;
+        let Some(read) = self.session.view.read.as_ref() else {
+            if let Some(w) = self.session.view.window.as_ref() {
+                aether_client::grid::prune_measured(&mut self.measured, &w.root);
+            }
+            return None;
+        };
         // First fetch still in flight: show the loading page WITHOUT touching the layout cache —
         // the adopt often lands at the same revision (an unedited buffer stays at rev 0), so a
         // cached empty layout would otherwise mask the parsed document.
@@ -2254,9 +2308,8 @@ impl Shell {
             .map(|c| (c.0, c.1, c.2, c.3) != key)
             .unwrap_or(true);
         if stale {
-            // A buffer switch resets the scroll; a re-parse of the same buffer keeps it.
+            // A buffer switch reveals afresh; a re-parse of the same buffer keeps the position.
             if self.read_cache.as_ref().map(|c| c.0) != Some(read.buffer_id) {
-                self.read_scroll = 0;
                 self.read_last_focus = None;
             }
             // Horizontal offsets are keyed by element index, which shifts with the parse —
@@ -2271,9 +2324,43 @@ impl Shell {
                 content_cols,
                 &read.code_highlights,
             );
+            // What the grid scrolls, fetches and anchors by: the element is as tall as this
+            // layout, and each source line starts on its block's first row.
+            let measured = aether_client::read_layout::measured_element(
+                &rows,
+                &read.elements,
+                |byte| read.pos_of(byte).line,
+                read.text.split('\n').count() as u32,
+                u32::from(crate::ui::READ_PAD_TOP),
+                u32::from(crate::ui::READ_PAD_BOTTOM),
+            );
+            self.measured
+                .elements
+                .insert(self.session.view.focused_element, measured);
             self.read_cache = Some((key.0, key.1, key.2, key.3, std::sync::Arc::new(rows)));
         }
         let rows = self.read_cache.as_ref().expect("just filled").4.clone();
+        // A placement the window's adoption left for this layout: the content anchor a `Space v`
+        // captured, else the subscribe's scroll — the same two answers the editor places by.
+        if std::mem::take(&mut self.read_place_pending) {
+            let scroll = self.subscribe_scroll;
+            let placed = self
+                .session
+                .resolve_scroll_anchor(&self.measured)
+                .or_else(|| {
+                    let w = self.session.view.window.as_ref()?;
+                    aether_client::grid::line_block_start(
+                        w,
+                        scroll.element,
+                        scroll.line,
+                        &self.measured,
+                    )
+                });
+            if let Some(row) = placed {
+                self.top_visual_row = row;
+            }
+        }
+        let read = self.session.view.read.as_ref().expect("checked above");
         // Two projections of the one server cursor: the block bar always marks the reading
         // position; the interactive target inverts on top of it. An extended selection adds a third
         //: the selection tint over the selected blocks' rows — and suppresses the pill
@@ -2334,32 +2421,27 @@ impl Shell {
             if let Some(row) = reveal.and_then(|f| {
                 aether_client::read_layout::first_row_of_element(&rows, &read.elements, f)
             }) {
-                let padded = row as u16 + crate::ui::READ_PAD_TOP;
-                if padded < self.read_scroll || padded >= self.read_scroll.saturating_add(visible) {
+                let padded = row as u32 + u32::from(crate::ui::READ_PAD_TOP);
+                let top = self.top_visual_row.get();
+                if padded < top || padded >= top.saturating_add(u32::from(visible)) {
                     // Rest the element ~20% down, matching the editor's jump reveals.
-                    self.read_scroll = padded.saturating_sub(visible / 5);
+                    self.top_visual_row = VisualRow(padded.saturating_sub(u32::from(visible / 5)));
                 }
             }
         }
-        let total = rows.len() as u16 + crate::ui::READ_PAD_TOP + crate::ui::READ_PAD_BOTTOM;
-        let max_scroll = total.saturating_sub(visible);
-        self.read_scroll = self.read_scroll.min(max_scroll);
+        // The document's height is what the grid now knows of the element, padding included, so
+        // the viewport's own clamp is the reader's.
+        self.clamp_scroll();
         Some(crate::app::ReadViewState {
             rows,
             bar_rows,
             sel_rows,
             target_focus,
-            scroll: self.read_scroll,
+            scroll: self.top_visual_row.get().min(u32::from(u16::MAX)) as u16,
             hscroll: self.read_hscroll.clone(),
             placeholder,
             width: self.session.markdown_width,
         })
-    }
-
-    /// Scroll the reading view by `delta` rows (keys and wheel; clamped in `read_view`).
-    fn read_scroll_by(&mut self, delta: i32) {
-        let cur = self.read_scroll as i32;
-        self.read_scroll = cur.saturating_add(delta).max(0) as u16;
     }
 
     /// Pan `element`'s horizontal scroll by `delta` columns: clamped so the block's widest row just
@@ -2401,7 +2483,7 @@ impl Shell {
             return None; // the status row (or below)
         }
         let rows = &self.read_cache.as_ref()?.4;
-        (self.read_scroll as usize + row as usize)
+        (self.top_visual_row.get() as usize + row as usize)
             .checked_sub(crate::ui::READ_PAD_TOP as usize)
             .and_then(|i| rows.get(i))
             .and_then(|r| r.element)
@@ -2420,7 +2502,7 @@ impl Shell {
         if u32::from(row) >= self.visible_rows() {
             return None; // the status row (or below)
         }
-        let r = (self.read_scroll as usize + row as usize)
+        let r = (self.top_visual_row.get() as usize + row as usize)
             .checked_sub(crate::ui::READ_PAD_TOP as usize)
             .and_then(|i| rows.get(i))?;
         let (_, margin) = crate::ui::read_measure(self.term.0, self.session.markdown_width);
@@ -3503,7 +3585,7 @@ mod scroll_tests {
             boot_attempt: 0,
             fatal: None,
             server_url: String::new(),
-            read_scroll: 0,
+            read_place_pending: false,
             read_last_focus: None,
             read_cache: None,
             read_hscroll: std::collections::HashMap::new(),

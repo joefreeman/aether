@@ -52,6 +52,7 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -99,6 +100,7 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -241,6 +243,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -728,6 +731,7 @@ async fn save_as_to_same_path_is_in_place_save() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -812,6 +816,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -918,6 +923,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1008,6 +1014,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1236,6 +1243,7 @@ async fn buffer_close_drops_viewports() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1327,6 +1335,7 @@ async fn setup_watched_buffer(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1378,6 +1387,7 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1470,6 +1480,7 @@ async fn subscribe_with_scroll_past_eof_returns_non_empty_window() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1651,6 +1662,7 @@ async fn watcher_covers_open_buffer_inside_gitignored_dir() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1712,6 +1724,7 @@ async fn connect_and_open_watched(ws_url: &str, workspace: &str) -> (Ws, u64) {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3723,6 +3736,7 @@ async fn restore_flags_externally_modified_when_disk_changed() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;

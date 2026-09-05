@@ -9,7 +9,7 @@ use crate::search::SearchMatchRange;
 use crate::sneak::SneakTarget;
 // The element vocabulary lives in `ui`; re-exported here because a view's tree is what
 // `viewport` messages carry, and that is where callers look for it.
-pub use crate::ui::{Element, FieldId};
+pub use crate::ui::{Element, FieldId, ViewKind};
 use crate::{Revision, ViewportId};
 use serde::{Deserialize, Serialize};
 
@@ -470,6 +470,13 @@ pub struct ViewportSubscribeParams {
     /// here and the first frame is correct without a follow-up `git/set_diff_view`. Defaults off.
     #[serde(default)]
     pub diff_view: bool,
+    /// Present the view as this kind — the editor over the file's source, or the reader over the
+    /// document it describes. `None` leaves the choice to the server: the kind the file was last
+    /// presented as, else the app setting. A client sends `Some` only when its route decides —
+    /// a jump to a `line:col` lands in the editor, a followed `#anchor` in the reader, and
+    /// `Space v` asks for the other one. Ignored for a view a driver built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::ui::ViewKind>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

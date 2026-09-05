@@ -1170,17 +1170,20 @@ pub struct Session {
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
-    /// This session's live read-vs-source choice for markdown, flipped by `Space v`. Session
-    /// state, not a per-buffer memory: reaching for source is a *task* ("show me the raw
-    /// markdown to fix this link"), not a property of a document — editing works in the reading
-    /// view itself, so being mid-edit is no reason to want source. Seeded from
-    /// [`Self::markdown_read_default`] and re-seeded whenever that setting changes; `Space v`
-    /// deliberately does **not** write through to the setting, which is app-wide and shared with
-    /// every other client.
-    pub(crate) read_on: bool,
+    /// The kind the next `view/subscribe` asks for — `Some` only when this client's route has
+    /// decided: a jump to a `line:col` lands in the editor, a followed `#anchor` in the reader,
+    /// `Space v` asks for the other one, and an edit transition out of the reader asks for the
+    /// editor. `None` leaves it to the server, which presents a markdown file as it last was, or
+    /// as the app setting says for one never presented. Taken by the shell as it subscribes
+    /// ([`Self::subscribe_kind`]), so it names exactly one presentation.
+    ///
+    /// Which view is showing is then read off the window: a markdown file presented as the reader
+    /// arrives as an element the client lays out, and [`Self::sync_read_presentation`] turns that
+    /// into the reading view. Nothing here remembers the choice — the server does, per file.
+    pub(crate) subscribe_kind: Option<aether_protocol::ui::ViewKind>,
     /// App-wide "open markdown as reading view" setting (`Space,`), seeded from `settings/get`
-    /// and synced via `settings/changed`. The persisted *default* [`Self::read_on`] starts from,
-    /// not the live state.
+    /// and synced via `settings/changed`. The server consults its own copy when a file is first
+    /// presented; this mirror only feeds the settings overlay.
     pub markdown_read_default: bool,
     /// App-wide reading-view width setting (`Space ,`), seeded from `settings/get` and synced via
     /// `settings/changed`. Shells resolve it through `read_layout`'s measure table at draw time —
@@ -1630,7 +1633,7 @@ impl Session {
             worktree_store: String::new(),
             git_operation: None,
             diff_view: false,
-            read_on: true,
+            subscribe_kind: None,
             markdown_read_default: true,
             markdown_width: aether_protocol::settings::default_markdown_width(),
             open_route_jumped: false,
@@ -1732,10 +1735,11 @@ impl Session {
             .collect()
     }
 
-    /// This session's live read-vs-source choice (`Space v` flips it; the edit transitions
-    /// deliberately don't). Exposed read-only so tests can pin that contract.
-    pub fn read_on(&self) -> bool {
-        self.read_on
+    /// The kind the subscribe being issued asks for, if this client's route decided one — see
+    /// [`Self::subscribe_kind`]. Taken: the decision is for one subscribe, and a re-subscribe
+    /// for a wrap toggle or a reconnect must not repeat it.
+    pub fn subscribe_kind(&mut self) -> Option<aether_protocol::ui::ViewKind> {
+        self.subscribe_kind.take()
     }
 
     /// Capture a content scroll anchor for the current view, ahead of a wrap/diff re-layout. The

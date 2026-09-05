@@ -56,6 +56,13 @@ pub async fn run(idle_timeout: Option<Duration>) -> anyhow::Result<()> {
         // Opt the production daemon into unsaved-buffer backups (left unset elsewhere — see
         // `ServerState::backups_path`). A resolution failure just disables the feature.
         s.backups_path = config::backups_dir().ok();
+        // The app settings the server consults itself (which view a markdown file opens in); the
+        // clients keep reading the file through `settings/get`. A missing or unreadable file is
+        // the defaults, exactly as it is for them.
+        match config::load_app_settings() {
+            Ok(settings) => s.app_settings = settings,
+            Err(e) => tracing::warn!(error = %e, "could not load app settings; using defaults"),
+        }
         // Hint learning state: same opt-in shape as sessions. Loaded once here; a corrupt file logs
         // and starts fresh rather than refusing to boot.
         s.hints_path = config::hints_state_path().ok();

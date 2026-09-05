@@ -2876,6 +2876,7 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2971,6 +2972,7 @@ async fn an_ordinary_views_outline_is_its_document_symbols() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3052,6 +3054,7 @@ async fn a_views_height_counts_wrapped_rows() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3099,6 +3102,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
+                kind: None,
             },
         )
         .await;
@@ -3214,6 +3218,7 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3595,6 +3600,7 @@ async fn a_composed_views_status_snapshot_describes_the_focused_file() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3703,6 +3709,7 @@ async fn navigate_diagnostic_refuses_one_outside_the_focused_hunk() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;

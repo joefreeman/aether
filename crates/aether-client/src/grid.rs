@@ -304,8 +304,10 @@ pub fn element_start_row_of(
 ///
 /// This is the request a client makes while scrolling. It knows where every editor starts from the
 /// tree; what it cannot know is which *lines* a row range is, since that depends on how the lines
-/// above wrapped — so it asks by row and the server answers with lines. For an element the client
-/// laid out the rows are its own, so the request names the wire rows its measurement puts there.
+/// above wrapped — so it asks by row and the server answers with lines. An element the client lays
+/// out is asked for whole whenever any of it is in reach: the client renders it from its source
+/// entire — a block's shape depends on the lines around it — so a part of it is never something
+/// it can paint, and the server loads such an element whole regardless.
 pub fn slices_for(
     root: &Element,
     top: VisualRow,
@@ -318,22 +320,69 @@ pub fn slices_for(
     let mut out = Vec::new();
     let mut at = 0u32;
     walk_rows(root, measured, &mut |node, height| {
-        if let Element::Editor { element, .. } = node {
+        if let Element::Editor {
+            element,
+            rows: lines,
+            laid_out_by,
+            ..
+        } = node
+        {
             let (start, end) = (at, at.saturating_add(height));
             let (a, b) = (lo.max(start), hi.min(end));
             if a < b {
-                let from = measured.row_at(node, a - start);
-                let to = measured.row_at(node, b - start);
+                let (from, rows) = match laid_out_by {
+                    LayoutOwner::Client => (ElementRow::ZERO, (*lines).max(1)),
+                    LayoutOwner::Server => {
+                        let from = measured.row_at(node, a - start);
+                        let to = measured.row_at(node, b - start);
+                        (from, to.get().saturating_sub(from.get()).max(1))
+                    }
+                };
                 out.push(SliceRequest {
                     element: *element,
                     from_row: from,
-                    rows: to.get().saturating_sub(from.get()).max(1),
+                    rows,
                 });
             }
         }
         at = at.saturating_add(height);
     });
     out
+}
+
+/// Drop measurements of elements the tree no longer lays out client-side — a view re-presented as
+/// the editor, or a switch to another view — so no stale height positions a window it was never
+/// measured for. Called by a shell on every window adoption, before anything resolves through it.
+pub fn prune_measured(measured: &mut Measured, root: &Element) {
+    let client: Vec<FieldId> = root
+        .editors()
+        .into_iter()
+        .filter_map(|node| match node {
+            Element::Editor {
+                element,
+                laid_out_by: LayoutOwner::Client,
+                ..
+            } => Some(*element),
+            _ => None,
+        })
+        .collect();
+    measured.elements.retain(|id, _| client.contains(id));
+}
+
+/// Whether the tree has an element the client lays out that it has not measured yet: the shell
+/// cannot place a window by rows it has not counted, so a placement into such a view waits for
+/// the shell's layout — the reader's, once it has parsed what the window carries.
+pub fn awaits_measure(root: &Element, measured: &Measured) -> bool {
+    root.editors().into_iter().any(|node| {
+        matches!(
+            node,
+            Element::Editor {
+                element,
+                laid_out_by: LayoutOwner::Client,
+                ..
+            } if !measured.elements.contains_key(element)
+        )
+    })
 }
 
 /// Whether every slice in `wanted` is already loaded: its rows lie inside the rows the editor's
@@ -2267,26 +2316,29 @@ mod tests {
             ],
         };
         let m = measured(0, 2, &[1, 3, 2]);
-        // A screen from absolute row 5 (inside line 3) to row 16 reaches line 3 through the last
-        // line, and then the editor below.
+        // A screen from absolute row 5 (inside line 3) to row 16 reaches the prose element and
+        // then the editor below. The prose is asked for whole — every one of its ten lines from
+        // wire row 0 — however little of it is on screen; the editor for the rows reached.
         let slices = slices_for(&w.root, VisualRow(5), 11, 0, &m);
         assert_eq!(
             slices
                 .iter()
                 .map(|s| (s.element, s.from_row.get(), s.rows))
                 .collect::<Vec<_>>(),
-            vec![(0, 3, 7), (1, 0, 1)],
-            "from wire row 3 (line 3) through the element's ten lines"
+            vec![(0, 0, 10), (1, 0, 1)],
+            "the whole element, then the editor's reached row"
         );
-        // Unmeasured, the same request is one row per line: rows 4..10 of the element, then the
-        // editor's three.
+        // Unmeasured, the prose is still whole; the editor's request is one row per line.
         let plain = slices_for(&w.root, VisualRow(5), 11, 0, &Measured::default());
         assert_eq!(
             plain
                 .iter()
                 .map(|s| (s.element, s.from_row.get(), s.rows))
                 .collect::<Vec<_>>(),
-            vec![(0, 4, 6), (1, 0, 3)]
+            vec![(0, 0, 10), (1, 0, 3)]
         );
+        // A screen entirely below it — the prose is 13 rows under its chrome — asks nothing of it.
+        let below = slices_for(&w.root, VisualRow(15), 3, 0, &m);
+        assert_eq!(below.iter().map(|s| s.element).collect::<Vec<_>>(), vec![1]);
     }
 }

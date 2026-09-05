@@ -1923,27 +1923,26 @@ export class Shell {
       }
 
       this.session = WasmSession.bootstrap(workspace, open);
+      // Boot installs the session directly (no adopt_switch), so the markdown reading-view
+      // decision runs here, ahead of the subscribe it decides. A `view=read|source` param is the
+      // presentation this URL was captured in (a refresh, a shared reading link) and wins
+      // outright; without one, a `#line:col` link is jump-shaped and lands in the editor, and a
+      // plain link leaves the choice to the server (the file as it was last shown, else the app
+      // setting). (Only honored for a URL-directed open — on a fallback landing the param
+      // describes a buffer we didn't open.)
+      const urlView = directed ? sp.get("view") : null;
+      if (urlView === "read" || urlView === "source") {
+        this.session.boot_read_presentation_explicit(urlView === "read");
+      } else {
+        const jumpShaped = Boolean(jump && (urlFile || urlPath));
+        this.session.boot_read_presentation(jumpShaped);
+      }
       await this.subscribe(); // derives its scroll from the buffer (open.scroll / cursor)
       // Fetch the persisted app settings (e.g. the soft-wrap default) now that the session is live.
       this.runEffects(this.session.startup() as CoreEffect[]);
       // A directory link browses it, exactly as `ae DIR` does in the native shells.
       if (explorerDir) {
         this.runEffects(this.session.open_explorer_at(explorerDir) as CoreEffect[]);
-      }
-      // Boot installs the session directly (no adopt_switch), so the markdown reading-view
-      // decision runs here. A `view=read|source` param is the
-      // presentation this URL was captured in (a refresh, a shared reading link) and wins
-      // outright; without one, a `#line:col` link is jump-shaped and lands in the editor.
-      // (Only honored for a URL-directed open — on a fallback landing the param describes a
-      // buffer we didn't open.)
-      const urlView = directed ? sp.get("view") : null;
-      if (urlView === "read" || urlView === "source") {
-        this.runEffects(
-          this.session.boot_read_presentation_explicit(urlView === "read") as CoreEffect[],
-        );
-      } else {
-        const jumpShaped = Boolean(jump && (urlFile || urlPath));
-        this.runEffects(this.session.boot_read_presentation(jumpShaped) as CoreEffect[]);
       }
       this.capture.focus(); // ensure the menu-suppressing field has focus once we're live
     } catch (e) {
@@ -2619,7 +2618,7 @@ export class Shell {
       return; // a failed set_wrap (e.g. raced a buffer close) — a newer geometry op will follow
     }
     if (epoch !== this.viewportEpoch) return; // superseded
-    this.session.adopt_window(res);
+    this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
     this.render();
     // Restore the view to the content anchor captured before the toggle (same content on screen
     // across the reflow); fall back to revealing the cursor when none is pending.
@@ -2640,12 +2639,18 @@ export class Shell {
     // As content — the element the cursor is in and a line of its buffer — which is what a scroll
     // position is; a row is something only the client can count, once it has the tree.
     // A fresh jump target (no saved scroll) rests near the top — the cross-buffer counterpart of
-    // the in-buffer jump reveal.
-    const scroll: ScrollPosition = v.buffer.scroll ?? {
-      element: v.focused_element,
-      line: Math.max(0, v.buffer.cursor.position.line - Math.floor(this.rows * CURSOR_REST_FRACTION)),
-      sub_row: 0,
-    };
+    // the in-buffer jump reveal. A pending content anchor (a wrap toggle, `Space v`) wins over
+    // both: the window loads around it and the view is placed by it when the window arrives.
+    const anchor = this.session.relayout_anchor_position() as ScrollPosition | null;
+    const scroll: ScrollPosition = anchor ??
+      v.buffer.scroll ?? {
+        element: v.focused_element,
+        line: Math.max(
+          0,
+          v.buffer.cursor.position.line - Math.floor(this.rows * CURSOR_REST_FRACTION),
+        ),
+        sub_row: 0,
+      };
     const epoch = ++this.viewportEpoch;
     this.fetchInFlight = false;
     let res: ViewportSubscribeResult;
@@ -2665,12 +2670,15 @@ export class Shell {
         tab_width: TAB_WIDTH,
         // Sticky diff view rides the subscribe so it survives a buffer switch.
         diff_view: v.diff_view,
+        // What this route decided, if anything: `Space v`, a jump, a followed anchor, the URL's
+        // `view=`. Absent, the server presents the file as it last was.
+        kind: this.session.subscribe_kind() ?? null,
       });
     } catch {
       return; // a failed subscribe (e.g. raced a buffer close) — a newer one will follow
     }
     if (epoch !== this.viewportEpoch) return; // superseded by a newer subscribe — drop this window
-    this.session.adopt_subscribe(res);
+    this.runEffects(this.session.adopt_subscribe(res) as CoreEffect[]);
     this.render();
     // A subscribe replaces the whole window (a buffer switch / wrap toggle), so it snaps — there's no
     // scroll to animate. Same-buffer *moves* (grep next-hit, cursor motions) animate via the
@@ -2678,6 +2686,13 @@ export class Shell {
     // The *block's* first row, so a line's chrome comes with it: a patch opened at its first line
     // shows the file heading that introduces it rather than starting just below it. The core
     // answers off the layout it holds, so this is the row the painter puts that line on.
+    // A pending content anchor places the view itself — the same content on screen across the
+    // re-presentation — and supersedes the reveal.
+    const anchored = this.session.resolve_scroll_anchor();
+    if (anchored != null) {
+      this.bufferEl.scrollTop = anchored * this.cell.h + BUFFER_PAD;
+      return;
+    }
     const row = this.session.subscribe_top_row(scroll.element, scroll.line, scroll.sub_row);
     if (row != null) {
       this.bufferEl.scrollTop = row * this.cell.h + BUFFER_PAD;
@@ -2691,9 +2706,12 @@ export class Shell {
     // The reading view owns its scroll: `revealFocus` positions the focused element from the
     // *rendered* layout. This editor-grid math (rows × cell.h) is meaningless there and was
     // fighting it — every cursor move fires `RevealCursor`, and in code-heavy documents the
-    // grid estimate diverges linearly from the real layout, dragging focus off screen.
-    if (this.readActive) return;
+    // grid estimate diverges linearly from the real layout, dragging focus off screen. Gated on
+    // the core's state, not this shell's flag: the reveal that frames the cursor as the reading
+    // view is *left* (`Space v`) arrives before the render that clears the flag, and it is the
+    // editor's grid that reveal positions.
     const v = this.view();
+    if (v.read !== null) return;
     if (!v.window) return;
     const cl = v.buffer.cursor.position.line;
     if (!lineIsLoaded(v.window, v.focused_element, cl)) {
@@ -2712,7 +2730,7 @@ export class Shell {
         return; // viewport gone (e.g. a resubscribe raced in) — that subscribe reveals afresh
       }
       if (epoch !== this.viewportEpoch) return; // a resubscribe superseded this fetch
-      this.session.adopt_window(res);
+      this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
     }
     this.render();
     if (style === "jump") this.revealCursorJump();
@@ -2818,7 +2836,7 @@ export class Shell {
         (res) => {
           this.fetchInFlight = false;
           if (epoch !== this.viewportEpoch) return; // a resubscribe superseded this fetch
-          this.session.adopt_window(res);
+          this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
           this.render();
           this.onScroll(); // re-check in case the view moved further while fetching
         },
@@ -2884,7 +2902,7 @@ export class Shell {
         return; // viewport gone (e.g. a resubscribe raced in)
       }
       if (epoch !== this.viewportEpoch) return; // a resubscribe superseded this fetch
-      this.session.adopt_window(res);
+      this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
       this.render();
     }
     const row = this.cursorAbsoluteVisualRow();
@@ -2965,7 +2983,7 @@ export class Shell {
       })
       .then(
         (res) => {
-          this.session.adopt_window(res);
+          this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
           this.render();
         },
         () => {},

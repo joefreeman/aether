@@ -126,6 +126,21 @@ impl LayoutOwner {
     }
 }
 
+/// The two views a client can ask for over one file: its source in the editor, or the document
+/// its source describes, laid out by the client and read at block grain.
+///
+/// What a subscribe *requests*, not what a view is. A driver's view — a patch — is neither and
+/// ignores the request; an ordinary file's view is one or the other, and which one shows in the
+/// window as the element's [`LayoutOwner`]. The server remembers the kind each file was last
+/// presented as, so the choice outlives the buffer; a client that has no opinion sends nothing
+/// and gets the remembered kind, or the app setting for a file never presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewKind {
+    Editor,
+    Reader,
+}
+
 impl Element {
     pub fn stack(children: Vec<Element>) -> Element {
         Element::Stack { children }

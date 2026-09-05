@@ -458,6 +458,7 @@ async fn apply_hunk_stage_refreshes_status_counts() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -524,6 +525,7 @@ async fn remodified_staged_line_reads_as_unstaged() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -580,6 +582,7 @@ async fn shared_anchor_phantom_rows_show_only_the_unstaged_layer() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -664,6 +667,7 @@ async fn git_gutter_marker_present_without_diff_view() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -881,6 +885,7 @@ async fn an_ordinary_views_changes_are_stepped_through_the_view() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1562,6 +1567,7 @@ async fn git_refresh_rebases_baselines_when_no_file_changed() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1686,6 +1692,7 @@ async fn buffer_reload_leaves_a_fresh_gutter() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1775,6 +1782,7 @@ async fn subscribing_refreshes_a_gutter_left_stale_while_hidden() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1909,6 +1917,7 @@ async fn every_captured_outline_entry_lands_in_the_review() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -1966,6 +1975,7 @@ async fn every_captured_outline_entry_lands_in_the_review() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2014,6 +2024,7 @@ async fn every_captured_outline_entry_lands_in_the_review() {
                             continuation_marker_width: 0,
                             tab_width: 4,
                             diff_view: false,
+                            kind: None,
                         },
                     )
                     .await;
@@ -2058,6 +2069,7 @@ async fn every_captured_outline_entry_lands_in_the_review() {
                         continuation_marker_width: 0,
                         tab_width: 4,
                         diff_view: false,
+                        kind: None,
                     },
                 )
                 .await;
@@ -2150,6 +2162,7 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2218,6 +2231,7 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2283,6 +2297,7 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
                                 continuation_marker_width: 0,
                                 tab_width: 4,
                                 diff_view: false,
+                                kind: None,
                             },
                         )
                         .await;
@@ -2327,6 +2342,7 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
                             continuation_marker_width: 0,
                             tab_width: 4,
                             diff_view: false,
+                            kind: None,
                         },
                     )
                     .await;
@@ -2414,6 +2430,7 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
+                kind: None,
             },
         )
         .await
@@ -2590,6 +2607,7 @@ async fn a_reverted_change_is_stepped_over_not_opened_as_a_file() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2801,6 +2819,7 @@ async fn set_baseline_diffs_against_an_older_commit() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2904,6 +2923,7 @@ async fn set_baseline_resolves_and_pins_a_named_revision() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -3890,6 +3910,7 @@ async fn hunk_navigation_steps_a_patchs_own_changes() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -4709,6 +4730,7 @@ async fn an_unsaved_edit_in_one_element_is_reported_while_another_is_focused() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
+                kind: None,
             },
         )
         .await
@@ -4801,6 +4823,7 @@ async fn the_git_cluster_follows_the_focused_element() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
+                kind: None,
             },
         )
         .await
@@ -4910,6 +4933,7 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
+                kind: None,
             },
         )
         .await
@@ -5283,6 +5307,7 @@ async fn staging_pushes_the_rebuilt_patch_as_clean() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -5570,6 +5595,7 @@ async fn subscribe_window(ws: &mut Ws, buffer_id: u64) -> aether_protocol::viewp
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -7298,6 +7324,7 @@ async fn patch_element_ids_survive_a_scroll() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -7396,6 +7423,7 @@ async fn patch_editors_report_their_buffer_and_full_height() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
+            kind: None,
         },
     )
     .await;
@@ -7521,6 +7549,7 @@ async fn scrolled_out_elements_keep_their_place_in_the_tree() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -7631,6 +7660,7 @@ async fn focus_steps_between_a_patchs_elements_and_stops_at_the_ends() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -7743,6 +7773,7 @@ async fn enter_on_a_patch_leads_to_the_working_file() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -8043,6 +8074,7 @@ async fn toggling_the_diff_on_an_open_patch_view_adds_and_removes_its_phantoms()
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -8149,6 +8181,7 @@ async fn toggling_the_diff_keeps_a_scrolled_patch_view_where_it_was() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -8258,6 +8291,7 @@ async fn typing_in_a_working_changes_hunk_edits_the_file() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -8360,6 +8394,7 @@ async fn staging_through_a_focused_element_stages_that_files_block() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -8466,6 +8501,7 @@ async fn a_hunk_grows_when_you_type_a_line_into_it() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -8573,6 +8609,7 @@ async fn moving_past_a_hunks_end_stays_within_the_view() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -8685,6 +8722,7 @@ async fn scrolling_to_the_end_of_a_patch_still_shows_content() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -8769,6 +8807,7 @@ async fn the_scroll_limit_reaches_the_last_line_of_a_patch() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -8855,6 +8894,7 @@ async fn rendering_a_bound_patch_near_its_end_does_not_panic() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
+            kind: None,
         },
     )
     .await;
@@ -8930,6 +8970,7 @@ async fn walking_down_a_freshly_opened_commit_patch_does_not_panic() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -9004,6 +9045,7 @@ async fn a_counted_change_step_past_the_last_change_refuses() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -9110,6 +9152,7 @@ async fn staging_from_inside_an_element_never_touches_the_patch_index() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -9258,6 +9301,7 @@ async fn leaving_a_composed_view_collects_the_patch_and_its_elements() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -9291,6 +9335,7 @@ async fn leaving_a_composed_view_collects_the_patch_and_its_elements() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -9376,6 +9421,7 @@ async fn the_outline_of_a_patch_is_its_changes_grouped_by_file() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -9474,6 +9520,7 @@ async fn scrolling_the_patch_outline_keeps_its_rows() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -9575,6 +9622,7 @@ async fn each_outline_row_selects_its_own_hunk_top() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -9756,6 +9804,7 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -10038,6 +10087,7 @@ async fn a_patch_jumplist_steps_from_another_editor() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -10097,6 +10147,7 @@ async fn a_patch_jumplist_steps_from_another_editor() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -10251,6 +10302,7 @@ async fn saving_a_composed_view_writes_every_file_it_windows() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -10408,6 +10460,7 @@ async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -10466,6 +10519,7 @@ async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -10603,6 +10657,7 @@ async fn the_outline_the_motion_and_the_breadcrumb_agree() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -10761,6 +10816,7 @@ async fn the_outline_opens_on_the_change_the_cursor_is_in() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -10906,6 +10962,7 @@ async fn stepping_the_outline_of_a_patch_visits_each_change() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -11040,6 +11097,7 @@ async fn a_lines_changed_push_names_the_focused_elements_buffer() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -11133,6 +11191,7 @@ async fn change_stepping_reaches_a_deleted_file_beside_a_bound_one() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -11226,6 +11285,7 @@ async fn restaging_rebinds_a_view_whose_hunks_all_window_files() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -11338,6 +11398,7 @@ async fn stepping_from_an_unbound_element_reads_the_cursors_place_in_the_view() 
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;

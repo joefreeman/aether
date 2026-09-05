@@ -33,10 +33,10 @@ use super::transport::RpcError;
 use aether_protocol::app::{AppInfoGet, AppInfoParams};
 use aether_protocol::buffer::{
     BufferChanged, BufferChangedParams, BufferClose, BufferCloseParams, BufferClosed,
-    BufferClosedParams, BufferContent, BufferContentParams, BufferContentResult, BufferCopy,
-    BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen, BufferOpenParams,
-    BufferOpenResult, BufferReload, BufferReloadParams, BufferSave, BufferSaveParams,
-    BufferSetTransient, BufferSetTransientParams, BufferState, BufferStateParams, CopyScope,
+    BufferClosedParams, BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult,
+    BufferOpen, BufferOpenParams, BufferOpenResult, BufferReload, BufferReloadParams, BufferSave,
+    BufferSaveParams, BufferSetTransient, BufferSetTransientParams, BufferState, BufferStateParams,
+    CopyScope,
 };
 use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::{
@@ -130,7 +130,7 @@ use aether_protocol::sneak::{
 };
 use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
 use aether_protocol::viewport::{
-    DiagnosticSeverity, FocusStep, FocusTarget, NavigateGrain, ViewSave, ViewSaveParams,
+    DiagnosticSeverity, Element, FocusStep, FocusTarget, NavigateGrain, ViewSave, ViewSaveParams,
     ViewportFocusElement, ViewportFocusElementParams, ViewportFocusElementResult,
     ViewportLinesChanged, ViewportLinesChangedParams, ViewportNavigateChange,
     ViewportNavigateChangeParams, ViewportSubscribeResult, ViewportWindowResult, WrapMode,
@@ -193,10 +193,6 @@ pub enum Event {
     Shown(Result<aether_protocol::git::GitShowResult, String>),
     /// `Enter` in a patch resolved (or didn't) to a file at a revision.
     PatchLineFollowed(Result<GitFollowPatchLineResult, String>),
-    /// A `buffer/content` fetch for the markdown reading view resolved: parse and adopt. Guarded
-    /// against staleness — the buffer may have switched, or moved to a newer revision, while the
-    /// fetch was in flight.
-    ReadContent(Result<BufferContentResult, String>),
     /// A `syntax/highlight_snippet` result for one fenced code block of the reading view, keyed
     /// by the fence's span start at `(buffer, revision)` parse time — stale results are dropped.
     ReadHighlights {
@@ -698,11 +694,10 @@ impl Session {
                     Effects::toast_grouped("Nothing to undo or redo", ToastKind::Info, "undo-redo")
                 };
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
-                // A `Ctrl-z` in the reading view changes the text under the parse: refresh
-                // straight off our own response rather than relying on the server's change
-                // push alone (idempotent — the in-flight guard drops the duplicate when the
-                // push arrives too).
-                fx.and(self.maybe_refresh_read(self.view.buffer.buffer_id, r.revision))
+                // A `Ctrl-z` in the reading view changes the text under the parse; the window
+                // the server pushes for it re-parses (`sync_read_presentation`).
+                self.mark_read_stale(r.revision);
+                fx
             }
             Event::UndoRedoDone(Err(e)) => Effects::error_detail("Undo/redo failed", e),
 
@@ -722,9 +717,12 @@ impl Session {
                     ));
                 }
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
-                // The edit changed the text under the reading view's parse — refresh off our
-                // own response, exactly like undo (revisions identify states, `!=` guard).
-                fx.and(self.maybe_refresh_read(self.view.buffer.buffer_id, r.revision))
+                // The edit changed the text under the reading view's parse; the window the
+                // server pushes for it re-parses (`sync_read_presentation`).
+                if r.applied {
+                    self.mark_read_stale(r.revision);
+                }
+                fx
             }
             Event::BlockEditDone(Err(e)) => Effects::error_detail("Edit failed", e),
 
@@ -739,6 +737,7 @@ impl Session {
                     // was — the transition is the *edit's* to make, not the keypress's.
                     self.read_exit_for_edit();
                     self.view.mode = Mode::Insert;
+                    fx = fx.and(self.represent_as(aether_protocol::ui::ViewKind::Editor));
                 } else if let Some(reason) = r.reason {
                     fx = fx.and(Effects::toast_grouped(
                         reason,
@@ -806,48 +805,6 @@ impl Session {
             Event::PatchLineFollowed(Err(e)) => Effects::error_detail("Couldn't open the file", e),
 
             Event::Switched(Err(e)) => self.open_failed(e),
-
-            Event::ReadContent(Ok(c)) => {
-                let Some(read) = self.view.read.as_mut() else {
-                    return Effects::none(); // reading view was left while the fetch was in flight
-                };
-                if read.buffer_id != self.view.buffer.buffer_id {
-                    return Effects::none(); // buffer switched under the fetch
-                }
-                // The buffer moved on while the fetch was in flight — chase the newer
-                // revision. Deliberately `>`, not `!=`: on a fresh open the client's
-                // `buffer.revision` is *behind* the fetched content (the fetch is often the
-                // first thing carrying a real revision), so a mismatch alone is normal. An
-                // undo landing mid-fetch (revision restored *backwards*, see
-                // `maybe_refresh_read`) slips past this check, but its change signal — and
-                // the undoing client's own `UndoRedoDone` refresh — refetch one round trip
-                // later, so the stale adopt is transient. A pending anchor stays armed for
-                // the fresh fetch, and the view stays loading meanwhile (the anchor-hold
-                // invariant: no paint before place).
-                if self.view.buffer.revision > c.revision {
-                    if self.pending_read_anchor.is_none() {
-                        read.adopt(c.revision, c.text);
-                    }
-                    return self.refetch_read_content();
-                }
-                // A followed cross-file anchor is pending: stage the parse instead of
-                // installing it — the document paints once, already in place.
-                if self.pending_read_anchor.is_some() {
-                    let mut staged = ReadView::loading(self.view.buffer.buffer_id);
-                    staged.adopt(c.revision, c.text);
-                    return self.stage_read_place(staged);
-                }
-                read.adopt(c.revision, c.text);
-                self.read_fence_requests()
-            }
-            Event::ReadContent(Err(e)) => {
-                self.pending_read_anchor = None;
-                // Fall back to the editor rather than showing an empty page.
-                if self.view.read.take().is_some() && self.view.mode == Mode::Read {
-                    self.view.mode = Mode::Normal;
-                }
-                Effects::error_detail("Reading view failed to load", e)
-            }
 
             Event::ReadHighlights {
                 buffer_id,
@@ -3348,8 +3305,8 @@ impl Session {
         // Not view state, but bound to whatever was on screen when it opened, so a switch dismisses
         // it: a modal prompt is the session's, and it has nowhere to return to.
         self.prompt = None;
-        let read_fx = self.sync_read_on_switch();
-        sneak_fx.and(Effects::one(Effect::Resubscribe)).and(read_fx)
+        self.sync_presentation_on_switch();
+        sneak_fx.and(Effects::one(Effect::Resubscribe))
     }
 
     /// Clear an active sneak session on `buffer_id`, both halves. No-op when not sneaking.
@@ -3364,9 +3321,9 @@ impl Session {
         self.request::<SneakCancel>(SneakCancelParams { buffer_id }, |_r| Event::Noop)
     }
 
-    /// Decide the freshly adopted buffer's read/edit presentation: markdown buffers follow this
-    /// session's live read-vs-source choice ([`Session::read_on`]), with two overrides that outrank
-    /// it, one each way:
+    /// Decide what the freshly adopted buffer's subscribe asks for. Markdown buffers are the
+    /// server's to present — as the file last was, or as the app setting says — with two overrides
+    /// that this client's route knows and the server cannot, one each way:
     ///
     /// - A **jump-shaped** open (grep hit, reference, a positioned jumplist entry) lands in the
     ///   editor — it is going to a `line:col`, which only means something over the source.
@@ -3374,56 +3331,145 @@ impl Session {
     ///   view — the slug resolves against the rendered document, and landing anywhere else would
     ///   silently drop it.
     ///
-    /// Both are one-shot: neither flips the session's choice for the next document. Non-markdown
-    /// buffers open in the editor as always.
-    fn sync_read_on_switch(&mut self) -> Effects {
+    /// Both are one-shot: they name this subscribe's kind and nothing else. Non-markdown buffers
+    /// have only the editor, and the server presents them so whatever is asked.
+    fn sync_presentation_on_switch(&mut self) {
         let jumped = std::mem::replace(&mut self.open_route_jumped, false);
         self.view.read = None;
         let is_md = self.view.buffer.language.as_deref() == Some("markdown");
-        let want = is_md && (self.pending_read_anchor.is_some() || (self.read_on && !jumped));
-        if want {
-            self.begin_read()
-        } else {
-            // A pending cross-file anchor can only land in a reading view; this switch went
-            // to the editor (non-markdown target, or a jump-shaped route), so drop it.
+        self.subscribe_kind = if !is_md {
+            // A pending cross-file anchor can only land in a reading view; this switch went to
+            // a non-markdown target, so drop it.
             self.pending_read_anchor = None;
-            Effects::none()
-        }
+            None
+        } else if self.pending_read_anchor.is_some() {
+            Some(aether_protocol::ui::ViewKind::Reader)
+        } else if jumped {
+            Some(aether_protocol::ui::ViewKind::Editor)
+        } else {
+            None
+        };
     }
 
     /// Apply the open-route presentation rules to a freshly *booted* session: `ae file.md` launches
     /// install the session directly, never passing through `adopt_switch`, so the shells call this
-    /// once after boot. `jumped` = the launch carried a jump target (`ae file:line`), which lands
-    /// in the editor like any other jump.
-    pub fn boot_read_presentation(&mut self, jumped: bool) -> Effects {
+    /// once after boot and **before** subscribing. `jumped` = the launch carried a jump target
+    /// (`ae file:line`), which lands in the editor like any other jump.
+    pub fn boot_read_presentation(&mut self, jumped: bool) {
         self.open_route_jumped = jumped;
-        self.sync_read_on_switch()
+        self.sync_presentation_on_switch();
     }
 
     /// [`Self::boot_read_presentation`] with an explicit read/source choice, overriding the
     /// open-route rules: the web shell records the current presentation in the URL (`view=`), so a
     /// refresh restores exactly what was on screen — the `#line:col` cursor restore in the same URL
     /// must not read as a jump-shaped open.
-    pub fn boot_read_presentation_explicit(&mut self, read: bool) -> Effects {
-        self.read_on = read;
-        self.boot_read_presentation(false)
+    pub fn boot_read_presentation_explicit(&mut self, read: bool) {
+        self.boot_read_presentation(false);
+        if self.view.buffer.language.as_deref() == Some("markdown") {
+            self.subscribe_kind = Some(if read {
+                aether_protocol::ui::ViewKind::Reader
+            } else {
+                aether_protocol::ui::ViewKind::Editor
+            });
+        }
     }
 
-    /// Enter the reading view on the current buffer: flip the mode and fetch the full content
-    /// (the parse adopts via [`Event::ReadContent`]).
-    fn begin_read(&mut self) -> Effects {
-        self.view.mode = Mode::Read;
-        self.view.pending = Pending::None;
-        self.view.count = None;
+    /// Re-present the current view as `kind`, keeping what is on screen where it is: the content
+    /// anchor captured ahead of the subscribe is what the shell positions the new window by.
+    fn represent_as(&mut self, kind: aether_protocol::ui::ViewKind) -> Effects {
+        self.subscribe_kind = Some(kind);
+        Effects::one(Effect::SaveContentAnchor).and(Effects::one(Effect::Resubscribe))
+    }
+
+    /// An edit of our own changed the text under the reading view's parse, and its new cursor is
+    /// adopted from the response a round trip before the re-parse lands in the pushed window.
+    /// Deriving focus against the old parse meanwhile painted the bar on whatever block happened
+    /// to sit at those bytes in the *previous* document — a flash on an unrelated block — so the
+    /// parse is marked stale (`loading`) until the window re-parses it. Not when the window got
+    /// here first: a parse already at the edit's revision is the new document.
+    fn mark_read_stale(&mut self, revision: u64) {
+        if let Some(read) = self.view.read.as_mut() {
+            if read.revision != revision {
+                read.loading = true;
+            }
+        }
+    }
+
+    /// The reading view is a consequence of the window, and this is where the client notices.
+    ///
+    /// The server presents a markdown file as the reader by sending it as one element the client
+    /// lays out — unwrapped, whole, one wire row per line. Every window adoption comes through
+    /// here: an element of that kind under the cursor puts the session in the reading view over
+    /// the lines it carries, re-parsing whenever they change (an edit, an undo, another client's
+    /// change — all of them arrive as a pushed window, so nothing is fetched); an ordinary editor
+    /// takes the reading view down. Nothing else decides which view is showing: `Space v` and the
+    /// edit transitions only *ask*, through the subscribe, and adopt whatever comes back.
+    ///
+    /// A partial load — the element has more lines than the window carries — is a window still
+    /// on its way (the server loads such an element whole, and the grid asks for all of it), so
+    /// the view stays loading rather than parsing half a document.
+    fn sync_read_presentation(&mut self) -> Effects {
         let buffer_id = self.view.buffer.buffer_id;
-        let sneak_fx = self.cancel_sneak_on(buffer_id);
-        self.view.read = Some(ReadView::loading(buffer_id));
-        sneak_fx.and(
-            self.request_str::<BufferContent>(
-                BufferContentParams { buffer_id },
-                Event::ReadContent,
-            ),
-        )
+        let prose = self.view.window.as_ref().and_then(|w| {
+            w.root.editors().into_iter().find_map(|node| match node {
+                Element::Editor {
+                    element,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Client,
+                    rows,
+                    first_row,
+                    lines,
+                    ..
+                } if *element == self.view.focused_element => {
+                    let whole = first_row.get() == 0 && lines.len() as u32 == *rows;
+                    let text = lines
+                        .iter()
+                        .map(|l| {
+                            l.visual_rows
+                                .iter()
+                                .flat_map(|r| r.segments.iter().map(|s| s.text.as_str()))
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Some((whole, text))
+                }
+                _ => None,
+            })
+        });
+        let Some((whole, text)) = prose else {
+            // The editor. A pending cross-file anchor could only have landed in a reading view.
+            self.pending_read_anchor = None;
+            if self.view.read.take().is_some() && self.view.mode == Mode::Read {
+                self.view.mode = Mode::Normal;
+            }
+            return Effects::none();
+        };
+        let mut fx = Effects::none();
+        if self.view.read.is_none() {
+            self.view.mode = Mode::Read;
+            self.view.pending = Pending::None;
+            self.view.count = None;
+            fx = fx.and(self.cancel_sneak_on(buffer_id));
+            self.view.read = Some(ReadView::loading(buffer_id));
+        }
+        if !whole {
+            return fx;
+        }
+        let revision = self.view.buffer.revision;
+        let read = self.view.read.as_mut().expect("installed above");
+        if !read.loading && read.text == text {
+            return fx; // the push was about something other than the text
+        }
+        // A followed cross-file anchor is pending: stage the parse instead of installing it —
+        // the document paints once, already in place.
+        if self.pending_read_anchor.is_some() {
+            let mut staged = ReadView::loading(buffer_id);
+            staged.adopt(revision, text);
+            return fx.and(self.stage_read_place(staged));
+        }
+        read.adopt(revision, text);
+        fx.and(self.read_fence_requests())
     }
 
     /// Ask the server to highlight every fenced code block of the freshly parsed document —
@@ -3459,21 +3505,6 @@ impl Session {
             ));
         }
         fx
-    }
-
-    /// Re-fetch the reading view's content (an external change notified a newer revision). The
-    /// `loading` flag debounces: a fetch already in flight will chase the newest revision itself
-    /// when it adopts.
-    fn refetch_read_content(&mut self) -> Effects {
-        let Some(read) = self.view.read.as_mut() else {
-            return Effects::none();
-        };
-        if read.loading {
-            return Effects::none();
-        }
-        read.loading = true;
-        let buffer_id = read.buffer_id;
-        self.request_str::<BufferContent>(BufferContentParams { buffer_id }, Event::ReadContent)
     }
 
     /// React to a change signal for `buffer_id` at `revision`: when the reading view shows that
@@ -3648,30 +3679,16 @@ impl Session {
         self.view.buffer.cursor = cursor;
     }
 
-    fn maybe_refresh_read(&mut self, buffer_id: BufferId, revision: u64) -> Effects {
-        // `!=`, not `>`: revisions identify buffer states, they don't order them — undo
-        // *restores* the undone entry's older revision number (dirty-tracking relies on
-        // that), so a `Ctrl-z` in the reading view signals a change with a revision that
-        // went backwards. Any revision other than the parsed one means the text moved.
-        let stale = self
-            .view
-            .read
-            .as_ref()
-            .is_some_and(|r| r.buffer_id == buffer_id && revision != r.revision);
-        if stale {
-            self.refetch_read_content()
-        } else {
-            Effects::none()
-        }
-    }
-
     /// Adopt the result of a `viewport/subscribe` the shell issued: install the viewport binding
     /// and the buffer-wide status that rides with it atomically (diagnostics, language-server
     /// health, external-change flags), plus the first window. Pure core state — the shell owns the
     /// pixel work it does afterward (seeding the scroll, revealing the cursor). One definition
     /// shared by every shell: the native shells pass the typed result; the wasm shell deserialises
     /// the same struct. Shells must never write these fields directly.
-    pub fn adopt_subscribe(&mut self, res: ViewportSubscribeResult) {
+    ///
+    /// The effects are the reading view's (`sync_read_presentation`): the window says which view
+    /// this is, and a reader's parse asks for its fence highlights.
+    pub fn adopt_subscribe(&mut self, res: ViewportSubscribeResult) -> Effects {
         self.view.viewport_id = Some(res.viewport_id);
         self.adopt_buffer_status(res.buffer_status);
         self.view.window = Some(res.window);
@@ -3693,12 +3710,15 @@ impl Session {
         if focus.buffer.buffer_id != self.view.buffer.buffer_id {
             self.view.buffer = buffer_info(focus.buffer, &self.workspace_paths);
         }
+        self.sync_read_presentation()
     }
 
     /// Adopt the window from a geometry RPC the shell issued (`view/window`, `view/set_wrap`,
     /// `view/resize`). Pure core state; the shell clamps its scroll and reveals the cursor around it.
-    pub fn adopt_window(&mut self, res: ViewportWindowResult) {
+    /// The effects are the reading view's, as for [`Self::adopt_subscribe`].
+    pub fn adopt_window(&mut self, res: ViewportWindowResult) -> Effects {
         self.view.window = Some(res.window);
+        self.sync_read_presentation()
     }
 
     /// Report the viewport's current scroll position so the core knows what's actually on screen
@@ -6716,8 +6736,8 @@ impl Session {
                     self.view.buffer.cursor = cursor;
                 }
                 self.view.window = Some(p.window);
-                // An in-window edit is also a change signal for the reading view.
-                let read_fx = self.maybe_refresh_read(p.buffer, p.revision);
+                // A reader's lines are all in the window, so this is also its re-parse.
+                let read_fx = self.sync_read_presentation();
                 Effects::one(Effect::WindowAdopted).and(read_fx)
             }
             GitBlameChanged::NAME => {
@@ -6743,16 +6763,17 @@ impl Session {
                 Effects::none()
             }
             BufferChanged::NAME => {
-                // The revision-only change signal for edits outside the pushed window — the reading
-                // view's cue to re-fetch. Editor rendering ignores it (the window on screen is
-                // untouched by an out-of-window edit).
+                // The revision-only change signal for edits outside the pushed window. Rendering
+                // ignores it (the window on screen is untouched by an out-of-window edit), and a
+                // reader has no outside — its element is loaded whole, so its edits arrive as
+                // windows.
                 let Ok(p) = serde_json::from_value::<BufferChangedParams>(n.params) else {
                     return Effects::none();
                 };
                 if p.buffer_id == self.view.buffer.buffer_id {
                     self.view.buffer.revision = p.revision;
                 }
-                self.maybe_refresh_read(p.buffer_id, p.revision)
+                Effects::none()
             }
             BufferState::NAME => {
                 let Ok(p) = serde_json::from_value::<BufferStateParams>(n.params) else {
@@ -8475,13 +8496,8 @@ impl Session {
         // Hints likewise: the engine reads the flag before observing/sampling, and the shells stop
         // rendering the corner hint when it's off.
         self.hints_enabled = settings.hints;
-        // The markdown-read setting is the *default* the session's live choice starts from, so
-        // changing it re-seeds that choice — otherwise turning the setting off would do nothing
-        // until the client restarted. Only future opens are affected either way; the current
-        // buffer's presentation isn't retroactively flipped.
-        if settings.markdown_read != self.markdown_read_default {
-            self.read_on = settings.markdown_read;
-        }
+        // The markdown-read setting is the server's to apply, when a file is first presented;
+        // the mirror only feeds the settings overlay.
         self.markdown_read_default = settings.markdown_read;
         // The reading width is shell-render-only: each shell resolves it through `read_layout`'s
         // measure table every frame, so adopting the value is enough. The TUI's layout cache keys
@@ -8548,11 +8564,11 @@ impl Session {
             }
             // Hints: same flip (and toast) as `Space Alt-h`.
             AppSettingId::Hints => self.toggle_hints(),
-            // Markdown reading view default: applies to future opens (`Space v` flips the
-            // session's live choice without touching the setting); flip both + persist.
+            // Markdown reading view default: applies to files never presented (the server
+            // remembers how each file was last shown; `Space v` re-presents without touching the
+            // setting). Flip + persist.
             AppSettingId::MarkdownRead => {
                 self.markdown_read_default = !self.markdown_read_default;
-                self.read_on = self.markdown_read_default;
                 self.persist_app_settings()
             }
             // Reading width: activating the row cycles to the next option (wrapping), like the
@@ -10327,20 +10343,9 @@ impl Session {
         }
     }
 
-    /// Toggle the reading view on the current buffer (`Space v`). The choice is remembered per
-    /// buffer for the session; non-markdown buffers toast instead.
+    /// Toggle the reading view on the current buffer (`Space v`): ask the server for the other
+    /// kind, which it remembers for the file. Non-markdown buffers toast instead.
     fn toggle_read_view(&mut self) -> Effects {
-        if self.view.read.is_some() {
-            self.read_on = false;
-            self.view.read = None;
-            if self.view.mode == Mode::Read {
-                self.view.mode = Mode::Normal;
-            }
-            // The editor window stayed subscribed throughout — just frame the reading position.
-            return Effects::one(Effect::RevealCursor(RevealStyle::Jump));
-        }
-        // A buffer with no reading view to show leaves the session choice alone: flipping global
-        // state from a buffer where you can't see it change is worse than doing nothing.
         if self.view.buffer.language.as_deref() != Some("markdown") {
             return Effects::toast_grouped(
                 "No reader view available",
@@ -10348,8 +10353,15 @@ impl Session {
                 "read-view",
             );
         }
-        self.read_on = true;
-        self.begin_read()
+        if self.view.read.is_some() {
+            self.read_exit_for_edit();
+            // Frame the reading position first — the block's row is still known — so the anchor
+            // then captured has the cursor on screen, and the editor opens showing it: what
+            // leaving the reader always did.
+            return Effects::one(Effect::RevealCursor(RevealStyle::Jump))
+                .and(self.represent_as(aether_protocol::ui::ViewKind::Editor));
+        }
+        self.represent_as(aether_protocol::ui::ViewKind::Reader)
     }
 
     /// Step the reading focus (`j`/`k`, `Tab`, `o` — the predicate picks the element class) and
@@ -10532,9 +10544,9 @@ impl Session {
         )
     }
 
-    /// Leave the reading view for the editor as an *edit transition*: unlike `Space v`, does NOT
-    /// record a presentation preference — ducking out to type is not "I prefer source". The caller
-    /// sets the destination mode.
+    /// Leave the reading view for the editor, locally and at once — the caller sets the
+    /// destination mode, and asks the server for the editor with [`Self::represent_as`], or the
+    /// next pushed window would bring the reading view straight back.
     fn read_exit_for_edit(&mut self) {
         self.view.read = None;
         if self.view.mode == Mode::Read {
@@ -10572,7 +10584,8 @@ impl Session {
         };
         self.read_exit_for_edit();
         self.view.mode = Mode::Insert;
-        match target {
+        let fx = self.represent_as(aether_protocol::ui::ViewKind::Editor);
+        fx.and(match target {
             Some(position) => self.move_motion(Motion::Goto { position }, false),
             None => self.enter_insert_at(if at_end {
                 // `LastLineEnd`, not `SelectionEnd`: a block selection is always in whole-line
@@ -10584,7 +10597,7 @@ impl Session {
             } else {
                 InsertWhere::SelectionStart
             }),
-        }
+        })
     }
 
     /// `Ctrl-e`: rewrite the selected block(s) — a *content-only* change. The selection is
@@ -10610,19 +10623,20 @@ impl Session {
         self.read_exit_for_edit();
         self.view.mode = Mode::Insert;
         let buffer_id = self.view.buffer.buffer_id;
-        self.request_str::<CursorSet>(
-            CursorSetParams {
+        self.represent_as(aether_protocol::ui::ViewKind::Editor)
+            .and(self.request_str::<CursorSet>(
+                CursorSetParams {
+                    buffer_id,
+                    position,
+                    anchor,
+                    granularity: Granularity::Char,
+                },
+                Event::CursorMsg,
+            ))
+            .and(self.edit::<InputChange>(CountedEditParams {
                 buffer_id,
-                position,
-                anchor,
-                granularity: Granularity::Char,
-            },
-            Event::CursorMsg,
-        )
-        .and(self.edit::<InputChange>(CountedEditParams {
-            buffer_id,
-            count: 1,
-        }))
+                count: 1,
+            }))
     }
 
     /// `h`/`l`: step the Enter target among the interactive elements *inside the focused block*.
@@ -11636,42 +11650,149 @@ mod tests {
         s
     }
 
-    /// A link anchor outranks the session's read-vs-source choice: `[x](./other.md#section)`
-    /// followed while the session is on *source* still lands in the reading view, because a
-    /// heading slug only resolves against the rendered document — landing in the editor would
-    /// silently drop it (`sync_read_on_switch`). One-shot: it doesn't flip the session choice.
+    /// The window the server sends for a markdown file presented as the reader: one element the
+    /// client lays out, carrying every line of `text` unwrapped.
+    fn prose_window(buffer: BufferId, text: &str) -> aether_protocol::viewport::Window {
+        use aether_protocol::viewport::{LogicalLineRender, Segment, Window, WrappedRow};
+        let lines: Vec<LogicalLineRender> = text
+            .split('\n')
+            .enumerate()
+            .map(|(i, t)| LogicalLineRender {
+                change: Default::default(),
+                logical_line: i as u32,
+                visual_rows: vec![WrappedRow {
+                    byte_offset: 0,
+                    continuation_indent: 0,
+                    segments: vec![Segment {
+                        text: t.into(),
+                        highlights: vec![],
+                    }],
+                }],
+                search_matches: vec![],
+                baseline_above: vec![],
+                diagnostics: vec![],
+                sneak_targets: vec![],
+            })
+            .collect();
+        Window {
+            other_elements_dirty: false,
+            max_line_width: 0,
+            git_status: None,
+            root: Element::Editor {
+                element: 0,
+                buffer,
+                rows: lines.len() as u32,
+                first_row: aether_protocol::coords::ElementRow::ZERO,
+                laid_out_by: aether_protocol::ui::LayoutOwner::Client,
+                first_buffer_line: 0,
+                lines,
+            },
+        }
+    }
+
+    /// A link anchor decides the subscribe: `[x](./other.md#section)` lands in the reading view
+    /// whatever the file was last shown as, because a heading slug only resolves against the
+    /// rendered document — landing in the editor would silently drop it. A jump-shaped open asks
+    /// for the editor the same way; a plain open asks for nothing and takes the server's answer.
     #[test]
-    fn a_link_anchor_outranks_a_source_session_choice() {
+    fn the_route_decides_what_a_switch_asks_for() {
+        use aether_protocol::ui::ViewKind;
         let mut s = reading_session();
-        s.read_on = false; // `Space v` out to source
         let _ = s.read_follow_link("./other.md#section-two");
         assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
 
-        // The open lands on a markdown buffer: the armed anchor forces the reading view.
+        // The open lands on a markdown buffer: the armed anchor asks for the reader.
         s.view.buffer.buffer_id += 1;
         s.view.buffer.language = Some("markdown".into());
-        let fx = s.sync_read_on_switch();
-        assert!(s.view.read.is_some(), "the anchor forced the reading view");
-        assert!(!s.read_on, "without flipping the session's choice");
-        assert!(fx.0.iter().any(|e| matches!(
-            e,
-            Effect::Request { method, .. } if *method == "buffer/content"
-        )));
-
-        // Without an anchor, the same switch honours the source choice.
-        let mut s = reading_session();
-        s.read_on = false;
-        s.view.buffer.language = Some("markdown".into());
-        let _ = s.sync_read_on_switch();
+        s.open_route_jumped = true; // …and outranks a jump-shaped route
+        s.sync_presentation_on_switch();
+        assert_eq!(s.subscribe_kind(), Some(ViewKind::Reader));
         assert!(
             s.view.read.is_none(),
-            "no anchor → the session choice stands"
+            "the view is fresh until its window arrives"
         );
+        assert!(s.pending_read_anchor.is_some(), "still armed for the parse");
+
+        // A jump-shaped open asks for the editor.
+        let mut s = reading_session();
+        s.view.buffer.language = Some("markdown".into());
+        s.open_route_jumped = true;
+        s.sync_presentation_on_switch();
+        assert_eq!(s.subscribe_kind(), Some(ViewKind::Editor));
+        assert!(!s.open_route_jumped, "one-shot");
+
+        // A plain open asks for nothing: the server presents the file as it last was.
+        let mut s = reading_session();
+        s.view.buffer.language = Some("markdown".into());
+        s.sync_presentation_on_switch();
+        assert_eq!(s.subscribe_kind(), None);
+
+        // A non-markdown target drops the anchor: nothing could land it.
+        let mut s = reading_session();
+        let _ = s.read_follow_link("./other.md#section-two");
+        s.view.buffer.language = Some("rust".into());
+        s.sync_presentation_on_switch();
+        assert_eq!(s.subscribe_kind(), None);
+        assert_eq!(s.pending_read_anchor, None);
+    }
+
+    /// The reading view is a consequence of the window: an element the client lays out puts the
+    /// session in Read over its lines; an ordinary editor takes it down again.
+    #[test]
+    fn the_window_decides_the_reading_view() {
+        let mut s = reading_session();
+        s.view.read = None;
+        s.view.mode = Mode::Normal;
+        let id = s.view.buffer.buffer_id;
+        s.view.window = Some(prose_window(id, "# Title\n\nbody\n"));
+        let fx = s.sync_read_presentation();
+        assert_eq!(s.view.mode, Mode::Read);
+        let read = s.view.read.as_ref().expect("reading view");
+        assert!(!read.loading);
+        assert_eq!(read.text, "# Title\n\nbody\n");
+        assert_eq!(read.blocks.len(), 2);
+        assert!(
+            !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+            "no fences, nothing to ask for"
+        );
+
+        // The same text again (a push about the cursor) is not a re-parse.
+        let gen = s.view.read.as_ref().unwrap().hl_gen;
+        let _ = s.sync_read_presentation();
+        assert_eq!(s.view.read.as_ref().unwrap().hl_gen, gen);
+
+        // Changed text re-parses in place.
+        s.view.window = Some(prose_window(id, "# Title\n\nbody\n\nmore\n"));
+        let _ = s.sync_read_presentation();
+        let read = s.view.read.as_ref().unwrap();
+        assert_eq!(read.blocks.len(), 3);
+        assert_eq!(read.hl_gen, gen + 1);
+
+        // A partial load is a window still on its way: the view waits rather than parsing half.
+        let mut partial = prose_window(id, "# Title\n\nbody\n");
+        if let Element::Editor { rows, .. } = &mut partial.root {
+            *rows += 5;
+        }
+        s.view.read = None;
+        s.view.window = Some(partial);
+        let _ = s.sync_read_presentation();
+        let read = s.view.read.as_ref().expect("entered, loading");
+        assert!(read.loading && read.blocks.is_empty());
+
+        // An editor window takes the reading view down.
+        let mut editor = prose_window(id, "# Title\n");
+        if let Element::Editor { laid_out_by, .. } = &mut editor.root {
+            *laid_out_by = aether_protocol::ui::LayoutOwner::Server;
+        }
+        s.view.window = Some(editor);
+        let _ = s.sync_read_presentation();
+        assert!(s.view.read.is_none());
+        assert_eq!(s.view.mode, Mode::Normal);
     }
 
     /// Cross-file anchors: following `[x](./other.md#section)` opens the file and arms the
-    /// fragment; the anchor lands as a `cursor/move` Goto once the target document's reading view
-    /// adopts.
+    /// fragment; the anchor lands as a `cursor/move` Goto once the target document's window
+    /// arrives and parses.
     #[test]
     fn cross_file_anchor_lands_after_target_adopts() {
         let mut s = reading_session();
@@ -11683,13 +11804,15 @@ mod tests {
         );
         assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
 
-        // The switch lands: the new buffer's reading view fetches and adopts its content.
+        // The switch lands: the new buffer's window carries the document, laid out by us.
         s.view.buffer.buffer_id += 1;
-        s.view.read = Some(ReadView::loading(s.view.buffer.buffer_id));
-        let fx = s.on_event(Event::ReadContent(Ok(BufferContentResult {
-            revision: 0,
-            text: "# One\n\ntext\n\n## Section Two\n\nbody\n".into(),
-        })));
+        s.view.read = None;
+        let id = s.view.buffer.buffer_id;
+        s.view.window = Some(prose_window(
+            id,
+            "# One\n\ntext\n\n## Section Two\n\nbody\n",
+        ));
+        let fx = s.sync_read_presentation();
         assert_eq!(s.pending_read_anchor, None, "the anchor is consumed");
         // The parse is *staged*, not installed: the visible view stays "Loading…" for the
         // cursor round-trip, so the document paints exactly once, already in place.
@@ -11743,11 +11866,10 @@ mod tests {
         s.read_follow_link("./other.md#nope");
         assert_eq!(s.pending_read_anchor.as_deref(), Some("nope"));
         s.view.buffer.buffer_id += 1;
-        s.view.read = Some(ReadView::loading(s.view.buffer.buffer_id));
-        let fx = s.on_event(Event::ReadContent(Ok(BufferContentResult {
-            revision: 0,
-            text: "# Only Heading\n".into(),
-        })));
+        s.view.read = None;
+        let id = s.view.buffer.buffer_id;
+        s.view.window = Some(prose_window(id, "# Only Heading\n"));
+        let fx = s.sync_read_presentation();
         assert_eq!(s.pending_read_anchor, None);
         assert!(
             fx.0.iter().any(|e| matches!(

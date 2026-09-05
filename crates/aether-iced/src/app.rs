@@ -994,7 +994,7 @@ impl App {
                 // reading-view default is applied here; an `ae file:line` launch is jump-shaped and
                 // lands in the editor.
                 let jumped = jump_boot;
-                let startup = startup.and(self.session.boot_read_presentation(jumped));
+                self.session.boot_read_presentation(jumped);
                 // A document the desktop handed us during boot wins over the workspace's MRU
                 // buffer — it is the reason this window exists.
                 let startup = startup.and(self.drain_os_opens());
@@ -1096,30 +1096,39 @@ impl App {
                 // cursor-centred), now the window geometry is known, then make sure the cursor
                 // is on-screen (it may sit below a restored scroll after a `jump_to` open).
                 let scroll = self.subscribe_scroll;
-                self.session.adopt_subscribe(res);
-                if let (Some(cell), Some(w)) = (self.cell, self.session.view.window.as_ref()) {
-                    // The *block's* first row, so a line's chrome comes with it — see
-                    // `grid::line_block_start`. A scroll restored from inside the line's own rows
-                    // goes back to that row; a line the server clamped away leaves the element it
-                    // named as where the view opens.
-                    let row = if scroll.sub_row > 0.0 {
-                        grid::line_top_row(w, scroll.element, scroll.line, &self.measured)
-                            .map(|r| r.get() as f32 + scroll.sub_row)
-                    } else {
-                        grid::line_block_start(w, scroll.element, scroll.line, &self.measured)
-                            .map(|r| r.get() as f32)
-                    };
-                    if let Some(row) = row.or_else(|| {
-                        grid::element_start_row(w, scroll.element, &self.measured)
-                            .map(|r| r.get() as f32)
-                    }) {
-                        self.scroll_px = row * cell.height;
+                let read_fx = self.session.adopt_subscribe(res);
+                // A wrap toggle or a `Space v` left a content anchor pending: restore the view to
+                // it (the same content on screen across the re-presentation), superseding the
+                // reveal the subscribe would otherwise do.
+                if let Some(px) = self.resolve_anchor_px() {
+                    self.scroll_px = px;
+                    self.clamp_scroll();
+                    self.pending_reveal.abandon();
+                } else {
+                    if let (Some(cell), Some(w)) = (self.cell, self.session.view.window.as_ref()) {
+                        // The *block's* first row, so a line's chrome comes with it — see
+                        // `grid::line_block_start`. A scroll restored from inside the line's own rows
+                        // goes back to that row; a line the server clamped away leaves the element it
+                        // named as where the view opens.
+                        let row = if scroll.sub_row > 0.0 {
+                            grid::line_top_row(w, scroll.element, scroll.line, &self.measured)
+                                .map(|r| r.get() as f32 + scroll.sub_row)
+                        } else {
+                            grid::line_block_start(w, scroll.element, scroll.line, &self.measured)
+                                .map(|r| r.get() as f32)
+                        };
+                        if let Some(row) = row.or_else(|| {
+                            grid::element_start_row(w, scroll.element, &self.measured)
+                                .map(|r| r.get() as f32)
+                        }) {
+                            self.scroll_px = row * cell.height;
+                        }
                     }
+                    self.clamp_scroll();
+                    self.reveal_cursor();
                 }
-                self.clamp_scroll();
-                self.reveal_cursor();
                 // Diff view rides the subscribe params, so there's nothing to re-apply here.
-                Task::none()
+                self.run_core(read_fx)
             }
             Message::Subscribed(Err(e)) => {
                 self.pending_subscribe = None;
@@ -1145,7 +1154,7 @@ impl App {
             }
             Message::WindowUpdate(Ok(res)) => {
                 self.fetch_in_flight = false;
-                self.session.adopt_window(res);
+                let read_fx = self.session.adopt_window(res);
                 // A wrap toggle left a content anchor pending: restore the view to it (same content
                 // on screen across the reflow), suppressing the reveal/center this fetch would do.
                 let anchored = if let Some(px) = self.resolve_anchor_px() {
@@ -1168,7 +1177,8 @@ impl App {
                 // would go on rendering whichever region that window happened to hold.
                 // `maybe_fetch` no-ops when it does cover.
                 self.refetch_queued = false;
-                self.maybe_fetch()
+                let fetch = self.maybe_fetch();
+                Task::batch([fetch, self.run_core(read_fx)])
             }
             Message::WindowUpdate(Err(e)) => {
                 self.fetch_in_flight = false;
@@ -2188,20 +2198,27 @@ impl App {
         self.fetch_in_flight = false;
         self.refetch_queued = false;
         self.pending_reveal.abandon();
-        let scroll = self.session.view.buffer.scroll.unwrap_or(ScrollPosition {
-            element: self.session.view.focused_element,
-            // A fresh jump target (no saved scroll) rests near the top — the cross-buffer
-            // counterpart of the in-buffer jump reveal.
-            line: self
-                .session
-                .view
-                .buffer
-                .cursor
-                .position
-                .line
-                .saturating_sub((rows as f32 * CURSOR_REST_FRACTION) as u32),
-            sub_row: 0.0,
-        });
+        // A pending content anchor (a wrap toggle, `Space v`) wins: load a window around its
+        // reference line so it resolves precisely once the window arrives. Otherwise restore the
+        // buffer's saved scroll, else open near the cursor.
+        let scroll = self
+            .session
+            .relayout_anchor_position()
+            .or(self.session.view.buffer.scroll)
+            .unwrap_or(ScrollPosition {
+                element: self.session.view.focused_element,
+                // A fresh jump target (no saved scroll) rests near the top — the cross-buffer
+                // counterpart of the in-buffer jump reveal.
+                line: self
+                    .session
+                    .view
+                    .buffer
+                    .cursor
+                    .position
+                    .line
+                    .saturating_sub((rows as f32 * CURSOR_REST_FRACTION) as u32),
+                sub_row: 0.0,
+            });
         self.subscribe_scroll = scroll;
         // Supersede any subscribe still in flight: deregistering its continuation drops the
         // stale adoption entirely — the server has already replaced (and likely deleted) that
@@ -2209,6 +2226,7 @@ impl App {
         if let Some(old) = self.pending_subscribe.take() {
             self.inflight.remove(&old);
         }
+        let kind = self.session.subscribe_kind();
         let id = self.rpc::<ViewportSubscribe>(
             ViewportSubscribeParams {
                 // The *view* is what a viewport subscribes to: the server builds its element
@@ -2223,6 +2241,7 @@ impl App {
                 continuation_marker_width: grid::CONTINUATION_MARKER_COLS,
                 tab_width: TAB_WIDTH,
                 diff_view: self.session.diff_view,
+                kind,
             },
             Message::Subscribed,
         );

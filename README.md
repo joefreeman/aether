@@ -154,7 +154,8 @@ both following the file's own indent style. `Alt-←`/`Alt-→` move by word, an
 
 `Space v` renders the current Markdown buffer — headings, tables, images, links and highlighted
 code fences — as a read-only view with its own keys. The reading position *is* the cursor, so
-toggling back lands where you were reading.
+toggling back lands where you were reading. A file opens in whichever view you last had it in;
+the `markdown_read` setting (`Space ,`) decides for a file you have never opened.
 
 `o`/`Alt-o` step the document outline — the same outline the breadcrumb and `Space o` show, which
 comes from the language server. Heading navigation therefore needs a Markdown language server

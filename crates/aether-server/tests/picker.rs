@@ -2353,6 +2353,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             continuation_marker_width: 1,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2443,6 +2444,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             continuation_marker_width: 1,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;
@@ -2537,6 +2539,7 @@ async fn buffers_picker_pushes_on_save() {
             continuation_marker_width: 1,
             tab_width: 4,
             diff_view: false,
+            kind: None,
         },
     )
     .await;

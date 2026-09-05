@@ -10673,19 +10673,84 @@ fn git_leader(s: &mut Session, c: char) -> Effects {
     key(s, c)
 }
 
-/// A canned reading-view setup: `Space v` on a markdown buffer, content fetched and parsed.
+/// The window the server answers a subscribe with when it presents `buffer_id` as the reader:
+/// one element laid out by the client, carrying every line of `text` unwrapped.
+fn reader_subscribe(
+    buffer_id: u64,
+    text: &str,
+) -> aether_protocol::viewport::ViewportSubscribeResult {
+    use aether_protocol::viewport::{Element, LogicalLineRender, Segment, Window, WrappedRow};
+    let lines: Vec<LogicalLineRender> = text
+        .split('\n')
+        .enumerate()
+        .map(|(i, t)| LogicalLineRender {
+            change: Default::default(),
+            logical_line: i as u32,
+            visual_rows: vec![WrappedRow {
+                byte_offset: 0,
+                continuation_indent: 0,
+                segments: vec![Segment {
+                    text: t.into(),
+                    highlights: vec![],
+                }],
+            }],
+            search_matches: vec![],
+            baseline_above: vec![],
+            diagnostics: vec![],
+            sneak_targets: vec![],
+        })
+        .collect();
+    aether_protocol::viewport::ViewportSubscribeResult {
+        viewport_id: 7,
+        buffer_status: Default::default(),
+        focus: focus_on(0, buffer_id, 0),
+        window: Window {
+            other_elements_dirty: false,
+            max_line_width: 0,
+            git_status: None,
+            root: Element::Editor {
+                element: 0,
+                buffer: buffer_id,
+                rows: lines.len() as u32,
+                first_row: aether_protocol::coords::ElementRow::ZERO,
+                laid_out_by: aether_protocol::ui::LayoutOwner::Client,
+                first_buffer_line: 0,
+                lines,
+            },
+        },
+    }
+}
+
+/// The reader's window lands: adopt it as the shell would, returning the adoption's effects (the
+/// fence highlight requests, a followed anchor's cursor move).
+fn adopt_reader_window(s: &mut Session, text: &str) -> Effects {
+    let id = s.view.buffer.buffer_id;
+    s.adopt_subscribe(reader_subscribe(id, text))
+}
+
+/// `Space v` on the session's markdown buffer — which asks the server for the reader through a
+/// resubscribe — and the window it answers with, over `text`. Returns the adoption's effects.
+fn enter_reader(s: &mut Session, text: &str) -> Effects {
+    let fx = leader(s, 'v');
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
+        "Space v re-presents the view"
+    );
+    assert_eq!(
+        s.subscribe_kind(),
+        Some(aether_protocol::ui::ViewKind::Reader),
+        "…asking for the reader"
+    );
+    adopt_reader_window(s, text)
+}
+
+/// A canned reading-view setup: `Space v` on a markdown buffer, the reader's window adopted.
 /// Layout: heading (line 0), paragraph (line 2), paragraph with a link (line 4).
 fn read_session() -> Session {
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, method, _) = the_request(&fx);
-    assert_eq!(method, "buffer/content");
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({
-            "revision": 1,
-            "text": "# Title\n\nFirst para.\n\nSee [docs](https://x.y) here.\n",
-        })),
+    let _ = enter_reader(
+        &mut s,
+        "# Title\n\nFirst para.\n\nSee [docs](https://x.y) here.\n",
     );
     s
 }
@@ -10694,10 +10759,7 @@ fn read_session() -> Session {
 /// holding nothing but blank lines.
 fn blockless_read_session(text: &str) -> Session {
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, method, _) = the_request(&fx);
-    assert_eq!(method, "buffer/content");
-    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": text })));
+    let _ = enter_reader(&mut s, text);
     assert!(s
         .view
         .read
@@ -10709,12 +10771,29 @@ fn blockless_read_session(text: &str) -> Session {
 }
 
 #[test]
-fn space_v_enters_reading_view_and_fetches_content() {
+fn space_v_asks_for_the_reader_and_its_window_delivers_it() {
     use aether_client::session::Mode;
-    let s = read_session();
+    let mut s = md_session();
+    let fx = leader(&mut s, 'v');
+    // The ask: a content anchor so the same lines stay on screen, then the resubscribe that
+    // names the reader. Nothing is fetched — the window carries the document.
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)));
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
+    assert!(all_requests(&fx).is_empty());
+    assert_eq!(s.view.mode, Mode::Normal, "until the window says otherwise");
+    assert!(s.view.read.is_none());
+    assert_eq!(
+        s.subscribe_kind(),
+        Some(aether_protocol::ui::ViewKind::Reader)
+    );
+    assert_eq!(s.subscribe_kind(), None, "taken: one subscribe asks");
+
+    let _ = adopt_reader_window(
+        &mut s,
+        "# Title\n\nFirst para.\n\nSee [docs](https://x.y) here.\n",
+    );
     assert_eq!(s.view.mode, Mode::Read);
     let read = s.view.read.as_ref().expect("reading view active");
-    assert_eq!(read.revision, 1);
     assert!(!read.loading);
     // heading + 2 paragraphs + the link, in document order.
     assert_eq!(read.elements.len(), 4);
@@ -11125,25 +11204,24 @@ fn read_projections_pause_while_the_parse_is_being_refreshed() {
         text: None,
     })));
     assert!(
-        fx.0.iter().any(|e| matches!(
-            e,
-            Effect::Request { method, .. } if *method == "buffer/content"
-        )),
-        "the refresh is in flight"
+        !all_requests(&fx)
+            .iter()
+            .any(|(m, _)| *m == "buffer/content"),
+        "nothing is fetched — the pushed window re-parses"
     );
     let read = s.view.read.as_ref().unwrap();
-    assert!(read.loading, "…and the view knows its parse is stale");
+    assert!(
+        read.loading,
+        "…and meanwhile the view knows its parse is stale"
+    );
     assert_eq!(read.display_block_focus(&s.view.buffer.cursor), None);
     assert_eq!(read.display_target(&s.view.buffer.cursor), None);
     assert_eq!(read.display_selection(&s.view.buffer.cursor), None);
-    // The new parse restores them.
-    let (token, _, _) = the_request(&fx);
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({ "revision": 2, "text": "# Title\n\nMoved.\n\nFirst para.\n" })),
-    );
+    // The pushed window's parse restores them.
+    let _ = adopt_reader_window(&mut s, "# Title\n\nMoved.\n\nFirst para.\n");
     let read = s.view.read.as_ref().unwrap();
     assert!(!read.loading);
+    assert_eq!(read.revision, 2);
     assert!(read.display_block_focus(&s.view.buffer.cursor).is_some());
 }
 
@@ -11194,13 +11272,17 @@ fn read_i_and_a_enter_insert_at_the_blocks_edges() {
 fn read_placeholder_names_the_loading_and_empty_states() {
     // The line every shell paints when there's nothing to lay out — spelled once, in the core.
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, _method, _) = the_request(&fx);
+    // A window whose element is taller than the lines it carries is still on its way.
+    let mut partial = reader_subscribe(s.view.buffer.buffer_id, "# T\n");
+    if let aether_protocol::viewport::Element::Editor { rows, .. } = &mut partial.window.root {
+        *rows = 40;
+    }
+    let _ = s.adopt_subscribe(partial);
     assert_eq!(
         s.view.read.as_ref().unwrap().placeholder(),
         Some("Loading…")
     );
-    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": "" })));
+    let _ = adopt_reader_window(&mut s, "");
     assert_eq!(
         s.view.read.as_ref().unwrap().placeholder(),
         Some("Empty document")
@@ -11336,35 +11418,39 @@ fn read_ctrl_o_refused_stays_in_the_reading_view() {
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Toast { .. })));
 }
 
+/// The edit transitions leave the reading view at once *and* ask the server for the editor —
+/// the view is the server's, and the next pushed window would otherwise bring the reader back
+/// mid-Insert.
 #[test]
-fn read_transitions_do_not_record_a_presentation_preference() {
+fn read_edit_transitions_ask_for_the_editor() {
     use aether_client::session::Mode;
-    // `Space v` back into the editor is the explicit "source, please" signal and flips the
-    // session's choice; the edit transitions must not — you can edit *in* the reading view,
-    // so dropping into Insert says nothing about how the next document should open.
+    use aether_protocol::ui::ViewKind;
     let mut s = read_session();
-    assert!(s.read_on(), "Space v into the view set the session choice");
-    let _ = key(&mut s, 'i');
+    let fx = key(&mut s, 'i');
     assert_eq!(s.view.mode, Mode::Insert);
-    assert!(s.read_on(), "the transition left the choice alone");
-    // Contrast: Space v out of Read is the explicit "I prefer source" signal.
+    assert!(s.view.read.is_none(), "handed over to the editor at once");
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
+    assert_eq!(s.subscribe_kind(), Some(ViewKind::Editor));
+    // Space v out of Read asks the same way.
     let mut s = read_session();
-    let _ = leader(&mut s, 'v');
-    assert!(!s.read_on());
+    let fx = leader(&mut s, 'v');
+    assert_eq!(s.view.mode, Mode::Normal);
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
+    assert_eq!(s.subscribe_kind(), Some(ViewKind::Editor));
 }
 
-/// The choice is one session-wide flag, not a per-buffer memory: leaving one document for source
-/// means the next markdown document opens in source too. The alternative — remembering per buffer —
-/// treats "I dropped into raw markdown to fix a link" as a durable property of that document, which
-/// it isn't.
+/// Which kind a file opens in is the server's memory of that file, not a client flag: a plain open
+/// asks for nothing, and the window that comes back says what the view is.
 #[test]
-fn read_choice_is_session_wide_not_per_buffer() {
+fn a_plain_open_leaves_the_kind_to_the_server() {
     use aether_client::session::Mode;
     let mut s = read_session();
     let _ = leader(&mut s, 'v'); // out to source
-    assert!(!s.read_on());
+    assert_eq!(
+        s.subscribe_kind(),
+        Some(aether_protocol::ui::ViewKind::Editor)
+    );
 
-    // A different markdown document now opens in source as well.
     let fx = s.open_path_at("/tmp/other.md".into(), None, None);
     let (token, _m, _p) = the_request(&fx);
     let _ = s.on_rpc_result(
@@ -11375,11 +11461,15 @@ fn read_choice_is_session_wide_not_per_buffer() {
         })),
     );
     assert_eq!(
-        s.view.mode,
-        Mode::Normal,
-        "session choice carries across buffers"
+        s.subscribe_kind(),
+        None,
+        "no opinion: the server's memory of the file decides"
     );
+    assert_eq!(s.view.mode, Mode::Normal, "until the window arrives");
     assert!(s.view.read.is_none());
+    // …and a reader window puts the session in the reading view.
+    let _ = adopt_reader_window(&mut s, "# Other\n");
+    assert_eq!(s.view.mode, Mode::Read);
 }
 
 #[test]
@@ -11439,11 +11529,8 @@ fn read_ctrl_x_cuts_and_the_response_lands_on_the_clipboard() {
         "cut payload reaches the clipboard"
     );
     assert!(
-        fx.0.iter().any(|e| matches!(
-            e,
-            Effect::Request { method, .. } if *method == "buffer/content"
-        )),
-        "the parse refreshes off the edit response"
+        s.view.read.as_ref().unwrap().loading,
+        "the parse is stale until the pushed window re-parses it"
     );
 }
 
@@ -11489,11 +11576,8 @@ fn read_ctrl_d_deletes_the_blocks_without_touching_the_clipboard() {
         "the payload the server always sends is dropped, not clipboarded"
     );
     assert!(
-        fx.0.iter().any(|e| matches!(
-            e,
-            Effect::Request { method, .. } if *method == "buffer/content"
-        )),
-        "the parse refreshes off the edit response"
+        s.view.read.as_ref().unwrap().loading,
+        "the parse is stale until the pushed window re-parses it"
     );
     assert_eq!(s.view.buffer.revision, 2);
     assert_eq!(s.view.mode, Mode::Read, "a deletion is not a transition");
@@ -11556,13 +11640,7 @@ fn enter_toggles_a_task_items_checkbox() {
     use aether_protocol::LogicalPosition;
     // A read fixture with task items.
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, method, _) = the_request(&fx);
-    assert_eq!(method, "buffer/content");
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({ "revision": 1, "text": "- [ ] open\n- [x] done\n" })),
-    );
+    let _ = enter_reader(&mut s, "- [ ] open\n- [x] done\n");
     s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 6 };
     s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
@@ -11578,10 +11656,8 @@ fn j_steps_one_block_from_a_selected_fence() {
     // does not reach, unlike a paragraph's. Resolving the step origin there fell forward to the
     // block *after* the fence, so `j` landed two blocks down and skipped one.
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, _method, _) = the_request(&fx);
     let text = "Intro.\n\n```rust\nfn a() {}\n```\n\nMiddle.\n\nLast.\n";
-    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": text })));
+    let _ = enter_reader(&mut s, text);
     // Cursor on the closing fence line's newline, as a whole-line block selection leaves it.
     s.view.buffer.cursor.anchor = LogicalPosition { line: 2, col: 0 };
     s.view.buffer.cursor.position = LogicalPosition { line: 4, col: 3 };
@@ -11612,9 +11688,7 @@ fn ctrl_a_checks_a_task_item_in_markdown_and_still_adjusts_numbers_elsewhere() {
     assert_eq!(method, "element/toggle_task");
     assert_eq!(params["set"], json!(false), "down unchecks it");
     // The same chord in the reading view resolves the same way — that is the point of it.
-    let fx = leader(&mut s, 'v');
-    let (token, _method, _) = the_request(&fx);
-    let _ = s.on_rpc_result(token, Ok(json!({ "revision": 1, "text": "- [ ] open\n" })));
+    let _ = enter_reader(&mut s, "- [ ] open\n");
     let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL, None, ROWS);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/toggle_task");
@@ -11634,12 +11708,7 @@ fn enter_toggles_a_task_item_holding_more_than_one_block() {
     // own, so innermost-first resolution stops there and never sees the checkbox. The item around
     // it owns the box — the same outward walk the server's `resolve_toggle_task` does.
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, _method, _) = the_request(&fx);
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({ "revision": 1, "text": "- [ ] outer\n\n  - [x] inner\n" })),
-    );
+    let _ = enter_reader(&mut s, "- [ ] outer\n\n  - [x] inner\n");
     // On the outer item's own text, whose innermost element is the paragraph, not the item.
     s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 8 };
     s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
@@ -11654,12 +11723,7 @@ fn enter_does_not_follow_a_link_the_selection_has_un_armed() {
     // With the selection extended the shells hide the target pill, so nothing on screen says a
     // link is armed. Enter must not follow one it isn't showing.
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, _method, _) = the_request(&fx);
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({ "revision": 1, "text": "[docs](https://example.com) and text.\n" })),
-    );
+    let _ = enter_reader(&mut s, "[docs](https://example.com) and text.\n");
     // Point cursor on the link: Enter follows it.
     s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 2 };
     s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
@@ -11688,16 +11752,40 @@ fn space_v_toggles_back_to_the_editor() {
     let fx = leader(&mut s, 'v');
     assert_eq!(s.view.mode, Mode::Normal);
     assert!(s.view.read.is_none());
-    assert!(
-        fx.0.iter().any(|e| matches!(e, Effect::RevealCursor(_))),
-        "leaving the reading view frames the reading position"
+    // The reading position is framed first, then the anchor captured with it on screen, then
+    // the editor asked for — so it opens showing where you were reading.
+    let order: Vec<&str> =
+        fx.0.iter()
+            .filter_map(|e| match e {
+                Effect::RevealCursor(aether_client::effect::RevealStyle::Jump) => Some("reveal"),
+                Effect::SaveContentAnchor => Some("anchor"),
+                Effect::Resubscribe => Some("resubscribe"),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(order, vec!["reveal", "anchor", "resubscribe"]);
+    assert_eq!(
+        s.subscribe_kind(),
+        Some(aether_protocol::ui::ViewKind::Editor)
     );
-    // The choice is remembered: `Space v` again re-enters without consulting the default.
+    // The editor's window confirms it.
+    let id = s.view.buffer.buffer_id;
+    let mut editor = reader_subscribe(id, "# Title\n");
+    if let aether_protocol::viewport::Element::Editor { laid_out_by, .. } = &mut editor.window.root
+    {
+        *laid_out_by = aether_protocol::ui::LayoutOwner::Server;
+    }
+    let _ = s.adopt_subscribe(editor);
+    assert_eq!(s.view.mode, Mode::Normal);
+    assert!(s.view.read.is_none());
+    // `Space v` again asks for the reader, whatever the app default says.
     s.markdown_read_default = false;
     let fx = leader(&mut s, 'v');
-    assert_eq!(s.view.mode, Mode::Read);
-    let (_t, method, _p) = the_request(&fx);
-    assert_eq!(method, "buffer/content");
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
+    assert_eq!(
+        s.subscribe_kind(),
+        Some(aether_protocol::ui::ViewKind::Reader)
+    );
 }
 
 #[test]
@@ -11763,66 +11851,81 @@ fn read_table_contains_no_editing_action() {
     }
 }
 
+/// A reader's element is loaded whole, so every edit to it — another client's included — arrives
+/// as a pushed window, and the push is the re-parse. The revision-only `buffer/changed` signal is
+/// for consumers with lines outside the window, which a reader has none of: it is quiet here.
 #[test]
-fn buffer_changed_with_newer_revision_refetches_content() {
+fn a_pushed_window_reparses_the_reader() {
     use aether_client::update::Event;
     use aether_protocol::envelope::{JsonRpc, Notification};
     let mut s = read_session();
+    let id = s.view.buffer.buffer_id;
+    let gen = s.view.read.as_ref().unwrap().hl_gen;
     let fx = s.on_event(Event::ServerPush(Notification {
         jsonrpc: JsonRpc,
         method: "buffer/changed".into(),
-        params: json!({"buffer_id": s.view.buffer.buffer_id, "revision": 2}),
+        params: json!({"buffer_id": id, "revision": 2}),
     }));
-    let (_t, method, _p) = the_request(&fx);
-    assert_eq!(method, "buffer/content", "newer revision → re-fetch");
-    // A repeat of the same signal is quiet: a fetch is already in flight.
-    let fx = s.on_event(Event::ServerPush(Notification {
-        jsonrpc: JsonRpc,
-        method: "buffer/changed".into(),
-        params: json!({"buffer_id": s.view.buffer.buffer_id, "revision": 2}),
-    }));
-    assert!(
-        !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
-        "no duplicate fetch while one is already in flight"
+    assert!(all_requests(&fx).is_empty(), "nothing to fetch");
+    assert_eq!(
+        s.view.read.as_ref().unwrap().hl_gen,
+        gen,
+        "…and nothing to re-parse yet"
     );
+
+    let window = reader_subscribe(id, "# Title\n\nChanged.\n").window;
+    let fx = s.on_event(Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: "view/lines_changed".into(),
+        params: json!({
+            "viewport_id": 7,
+            "buffer": id,
+            "revision": 2,
+            "window": serde_json::to_value(&window).unwrap(),
+        }),
+    }));
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::WindowAdopted)));
+    let read = s.view.read.as_ref().unwrap();
+    assert_eq!(
+        read.text, "# Title\n\nChanged.\n",
+        "re-parsed from the push"
+    );
+    assert_eq!(read.revision, 2);
+    assert_eq!(read.hl_gen, gen + 1);
+    assert!(!read.loading);
 }
 
 #[test]
-fn read_undo_refetches_despite_the_restored_older_revision() {
+fn read_undo_marks_the_parse_stale_despite_the_restored_older_revision() {
     use aether_client::update::Event;
     use aether_protocol::cursor::CursorState;
-    use aether_protocol::envelope::{JsonRpc, Notification};
     use aether_protocol::input::UndoResult;
     // Undo restores the undone entry's revision NUMBER — revisions identify states, they
-    // don't order them — so a change signal can arrive with an *older* revision than the
-    // parse. It must still refetch (the old `>` guard left the view rendering undone text).
-    let mut s = read_session(); // parse at revision 1
-    let fx = s.on_event(Event::ServerPush(Notification {
-        jsonrpc: JsonRpc,
-        method: "buffer/changed".into(),
-        params: json!({"buffer_id": s.view.buffer.buffer_id, "revision": 0}),
-    }));
-    let (_t, method, _p) = the_request(&fx);
-    assert_eq!(
-        method, "buffer/content",
-        "older revision → still a re-fetch"
-    );
-    // And the client's own undo response refreshes directly, without waiting for the
-    // server's change push.
+    // don't order them — so the response can carry an *older* revision than the parse. The
+    // parse is stale all the same, until the pushed window re-parses it.
     let mut s = read_session();
+    s.view.read.as_mut().unwrap().revision = 1;
     let fx = s.on_event(Event::UndoRedoDone(Ok(UndoResult {
         buffer: 0,
         revision: 0,
         applied: true,
         cursor: CursorState::default(),
     })));
+    assert!(all_requests(&fx).is_empty(), "nothing fetched");
     assert!(
-        fx.0.iter().any(|e| matches!(
-            e,
-            Effect::Request { method, .. } if *method == "buffer/content"
-        )),
-        "own undo response → re-fetch"
+        s.view.read.as_ref().unwrap().loading,
+        "older revision → still stale"
     );
+    // A response for the revision the parse already has (the push got here first) is not.
+    let mut s = read_session();
+    let at = s.view.read.as_ref().unwrap().revision;
+    let _ = s.on_event(Event::UndoRedoDone(Ok(UndoResult {
+        buffer: 0,
+        revision: at,
+        applied: true,
+        cursor: CursorState::default(),
+    })));
+    assert!(!s.view.read.as_ref().unwrap().loading);
 }
 
 #[test]
@@ -11847,8 +11950,14 @@ fn jump_shaped_open_lands_in_editor_file_shaped_in_read() {
     assert_eq!(s.view.mode, Mode::Normal, "jump-shaped → editor");
     assert!(s.view.read.is_none());
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
+    assert_eq!(
+        s.subscribe_kind(),
+        Some(aether_protocol::ui::ViewKind::Editor),
+        "…asked for by the subscribe"
+    );
 
-    // File-shaped (files picker / a doc link): opens as a reading view.
+    // File-shaped (files picker / a doc link): no opinion — the server presents the file as it
+    // last was, or as the setting says, and the window decides the view.
     let fx = s.open_path_at("/tmp/other.md".into(), None, None);
     let (token, _m, _p) = the_request(&fx);
     let other = json!({
@@ -11856,14 +11965,14 @@ fn jump_shaped_open_lands_in_editor_file_shaped_in_read() {
         "revision": 0, "saved_revision": 0, "path": "/tmp/other.md",
     });
     let fx = s.on_rpc_result(token, Ok(other));
-    assert_eq!(s.view.mode, Mode::Read, "file-shaped → reading view");
-    assert!(s.view.read.as_ref().is_some_and(|r| r.loading));
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
+    assert_eq!(s.subscribe_kind(), None, "file-shaped → the server's call");
+    assert_eq!(s.view.mode, Mode::Normal, "until the window arrives");
     assert!(
-        fx.0.iter().any(|e| matches!(
-            e,
-            Effect::Request { method, .. } if *method == "buffer/content"
-        )),
-        "the content fetch rides the switch"
+        !all_requests(&fx)
+            .iter()
+            .any(|(m, _)| *m == "buffer/content"),
+        "nothing fetched: the window carries the document"
     );
 }
 
@@ -11916,11 +12025,15 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
         )
     };
 
-    // Whole-target entry → reading view, like selecting the row.
+    // Whole-target entry → no opinion, like selecting the row: the server presents the file as
+    // it last was.
     let mut s = md_session();
     let _ = s.on_event(step(None, 7, "/tmp/notes.md"));
-    assert_eq!(s.view.mode, Mode::Read, "whole-target step → reading view");
-    assert!(s.view.read.is_some());
+    assert_eq!(
+        s.subscribe_kind(),
+        None,
+        "whole-target step → the server's call"
+    );
 
     // Positioned entry (a grep hit in a markdown file) → editor.
     let mut s = md_session();
@@ -11929,22 +12042,19 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
         8,
         "/tmp/doc.md",
     ));
-    assert_eq!(s.view.mode, Mode::Normal, "positioned step → editor");
+    assert_eq!(
+        s.subscribe_kind(),
+        Some(aether_protocol::ui::ViewKind::Editor),
+        "positioned step → editor"
+    );
+    assert_eq!(s.view.mode, Mode::Normal);
     assert!(s.view.read.is_none());
 }
 
 #[test]
 fn read_adopt_requests_fence_highlights_and_adopts_them() {
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, _m, _p) = the_request(&fx);
-    let fx = s.on_rpc_result(
-        token,
-        Ok(json!({
-            "revision": 1,
-            "text": "# T\n\n```rust\nfn x() {}\n```\n",
-        })),
-    );
+    let fx = enter_reader(&mut s, "# T\n\n```rust\nfn x() {}\n```\n");
     // The parse fans out one highlight request per fenced block.
     let (hl_token, method, params) = the_request(&fx);
     assert_eq!(method, "syntax/highlight_snippet");
@@ -12003,12 +12113,7 @@ fn read_click_activate_follows_a_link() {
 #[test]
 fn read_click_activate_jumps_to_a_footnote_definition() {
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, _m, _p) = the_request(&fx);
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({ "revision": 1, "text": "A claim[^1].\n\n[^1]: The definition.\n" })),
-    );
+    let _ = enter_reader(&mut s, "A claim[^1].\n\n[^1]: The definition.\n");
     // The ref's span starts at byte 7.
     let fx = s.read_click_activate(7);
     let gotos: Vec<_> =
@@ -12033,12 +12138,7 @@ fn read_click_activate_jumps_to_a_footnote_definition() {
 fn read_click_activate_on_an_image_arms_only() {
     let mut s = md_session();
     s.view.buffer.path = Some("/ws/docs/doc.md".into());
-    let fx = leader(&mut s, 'v');
-    let (token, _m, _p) = the_request(&fx);
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({ "revision": 1, "text": "![d](../img.png)\n" })),
-    );
+    let _ = enter_reader(&mut s, "![d](../img.png)\n");
     let fx = s.read_click_activate(0);
     let (_t, method, _params) = the_request(&fx);
     assert_eq!(method, "element/move");
@@ -12055,12 +12155,7 @@ fn read_click_new_window_opens_relative_links() {
     use aether_client::effect::{WindowOpen, WindowTarget};
     let mut s = md_session();
     s.view.buffer.path = Some("/ws/docs/doc.md".into());
-    let fx = leader(&mut s, 'v');
-    let (token, _m, _p) = the_request(&fx);
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({ "revision": 1, "text": "[next](./other.md)\n" })),
-    );
+    let _ = enter_reader(&mut s, "[next](./other.md)\n");
     let fx = s.read_click_new_window(0);
     assert!(
         fx.0.iter().any(|e| matches!(
@@ -12092,15 +12187,9 @@ fn read_click_new_window_opens_relative_links() {
 #[test]
 fn read_k_steps_past_a_lone_link_paragraph() {
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, method, _) = the_request(&fx);
-    assert_eq!(method, "buffer/content");
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({
-            "revision": 1,
-            "text": "# Title\n\nFirst para.\n\n[docs](https://x.y)\n\nLast para.\n",
-        })),
+    let _ = enter_reader(
+        &mut s,
+        "# Title\n\nFirst para.\n\n[docs](https://x.y)\n\nLast para.\n",
     );
     // Walk down: heading → First para (2,0) → the link paragraph, landing at its rest byte
     // AFTER the link (4,19) so the bar shows alone — `l` opts into the link — → Last para.
@@ -12148,15 +12237,7 @@ fn read_k_steps_past_a_lone_link_paragraph() {
 #[test]
 fn read_enter_on_a_remote_image_opens_the_url() {
     let mut s = md_session();
-    let fx = leader(&mut s, 'v');
-    let (token, _m, _p) = the_request(&fx);
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({
-            "revision": 1,
-            "text": "![logo](https://x.y/logo.svg)\n",
-        })),
-    );
+    let _ = enter_reader(&mut s, "![logo](https://x.y/logo.svg)\n");
     // The lone image promotes to a block element; the boot cursor (0,0) focuses it.
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
     assert!(
@@ -12219,12 +12300,7 @@ fn read_ctrl_enter_opens_relative_links_in_a_new_window() {
     use aether_client::effect::{WindowOpen, WindowTarget};
     let mut s = md_session();
     s.view.buffer.path = Some("/ws/docs/doc.md".into());
-    let fx = leader(&mut s, 'v');
-    let (token, _m, _p) = the_request(&fx);
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({ "revision": 1, "text": "[next](./other.md)\n" })),
-    );
+    let _ = enter_reader(&mut s, "[next](./other.md)\n");
     // The boot cursor (0,0) sits inside the link — Ctrl-Enter opens it in a new window.
     let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None, ROWS);
     assert!(
@@ -12258,12 +12334,7 @@ fn read_ctrl_enter_opens_relative_links_in_a_new_window() {
 fn read_enter_on_a_local_image_emits_open_buffer_file() {
     let mut s = md_session();
     s.view.buffer.path = Some("/ws/docs/doc.md".into());
-    let fx = leader(&mut s, 'v');
-    let (token, _m, _p) = the_request(&fx);
-    let _ = s.on_rpc_result(
-        token,
-        Ok(json!({ "revision": 1, "text": "![d](../img.png)\n" })),
-    );
+    let _ = enter_reader(&mut s, "![d](../img.png)\n");
     let id = s.view.buffer.buffer_id;
     // The boot cursor (0,0) sits inside the image markup — armed; Enter opens.
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
@@ -12280,22 +12351,32 @@ fn read_enter_on_a_local_image_emits_open_buffer_file() {
 }
 
 /// The web shell's `view=read|source` URL param: an explicit boot presentation overrides both
-/// the jump rules and the app default, so a refresh restores exactly what was on screen.
+/// the jump rules and the server's memory of the file, so a refresh restores exactly what was on
+/// screen. Without it, boot asks like any open: the editor for a jump, nothing otherwise.
 #[test]
 fn explicit_boot_presentation_overrides_default_and_jump_rules() {
-    use aether_client::session::Mode;
+    use aether_protocol::ui::ViewKind;
     let mut s = md_session();
-    // view=source lands in the editor even though the read default is on.
-    let fx = s.boot_read_presentation_explicit(false);
-    assert_eq!(s.view.mode, Mode::Normal);
-    assert!(s.view.read.is_none());
-    assert!(!fx.0.iter().any(|e| matches!(e, Effect::Request { .. })));
-    // view=read opens the reading view even with the default off.
-    s.markdown_read_default = false;
-    let fx = s.boot_read_presentation_explicit(true);
-    assert_eq!(s.view.mode, Mode::Read);
-    let (_t, method, _p) = the_request(&fx);
-    assert_eq!(method, "buffer/content");
+    s.boot_read_presentation_explicit(false);
+    assert_eq!(s.subscribe_kind(), Some(ViewKind::Editor));
+    s.boot_read_presentation_explicit(true);
+    assert_eq!(s.subscribe_kind(), Some(ViewKind::Reader));
+    s.boot_read_presentation(true);
+    assert_eq!(
+        s.subscribe_kind(),
+        Some(ViewKind::Editor),
+        "a #line:col boot is a jump"
+    );
+    s.boot_read_presentation(false);
+    assert_eq!(
+        s.subscribe_kind(),
+        None,
+        "a plain boot is the server's call"
+    );
+    // A non-markdown buffer has only the editor; the URL's opinion is moot.
+    let mut s = session();
+    s.boot_read_presentation_explicit(true);
+    assert_eq!(s.subscribe_kind(), None);
 }
 
 // -------- git commit (Space g c) --------------------------------------------------------------------
