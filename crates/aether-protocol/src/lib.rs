@@ -25,6 +25,7 @@ pub mod settings;
 pub mod sneak;
 pub mod syntax;
 pub mod ui;
+pub mod view;
 pub mod viewport;
 pub mod workspace;
 
@@ -39,27 +40,20 @@ pub type ViewportId = u64;
 /// edits, search and undo all address whichever file the focused element windows. The two are then
 /// different ids of the same type, and every site that picks one is a silent choice.
 ///
-/// So the choice becomes a type. `buffer/close` closes a view; `element/*` edits a buffer; the
-/// picker lists views; a session records views. Where a conversion is genuinely right — an ordinary
-/// view *is* its buffer — it is spelled, and spelling it is the point.
+/// So the choice becomes a type. `view/open` presents a view and `view/close` closes one;
+/// `element/*` edits a buffer; the picker lists views; a session records views. Which buffer
+/// presents a view is the server's to answer, from its table — no conversion produces it from the
+/// number, and buffers and views draw on one id space so no number is ever both.
 ///
-/// `#[serde(transparent)]`: the wire is unchanged, so no client or on-disk session has to know this
-/// happened.
+/// `#[serde(transparent)]`: the wire is a number, as it always was.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
 #[serde(transparent)]
-pub struct ViewId(pub BufferId);
+pub struct ViewId(pub u64);
 
 impl ViewId {
-    pub fn get(self) -> BufferId {
-        self.0
-    }
-
-    /// The buffer that presents this view. Correct by construction: a view *is* presented by a
-    /// buffer, and that buffer's id is this id. Distinct from the buffer being **edited**, which is
-    /// the focused element's and which no conversion can produce.
-    pub fn presenting_buffer(self) -> BufferId {
+    pub fn get(self) -> u64 {
         self.0
     }
 }

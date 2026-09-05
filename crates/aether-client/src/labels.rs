@@ -5,7 +5,7 @@
 //! plus window-title assembly and path truncation.
 //!
 //! Deliberately client-side: the server sends *root indices* (`path_index`), and the client decides
-//! how to print them — the buffers picker, Files, and Grep all ship `path_index` + `relative_path`
+//! how to print them — the view picker, Files, and Grep all ship `path_index` + `relative_path`
 //! and format their rows here. Anything that needs to show a buffer's location routes through this
 //! module (or the shells' thin per-widget wrappers over [`root_labels`]); don't reinvent the
 //! `"{label}: {path}"` join, or the status bar / title / picker will drift apart again.
@@ -441,7 +441,7 @@ pub fn picker_placeholder(kind: Option<PickerKind>) -> &'static str {
     };
     match kind {
         PickerKind::Files => "Find files…",
-        PickerKind::Buffers => "Switch buffer…",
+        PickerKind::Views => "Switch view…",
         PickerKind::Grep => "Grep workspace…",
         PickerKind::Explorer => "Explore files…",
         PickerKind::Workspaces => "Select workspace…",
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(picker_placeholder(None), "Search…");
         for kind in [
             Files,
-            Buffers,
+            Views,
             Grep,
             Explorer,
             Workspaces,

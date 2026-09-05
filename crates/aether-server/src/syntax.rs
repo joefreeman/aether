@@ -180,13 +180,13 @@ pub fn fence_language(info: &str) -> &str {
 /// extension table: every extension we detect (`"rs"`, `"py"`, `"tfvars"`) is listed as an alias
 /// alongside the markdown-fence short names (`"sh"`, `"js"`, `"yml"`), so extension-based
 /// detection ([`config_for_path`]), injection-language lookups, and an explicit `language` on
-/// `buffer/open` all resolve through this one table. Input is lowercased; unknown names return
+/// `view/open` all resolve through this one table. Input is lowercased; unknown names return
 /// `None`.
 pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         // No extension of its own: reached by the `COMMIT_EDITMSG` file rules below, or by an
-        // explicit `language` on `buffer/open`.
+        // explicit `language` on `view/open`.
         "gitcommit" | "git-commit" => Some(simple(
             &GITCOMMIT,
             LanguageSpec {

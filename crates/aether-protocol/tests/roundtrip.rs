@@ -2,7 +2,6 @@
 //! internally-tagged enums, optional fields) and to lock in the JSON shape against the protocol
 //! doc.
 
-use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::coords::ElementRow;
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
@@ -44,6 +43,7 @@ use aether_protocol::sneak::{
     SneakUpdateResult,
 };
 use aether_protocol::ui::{Element, RailJoin};
+use aether_protocol::view::{ViewOpen, ViewOpenParams, ViewOpenResult};
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
     BaselineRow, BufferStatusSnapshot, ChromeKind, DiagnosticSeverity, DiagnosticSpan, DiffMarker,
@@ -108,7 +108,7 @@ fn workspace_open_path_roundtrip() {
     assert!(v["params"].get("transient").is_none());
     // Nor does an absent jump — `ae PATH` with no `:LINE` suffix, and every overlay open.
     assert!(v["params"].get("jump_to").is_none());
-    // A jump rides in `buffer/open`'s shape (0-based), which this delegates to: `ae /etc/hosts:42`.
+    // A jump rides in `view/open`'s shape (0-based), which this delegates to: `ae /etc/hosts:42`.
     let jumped = to_value(WorkspaceOpenPathParams {
         path: "/etc/hosts".into(),
         transient: None,
@@ -132,14 +132,14 @@ fn workspace_open_path_roundtrip() {
 #[test]
 fn buffer_open_absolute_path_roundtrips_and_omits_when_absent() {
     // Present: serialized through.
-    let with = to_value(BufferOpenParams {
+    let with = to_value(ViewOpenParams {
         absolute_path: Some("/tmp/x.rs".into()),
         ..Default::default()
     })
     .unwrap();
     assert_eq!(with["absolute_path"], "/tmp/x.rs");
     // Absent (the default): skipped, so existing root-relative opens keep their wire shape.
-    let without = to_value(BufferOpenParams::default()).unwrap();
+    let without = to_value(ViewOpenParams::default()).unwrap();
     assert!(without.get("absolute_path").is_none());
 }
 
@@ -1738,9 +1738,10 @@ fn input_adjust_number_methods() {
 
 #[test]
 fn buffer_open_result_shape() {
-    let v = to_value(BufferOpenResult {
+    let v = to_value(ViewOpenResult {
         transient: false,
         buffer_id: 42,
+        view_id: aether_protocol::ViewId(42),
         language: Some("rust".into()),
         line_count: 100,
         byte_count: 1234,
@@ -1771,12 +1772,76 @@ fn buffer_open_result_shape() {
     assert!(v.get("scroll").is_none(), "scroll: None should be skipped");
 }
 
+/// An open answers with the view it presented — always, since a client subscribes to it — and
+/// a result from before views were reported reads as view 0, which no view ever is.
+#[test]
+fn buffer_open_result_reports_its_view() {
+    let v = to_value(ViewOpenResult {
+        transient: false,
+        buffer_id: 42,
+        view_id: aether_protocol::ViewId(7),
+        language: None,
+        line_count: 1,
+        byte_count: 0,
+        revision: 0,
+        saved_revision: 0,
+        path: None,
+        scratch_number: None,
+        cursor: Default::default(),
+        scroll: None,
+        lsp_server: None,
+        title: None,
+        read_only: false,
+        is_patch: false,
+    })
+    .unwrap();
+    assert_eq!(v["view_id"], 7);
+    let back: ViewOpenResult = from_value(json!({
+        "buffer_id": 42, "line_count": 1, "byte_count": 0, "revision": 0, "saved_revision": 0,
+        "cursor": { "position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0} },
+    }))
+    .unwrap();
+    assert_eq!(back.view_id, aether_protocol::ViewId(0));
+}
+
+/// What an open may ask for beyond a file: a view outright, one of its elements, and a kind of
+/// view for a markdown file. All off the wire unless asked — and there is no `buffer_id`: the
+/// wire names views.
+#[test]
+fn view_open_params_carry_a_view_an_element_and_a_kind() {
+    let plain = ViewOpenParams {
+        path_index: Some(0),
+        relative_path: Some("a.md".into()),
+        ..Default::default()
+    };
+    let v = to_value(&plain).unwrap();
+    assert!(v.get("view_id").is_none());
+    assert!(v.get("element").is_none());
+    assert!(v.get("kind").is_none());
+    assert!(v.get("buffer_id").is_none());
+    let asked = ViewOpenParams {
+        view_id: Some(aether_protocol::ViewId(9)),
+        element: Some(2),
+        kind: Some(aether_protocol::ui::ViewKind::Reader),
+        ..Default::default()
+    };
+    let v = to_value(&asked).unwrap();
+    assert_eq!(v["view_id"], 9);
+    assert_eq!(v["element"], 2);
+    assert_eq!(v["kind"], "reader");
+    let back: ViewOpenParams = from_value(json!({"kind": "editor"})).unwrap();
+    assert_eq!(back.kind, Some(aether_protocol::ui::ViewKind::Editor));
+    assert_eq!(back.view_id, None);
+    assert_eq!(back.element, None);
+}
+
 #[test]
 fn buffer_open_result_restored_scroll() {
     use aether_protocol::viewport::ScrollPosition;
-    let v = to_value(BufferOpenResult {
+    let v = to_value(ViewOpenResult {
         transient: false,
         buffer_id: 42,
+        view_id: aether_protocol::ViewId(42),
         language: None,
         line_count: 1,
         byte_count: 0,
@@ -1833,7 +1898,7 @@ fn error_response_shape() {
 fn method_name_constants() {
     assert_eq!(WorkspaceList::NAME, "workspace/list");
     assert_eq!(WorkspaceActivate::NAME, "workspace/activate");
-    assert_eq!(BufferOpen::NAME, "buffer/open");
+    assert_eq!(ViewOpen::NAME, "view/open");
     assert_eq!(CursorMove::NAME, "element/move");
     assert_eq!(InputText::NAME, "element/text");
     assert_eq!(ViewportLinesChanged::NAME, "view/lines_changed");
@@ -2098,7 +2163,7 @@ fn viewport_subscribe_params_carry_sticky_diff_view() {
     };
     assert_eq!(ViewportSubscribe::NAME, "view/subscribe");
     let p = ViewportSubscribeParams {
-        buffer_id: aether_protocol::ViewId(1),
+        view_id: aether_protocol::ViewId(1),
         cols: 80,
         rows: 24,
         overscan_rows: 0,
@@ -2112,30 +2177,20 @@ fn viewport_subscribe_params_carry_sticky_diff_view() {
         continuation_marker_width: 0,
         tab_width: 4,
         diff_view: true,
-        kind: None,
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["diff_view"], true);
     // A fresh open names no focus: the server takes it from the scroll's element.
     assert!(v.get("focus").is_none(), "focus: None stays off the wire");
-    // Nor a kind: the server presents the file as it last was, or as the setting says.
-    assert!(v.get("kind").is_none(), "kind: None stays off the wire");
-    // A route that decided says so, by name.
-    let asked = ViewportSubscribeParams {
-        kind: Some(aether_protocol::ui::ViewKind::Reader),
-        ..p
-    };
-    assert_eq!(to_value(&asked).unwrap()["kind"], "reader");
-    let back: ViewportSubscribeParams = from_value(json!({
-        "buffer_id": 1, "cols": 80, "rows": 24, "overscan_rows": 0,
-        "scroll": { "element": 0, "line": 0, "sub_row": 0.0 },
-        "wrap": "none", "continuation_marker_width": 0, "tab_width": 4, "kind": "editor",
-    }))
-    .unwrap();
-    assert_eq!(back.kind, Some(aether_protocol::ui::ViewKind::Editor));
+    // The view it subscribes to is named as one.
+    assert_eq!(v["view_id"], 1);
+    assert!(
+        v.get("buffer_id").is_none(),
+        "a subscribe names a view, not a buffer"
+    );
     // Absent on the wire → defaults off (older clients that don't send the sticky toggle).
     let back: ViewportSubscribeParams = from_value(json!({
-        "buffer_id": 1, "cols": 80, "rows": 24, "overscan_rows": 0,
+        "view_id": 1, "cols": 80, "rows": 24, "overscan_rows": 0,
         "scroll": { "element": 0, "line": 0, "sub_row": 0.0 },
         "wrap": "none", "continuation_marker_width": 0, "tab_width": 4,
     }))
@@ -2144,7 +2199,7 @@ fn viewport_subscribe_params_carry_sticky_diff_view() {
     assert!(back.focus.is_none());
     // A re-subscribe says which element already holds the cursor.
     let back: ViewportSubscribeParams = from_value(json!({
-        "buffer_id": 1, "cols": 80, "rows": 24, "overscan_rows": 0,
+        "view_id": 1, "cols": 80, "rows": 24, "overscan_rows": 0,
         "scroll": { "element": 2, "line": 9, "sub_row": 0.0 }, "focus": 2,
         "wrap": "none", "continuation_marker_width": 0, "tab_width": 4,
     }))
@@ -2441,7 +2496,7 @@ fn workspace_activate_result_wraps_info() {
             paths: vec!["/p".into()],
             projects: Vec::new(),
         },
-        last_buffer_id: None,
+        last_view_id: None,
         opened: None,
         server_started_at: 0,
     };
@@ -2449,8 +2504,8 @@ fn workspace_activate_result_wraps_info() {
     assert_eq!(v["workspace"]["name"], "aether");
     assert_eq!(v["workspace"]["paths"][0], "/p");
     assert!(
-        v.get("last_buffer_id").is_none(),
-        "None last_buffer_id should be skipped"
+        v.get("last_view_id").is_none(),
+        "None last_view_id should be skipped"
     );
 }
 
@@ -2534,18 +2589,18 @@ fn path_delete_round_trips() {
 
     let full = PathDeleteResult {
         closed_buffer_ids: vec![3, 7],
-        next_buffer_id: Some(9),
+        next_view_id: Some(aether_protocol::ViewId(9)),
     };
     let v = to_value(&full).unwrap();
     assert_eq!(v["closed_buffer_ids"], json!([3, 7]));
-    assert_eq!(v["next_buffer_id"], 9);
+    assert_eq!(v["next_view_id"], 9);
 
-    // `next_buffer_id` is omitted when there's nothing to attach to.
+    // `next_view_id` is omitted when there's nothing to attach to.
     let none = PathDeleteResult {
         closed_buffer_ids: vec![],
-        next_buffer_id: None,
+        next_view_id: None,
     };
-    assert_eq!(to_value(&none).unwrap().get("next_buffer_id"), None);
+    assert_eq!(to_value(&none).unwrap().get("next_view_id"), None);
 }
 
 #[test]
@@ -2560,12 +2615,12 @@ fn workspace_remove_root_result_shape() {
             projects: Vec::new(),
         },
         closed_buffer_ids: vec![3, 5],
-        next_buffer_id: Some(7),
+        next_view_id: Some(aether_protocol::ViewId(7)),
     };
     let v = to_value(&r).unwrap();
     assert_eq!(v["workspace"]["name"], "aether");
     assert_eq!(v["closed_buffer_ids"], json!([3, 5]));
-    assert_eq!(v["next_buffer_id"], 7);
+    assert_eq!(v["next_view_id"], 7);
 }
 
 #[test]
@@ -2579,14 +2634,14 @@ fn workspace_remove_root_result_skips_none_next_buffer() {
             projects: Vec::new(),
         },
         closed_buffer_ids: vec![],
-        next_buffer_id: None,
+        next_view_id: None,
     };
     let v = to_value(&r).unwrap();
-    assert!(v.get("next_buffer_id").is_none());
+    assert!(v.get("next_view_id").is_none());
 }
 
 #[test]
-fn workspace_activate_result_includes_last_buffer_id_when_set() {
+fn workspace_activate_result_includes_last_view_id_when_set() {
     use aether_protocol::workspace::WorkspaceActivateResult;
     let r = WorkspaceActivateResult {
         workspace: WorkspaceInfo {
@@ -2595,21 +2650,20 @@ fn workspace_activate_result_includes_last_buffer_id_when_set() {
             paths: vec!["/p".into()],
             projects: Vec::new(),
         },
-        last_buffer_id: Some(7),
+        last_view_id: Some(aether_protocol::ViewId(7)),
         opened: None,
         server_started_at: 1_700_000_000_000,
     };
     let v = to_value(&r).unwrap();
-    assert_eq!(v["last_buffer_id"], 7);
+    assert_eq!(v["last_view_id"], 7);
     assert_eq!(v["server_started_at"], 1_700_000_000_000_u64);
 }
 
 #[test]
 fn buffer_open_scratch_form() {
     // Both path_index and relative_path null => scratch buffer.
-    let v = to_value(BufferOpenParams {
+    let v = to_value(ViewOpenParams {
         transient: None,
-        buffer_id: None,
         path_index: None,
         relative_path: None,
         language: Some("rust".into()),
@@ -2623,35 +2677,45 @@ fn buffer_open_scratch_form() {
 }
 
 #[test]
-fn buffer_closed_notification_shape() {
-    use aether_protocol::buffer::{BufferClosedParams, BufferLocation};
-    // With a next buffer to switch to.
-    let some = to_value(BufferClosedParams {
-        buffer_id: 4,
-        next_buffer_id: Some(7),
+fn view_closed_notification_shape() {
+    use aether_protocol::buffer::BufferLocation;
+    use aether_protocol::view::ViewClosedParams;
+    use aether_protocol::ViewId;
+    // The view's buffer went with it, and there is a next view to switch to.
+    let some = to_value(ViewClosedParams {
+        view_id: ViewId(4),
+        buffer_id: Some(4),
+        next_view_id: Some(ViewId(7)),
         next_path: None,
     })
     .unwrap();
-    assert_eq!(some, json!({"buffer_id": 4, "next_buffer_id": 7}));
-    // No buffers remain — `next_buffer_id` is omitted, signalling "open a fresh scratch".
-    let none = to_value(BufferClosedParams {
-        buffer_id: 4,
-        next_buffer_id: None,
+    assert_eq!(
+        some,
+        json!({"view_id": 4, "buffer_id": 4, "next_view_id": 7})
+    );
+    // A sibling closed alone — the buffer stays for its other view — and no views remain:
+    // `buffer_id` and `next_view_id` are omitted, the latter signalling "open a fresh scratch".
+    let none = to_value(ViewClosedParams {
+        view_id: ViewId(4),
+        buffer_id: None,
+        next_view_id: None,
         next_path: None,
     })
     .unwrap();
-    assert_eq!(none, json!({"buffer_id": 4}));
-    // And it deserializes back when the field is absent.
-    let parsed: BufferClosedParams = from_value(json!({"buffer_id": 9})).unwrap();
-    assert_eq!(parsed.buffer_id, 9);
-    assert_eq!(parsed.next_buffer_id, None);
+    assert_eq!(none, json!({"view_id": 4}));
+    // And it deserializes back when the fields are absent.
+    let parsed: ViewClosedParams = from_value(json!({"view_id": 9})).unwrap();
+    assert_eq!(parsed.view_id, ViewId(9));
+    assert_eq!(parsed.buffer_id, None);
+    assert_eq!(parsed.next_view_id, None);
     assert_eq!(parsed.next_path, None);
 
     // A worktree rebind names the successor by **path** instead — the id it could offer is a
-    // dormant placeholder the initiator's own landing buffer can materialise under a different id.
-    let moved = to_value(BufferClosedParams {
-        buffer_id: 4,
-        next_buffer_id: None,
+    // dormant placeholder the initiator's own landing view can materialise under a different id.
+    let moved = to_value(ViewClosedParams {
+        view_id: ViewId(4),
+        buffer_id: Some(4),
+        next_view_id: None,
         next_path: Some(BufferLocation {
             path_index: 0,
             relative_path: "src/main.rs".into(),
@@ -2661,6 +2725,7 @@ fn buffer_closed_notification_shape() {
     assert_eq!(
         moved,
         json!({
+            "view_id": 4,
             "buffer_id": 4,
             "next_path": { "path_index": 0, "relative_path": "src/main.rs" },
         })
@@ -2668,19 +2733,19 @@ fn buffer_closed_notification_shape() {
 }
 
 #[test]
-fn buffer_set_transient_shape() {
-    use aether_protocol::buffer::{BufferSetTransientParams, BufferSetTransientResult};
-    let p = to_value(BufferSetTransientParams {
-        buffer_id: 4,
+fn view_set_transient_shape() {
+    use aether_protocol::view::{ViewSetTransientParams, ViewSetTransientResult};
+    let p = to_value(ViewSetTransientParams {
+        view_id: aether_protocol::ViewId(4),
         transient: true,
     })
     .unwrap();
-    assert_eq!(p, json!({"buffer_id": 4, "transient": true}));
-    let parsed: BufferSetTransientParams =
-        from_value(json!({"buffer_id": 9, "transient": false})).unwrap();
-    assert_eq!(parsed.buffer_id, 9);
+    assert_eq!(p, json!({"view_id": 4, "transient": true}));
+    let parsed: ViewSetTransientParams =
+        from_value(json!({"view_id": 9, "transient": false})).unwrap();
+    assert_eq!(parsed.view_id, aether_protocol::ViewId(9));
     assert!(!parsed.transient);
-    let r = to_value(BufferSetTransientResult { transient: false }).unwrap();
+    let r = to_value(ViewSetTransientResult { transient: false }).unwrap();
     assert_eq!(r, json!({"transient": false}));
 }
 
@@ -2816,8 +2881,8 @@ fn git_show_target_shape() {
 
 #[test]
 fn follow_patch_line_shape() {
-    use aether_protocol::buffer::BufferOpenResult;
     use aether_protocol::git::{GitFollowPatchLineParams, GitFollowPatchLineResult};
+    use aether_protocol::view::ViewOpenResult;
 
     let v = to_value(GitFollowPatchLineParams { buffer_id: 7 }).unwrap();
     assert_eq!(v, json!({ "buffer_id": 7 }), "the cursor stays server-side");
@@ -2831,8 +2896,9 @@ fn follow_patch_line_shape() {
 
     // `is_patch` distinguishes a commit's diff from a file at a revision — both read-only, only
     // the first has an index for `Enter` to follow through. Omitted when false, like `read_only`.
-    let revision_buffer = |is_patch: bool| BufferOpenResult {
+    let revision_buffer = |is_patch: bool| ViewOpenResult {
         buffer_id: 3,
+        view_id: aether_protocol::ViewId(3),
         language: None,
         line_count: 1,
         byte_count: 0,
@@ -2856,7 +2922,7 @@ fn follow_patch_line_shape() {
     );
     let v = to_value(revision_buffer(true)).unwrap();
     assert_eq!(v["is_patch"], true);
-    let back: BufferOpenResult = from_value(v).unwrap();
+    let back: ViewOpenResult = from_value(v).unwrap();
     assert!(back.is_patch);
 }
 
@@ -2864,10 +2930,10 @@ fn follow_patch_line_shape() {
 fn nav_goto_params_shape() {
     use aether_protocol::cursor::CursorState;
     use aether_protocol::nav::NavGotoParams;
-    // File entry: path fields present, buffer_id omitted; cursor carries the selection.
+    // File entry: path fields present, view_id omitted; cursor carries the selection.
     let p = NavGotoParams {
         virtual_key: None,
-        buffer_id: None,
+        view_id: None,
         path_index: Some(0),
         relative_path: Some("src/main.rs".into()),
         cursor: CursorState {
@@ -2886,13 +2952,13 @@ fn nav_goto_params_shape() {
             "cursor": { "position": {"line": 9, "col": 2}, "anchor": {"line": 5, "col": 0} },
         })
     );
-    // Round-trips with a bare cursor (no match_bracket/jumplist_position) and a buffer_id reference.
+    // Round-trips with a bare cursor (no match_bracket/jumplist_position) and a view_id reference.
     let parsed: NavGotoParams = from_value(json!({
-        "buffer_id": 3,
+        "view_id": 3,
         "cursor": { "position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0} },
     }))
     .unwrap();
-    assert_eq!(parsed.buffer_id, Some(3));
+    assert_eq!(parsed.view_id, Some(aether_protocol::ViewId(3)));
     assert_eq!(parsed.relative_path, None);
 }
 
@@ -2904,7 +2970,7 @@ fn nav_step_result_omits_absent_target() {
 
 #[test]
 fn unit_result_round_trips() {
-    // BufferClose and ViewportUnsubscribe have Result = (). The JSON unit value is `null`.
+    // ViewClose and ViewportUnsubscribe have Result = (). The JSON unit value is `null`.
     let unit: () = ();
     let s = serde_json::to_string(&unit).unwrap();
     assert_eq!(s, "null");
@@ -4139,7 +4205,7 @@ fn only_grep_maps_to_an_input_history_list() {
     assert_eq!(PickerKind::Grep.history_kind(), Some(HistoryKind::Grep));
     for kind in [
         PickerKind::Files,
-        PickerKind::Buffers,
+        PickerKind::Views,
         PickerKind::Explorer,
         PickerKind::GitChanges,
         PickerKind::Workspaces,
@@ -4362,8 +4428,10 @@ fn picker_select_result_is_tagged() {
 #[test]
 fn picker_item_buffer_is_tagged() {
     use aether_protocol::picker::{BufferDirtyState, PickerItem};
-    let item = PickerItem::Buffer {
+    let item = PickerItem::View {
         buffer_id: 7,
+        view_id: aether_protocol::ViewId(7),
+        view_kind: None,
         display: "src/main.rs".into(),
         status: BufferDirtyState::ExternallyModified,
         path_index: Some(0),
@@ -4375,8 +4443,9 @@ fn picker_item_buffer_is_tagged() {
     assert_eq!(
         v,
         json!({
-            "kind": "buffer",
+            "kind": "view",
             "buffer_id": 7,
+            "view_id": 7,
             "display": "src/main.rs",
             "status": "externally_modified",
             "path_index": 0,
@@ -4388,8 +4457,10 @@ fn picker_item_buffer_is_tagged() {
 
     // Scratch buffer: no path → both fields skipped; clean status → `status` skipped too;
     // permanent → `transient` skipped (the common case).
-    let scratch = PickerItem::Buffer {
+    let scratch = PickerItem::View {
         buffer_id: 9,
+        view_id: aether_protocol::ViewId(9),
+        view_kind: None,
         display: "(scratch 1)".into(),
         status: BufferDirtyState::Clean,
         path_index: None,
@@ -4414,26 +4485,36 @@ fn picker_item_buffer_is_tagged() {
 
     // A clean status absent on the wire deserializes back to `Clean` (serde default).
     let back: PickerItem = from_value(json!({
-        "kind": "buffer", "buffer_id": 9, "display": "(scratch 1)"
+        "kind": "view", "buffer_id": 9, "view_id": 9, "display": "(scratch 1)"
     }))
     .unwrap();
     assert_eq!(back, scratch);
 }
 
 #[test]
-fn picker_select_result_buffer_is_tagged() {
+fn picker_select_result_view_is_tagged() {
     use aether_protocol::picker::PickerSelectResult;
-    let r = PickerSelectResult::Buffer { buffer_id: 42 };
+    let r = PickerSelectResult::View {
+        view_id: aether_protocol::ViewId(42),
+    };
     assert_eq!(
         to_value(&r).unwrap(),
-        json!({"kind": "buffer", "buffer_id": 42})
+        json!({"kind": "view", "view_id": 42})
+    );
+    let at = PickerSelectResult::ViewAt {
+        view_id: aether_protocol::ViewId(42),
+        position: LogicalPosition { line: 3, col: 1 },
+    };
+    assert_eq!(
+        to_value(&at).unwrap(),
+        json!({"kind": "view_at", "view_id": 42, "position": {"line": 3, "col": 1}})
     );
 }
 
 #[test]
 fn picker_kind_buffers_is_snake_case() {
     use aether_protocol::picker::PickerKind;
-    assert_eq!(to_value(PickerKind::Buffers).unwrap(), json!("buffers"));
+    assert_eq!(to_value(PickerKind::Views).unwrap(), json!("views"));
 }
 
 #[test]
@@ -4593,11 +4674,11 @@ fn picker_item_workspace_is_tagged() {
     use aether_protocol::picker::PickerItem;
     let item = PickerItem::Workspace {
         name: "aether".into(),
-        unsaved_buffers: 0,
+        unsaved: 0,
         match_indices: vec![0, 4],
     };
     let v = to_value(&item).unwrap();
-    // `unsaved_buffers` is omitted when zero.
+    // `unsaved` is omitted when zero.
     assert_eq!(
         v,
         json!({"kind": "workspace", "name": "aether", "match_indices": [0, 4]})
@@ -4609,13 +4690,13 @@ fn picker_item_workspace_carries_unsaved_count() {
     use aether_protocol::picker::PickerItem;
     let item = PickerItem::Workspace {
         name: "aether".into(),
-        unsaved_buffers: 3,
+        unsaved: 3,
         match_indices: vec![],
     };
     let v = to_value(&item).unwrap();
     assert_eq!(
         v,
-        json!({"kind": "workspace", "name": "aether", "unsaved_buffers": 3, "match_indices": []})
+        json!({"kind": "workspace", "name": "aether", "unsaved": 3, "match_indices": []})
     );
     // Round-trips back to the same value.
     let back: PickerItem = serde_json::from_value(v).unwrap();
@@ -4893,11 +4974,10 @@ fn picker_view_result_filters_serialized_when_non_default() {
 }
 
 #[test]
-fn buffer_open_params_buffer_id_skipped_when_none() {
-    use aether_protocol::buffer::BufferOpenParams;
-    let p = BufferOpenParams {
+fn view_open_params_view_id_skipped_when_none() {
+    use aether_protocol::view::ViewOpenParams;
+    let p = ViewOpenParams {
         transient: None,
-        buffer_id: None,
         path_index: Some(0),
         relative_path: Some("x".into()),
         language: None,
@@ -4906,16 +4986,16 @@ fn buffer_open_params_buffer_id_skipped_when_none() {
         ..Default::default()
     };
     let v = to_value(&p).unwrap();
-    assert!(v.get("buffer_id").is_none());
+    assert!(v.get("view_id").is_none());
     assert_eq!(v["path_index"], 0);
 }
 
 #[test]
-fn buffer_open_params_buffer_id_round_trips() {
-    use aether_protocol::buffer::BufferOpenParams;
-    let p = BufferOpenParams {
+fn view_open_params_view_id_round_trips() {
+    use aether_protocol::view::ViewOpenParams;
+    let p = ViewOpenParams {
         transient: None,
-        buffer_id: Some(11),
+        view_id: Some(aether_protocol::ViewId(11)),
         path_index: None,
         relative_path: None,
         language: None,
@@ -4924,15 +5004,16 @@ fn buffer_open_params_buffer_id_round_trips() {
         ..Default::default()
     };
     let v = to_value(&p).unwrap();
-    assert_eq!(v["buffer_id"], 11);
+    assert_eq!(v["view_id"], 11);
+    let back: ViewOpenParams = from_value(v).unwrap();
+    assert_eq!(back.view_id, Some(aether_protocol::ViewId(11)));
 }
 
 #[test]
 fn buffer_open_params_jump_to_skipped_when_none() {
-    use aether_protocol::buffer::BufferOpenParams;
-    let p = BufferOpenParams {
+    use aether_protocol::view::ViewOpenParams;
+    let p = ViewOpenParams {
         transient: None,
-        buffer_id: None,
         path_index: Some(0),
         relative_path: Some("x".into()),
         language: None,
@@ -4946,10 +5027,9 @@ fn buffer_open_params_jump_to_skipped_when_none() {
 
 #[test]
 fn buffer_open_params_jump_to_round_trips() {
-    use aether_protocol::buffer::BufferOpenParams;
-    let p = BufferOpenParams {
+    use aether_protocol::view::ViewOpenParams;
+    let p = ViewOpenParams {
         transient: None,
-        buffer_id: None,
         path_index: Some(0),
         relative_path: Some("x".into()),
         language: None,
@@ -4982,7 +5062,6 @@ fn buffer_state_params_external_flags_default_false_when_missing() {
 fn buffer_state_params_external_flags_round_trip() {
     use aether_protocol::buffer::BufferStateParams;
     let p = BufferStateParams {
-        transient: false,
         buffer_id: 5,
         saved_revision: 7,
         saved_at_unix_ms: Some(123),
@@ -5008,14 +5087,13 @@ fn buffer_state_params_external_flags_round_trip() {
 
 // ---- transient buffers ---------------------------------------------------------------------
 
-/// `BufferOpenParams.transient` is a three-state intent: omitted = leave as-is, `true` =
+/// `ViewOpenParams.transient` is a three-state intent: omitted = leave as-is, `true` =
 /// transient-if-created, `false` = pin. Pin the skip-when-None shape and the round trip.
 #[test]
 fn buffer_open_params_transient_shape() {
-    use aether_protocol::buffer::BufferOpenParams;
-    let mut p = BufferOpenParams {
+    use aether_protocol::view::ViewOpenParams;
+    let mut p = ViewOpenParams {
         transient: None,
-        buffer_id: None,
         path_index: Some(0),
         relative_path: Some("x".into()),
         language: None,
@@ -5032,20 +5110,22 @@ fn buffer_open_params_transient_shape() {
     p.transient = Some(true);
     let v = to_value(&p).unwrap();
     assert_eq!(v["transient"], true);
-    let p2: BufferOpenParams = from_value(v).unwrap();
+    let p2: ViewOpenParams = from_value(v).unwrap();
     assert_eq!(p2.transient, Some(true));
 
     // Missing on the wire deserialises as None (older clients).
-    let p3: BufferOpenParams = from_value(json!({"path_index": 0, "relative_path": "x"})).unwrap();
+    let p3: ViewOpenParams = from_value(json!({"path_index": 0, "relative_path": "x"})).unwrap();
     assert_eq!(p3.transient, None);
 }
 
-/// `transient` defaults to false when missing in `BufferOpenResult` and `BufferStateParams`,
-/// and round-trips when set.
+/// `transient` defaults to false when missing in `ViewOpenResult`, and rides `view/state` — never
+/// `buffer/state` — once a view is open. Transience is the view's, and one buffer's views can
+/// disagree, so a buffer-addressed push has no single answer to carry.
 #[test]
-fn transient_flag_defaults_false_in_result_and_state() {
-    use aether_protocol::buffer::{BufferOpenResult, BufferStateParams};
-    let r: BufferOpenResult = from_value(json!({
+fn transient_is_a_view_fact() {
+    use aether_protocol::buffer::BufferStateParams;
+    use aether_protocol::view::{ViewOpenResult, ViewState, ViewStateParams};
+    let r: ViewOpenResult = from_value(json!({
         "buffer_id": 1,
         "language": null,
         "line_count": 1,
@@ -5057,6 +5137,7 @@ fn transient_flag_defaults_false_in_result_and_state() {
     .unwrap();
     assert!(!r.transient);
 
+    // A `buffer/state` payload still carrying the old key parses, and drops it.
     let s: BufferStateParams = from_value(json!({
         "buffer_id": 5,
         "saved_revision": 7,
@@ -5064,9 +5145,23 @@ fn transient_flag_defaults_false_in_result_and_state() {
         "transient": true
     }))
     .unwrap();
-    assert!(s.transient);
-    let v = to_value(&s).unwrap();
-    assert_eq!(v["transient"], true);
+    assert!(
+        !to_value(&s)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("transient"),
+        "buffer/state does not carry a view's transient flag"
+    );
+
+    assert_eq!(ViewState::NAME, "view/state");
+    let p = ViewStateParams {
+        view_id: aether_protocol::ViewId(9),
+        transient: true,
+    };
+    let v = to_value(p).unwrap();
+    assert_eq!(v, json!({ "view_id": 9, "transient": true }));
+    assert_eq!(from_value::<ViewStateParams>(v).unwrap(), p);
 }
 
 #[test]
@@ -5156,7 +5251,7 @@ fn app_settings_wire_shape_and_defaults() {
     let s = AppSettings {
         wrap: WrapMode::None,
         ligatures: false,
-        buffer_font_size: 16,
+        editor_font_size: 16,
         ui_font_size: 12,
         hints: false,
         markdown_read: false,
@@ -5170,7 +5265,7 @@ fn app_settings_wire_shape_and_defaults() {
         json!({
             "wrap": "none",
             "ligatures": false,
-            "buffer_font_size": 16,
+            "editor_font_size": 16,
             "ui_font_size": 12,
             "hints": false,
             "markdown_read": false,
@@ -5193,8 +5288,8 @@ fn app_settings_wire_shape_and_defaults() {
     );
     assert!(!AppSettings::default().git_auto_fetch);
     assert_eq!(
-        parsed.buffer_font_size,
-        aether_protocol::settings::default_buffer_font_size()
+        parsed.editor_font_size,
+        aether_protocol::settings::default_editor_font_size()
     );
     assert_eq!(
         parsed.ui_font_size,
@@ -5236,6 +5331,20 @@ fn app_settings_wire_shape_and_defaults() {
     // field carries a serde default so settings can be added without breaking old files.
     let parsed: AppSettings = from_value(json!({})).unwrap();
     assert_eq!(parsed, AppSettings::default());
+
+    // `editor_font_size` was called `buffer_font_size` before views became the user-facing entity.
+    // The old key still reads, so an existing settings.toml keeps the size its owner chose instead
+    // of silently reverting to the default; the new key is the only one ever written.
+    let parsed: AppSettings = from_value(json!({ "buffer_font_size": 20 })).unwrap();
+    assert_eq!(parsed.editor_font_size, 20);
+    assert!(
+        !to_value(&parsed)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("buffer_font_size"),
+        "the alias is read-only — serialization uses the new key alone"
+    );
 
     // Full round-trip.
     let back: AppSettings = from_value(to_value(&s).unwrap()).unwrap();
@@ -5318,8 +5427,8 @@ fn app_info_wire_shapes() {
         uptime_secs: 61,
         idle_timeout_secs: Some(300),
         clients: 2,
-        buffers_open: 5,
-        buffers_unsaved: 1,
+        views_open: 5,
+        documents_unsaved: 1,
         workspaces_active: 3,
         git_version: Some("git version 2.43.0".into()),
         paths: AppPaths {
@@ -5369,8 +5478,8 @@ fn app_info_wire_shapes() {
         "pid": 7,
         "started_at_unix_ms": 0,
         "clients": 0,
-        "buffers_open": 0,
-        "buffers_unsaved": 0,
+        "views_open": 0,
+        "documents_unsaved": 0,
         "workspaces_active": 0
     }))
     .unwrap();
@@ -5505,7 +5614,7 @@ fn jumplist_wire_shapes() {
     // the tag. `anchor: None` and `opened: None` stay off the wire.
     let t = JumplistStepTarget {
         path: Some("/proj/src/main.rs".into()),
-        buffer_id: None,
+        view_id: None,
         position: Some(LogicalPosition { line: 4, col: 9 }),
         anchor: Some(LogicalPosition { line: 4, col: 2 }),
         index: 3,
@@ -5532,7 +5641,7 @@ fn jumplist_wire_shapes() {
     use aether_protocol::viewport::ViewSeat;
     let seated = JumplistStepTarget {
         path: None,
-        buffer_id: Some(9),
+        view_id: Some(aether_protocol::ViewId(9)),
         position: Some(LogicalPosition { line: 42, col: 0 }),
         anchor: None,
         index: 2,
@@ -5548,7 +5657,7 @@ fn jumplist_wire_shapes() {
         to_value(JumplistStepResult::Moved(Box::new(seated))).unwrap(),
         json!({
             "status": "moved",
-            "buffer_id": 9,
+            "view_id": 9,
             "position": {"line": 42, "col": 0},
             "index": 2,
             "total": 4,
@@ -5556,11 +5665,11 @@ fn jumplist_wire_shapes() {
         })
     );
 
-    // A whole-target step (a captured file or buffer): no position on the wire, and a pathless one
-    // identifies by `buffer_id` instead — exactly one of the two is present.
+    // A whole-target step (a captured file or scratch): no position on the wire, and a pathless one
+    // identifies by `view_id` instead — exactly one of the two is present.
     let whole_file = JumplistStepTarget {
         path: Some("/proj/src/main.rs".into()),
-        buffer_id: None,
+        view_id: None,
         position: None,
         anchor: None,
         index: 1,
@@ -5580,7 +5689,7 @@ fn jumplist_wire_shapes() {
     );
     let scratch = JumplistStepTarget {
         path: None,
-        buffer_id: Some(9),
+        view_id: Some(aether_protocol::ViewId(9)),
         position: None,
         anchor: None,
         index: 2,
@@ -5593,7 +5702,7 @@ fn jumplist_wire_shapes() {
         to_value(JumplistStepResult::Moved(Box::new(scratch))).unwrap(),
         json!({
             "status": "moved",
-            "buffer_id": 9,
+            "view_id": 9,
             "index": 2,
             "total": 4,
         })
@@ -5642,7 +5751,7 @@ fn jumplist_wire_shapes() {
         v,
         json!({ "kind": "jumplist_entry", "index": 4, "line": 5, "display": "let x = 1;", "match_indices": [0, 1] })
     );
-    // A whole-target row (captured from the Files or Buffers picker) carries no line at all —
+    // A whole-target row (captured from the Files or view picker) carries no line at all —
     // the shells render nothing in its place rather than a fictional line 1.
     let v = to_value(PickerItem::JumplistEntry {
         index: 0,
@@ -6157,7 +6266,7 @@ fn jumplist_step_reports_gone_entries() {
     let plain = to_value(JumplistStepResult::Moved(Box::new(
         aether_protocol::jumplist::JumplistStepTarget {
             path: None,
-            buffer_id: Some(3),
+            view_id: Some(aether_protocol::ViewId(3)),
             position: None,
             anchor: None,
             index: 1,
@@ -6225,23 +6334,23 @@ fn previously_unpinned_params_round_trip() {
         },
         &["buffer_id", "path_index", "relative_path", "overwrite"],
     );
-    // `buffer/close`: the composite result carries the follow-on open, and both optional halves
+    // `view/close`: the composite result carries the follow-on open, and both optional halves
     // stay off the wire when the close was a plain one.
     {
-        use aether_protocol::buffer::{BufferCloseParams, BufferCloseResult};
-        let plain = BufferCloseResult {
-            next_buffer_id: None,
+        use aether_protocol::view::{ViewCloseParams, ViewCloseResult};
+        let plain = ViewCloseResult {
+            next_view_id: None,
             opened: None,
         };
         let v = to_value(&plain).unwrap();
         assert_eq!(v, json!({}), "a plain close is an empty object");
         round_trips(&plain);
         wire_keys(
-            &BufferCloseParams {
-                buffer_id: aether_protocol::ViewId(7),
+            &ViewCloseParams {
+                view_id: aether_protocol::ViewId(7),
                 open_next: true,
             },
-            &["buffer_id", "open_next"],
+            &["view_id", "open_next"],
         );
     }
     wire_keys(
@@ -6396,8 +6505,9 @@ fn every_subscribe_carries_the_focus_it_resolved() {
 
     let focus_on = |element: u32| ViewportFocusElementResult {
         element,
-        buffer: aether_protocol::buffer::BufferOpenResult {
+        buffer: aether_protocol::view::ViewOpenResult {
             buffer_id: 9,
+            view_id: aether_protocol::ViewId(9),
             language: None,
             line_count: 40,
             byte_count: 400,

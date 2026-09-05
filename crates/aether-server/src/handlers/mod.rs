@@ -21,11 +21,9 @@ use crate::surround;
 use crate::wrap;
 use aether_protocol::app::{AppInfo, AppInfoParams};
 use aether_protocol::buffer::{
-    BufferChanged, BufferChangedParams, BufferCloseParams, BufferClosed, BufferClosedParams,
-    BufferContentParams, BufferContentResult, BufferCopyParams, BufferCopyResult, BufferCutResult,
-    BufferOpenParams, BufferOpenResult, BufferReloadParams, BufferReloadResult, BufferSaveParams,
-    BufferSaveResult, BufferSetTransientParams, BufferSetTransientResult, BufferState,
-    BufferStateParams, CopyScope,
+    BufferChanged, BufferChangedParams, BufferContentParams, BufferContentResult, BufferCopyParams,
+    BufferCopyResult, BufferCutResult, BufferReloadParams, BufferReloadResult, BufferSaveParams,
+    BufferSaveResult, BufferState, BufferStateParams, CopyScope,
 };
 use aether_protocol::cursor::{
     CursorMoveParams, CursorSelectAllParams, CursorSelectLineParams, CursorSelectWordParams,
@@ -97,6 +95,10 @@ use aether_protocol::search::{
 use aether_protocol::settings::{AppSettings, SettingsChanged, SettingsGetParams};
 use aether_protocol::sneak::{
     SneakCancelParams, SneakSelectParams, SneakTarget, SneakUpdateParams, SneakUpdateResult,
+};
+use aether_protocol::view::{
+    ViewCloseParams, ViewClosed, ViewClosedParams, ViewOpenParams, ViewOpenResult,
+    ViewSetTransientParams, ViewSetTransientResult, ViewState, ViewStateParams,
 };
 use aether_protocol::viewport::{
     BaselineRow, BufferStatusSnapshot, ConflictLine, DiagnosticSpan, DiffMarker, DiffStage,

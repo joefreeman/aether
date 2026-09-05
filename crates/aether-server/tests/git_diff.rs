@@ -77,9 +77,9 @@ async fn a_file_outside_the_roots_but_inside_the_repo_gets_a_baseline_and_stages
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             absolute_path: Some(repo_root.join("other/outside.rs").to_string_lossy().into()),
             ..Default::default()
         },
@@ -127,9 +127,9 @@ async fn a_file_in_an_unreachable_repo_stays_a_guest() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             absolute_path: Some(dep_root.join("dep.rs").to_string_lossy().into()),
             ..Default::default()
         },
@@ -444,7 +444,7 @@ async fn apply_hunk_stage_refreshes_status_counts() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -458,7 +458,6 @@ async fn apply_hunk_stage_refreshes_status_counts() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -511,7 +510,7 @@ async fn remodified_staged_line_reads_as_unstaged() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -525,7 +524,6 @@ async fn remodified_staged_line_reads_as_unstaged() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -568,7 +566,7 @@ async fn shared_anchor_phantom_rows_show_only_the_unstaged_layer() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -582,7 +580,6 @@ async fn shared_anchor_phantom_rows_show_only_the_unstaged_layer() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -636,11 +633,10 @@ async fn git_gutter_marker_present_without_diff_view() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("g.rs".into()),
             language: None,
@@ -653,7 +649,7 @@ async fn git_gutter_marker_present_without_diff_view() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -667,7 +663,6 @@ async fn git_gutter_marker_present_without_diff_view() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -718,11 +713,10 @@ async fn git_navigate_hunk_jumps_between_changes() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("nav.rs".into()),
             language: None,
@@ -875,7 +869,7 @@ async fn an_ordinary_views_changes_are_stepped_through_the_view() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -885,7 +879,6 @@ async fn an_ordinary_views_changes_are_stepped_through_the_view() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -949,11 +942,10 @@ async fn git_navigate_hunk_honours_count() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("nav.rs".into()),
             language: None,
@@ -1058,9 +1050,9 @@ async fn git_navigate_hunk_honours_count() {
 
 /// Open `rel` under root 0 and return its buffer id.
 async fn open_under_root(ws: &mut Ws, rel: &str) -> u64 {
-    let res: BufferOpenResult = send_request::<BufferOpen>(
+    let res: ViewOpenResult = send_request::<ViewOpen>(
         ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some(rel.into()),
             ..Default::default()
@@ -1165,18 +1157,18 @@ async fn each_buffer_resolves_to_its_own_repo_in_a_multi_repo_workspace() {
 
     let (server, mut ws) = setup_repos_workspace(vec![first.clone(), second.clone()]).await;
 
-    let in_alpha: BufferOpenResult = send_request::<BufferOpen>(
+    let in_alpha: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
         },
     )
     .await;
-    let in_beta: BufferOpenResult = send_request::<BufferOpen>(
+    let in_beta: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(1),
             relative_path: Some("b.rs".into()),
             ..Default::default()
@@ -1205,8 +1197,8 @@ async fn a_scratch_buffer_refuses_rather_than_choosing_a_repo() {
     commit_file(&init_repo_at(&root), "a.rs", "one\n");
 
     let (server, mut ws) = setup_repos_workspace(vec![root]).await;
-    let scratch: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &BufferOpenParams::default()).await;
+    let scratch: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &ViewOpenParams::default()).await;
 
     let err = resolve_repo_err(&mut ws, Some(scratch.buffer_id)).await;
     assert_eq!(err["code"], serde_json::json!(-32040), "got {err}");
@@ -1297,18 +1289,18 @@ async fn a_worktree_resolves_as_its_own_repo() {
 
     let (server, mut ws) = setup_repos_workspace(vec![main.clone(), wt_path.clone()]).await;
 
-    let in_main: BufferOpenResult = send_request::<BufferOpen>(
+    let in_main: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
         },
     )
     .await;
-    let in_worktree: BufferOpenResult = send_request::<BufferOpen>(
+    let in_worktree: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(1),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -1403,9 +1395,9 @@ async fn setup_refresh_workspace(
 
     let (mut server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
     server.keep_alive(dir);
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -1553,7 +1545,7 @@ async fn git_refresh_rebases_baselines_when_no_file_changed() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1567,7 +1559,6 @@ async fn git_refresh_rebases_baselines_when_no_file_changed() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1678,7 +1669,7 @@ async fn buffer_reload_leaves_a_fresh_gutter() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1692,7 +1683,6 @@ async fn buffer_reload_leaves_a_fresh_gutter() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1768,7 +1758,7 @@ async fn subscribing_refreshes_a_gutter_left_stale_while_hidden() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1782,7 +1772,6 @@ async fn subscribing_refreshes_a_gutter_left_stale_while_hidden() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1907,7 +1896,7 @@ async fn every_captured_outline_entry_lands_in_the_review() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 40,
             overscan_rows: 0,
@@ -1917,7 +1906,6 @@ async fn every_captured_outline_entry_lands_in_the_review() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1926,7 +1914,7 @@ async fn every_captured_outline_entry_lands_in_the_review() {
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -1948,11 +1936,10 @@ async fn every_captured_outline_entry_lands_in_the_review() {
 
     // Leave the view: open a file in an ordinary editor and look at it (hides the review, closes
     // its transient element buffers), exactly as a user who wandered off would.
-    let away: BufferOpenResult = send_request::<BufferOpen>(
+    let away: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("top.rs".into()),
             language: None,
@@ -1965,7 +1952,7 @@ async fn every_captured_outline_entry_lands_in_the_review() {
     let away_sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(away.buffer_id),
+            view_id: away.view_id,
             cols: 120,
             rows: 40,
             overscan_rows: 0,
@@ -1975,7 +1962,6 @@ async fn every_captured_outline_entry_lands_in_the_review() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2014,7 +2000,7 @@ async fn every_captured_outline_entry_lands_in_the_review() {
                     let re: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
                         &mut ws,
                         &ViewportSubscribeParams {
-                            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+                            view_id: opened.view_id,
                             cols: 120,
                             rows: 40,
                             overscan_rows: 0,
@@ -2024,7 +2010,6 @@ async fn every_captured_outline_entry_lands_in_the_review() {
                             continuation_marker_width: 0,
                             tab_width: 4,
                             diff_view: false,
-                            kind: None,
                         },
                     )
                     .await;
@@ -2059,7 +2044,7 @@ async fn every_captured_outline_entry_lands_in_the_review() {
                 let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
                     &mut ws,
                     &ViewportSubscribeParams {
-                        buffer_id: aether_protocol::ViewId(opened.buffer_id),
+                        view_id: opened.view_id,
                         cols: 120,
                         rows: 40,
                         overscan_rows: 0,
@@ -2069,7 +2054,6 @@ async fn every_captured_outline_entry_lands_in_the_review() {
                         continuation_marker_width: 0,
                         tab_width: 4,
                         diff_view: false,
-                        kind: None,
                     },
                 )
                 .await;
@@ -2152,7 +2136,7 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 40,
             overscan_rows: 0,
@@ -2162,7 +2146,6 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2171,7 +2154,7 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -2193,22 +2176,21 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
 
     // Keep the review (`Space k`), so hiding it does not close it — only its transient element
     // buffers go.
-    let _: aether_protocol::buffer::BufferSetTransientResult =
-        send_request::<aether_protocol::buffer::BufferSetTransient>(
+    let _: aether_protocol::view::ViewSetTransientResult =
+        send_request::<aether_protocol::view::ViewSetTransient>(
             &mut ws,
-            &aether_protocol::buffer::BufferSetTransientParams {
-                buffer_id: patch.buffer_id,
+            &aether_protocol::view::ViewSetTransientParams {
+                view_id: patch.view_id,
                 transient: false,
             },
         )
         .await;
     // Leave the view: open a file in an ordinary editor and look at it (hides the review, closes
     // its transient element buffers), exactly as a user who wandered off would.
-    let away: BufferOpenResult = send_request::<BufferOpen>(
+    let away: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("top.rs".into()),
             language: None,
@@ -2221,7 +2203,7 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
     let away_sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(away.buffer_id),
+            view_id: away.view_id,
             cols: 120,
             rows: 40,
             overscan_rows: 0,
@@ -2231,7 +2213,6 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2287,7 +2268,7 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
                         let re: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
                             &mut ws,
                             &ViewportSubscribeParams {
-                                buffer_id: aether_protocol::ViewId(opened.buffer_id),
+                                view_id: opened.view_id,
                                 cols: 120,
                                 rows: 40,
                                 overscan_rows: 0,
@@ -2297,7 +2278,6 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
                                 continuation_marker_width: 0,
                                 tab_width: 4,
                                 diff_view: false,
-                                kind: None,
                             },
                         )
                         .await;
@@ -2332,7 +2312,7 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
                     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
                         &mut ws,
                         &ViewportSubscribeParams {
-                            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+                            view_id: opened.view_id,
                             cols: 120,
                             rows: 40,
                             overscan_rows: 0,
@@ -2342,7 +2322,6 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
                             continuation_marker_width: 0,
                             tab_width: 4,
                             diff_view: false,
-                            kind: None,
                         },
                     )
                     .await;
@@ -2420,7 +2399,7 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
         send_request::<ViewportSubscribe>(
             ws,
             &ViewportSubscribeParams {
-                buffer_id: aether_protocol::ViewId(buffer),
+                view_id: view_of(buffer),
                 cols: 120,
                 rows: 40,
                 overscan_rows: 0,
@@ -2430,7 +2409,6 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
-                kind: None,
             },
         )
         .await
@@ -2439,7 +2417,7 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -2462,21 +2440,20 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
     )
     .await
     .expect("captures");
-    let _: aether_protocol::buffer::BufferSetTransientResult =
-        send_request::<aether_protocol::buffer::BufferSetTransient>(
+    let _: aether_protocol::view::ViewSetTransientResult =
+        send_request::<aether_protocol::view::ViewSetTransient>(
             &mut ws,
-            &aether_protocol::buffer::BufferSetTransientParams {
-                buffer_id: patch.buffer_id,
+            &aether_protocol::view::ViewSetTransientParams {
+                view_id: patch.view_id,
                 transient: false,
             },
         )
         .await;
     // Away to top.rs: aaa.rs's element buffer closes with the review hidden.
-    let away: BufferOpenResult = send_request::<BufferOpen>(
+    let away: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("top.rs".into()),
             language: None,
@@ -2597,7 +2574,7 @@ async fn a_reverted_change_is_stepped_over_not_opened_as_a_file() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 40,
             overscan_rows: 0,
@@ -2607,14 +2584,13 @@ async fn a_reverted_change_is_stepped_over_not_opened_as_a_file() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -2805,7 +2781,7 @@ async fn set_baseline_diffs_against_an_older_commit() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -2819,7 +2795,6 @@ async fn set_baseline_diffs_against_an_older_commit() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2909,7 +2884,7 @@ async fn set_baseline_resolves_and_pins_a_named_revision() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(_buffer_id),
+            view_id: view_of(_buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -2923,7 +2898,6 @@ async fn set_baseline_resolves_and_pins_a_named_revision() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3033,7 +3007,7 @@ async fn git_show_opens_a_commit_as_a_read_only_virtual_buffer() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3137,7 +3111,7 @@ async fn a_read_only_buffer_refuses_every_mutating_method() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3445,12 +3419,12 @@ async fn git_show_reuses_the_buffer_for_the_same_revision() {
         target: ShowTarget::Commit { rev: head.clone() },
         focus_path: None,
     };
-    let opened: BufferOpenResult = show_buffer(&mut ws, &params()).await;
-    let again: BufferOpenResult = show_buffer(&mut ws, &params()).await;
+    let opened: ViewOpenResult = show_buffer(&mut ws, &params()).await;
+    let again: ViewOpenResult = show_buffer(&mut ws, &params()).await;
     assert_eq!(opened.buffer_id, again.buffer_id);
 
     // A *different* revision is a different buffer.
-    let other: BufferOpenResult = show_buffer(
+    let other: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3484,7 +3458,7 @@ async fn git_show_with_a_path_yields_that_file_at_the_revision() {
     commit_file(&repo, "src/main.rs", "fn main() { changed(); }\n");
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3555,7 +3529,7 @@ async fn git_show_buffers_are_titled_in_the_picker_and_absent_from_the_session()
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3567,20 +3541,20 @@ async fn git_show_buffers_are_titled_in_the_picker_and_absent_from_the_session()
     .await;
     let title = opened.title.clone().expect("titled");
 
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Buffers)).await;
+    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Views)).await;
     let displays: Vec<String> = view
         .update
         .expect("window")
         .items()
         .iter()
         .filter_map(|i| match i {
-            PickerItem::Buffer { display, .. } => Some(display.clone()),
+            PickerItem::View { display, .. } => Some(display.clone()),
             _ => None,
         })
         .collect();
     assert!(
         displays.contains(&title),
-        "the buffers picker names the revision, got {displays:?}"
+        "the view picker names the revision, got {displays:?}"
     );
     assert!(
         !displays.iter().any(|d| d.starts_with("(scratch")),
@@ -3612,7 +3586,7 @@ async fn git_show_decorates_the_patch_it_generates() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3795,7 +3769,7 @@ async fn patch_chrome_counts_toward_the_scroll_extent() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3882,7 +3856,7 @@ async fn hunk_navigation_steps_a_patchs_own_changes() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3896,7 +3870,7 @@ async fn hunk_navigation_steps_a_patchs_own_changes() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -3910,7 +3884,6 @@ async fn hunk_navigation_steps_a_patchs_own_changes() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -4036,7 +4009,7 @@ async fn changes_picker_in_a_patch_lists_its_hunks_grouped_by_file() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -4053,7 +4026,7 @@ async fn changes_picker_in_a_patch_lists_its_hunks_grouped_by_file() {
         &PickerViewParams {
             // The **view**, as the client sends it: `Space c` in a patch lists the whole review,
             // not the hunk the cursor is in.
-            view_id: Some(aether_protocol::ViewId(buffer_id)),
+            view_id: Some(view_of(buffer_id)),
             buffer_id: Some(buffer_id),
             limit: 50,
             ..view_params(PickerKind::GitChangesFile)
@@ -4101,14 +4074,18 @@ async fn changes_picker_in_a_patch_lists_its_hunks_grouped_by_file() {
     )
     .await;
     match result {
-        PickerSelectResult::BufferAt {
-            buffer_id: target,
+        PickerSelectResult::ViewAt {
+            view_id: target,
             position,
         } => {
-            assert_eq!(target, buffer_id, "jumps within the patch it came from");
+            assert_eq!(
+                target,
+                view_of(buffer_id),
+                "jumps within the patch it came from"
+            );
             assert_eq!(position.line, expected);
         }
-        other => panic!("expected BufferAt, got {other:?}"),
+        other => panic!("expected ViewAt, got {other:?}"),
     }
 
     // And the row it lands on is a changed line of the patch, not chrome or metadata.
@@ -4168,7 +4145,7 @@ async fn changes_picker_in_a_patch_centres_on_the_cursors_change() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -4207,7 +4184,7 @@ async fn changes_picker_in_a_patch_centres_on_the_cursors_change() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(buffer_id)),
+            view_id: Some(view_of(buffer_id)),
             buffer_id: Some(buffer_id),
             center_on_cursor: Some(buffer_id),
             limit: 50,
@@ -4340,7 +4317,7 @@ async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
         },
         focus_path: None,
     };
-    let patch: BufferOpenResult = show_buffer(&mut ws, &show(&head)).await;
+    let patch: ViewOpenResult = show_buffer(&mut ws, &show(&head)).await;
     let patch_buffer = patch.buffer_id;
     assert!(
         patch.is_patch,
@@ -4465,7 +4442,7 @@ async fn a_kept_diff_is_session_restorable_and_a_previewed_one_is_not() {
     )
     .await;
 
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -4478,9 +4455,9 @@ async fn a_kept_diff_is_session_restorable_and_a_previewed_one_is_not() {
     assert!(opened.transient, "a revision opens as a preview");
 
     // Force a session write while it's still a preview, by opening a file permanently.
-    let _: BufferOpenResult = send_request::<BufferOpen>(
+    let _: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -4494,10 +4471,10 @@ async fn a_kept_diff_is_session_restorable_and_a_previewed_one_is_not() {
     );
 
     // `Space k` keeps it — and persists directly, since there's no later save to rely on.
-    let _: BufferSetTransientResult = send_request::<BufferSetTransient>(
+    let _: ViewSetTransientResult = send_request::<ViewSetTransient>(
         &mut ws,
-        &BufferSetTransientParams {
-            buffer_id: opened.buffer_id,
+        &ViewSetTransientParams {
+            view_id: opened.view_id,
             transient: false,
         },
     )
@@ -4535,7 +4512,7 @@ async fn a_file_at_a_revision_blames_at_that_revision() {
     commit_file(&repo, "a.rs", "fn one() {}\nfn two() {}\n");
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -4603,7 +4580,7 @@ async fn working_changes_compose_staged_and_unstaged_and_regenerate() {
     std::fs::write(root.join("loose.rs"), "fn l1() {}\nfn LOOSE() {}\n").unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -4642,7 +4619,7 @@ async fn working_changes_compose_staged_and_unstaged_and_regenerate() {
 
     // Change the tree, re-open: same buffer, rebuilt content.
     std::fs::write(root.join("loose.rs"), "fn l1() {}\nfn LATER() {}\n").unwrap();
-    let again: BufferOpenResult = show_buffer(
+    let again: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -4701,7 +4678,7 @@ async fn an_unsaved_edit_in_one_element_is_reported_while_another_is_focused() {
     std::fs::write(root.join("two.rs"), "fn B2() {}\n").unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -4716,7 +4693,7 @@ async fn an_unsaved_edit_in_one_element_is_reported_while_another_is_focused() {
         send_request::<ViewportSubscribe>(
             ws,
             &ViewportSubscribeParams {
-                buffer_id: aether_protocol::ViewId(buffer_id),
+                view_id: view_of(buffer_id),
                 cols: 120,
                 rows: 60,
                 overscan_rows: 0,
@@ -4730,7 +4707,6 @@ async fn an_unsaved_edit_in_one_element_is_reported_while_another_is_focused() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
-                kind: None,
             },
         )
         .await
@@ -4794,7 +4770,7 @@ async fn the_git_cluster_follows_the_focused_element() {
     std::fs::write(root.join("two.rs"), "fn B2() {}\nfn B3() {}\nfn B4() {}\n").unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -4809,7 +4785,7 @@ async fn the_git_cluster_follows_the_focused_element() {
         send_request::<ViewportSubscribe>(
             ws,
             &ViewportSubscribeParams {
-                buffer_id: aether_protocol::ViewId(buffer_id),
+                view_id: view_of(buffer_id),
                 cols: 80,
                 rows: 24,
                 overscan_rows: 0,
@@ -4823,7 +4799,6 @@ async fn the_git_cluster_follows_the_focused_element() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
-                kind: None,
             },
         )
         .await
@@ -4865,7 +4840,7 @@ async fn the_git_cluster_follows_the_focused_element() {
 /// Closing a file the working-changes view windows hands the file to the view, rather than tearing
 /// it down underneath it.
 ///
-/// The close still means what it says about the *name*: the file leaves the buffers picker and the
+/// The close still means what it says about the *name*: the file leaves the view picker and the
 /// session, and is collected with the view like every other element buffer. What it no longer does
 /// is drop the review's layout and viewport — which was silent, because the client whose review it
 /// was simply stopped receiving updates. A buffer lives while some view shows it, and a close is not
@@ -4887,10 +4862,9 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
 
     // Open the file the ordinary way first, so the view's element binds *this* buffer — the one
     // `Space x` then closes. (Buffers are shared by canonical path, so the bind reuses it.)
-    let file: BufferOpenResult = send_request::<BufferOpen>(
+    let file: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
-            buffer_id: None,
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("windowed.rs".into()),
             absolute_path: None,
@@ -4900,11 +4874,12 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
             jump_to_anchor: None,
             transient: None,
             record_nav_from: None,
+            ..Default::default()
         },
     )
     .await;
 
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -4919,7 +4894,7 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
         send_request::<ViewportSubscribe>(
             ws,
             &ViewportSubscribeParams {
-                buffer_id: aether_protocol::ViewId(buffer_id),
+                view_id: view_of(buffer_id),
                 cols: 80,
                 rows: 24,
                 overscan_rows: 0,
@@ -4933,7 +4908,6 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
-                kind: None,
             },
         )
         .await
@@ -4946,10 +4920,10 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
         "the bind reuses the buffer opened by name, so the close below names what the view windows"
     );
 
-    let _: BufferCloseResult = send_request::<BufferClose>(
+    let _: ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(file.buffer_id),
+        &ViewCloseParams {
+            view_id: file.view_id,
             open_next: false,
         },
     )
@@ -4975,12 +4949,12 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
         content.text
     );
 
-    // But it is no longer anything opened *by name*: the buffers picker lists the view alone.
+    // But it is no longer anything opened *by name*: the view picker lists the view alone.
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
             limit: 50,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
@@ -4990,7 +4964,7 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
             u.items()
                 .iter()
                 .filter_map(|i| match i {
-                    PickerItem::Buffer { buffer_id, .. } => Some(*buffer_id),
+                    PickerItem::View { buffer_id, .. } => Some(*buffer_id),
                     _ => None,
                 })
                 .collect()
@@ -5003,9 +4977,9 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
     );
 
     // And leaving the review collects it, as it collects every element buffer.
-    let other: BufferOpenResult = send_request::<BufferOpen>(
+    let other: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("elsewhere.rs".into()),
             ..Default::default()
@@ -5025,6 +4999,395 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
         "the file was handed to the view and should go with it"
     );
 
+    drop(server);
+}
+
+/// A session comes back as it was kept. Every entry in it was a kept view, so every row it
+/// restores reads as kept and materialises kept — a revision included, though a revision opens as
+/// a preview when *asked for*. The working changes are named as the live view names them, not by
+/// their key. And a review materialised from the session binds its files without losing the
+/// views the session kept of them: a file's kind-less entry is its editor, and it comes back kept
+/// beside the kept reader rather than vanishing into the review's preview of the file.
+#[tokio::test]
+async fn a_kept_review_and_revision_come_back_kept() {
+    use aether_protocol::picker::{
+        PickerItem, PickerKind, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
+    };
+    use aether_protocol::ui::ViewKind;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "README.md", "# Title\n\nbody\n");
+    std::fs::write(root.join("README.md"), "# Title\n\nbody\n\nmore\n").unwrap();
+    let head = repo.head().unwrap().target().unwrap().to_string();
+    let store = tempfile::tempdir().unwrap();
+    let sessions_path = store.path().join("sessions.json");
+    let repo_id = root.to_string_lossy().into_owned();
+    async fn activate(ws: &mut Ws) {
+        let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+            ws,
+            &WorkspaceActivateParams {
+                worktrees: None,
+                name: "p".into(),
+                open_last: false,
+            },
+        )
+        .await;
+    }
+    async fn keep(ws: &mut Ws, view_id: aether_protocol::ViewId) {
+        let _ = send_request::<aether_protocol::view::ViewSetTransient>(
+            ws,
+            &aether_protocol::view::ViewSetTransientParams {
+                view_id,
+                transient: false,
+            },
+        )
+        .await;
+    }
+    async fn picker_rows(
+        ws: &mut Ws,
+    ) -> Vec<(String, Option<ViewKind>, bool, aether_protocol::ViewId)> {
+        let _ = send_request::<PickerView>(
+            ws,
+            &PickerViewParams {
+                view_id: None,
+                limit: 30,
+                ..view_params(PickerKind::Views)
+            },
+        )
+        .await;
+        let update: PickerUpdateParams = expect_notification::<PickerUpdate>(ws).await;
+        update
+            .items()
+            .iter()
+            .filter_map(|i| match i {
+                PickerItem::View {
+                    display,
+                    view_kind,
+                    transient,
+                    view_id,
+                    ..
+                } => Some((display.clone(), *view_kind, *transient, *view_id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // First life: the reader and its editor, the working changes and a commit — all kept.
+    let server = aether_server::spawn_for_test_multi_with_sessions(
+        vec![("p".into(), vec![root.clone()])],
+        Some(sessions_path.clone()),
+    )
+    .await
+    .unwrap();
+    let mut ws = Ws::connect(&server).await;
+    activate(&mut ws).await;
+    let reader: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("README.md", None)).await;
+    let editor: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(reader.view_id),
+            kind: Some(ViewKind::Editor),
+            ..Default::default()
+        },
+    )
+    .await;
+    keep(&mut ws, editor.view_id).await;
+    let changes: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    keep(&mut ws, changes.view_id).await;
+    let commit: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head.clone() },
+            focus_path: None,
+        },
+    )
+    .await;
+    keep(&mut ws, commit.view_id).await;
+    let entries = |raw: &str| -> usize {
+        let json: serde_json::Value = serde_json::from_str(raw).unwrap();
+        json["workspaces"]["p"]["views"]
+            .as_array()
+            .map_or(0, |a| a.len())
+    };
+    eventually("all four kept views to reach the session file", || {
+        std::fs::read_to_string(&sessions_path)
+            .ok()
+            .filter(|raw| entries(raw) == 4)
+    })
+    .await;
+    drop(ws);
+    drop(server);
+
+    // Second life: cold-loaded from the workspace config, the four come back as dormant rows.
+    let configs = store.path().join("workspaces");
+    std::fs::create_dir_all(&configs).unwrap();
+    std::fs::write(
+        configs.join("p.toml"),
+        format!("[[roots]]\npath = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+    let server =
+        aether_server::spawn_for_test_multi_with_sessions(vec![], Some(sessions_path.clone()))
+            .await
+            .unwrap();
+    server.state.lock().await.workspaces_dir = Some(configs);
+    let mut ws = Ws::connect(&server).await;
+    activate(&mut ws).await;
+    let rows = picker_rows(&mut ws).await;
+    let short: String = head.chars().take(7).collect();
+    assert_eq!(rows.len(), 4, "four dormant rows: {rows:?}");
+    assert!(
+        rows.iter().all(|r| !r.2),
+        "every restored row was kept, and reads as kept: {rows:?}"
+    );
+    let named: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert!(
+        named.contains(&"Working changes"),
+        "the working changes are named as the live view is, not by their key: {named:?}"
+    );
+    assert!(
+        named.contains(&short.as_str()),
+        "the commit by its hash: {named:?}"
+    );
+    assert_eq!(
+        named.iter().filter(|n| **n == "README.md").count(),
+        2,
+        "the file's editor and reader: {named:?}"
+    );
+    let changes_row = rows
+        .iter()
+        .find(|r| r.0 == "Working changes")
+        .map(|r| r.3)
+        .unwrap();
+
+    // Materialising the review keeps it, as it was — and binding the file it windows brings that
+    // file's kept views back live, both of them.
+    let restored: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(changes_row),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        !restored.transient,
+        "kept in the session, kept when it comes back"
+    );
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: restored.view_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let rows = picker_rows(&mut ws).await;
+    let readme: Vec<(Option<ViewKind>, bool)> = rows
+        .iter()
+        .filter(|r| r.0 == "README.md")
+        .map(|r| (r.1, r.2))
+        .collect();
+    assert_eq!(
+        readme.len(),
+        2,
+        "the file's editor and reader are still both listed: {rows:?}"
+    );
+    assert!(
+        readme.iter().all(|(_, transient)| !transient),
+        "and both still kept: {rows:?}"
+    );
+    assert!(
+        readme.iter().any(|(k, _)| *k == Some(ViewKind::Editor))
+            && readme.iter().any(|(k, _)| *k == Some(ViewKind::Reader)),
+        "one of each kind: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.0 == short && !r.2),
+        "the commit's row is still there, kept: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.0 == "Working changes" && !r.2),
+        "the review's row, kept: {rows:?}"
+    );
+    drop(server);
+}
+
+/// Closing a review collects the files it windowed: its element buffers are previews the view
+/// alone kept alive, and a close is not the one way of hiding a view that leaves them behind.
+#[tokio::test]
+async fn closing_a_review_collects_the_files_it_windowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "windowed.rs", "fn a() {}\n");
+    std::fs::write(root.join("windowed.rs"), "fn a() {}\nfn ADDED() {}\n").unwrap();
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+
+    let patch: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let bound: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: patch.view_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let windowed = bound.focus.buffer.buffer_id;
+    assert_ne!(windowed, patch.buffer_id, "the element windows a file");
+
+    let closed: ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: patch.view_id,
+            open_next: true,
+        },
+    )
+    .await;
+    let landed = closed.opened.expect("lands on a placeholder");
+    assert_ne!(landed.buffer_id, windowed, "not a file the review windowed");
+    let err = send_request_expect_err::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: windowed,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("unknown buffer_id"),
+        "the windowed file went with the review: {err}"
+    );
+    drop(server);
+}
+
+/// `view/open { view_id, element }` presents the file an element of a composed view windows as its
+/// own view — `Enter` in a review. Named through the view rather than by the file, because a file
+/// at a revision has no path, and a buffer is not something the wire names.
+#[tokio::test]
+async fn opening_a_views_element_presents_the_file_it_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "windowed.rs", "fn a() {}\n");
+    std::fs::write(root.join("windowed.rs"), "fn a() {}\nfn ADDED() {}\n").unwrap();
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+
+    let patch: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let bound: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: patch.view_id,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let windowed = bound.focus.buffer.buffer_id;
+    assert_ne!(
+        windowed, patch.buffer_id,
+        "the focused element windows a file, not the patch"
+    );
+
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(patch.view_id),
+            element: Some(bound.focus.element),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        opened.buffer_id, windowed,
+        "the element's file, as its own view"
+    );
+    assert_ne!(
+        opened.view_id, patch.view_id,
+        "a view of its own, not the review"
+    );
+    assert_eq!(
+        opened.path.as_deref(),
+        Some(root.join("windowed.rs").to_string_lossy().as_ref()),
+        "a working-tree file keeps its path"
+    );
+
+    // An element the view does not have is refused, not answered with the review itself.
+    let err = send_request_expect_err::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(patch.view_id),
+            element: Some(99),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(err.contains("no element 99"), "{err}");
     drop(server);
 }
 
@@ -5060,7 +5423,7 @@ async fn working_changes_mark_staged_blocks_apart_from_unstaged() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -5139,7 +5502,7 @@ async fn staging_from_the_working_changes_view_moves_the_block_into_the_index() 
         target: ShowTarget::WorkingChanges,
         focus_path: None,
     };
-    let opened: BufferOpenResult = show_buffer(&mut ws, &show).await;
+    let opened: ViewOpenResult = show_buffer(&mut ws, &show).await;
     let buffer_id = opened.buffer_id;
 
     let content: BufferContentResult =
@@ -5247,7 +5610,7 @@ async fn staging_from_the_working_changes_view_moves_the_block_into_the_index() 
     // and the rebuild bumps the revision so its viewport pushes aren't discarded as stale — so the
     // save marker has to move with it, or a read-only buffer shows a dirty dot for content nobody
     // typed.
-    let reopened: BufferOpenResult = show_buffer(&mut ws, &show).await;
+    let reopened: ViewOpenResult = show_buffer(&mut ws, &show).await;
     assert_eq!(reopened.buffer_id, buffer_id);
     assert_eq!(
         reopened.revision, reopened.saved_revision,
@@ -5277,7 +5640,7 @@ async fn staging_pushes_the_rebuilt_patch_as_clean() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -5293,7 +5656,7 @@ async fn staging_pushes_the_rebuilt_patch_as_clean() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -5307,7 +5670,6 @@ async fn staging_pushes_the_rebuilt_patch_as_clean() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5370,8 +5732,8 @@ async fn staging_pushes_the_rebuilt_patch_as_clean() {
             break p;
         }
     };
-    assert!(
-        !state_push.transient || state_push.saved_revision == state_push.saved_revision,
+    assert_eq!(
+        state_push.buffer_id, buffer_id,
         "a state push arrived for the rebuilt patch"
     );
     // The content push for this viewport names the buffer under the cursor — the working file its
@@ -5418,7 +5780,7 @@ async fn blame_follow_pushes_a_label_in_a_file_at_a_revision() {
     commit_file(&repo, "a.rs", "fn one() {}\nfn two() {}\n");
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -5492,9 +5854,9 @@ async fn opening_a_commit_from_a_files_history_lands_on_that_file() {
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
     // Open `later.rs` and ask for *its* history — that's what locks the picker to the path.
-    let file: BufferOpenResult = send_request::<BufferOpen>(
+    let file: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("later.rs".into()),
             ..Default::default()
@@ -5527,7 +5889,7 @@ async fn opening_a_commit_from_a_files_history_lands_on_that_file() {
     );
 
     // Selecting it opens the commit's diff focused on that file's first change.
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -5581,7 +5943,7 @@ async fn subscribe_window(ws: &mut Ws, buffer_id: u64) -> aether_protocol::viewp
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -5595,7 +5957,6 @@ async fn subscribe_window(ws: &mut Ws, buffer_id: u64) -> aether_protocol::viewp
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5729,11 +6090,10 @@ async fn a_new_file_has_no_gutter() {
             },
         )
         .await;
-        let open: BufferOpenResult = send_request::<BufferOpen>(
+        let open: ViewOpenResult = send_request::<ViewOpen>(
             &mut ws,
-            &BufferOpenParams {
+            &ViewOpenParams {
                 transient: None,
-                buffer_id: None,
                 path_index: Some(0),
                 relative_path: Some("fresh.rs".into()),
                 language: None,
@@ -6164,9 +6524,9 @@ async fn saving_a_buffer_rebuilds_an_open_working_changes_view() {
     std::fs::write(root.join("a.rs"), "fn one() {}\nfn SAVED() {}\n").unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let file: BufferOpenResult = send_request::<BufferOpen>(
+    let file: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -6988,10 +7348,10 @@ async fn nav_back_onto_a_since_cleaned_working_changes_view_says_why() {
     let file = followed.opened.expect("Enter opened the file").buffer_id;
 
     // The transient patch closes behind the open, as it does the moment it's hidden for real.
-    let _: BufferCloseResult = send_request::<BufferClose>(
+    let _: ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+        &ViewCloseParams {
+            view_id: patch.view_id,
             open_next: false,
         },
     )
@@ -7170,9 +7530,9 @@ async fn staging_a_just_opened_large_file_waits_for_its_baseline() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             absolute_path: Some(root.join("big.rs").to_string_lossy().into_owned()),
             ..Default::default()
         },
@@ -7205,9 +7565,9 @@ async fn an_external_file_still_has_no_baseline_to_stage_against() {
     std::fs::write(far.join("far.rs"), "beta\n").unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             absolute_path: Some(far.join("far.rs").to_string_lossy().into_owned()),
             ..Default::default()
         },
@@ -7242,9 +7602,9 @@ async fn repo_resolution_survives_a_large_files_deferred_baseline() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             absolute_path: Some(root.join("big.rs").to_string_lossy().into_owned()),
             ..Default::default()
         },
@@ -7296,7 +7656,7 @@ async fn patch_element_ids_survive_a_scroll() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -7310,7 +7670,7 @@ async fn patch_element_ids_survive_a_scroll() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -7324,7 +7684,6 @@ async fn patch_element_ids_survive_a_scroll() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -7391,7 +7750,7 @@ async fn patch_editors_report_their_buffer_and_full_height() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -7409,7 +7768,7 @@ async fn patch_editors_report_their_buffer_and_full_height() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 200,
             rows: 400,
             overscan_rows: 0,
@@ -7423,7 +7782,6 @@ async fn patch_editors_report_their_buffer_and_full_height() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
-            kind: None,
         },
     )
     .await;
@@ -7520,7 +7878,7 @@ async fn scrolled_out_elements_keep_their_place_in_the_tree() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -7535,7 +7893,7 @@ async fn scrolled_out_elements_keep_their_place_in_the_tree() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 6,
             overscan_rows: 0,
@@ -7549,7 +7907,6 @@ async fn scrolled_out_elements_keep_their_place_in_the_tree() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -7633,7 +7990,7 @@ async fn focus_steps_between_a_patchs_elements_and_stops_at_the_ends() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -7646,7 +8003,7 @@ async fn focus_steps_between_a_patchs_elements_and_stops_at_the_ends() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -7660,7 +8017,6 @@ async fn focus_steps_between_a_patchs_elements_and_stops_at_the_ends() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -7746,7 +8102,7 @@ async fn enter_on_a_patch_leads_to_the_working_file() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -7759,7 +8115,7 @@ async fn enter_on_a_patch_leads_to_the_working_file() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -7773,7 +8129,6 @@ async fn enter_on_a_patch_leads_to_the_working_file() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -7847,7 +8202,7 @@ async fn a_deleted_files_hunk_still_renders_from_the_generated_patch() {
     let _ = head;
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -7925,7 +8280,7 @@ async fn a_patch_collapses_its_removals_when_the_diff_is_off() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8046,7 +8401,7 @@ async fn toggling_the_diff_on_an_open_patch_view_adds_and_removes_its_phantoms()
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8060,7 +8415,7 @@ async fn toggling_the_diff_on_an_open_patch_view_adds_and_removes_its_phantoms()
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 80,
             rows: 40,
             overscan_rows: 0,
@@ -8074,7 +8429,6 @@ async fn toggling_the_diff_on_an_open_patch_view_adds_and_removes_its_phantoms()
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -8153,7 +8507,7 @@ async fn toggling_the_diff_keeps_a_scrolled_patch_view_where_it_was() {
     }
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8167,7 +8521,7 @@ async fn toggling_the_diff_keeps_a_scrolled_patch_view_where_it_was() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows,
             overscan_rows: rows,
@@ -8181,7 +8535,6 @@ async fn toggling_the_diff_keeps_a_scrolled_patch_view_where_it_was() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -8262,7 +8615,7 @@ async fn typing_in_a_working_changes_hunk_edits_the_file() {
     std::fs::write(root.join("a.rs"), "fn EDITED() {}\n").unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8277,7 +8630,7 @@ async fn typing_in_a_working_changes_hunk_edits_the_file() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -8291,7 +8644,6 @@ async fn typing_in_a_working_changes_hunk_edits_the_file() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -8367,7 +8719,7 @@ async fn staging_through_a_focused_element_stages_that_files_block() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8380,7 +8732,7 @@ async fn staging_through_a_focused_element_stages_that_files_block() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -8394,7 +8746,6 @@ async fn staging_through_a_focused_element_stages_that_files_block() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -8474,7 +8825,7 @@ async fn a_hunk_grows_when_you_type_a_line_into_it() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8487,7 +8838,7 @@ async fn a_hunk_grows_when_you_type_a_line_into_it() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -8501,7 +8852,6 @@ async fn a_hunk_grows_when_you_type_a_line_into_it() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -8582,7 +8932,7 @@ async fn moving_past_a_hunks_end_stays_within_the_view() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8595,7 +8945,7 @@ async fn moving_past_a_hunks_end_stays_within_the_view() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -8609,7 +8959,6 @@ async fn moving_past_a_hunks_end_stays_within_the_view() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -8695,7 +9044,7 @@ async fn scrolling_to_the_end_of_a_patch_still_shows_content() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8708,7 +9057,7 @@ async fn scrolling_to_the_end_of_a_patch_still_shows_content() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 10,
             overscan_rows: 0,
@@ -8722,7 +9071,6 @@ async fn scrolling_to_the_end_of_a_patch_still_shows_content() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -8780,7 +9128,7 @@ async fn the_scroll_limit_reaches_the_last_line_of_a_patch() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8793,7 +9141,7 @@ async fn the_scroll_limit_reaches_the_last_line_of_a_patch() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: ROWS,
             overscan_rows: 0,
@@ -8807,7 +9155,6 @@ async fn the_scroll_limit_reaches_the_last_line_of_a_patch() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -8866,7 +9213,7 @@ async fn rendering_a_bound_patch_near_its_end_does_not_panic() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8880,7 +9227,7 @@ async fn rendering_a_bound_patch_near_its_end_does_not_panic() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 8,
             overscan_rows: 2,
@@ -8894,7 +9241,6 @@ async fn rendering_a_bound_patch_near_its_end_does_not_panic() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
-            kind: None,
         },
     )
     .await;
@@ -8943,7 +9289,7 @@ async fn walking_down_a_freshly_opened_commit_patch_does_not_panic() {
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -8956,7 +9302,7 @@ async fn walking_down_a_freshly_opened_commit_patch_does_not_panic() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 20,
             overscan_rows: 0,
@@ -8970,7 +9316,6 @@ async fn walking_down_a_freshly_opened_commit_patch_does_not_panic() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -9018,7 +9363,7 @@ async fn a_counted_change_step_past_the_last_change_refuses() {
     std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -9031,7 +9376,7 @@ async fn a_counted_change_step_past_the_last_change_refuses() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -9045,7 +9390,6 @@ async fn a_counted_change_step_past_the_last_change_refuses() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -9125,7 +9469,7 @@ async fn staging_from_inside_an_element_never_touches_the_patch_index() {
     std::fs::write(root.join("a.rs"), &edited).unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -9138,7 +9482,7 @@ async fn staging_from_inside_an_element_never_touches_the_patch_index() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -9152,7 +9496,6 @@ async fn staging_from_inside_an_element_never_touches_the_patch_index() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -9192,9 +9535,9 @@ async fn staging_from_inside_an_element_never_touches_the_patch_index() {
     drop(server);
 }
 
-/// Opening working changes does not turn every changed file into a row in `Space b`.
+/// Opening working changes does not turn every changed file into a row in `Space v`.
 ///
-/// The buffers picker switches between **views**. A file a composed view happens to window is an
+/// The view picker switches between **views**. A file a composed view happens to window is an
 /// *element* of one, not a view of its own — it was never opened by name and switching to it is not
 /// what the key is for. `Space g w` on a busy tree used to add a row per changed file, and they
 /// stayed after the view was gone, because the binds also opened permanent.
@@ -9228,7 +9571,7 @@ async fn opening_working_changes_does_not_list_its_files_as_buffers() {
         &mut ws,
         &PickerViewParams {
             limit: 50,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
@@ -9238,7 +9581,7 @@ async fn opening_working_changes_does_not_list_its_files_as_buffers() {
             u.items()
                 .iter()
                 .filter_map(|i| match i {
-                    PickerItem::Buffer {
+                    PickerItem::View {
                         buffer_id, display, ..
                     } => Some((*buffer_id, display.clone())),
                     _ => None,
@@ -9287,7 +9630,7 @@ async fn leaving_a_composed_view_collects_the_patch_and_its_elements() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -9301,7 +9644,6 @@ async fn leaving_a_composed_view_collects_the_patch_and_its_elements() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -9309,9 +9651,9 @@ async fn leaving_a_composed_view_collects_the_patch_and_its_elements() {
     assert_ne!(bound, patch.buffer_id, "the element windows a real file");
 
     // Navigate away: open an unrelated file and subscribe to it, which supersedes the viewport.
-    let other: BufferOpenResult = send_request::<BufferOpen>(
+    let other: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("elsewhere.rs".into()),
             ..Default::default()
@@ -9321,7 +9663,7 @@ async fn leaving_a_composed_view_collects_the_patch_and_its_elements() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(other.buffer_id),
+            view_id: other.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -9335,7 +9677,6 @@ async fn leaving_a_composed_view_collects_the_patch_and_its_elements() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -9407,7 +9748,7 @@ async fn the_outline_of_a_patch_is_its_changes_grouped_by_file() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -9421,7 +9762,6 @@ async fn the_outline_of_a_patch_is_its_changes_grouped_by_file() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -9429,7 +9769,7 @@ async fn the_outline_of_a_patch_is_its_changes_grouped_by_file() {
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -9506,7 +9846,7 @@ async fn scrolling_the_patch_outline_keeps_its_rows() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -9520,14 +9860,13 @@ async fn scrolling_the_patch_outline_keeps_its_rows() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
     let opened: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -9608,7 +9947,7 @@ async fn each_outline_row_selects_its_own_hunk_top() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -9622,7 +9961,6 @@ async fn each_outline_row_selects_its_own_hunk_top() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -9630,7 +9968,7 @@ async fn each_outline_row_selects_its_own_hunk_top() {
     let _view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 100,
             ..view_params(PickerKind::DocumentSymbols)
@@ -9655,7 +9993,7 @@ async fn each_outline_row_selects_its_own_hunk_top() {
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 100,
             reset: PickerReset::Keep, // a default re-view resets the expansion we just set
@@ -9790,7 +10128,7 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -9804,14 +10142,13 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -9899,8 +10236,8 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
     .await;
     let landed = stepped.moved().expect("the captured list steps");
     assert_ne!(
-        landed.buffer_id,
-        Some(patch.buffer_id),
+        landed.view_id,
+        Some(patch.view_id),
         "the entry names the file its change is in, not the patch document it was read from"
     );
     // And it names it by **path**: a view's element buffers are transient, so an id captured while
@@ -9995,8 +10332,8 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
         "the second press advances to entry 2 instead of answering with the first again"
     );
     assert_ne!(
-        (again.buffer_id, again.position),
-        (landed.buffer_id, landed.position),
+        (again.view_id, again.position),
+        (landed.view_id, landed.position),
         "and lands somewhere else"
     );
 
@@ -10073,7 +10410,7 @@ async fn a_patch_jumplist_steps_from_another_editor() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -10087,14 +10424,13 @@ async fn a_patch_jumplist_steps_from_another_editor() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -10121,9 +10457,9 @@ async fn a_patch_jumplist_steps_from_another_editor() {
 
     // Now go and look at something else: opening a file supersedes the client's viewport, so the
     // patch view is no longer on screen.
-    let other: BufferOpenResult = send_request::<BufferOpen>(
+    let other: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("elsewhere.rs".into()),
             ..Default::default()
@@ -10133,7 +10469,7 @@ async fn a_patch_jumplist_steps_from_another_editor() {
     let _resub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(other.buffer_id),
+            view_id: other.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -10147,7 +10483,6 @@ async fn a_patch_jumplist_steps_from_another_editor() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -10288,7 +10623,7 @@ async fn saving_a_composed_view_writes_every_file_it_windows() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -10302,7 +10637,6 @@ async fn saving_a_composed_view_writes_every_file_it_windows() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -10353,7 +10687,7 @@ async fn saving_a_composed_view_writes_every_file_it_windows() {
     let saved: ViewSaveResult = send_request::<ViewSave>(
         &mut ws,
         &ViewSaveParams {
-            view_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             overwrite: false,
         },
     )
@@ -10379,7 +10713,7 @@ async fn saving_a_composed_view_writes_every_file_it_windows() {
     let again: ViewSaveResult = send_request::<ViewSave>(
         &mut ws,
         &ViewSaveParams {
-            view_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             overwrite: false,
         },
     )
@@ -10446,7 +10780,7 @@ async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -10460,14 +10794,13 @@ async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -10493,9 +10826,9 @@ async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
     assert!(captured.total >= 2, "one entry per hunk in the commit");
 
     // Go and look at something else, which closes the commit patch (it is transient).
-    let other: BufferOpenResult = send_request::<BufferOpen>(
+    let other: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("elsewhere.rs".into()),
             ..Default::default()
@@ -10505,7 +10838,7 @@ async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
     let _resub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(other.buffer_id),
+            view_id: other.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -10519,7 +10852,6 @@ async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -10643,7 +10975,7 @@ async fn the_outline_the_motion_and_the_breadcrumb_agree() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -10657,7 +10989,6 @@ async fn the_outline_the_motion_and_the_breadcrumb_agree() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -10666,7 +10997,7 @@ async fn the_outline_the_motion_and_the_breadcrumb_agree() {
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -10707,7 +11038,7 @@ async fn the_outline_the_motion_and_the_breadcrumb_agree() {
         &mut ws,
         &PickerViewParams {
             reset: aether_protocol::picker::PickerReset::Keep,
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)
@@ -10802,7 +11133,7 @@ async fn the_outline_opens_on_the_change_the_cursor_is_in() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -10816,7 +11147,6 @@ async fn the_outline_opens_on_the_change_the_cursor_is_in() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -10844,7 +11174,7 @@ async fn the_outline_opens_on_the_change_the_cursor_is_in() {
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             // What the client sends for a cursor-anchored kind: the buffer the cursor is in.
             center_on_cursor: Some(focused_buffer),
@@ -10948,7 +11278,7 @@ async fn stepping_the_outline_of_a_patch_visits_each_change() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 200,
             overscan_rows: 0,
@@ -10962,7 +11292,6 @@ async fn stepping_the_outline_of_a_patch_visits_each_change() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -11070,7 +11399,7 @@ async fn a_lines_changed_push_names_the_focused_elements_buffer() {
     std::fs::write(root.join("two.rs"), "fn B2() {}\n").unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -11083,7 +11412,7 @@ async fn a_lines_changed_push_names_the_focused_elements_buffer() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -11097,7 +11426,6 @@ async fn a_lines_changed_push_names_the_focused_elements_buffer() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -11164,7 +11492,7 @@ async fn change_stepping_reaches_a_deleted_file_beside_a_bound_one() {
     }
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -11177,7 +11505,7 @@ async fn change_stepping_reaches_a_deleted_file_beside_a_bound_one() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -11191,7 +11519,6 @@ async fn change_stepping_reaches_a_deleted_file_beside_a_bound_one() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -11258,7 +11585,7 @@ async fn restaging_rebinds_a_view_whose_hunks_all_window_files() {
     .unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -11271,7 +11598,7 @@ async fn restaging_rebinds_a_view_whose_hunks_all_window_files() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -11285,7 +11612,6 @@ async fn restaging_rebinds_a_view_whose_hunks_all_window_files() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -11388,7 +11714,7 @@ async fn stepping_from_an_unbound_element_reads_the_cursors_place_in_the_view() 
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 40,
             overscan_rows: 0,
@@ -11398,7 +11724,6 @@ async fn stepping_from_an_unbound_element_reads_the_cursors_place_in_the_view() 
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -11409,7 +11734,7 @@ async fn stepping_from_an_unbound_element_reads_the_cursors_place_in_the_view() 
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-            view_id: Some(aether_protocol::ViewId(patch.buffer_id)),
+            view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 50,
             ..view_params(PickerKind::DocumentSymbols)

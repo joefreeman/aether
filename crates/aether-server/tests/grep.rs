@@ -89,11 +89,10 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
 async fn picker_grep_from_selection_seeds_query_and_searches() {
     let (server, mut ws) = setup_grep_workspace().await;
     // Open src/main.rs and select "needle" on line 1 (`    needle();`, cols 4..=9).
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
             language: None,
@@ -147,11 +146,10 @@ async fn picker_grep_from_selection_empty_is_unseeded() {
     let (server, mut ws) = setup_grep_workspace().await;
     // README.md ends with a newline; opening it and sitting on the trailing empty line gives a
     // point cursor over an empty slice.
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("README.md".into()),
             language: None,
@@ -1622,7 +1620,7 @@ async fn jumplist_captured_from_the_files_picker_is_flat_and_steps_by_file() {
 }
 
 /// Selecting (or stepping to) a whole-target entry opens the file *where the cursor last was* in
-/// it — `buffer/open` with no `jump_to`, which is exactly what the Files picker's own select
+/// it — `view/open` with no `jump_to`, which is exactly what the Files picker's own select
 /// does. A file this client has never opened lands at the top.
 #[tokio::test]
 async fn jumplist_step_to_a_captured_file_restores_its_last_cursor() {
@@ -1676,17 +1674,16 @@ async fn jumplist_step_to_a_captured_file_restores_its_last_cursor() {
     drop(server);
 }
 
-/// The Buffers picker captures too, and its one pathless row shape — a scratch buffer — rides as
+/// The view picker captures too, and its one pathless row shape — a scratch buffer — rides as
 /// a *buffer* target: stepping to it attaches by id, exactly as selecting it in that picker does.
 #[tokio::test]
 async fn jumplist_captured_from_the_buffers_picker_includes_scratch_buffers() {
     let (server, mut ws) = setup_grep_workspace().await;
     let main = open_test_buffer(&mut ws, "src/main.rs").await;
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -1701,7 +1698,7 @@ async fn jumplist_captured_from_the_buffers_picker_includes_scratch_buffers() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
@@ -1710,9 +1707,11 @@ async fn jumplist_captured_from_the_buffers_picker_includes_scratch_buffers() {
     let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
         &mut ws,
         &JumplistCaptureParams {
-            kind: PickerKind::Buffers,
-            item: PickerItem::Buffer {
+            kind: PickerKind::Views,
+            item: PickerItem::View {
                 buffer_id: main,
+                view_id: view_of(main),
+                view_kind: None,
                 display: "src/main.rs".into(),
                 status: Default::default(),
                 match_indices: vec![],
@@ -1730,11 +1729,11 @@ async fn jumplist_captured_from_the_buffers_picker_includes_scratch_buffers() {
     );
 
     // From the file buffer, `]` steps to the scratch — pathless targets sort after files, and
-    // the step identifies it by buffer id rather than a path.
+    // the step identifies it by view id rather than a path.
     let outcome = step_results(&mut ws, main, Direction::Forward).await;
     let target = outcome.moved().expect("steps");
     assert_eq!(target.path, None, "a scratch buffer has no path");
-    assert_eq!(target.buffer_id, Some(scratch.buffer_id));
+    assert_eq!(target.view_id, Some(scratch.view_id));
     assert_eq!(target.position, None);
 
     // Stepping back off it reaches the file again — the scratch is a first-class entry, not an

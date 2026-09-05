@@ -13,10 +13,10 @@
 //! two lists. It survives until the next `jumplist/capture` replaces it or `jumplist/clear`
 //! discards it.
 
-use crate::buffer::BufferOpenResult;
 use crate::cursor::Direction;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::picker::{PickerItem, PickerKind};
+use crate::view::ViewOpenResult;
 use crate::viewport::ViewSeat;
 use crate::{BufferId, LogicalPosition};
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 /// row stays highlighted), and Enter there jumps through the ordinary select path.
 ///
 /// Only the jump-shaped kinds capture (`PickerKind::captures_to_jumplist`) — the position-shaped
-/// ones (a row is a location *in* a file) plus the file-shaped Files and Buffers (a row is a whole
+/// ones (a row is a location *in* a file) plus the file-shaped Files and Views (a row is a whole
 /// target, captured without a position). Capturing from
 /// the Jumplist picker itself replaces the list with the picker's current (typically
 /// query-narrowed) subset — iterative narrowing. Returns `None` when the picker has nothing to
@@ -126,7 +126,7 @@ pub struct JumplistChangedParams {}
 /// `]` / `[`. Cursor-derived: the server compares against the cursor selection's *outer* edge
 /// (max edge stepping forward, min edge backward), so an entry the cursor sits on is "current"
 /// and gets skipped — repeated presses always make progress. A *whole-target* entry (one captured
-/// without a position, from the Files or Buffers picker) is always "current" for its own buffer, so
+/// without a position, from the Files or view picker) is always "current" for its own buffer, so
 /// a step out of it lands on the neighbouring entry: `]`/`[` walk a captured file list one file at
 /// a time. When the current file has no entries, it is virtually inserted into the list's target
 /// sequence by path comparison and the step lands on the adjacent target's first/last entry; a
@@ -215,7 +215,7 @@ pub enum JumplistStepResult {
         total: u32,
         skipped: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        opened: Option<Box<BufferOpenResult>>,
+        opened: Option<Box<ViewOpenResult>>,
     },
 }
 
@@ -234,25 +234,25 @@ impl JumplistStepResult {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JumplistStepTarget {
-    /// Absolute canonical path of the target file — feed into `buffer/open` when not using
-    /// the `open` composite. `None` when the entry targets a *buffer* with no path (a scratch
-    /// captured from the Buffers picker), where `buffer_id` is the identity instead.
+    /// Absolute canonical path of the target file — feed into `view/open` when not using
+    /// the `open` composite. `None` when the entry targets a *view* with no path (a scratch
+    /// captured from the picker), where `view_id` is the identity instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// The target buffer's id, for the pathless entries described on `path`. `None` whenever
+    /// The target view's id, for the pathless entries described on `path`. `None` whenever
     /// `path` is set — exactly one of the two identifies the target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub buffer_id: Option<BufferId>,
+    pub view_id: Option<crate::ViewId>,
     /// Position to land the cursor on. Same semantics as `PickerSelectResult::FileAt`: for an
     /// entry carrying a span this is the span's inclusive end, with `anchor` at its start, so
     /// the jump lands the same selection the source picker's Enter would. `None` for a
-    /// whole-target entry (captured from the Files or Buffers picker), which lands on the
+    /// whole-target entry (captured from the Files or view picker), which lands on the
     /// cursor position last recorded for that buffer — the top of the file if there isn't one,
     /// exactly as selecting the row in its source picker would.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<LogicalPosition>,
     /// When `Some`, the *other* end of a selection to establish — anchor here, cursor at
-    /// `position` (`buffer/open { jump_to_anchor }`). `None` lands a plain point cursor.
+    /// `position` (`view/open { jump_to_anchor }`). `None` lands a plain point cursor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<LogicalPosition>,
     /// 1-based position of the target entry within the list (the status `index/total`).
@@ -261,7 +261,7 @@ pub struct JumplistStepTarget {
     pub total: u32,
     /// With `open`: the target, fully opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opened: Option<BufferOpenResult>,
+    pub opened: Option<ViewOpenResult>,
     /// Where to land *inside* a composed view, when the entry was captured from one that is **still
     /// on screen**. `path`/`position` already name the file and line; this says which of the view's
     /// windows onto that file to seat the cursor in, so `]` lands where selecting the same row in

@@ -13,13 +13,13 @@ use aether_client::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind
 use aether_client::keymap::{
     hover_action, keycode_for_binding, HoverAction, KeyCode, Mods, ScrollDir, ScrollUnit,
 };
-use aether_client::session::{buffer_info, HoverText, PasteKind, Session};
+use aether_client::session::{HoverText, PasteKind, Session};
 use aether_client::transport::RpcError;
 use aether_client::update::Event;
-use aether_protocol::buffer::BufferOpenResult;
 use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::Granularity;
 use aether_protocol::envelope::{JsonRpc, Notification};
+use aether_protocol::view::ViewOpenResult;
 use aether_protocol::viewport::{ViewportSubscribeResult, ViewportWindowResult};
 use aether_protocol::LogicalPosition;
 use serde_json::{json, Value};
@@ -71,7 +71,7 @@ fn install_panic_hook() {
 #[wasm_bindgen]
 impl WasmSession {
     /// A placeholder session (no workspace, empty buffer). Phase 1 uses this to prove the boundary;
-    /// the real constructor takes a bootstrapped buffer once `buffer/open` is wired (Phase 3).
+    /// the real constructor takes a bootstrapped buffer once `view/open` is wired (Phase 3).
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmSession {
         install_panic_hook();
@@ -105,7 +105,7 @@ impl WasmSession {
     }
 
     /// Build a real session from the bootstrap landing buffer. `workspace` is the activation's
-    /// `WorkspaceInfo` JSON (name + roots + declared projects); `open` is the `buffer/open` result
+    /// `WorkspaceInfo` JSON (name + roots + declared projects); `open` is the `view/open` result
     /// JSON. (The `new()` placeholder is for tests.)
     ///
     /// The whole `WorkspaceInfo` crosses the boundary, not just the name and roots: boot is the one
@@ -113,37 +113,10 @@ impl WasmSession {
     /// missing for the life of the client.
     pub fn bootstrap(workspace: JsValue, open: JsValue) -> Result<WasmSession, JsValue> {
         let workspace: aether_protocol::workspace::WorkspaceInfo = from_js(workspace)?;
-        let open: BufferOpenResult = from_js(open)?;
-        let buffer = buffer_info(open, &workspace.paths);
+        let open: ViewOpenResult = from_js(open)?;
         Ok(WasmSession {
-            inner: Session::new(workspace, buffer),
+            inner: Session::new(workspace, open),
             measured: aether_client::grid::Measured::default(),
-        })
-    }
-
-    /// Apply the markdown reading-view boot rules — call once after [`Self::bootstrap`] and
-    /// **before** the first subscribe: boot installs the session directly, never passing through
-    /// `adopt_switch`, so the read-vs-edit decision runs here, and it decides what that subscribe
-    /// asks for. `jumped` = the URL carried a `#line:col` jump (jump-shaped opens land in the
-    /// editor).
-    pub fn boot_read_presentation(&mut self, jumped: bool) {
-        self.inner.boot_read_presentation(jumped);
-    }
-
-    /// [`Self::boot_read_presentation`] with an explicit choice — the URL's `view=read|source`
-    /// param, recorded by the shell so a refresh restores the presentation on screen (the
-    /// `#line:col` cursor restore in the same URL must not read as a jump).
-    pub fn boot_read_presentation_explicit(&mut self, read: bool) {
-        self.inner.boot_read_presentation_explicit(read);
-    }
-
-    /// The kind the subscribe being issued asks for — `"editor"`, `"reader"`, or `undefined`
-    /// when this client's route has no opinion and the server presents the file as it last was.
-    /// Taken: a re-subscribe must not repeat it.
-    pub fn subscribe_kind(&mut self) -> Option<String> {
-        self.inner.subscribe_kind().map(|k| match k {
-            aether_protocol::ui::ViewKind::Editor => "editor".to_string(),
-            aether_protocol::ui::ViewKind::Reader => "reader".to_string(),
         })
     }
 
@@ -308,7 +281,7 @@ impl WasmSession {
         self.inner.subscribe_focus()
     }
 
-    /// Where a pending content anchor (a wrap toggle, `Space v`) says the next subscribe should
+    /// Where a pending content anchor (a wrap toggle, `Space u`) says the next subscribe should
     /// open — a `ScrollPosition`, or `null` when none is pending. The subscribe loads a window
     /// around it so `resolve_scroll_anchor` can place the view exactly once the window arrives.
     pub fn relayout_anchor_position(&self) -> Result<JsValue, JsValue> {

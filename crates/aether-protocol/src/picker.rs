@@ -25,9 +25,10 @@ use serde::{Deserialize, Serialize};
 pub enum PickerKind {
     /// Workspace files, fuzzy-matched on path.
     Files,
-    /// Open buffers, ordered by most-recently-used. The current buffer sits at position 0 and
-    /// selecting it is a no-op switch.
-    Buffers,
+    /// Open views, ordered by most-recently-used — a file's editor and its reader are two rows —
+    /// then the kept ones, then the session's dormant rows. The current view sits at position 0
+    /// and selecting it is a no-op switch.
+    Views,
     /// Workspace-wide content search. Each candidate is a single match on a single line; the query
     /// *is* the search (no fuzzy filtering on a pre-built candidate set), so query changes throw
     /// out the prior candidates and start a fresh scan. Each open starts a *fresh* search: query,
@@ -274,7 +275,7 @@ impl PickerKind {
     /// non-selectable, always-expanded headers.
     ///
     /// **This is the default, not the authority.** [`Self::Jumplist`] is collapsible only when
-    /// its captured entries carry groups — a capture from Files or Buffers is flat — so the
+    /// its captured entries carry groups — a capture from Files or Views is flat — so the
     /// server answers per view in [`PickerViewResult::collapsible`], which is what clients
     /// render from. Use this predicate only where no view response is in hand yet.
     pub fn collapsible(self) -> bool {
@@ -339,7 +340,7 @@ impl PickerKind {
     }
 
     /// Whether `jumplist/capture` (picker `Ctrl-j`) applies — the position-shaped kinds, whose rows
-    /// are jump targets *into* a file, plus the file-shaped [`Self::Files`] and [`Self::Buffers`],
+    /// are jump targets *into* a file, plus the file-shaped [`Self::Files`] and [`Self::Views`],
     /// whose rows are whole targets with no position (they capture as position-less entries and
     /// open where the cursor last sat). Excludes the non-jump kinds (Explorer, Workspaces,
     /// LspServers, Keybindings). Includes [`Self::Jumplist`] itself: capturing there replaces the
@@ -348,7 +349,7 @@ impl PickerKind {
         matches!(
             self,
             PickerKind::Files
-                | PickerKind::Buffers
+                | PickerKind::Views
                 | PickerKind::Grep
                 | PickerKind::Diagnostics
                 | PickerKind::DiagnosticsWorkspace
@@ -361,7 +362,7 @@ impl PickerKind {
 
     /// Whether a jumplist captured *from* this kind carries group headers. The position-shaped
     /// sources group by file (or keep their section labels); the file-shaped ones
-    /// ([`Self::Files`], [`Self::Buffers`]) have exactly one entry per target, so a per-file
+    /// ([`Self::Files`], [`Self::Views`]) have exactly one entry per target, so a per-file
     /// header would just repeat its own row — they capture ungrouped and the Jumplist picker
     /// renders them flat ([`PickerViewResult::collapsible`]). Grouping is all-or-nothing per
     /// capture: that uniformity is what keeps the collapsible row space's "every row is keyed"
@@ -370,11 +371,11 @@ impl PickerKind {
     /// [`Self::Jumplist`] isn't listed — a re-capture inherits whatever the entries already
     /// carry rather than consulting this.
     pub fn groups_in_jumplist(self) -> bool {
-        self.captures_to_jumplist() && !matches!(self, PickerKind::Files | PickerKind::Buffers)
+        self.captures_to_jumplist() && !matches!(self, PickerKind::Files | PickerKind::Views)
     }
 }
 
-/// Save/disk state of an open buffer, shown as a colour-coded dot in the buffer picker and
+/// Save/disk state of an open buffer, shown as a colour-coded dot in the view picker and
 /// mirrored by the editor status bar. Precedence when several conditions hold (highest first):
 /// deleted-on-disk → changed-on-disk → unsaved local edits → clean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -525,11 +526,21 @@ pub enum PickerItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         git_status: Option<GitStatus>,
     },
-    /// An open buffer. Identity is `buffer_id` — stable across rename / Save-As, where the
-    /// `display` string would change. `status` is captured at row-build time and may go stale
-    /// between pushes (an active picker re-pushes on status transitions).
-    Buffer {
+    /// An open (or dormant) view. Identity is `view_id`; `buffer_id` is what it shows — stable
+    /// across rename / Save-As, where the `display` string would change. `status` is captured at
+    /// row-build time and may go stale between pushes (an active picker re-pushes on status
+    /// transitions).
+    View {
         buffer_id: BufferId,
+        /// The row's **view**: what selecting the row presents and what closing it closes. A
+        /// file's editor and its reader are two rows, sharing `buffer_id`.
+        #[serde(default)]
+        view_id: crate::ViewId,
+        /// Which kind of view the row is, for the badge that tells a file's reader from its
+        /// editor. Absent for a view a driver built, and for a dormant row, whose kind nothing
+        /// knows until it is opened.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_kind: Option<crate::ui::ViewKind>,
         /// What the row renders: workspace-relative path for file-backed buffers, `(scratch N)`
         /// for scratch buffers. Also the haystack the matcher scores against.
         display: String,
@@ -643,7 +654,7 @@ pub enum PickerItem {
         /// Number of open buffers in this workspace with unsaved edits (`revision != saved_revision`).
         /// `0` when the workspace has no dirty buffers (or isn't loaded). Absent on the wire when `0`.
         #[serde(default, skip_serializing_if = "is_zero")]
-        unsaved_buffers: u32,
+        unsaved: u32,
         /// Char offsets into `name` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
@@ -675,7 +686,7 @@ pub enum PickerItem {
         match_indices: Vec<u32>,
     },
     /// One reference location from `textDocument/references`. Identity is `(path, line, col)`.
-    /// Cross-file, so it carries its own absolute `path` (fed into `buffer/open` on select) plus a
+    /// Cross-file, so it carries its own absolute `path` (fed into `view/open` on select) plus a
     /// server-computed `display_path` for the row label — workspace-relative when the file lives
     /// inside a root, otherwise the absolute path (references can point into dependencies / stdlib
     /// outside every root, where no `path_index`/root label applies). The matcher haystack is
@@ -705,7 +716,7 @@ pub enum PickerItem {
     },
     /// One symbol from `textDocument/documentSymbol`, scoped to the picked buffer. Identity is
     /// `(path, line, col)` — the symbol's name position. Carries its own absolute `path` (fed into
-    /// `buffer/open` on select; always the picked buffer, but kept uniform with the other `FileAt`
+    /// `view/open` on select; always the picked buffer, but kept uniform with the other `FileAt`
     /// kinds). The matcher haystack is `name`; `match_indices` are char offsets into it. `detail`
     /// is the `DocumentSymbol` signature (shown dim), empty for flat servers; `depth` is the nesting
     /// level (0 = top-level) so the row can indent members under their container.
@@ -943,7 +954,7 @@ pub enum PickerItem {
         index: u32,
         /// 0-based line of the entry's landing position, rendered right-aligned and dim like a
         /// grep hit's line number (shells add 1 for display). `None` for a *whole-target* entry —
-        /// a file or buffer captured without a position (the Files and Buffers pickers), which
+        /// a file or buffer captured without a position (the Files and view pickers), which
         /// opens wherever the cursor last sat — where a line number would be a fiction. Shells
         /// render nothing in its place.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1348,7 +1359,7 @@ pub struct PickerViewResult {
     /// [`PickerItem::Group`] rows, two-level selection, the row space counting headers. Normally a
     /// per-kind constant ([`PickerKind::collapsible`]) — the second data gate after
     /// [`Self::path_filterable`], and for the same reason: a Jumplist captured from a *file-shaped*
-    /// picker (Files, Buffers) has one entry per file and nothing to group by, so it renders flat,
+    /// picker (Files, Views) has one entry per file and nothing to group by, so it renders flat,
     /// while the same kind captured from Grep renders grouped. Clients must read this rather than
     /// the kind predicate; the kind is only the pre-response default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1412,9 +1423,9 @@ pub struct PickerSelectParams {
 }
 
 /// Per-kind action result. For `Files`, the canonical absolute path the client should open
-/// (via `buffer/open`). For `Buffers`, the `buffer_id` the client should attach to (via
-/// `buffer/open { buffer_id }`). For `Grep`, the canonical absolute path plus the position to
-/// jump to (client opens via `buffer/open { jump_to }`). The picker handler doesn't perform the
+/// (via `view/open`). For `Views`, the `view_id` the client should present (via
+/// `view/open { view_id }`). For `Grep`, the canonical absolute path plus the position to
+/// jump to (client opens via `view/open { jump_to }`). The picker handler doesn't perform the
 /// switch itself — that's the client's job, same as the file browser flow.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1423,17 +1434,16 @@ pub enum PickerSelectResult {
         /// Absolute canonical path on disk.
         path: String,
     },
-    Buffer {
-        buffer_id: BufferId,
-    },
+    /// A view to present: a picker row's, or a pathless jumplist entry's.
+    View { view_id: crate::ViewId },
     FileAt {
         /// Absolute canonical path on disk.
         path: String,
         /// Position to land the cursor on. Coordinates may be stale if the file changed since the
-        /// hit was recorded; the server clamps in `buffer/open` when applying.
+        /// hit was recorded; the server clamps in `view/open` when applying.
         position: LogicalPosition,
         /// When `Some`, the *other* end of a selection to establish on open — anchor at this
-        /// position, cursor at `position`. The client forwards it as `buffer/open { jump_to_anchor }`.
+        /// position, cursor at `position`. The client forwards it as `view/open { jump_to_anchor }`.
         /// `None` (the default) lands a plain point cursor. The outline picker uses it to land a
         /// symbol's identifier selected.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1441,7 +1451,7 @@ pub enum PickerSelectResult {
     },
     /// A place inside the view **already open**: focus this element, and land the cursor in it.
     ///
-    /// Distinct from [`Self::BufferAt`] because a composed view's cursor is only drawn inside the
+    /// Distinct from [`Self::ViewAt`] because a composed view's cursor is only drawn inside the
     /// *focused* element. Moving it into another element without focusing there puts it outside the
     /// window that renders it: the jump resolves, travels, is applied — and nothing moves on screen,
     /// which is precisely how this presented.
@@ -1459,7 +1469,7 @@ pub enum PickerSelectResult {
         /// view is on screen. Absent when the view was already showing, which is the common case
         /// and the only one that used to exist.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        open: Option<Box<crate::buffer::BufferOpenResult>>,
+        open: Option<Box<crate::view::ViewOpenResult>>,
     },
     /// A jumplist row whose view no longer holds it: the change was staged, committed or reverted
     /// since the capture. Nowhere to land and nowhere else to go — the row is a place *in that
@@ -1468,22 +1478,20 @@ pub enum PickerSelectResult {
     /// look, for the client to show.
     Gone {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        open: Option<Box<crate::buffer::BufferOpenResult>>,
+        open: Option<Box<crate::view::ViewOpenResult>>,
     },
-    /// Attach to an already-open buffer *and* land the cursor somewhere in it — [`Self::Buffer`]
-    /// with a position, and the pathless counterpart of [`Self::FileAt`].
+    /// Present an open view *and* land the cursor somewhere in it — [`Self::View`] with a
+    /// position, and the pathless counterpart of [`Self::FileAt`].
     ///
-    /// For buffers there is no file to reopen: a generated patch was materialised rather than
-    /// loaded, so its rows can only be addressed by buffer id. The client attaches via
-    /// `buffer/open { buffer_id, jump_to }` exactly as it would for a file.
-    BufferAt {
-        buffer_id: BufferId,
+    /// There is no file to reopen: a generated patch was materialised rather than loaded, so its
+    /// rows can only be addressed by the view. The client presents it via
+    /// `view/open { view_id, jump_to }` exactly as it would for a file.
+    ViewAt {
+        view_id: crate::ViewId,
         position: LogicalPosition,
     },
     /// A workspace was selected. The client follows up with `workspace/activate` to switch.
-    Workspace {
-        name: String,
-    },
+    Workspace { name: String },
 }
 
 /// The checkout in a repo family holding one branch — the annotation that turns a branch row into a

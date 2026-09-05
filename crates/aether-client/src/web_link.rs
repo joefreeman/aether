@@ -6,7 +6,7 @@
 //! server's loopback address, the web shell its own origin (which may be a port-forward the
 //! server address would misname).
 
-use aether_protocol::BufferId;
+use aether_protocol::ViewId;
 
 /// What a link opens — mirrors the web shell's `pickerItemUrl` switch.
 pub enum WebLinkTarget<'a> {
@@ -17,9 +17,9 @@ pub enum WebLinkTarget<'a> {
         path: &'a str,
         at: Option<(u32, u32)>,
     },
-    /// A scratch buffer (`?buffer=<id>`). Ids are daemon-session-scoped; the web boot falls
-    /// back to the workspace's MRU when the id has gone stale.
-    Buffer(BufferId),
+    /// A scratch (`?view=<id>`) — a view with no path to name it by. Ids are daemon-session-scoped;
+    /// the web boot falls back to the workspace's MRU when the id has gone stale.
+    View(ViewId),
     /// An absolute **file** path with no workspace to be relative to (`?path=/etc/hosts`): one
     /// outside every configured root, or any file in a temporary context. The web boot hands it to
     /// `workspace/open_path`, which resolves the context server-side — so, unlike `workspace`,
@@ -40,7 +40,7 @@ pub enum WebLinkTarget<'a> {
 }
 
 /// Build the query (+ fragment) for a target: `?workspace=aether&file=src/main.rs#42:10`,
-/// `?workspace=aether&buffer=7`, `?path=/etc/hosts#42:10`, `?workspace=aether&dir=/abs/dir`,
+/// `?workspace=aether&view=7`, `?path=/etc/hosts#42:10`, `?workspace=aether&dir=/abs/dir`,
 /// `?workspace=aether`, or `""` for the bare chooser. `root` is omitted when 0 and the fragment is
 /// 1-based, both matching the web shell's own links. Append to a base ending in `/` (the served
 /// page).
@@ -76,7 +76,7 @@ pub fn web_link(workspace: Option<&str>, target: WebLinkTarget) -> String {
             fragment = at;
         }
         WebLinkTarget::Directory { path } => push(&mut link, "dir", path),
-        WebLinkTarget::Buffer(id) => push(&mut link, "buffer", &id.to_string()),
+        WebLinkTarget::View(id) => push(&mut link, "view", &id.get().to_string()),
         WebLinkTarget::Workspace => {}
     }
     if let Some((line, col)) = fragment {
@@ -148,10 +148,10 @@ mod tests {
             ),
             "?workspace=aether&root=2&file=notes.md"
         );
-        // Scratch buffers are `?buffer=` links.
+        // Scratches are `?view=` links.
         assert_eq!(
-            web_link(Some("aether"), WebLinkTarget::Buffer(7)),
-            "?workspace=aether&buffer=7"
+            web_link(Some("aether"), WebLinkTarget::View(ViewId(7))),
+            "?workspace=aether&view=7"
         );
         // An absolute path addresses itself — no `workspace`, even when one is passed (a file
         // outside a named workspace's roots is still opened by path).

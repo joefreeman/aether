@@ -797,9 +797,7 @@ pub async fn workspace_bind_worktree(
         Some(id) => Some(id),
         None => {
             let s = state.lock().await;
-            s.workspaces
-                .get(&context_id)
-                .and_then(|e| e.mru_buffers.front().copied())
+            s.mru_buffer(&context_id)
         }
     };
     let landing = match viewing {
@@ -828,10 +826,10 @@ pub async fn workspace_bind_worktree(
             // tree — a new branch, or an untracked file that never left the checkout. Propagating
             // that would fail the whole switch over the *landing*, leaving you neither moved nor
             // told why. So a landing that can't be opened falls back to the ordinary one.
-            match buffer_open(
+            match view_open(
                 state,
                 ctx,
-                BufferOpenParams {
+                ViewOpenParams {
                     path_index: Some(loc.path_index),
                     relative_path: Some(loc.relative_path),
                     ..Default::default()
@@ -850,7 +848,7 @@ pub async fn workspace_bind_worktree(
                     )
                     .await?;
                     result.opened = fallback.opened.take();
-                    result.last_buffer_id = fallback.last_buffer_id;
+                    result.last_view_id = fallback.last_view_id;
                 }
             }
         }
@@ -909,7 +907,7 @@ async fn workspace_location_of_workspace(
 /// the previous shape is exactly what you find when you switch back.
 ///
 /// **A workspace is one thing, however many clients are in it.** Its roots move for all of them, so
-/// every *other* client on it is told what closed and what replaced it (`buffer/closed`), the same
+/// every *other* client on it is told what closed and what replaced it (`view/closed`), the same
 /// way `workspace/remove_root` and `workspace/delete` tell them. `client_id` is the initiator, who
 /// is excluded — its own reply carries the new state.
 pub async fn rebind_loaded_workspace(
@@ -948,7 +946,7 @@ pub async fn rebind_loaded_workspace(
     // that's the shared non-repo root case, and it keeps its document, rope and undo stack.
     let mut follow: Vec<(BufferId, std::path::PathBuf)> = Vec::new();
     let mut stayed: Vec<BufferId> = Vec::new();
-    // Where a buffer that *stayed* would have gone, for the landing below. Not a `buffer/closed`
+    // Where a buffer that *stayed* would have gone, for the landing below. Not a `view/closed`
     // successor — nothing closed — so it is kept apart from `successor`.
     let mut stayed_successor: std::collections::HashMap<BufferId, std::path::PathBuf> =
         Default::default();
@@ -1000,14 +998,18 @@ pub async fn rebind_loaded_workspace(
     // Ids come from the allocator first, because it borrows `s` mutably on its own and the entry
     // does too.
     // Keyed by the buffer it replaces, and carried as a **path**: the dormant id below is not a
-    // stable handle for another client (see `BufferClosedParams::next_path`).
+    // stable handle for another client (see `ViewClosedParams::next_path`).
     let mut successor: std::collections::HashMap<BufferId, std::path::PathBuf> = Default::default();
-    let dormant: Vec<crate::state::DormantBuffer> = follow
+    let dormant: Vec<crate::state::DormantView> = follow
         .into_iter()
         .map(|(was, path)| {
             successor.insert(was, path.clone());
-            crate::state::DormantBuffer {
-                id: s.allocate_buffer_id(),
+            let id = s.allocate_buffer_id();
+            crate::state::DormantView {
+                id,
+                view: s.allocate_view_id(),
+                // A file that followed a worktree switch comes back as its editor.
+                kind: None,
                 source: crate::state::DormantSource::File(path),
             }
         })
@@ -1021,7 +1023,7 @@ pub async fn rebind_loaded_workspace(
         // wholesale silently dropped it. Ones under a moved root follow to the same relative path
         // (keeping their reserved id, since nothing has materialised them); ones outside every
         // moved root, and scratches, are left exactly as they are.
-        for d in &mut entry.dormant_buffers {
+        for d in &mut entry.dormant_views {
             if let crate::state::DormantSource::File(path) = &d.source {
                 if let Some(mapped) = remap_path(path, &old_roots, &roots) {
                     d.source = crate::state::DormantSource::File(mapped);
@@ -1029,7 +1031,7 @@ pub async fn rebind_loaded_workspace(
             }
         }
         // Then the buffers this rebind just closed, which are dormant now too.
-        entry.dormant_buffers.extend(dormant);
+        entry.dormant_views.extend(dormant);
     }
     // Both halves above can produce a path that is already listed — a remapped entry landing on a
     // path this rebind also followed, or one whose file another client has since opened live. The
@@ -1061,7 +1063,7 @@ pub async fn rebind_loaded_workspace(
     // and left a rust-analyzer rooted in the directory git was about to delete.
     let launches = reconcile_workspace_pins(&mut s, workspace_id);
     let mut pushes = workspace_changed_pushes(&s, workspace_id, client_id);
-    pushes.extend(refresh_buffer_pickers(&mut s));
+    pushes.extend(refresh_view_pickers(&mut s));
     pushes.extend(refresh_lsp_server_pickers(&mut s));
     pushes.extend(buffer_closed_pushes_with(&s, &affected, &successor));
     let watcher = s.watcher.clone();
@@ -1360,7 +1362,7 @@ pub fn wire_bindings(
 /// the checkout you are standing in for the branch picker, the baseline in force for the baseline
 /// picker.
 ///
-/// "Where you are" is the selection, not a glyph on the row — the same move Buffers and Workspaces
+/// "Where you are" is the selection, not a glyph on the row — the same move Views and Workspaces
 /// make. Both of these pickers used to mark the row with a `●` in a reserved leading column;
 /// expressing it by opening *on* the row is what let those markers go.
 ///
@@ -2082,7 +2084,7 @@ struct TreeRun {
 /// correct.** The objection there — suppression is keyed by workdir containment, so holding it for
 /// the length of a slow transfer blinds the watcher to the user's own edits — does not apply to an
 /// operation that ends in [`reconcile_repo`], which re-stats every buffer in the repo and refreshes
-/// the explorer and buffer pickers. That pass is a superset of what the suppressed watcher would
+/// the explorer and view pickers. That pass is a superset of what the suppressed watcher would
 /// have done, so nothing is lost, only deferred to the end. A fetch has no such pass, which is
 /// exactly why it must not suppress.
 async fn run_tree_git(
@@ -2518,7 +2520,7 @@ fn reconcile_repo(
             .into_iter()
             .collect();
     pushes.extend(refresh_explorers_for_dirs(s, &dirs));
-    pushes.extend(refresh_buffer_pickers(s));
+    pushes.extend(refresh_view_pickers(s));
 
     (result, pushes)
 }
@@ -3807,10 +3809,10 @@ async fn apply_hunk_via_patch(
     let patch_buffer = params.buffer_id;
 
     // Transient: staging from the diff shouldn't leave a trail of buffers you never asked to open.
-    let file = Box::pin(buffer_open(
+    let file = Box::pin(view_open(
         state,
         ctx,
-        BufferOpenParams {
+        ViewOpenParams {
             absolute_path: Some(abs_path.to_string_lossy().into_owned()),
             transient: Some(true),
             ..Default::default()

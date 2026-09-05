@@ -9,14 +9,12 @@
 #![allow(dead_code, unused_imports)]
 pub use aether_client::grid::Measured;
 pub use aether_protocol::coords::{ElementRow, VisualRow};
+pub use aether_protocol::ViewId;
 
 pub use aether_protocol::buffer::{
-    BufferChanged, BufferChangedParams, BufferClose, BufferCloseParams, BufferCloseResult,
-    BufferClosed, BufferClosedParams, BufferContent, BufferContentParams, BufferContentResult,
-    BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferOpen,
-    BufferOpenParams, BufferOpenResult, BufferSave, BufferSaveParams, BufferSaveResult,
-    BufferSetTransient, BufferSetTransientParams, BufferSetTransientResult, BufferState,
-    BufferStateParams, CopyScope,
+    BufferChanged, BufferChangedParams, BufferContent, BufferContentParams, BufferContentResult,
+    BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult, BufferSave,
+    BufferSaveParams, BufferSaveResult, BufferState, BufferStateParams, CopyScope,
 };
 pub use aether_protocol::buffer::{BufferReload, BufferReloadParams, BufferReloadResult};
 pub use aether_protocol::cursor::{
@@ -97,6 +95,11 @@ pub use aether_protocol::settings::{
 pub use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
+};
+pub use aether_protocol::view::{
+    ViewClose, ViewCloseParams, ViewCloseResult, ViewClosed, ViewClosedParams, ViewOpen,
+    ViewOpenParams, ViewOpenResult, ViewSetTransient, ViewSetTransientParams,
+    ViewSetTransientResult, ViewState, ViewStateParams,
 };
 pub use aether_protocol::viewport::Element;
 pub use aether_protocol::viewport::{
@@ -197,15 +200,64 @@ impl Ws {
         self.seen.clear();
     }
 
-    /// Read the next frame, logging notifications as they go past.
+    /// Read the next frame, logging notifications as they go past and every opened view.
     async fn next_inbound(&mut self) -> ClientInbound {
         let text = next_text(self).await;
         let inbound: ClientInbound = serde_json::from_str(&text).expect("parseable inbound");
-        if let ClientInbound::Notification(n) = &inbound {
-            self.seen.push((n.method.clone(), n.params.clone()));
+        match &inbound {
+            ClientInbound::Notification(n) => {
+                self.seen.push((n.method.clone(), n.params.clone()));
+            }
+            ClientInbound::Response(r) => record_opened_views(&r.result),
+            ClientInbound::Error(_) => {}
         }
         inbound
     }
+}
+
+thread_local! {
+    /// Every view a `view/open`-shaped result on this test's thread has reported, by the buffer
+    /// it presents — the most recent first. See [`view_of`].
+    static OPENED_VIEWS: std::cell::RefCell<std::collections::HashMap<u64, ViewId>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Note the view an open result reports: the result itself, or the open a composite carries
+/// (`opened`, `target`, `open`). Not the buffers a focus result describes — an element's buffer
+/// may have no view of its own, and a focus says nothing about one.
+fn record_opened_views(result: &Value) {
+    let mut candidates = vec![result];
+    for key in ["opened", "target", "open"] {
+        if let Some(v) = result.get(key) {
+            candidates.push(v);
+        }
+    }
+    for v in candidates {
+        let (Some(buffer), Some(view)) = (
+            v.get("buffer_id").and_then(Value::as_u64),
+            v.get("view_id").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        if v.get("line_count").is_none() || view == 0 {
+            continue;
+        }
+        OPENED_VIEWS.with(|m| {
+            m.borrow_mut().insert(buffer, ViewId(view));
+        });
+    }
+}
+
+/// The view this test most recently opened `buffer_id` through — what the wire names where a
+/// test reasons in buffers. A test that holds only a buffer id (from [`setup_with_buffer`], say)
+/// subscribes to, closes and reopens *this*; the ids are unrelated numbers, and the server hands
+/// the view out only in the open's result, which every helper here reads on the way past.
+pub fn view_of(buffer_id: u64) -> ViewId {
+    OPENED_VIEWS.with(|m| {
+        m.borrow().get(&buffer_id).copied().unwrap_or_else(|| {
+            panic!("no view opened for buffer {buffer_id} on this test — open it first")
+        })
+    })
 }
 
 impl std::ops::Deref for Ws {
@@ -310,6 +362,28 @@ pub async fn next_text(ws: &mut Ws) -> String {
 pub async fn send_request<M: RpcMethod>(ws: &mut Ws, params: &M::Params) -> M::Result {
     let id = send_no_wait::<M>(ws, params).await;
     await_response::<M>(ws, id).await
+}
+
+/// [`send_request`] for a call that may be refused: the typed result, or the error the server
+/// answered with. For the tests that ask "is this still here?" of a view or a buffer.
+pub async fn send_request_result<M: RpcMethod>(
+    ws: &mut Ws,
+    params: &M::Params,
+) -> Result<M::Result, Value> {
+    let id = send_no_wait::<M>(ws, params).await;
+    loop {
+        match ws.next_inbound().await {
+            ClientInbound::Response(r) if r.id == id => {
+                return Ok(serde_json::from_value(r.result).expect("typed result"));
+            }
+            ClientInbound::Error(e) if e.id == id => {
+                return Err(serde_json::to_value(e.error).unwrap_or(Value::Null));
+            }
+            ClientInbound::Notification(_)
+            | ClientInbound::Response(_)
+            | ClientInbound::Error(_) => {}
+        }
+    }
 }
 
 /// Send `M` without waiting for its reply, returning the id to await it by. For the handful of
@@ -432,11 +506,10 @@ pub async fn setup_with_buffer(
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("buf.txt".into()),
             language: None,
@@ -476,7 +549,7 @@ pub async fn buffer_text(ws: &mut Ws, buffer_id: u64) -> String {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 200,
             rows: 100,
             overscan_rows: 0,
@@ -490,7 +563,6 @@ pub async fn buffer_text(ws: &mut Ws, buffer_id: u64) -> String {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -508,7 +580,7 @@ pub async fn buffer_text(ws: &mut Ws, buffer_id: u64) -> String {
 pub async fn setup_with_named_file(
     file_name: &str,
     content: &str,
-) -> (aether_server::ServerHandle, Ws, BufferOpenResult) {
+) -> (aether_server::ServerHandle, Ws, ViewOpenResult) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(file_name), content).unwrap();
     let dir_path = dir.path().to_path_buf();
@@ -524,11 +596,10 @@ pub async fn setup_with_named_file(
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some(file_name.into()),
             language: None,
@@ -569,10 +640,10 @@ pub async fn setup_picker_workspace() -> (aether_server::ServerHandle, Ws) {
     (server, ws)
 }
 
-// -------- buffer picker --------------------------------------------------------------------------
+// -------- view picker --------------------------------------------------------------------------
 
 /// Workspace + handshake. Same shape as `setup_picker_workspace` but loads a few files we'll
-/// open through `buffer/open` so the buffer picker has something to surface.
+/// open through `view/open` so the view picker has something to surface.
 pub async fn setup_buffer_picker_workspace() -> (aether_server::ServerHandle, Ws) {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
@@ -730,11 +801,10 @@ pub async fn drain_grep_until_done(ws: &mut Ws) -> PickerUpdateParams {
 /// Open a buffer at `relative_path` against an established (server, ws) handshake. Used by the
 /// grep_navigate tests to put a buffer in scope before calling the RPC.
 pub async fn open_test_buffer(ws: &mut Ws, relative_path: &str) -> u64 {
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some(relative_path.into()),
             language: None,
@@ -866,11 +936,10 @@ pub async fn setup_git_apply(
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some(name.into()),
             language: None,
@@ -949,11 +1018,10 @@ pub async fn open_and_subscribe_with_lsp(
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some(rel_path.into()),
             language: None,
@@ -966,7 +1034,7 @@ pub async fn open_and_subscribe_with_lsp(
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 100,
             rows: 40,
             overscan_rows: 0,
@@ -980,7 +1048,6 @@ pub async fn open_and_subscribe_with_lsp(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1144,9 +1211,8 @@ pub async fn grep_with_filters(
     }
 }
 
-pub fn file_open_params(rel: &str, transient: Option<bool>) -> BufferOpenParams {
-    BufferOpenParams {
-        buffer_id: None,
+pub fn file_open_params(rel: &str, transient: Option<bool>) -> ViewOpenParams {
+    ViewOpenParams {
         path_index: Some(0),
         relative_path: Some(rel.into()),
         language: None,
@@ -1159,7 +1225,7 @@ pub fn file_open_params(rel: &str, transient: Option<bool>) -> BufferOpenParams 
 
 pub fn transient_sub_params(buffer_id: u64) -> ViewportSubscribeParams {
     ViewportSubscribeParams {
-        buffer_id: aether_protocol::ViewId(buffer_id),
+        view_id: view_of(buffer_id),
         cols: 80,
         rows: 10,
         overscan_rows: 0,
@@ -1173,7 +1239,6 @@ pub fn transient_sub_params(buffer_id: u64) -> ViewportSubscribeParams {
         continuation_marker_width: 0,
         tab_width: 4,
         diff_view: false,
-        kind: None,
     }
 }
 
@@ -1225,7 +1290,7 @@ pub fn commit_file(repo: &git2::Repository, rel: &str, content: &str) {
 pub async fn show_buffer(
     ws: &mut Ws,
     params: &aether_protocol::git::GitShowParams,
-) -> aether_protocol::buffer::BufferOpenResult {
+) -> aether_protocol::view::ViewOpenResult {
     send_request::<aether_protocol::git::GitShow>(ws, params)
         .await
         .opened
@@ -1258,9 +1323,9 @@ pub async fn setup_repos_workspace_on(
     relative_path: &str,
 ) -> (aether_server::ServerHandle, Ws, u64) {
     let (server, mut ws) = setup_repos_workspace(roots).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some(relative_path.into()),
             ..Default::default()
@@ -1391,7 +1456,7 @@ async fn window_with_diff(
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 40,
             overscan_rows: 0,
@@ -1405,7 +1470,6 @@ async fn window_with_diff(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view,
-            kind: None,
         },
     )
     .await;

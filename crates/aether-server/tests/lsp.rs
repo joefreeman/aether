@@ -658,9 +658,9 @@ async fn workspace_symbols_need_a_declared_project() {
     )
     .await;
     // Open a buffer, so a server *is* running — it just isn't pinned by a project.
-    let _: BufferOpenResult = send_request::<BufferOpen>(
+    let _: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
             ..Default::default()
@@ -1664,9 +1664,9 @@ async fn buffer_reuses_the_pinned_server_and_closing_it_keeps_it_alive() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             ..Default::default()
@@ -1680,10 +1680,10 @@ async fn buffer_reuses_the_pinned_server_and_closing_it_keeps_it_alive() {
     })
     .await;
 
-    let _: BufferCloseResult = send_request::<BufferClose>(
+    let _: ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+        &ViewCloseParams {
+            view_id: open.view_id,
             open_next: false,
         },
     )
@@ -1792,9 +1792,9 @@ async fn sibling_language_buffers_share_one_server() {
     )
     .await;
     for file in ["a.ts", "b.js"].iter() {
-        let _: BufferOpenResult = send_request::<BufferOpen>(
+        let _: ViewOpenResult = send_request::<ViewOpen>(
             &mut ws,
-            &BufferOpenParams {
+            &ViewOpenParams {
                 path_index: Some(0),
                 relative_path: Some((*file).into()),
                 ..Default::default()
@@ -1833,11 +1833,10 @@ async fn lsp_diagnostics_clear_on_undo() {
     )
     .await;
     // Re-open by path to learn the buffer id (dedups to the same buffer).
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -1915,11 +1914,10 @@ async fn lsp_diagnostics_clear_when_error_line_is_commented_out() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -1956,11 +1954,10 @@ async fn lsp_diagnostics_clear_when_error_line_is_commented_out() {
 async fn lsp_hover_without_a_server_reports_no_server() {
     let dir = lay_out(&[("notes.txt", "hello world\n")]);
     let (server, mut ws) = open_and_subscribe("hover-no-lsp", dir.path(), "notes.txt").await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("notes.txt".into()),
             language: None,
@@ -2001,11 +1998,10 @@ async fn lsp_hover_returns_contents() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -2063,11 +2059,10 @@ async fn lsp_goto_definition_resolves() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -2134,11 +2129,10 @@ async fn references_picker_lists_all_uses() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -2291,11 +2285,10 @@ async fn references_picker_waits_out_a_starting_server() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -2367,11 +2360,10 @@ async fn document_symbols_picker_fills_and_centers_deep() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -2460,11 +2452,10 @@ async fn lsp_format_reformats() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -2525,11 +2516,10 @@ async fn lsp_format_json_reformats() {
     let dir = lay_out(&[("data.json", "{\"a\":1,\"b\":[1,2,3]}\n")]);
     let json_path = dir.path().join("data.json");
     let (server, mut ws) = open_and_subscribe("fmt-json", dir.path(), "data.json").await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("data.json".into()),
             language: None,
@@ -2608,11 +2598,10 @@ async fn lsp_diagnostics_picker_lists_and_selects() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -2678,11 +2667,10 @@ async fn jumplist_from_buffer_diagnostics_groups_by_file_and_steps() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -2862,7 +2850,7 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 10,
@@ -2876,7 +2864,6 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2939,11 +2926,10 @@ async fn an_ordinary_views_outline_is_its_document_symbols() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -2962,7 +2948,7 @@ async fn an_ordinary_views_outline_is_its_document_symbols() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 100,
             rows: 40,
             overscan_rows: 0,
@@ -2972,7 +2958,6 @@ async fn an_ordinary_views_outline_is_its_document_symbols() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3040,7 +3025,7 @@ async fn a_views_height_counts_wrapped_rows() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 5,
@@ -3054,7 +3039,6 @@ async fn a_views_height_counts_wrapped_rows() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3072,7 +3056,7 @@ async fn a_views_height_counts_wrapped_rows() {
 }
 
 /// Two clients open the same buffer; when one closes it, the *other* must be told (via a
-/// `buffer/closed` push) so it can switch off the now-gone buffer rather than holding a dead
+/// `view/closed` push) so it can switch off the now-gone buffer rather than holding a dead
 /// viewport. The push carries the recipient's next buffer (its MRU top after the close).
 #[tokio::test]
 async fn closing_a_buffer_notifies_other_clients_viewing_it() {
@@ -3088,7 +3072,7 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
         let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
             ws,
             &ViewportSubscribeParams {
-                buffer_id: aether_protocol::ViewId(buffer_id),
+                view_id: view_of(buffer_id),
                 cols: 80,
                 rows: 10,
                 overscan_rows: 0,
@@ -3102,18 +3086,16 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
-                kind: None,
             },
         )
         .await;
     }
 
-    async fn open(ws: &mut Ws, file: &str) -> BufferOpenResult {
-        send_request::<BufferOpen>(
+    async fn open(ws: &mut Ws, file: &str) -> ViewOpenResult {
+        send_request::<ViewOpen>(
             ws,
-            &BufferOpenParams {
+            &ViewOpenParams {
                 transient: None,
-                buffer_id: None,
                 path_index: Some(0),
                 relative_path: Some(file.into()),
                 language: None,
@@ -3149,26 +3131,28 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
     subscribe(&mut ws_b, buf_a).await;
 
     // Client A closes the shared buffer. It gets its next buffer in the RPC result...
-    let result: BufferCloseResult = send_request::<BufferClose>(
+    let result: ViewCloseResult = send_request::<ViewClose>(
         &mut ws_a,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(buf_a),
+        &ViewCloseParams {
+            view_id: view_of(buf_a),
             open_next: false,
         },
     )
     .await;
-    assert_eq!(result.next_buffer_id, Some(buf_b));
+    assert_eq!(result.next_view_id, Some(view_of(buf_b)));
 
-    // ...and client B is pushed `buffer/closed` for the buffer it was viewing, with its own next.
-    let pushed: BufferClosedParams = expect_notification::<BufferClosed>(&mut ws_b).await;
-    assert_eq!(pushed.buffer_id, buf_a);
-    assert_eq!(pushed.next_buffer_id, Some(buf_b));
+    // ...and client B is pushed `view/closed` for the view it was presenting — the buffer went
+    // with it — with its own next.
+    let pushed: ViewClosedParams = expect_notification::<ViewClosed>(&mut ws_b).await;
+    assert_eq!(pushed.view_id, view_of(buf_a));
+    assert_eq!(pushed.buffer_id, Some(buf_a));
+    assert_eq!(pushed.next_view_id, Some(view_of(buf_b)));
 
     drop(server);
 }
 
 /// A client that is *not* viewing the closed buffer — it switched to another one — still gets the
-/// `buffer/closed` push when the buffer lives in its active workspace. This is what lets a tethered
+/// `view/closed` push when the buffer lives in its active workspace. This is what lets a tethered
 /// client exit when another client closes its tether out from under it, even mid-browse; clients
 /// ignore pushes for buffers that are neither current nor the tether, so the broad audience is
 /// safe.
@@ -3185,7 +3169,7 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
         name: "test-proj".into(),
         open_last: false,
     };
-    let open = |file: &str| BufferOpenParams {
+    let open = |file: &str| ViewOpenParams {
         path_index: Some(0),
         relative_path: Some(file.into()),
         ..Default::default()
@@ -3195,16 +3179,16 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
     // holds one viewport, and subscribing supersedes the previous one).
     let mut ws_a = Ws::connect(&server).await;
     let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(&mut ws_a, &activate).await;
-    let buf_a = send_request::<BufferOpen>(&mut ws_a, &open("a.txt"))
+    let buf_a = send_request::<ViewOpen>(&mut ws_a, &open("a.txt"))
         .await
         .buffer_id;
-    let buf_b = send_request::<BufferOpen>(&mut ws_a, &open("b.txt"))
+    let buf_b = send_request::<ViewOpen>(&mut ws_a, &open("b.txt"))
         .await
         .buffer_id;
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws_a,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buf_b),
+            view_id: view_of(buf_b),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -3218,7 +3202,6 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3226,28 +3209,28 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
     // Client B closes a.txt — which client A holds in its workspace but is not viewing.
     let mut ws_b = Ws::connect(&server).await;
     let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(&mut ws_b, &activate).await;
-    let same = send_request::<BufferOpen>(&mut ws_b, &open("a.txt"))
+    let same = send_request::<ViewOpen>(&mut ws_b, &open("a.txt"))
         .await
         .buffer_id;
     assert_eq!(same, buf_a);
-    let _: BufferCloseResult = send_request::<BufferClose>(
+    let _: ViewCloseResult = send_request::<ViewClose>(
         &mut ws_b,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(buf_a),
+        &ViewCloseParams {
+            view_id: view_of(buf_a),
             open_next: false,
         },
     )
     .await;
 
     // Client A hears about it despite viewing b.txt.
-    let pushed: BufferClosedParams = expect_notification::<BufferClosed>(&mut ws_a).await;
-    assert_eq!(pushed.buffer_id, buf_a);
+    let pushed: ViewClosedParams = expect_notification::<ViewClosed>(&mut ws_a).await;
+    assert_eq!(pushed.buffer_id, Some(buf_a));
 
     drop(server);
 }
 
 /// The `ae --web` waiter's contract (`aether-ae/src/web.rs`): a client that activates a workspace
-/// and opens a buffer but never subscribes ANY viewport still receives the `buffer/closed` push
+/// and opens a buffer but never subscribes ANY viewport still receives the `view/closed` push
 /// when another client closes that buffer — membership in the active workspace's MRU alone routes
 /// it. This is what lets the headless waiter exit when the browser tab finishes the edit.
 #[tokio::test]
@@ -3262,7 +3245,7 @@ async fn closing_a_buffer_notifies_a_viewportless_waiter_client() {
         name: "test-proj".into(),
         open_last: false,
     };
-    let open = BufferOpenParams {
+    let open = ViewOpenParams {
         path_index: Some(0),
         relative_path: Some("a.txt".into()),
         ..Default::default()
@@ -3272,29 +3255,31 @@ async fn closing_a_buffer_notifies_a_viewportless_waiter_client() {
     let mut waiter = Ws::connect(&server).await;
     let _: WorkspaceActivateResult =
         send_request::<WorkspaceActivate>(&mut waiter, &activate).await;
-    let buf = send_request::<BufferOpen>(&mut waiter, &open)
-        .await
-        .buffer_id;
+    let buf = send_request::<ViewOpen>(&mut waiter, &open).await.buffer_id;
 
     // The browser: attaches to the same buffer by path, edits done, closes it.
     let mut browser = Ws::connect(&server).await;
     let _: WorkspaceActivateResult =
         send_request::<WorkspaceActivate>(&mut browser, &activate).await;
-    let same = send_request::<BufferOpen>(&mut browser, &open)
+    let same = send_request::<ViewOpen>(&mut browser, &open)
         .await
         .buffer_id;
     assert_eq!(same, buf, "open-by-path attaches to the waiter's buffer");
-    let _: BufferCloseResult = send_request::<BufferClose>(
+    let _: ViewCloseResult = send_request::<ViewClose>(
         &mut browser,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(buf),
+        &ViewCloseParams {
+            view_id: view_of(buf),
             open_next: false,
         },
     )
     .await;
 
-    let pushed: BufferClosedParams = expect_notification::<BufferClosed>(&mut waiter).await;
-    assert_eq!(pushed.buffer_id, buf, "the viewportless waiter is notified");
+    let pushed: ViewClosedParams = expect_notification::<ViewClosed>(&mut waiter).await;
+    assert_eq!(
+        pushed.buffer_id,
+        Some(buf),
+        "the viewportless waiter is notified"
+    );
 
     drop(server);
 }
@@ -3331,11 +3316,10 @@ async fn setup_two_diagnostics() -> (aether_server::ServerHandle, Ws, u64) {
     let (server, mut ws) =
         open_and_subscribe_with_lsp("diags", dir.path(), "main.rs", vec![("rust".into(), dummy)])
             .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -3498,11 +3482,10 @@ async fn restart_server_takes_the_language_down_and_brings_it_back() {
     .await;
 
     // And the buffer it serves is still usable afterwards — a restart re-registers open documents.
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -3551,11 +3534,10 @@ async fn a_composed_views_status_snapshot_describes_the_focused_file() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -3568,7 +3550,7 @@ async fn a_composed_views_status_snapshot_describes_the_focused_file() {
     // The file's own diagnostics have landed before the patch view is opened.
     wait_for_buffer_diag_present(&mut ws, open.buffer_id, true).await;
 
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &aether_protocol::git::GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3586,7 +3568,7 @@ async fn a_composed_views_status_snapshot_describes_the_focused_file() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -3600,7 +3582,6 @@ async fn a_composed_views_status_snapshot_describes_the_focused_file() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3655,11 +3636,10 @@ async fn navigate_diagnostic_refuses_one_outside_the_focused_hunk() {
     let (server, mut ws) =
         open_and_subscribe_with_lsp("diag-scope", &root, "main.rs", vec![("rust".into(), dummy)])
             .await;
-    let file: BufferOpenResult = send_request::<BufferOpen>(
+    let file: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -3682,7 +3662,7 @@ async fn navigate_diagnostic_refuses_one_outside_the_focused_hunk() {
     assert_eq!(plain.cursor.position.line, 38);
 
     // Now the composed view: subscribing rebinds the scope to the hunk around line 20.
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &aether_protocol::git::GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -3695,7 +3675,7 @@ async fn navigate_diagnostic_refuses_one_outside_the_focused_hunk() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -3709,7 +3689,6 @@ async fn navigate_diagnostic_refuses_one_outside_the_focused_hunk() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3787,7 +3766,7 @@ async fn the_diagnostics_picker_covers_every_file_a_view_shows() {
         },
     )
     .await;
-    let view_id = aether_protocol::ViewId(patch.buffer_id);
+    let view_id = patch.view_id;
 
     // Poll: the two files' servers publish asynchronously.
     let mut view_wide = 0usize;

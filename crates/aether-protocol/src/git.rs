@@ -1381,7 +1381,7 @@ impl RpcMethod for GitShow {
 /// What `git/show` materialised, if anything.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GitShowResult {
-    /// The opened buffer, in the same shape `buffer/open` returns — the client's adopt path is
+    /// The opened buffer, in the same shape `view/open` returns — the client's adopt path is
     /// identical, and `title` + `read_only` are what mark it as virtual.
     ///
     /// `None` only for [`ShowTarget::WorkingChanges`] against a **clean** tree, and only when no
@@ -1392,7 +1392,7 @@ pub struct GitShowResult {
     /// though by then it is rarely stale, since an open one is rebuilt by every write to the tree
     /// it is showing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opened: Option<crate::buffer::BufferOpenResult>,
+    pub opened: Option<crate::view::ViewOpenResult>,
     /// What the emptiness was measured against — set only alongside `opened: None`, and only when
     /// a baseline is pinned ([`GitSetBaseline`]).
     ///
@@ -1517,7 +1517,7 @@ pub struct GitFollowPatchLineResult {
     /// message. A quiet no-op rather than an error: `Enter` is a common key, and being told off for
     /// pressing it on the subject line would be noise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opened: Option<crate::buffer::BufferOpenResult>,
+    pub opened: Option<crate::view::ViewOpenResult>,
 }
 
 // ---- git/stash_* --------------------------------------------------------------------------------

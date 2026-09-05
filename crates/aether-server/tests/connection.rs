@@ -39,11 +39,10 @@ async fn hello_then_open_file() {
     );
 
     // Open the file.
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("hello.rs".into()),
             language: None,
@@ -64,11 +63,10 @@ async fn hello_then_open_file() {
     assert!(open.scroll.is_none());
 
     // Re-opening returns the same buffer id (deduping by canonical path).
-    let open2: BufferOpenResult = send_request::<BufferOpen>(
+    let open2: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("hello.rs".into()),
             language: None,
@@ -145,11 +143,10 @@ async fn buffer_open_restores_cursor_and_scroll() {
     )
     .await;
 
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -164,7 +161,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -178,7 +175,6 @@ async fn buffer_open_restores_cursor_and_scroll() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -200,11 +196,10 @@ async fn buffer_open_restores_cursor_and_scroll() {
 
     // Reopen the same path (file-browser navigation pattern). The server should report the
     // prior cursor and scroll so the client can restore the view.
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -249,11 +244,10 @@ async fn buffer_open_restores_scroll_from_a_window_request() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -267,7 +261,7 @@ async fn buffer_open_restores_scroll_from_a_window_request() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -281,7 +275,6 @@ async fn buffer_open_restores_scroll_from_a_window_request() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -289,11 +282,10 @@ async fn buffer_open_restores_scroll_from_a_window_request() {
     // Scroll by row (no wrap → row 20 of the one element is line 20).
     let _ = window_from_row(&mut ws, sub.viewport_id, 20, 10).await;
 
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -342,11 +334,10 @@ async fn buffer_open_jump_drops_saved_scroll() {
     )
     .await;
 
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -361,7 +352,7 @@ async fn buffer_open_jump_drops_saved_scroll() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -375,7 +366,6 @@ async fn buffer_open_jump_drops_saved_scroll() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -385,11 +375,10 @@ async fn buffer_open_jump_drops_saved_scroll() {
     // Reopen the same buffer with a jump (the grep-navigate pattern): the cursor lands on the
     // jump target, and the stale scroll is dropped.
     let jump = LogicalPosition { line: 20, col: 0 };
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -436,11 +425,10 @@ async fn buffer_open_isolates_scroll_per_client() {
             },
         )
         .await;
-        let open: BufferOpenResult = send_request::<BufferOpen>(
+        let open: ViewOpenResult = send_request::<ViewOpen>(
             &mut ws,
-            &BufferOpenParams {
+            &ViewOpenParams {
                 transient: None,
-                buffer_id: None,
                 path_index: Some(0),
                 relative_path: Some("a.txt".into()),
                 language: None,
@@ -453,7 +441,7 @@ async fn buffer_open_isolates_scroll_per_client() {
         let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
             &mut ws,
             &ViewportSubscribeParams {
-                buffer_id: aether_protocol::ViewId(open.buffer_id),
+                view_id: open.view_id,
                 cols: 80,
                 rows: 10,
                 overscan_rows: 0,
@@ -467,7 +455,6 @@ async fn buffer_open_isolates_scroll_per_client() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
-                kind: None,
             },
         )
         .await;
@@ -481,11 +468,10 @@ async fn buffer_open_isolates_scroll_per_client() {
     let _ = window_from_row(&mut ws_a, vp_a, 5, 10).await;
     let _ = window_from_row(&mut ws_b, vp_b, 17, 10).await;
 
-    let reopen_a: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen_a: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws_a,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -495,11 +481,10 @@ async fn buffer_open_isolates_scroll_per_client() {
         },
     )
     .await;
-    let reopen_b: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen_b: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws_b,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -633,11 +618,10 @@ async fn rejects_path_outside_workspace() {
     let req = Request {
         jsonrpc: JsonRpc,
         id: 2,
-        method: BufferOpen::NAME.into(),
+        method: ViewOpen::NAME.into(),
         params: Some(
-            serde_json::to_value(BufferOpenParams {
+            serde_json::to_value(ViewOpenParams {
                 transient: None,
-                buffer_id: None,
                 path_index: Some(0),
                 relative_path: Some("../aether-outside-test.txt".into()),
                 language: None,
@@ -681,11 +665,10 @@ async fn viewport_subscribe_renders_window() {
     )
     .await;
 
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -700,7 +683,7 @@ async fn viewport_subscribe_renders_window() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -715,7 +698,6 @@ async fn viewport_subscribe_renders_window() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -752,11 +734,10 @@ async fn viewport_subscribe_wraps_long_line() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("long.txt".into()),
             language: None,
@@ -770,7 +751,7 @@ async fn viewport_subscribe_wraps_long_line() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 20,
             rows: 10,
             overscan_rows: 0,
@@ -785,7 +766,6 @@ async fn viewport_subscribe_wraps_long_line() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -837,11 +817,10 @@ async fn viewport_scroll_returns_new_window() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("many.txt".into()),
             language: None,
@@ -854,7 +833,7 @@ async fn viewport_scroll_returns_new_window() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 5,
             overscan_rows: 2,
@@ -869,7 +848,6 @@ async fn viewport_scroll_returns_new_window() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -907,9 +885,8 @@ async fn the_socket_logs_pushes_it_read_past() {
         name: "test-proj".into(),
         open_last: false,
     };
-    let open = BufferOpenParams {
+    let open = ViewOpenParams {
         transient: None,
-        buffer_id: None,
         path_index: Some(0),
         relative_path: Some("a.txt".into()),
         language: None,
@@ -920,18 +897,18 @@ async fn the_socket_logs_pushes_it_read_past() {
 
     let mut a = Ws::connect(&server).await;
     let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(&mut a, &activate).await;
-    let a_open: BufferOpenResult = send_request::<BufferOpen>(&mut a, &open).await;
+    let a_open: ViewOpenResult = send_request::<ViewOpen>(&mut a, &open).await;
 
     let mut b = Ws::connect(&server).await;
     let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(&mut b, &activate).await;
-    let b_open: BufferOpenResult = send_request::<BufferOpen>(&mut b, &open).await;
+    let b_open: ViewOpenResult = send_request::<ViewOpen>(&mut b, &open).await;
     assert_eq!(a_open.buffer_id, b_open.buffer_id, "same path, same buffer");
 
     // B watches the buffer, then stops paying attention.
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut b,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(b_open.buffer_id),
+            view_id: b_open.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -945,7 +922,6 @@ async fn the_socket_logs_pushes_it_read_past() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1067,7 +1043,7 @@ async fn settings_set_persists_and_a_later_get_reads_it_back() {
 
     let defaults = AppSettings::default();
     let want = AppSettings {
-        buffer_font_size: 22,
+        editor_font_size: 22,
         ui_font_size: 13,
         ligatures: !defaults.ligatures,
         hints: !defaults.hints,
@@ -1101,7 +1077,7 @@ async fn settings_set_pushes_to_other_clients_but_not_the_setter() {
     setter.clear_seen();
 
     let want = AppSettings {
-        buffer_font_size: 19,
+        editor_font_size: 19,
         ..AppSettings::default()
     };
     let _: AppSettings = send_request::<SettingsSet>(&mut setter, &want).await;
@@ -1114,7 +1090,7 @@ async fn settings_set_pushes_to_other_clients_but_not_the_setter() {
         1,
         "the other client is told, so the change applies live"
     );
-    assert_eq!(pushed[0].buffer_font_size, 19);
+    assert_eq!(pushed[0].editor_font_size, 19);
 
     assert!(
         setter.saw::<SettingsChanged>().is_empty(),

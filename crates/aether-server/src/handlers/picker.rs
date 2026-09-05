@@ -7,10 +7,7 @@ use super::*;
 /// (e.g. opened by another client of the same workspace) in buffer-id order. `(scratch N)`
 /// placeholder display for buffers without a path. Returns an empty list if the client has no
 /// active workspace (the picker shouldn't be reachable without one, but the lookup stays defensive).
-fn build_buffer_candidates(
-    s: &ServerState,
-    client_id: ClientId,
-) -> Vec<picker_state::BufferCandidate> {
+fn build_view_candidates(s: &ServerState, client_id: ClientId) -> Vec<picker_state::ViewCandidate> {
     let Some(workspace) = s.active_workspace(client_id) else {
         return Vec::new();
     };
@@ -19,52 +16,54 @@ fn build_buffer_candidates(
     let belongs =
         |id: &BufferId| s.buffer_workspaces.get(id).map(|s| s.as_str()) == Some(&workspace_name);
 
-    let mut out: Vec<picker_state::BufferCandidate> = Vec::with_capacity(s.buffers.len());
-    let mut seen: std::collections::HashSet<BufferId> = std::collections::HashSet::new();
+    let mut out: Vec<picker_state::ViewCandidate> = Vec::with_capacity(s.views.len());
+    let mut seen: std::collections::HashSet<ViewId> = std::collections::HashSet::new();
 
-    for &id in &workspace.mru_buffers {
+    // One row per **view**, most recently used first: a file's editor and its reader are two
+    // rows, and the one you used last is nearer the top.
+    for &view_id in &workspace.mru_views {
+        let Some(view) = s.try_view(view_id) else {
+            continue;
+        };
+        let id = view.presenting;
         if !belongs(&id) {
             continue;
         }
         let (Some(buf), Some(doc)) = (s.buffers.get(&id), s.try_doc_of(id)) else {
             continue;
         };
-        out.push(buffer_candidate(buf, doc, &roots));
-        seen.insert(id);
+        out.push(buffer_candidate(buf, doc, view_id, view, &roots));
+        seen.insert(view_id);
     }
-    // Append any workspace buffers not in the MRU yet so the picker still surfaces them — one
-    // opened by another client of the same workspace, say. Stable order (by id) so the tail is
-    // deterministic.
-    //
-    // **Transient ones are skipped here, and only here.** A buffer that has never been in the MRU
-    // and is transient was never *opened* by anybody: it exists because something else needed it —
-    // in practice because a composed view windows it. Those are elements, not views, and this
-    // picker switches between views. Listing them meant `Space g w` on a busy tree quietly added a
-    // row per changed file to `Space b`.
-    //
-    // A transient buffer you really did visit — a picker preview — is in the MRU and still shows,
-    // which is why the filter belongs on this sweep rather than on the candidate as a whole.
-    let mut leftovers: Vec<BufferId> = s
-        .buffers
-        .keys()
-        .copied()
-        .filter(|id| belongs(id) && !seen.contains(id))
-        .filter(|id| !s.buffers[id].transient)
+    // Views nothing has landed on yet — a file bound into a review and then kept — sorted by id
+    // so the sweep is deterministic. Previews you never visited stay out: a preview is somewhere
+    // you looked, and the MRU has every one of those.
+    let mut leftovers: Vec<ViewId> = s
+        .views
+        .iter()
+        .filter(|(view_id, view)| belongs(&view.presenting) && !seen.contains(view_id))
+        .filter(|(_, view)| !view.transient)
+        .map(|(view_id, _)| *view_id)
         .collect();
     leftovers.sort_unstable();
-    for id in leftovers {
-        out.push(buffer_candidate(&s.buffers[&id], s.doc_of(id), &roots));
+    for view_id in leftovers {
+        let view = &s.views[&view_id];
+        let id = view.presenting;
+        out.push(buffer_candidate(
+            &s.buffers[&id],
+            s.doc_of(id),
+            view_id,
+            view,
+            &roots,
+        ));
     }
-    // Dormant buffers (restored from the session, not yet loaded) come last — but only
-    // those whose file isn't already open as a live buffer above (a stale dormant entry that was
-    // never pruned shouldn't double-show). MRU order is preserved by the list's own order.
     let live_paths: std::collections::HashSet<&std::path::Path> = s
         .buffers
         .iter()
         .filter(|(id, _)| belongs(id))
         .filter_map(|(_, b)| s.documents.get(&b.document)?.canonical_path.as_deref())
         .collect();
-    for d in &workspace.dormant_buffers {
+    for d in &workspace.dormant_views {
         // A dormant *file* whose path is already open as a live buffer shouldn't double-show; a
         // dormant scratch (no path) can never collide, so it always shows.
         if d.path().is_none_or(|p| !live_paths.contains(p)) {
@@ -80,9 +79,9 @@ fn build_buffer_candidates(
 /// distinction never changes what the user can do. A file's display/path is derived from its path;
 /// a dormant scratch shows `(scratch N)` and has no opener path.
 fn dormant_candidate(
-    d: &crate::state::DormantBuffer,
+    d: &crate::state::DormantView,
     roots: &[std::path::PathBuf],
-) -> picker_state::BufferCandidate {
+) -> picker_state::ViewCandidate {
     let (display, path) = match &d.source {
         crate::state::DormantSource::File(p) => (
             crate::workspace_index::workspace_relative_display(p, roots)
@@ -90,16 +89,21 @@ fn dormant_candidate(
             crate::workspace_index::workspace_relative_parts(p, roots),
         ),
         crate::state::DormantSource::Scratch { number } => (format!("(scratch {number})"), None),
-        // The key's own tail is the readable part — `abc1234` or `abc1234:src/a.rs`. The real
-        // buffer's title is generated with the content, which a dormant entry hasn't paid for yet.
+        // Named as the live view names itself, as far as the key allows: the working changes are
+        // `Working changes`, a revision its short hash (`abc1234`, `abc1234:src/a.rs`) — the
+        // subject is generated with the content, which a dormant entry hasn't paid for yet. A key
+        // that doesn't parse is shown as it is.
         crate::state::DormantSource::Virtual { key } => (
-            key.rsplit_once('@').map_or(key.clone(), |(_, r)| {
-                let short: String = r.chars().take(7).collect();
-                match r.split_once(':') {
-                    Some((_, path)) => format!("{short}:{path}"),
-                    None => short,
+            match crate::state::VirtualTarget::parse_key(key).map(|t| t.what) {
+                Some(aether_protocol::git::ShowTarget::WorkingChanges) => "Working changes".into(),
+                Some(aether_protocol::git::ShowTarget::Commit { rev }) => {
+                    rev.chars().take(7).collect()
                 }
-            }),
+                Some(aether_protocol::git::ShowTarget::File { rev, path }) => {
+                    format!("{}:{path}", rev.chars().take(7).collect::<String>())
+                }
+                None => key.clone(),
+            },
             None,
         ),
     };
@@ -115,8 +119,10 @@ fn dormant_candidate(
         }
         crate::state::DormantSource::Scratch { .. } => BufferDirtyState::Unsaved,
     };
-    picker_state::BufferCandidate {
+    picker_state::ViewCandidate {
         buffer_id: d.id,
+        view_id: d.view,
+        view_kind: d.kind,
         display,
         status,
         path,
@@ -134,8 +140,10 @@ fn dormant_candidate(
 fn buffer_candidate(
     buf: &Buffer,
     doc: &Document,
+    view_id: ViewId,
+    view: &crate::state::View,
     roots: &[std::path::PathBuf],
-) -> picker_state::BufferCandidate {
+) -> picker_state::ViewCandidate {
     let display = match (doc.canonical_path.as_deref(), &doc.virtual_source) {
         (Some(p), _) => crate::workspace_index::workspace_relative_display(p, roots)
             .unwrap_or_else(|| p.display().to_string()),
@@ -153,8 +161,9 @@ fn buffer_candidate(
         .canonical_path
         .as_deref()
         .and_then(|p| crate::workspace_index::workspace_relative_parts(p, roots));
-    picker_state::BufferCandidate {
+    picker_state::ViewCandidate {
         buffer_id: buf.id,
+        view_id,
         display,
         status: buffer_dirty_state(doc),
         path,
@@ -162,7 +171,8 @@ fn buffer_candidate(
             .canonical_path
             .as_deref()
             .map(|p| p.to_string_lossy().into_owned()),
-        transient: buf.transient,
+        transient: view.transient,
+        view_kind: view.kind(),
     }
 }
 
@@ -287,32 +297,30 @@ pub(crate) fn refresh_git_ref_pickers(s: &mut ServerState, kind: PickerKind) -> 
     pushes
 }
 
-/// Rebuild candidates for every subscribed `Buffers` picker, re-rank under the existing query,
+/// Rebuild candidates for every subscribed `Views` picker, re-rank under the existing query,
 /// and collect the resulting `picker/update` pushes. Caller sends them after dropping the lock.
 /// Cheap when no picker is open: a HashMap scan over `pickers` and an early return.
-pub(crate) fn refresh_buffer_pickers(s: &mut ServerState) -> PendingPushes {
-    // Collect client_ids with a *subscribed* Buffers picker. Skip the rest — they may still
+pub(crate) fn refresh_view_pickers(s: &mut ServerState) -> PendingPushes {
+    // Collect client_ids with a *subscribed* view picker. Skip the rest — they may still
     // have persisted state from a prior session, but they're not waiting for pushes.
     let client_ids: Vec<ClientId> = s
         .pickers
         .iter()
-        .filter_map(|((c, k), p)| {
-            (*k == PickerKind::Buffers && p.subscribed.is_some()).then_some(*c)
-        })
+        .filter_map(|((c, k), p)| (*k == PickerKind::Views && p.subscribed.is_some()).then_some(*c))
         .collect();
     let mut pushes = Vec::new();
     for client_id in client_ids {
-        let new_candidates = build_buffer_candidates(s, client_id);
+        let new_candidates = build_view_candidates(s, client_id);
         let ServerState {
             pickers,
             matcher,
             clients,
             ..
         } = &mut *s;
-        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::Buffers)) else {
+        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::Views)) else {
             continue;
         };
-        picker.candidates = picker_state::PickerCandidates::Buffers(new_candidates);
+        picker.candidates = picker_state::PickerCandidates::Views(new_candidates);
         picker.rerank(matcher);
         if let Some(window) = picker.subscribed.as_mut() {
             let total = picker.ranked.len() as u32;
@@ -333,7 +341,7 @@ pub(crate) fn refresh_buffer_pickers(s: &mut ServerState) -> PendingPushes {
 
 /// Rebuild and re-push every subscribed `Workspaces` picker. Called after a workspace is created,
 /// renamed, or deleted (by any client) so an open chooser elsewhere reflects the new set live.
-/// Mirrors [`refresh_buffer_pickers`]; the candidate list is a disk read, so callers must have
+/// Mirrors [`refresh_view_pickers`]; the candidate list is a disk read, so callers must have
 /// already written the config change before invoking this.
 pub(crate) fn refresh_workspace_pickers(s: &mut ServerState) -> PendingPushes {
     let client_ids: Vec<ClientId> = s
@@ -405,7 +413,7 @@ pub fn unpin_workspace_if_unused(s: &mut ServerState, workspace_id: &str) -> Pen
 
 /// Rebuild and re-push every subscribed `LspServers` picker. Called whenever a server's status
 /// changes (from `crate::lsp::manager`) so the open dialog's health glyphs update live — e.g.
-/// `◐ → ●` as a restart completes. Mirrors [`refresh_buffer_pickers`].
+/// `◐ → ●` as a restart completes. Mirrors [`refresh_view_pickers`].
 pub fn refresh_lsp_server_pickers(s: &mut ServerState) -> PendingPushes {
     let client_ids: Vec<ClientId> = s
         .pickers
@@ -506,7 +514,7 @@ pub(crate) fn picker_update_notif(params: PickerUpdateParams) -> Notification {
 /// Tell the *other* clients standing in `actor`'s context that its jumplist just changed, so any
 /// open Jumplist picker can re-view. Called after a capture or a clear.
 ///
-/// Unlike [`refresh_buffer_pickers`] this pushes no rows — see
+/// Unlike [`refresh_view_pickers`] this pushes no rows — see
 /// [`aether_protocol::jumplist::JumplistChanged`] for why a capture's change of *shape* has to go
 /// through `picker/view` rather than a `picker/update`. Scoped two ways: to clients in the same
 /// context (another context's picker lists its own list, untouched), and to those with the picker
@@ -557,7 +565,7 @@ pub fn maybe_refresh_dirty(
     if now_dirty == was_dirty {
         Vec::new()
     } else {
-        refresh_buffer_pickers(s)
+        refresh_view_pickers(s)
     }
 }
 
@@ -1092,7 +1100,7 @@ fn build_outline_candidates(
     vp: &crate::state::Viewport,
     text: &ropey::Rope,
 ) -> Vec<crate::picker::GitChangeCandidate> {
-    let view_buffer = vp.view_id.presenting_buffer();
+    let view_buffer = s.view_of(vp).presenting;
     crate::handlers::viewport::view_outline(s, vp)
         .into_iter()
         .enumerate()
@@ -1130,7 +1138,7 @@ fn build_outline_candidates(
             });
             crate::picker::GitChangeCandidate::for_patch(
                 crate::picker::PatchRowTarget {
-                    buffer: view_buffer,
+                    view: vp.view_id,
                     file,
                     durable,
                     line_of: vec![e.patch_line],
@@ -1147,7 +1155,7 @@ fn build_outline_candidates(
 }
 
 fn build_patch_change_candidates(
-    buffer_id: BufferId,
+    view_id: ViewId,
     generated: &crate::patch::GeneratedPatch,
     text: &ropey::Rope,
 ) -> Vec<crate::picker::GitChangeCandidate> {
@@ -1194,7 +1202,7 @@ fn build_patch_change_candidates(
             }
             out.push(crate::picker::GitChangeCandidate::for_patch(
                 crate::picker::PatchRowTarget {
-                    buffer: buffer_id,
+                    view: view_id,
                     // No viewport here, so no element to resolve against: this builder runs for a
                     // cursor that has not entered one.
                     file: None,
@@ -1414,15 +1422,16 @@ struct CursorCentering {
     /// Leading edge of the selection: the position "nearest candidate" is measured from.
     leading_edge: LogicalPosition,
     /// The buffer's absolute path — the jumplist keys entries by it, since its files can sit
-    /// outside every root. `None` for a scratch buffer, which `buffer_id` then identifies.
+    /// outside every root. `None` for a scratch, which `view_id` then identifies.
     abs_path: Option<String>,
     /// The view key, when the cursor sits in a materialised view — a commit's patch, the working
     /// changes. A jumplist entry captured from one matches on this rather than on the buffer id,
     /// which does not survive the view being closed and reopened.
     view_key: Option<String>,
-    /// The buffer itself — the jumplist's identity for a pathless (scratch) buffer, which can be
-    /// a captured target in its own right (`crate::jumplist::location_of`).
-    buffer_id: BufferId,
+    /// The view the client is in — the jumplist's identity for a pathless target (a scratch, a
+    /// patch's own text), which can be a captured target in its own right
+    /// (`crate::jumplist::location_of`). `None` when the buffer is gone.
+    view_id: Option<ViewId>,
     /// The revision this buffer *is*, for a `git/show` virtual buffer — the log picker's "where
     /// you are". `None` for an ordinary file buffer.
     revision: Option<String>,
@@ -1482,7 +1491,7 @@ fn re_view_build(kind: PickerKind) -> ReViewBuild {
         | PickerKind::GitStash
         | PickerKind::GitBaseline => ReViewBuild::Placeholder,
         // Cheap and live: re-reading them is the point, and a stale list would be the bug.
-        PickerKind::Buffers
+        PickerKind::Views
         | PickerKind::Explorer
         | PickerKind::Workspaces
         | PickerKind::LspServers
@@ -1498,12 +1507,12 @@ pub async fn picker_view(
     let client_id = ctx.client_id;
 
     // Build candidates outside the mutation phase. Files needs an async workspace walk;
-    // Buffers reads ServerState directly. Grep starts empty — the candidate set is generated
+    // Views reads ServerState directly. Grep starts empty — the candidate set is generated
     // on demand by `picker/query`'s spawned search. Explorer re-lists the requested directory
-    // (or the previously-listed one on resume) every call, like Buffers — directories change.
+    // (or the previously-listed one on resume) every call, like Views — directories change.
     // Per-kind active-workspace gating. Workspaces is allowed before activation — it's how the
     // user gets a workspace active in the first place — and Keybindings has no workspace-scoped
-    // data at all (the client ships its rows), so help works pre-activation too. Files / Buffers /
+    // data at all (the client ships its rows), so help works pre-activation too. Files / Views /
     // Grep / Explorer require an active workspace; their candidate builders all hit workspace-scoped
     // data and would error or return nothing without one.
     if !matches!(
@@ -1538,9 +1547,9 @@ pub async fn picker_view(
             let git_status = std::sync::Arc::new(build_file_git_status(&files, &roots));
             picker_state::PickerCandidates::Files { files, git_status }
         }
-        PickerKind::Buffers => {
+        PickerKind::Views => {
             let s = state.lock().await;
-            picker_state::PickerCandidates::Buffers(build_buffer_candidates(&s, client_id))
+            picker_state::PickerCandidates::Views(build_view_candidates(&s, client_id))
         }
         PickerKind::Grep => picker_state::PickerCandidates::Grep(Vec::new()),
         PickerKind::Explorer => {
@@ -1642,18 +1651,18 @@ pub async fn picker_view(
         PickerKind::DocumentSymbols => {
             // Needs the *viewport*, not just the view: an outline entry's line is a line of the
             // element's buffer, and only the viewport knows which buffer each element windows.
-            let outline = match params.view_id.map(|v| v.presenting_buffer()) {
-                Some(view_buffer) => {
+            let outline = match params.view_id {
+                Some(view_id) => {
                     let s = state.lock().await;
                     let vp = s
                         .viewports
                         .values()
-                        .find(|v| v.client_id == client_id && v.shows(s.view_of(v), view_buffer));
-                    vp.filter(|_| {
-                        s.try_doc_of(view_buffer)
-                            .is_some_and(|d| d.generated.is_some())
+                        .find(|v| v.client_id == client_id && v.view_id == view_id);
+                    vp.and_then(|v| {
+                        let doc = s.try_doc_of(s.view_of(v).presenting)?;
+                        doc.generated.as_ref()?;
+                        Some(build_outline_candidates(&s, v, &doc.text))
                     })
-                    .map(|v| build_outline_candidates(&s, v, &s.doc_of(view_buffer).text))
                 }
                 None => None,
             };
@@ -1746,9 +1755,9 @@ pub async fn picker_view(
                 Some(buffer_id) => {
                     let s = state.lock().await;
                     s.try_doc_of(buffer_id).and_then(|d| {
-                        d.generated
-                            .as_ref()
-                            .map(|g| build_patch_change_candidates(buffer_id, g, &d.text))
+                        let generated = d.generated.as_ref()?;
+                        let view = s.view_presenting(buffer_id)?;
+                        Some(build_patch_change_candidates(view, generated, &d.text))
                     })
                 }
                 None => None,
@@ -2008,7 +2017,7 @@ pub async fn picker_view(
                     leading_edge,
                     abs_path: current_abs,
                     view_key,
-                    buffer_id,
+                    view_id: here.as_ref().map(|h| h.view),
                     revision,
                     // Only meaningful for the outline, and only over a composed view; `None`
                     // everywhere else, which is what the centring arm below keys off.
@@ -2075,7 +2084,7 @@ pub async fn picker_view(
         std::collections::hash_map::Entry::Occupied(mut o) => {
             let p = o.get_mut();
             // Files: the workspace index returns the same `Arc` until a refresh — skip the
-            // rerank in that case. Buffers: the candidate set is fresh each call, always re-bind.
+            // rerank in that case. Views: the candidate set is fresh each call, always re-bind.
             // Grep: the persisted candidates *are* the prior search results — keep them on resume
             // (the caller passed an empty placeholder). Discard them only on `reset`, which was
             // handled by the `pickers.remove(&key)` call above. Explorer: fresh listing every call
@@ -2224,13 +2233,13 @@ pub async fn picker_view(
             (
                 Some(CursorCentering {
                     leading_edge,
-                    buffer_id,
+                    view_id: Some(view_id),
                     ..
                 }),
                 picker_state::PickerCandidates::GitChanges(c),
             ) if c
                 .first()
-                .is_some_and(|x| x.patch.as_ref().is_some_and(|p| p.buffer == *buffer_id)) =>
+                .is_some_and(|x| x.patch.as_ref().is_some_and(|p| p.view == *view_id)) =>
             {
                 find_nearest_patch_change(c, leading_edge.line)
                     .map(|idx| picker.candidates.make_item(idx, Vec::new()))
@@ -2258,7 +2267,7 @@ pub async fn picker_view(
                 Some(CursorCentering {
                     leading_edge,
                     abs_path,
-                    buffer_id,
+                    view_id: Some(view_id),
                     view_key,
                     ..
                 }),
@@ -2266,7 +2275,7 @@ pub async fn picker_view(
             ) if !entries.is_empty() => {
                 let location = crate::jumplist::location_of(
                     abs_path.as_deref(),
-                    *buffer_id,
+                    *view_id,
                     view_key.as_deref(),
                 );
                 let idx = crate::jumplist::nearest_index(entries, location, *leading_edge);
@@ -2736,14 +2745,14 @@ enum Landing {
     /// In the view: which element, and where in its buffer. `open` is the view itself, reopened,
     /// when nothing was showing it — the client adopts it before seating.
     Seated {
-        open: Option<BufferOpenResult>,
+        open: Option<ViewOpenResult>,
         seat: aether_protocol::viewport::ViewSeat,
         position: LogicalPosition,
     },
     /// The view was reached — on screen, or reopened (`open`) — and no longer holds the entry:
     /// the change was staged, committed or reverted since the capture. Nowhere to land, and
     /// nowhere else to go: the entry is a place *in that view*.
-    Gone { open: Option<BufferOpenResult> },
+    Gone { open: Option<ViewOpenResult> },
     /// Not on screen and not to be reopened here.
     NoView,
 }
@@ -2812,7 +2821,7 @@ async fn land_in_captured_view(
 /// why an entry stores a key and a file and never an element id.
 fn seat_in_reopened(
     s: &ServerState,
-    mut opened: BufferOpenResult,
+    mut opened: ViewOpenResult,
     identity: &str,
     line: u32,
 ) -> Landing {
@@ -2968,7 +2977,7 @@ pub async fn picker_set_group(
     Ok(PickerSetGroupResult { run })
 }
 
-/// The `buffer/open` params that jump to a captured results entry: transient, cursor landing
+/// The `view/open` params that jump to a captured results entry: transient, cursor landing
 /// exactly as selecting the source row would (`jump_to` + `jump_to_anchor`), origin recorded on
 /// nav history. Entries missing workspace-relative parts (references into dependency sources)
 /// get them re-derived from the active workspace, falling back to an absolute-path (external
@@ -2978,12 +2987,12 @@ fn jumplist_open_params(
     client_id: ClientId,
     entry: &crate::jumplist::JumplistEntry,
     origin: BufferId,
-) -> BufferOpenParams {
-    // A pathless entry (a captured scratch buffer) attaches by id, exactly as the Buffers
-    // picker's own select does — there is no path to route through the workspace.
+) -> ViewOpenParams {
+    // A pathless entry (a captured scratch) names its view, exactly as the picker's own select
+    // does — there is no path to route through the workspace.
     let Some(abs_path) = entry.abs_path() else {
-        return BufferOpenParams {
-            buffer_id: entry.target.buffer_id(),
+        return ViewOpenParams {
+            view_id: entry.target.view_id(),
             record_nav_from: Some(origin),
             ..Default::default()
         };
@@ -3004,13 +3013,13 @@ fn jumplist_open_params(
         }
     }
     let absolute_path = relative_path.is_none().then(|| abs_path.to_string());
-    BufferOpenParams {
+    ViewOpenParams {
         path_index,
         relative_path,
         absolute_path,
         // `None` for a whole-target entry: the open then restores the cursor (and scroll) this
         // client last had in that buffer, or the top of the file if it has never opened it —
-        // which is precisely what selecting the row in the Files/Buffers picker does.
+        // which is precisely what selecting the row in the Files/view picker does.
         jump_to: entry.position,
         jump_to_anchor: entry.anchor,
         transient: Some(true),
@@ -3053,10 +3062,10 @@ pub async fn jumplist_capture(
     } as u32;
     // The view these rows are rows *of*, taken while it is still open — every patch row names it,
     // and they all name the same one. Read before the capture, which ends the picker borrow.
-    let patch_view = match &picker.candidates {
+    let patch_buffer = match &picker.candidates {
         crate::picker::PickerCandidates::GitChanges(v) => v
             .iter()
-            .find_map(|c| c.patch.as_ref().map(|p| aether_protocol::ViewId(p.buffer))),
+            .find_map(|c| s.try_presenting_buffer(c.patch.as_ref()?.view)),
         _ => None,
     };
     let Some((mut list, candidate_indices)) = crate::jumplist::capture(picker, &mut s.matcher)
@@ -3070,18 +3079,22 @@ pub async fn jumplist_capture(
     // on the step, which is what "the jumplist stops working once you look at something else" was).
     //
     // So give any entry whose buffer has a path the path instead. This restores the invariant the
-    // rest of the jumplist already keeps — a `Buffer` target means *pathless* (the Buffers picker
+    // rest of the jumplist already keeps — a `Buffer` target means *pathless* (the view picker
     // captures pathed rows as `File` for exactly this reason) — which is also what `location_of`
     // assumes when it decides how the current buffer identifies itself.
     // The view each row came from, named durably. Taken from the picker's own view rather than the
     // rows: every row of a patch picker is a row *of that view*.
-    let view_key = patch_view.and_then(|v| crate::handlers::viewport::view_key_of(s, v));
+    let view_key = patch_buffer.and_then(|b| crate::handlers::viewport::buffer_view_key(s, b));
     for entry in &mut list.entries {
         // Every row of a patch picker is a row of that view, whatever it addresses.
         if view_key.is_some() {
             entry.view = view_key.clone();
         }
-        let Some(buffer_id) = entry.target.buffer_id() else {
+        let Some(buffer_id) = entry
+            .target
+            .view_id()
+            .and_then(|view| s.try_presenting_buffer(view))
+        else {
             continue;
         };
         let doc = s.try_doc_of(buffer_id);
@@ -3266,7 +3279,7 @@ pub async fn jumplist_step(
     // in one already on screen, but conjures nothing back.
     let Some((view_key, identity, line)) = landing else {
         if let Some(open_params) = open_params {
-            target.opened = Some(buffer_open(state, ctx, open_params).await?);
+            target.opened = Some(view_open(state, ctx, open_params).await?);
         }
         return Ok(JumplistStepResult::Moved(Box::new(target)));
     };
@@ -3284,7 +3297,7 @@ pub async fn jumplist_step(
     // step is cursor-relative, and a landing that moved nothing leaves the next press choosing the
     // same entry again. The view is reached once; the entries after it are looked up in it directly.
     let mut skipped = 0u32;
-    let mut reopened: Option<BufferOpenResult> = None;
+    let mut reopened: Option<ViewOpenResult> = None;
     let mut idx = idx;
     loop {
         match landing {
@@ -3369,7 +3382,7 @@ pub async fn jumplist_step(
                         });
                         drop(s);
                         if let Some(open_params) = open_params {
-                            target.opened = Some(buffer_open(state, ctx, open_params).await?);
+                            target.opened = Some(view_open(state, ctx, open_params).await?);
                         }
                         target.skipped = skipped;
                         return Ok(JumplistStepResult::Moved(Box::new(target)));
@@ -3393,13 +3406,18 @@ pub fn step_location(
         .get(&(client_id, buffer_id))
         .copied()
         .unwrap_or_default();
+    // A buffer with no view yet — an open decorating its cursor before its view is made — has no
+    // pathless identity; `ViewId(0)` is never minted, so no entry matches it.
+    let view =
+        crate::handlers::viewport::client_view_of(s, client_id, buffer_id).unwrap_or_default();
     let plain = crate::jumplist::StepLocation {
         path: doc
             .canonical_path
             .as_deref()
             .map(|p| p.to_string_lossy().into_owned()),
+        view,
         buffer: buffer_id,
-        view_key: crate::handlers::viewport::view_key_of(s, ViewId(buffer_id)),
+        view_key: crate::handlers::viewport::buffer_view_key(s, buffer_id),
         cursor,
         translated: false,
     };
@@ -3438,6 +3456,7 @@ pub fn step_location(
     };
     Some(crate::jumplist::StepLocation {
         path,
+        view,
         buffer: buffer_id,
         view_key,
         cursor: CursorState {
@@ -3460,7 +3479,7 @@ fn step_plan(
     idx: usize,
 ) -> (
     JumplistStepTarget,
-    Option<BufferOpenParams>,
+    Option<ViewOpenParams>,
     Option<(String, String, u32)>,
 ) {
     let list = s.jumplist(client_id).expect("a captured list");
@@ -3475,7 +3494,7 @@ fn step_plan(
     };
     let target = JumplistStepTarget {
         path: entry.abs_path().map(str::to_string),
-        buffer_id: entry.target.buffer_id(),
+        view_id: entry.target.view_id(),
         position: entry.position,
         anchor: entry.anchor,
         index: idx as u32 + 1,

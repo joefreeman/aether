@@ -110,14 +110,14 @@ pub fn sections(info: Option<&AppInfo>, conn: &ConnState) -> Vec<InfoSection> {
     ));
     instance.push(InfoRow::new("Clients", info.clients.to_string()));
     instance.push(InfoRow::new(
-        "Buffers",
-        if info.buffers_unsaved > 0 {
+        "Views",
+        if info.documents_unsaved > 0 {
             format!(
                 "{} open, {} unsaved",
-                info.buffers_open, info.buffers_unsaved
+                info.views_open, info.documents_unsaved
             )
         } else {
-            format!("{} open", info.buffers_open)
+            format!("{} open", info.views_open)
         },
     ));
     instance.push(InfoRow::new(
@@ -328,8 +328,8 @@ mod tests {
             uptime_secs: 3 * 3600 + 12 * 60,
             idle_timeout_secs: None,
             clients: 2,
-            buffers_open: 5,
-            buffers_unsaved: 1,
+            views_open: 5,
+            documents_unsaved: 1,
             workspaces_active: 3,
             git_version: Some("git version 2.43.0".into()),
             paths: AppPaths {
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(value(&s, "Profile").as_deref(), Some("default"));
         assert_eq!(value(&s, "Port").as_deref(), Some("2384"));
         assert_eq!(value(&s, "Uptime").as_deref(), Some("3h 12m"));
-        assert_eq!(value(&s, "Buffers").as_deref(), Some("5 open, 1 unsaved"));
+        assert_eq!(value(&s, "Views").as_deref(), Some("5 open, 1 unsaved"));
         assert_eq!(value(&s, "Git").as_deref(), Some("git version 2.43.0"));
     }
 

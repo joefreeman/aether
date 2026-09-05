@@ -12,10 +12,7 @@ use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::{ClientSession, SharedState};
 use aether_protocol::app::AppInfoGet;
-use aether_protocol::buffer::{
-    BufferClose, BufferContent, BufferCopy, BufferCut, BufferOpen, BufferReload, BufferSave,
-    BufferSetTransient,
-};
+use aether_protocol::buffer::{BufferContent, BufferCopy, BufferCut, BufferReload, BufferSave};
 use aether_protocol::cursor::{
     CursorMove, CursorRedo, CursorSelectAll, CursorSelectLine, CursorSelectWord, CursorSet,
     CursorSwapAnchor, CursorTreeSelect, CursorUndo,
@@ -52,6 +49,7 @@ use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::syntax::SyntaxHighlightSnippet;
+use aether_protocol::view::{ViewClose, ViewOpen, ViewSetTransient};
 use aether_protocol::viewport::{
     ViewSave, ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportSetWrap,
     ViewportSubscribe, ViewportWindow, ViewportWindowAtCursor,
@@ -307,7 +305,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
             .flat_map(|v| v.shown_buffers(s.view_of(v)))
             .collect();
         s.drop_viewports_for_client(client_id);
-        let (closed, _stopped) = s.close_orphaned_transients(viewed);
+        let (closed, _stopped, _closed_views) = s.close_orphaned_transients(viewed);
         s.drop_cursors_for_client(client_id);
         s.drop_motion_history_for_client(client_id);
         s.drop_virtual_col_for_client(client_id);
@@ -323,12 +321,12 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
             .as_deref()
             .is_some_and(|pid| s.prune_ephemeral_if_empty(pid));
         tracing::info!(%client_id, "client disconnected");
-        // Other clients' buffer pickers should drop the closed transients from their lists; a
+        // Other clients' view pickers should drop the closed transients from their lists; a
         // retired ephemeral workspace drops out of any open switcher.
         let mut pushes = if closed.is_empty() {
             Vec::new()
         } else {
-            crate::handlers::refresh_buffer_pickers(&mut s)
+            crate::handlers::refresh_view_pickers(&mut s)
         };
         if pruned_ephemeral {
             pushes.extend(crate::handlers::refresh_workspace_pickers(&mut s));
@@ -485,11 +483,11 @@ async fn dispatch(
         WorkspaceRename::NAME => run!(WorkspaceRename, handlers::workspace_rename),
         WorkspaceDelete::NAME => run!(WorkspaceDelete, handlers::workspace_delete),
         PathDelete::NAME => run!(PathDelete, handlers::path_delete),
-        BufferOpen::NAME => run!(BufferOpen, handlers::buffer_open),
+        ViewOpen::NAME => run!(ViewOpen, handlers::view_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
         BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),
-        BufferSetTransient::NAME => run!(BufferSetTransient, handlers::buffer_set_transient),
-        BufferClose::NAME => run!(BufferClose, handlers::buffer_close),
+        ViewSetTransient::NAME => run!(ViewSetTransient, handlers::view_set_transient),
+        ViewClose::NAME => run!(ViewClose, handlers::view_close),
         BufferContent::NAME => run!(BufferContent, handlers::buffer_content),
         SyntaxHighlightSnippet::NAME => {
             run!(SyntaxHighlightSnippet, handlers::syntax_highlight_snippet)

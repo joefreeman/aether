@@ -23,9 +23,9 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
         .unwrap()
         .to_path_buf();
     std::fs::write(root.join("preview.rs"), "alpha\n").unwrap();
-    let preview_open: BufferOpenResult = send_request::<BufferOpen>(
+    let preview_open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: Some(true),
             path_index: Some(0),
             relative_path: Some("preview.rs".into()),
@@ -38,7 +38,7 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(preview),
+            view_id: view_of(preview),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -52,7 +52,6 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -69,11 +68,10 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
         },
     )
     .await;
-    let other: BufferOpenResult = send_request::<BufferOpen>(
+    let other: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -86,7 +84,7 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(other.buffer_id),
+            view_id: other.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -100,16 +98,15 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
 
     // Still there, and still holding the edit: asking for its state answers rather than erroring.
-    let state: BufferOpenResult = send_request::<BufferOpen>(
+    let state: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
-            buffer_id: Some(preview),
+        &ViewOpenParams {
+            view_id: Some(view_of(preview)),
             ..Default::default()
         },
     )
@@ -163,7 +160,7 @@ async fn saving_an_ordinary_view_writes_its_one_document() {
     let saved: ViewSaveResult = send_request::<ViewSave>(
         &mut ws,
         &ViewSaveParams {
-            view_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             overwrite: false,
         },
     )
@@ -179,7 +176,7 @@ async fn saving_an_ordinary_view_writes_its_one_document() {
     let again: ViewSaveResult = send_request::<ViewSave>(
         &mut ws,
         &ViewSaveParams {
-            view_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             overwrite: false,
         },
     )
@@ -212,11 +209,10 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     )
     .await;
 
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -229,7 +225,7 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(scratch.buffer_id),
+            view_id: scratch.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -243,7 +239,6 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -276,11 +271,11 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
     assert_eq!(on_disk, "hello world\n");
 
     // Dirty cleared. Reopen the buffer by id to check its post-save state.
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: Some(scratch.buffer_id),
+            view_id: Some(scratch.view_id),
             path_index: None,
             relative_path: None,
             language: None,
@@ -323,11 +318,10 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
     )
     .await;
 
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -370,11 +364,11 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
     );
 
     // Reopen by id and confirm the buffer's path is under root B.
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: Some(scratch.buffer_id),
+            view_id: Some(scratch.view_id),
             path_index: None,
             relative_path: None,
             language: None,
@@ -399,7 +393,7 @@ async fn save_as_to_non_zero_root_writes_under_that_root() {
     drop(server);
 }
 
-/// Regression: `buffer/open { create_if_missing: true }` used to canonicalize the parent dir,
+/// Regression: `view/open { create_if_missing: true }` used to canonicalize the parent dir,
 /// which fails when the parent itself doesn't exist. With a multi-segment path like
 /// `foo/bar.rs` and no pre-existing `foo/`, that crashed the client. The fix is to use
 /// `canonicalize_partial` so the boundary check works against a not-fully-existing path; the
@@ -422,11 +416,10 @@ async fn buffer_open_create_if_missing_handles_missing_parent_dirs() {
     )
     .await;
     // Open with a path whose parent (`foo/`) doesn't exist yet.
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("foo/bar.rs".into()),
             language: None,
@@ -498,11 +491,10 @@ async fn save_as_creates_missing_parent_directories() {
         },
     )
     .await;
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -571,11 +563,10 @@ async fn save_as_does_not_create_dirs_outside_workspace() {
         },
     )
     .await;
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -630,11 +621,10 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
     .await;
 
     // Open the existing file (now claimed by buffer A).
-    let _: BufferOpenResult = send_request::<BufferOpen>(
+    let _: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("existing.txt".into()),
             language: None,
@@ -645,11 +635,10 @@ async fn save_as_rejects_path_conflict_with_open_buffer() {
     )
     .await;
     // Open a fresh scratch (buffer B).
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -700,11 +689,10 @@ async fn save_as_to_same_path_is_in_place_save() {
         },
     )
     .await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("doc.txt".into()),
             language: None,
@@ -717,7 +705,7 @@ async fn save_as_to_same_path_is_in_place_save() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -731,7 +719,6 @@ async fn save_as_to_same_path_is_in_place_save() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -785,11 +772,10 @@ async fn save_as_rejects_existing_file_without_overwrite() {
     .await;
 
     // Scratch buffer with some content.
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -802,7 +788,7 @@ async fn save_as_rejects_existing_file_without_overwrite() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(scratch.buffer_id),
+            view_id: scratch.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -816,7 +802,6 @@ async fn save_as_rejects_existing_file_without_overwrite() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -892,11 +877,10 @@ async fn in_place_save_never_triggers_overwrite_check() {
         },
     )
     .await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("file.txt".into()),
             language: None,
@@ -909,7 +893,7 @@ async fn in_place_save_never_triggers_overwrite_check() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -923,7 +907,6 @@ async fn in_place_save_never_triggers_overwrite_check() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -983,11 +966,10 @@ async fn in_place_save_after_save_as_targets_new_path() {
         },
     )
     .await;
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -1000,7 +982,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(scratch.buffer_id),
+            view_id: scratch.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1014,7 +996,6 @@ async fn in_place_save_after_save_as_targets_new_path() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1068,7 +1049,7 @@ async fn in_place_save_after_save_as_targets_new_path() {
     drop(server);
 }
 
-// -------- buffer/close ---------------------------------------------------------------------------
+// -------- view/close ---------------------------------------------------------------------------
 
 /// Closing a buffer drops it from the server. After close, opening by id fails.
 #[tokio::test]
@@ -1088,11 +1069,10 @@ async fn buffer_close_drops_buffer() {
         },
     )
     .await;
-    let a: BufferOpenResult = send_request::<BufferOpen>(
+    let a: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -1102,11 +1082,10 @@ async fn buffer_close_drops_buffer() {
         },
     )
     .await;
-    let b: BufferOpenResult = send_request::<BufferOpen>(
+    let b: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("b.txt".into()),
             language: None,
@@ -1117,21 +1096,21 @@ async fn buffer_close_drops_buffer() {
     )
     .await;
     // MRU is [b, a]; closing b should return next = a.
-    let r: BufferCloseResult = send_request::<BufferClose>(
+    let r: ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(b.buffer_id),
+        &ViewCloseParams {
+            view_id: b.view_id,
             open_next: false,
         },
     )
     .await;
-    assert_eq!(r.next_buffer_id, Some(a.buffer_id));
+    assert_eq!(r.next_view_id, Some(a.view_id));
     // Trying to attach to the closed buffer is an error.
-    let err = send_request_expect_err::<BufferOpen>(
+    let err = send_request_expect_err::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: Some(b.buffer_id),
+            view_id: Some(b.view_id),
             path_index: None,
             relative_path: None,
             language: None,
@@ -1142,14 +1121,14 @@ async fn buffer_close_drops_buffer() {
     )
     .await;
     assert!(
-        err.contains("unknown buffer_id"),
-        "expected buffer-not-found, got: {err}"
+        err.contains("unknown view_id"),
+        "expected view-not-found, got: {err}"
     );
 
     drop(server);
 }
 
-/// Closing the last buffer returns `next_buffer_id: None` so the client knows to spawn a
+/// Closing the last buffer returns `next_view_id: None` so the client knows to spawn a
 /// scratch.
 #[tokio::test]
 async fn buffer_close_last_buffer_returns_none() {
@@ -1167,11 +1146,10 @@ async fn buffer_close_last_buffer_returns_none() {
         },
     )
     .await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("only.txt".into()),
             language: None,
@@ -1181,15 +1159,15 @@ async fn buffer_close_last_buffer_returns_none() {
         },
     )
     .await;
-    let r: BufferCloseResult = send_request::<BufferClose>(
+    let r: ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+        &ViewCloseParams {
+            view_id: opened.view_id,
             open_next: false,
         },
     )
     .await;
-    assert_eq!(r.next_buffer_id, None);
+    assert_eq!(r.next_view_id, None);
 
     drop(server);
 }
@@ -1212,11 +1190,10 @@ async fn buffer_close_drops_viewports() {
         },
     )
     .await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -1229,7 +1206,7 @@ async fn buffer_close_drops_viewports() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1243,14 +1220,13 @@ async fn buffer_close_drops_viewports() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
-    let _: BufferCloseResult = send_request::<BufferClose>(
+    let _: ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+        &ViewCloseParams {
+            view_id: opened.view_id,
             open_next: false,
         },
     )
@@ -1304,11 +1280,10 @@ async fn setup_watched_buffer(
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("watched.txt".into()),
             language: None,
@@ -1321,7 +1296,7 @@ async fn setup_watched_buffer(
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1335,7 +1310,6 @@ async fn setup_watched_buffer(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1373,7 +1347,7 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 5,
@@ -1387,7 +1361,6 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1466,7 +1439,7 @@ async fn subscribe_with_scroll_past_eof_returns_non_empty_window() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1480,7 +1453,6 @@ async fn subscribe_with_scroll_past_eof_returns_non_empty_window() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1612,7 +1584,7 @@ async fn watcher_flags_deleted_file() {
 async fn watcher_covers_open_buffer_inside_gitignored_dir() {
     // Workspace-root watch registration is gitignore-aware (it skips e.g. `target/`), but a
     // buffer the user opens *inside* an ignored tree still gets external-change events via the
-    // targeted parent-dir watch `buffer/open` adds. Regression guard for the per-directory
+    // targeted parent-dir watch `view/open` adds. Regression guard for the per-directory
     // watcher scheme — under the old recursive watch this coverage was implicit.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -1636,9 +1608,9 @@ async fn watcher_covers_open_buffer_inside_gitignored_dir() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("generated/out.txt".into()),
             ..Default::default()
@@ -1648,7 +1620,7 @@ async fn watcher_covers_open_buffer_inside_gitignored_dir() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1662,7 +1634,6 @@ async fn watcher_covers_open_buffer_inside_gitignored_dir() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1693,11 +1664,10 @@ async fn connect_and_open_watched(ws_url: &str, workspace: &str) -> (Ws, u64) {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("watched.txt".into()),
             language: None,
@@ -1710,7 +1680,7 @@ async fn connect_and_open_watched(ws_url: &str, workspace: &str) -> (Ws, u64) {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1724,7 +1694,6 @@ async fn connect_and_open_watched(ws_url: &str, workspace: &str) -> (Ws, u64) {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2046,10 +2015,10 @@ async fn close_in_one_workspace_keeps_shared_document_alive() {
         },
     )
     .await;
-    let _: BufferCloseResult = send_request::<BufferClose>(
+    let _: ViewCloseResult = send_request::<ViewClose>(
         &mut ws_a,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(buf_a),
+        &ViewCloseParams {
+            view_id: view_of(buf_a),
             open_next: false,
         },
     )
@@ -2197,9 +2166,9 @@ async fn ephemeral_file_edits_survive_restart_via_path_keyed_backup() {
         },
     )
     .await;
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("tethered.txt".into()),
             ..Default::default()
@@ -2664,7 +2633,7 @@ async fn open_path_joins_the_temporary_workspace_already_rooted_at_the_directory
     drop(server);
 }
 
-/// `ae /etc/hosts:42` — the jump rides through to the delegated `buffer/open`, which clamps it.
+/// `ae /etc/hosts:42` — the jump rides through to the delegated `view/open`, which clamps it.
 /// Before, an external open dropped the position and landed at the top of the file.
 #[tokio::test]
 async fn open_path_lands_on_the_requested_position() {
@@ -2778,7 +2747,7 @@ async fn open_path_rejects_a_directory_in_a_persisted_workspace() {
 
 /// `ae path/to/new-file` outside any workspace: the open-from-path route accepts a missing path
 /// when `create_if_missing` is set — an empty buffer bound to the canonical target, with nothing
-/// on disk until the first save (explorer-create semantics, delegated to `buffer/open`).
+/// on disk until the first save (explorer-create semantics, delegated to `view/open`).
 #[tokio::test]
 async fn open_path_create_if_missing_binds_a_buffer_saved_on_write() {
     let (server, mut ws, ext_abs) = setup_with_external_file().await;
@@ -2945,10 +2914,10 @@ async fn ephemeral_workspace_shows_in_switcher_then_auto_removed() {
         },
     )
     .await;
-    let _close: BufferCloseResult = send_request::<BufferClose>(
+    let _close: ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+        &ViewCloseParams {
+            view_id: view_of(buffer_id),
             open_next: false,
         },
     )
@@ -3001,10 +2970,10 @@ async fn closing_last_buffer_retires_ephemeral_even_with_a_second_client() {
     // A closes the shared, only buffer. The context has no files left, so it's retired outright —
     // B is evicted from it and it drops out of the switcher (rather than lingering / re-opening
     // onto a scratch).
-    let _close: BufferCloseResult = send_request::<BufferClose>(
+    let _close: ViewCloseResult = send_request::<ViewClose>(
         &mut ws_a,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+        &ViewCloseParams {
+            view_id: view_of(buffer_id),
             open_next: false,
         },
     )
@@ -3345,9 +3314,9 @@ async fn a_temporary_workspace_gets_no_language_server() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws2,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("inside.rs".into()),
             ..Default::default()
@@ -3446,9 +3415,9 @@ async fn unsaved_file_edits_restored_across_restart() {
             },
         )
         .await;
-        let open: BufferOpenResult = send_request::<BufferOpen>(
+        let open: ViewOpenResult = send_request::<ViewOpen>(
             &mut ws,
-            &BufferOpenParams {
+            &ViewOpenParams {
                 path_index: Some(0),
                 relative_path: Some("a.rs".into()),
                 ..Default::default()
@@ -3495,9 +3464,9 @@ async fn unsaved_file_edits_restored_across_restart() {
         },
     )
     .await;
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -3546,9 +3515,9 @@ async fn unsaved_count_survives_a_restart_before_the_workspace_is_activated() {
             },
         )
         .await;
-        let open: BufferOpenResult = send_request::<BufferOpen>(
+        let open: ViewOpenResult = send_request::<ViewOpen>(
             &mut ws,
-            &BufferOpenParams {
+            &ViewOpenParams {
                 path_index: Some(0),
                 relative_path: Some("a.rs".into()),
                 ..Default::default()
@@ -3600,9 +3569,9 @@ async fn unsaved_count_survives_a_restart_before_the_workspace_is_activated() {
         },
     )
     .await;
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -3657,9 +3626,9 @@ async fn restore_flags_externally_modified_when_disk_changed() {
             },
         )
         .await;
-        let open: BufferOpenResult = send_request::<BufferOpen>(
+        let open: ViewOpenResult = send_request::<ViewOpen>(
             &mut ws,
-            &BufferOpenParams {
+            &ViewOpenParams {
                 path_index: Some(0),
                 relative_path: Some("a.rs".into()),
                 ..Default::default()
@@ -3709,9 +3678,9 @@ async fn restore_flags_externally_modified_when_disk_changed() {
         },
     )
     .await;
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -3722,7 +3691,7 @@ async fn restore_flags_externally_modified_when_disk_changed() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(reopen.buffer_id),
+            view_id: reopen.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -3736,7 +3705,6 @@ async fn restore_flags_externally_modified_when_disk_changed() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3775,9 +3743,9 @@ async fn saving_clears_the_backup() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -3836,11 +3804,11 @@ async fn saving_clears_the_backup() {
 }
 
 /// The `/status` HTTP endpoint reports the live server snapshot that `ae server status` prints:
-/// connected clients, open/unsaved buffer counts, the build version, and (for a test server) the
+/// connected clients, open views, unsaved documents, the build version, and (for a test server) the
 /// persistent no-idle-timeout mode. The fetch runs on a blocking thread so the current-thread test
 /// runtime is free to service the server task while the synchronous GET is in flight.
 #[tokio::test]
-async fn status_endpoint_reports_clients_and_unsaved_buffers() {
+async fn status_endpoint_reports_clients_and_unsaved_documents() {
     let (server, mut ws, buffer_id) = setup_with_buffer("hello\n").await;
     let port = server.port;
 
@@ -3851,8 +3819,8 @@ async fn status_endpoint_reports_clients_and_unsaved_buffers() {
         .unwrap();
     assert_eq!(before.version, aether_protocol::PROTOCOL_VERSION);
     assert_eq!(before.clients, 1);
-    assert_eq!(before.buffers_open, 1);
-    assert_eq!(before.buffers_unsaved, 0);
+    assert_eq!(before.views_open, 1);
+    assert_eq!(before.documents_unsaved, 0);
     assert_eq!(before.workspaces_active, 1);
     assert_eq!(
         before.idle_timeout_secs, None,
@@ -3876,8 +3844,8 @@ async fn status_endpoint_reports_clients_and_unsaved_buffers() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(after.buffers_open, 1);
-    assert_eq!(after.buffers_unsaved, 1);
+    assert_eq!(after.views_open, 1);
+    assert_eq!(after.documents_unsaved, 1);
 
     drop(server);
 }
@@ -3904,8 +3872,8 @@ async fn app_info_matches_the_status_endpoint() {
         "the bound (ephemeral) port, not the one profile.toml recorded"
     );
     assert_eq!(info.clients, 1);
-    assert_eq!(info.buffers_open, 1);
-    assert_eq!(info.buffers_unsaved, 0);
+    assert_eq!(info.views_open, 1);
+    assert_eq!(info.documents_unsaved, 0);
     assert_eq!(info.workspaces_active, 1);
     assert_eq!(
         info.idle_timeout_secs, None,
@@ -4295,11 +4263,10 @@ async fn setup_delete_workspace() -> (aether_server::ServerHandle, Ws, std::path
 }
 
 async fn open_named(ws: &mut Ws, relative: &str) -> u64 {
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some(relative.into()),
             language: None,
@@ -4331,9 +4298,9 @@ async fn path_delete_trashes_a_file_and_closes_its_buffer() {
     assert!(root.join("keep.txt").exists(), "its neighbour is untouched");
     assert_eq!(res.closed_buffer_ids, vec![doomed]);
     assert_ne!(
-        res.next_buffer_id,
-        Some(doomed),
-        "never hand back the buffer that was just closed"
+        res.next_view_id,
+        Some(view_of(doomed)),
+        "never hand back the view that was just closed"
     );
     // The surviving buffer is still usable.
     let content: BufferContentResult =

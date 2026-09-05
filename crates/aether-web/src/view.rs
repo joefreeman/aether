@@ -54,7 +54,7 @@ pub fn build_view(s: &Session) -> Value {
         "wrap": jv(&s.wrap),
         "diff_view": s.diff_view,
         "ligatures": s.ligatures,
-        "buffer_font_size": s.buffer_font_size,
+        "editor_font_size": s.editor_font_size,
         "ui_font_size": s.ui_font_size,
         // The reading view's column width, in ems of the reading size (the core's shared measure
         // table) — the shell stamps it as `--md-measure`. `null` is the full-width setting: no cap.
@@ -249,7 +249,7 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 // from item fields.
                 "groups": p.groups.iter().map(jv).collect::<Vec<_>>(),
                 // Whether this view is collapsible groups. A property of the view, not the
-                // kind — a Jumplist captured from the Files or Buffers picker renders flat — so the
+                // kind — a Jumplist captured from the Files or view picker renders flat — so the
                 // shell reads this rather than keeping its own list of collapsible kinds.
                 "collapsible": p.collapsible,
                 "total_matches": p.total_matches,
@@ -465,7 +465,6 @@ fn buffer(s: &Session) -> Value {
         "language": b.language,
         "revision": b.revision,
         "saved_revision": b.saved_revision,
-        "transient": b.transient,
         "cursor": jv(&b.cursor),
         // The buffer's restored scroll (server-provided; positions a fresh subscribe). The shell
         // reads this each subscribe so a jump always loads the window around its target.

@@ -440,10 +440,9 @@ impl RpcMethod for ViewportSubscribe {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ViewportSubscribeParams {
-    /// The **view** to show. Named `buffer_id` on the wire for compatibility, but it is a view
-    /// identity: for a patch this is the generated document, which no element windows and which
-    /// nothing edits. `ViewId` is `#[serde(transparent)]`, so the wire shape is unchanged.
-    pub buffer_id: crate::ViewId,
+    /// The **view** to show — what `view/open` answered with. For a patch that is the generated
+    /// document's view, which no element windows and which nothing edits.
+    pub view_id: crate::ViewId,
     pub cols: u32,
     pub rows: u32,
     pub overscan_rows: u32,
@@ -470,13 +469,6 @@ pub struct ViewportSubscribeParams {
     /// here and the first frame is correct without a follow-up `git/set_diff_view`. Defaults off.
     #[serde(default)]
     pub diff_view: bool,
-    /// Present the view as this kind — the editor over the file's source, or the reader over the
-    /// document it describes. `None` leaves the choice to the server: the kind the file was last
-    /// presented as, else the app setting. A client sends `Some` only when its route decides —
-    /// a jump to a `line:col` lands in the editor, a followed `#anchor` in the reader, and
-    /// `Space v` asks for the other one. Ignored for a view a driver built.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<crate::ui::ViewKind>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -662,7 +654,7 @@ pub struct ViewportFocusElementResult {
     /// A client given only an id would have to keep the old buffer's label beside the new one's
     /// text. It is deliberately the same shape an open returns, so the client rebinds through the
     /// path it already has.
-    pub buffer: crate::buffer::BufferOpenResult,
+    pub buffer: crate::view::ViewOpenResult,
     /// The same buffer-level snapshot [`ViewportSubscribe`] seeds, for the buffer focus just landed
     /// in — breadcrumb, diagnostic counts, language-server health, external-change flags.
     ///

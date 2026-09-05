@@ -30,7 +30,7 @@ use aether_protocol::viewport::{
 
 use crate::syntax::{InjectionLayer, LanguageConfig};
 
-/// Largest blob to parse for highlighting, matching the threshold `buffer/open` defers a parse at.
+/// Largest blob to parse for highlighting, matching the threshold `view/open` defers a parse at.
 /// Past it the file's lines render unhighlighted rather than stalling the whole patch.
 const MAX_HIGHLIGHT_BLOB_BYTES: usize = 128 * 1024;
 /// Most files in one patch to parse. A sweeping commit is a legitimate thing to look at, and it

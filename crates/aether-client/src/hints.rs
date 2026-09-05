@@ -77,8 +77,8 @@ pub enum ContextId {
 /// this is not a mirror of the picker vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerCmd {
-    /// `Ctrl-d` in the Buffers picker.
-    CloseBuffer,
+    /// `Ctrl-d` in the view picker.
+    CloseView,
     /// `Alt-p` in the path-filterable pickers (Files/Grep/…).
     AddPathScope,
     /// `Alt-j` / `Alt-k` in any picker — move the highlight.
@@ -109,7 +109,7 @@ pub struct HintFacts {
     /// picker is the mandatory chooser: its Esc *exits* rather than closing the picker, so the
     /// picker-dismiss hint would mislead there and is suppressed.
     pub mandatory_chooser: bool,
-    /// The current buffer is markdown — gates the `reader` entry-point hint (`Space v` teaches
+    /// The current buffer is markdown — gates the `reader` entry-point hint (`Space u` teaches
     /// nothing on a buffer the reading view refuses).
     pub markdown_buffer: bool,
     /// The reading view's focused block contains interactive elements (links, footnote refs,
@@ -206,16 +206,16 @@ pub static CURRICULUM: &[HintDef] = &[
     // ---- tier 1: files & saving ----
     HintDef { id: "save", tier: 1, contexts: &[C::Normal], keys: "Space s",
         trigger: Trigger::Action(|a| matches!(a, Action::Save)),
-        text: "Use {} to save the buffer" },
+        text: "Use {} to save the file" },
     HintDef { id: "picker-files", tier: 1, contexts: &[C::Normal], keys: "Space f",
         trigger: Trigger::Action(|a| matches!(a, Action::OpenPicker(PickerKind::Files))),
         text: "Use {} to fuzzy-find a file" },
-    HintDef { id: "picker-buffers", tier: 1, contexts: &[C::Normal], keys: "Space b",
-        trigger: Trigger::Action(|a| matches!(a, Action::OpenPicker(PickerKind::Buffers))),
-        text: "Use {} to switch between open buffers" },
+    HintDef { id: "picker-buffers", tier: 1, contexts: &[C::Normal], keys: "Space v",
+        trigger: Trigger::Action(|a| matches!(a, Action::OpenPicker(PickerKind::Views))),
+        text: "Use {} to switch between open views" },
     HintDef { id: "search", tier: 1, contexts: &[C::Normal], keys: "/",
         trigger: Trigger::Action(|a| matches!(a, Action::EnterSearch)),
-        text: "Use {} to search the buffer" },
+        text: "Use {} to search the file" },
     HintDef { id: "undo", tier: 1, contexts: &[C::Normal, C::Insert], keys: "Ctrl-z",
         trigger: Trigger::Action(|a| matches!(a, Action::Undo)),
         text: "Use {} to undo" },
@@ -275,11 +275,11 @@ pub static CURRICULUM: &[HintDef] = &[
     // `read-source` shares the entry point's trigger but is deliberately a *separate* hint:
     // merged, the ladder would gate the way OUT of a view the app can open by default
     // (`markdown_read_default`), and each side's copy teaches a different destination.
-    // Shared learning still holds — one `Space v` press records a use on both.
-    HintDef { id: "reader", tier: 3, contexts: &[C::Normal], keys: "Space v",
+    // Shared learning still holds — one `Space u` press records a use on both.
+    HintDef { id: "reader", tier: 3, contexts: &[C::Normal], keys: "Space u",
         trigger: Trigger::Action(|a| matches!(a, Action::ToggleReadView)),
         text: "Use {} to open the markdown reading view" },
-    HintDef { id: "read-source", tier: 3, contexts: &[C::Read], keys: "Space v",
+    HintDef { id: "read-source", tier: 3, contexts: &[C::Read], keys: "Space u",
         trigger: Trigger::Action(|a| matches!(a, Action::ToggleReadView)),
         text: "Use {} to view the markdown source" },
     HintDef { id: "read-step", tier: 3, contexts: &[C::Read], keys: "j/k",
@@ -329,9 +329,9 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "picker-dismiss", tier: 4, contexts: &[C::AnyPicker], keys: "Esc",
         trigger: Trigger::Picker(PickerCmd::Dismiss),
         text: "Use {} to close the picker" },
-    HintDef { id: "picker-close", tier: 4, contexts: &[C::Picker(PickerKind::Buffers)], keys: "Ctrl-d",
-        trigger: Trigger::Picker(PickerCmd::CloseBuffer),
-        text: "Use {} to close the selected buffer" },
+    HintDef { id: "picker-close", tier: 4, contexts: &[C::Picker(PickerKind::Views)], keys: "Ctrl-d",
+        trigger: Trigger::Picker(PickerCmd::CloseView),
+        text: "Use {} to close the selected view" },
     // The branch picker's least guessable key, and the one the merge made necessary. `Enter` on a
     // branch with no tree checks it out — which is what the *worktree* picker's Enter used to
     // create a tree for — so anyone carrying that muscle memory needs pointing here. The text says
@@ -355,7 +355,7 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "jumplist-capture", tier: 4,
         contexts: &[
             C::Picker(PickerKind::Files),
-            C::Picker(PickerKind::Buffers),
+            C::Picker(PickerKind::Views),
             C::Picker(PickerKind::Grep),
             C::Picker(PickerKind::Diagnostics),
             C::Picker(PickerKind::DiagnosticsWorkspace),
@@ -802,7 +802,7 @@ impl HintEngine {
     /// The hints eligible to display in `ctx` right now: not demonstrated, context-eligible,
     /// condition holding, and — for main-track (Normal-context) hints only — tier unlocked.
     /// Context-local hints (picker vocabulary, the Insert/Search hints) skip the tier ladder:
-    /// being *in* the context is the gate, and a locked Buffers picker corner teaches nothing.
+    /// being *in* the context is the gate, and a locked view picker corner teaches nothing.
     fn pool(&self, ctx: ContextId) -> Vec<usize> {
         let frontier = self.frontier_tier();
         CURRICULUM
@@ -1086,11 +1086,11 @@ mod tests {
     fn context_flip_freezes_and_restores_the_previous_hint() {
         let (mut e, _) = engine();
         let normal_hint = displayed(&e, C::Normal).unwrap();
-        // Open the Buffers picker: its own context, its own slot (tier 4 might not be unlocked, so
+        // Open the view picker: its own context, its own slot (tier 4 might not be unlocked, so
         // possibly an empty corner — either way Normal's slot must survive untouched).
-        e.on_tick(Some(C::Picker(PickerKind::Buffers)), T0 + 10_000, true);
+        e.on_tick(Some(C::Picker(PickerKind::Views)), T0 + 10_000, true);
         // Two minutes pass inside the picker — more than none, less than ROTATE_MS.
-        e.on_tick(Some(C::Picker(PickerKind::Buffers)), T0 + 130_000, true);
+        e.on_tick(Some(C::Picker(PickerKind::Views)), T0 + 130_000, true);
         // Back to Normal: the same hint returns, with no fresh Shown for it.
         let evs = e.on_tick(Some(C::Normal), T0 + 131_000, true);
         assert_eq!(displayed(&e, C::Normal), Some(normal_hint));
@@ -1238,11 +1238,11 @@ mod tests {
     fn picker_contexts_surface_their_own_hints_immediately() {
         let (mut e, _) = engine();
         // No tier grinding needed: context-local hints skip the ladder — being *in* the picker
-        // is the gate. A fresh profile's Buffers picker offers its Ctrl-d or the shared
+        // is the gate. A fresh profile's view picker offers its Ctrl-d or the shared
         // navigation hint straight away.
         e.note_input();
-        e.on_tick(Some(C::Picker(PickerKind::Buffers)), T0 + 1_000, true);
-        let id = displayed(&e, C::Picker(PickerKind::Buffers))
+        e.on_tick(Some(C::Picker(PickerKind::Views)), T0 + 1_000, true);
+        let id = displayed(&e, C::Picker(PickerKind::Views))
             .expect("a picker hint shows without tier progress");
         assert!(
             matches!(id, "picker-close" | "picker-nav" | "jumplist-capture"),
@@ -1254,13 +1254,13 @@ mod tests {
             displayed(&e, C::Picker(PickerKind::Workspaces)),
             Some("picker-nav")
         );
-        // And the picker-command follow path rotates whichever hint the Buffers corner shows.
+        // And the picker-command follow path rotates whichever hint the view picker's corner shows.
         let cmd = match id {
-            "picker-close" => PickerCmd::CloseBuffer,
+            "picker-close" => PickerCmd::CloseView,
             "jumplist-capture" => PickerCmd::CaptureJumplist,
             _ => PickerCmd::MoveSelection,
         };
-        let evs = e.observe_picker(cmd, Some(C::Picker(PickerKind::Buffers)), true);
+        let evs = e.observe_picker(cmd, Some(C::Picker(PickerKind::Views)), true);
         assert!(evs.contains(&WireEvent {
             hint_id: id,
             event: HintEvent::Followed
@@ -1669,7 +1669,7 @@ mod tests {
             "motion-hjkl" => Action::MoveChar(Direction::Forward),
             "save" => Action::Save,
             "picker-files" => Action::OpenPicker(PickerKind::Files),
-            "picker-buffers" => Action::OpenPicker(PickerKind::Buffers),
+            "picker-buffers" => Action::OpenPicker(PickerKind::Views),
             "search" => Action::EnterSearch,
             "undo" => Action::Undo,
             "reader" | "read-source" => Action::ToggleReadView,

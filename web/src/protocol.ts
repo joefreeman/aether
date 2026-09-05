@@ -9,7 +9,7 @@
 //!   1. Render/view types embedded in the `View` that `view()` returns (the viewport render chain,
 //!      cursor, diagnostics, LSP status, picker items) — consumed by render.ts / shell.ts.
 //!   2. The handful of results from RPCs the shell issues *directly* (bootstrap: workspace/list,
-//!      workspace/activate, buffer/open; geometry: view/subscribe|window|resize),
+//!      workspace/activate, view/open; geometry: view/subscribe|window|resize),
 //!      because their params need pixels or they run before the core exists.
 //!
 //! Keep field names exactly matching the serde wire format.
@@ -496,7 +496,7 @@ export interface CursorState {
   jumplist_position?: { current: number; total: number } | null;
 }
 
-// ---- bootstrap RPC results (workspace/list, workspace/activate, buffer/open) -------------------------
+// ---- bootstrap RPC results (workspace/list, workspace/activate, view/open) -------------------------
 
 export interface WorkspaceSummary {
   name: string;
@@ -511,9 +511,9 @@ export interface WorkspaceInfo {
 }
 export interface WorkspaceActivateResult {
   workspace: WorkspaceInfo;
-  last_buffer_id?: BufferId | null;
+  last_view_id?: number | null;
   /** With `open_last`: the landing buffer (MRU or fresh transient scratch), fully opened. */
-  opened?: BufferOpenResult | null;
+  opened?: ViewOpenResult | null;
 }
 
 export interface LspServerRef {
@@ -521,7 +521,7 @@ export interface LspServerRef {
   workspace_root: string;
 }
 
-export interface BufferOpenResult {
+export interface ViewOpenResult {
   buffer_id: BufferId;
   language?: string | null;
   line_count: number;
@@ -572,7 +572,7 @@ export interface LspServerStatus {
  *  buffer it is actually looking at rather than to the view's own document. */
 export interface ViewportFocusElementResult {
   element: number;
-  buffer: BufferOpenResult;
+  buffer: ViewOpenResult;
 }
 
 export interface ViewportSubscribeResult {
@@ -622,7 +622,7 @@ export interface GitBlameLineResult {
 
 export type PickerKind =
   | "files"
-  | "buffers"
+  | "views"
   | "grep"
   | "git_changes"
   | "git_changes_file"
@@ -654,7 +654,7 @@ export type SymbolKind =
  *  are code-point offsets into the row's display string, covered by the fuzzy match. */
 export type PickerItem =
   | { kind: "file"; path_index: number; relative_path: string; match_indices?: number[]; git_status?: GitStatus }
-  | { kind: "buffer"; buffer_id: BufferId; display: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[]; transient?: boolean }
+  | { kind: "view"; buffer_id: BufferId; view_id: number; view_kind?: "editor" | "reader"; display: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[]; transient?: boolean }
   | {
       kind: "grep_hit";
       path_index: number;
@@ -682,7 +682,7 @@ export type PickerItem =
       match_indices?: number[];
     }
   | { kind: "diagnostic"; path_index?: number; relative_path?: string; line: number; col: number; end_line?: number; end_col?: number; severity: DiagnosticSeverity; message: string; match_indices?: number[] }
-  | { kind: "workspace"; name: string; unsaved_buffers?: number; match_indices?: number[] }
+  | { kind: "workspace"; name: string; unsaved?: number; match_indices?: number[] }
   | { kind: "dir_entry"; name: string; is_dir: boolean; match_indices?: number[]; git_status?: GitStatus }
   | { kind: "root"; path_index: number; match_indices?: number[] }
   | {
@@ -779,7 +779,7 @@ export type PickerItem =
     }
   | {
       kind: "reference";
-      /** Absolute path to the file containing the reference (fed into buffer/open on select). */
+      /** Absolute path to the file containing the reference (fed into view/open on select). */
       path: string;
       /** Row label: workspace-relative path (references are filtered to workspace roots server-side). */
       display_path: string;
@@ -794,7 +794,7 @@ export type PickerItem =
     }
   | {
       kind: "symbol";
-      /** Absolute path to the buffer's file (fed into buffer/open on select). */
+      /** Absolute path to the buffer's file (fed into view/open on select). */
       path: string;
       line: number;
       col: number;

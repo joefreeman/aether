@@ -405,7 +405,7 @@ fn project_dir(project: &ProjectRef, workspace_roots: &[PathBuf]) -> Result<Path
         ));
     }
     // Nesting under a root makes containment structural, but `..` can still climb out — and a
-    // project outside every root is exactly what `buffer/open` refuses to start a server for (the
+    // project outside every root is exactly what `view/open` refuses to start a server for (the
     // workspace-trust boundary), so it stays rejected.
     if rel
         .components()
@@ -729,13 +729,13 @@ pub struct WorkspaceSession {
     /// most-recent-first ordering. `0` for a workspace that's only ever had its buffer list written.
     #[serde(default)]
     pub last_activated_at: u64,
-    /// The buffers that were open in this workspace, most-recently-used first. On re-activation
-    /// they're restored as *dormant* buffers (listed in the picker, loaded lazily). File buffers
-    /// carry their canonical path; dirty scratch buffers carry their per-workspace number (their
-    /// content is restored from the matching backup). Clean scratches and transient previews are
-    /// omitted.
-    #[serde(default)]
-    pub buffers: Vec<SessionBuffer>,
+    /// The views that were open in this workspace, most-recently-used first. On re-activation
+    /// they're restored as *dormant* rows (listed in the view picker, loaded lazily). Files carry
+    /// their canonical path; dirty scratches carry their per-workspace number (their content is
+    /// restored from the matching backup). Clean scratches and transient previews are omitted.
+    /// `buffers` in files written before views were the unit.
+    #[serde(default, alias = "buffers")]
+    pub views: Vec<SessionView>,
     /// **Worktree bindings**. Maps a repo **family** — its common dir — to the admin name of the
     /// worktree this workspace uses for it; a repo with no entry uses its main checkout, so an
     /// unbound workspace carries none at all.
@@ -793,35 +793,35 @@ pub struct WorkspaceContextSession {
     /// new state for a thin payoff.
     #[serde(default)]
     pub last_activated_at: u64,
-    /// Buffers open in *this* context, most-recently-used first — same shape and same restore path
-    /// as [`WorkspaceSession::buffers`].
-    #[serde(default)]
-    pub buffers: Vec<SessionBuffer>,
+    /// Views open in *this* context, most-recently-used first — same shape and same restore path
+    /// as [`WorkspaceSession::views`].
+    #[serde(default, alias = "buffers")]
+    pub views: Vec<SessionView>,
 }
 
 impl WorkspaceSession {
-    /// The buffers recorded for `bindings` — the base's own when empty, else the matching context's
+    /// The views recorded for `bindings` — the base's own when empty, else the matching context's
     /// (empty when it has never been visited).
-    pub fn buffers_for(&self, bindings: &BTreeMap<PathBuf, String>) -> &[SessionBuffer] {
+    pub fn views_for(&self, bindings: &BTreeMap<PathBuf, String>) -> &[SessionView] {
         if bindings.is_empty() {
-            return &self.buffers;
+            return &self.views;
         }
         self.contexts
             .iter()
             .find(|c| &c.worktrees == bindings)
-            .map_or(&[][..], |c| &c.buffers)
+            .map_or(&[][..], |c| &c.views)
     }
 
-    /// Record `buffers` and a fresh activation stamp against `bindings`, creating the context if
+    /// Record `views` and a fresh activation stamp against `bindings`, creating the context if
     /// this is the first visit.
     pub fn record(
         &mut self,
         bindings: &BTreeMap<PathBuf, String>,
-        buffers: Vec<SessionBuffer>,
+        views: Vec<SessionView>,
         at: u64,
     ) {
         if bindings.is_empty() {
-            self.buffers = buffers;
+            self.views = views;
             self.last_activated_at = at;
             return;
         }
@@ -831,13 +831,13 @@ impl WorkspaceSession {
         // [`Self::activated_at`], the max over all of them.
         match self.contexts.iter_mut().find(|c| &c.worktrees == bindings) {
             Some(ctx) => {
-                ctx.buffers = buffers;
+                ctx.views = views;
                 ctx.last_activated_at = at;
             }
             None => self.contexts.push(WorkspaceContextSession {
                 worktrees: bindings.clone(),
                 last_activated_at: at,
-                buffers,
+                views,
             }),
         }
     }
@@ -873,28 +873,72 @@ impl WorkspaceSession {
     }
 }
 
-/// One entry in a workspace's persisted buffer list. A scratch buffer has no path, so the list is a
-/// tagged enum rather than a bare path: a `File` carries its canonical path; a `Scratch` carries the
-/// per-workspace display number that keys its backup. Internally tagged (`{"kind":"file",…}`) to
-/// keep the machine-managed JSON self-describing.
+/// One view a workspace's session records — a row of the view picker when the workspace comes
+/// back, and what selecting that row opens. Only kept views get here. Internally tagged, and the
+/// tag **is the kind of view**: a file as its `editor` or its `reader` (a file you kept both of is
+/// two entries), a `scratch` (a dirty one, whose content survives as a backup, keyed by its
+/// per-workspace number), or a `virtual` view materialised from a repository — the working
+/// changes, a commit's patch, a file at a revision — by its `VirtualSource::key`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SessionBuffer {
-    File {
+pub enum SessionView {
+    Editor {
+        path: PathBuf,
+    },
+    Reader {
         path: PathBuf,
     },
     Scratch {
         number: u32,
     },
-    /// A materialised revision, by its `VirtualSource::key` (`<repo>@<rev>[:<path>]`). Only kept
-    /// diffs get here — they open transient, so one has to have been pinned with `Space k`.
-    ///
     /// Stable across restarts because a repo id is its canonical workdir. Nothing of the content is
     /// stored: it regenerates from the repo, and a revision that has been rewritten away since
-    /// simply doesn't come back.
+    /// simply doesn't come back. A revision opens as a preview, so one has to have been kept with
+    /// `Space k` to be here.
     Virtual {
         key: String,
     },
+    /// A session written before the tag was the view's kind: a file with an optional `view`. Read
+    /// as the editor or reader it named ([`WorkspaceSessions::normalise`]); never written.
+    #[doc(hidden)]
+    File {
+        path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<aether_protocol::ui::ViewKind>,
+    },
+}
+
+impl SessionView {
+    /// A file, as `kind` of view of it.
+    pub fn file(path: PathBuf, kind: aether_protocol::ui::ViewKind) -> Self {
+        match kind {
+            aether_protocol::ui::ViewKind::Editor => SessionView::Editor { path },
+            aether_protocol::ui::ViewKind::Reader => SessionView::Reader { path },
+        }
+    }
+
+    /// The file and the kind of view of it this entry is, for a file entry — a legacy `file` entry
+    /// read as what it named, the editor when it named nothing.
+    pub fn file_view(&self) -> Option<(&Path, aether_protocol::ui::ViewKind)> {
+        use aether_protocol::ui::ViewKind;
+        match self {
+            SessionView::Editor { path } => Some((path, ViewKind::Editor)),
+            SessionView::Reader { path } => Some((path, ViewKind::Reader)),
+            SessionView::File { path, view } => Some((path, view.unwrap_or(ViewKind::Editor))),
+            SessionView::Scratch { .. } | SessionView::Virtual { .. } => None,
+        }
+    }
+
+    /// This entry as the session writes it: a legacy `file` entry becomes the editor or reader it
+    /// named; everything else is itself.
+    fn normalised(self) -> Self {
+        match self {
+            SessionView::File { path, view } => {
+                SessionView::file(path, view.unwrap_or(aether_protocol::ui::ViewKind::Editor))
+            }
+            other => other,
+        }
+    }
 }
 
 /// The whole session file: every named workspace's [`WorkspaceSession`], keyed by workspace name. A
@@ -931,7 +975,28 @@ pub fn load_workspace_sessions_at(path: &Path) -> anyhow::Result<WorkspaceSessio
     let mut sessions: WorkspaceSessions = serde_json::from_str(&content)
         .with_context(|| format!("parsing workspace sessions at {}", path.display()))?;
     drop_stale_variant_sessions(&mut sessions);
+    sessions.normalise();
     Ok(sessions)
+}
+
+impl WorkspaceSessions {
+    /// Read a file written before the tag was the view's kind as one written now: every legacy
+    /// `file` entry becomes the `editor` or `reader` it named, so nothing after the load meets
+    /// one, and the next write is in the current shape.
+    pub fn normalise(&mut self) {
+        for session in self.workspaces.values_mut() {
+            session.views = std::mem::take(&mut session.views)
+                .into_iter()
+                .map(SessionView::normalised)
+                .collect();
+            for ctx in &mut session.contexts {
+                ctx.views = std::mem::take(&mut ctx.views)
+                    .into_iter()
+                    .map(SessionView::normalised)
+                    .collect();
+            }
+        }
+    }
 }
 
 /// Drop session entries left behind by worktree **variants** — the `<workspace>/<variant>` ids that
@@ -1664,7 +1729,7 @@ mod tests {
             &AppSettings {
                 wrap: WrapMode::None,
                 ligatures: false,
-                buffer_font_size: 18,
+                editor_font_size: 18,
                 ui_font_size: 11,
                 theme: aether_protocol::settings::ThemeMode::Light,
                 ..AppSettings::default()
@@ -1674,7 +1739,7 @@ mod tests {
         let s = load_app_settings_at(&path).unwrap();
         assert_eq!(s.wrap, WrapMode::None);
         assert!(!s.ligatures);
-        assert_eq!(s.buffer_font_size, 18);
+        assert_eq!(s.editor_font_size, 18);
         assert_eq!(s.ui_font_size, 11);
         assert_eq!(s.theme, aether_protocol::settings::ThemeMode::Light);
     }
@@ -1710,14 +1775,14 @@ mod tests {
             WorkspaceSession {
                 contexts: Vec::new(),
                 last_activated_at: 1000,
-                buffers: vec![
-                    SessionBuffer::File {
+                views: vec![
+                    SessionView::Editor {
                         path: PathBuf::from("/work/a.rs"),
                     },
-                    SessionBuffer::File {
+                    SessionView::Editor {
                         path: PathBuf::from("/work/b.rs"),
                     },
-                    SessionBuffer::Scratch { number: 2 },
+                    SessionView::Scratch { number: 2 },
                 ],
             },
         );
@@ -1726,7 +1791,7 @@ mod tests {
             WorkspaceSession {
                 contexts: Vec::new(),
                 last_activated_at: 2000,
-                buffers: vec![],
+                views: vec![],
             },
         );
         write_workspace_sessions_at(&path, &sessions).unwrap();
@@ -1741,7 +1806,7 @@ mod tests {
             WorkspaceSession {
                 contexts: Vec::new(),
                 last_activated_at: 100,
-                buffers: vec![],
+                views: vec![],
             },
         );
         sessions.workspaces.insert(
@@ -1749,7 +1814,7 @@ mod tests {
             WorkspaceSession {
                 contexts: Vec::new(),
                 last_activated_at: 200,
-                buffers: vec![],
+                views: vec![],
             },
         );
         // `gamma` and `delta` have no recorded session → stamp 0 → they sit at the end, keeping the

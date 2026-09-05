@@ -83,7 +83,7 @@ pub struct ServerState {
     /// dropped when its last buffer closes ([`Self::close_buffer`]).
     pub documents: HashMap<DocumentId, Document>,
     /// Which workspace each open buffer belongs to. Populated when a buffer is created
-    /// (`buffer/open`) and looked up when scoping per-buffer state to a workspace (e.g. on
+    /// (`view/open`) and looked up when scoping per-buffer state to a workspace (e.g. on
     /// `workspace/activate`, when tearing down a client's state for the previously active workspace).
     pub buffer_workspaces: HashMap<BufferId, String>,
     pub clients: HashMap<ClientId, ClientSession>,
@@ -154,16 +154,14 @@ pub struct ServerState {
     /// guess at how long its debounces take. See [`Deferred`].
     pub deferred: Arc<Deferred>,
     /// Per-`(client, view)` last-known scroll position, as content. Written whenever the client
-    /// subscribes to or loads a window of the view, and surfaced on `buffer/open` so the client can
+    /// subscribes to or loads a window of the view, and surfaced on `view/open` so the client can
     /// restore the view where it left it. Keyed by the **view**: keying by the focused element's
     /// buffer recorded a patch's position against one of its files, which a plain open of that file
     /// then restored as if it were the file's own. Cleared on disconnect.
     pub last_scroll: HashMap<(ClientId, ViewId), ScrollPosition>,
-    /// The kind each file was last presented as — editor or reader — by canonical path, so the
-    /// choice outlives the buffer: close a document you were reading and it reopens in the reader,
-    /// whichever client opens it. Consulted only when a subscribe names no kind of its own; the
-    /// app setting decides for a file never presented.
-    pub last_view_kind: HashMap<PathBuf, ViewKind>,
+    /// Ticks once per use of a view (an open, a subscribe), stamping [`View::last_used`] — the
+    /// order [`Self::view_presenting`] answers a buffer's most recently used view by.
+    pub view_clock: u64,
     /// The app settings as this server knows them: loaded from the profile at boot, replaced by
     /// every `settings/set`. Tests never touch the profile's file, and start from the defaults.
     pub app_settings: aether_protocol::settings::AppSettings,
@@ -174,13 +172,13 @@ pub struct ServerState {
     /// the *jumplist* — the captured picker-results list, which is per *context* rather than per
     /// client and lives on [`WorkspaceEntry::jumplist`].)
     /// Distinct from `motion_history` (per-buffer cursor undo via `z`): coarse, cross-buffer, and
-    /// untouched by edits or `z`. Recorded on qualifying jumps (the navigating `buffer/open`'s
+    /// untouched by edits or `z`. Recorded on qualifying jumps (the navigating `view/open`'s
     /// `record_nav_from`); driven by the TUI's `nav/back`/`nav/forward`. The web client rides
     /// native browser history instead, so its
     /// entries here go unused — but recording stays uniform across clients. Cleared on disconnect.
     pub nav_history: HashMap<ClientId, NavHistory>,
     /// Per-buffer *unstaged* diff hunks: the live buffer against its **index** content
-    /// (`git diff`). Populated on `buffer/open` for file-backed buffers; recomputed as the buffer
+    /// (`git diff`). Populated on `view/open` for file-backed buffers; recomputed as the buffer
     /// changes. Empty / absent for scratch buffers and files outside a repo. Shared by all clients
     /// viewing the buffer (the baseline is a property of the file, not the viewer). Drives the
     /// unstaged half of the status-bar counts and one side of the combined view.
@@ -321,7 +319,8 @@ pub struct ServerState {
     /// to, including the ephemeral one an in-process test server gets. `None` until then.
     /// Diagnostic only (the `app/info` snapshot); nothing routes on it.
     pub port: Option<u16>,
-    next_buffer_id: u64,
+    /// One id space for buffers and views: see [`Self::allocate_view_id`].
+    next_id: u64,
     next_viewport_id: u64,
     next_document_id: u64,
 }
@@ -407,11 +406,15 @@ impl MotionHistory {
     }
 }
 
-/// One location in the navigation history: a buffer plus the cursor/selection to
-/// restore. The path fields let a closed file be reopened; `buffer_id` is preferred while the
-/// buffer is still open (and is the only handle a scratch buffer has).
+/// One location in the navigation history: the view the client was in, its buffer, and the
+/// cursor/selection to restore there. The view is preferred while it is still open — it says
+/// *which* view of the file, the reader or the editor, and is the only handle a scratch has; the
+/// path fields let a closed file be reopened.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NavEntry {
+    pub view_id: ViewId,
+    /// The buffer the cursor is in — what the cursor is keyed by, and the file the path fields
+    /// name.
     pub buffer_id: BufferId,
     pub path_index: Option<u32>,
     pub relative_path: Option<String>,
@@ -500,27 +503,29 @@ pub struct WorkspaceEntry {
     /// survives picker hide/show.
     pub workspace_index: Arc<WorkspaceIndex>,
     /// Most-recently-used buffers in this workspace, front = most-recent. Bumped on every
-    /// `buffer/open` (fresh open, reopen, or attach-by-id) — so this is *focus* recency, not edit
-    /// recency. Drives the buffer picker's empty-query ordering, and the `last_buffer_id` returned
-    /// by `workspace/activate` (so re-attaching to a workspace drops the user on the buffer they
-    /// last had, scratch or file alike).
+    /// `view/open` (fresh open, reopen, or attach-by-id) — so this is *focus* recency, not edit
+    /// recency. Drives the picker's empty-query ordering, the successor a close lands on, and the
+    /// `last_view_id` returned by `workspace/activate` (so re-attaching to a workspace drops the
+    /// user on the view they last had, scratch or file alike).
     ///
-    /// Lives on the workspace — not on the client — so it persists across client disconnects.
-    /// A new TUI invocation gets a fresh `ClientId` but inherits the workspace's MRU.
-    pub mru_buffers: VecDeque<BufferId>,
-    /// Buffers restored from the persisted session ([`crate::config::WorkspaceSession`]) on
+    /// **Views**, not buffers: a file's editor and its reader are two entries, and the one you
+    /// used last is the one you come back to. Lives on the workspace — not on the client — so it
+    /// persists across client disconnects. A new TUI invocation gets a fresh `ClientId` but
+    /// inherits the workspace's MRU.
+    pub mru_views: VecDeque<ViewId>,
+    /// Views restored from the persisted session ([`crate::config::WorkspaceSession`]) on
     /// activation but not yet loaded into memory — most-recently-used first, mirroring the order
-    /// they were saved in. Each holds a reserved [`BufferId`] (its picker identity) and the file's
-    /// canonical path; it carries no rope/syntax/LSP. The buffer picker lists them after the live
-    /// buffers, rendered identically to them; opening one materializes a real buffer (see
-    /// `buffer_open`'s by-id path) and drops it from here. Never contains a path that's also a
+    /// they were saved in. Each holds a reserved [`ViewId`] (its picker identity) and enough to
+    /// rebuild what it shows; it carries no rope/syntax/LSP. The view picker lists them after the
+    /// live views, rendered identically to them; opening one materializes a real view (see
+    /// `view_open`'s by-id path) and drops it from here. Never contains a path that's also a
     /// live buffer in this workspace — promotion removes it.
-    pub dormant_buffers: Vec<DormantBuffer>,
+    pub dormant_views: Vec<DormantView>,
     /// This context's jumplist: the quickfix-style snapshot `jumplist/capture` takes of a picker's
     /// filtered results, stepped cursor-relative by `jumplist/step` (`]` / `[`). `None` until
     /// something is captured; replaced wholesale by the next capture.
     ///
-    /// Lives on the entry — not on the client — for the same reason [`Self::mru_buffers`] does, and
+    /// Lives on the entry — not on the client — for the same reason [`Self::mru_views`] does, and
     /// for one more. The reason it shares: a client has no durable identity, so a list hung off a
     /// `ClientId` dies with the window that captured it, and two shells attached to the same context
     /// each step a list the other can't see. The reason it doesn't: entries carry absolute paths, so
@@ -538,18 +543,28 @@ pub struct WorkspaceEntry {
     pub projects: Vec<crate::config::ProjectRef>,
 }
 
-/// A session-restored buffer that hasn't been loaded yet. See [`WorkspaceEntry::dormant_buffers`].
+/// A dormant *view*: a session-restored row that hasn't been loaded yet. It is what the picker
+/// lists and what a session records — the buffer behind it does not exist until the row is opened.
+/// See [`WorkspaceEntry::dormant_views`].
 #[derive(Debug, Clone)]
-pub struct DormantBuffer {
-    /// Reserved id — the buffer's identity in the picker, so selecting it can route back through
-    /// `buffer/open { buffer_id }`. Not present in `ServerState::buffers` until materialized.
+pub struct DormantView {
+    /// Reserved id — the buffer the row's view will present. Not present in `ServerState::buffers`
+    /// until materialized; nothing on the wire names it.
     pub id: BufferId,
+    /// Reserved view id — what the picker row names, so closing the row (`view/close`) and
+    /// selecting it (`view/open { view_id }`) address it as they would a live view. Discarded at
+    /// materialisation like `id`: the real buffer gets a real view.
+    pub view: ViewId,
+    /// The kind of view this row will materialise as — the reader, for a reader you kept. `None`
+    /// for the editor, for a scratch or a revision, and for a session written before views had
+    /// kinds.
+    pub kind: Option<ViewKind>,
     /// What to materialize: a file (by path) or a scratch (by per-workspace number, whose unsaved
     /// content is restored from its backup).
     pub source: DormantSource,
 }
 
-/// The thing a [`DormantBuffer`] materializes into.
+/// The thing a [`DormantView`] materializes into.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DormantSource {
     /// A file-backed buffer; the canonical path to load when materialized.
@@ -562,8 +577,8 @@ pub enum DormantSource {
     Virtual { key: String },
 }
 
-impl DormantBuffer {
-    /// The canonical path, for a file dormant buffer; `None` for a scratch.
+impl DormantView {
+    /// The canonical path, for a file-backed dormant view; `None` for a scratch.
     pub fn path(&self) -> Option<&Path> {
         match &self.source {
             DormantSource::File(p) => Some(p.as_path()),
@@ -574,7 +589,7 @@ impl DormantBuffer {
 
 impl WorkspaceEntry {
     /// True iff the given canonical path falls under one of this workspace's roots. A file that
-    /// isn't contained is a *guest* — no git baseline, no language server (`buffer_open`). Note this
+    /// isn't contained is a *guest* — no git baseline, no language server (`view_open`). Note this
     /// is containment, not trust: an ephemeral workspace's own files are contained (it roots itself
     /// at their directories) and still get no language server.
     pub fn contains(&self, canonical: &Path) -> bool {
@@ -666,7 +681,7 @@ impl ServerState {
             cursor_moved_tx: None,
             deferred: Arc::new(Deferred::default()),
             last_scroll: HashMap::new(),
-            last_view_kind: HashMap::new(),
+            view_clock: 0,
             app_settings: aether_protocol::settings::AppSettings::default(),
             pickers: HashMap::new(),
             nav_history: HashMap::new(),
@@ -699,7 +714,7 @@ impl ServerState {
             history_dirty: false,
             idle_timeout: None,
             port: None,
-            next_buffer_id: 1,
+            next_id: 1,
             next_viewport_id: 1,
             next_document_id: 1,
         }
@@ -720,11 +735,86 @@ impl ServerState {
             .expect("buffer references a live document")
     }
 
-    /// Install the layout a driver built for a view: elements bound to real buffers rather than to
-    /// slices of the view's own document. Set when a patch is generated.
+    /// Install the layout a driver built for the view `buffer_id` presents: elements bound to real
+    /// buffers rather than to slices of the view's own document. Set when a patch is generated,
+    /// replacing whatever view the buffer's creation gave it.
     pub fn set_view_layout(&mut self, buffer_id: BufferId, layout: Vec<ElementLayout>) {
-        self.views
-            .insert(ViewId(buffer_id), View::from_layout(buffer_id, layout));
+        let id = self
+            .view_presenting(buffer_id)
+            .unwrap_or_else(|| self.allocate_view_id());
+        let (last_used, transient) = self
+            .views
+            .get(&id)
+            .map_or((0, false), |v| (v.last_used, v.transient));
+        self.views.insert(
+            id,
+            View {
+                last_used,
+                transient,
+                ..View::from_layout(buffer_id, layout)
+            },
+        );
+    }
+
+    /// The buffer presenting view `id`. Panics like [`Self::view`] on a view nothing has created.
+    pub fn presenting_buffer(&self, id: ViewId) -> BufferId {
+        self.view(id).presenting
+    }
+
+    /// Non-panicking [`Self::presenting_buffer`].
+    pub fn try_presenting_buffer(&self, id: ViewId) -> Option<BufferId> {
+        self.views.get(&id).map(|v| v.presenting)
+    }
+
+    /// Every view `buffer_id` presents. One today; the reader and the editor of a file will be two.
+    pub fn views_presenting(&self, buffer_id: BufferId) -> Vec<ViewId> {
+        let mut ids: Vec<ViewId> = self
+            .views
+            .iter()
+            .filter(|(_, v)| v.presenting == buffer_id)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The view `buffer_id` presents — its **most recently used** one, when it has several: what an
+    /// open with no opinion presents, what a picker row names, what a close of the buffer's last
+    /// viewport tears down. `None` for a buffer with no view (a dormant one).
+    pub fn view_presenting(&self, buffer_id: BufferId) -> Option<ViewId> {
+        self.views_presenting(buffer_id)
+            .into_iter()
+            .max_by_key(|id| self.views[id].last_used)
+    }
+
+    /// Mint the id of a new view.
+    ///
+    /// Buffers and views draw on one id space ([`Self::next_id`]), so no view id is ever a
+    /// buffer's and no buffer id ever a view's: nothing can pass one off as the other, and no
+    /// arithmetic produces a view from a buffer. `view/open` reports the view it presented, and
+    /// that is the only way a client learns a view's id.
+    pub(crate) fn allocate_view_id(&mut self) -> ViewId {
+        let id = self.next_id;
+        self.next_id += 1;
+        ViewId(id)
+    }
+
+    /// Stamp `id` as used now — an open, a subscribe — so it is the buffer's most recently used
+    /// view until another is.
+    pub fn touch_view(&mut self, id: ViewId) {
+        self.view_clock += 1;
+        let clock = self.view_clock;
+        if let Some(view) = self.views.get_mut(&id) {
+            view.last_used = clock;
+        }
+    }
+
+    /// The view of `buffer_id` of the given kind, if it has one. At most one per kind: an open
+    /// asking for a kind reuses it rather than making another.
+    pub fn view_of_kind(&self, buffer_id: BufferId, kind: ViewKind) -> Option<ViewId> {
+        self.views_presenting(buffer_id)
+            .into_iter()
+            .find(|id| self.views[id].kind() == Some(kind))
     }
 
     /// The view presented by `id`. Panics like [`Self::doc_of`] on a view nothing has presented:
@@ -751,89 +841,136 @@ impl ServerState {
         vp.buffer_id(self.view_of(vp))
     }
 
-    /// The elements of `id`, whether or not it has been presented yet — the view's own if it has,
-    /// otherwise what presenting it *would* build: the regions a generated patch divides into, or
-    /// one element over the whole buffer.
+    /// The elements of the view `buffer_id` presents, whether or not one exists yet — the view's
+    /// own if it does, otherwise what creating it *would* build: the regions a generated patch
+    /// divides into, or one element over the whole buffer.
     ///
-    /// For the callers that resolve a place in a view nobody is subscribed to: a jumplist entry
+    /// For the callers that resolve a place in a view nobody has opened: a jumplist entry
     /// reopening the view it was captured from lands before the client's subscribe arrives.
-    pub fn view_elements(&self, id: ViewId) -> std::borrow::Cow<'_, [ElementBinding]> {
-        match self.views.get(&id) {
+    pub fn view_elements_of(&self, buffer_id: BufferId) -> std::borrow::Cow<'_, [ElementBinding]> {
+        match self
+            .view_presenting(buffer_id)
+            .and_then(|id| self.views.get(&id))
+        {
             Some(view) => std::borrow::Cow::Borrowed(&view.elements),
-            None => std::borrow::Cow::Owned(self.default_view(id).elements),
+            None => std::borrow::Cow::Owned(self.default_view(buffer_id).elements),
         }
     }
 
-    /// Make sure `id`'s view exists — what presenting a buffer that no driver built a view for
-    /// does. A driver's view is never replaced here.
-    pub fn ensure_view(&mut self, id: ViewId) {
-        if !self.views.contains_key(&id) {
-            let view = self.default_view(id);
-            self.views.insert(id, view);
-        }
+    /// The view `buffer_id` presents, created if it has none — what a buffer's creation does, so
+    /// every live buffer has a view from its first moment. [`Self::open_view_as`] with no opinion.
+    pub fn open_view(&mut self, buffer_id: BufferId) -> ViewId {
+        self.open_view_as(buffer_id, None, None)
     }
 
-    /// Make sure `id`'s view exists **as the kind it is being presented as** — what a subscribe
-    /// does, and the one place a view's kind is decided.
+    /// The view an open of `buffer_id` presents, and **the one place a view's kind is decided**.
     ///
-    /// A driver's view is what it is. A markdown file's view is the kind asked for; asked for
-    /// nothing, the kind it already is (a re-subscribe, a second client), else the kind the file
-    /// was last presented as, else the app setting. Any other file has only the editor, whatever
-    /// was asked. Presenting a markdown file records its kind, so the next open of it — from any
-    /// client, after any close — finds it.
-    pub fn present_view(&mut self, id: ViewId, requested: Option<ViewKind>) {
-        let buffer_id = id.presenting_buffer();
-        let (is_markdown, path) = {
-            let doc = self.doc_of(buffer_id);
-            (
-                doc.language.as_deref() == Some("markdown"),
-                doc.canonical_path.clone(),
-            )
+    /// Asked for a kind, the file's view of that kind, made if it has none; asked for nothing, the
+    /// file's most recently used view, else one made per the app setting. Only a markdown file
+    /// has a choice — any other file has its one view, whatever was asked — and a driver's view
+    /// is what it is. A view made here that nothing has ever shown (its creation's placeholder,
+    /// before the open that created the buffer said what it wanted) is re-made as the kind asked
+    /// for rather than left as a sibling nobody opened, and takes the open's transient intent as
+    /// its own.
+    ///
+    /// `transient` is the open's intent: a buffer's first view is transient only when asked
+    /// (`Some(true)`); a sibling made beside an existing view is a preview unless the open pins it
+    /// (`Some(false)`); an existing view is pinned by `Some(false)` and never demoted by an open.
+    pub fn open_view_as(
+        &mut self,
+        buffer_id: BufferId,
+        requested: Option<ViewKind>,
+        transient: Option<bool>,
+    ) -> ViewId {
+        let is_markdown = self.doc_of(buffer_id).language.as_deref() == Some("markdown");
+        let wanted = if is_markdown { requested } else { None };
+        let existing = match wanted {
+            Some(kind) => self.view_of_kind(buffer_id, kind),
+            None => self.view_presenting(buffer_id),
         };
-        let existing = match self.views.get(&id) {
-            Some(view) => match view.kind() {
-                Some(kind) => Some(kind),
-                None => return, // a driver's view
-            },
-            None => match self.default_view(id).kind() {
-                Some(_) => None,
-                None => {
-                    // A generated document with regions of its own: presented as they are.
-                    self.ensure_view(id);
-                    return;
-                }
-            },
-        };
-        let kind = if !is_markdown {
-            ViewKind::Editor
-        } else {
-            requested
-                .or(existing)
-                .or_else(|| {
-                    path.as_ref()
-                        .and_then(|p| self.last_view_kind.get(p).copied())
-                })
-                .unwrap_or(if self.app_settings.markdown_read {
-                    ViewKind::Reader
-                } else {
-                    ViewKind::Editor
-                })
-        };
-        if existing != Some(kind) {
-            self.views.insert(id, View::of_kind(buffer_id, kind));
-            self.rebind_viewports_of(buffer_id);
+        if let Some(id) = existing {
+            let view = self.views.get_mut(&id).expect("listed view");
+            if view.last_used == 0 {
+                // This open's own placeholder, made with the buffer: the intent is its own.
+                view.transient = transient == Some(true);
+            } else if transient == Some(false) {
+                view.transient = false;
+            }
+            self.touch_view(id);
+            return id;
         }
-        if is_markdown {
-            if let Some(path) = path {
-                self.last_view_kind.insert(path, kind);
+        let first = self.views_presenting(buffer_id).is_empty();
+        let kind = wanted.unwrap_or(if is_markdown && self.app_settings.markdown_read {
+            ViewKind::Reader
+        } else {
+            ViewKind::Editor
+        });
+        let mut view = match kind {
+            ViewKind::Reader => View::reader(buffer_id),
+            ViewKind::Editor => self.default_view(buffer_id),
+        };
+        view.transient = if first {
+            transient == Some(true)
+        } else {
+            transient != Some(false)
+        };
+        let unshown = self
+            .views_presenting(buffer_id)
+            .into_iter()
+            .find(|id| self.views[id].last_used == 0 && self.views[id].kind().is_some());
+        let id = match unshown {
+            Some(id) => id,
+            None => self.allocate_view_id(),
+        };
+        self.views.insert(id, view);
+        self.touch_view(id);
+        id
+    }
+
+    /// Whether every view of `buffer_id` is a preview — what "the buffer is transient" means now
+    /// that transience is the view's: a buffer with a kept view is kept. A buffer with no view is
+    /// nobody's, and counts as transient.
+    pub fn buffer_is_transient(&self, buffer_id: BufferId) -> bool {
+        self.views_presenting(buffer_id)
+            .iter()
+            .all(|id| self.views[id].transient)
+    }
+
+    /// Promote the views of `buffer_id` an edit, a save or a reload is a keep-signal for: the ones
+    /// on screen — presented by a viewport whose focus is in the buffer, since that is where the
+    /// edit came from — or, when none is, all of them (an edit with no viewport is a script's or a
+    /// test's, and means the buffer). A reader you glanced at and left hidden stays a preview.
+    /// Returns the views promoted; empty when none was transient.
+    pub fn promote_views_of(&mut self, buffer_id: BufferId) -> Vec<ViewId> {
+        let shown: Vec<ViewId> = self
+            .viewports
+            .values()
+            .filter(|vp| {
+                let view = self.view_of(vp);
+                view.presenting == buffer_id && self.focused_buffer(vp) == buffer_id
+            })
+            .map(|vp| vp.view_id)
+            .collect();
+        let targets = if shown.is_empty() {
+            self.views_presenting(buffer_id)
+        } else {
+            shown
+        };
+        let mut promoted = Vec::new();
+        for id in targets {
+            if let Some(view) = self.views.get_mut(&id) {
+                if view.transient {
+                    view.transient = false;
+                    promoted.push(id);
+                }
             }
         }
+        promoted
     }
 
     /// The view a buffer presents when no driver built one: a generated patch's own regions
     /// (chrome between files and hunks is what splits it), else one region over the whole buffer.
-    fn default_view(&self, id: ViewId) -> View {
-        let buffer_id = id.presenting_buffer();
+    fn default_view(&self, buffer_id: BufferId) -> View {
         match self.doc_of(buffer_id).generated.as_ref() {
             Some(g) if !g.decorations.elements.is_empty() => View::over_generated(buffer_id, g),
             _ => View::whole(buffer_id),
@@ -924,9 +1061,9 @@ impl ServerState {
     /// `false` when the view has no driver layout to rebuild — an ordinary buffer, or a patch no
     /// driver built — in which case nothing changes.
     pub fn rebuild_view_layout(&mut self, view_buffer: BufferId) -> bool {
-        if !self.views.contains_key(&ViewId(view_buffer)) {
+        let Some(view_id) = self.view_presenting(view_buffer) else {
             return false;
-        }
+        };
         let workspace = self.buffer_workspaces.get(&view_buffer).cloned();
         let Some(doc) = self.try_doc_of(view_buffer) else {
             return false;
@@ -944,8 +1081,18 @@ impl ServerState {
             let canonical = std::path::Path::new(&repo_id).join(path);
             self.buffer_for_path_in_workspace(workspace, &canonical)
         });
-        self.views
-            .insert(ViewId(view_buffer), View::from_layout(view_buffer, rebuilt));
+        let (last_used, transient) = self
+            .views
+            .get(&view_id)
+            .map_or((0, false), |v| (v.last_used, v.transient));
+        self.views.insert(
+            view_id,
+            View {
+                last_used,
+                transient,
+                ..View::from_layout(view_buffer, rebuilt)
+            },
+        );
         true
     }
 
@@ -953,15 +1100,16 @@ impl ServerState {
     /// viewport's focus was in, and a focus index past the end would fall back to element 0
     /// silently. The viewports reference the view, so this is all a rebuild has to tell them.
     pub fn rebind_viewports_of(&mut self, view_buffer: BufferId) {
-        let view_id = ViewId(view_buffer);
-        let last = self
-            .views
-            .get(&view_id)
-            .map_or(0, |v| v.elements.len().saturating_sub(1))
-            as aether_protocol::viewport::FieldId;
-        for vp in self.viewports.values_mut() {
-            if vp.view_id == view_id {
-                vp.focused = vp.focused.min(last);
+        for view_id in self.views_presenting(view_buffer) {
+            let last = self
+                .views
+                .get(&view_id)
+                .map_or(0, |v| v.elements.len().saturating_sub(1))
+                as aether_protocol::viewport::FieldId;
+            for vp in self.viewports.values_mut() {
+                if vp.view_id == view_id {
+                    vp.focused = vp.focused.min(last);
+                }
             }
         }
     }
@@ -1077,9 +1225,9 @@ impl ServerState {
                 id: buffer_id,
                 document: doc_id,
                 scratch_number,
-                transient,
             },
         );
+        self.open_view_as(buffer_id, None, Some(transient));
         doc_id
     }
 
@@ -1211,8 +1359,8 @@ impl ServerState {
                 // nothing, which `workspace/bind_worktree` refuses outright rather than silently
                 // recording something that could never resolve.
                 workspace_index,
-                mru_buffers: VecDeque::new(),
-                dormant_buffers: Vec::new(),
+                mru_views: VecDeque::new(),
+                dormant_views: Vec::new(),
                 jumplist: None,
                 // An ephemeral workspace has no config file, so nothing can declare a project in it.
                 projects: Vec::new(),
@@ -1247,7 +1395,7 @@ impl ServerState {
     /// an empty context alive while a client has it active — this *evicts* those clients (their
     /// `active_workspace` becomes `None`), because an ephemeral context with no files has no reason
     /// to linger in the switcher even if a second client had selected it. Call after a user-driven
-    /// `buffer/close`; the evicted clients are being told the buffer closed (`buffer/closed`) and
+    /// `view/close`; the evicted clients are being told the buffer closed (`view/closed`) and
     /// drop to the chooser. Returns whether the workspace was removed.
     pub fn retire_ephemeral_if_empty(&mut self, workspace_id: &str) -> bool {
         let is_ephemeral = self
@@ -1492,9 +1640,9 @@ impl ServerState {
         if let Some(sessions_path) = self.sessions_path.as_deref() {
             if let Ok(sessions) = crate::config::load_workspace_sessions_at(sessions_path) {
                 if let Some(session) = sessions.workspaces.get(workspace) {
-                    for entry in &session.buffers {
-                        if let crate::config::SessionBuffer::File { path } = entry {
-                            if !live_paths.contains(path.as_path())
+                    for entry in &session.views {
+                        if let Some((path, _)) = entry.file_view() {
+                            if !live_paths.contains(path)
                                 && crate::backup::exists(&crate::backup::file_backup_path(
                                     root, path,
                                 ))
@@ -1548,7 +1696,7 @@ impl ServerState {
         // Also reserve numbers held by *dormant* scratch buffers (restored from the session but not
         // yet materialized) so a fresh scratch can't grab one out from under a pending restore.
         if let Some(w) = self.workspaces.get(workspace) {
-            for d in &w.dormant_buffers {
+            for d in &w.dormant_views {
                 if let DormantSource::Scratch { number } = d.source {
                     used.insert(number);
                 }
@@ -1578,7 +1726,7 @@ impl ServerState {
     }
 
     /// Close one buffer: drop it and every per-`(client, buffer)` slice keyed to it. This is the
-    /// canonical `buffer/close` teardown, shared by root removal, workspace deletion, and path
+    /// canonical `view/close` teardown, shared by root removal, workspace deletion, and path
     /// deletion so they can't drift out of sync.
     /// Returns the key of a language server that was torn down because this was its last buffer
     /// (so the caller can refresh open status views), or `None`.
@@ -1615,26 +1763,28 @@ impl ServerState {
         // would reinterpret one space as the other — a silently wrong window in place of a panic.
         // And re-derived rather than dropped: dropping the layout dropped the review's viewports
         // with it, and the client whose review it was simply stopped receiving updates.
-        self.views.remove(&ViewId(id));
+        let gone = self.views_presenting(id);
+        self.drop_buffer_from_mru(id);
+        self.views.retain(|view_id, _| !gone.contains(view_id));
         let windowed_by: Vec<BufferId> = self
             .views
-            .iter()
-            .filter(|(_, view)| view.binds(id))
-            .map(|(view, _)| view.presenting_buffer())
+            .values()
+            .filter(|view| view.binds(id))
+            .map(|view| view.presenting)
             .collect();
         for view in windowed_by {
             if self.rebuild_view_layout(view) {
                 self.rebind_viewports_of(view);
             } else {
-                self.views.remove(&ViewId(view));
+                let ids = self.views_presenting(view);
+                self.views.retain(|view_id, _| !ids.contains(view_id));
             }
         }
         // Only the viewports *presenting* this buffer go with it; one that merely windowed it has
-        // just been rebound. `presenting_buffer`, not `binds`: a viewport presenting a patch binds
+        // just been rebound. The views presenting, not `binds`: a viewport presenting a patch binds
         // no element of it, so a `binds` test left it alive with a `view_id` pointing at a buffer
         // that no longer existed.
-        self.viewports
-            .retain(|_, v| v.view_id.presenting_buffer() != id);
+        self.viewports.retain(|_, v| !gone.contains(&v.view_id));
         self.cursors.retain(|(_, b), _| *b != id);
         self.motion_history.retain(|(_, b), _| *b != id);
         self.virtual_col.retain(|(_, b), _| *b != id);
@@ -1648,8 +1798,7 @@ impl ServerState {
         self.blame_follow_gen.retain(|(_, b), _| *b != id);
         self.blame_last_pushed.retain(|(_, b), _| *b != id);
         self.symbol_path_sent.retain(|(_, b), _| *b != id);
-        self.last_scroll
-            .retain(|(_, v), _| v.presenting_buffer() != id);
+        self.last_scroll.retain(|(_, v), _| !gone.contains(v));
         self.git_unstaged_hunks.remove(&id);
         self.git_both_hunks.remove(&id);
         self.git_baseline.remove(&id);
@@ -1681,7 +1830,7 @@ impl ServerState {
     /// about the *document* rather than the buffer: two views of one file are two buffers and one
     /// piece of unsaved work.
     ///
-    /// Not consulted by `buffer/close`: closing on purpose with unsaved changes is the user's call
+    /// Not consulted by `view/close`: closing on purpose with unsaved changes is the user's call
     /// to make (they are prompted), and this is about closes nobody asked for.
     pub fn close_would_orphan_unsaved(&self, id: BufferId) -> bool {
         let Some(buffer) = self.buffers.get(&id) else {
@@ -1696,14 +1845,38 @@ impl ServerState {
             .any(|o| o.document == buffer.document && o.id != id)
     }
 
+    /// Collect what hiding left behind: among `candidates` — the buffers a torn-down viewport was
+    /// showing — every transient view nothing presents any more closes, and a buffer whose views
+    /// are all previews and which nothing shows goes with them. A buffer lives exactly as long as
+    /// some view uses it: presented by a viewport, kept, or bound into a composed view someone is
+    /// looking at.
+    ///
+    /// Returns the buffers closed, the language servers stopped with them, and the views closed
+    /// on their own (a hidden reader beside a kept editor) — the pickers re-list on any of them.
     pub fn close_orphaned_transients(
         &mut self,
         candidates: impl IntoIterator<Item = BufferId>,
-    ) -> (Vec<BufferId>, Vec<crate::lsp::manager::LspServerKey>) {
+    ) -> (
+        Vec<BufferId>,
+        Vec<crate::lsp::manager::LspServerKey>,
+        Vec<ViewId>,
+    ) {
         let mut closed = Vec::new();
         let mut stopped = Vec::new();
+        let mut closed_views = Vec::new();
         for id in candidates {
-            let eligible = self.buffers.get(&id).is_some_and(|b| b.transient)
+            if !self.buffers.contains_key(&id) {
+                continue;
+            }
+            // Hidden previews of a buffer that has other views close alone.
+            for view_id in self.views_presenting(id) {
+                let hidden = self.views[&view_id].transient
+                    && !self.viewports.values().any(|v| v.view_id == view_id);
+                if hidden && self.close_view(view_id) {
+                    closed_views.push(view_id);
+                }
+            }
+            let eligible = self.buffer_is_transient(id)
                 && !self.close_would_orphan_unsaved(id)
                 // `shows`, not `binds`: a patch's viewers are watching the *view*, and no element
                 // windows it, so asking only about bindings said "nothing is showing this" about
@@ -1718,11 +1891,29 @@ impl ServerState {
                 stopped.push(key);
             }
         }
-        (closed, stopped)
+        (closed, stopped, closed_views)
+    }
+
+    /// Close one view of a buffer that has others — the file's reader beside its editor — leaving
+    /// the buffer and its other views alone: the view, the viewports presenting it, and its scroll
+    /// memories go. `false` when the view is its buffer's only one, which is a buffer close
+    /// ([`Self::close_buffer`]), or when it names no view.
+    pub fn close_view(&mut self, id: ViewId) -> bool {
+        let Some(buffer_id) = self.try_presenting_buffer(id) else {
+            return false;
+        };
+        if self.views_presenting(buffer_id).len() < 2 {
+            return false;
+        }
+        self.drop_view_from_mru(id);
+        self.views.remove(&id);
+        self.viewports.retain(|_, v| v.view_id != id);
+        self.last_scroll.retain(|(_, v), _| *v != id);
+        true
     }
 
     /// Delete a loaded workspace's in-memory state: drop the workspace entry and close every buffer
-    /// that belonged to it, tearing down all per-buffer state (same teardown as `buffer/close` /
+    /// that belonged to it, tearing down all per-buffer state (same teardown as `view/close` /
     /// `workspace/remove_root`). Returns the closed buffer ids. The caller is responsible for the
     /// refusal checks ([`Self::workspace_active_anywhere`], dirty buffers) and for removing the
     /// on-disk config. A no-op for the workspace entry when it was never loaded; still closes any
@@ -1738,8 +1929,8 @@ impl ServerState {
     }
 
     pub fn allocate_buffer_id(&mut self) -> BufferId {
-        let id = self.next_buffer_id;
-        self.next_buffer_id += 1;
+        let id = self.next_id;
+        self.next_id += 1;
         id
     }
 
@@ -1840,26 +2031,62 @@ impl ServerState {
         self.nav_history.remove(&client_id);
     }
 
-    /// Bump `buffer_id` to the front of its workspace's MRU. Called from `buffer/open` every time
-    /// any client lands on a buffer — fresh open, reopen, or attach-by-id. No-op if the buffer
-    /// has no recorded workspace (shouldn't happen for live buffers but the lookup is defensive).
+    /// Bump the view `buffer_id` presents — its most recently used one, which is the one an open
+    /// of it just presented — to the front of its workspace's MRU. Called from `view/open` every
+    /// time any client lands on a buffer: fresh open, reopen, or attach-by-id. No-op if the
+    /// buffer has no recorded workspace (shouldn't happen for live buffers but the lookup is
+    /// defensive).
     pub fn touch_mru(&mut self, buffer_id: BufferId) {
+        if let Some(view) = self.view_presenting(buffer_id) {
+            self.touch_mru_view(view);
+        }
+    }
+
+    /// Bump `view` to the front of its workspace's MRU.
+    pub fn touch_mru_view(&mut self, view: ViewId) {
+        let Some(buffer_id) = self.try_presenting_buffer(view) else {
+            return;
+        };
         let Some(workspace_name) = self.buffer_workspaces.get(&buffer_id).cloned() else {
             return;
         };
         let Some(workspace) = self.workspaces.get_mut(&workspace_name) else {
             return;
         };
-        workspace.mru_buffers.retain(|&b| b != buffer_id);
-        workspace.mru_buffers.push_front(buffer_id);
+        workspace.mru_views.retain(|&v| v != view);
+        workspace.mru_views.push_front(view);
     }
 
-    /// Drop `buffer_id` from every workspace's MRU. Called from `buffer/close` so a closed buffer
-    /// doesn't reappear at the top of the picker on the next open.
+    /// Drop every view of `buffer_id` from every workspace's MRU. Called from `view/close` so a
+    /// closed buffer doesn't reappear at the top of the picker on the next open.
     pub fn drop_buffer_from_mru(&mut self, buffer_id: BufferId) {
+        let views = self.views_presenting(buffer_id);
         for workspace in self.workspaces.values_mut() {
-            workspace.mru_buffers.retain(|&b| b != buffer_id);
+            workspace.mru_views.retain(|v| !views.contains(v));
         }
+    }
+
+    /// Drop one view from every workspace's MRU — a sibling closed on its own.
+    pub fn drop_view_from_mru(&mut self, view: ViewId) {
+        for workspace in self.workspaces.values_mut() {
+            workspace.mru_views.retain(|&v| v != view);
+        }
+    }
+
+    /// `workspace_name`'s most recently used **live** view, if any — where a close lands and where
+    /// activation lands.
+    pub fn mru_view(&self, workspace_name: &str) -> Option<ViewId> {
+        self.workspaces
+            .get(workspace_name)?
+            .mru_views
+            .iter()
+            .copied()
+            .find(|v| self.views.contains_key(v))
+    }
+
+    /// The buffer of [`Self::mru_view`].
+    pub fn mru_buffer(&self, workspace_name: &str) -> Option<BufferId> {
+        self.try_presenting_buffer(self.mru_view(workspace_name)?)
     }
 
     /// The buffers to persist for `workspace_name`, most-recently-used first: the workspace's live
@@ -1878,58 +2105,71 @@ impl ServerState {
     /// to persist one. That's the whole gate — a diff you glanced at from the log picker is a
     /// preview and stays out, a diff you pinned is somewhere you were working. Keyed by
     /// `VirtualSource::key`, which is stable across restarts (a repo id is its canonical workdir).
-    pub fn session_buffers(&self, workspace_name: &str) -> Vec<crate::config::SessionBuffer> {
-        use crate::config::SessionBuffer;
+    pub fn session_views(&self, workspace_name: &str) -> Vec<crate::config::SessionView> {
+        use crate::config::SessionView;
         let Some(workspace) = self.workspaces.get(workspace_name) else {
             return Vec::new();
         };
-        let mut out: Vec<SessionBuffer> = Vec::new();
-        let mut seen_paths: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+        let mut out: Vec<SessionView> = Vec::new();
+        // A file is persisted per **view**: its editor and its reader are two entries, each kept
+        // on its own. Scratches and revisions have one view and are keyed as before.
+        let mut seen_files: std::collections::HashSet<(PathBuf, ViewKind)> =
+            std::collections::HashSet::new();
         let mut seen_scratch: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut seen_virtual: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for id in &workspace.mru_buffers {
-            let Some(buf) = self.buffers.get(id) else {
+        for view_id in &workspace.mru_views {
+            let Some(view) = self.views.get(view_id) else {
                 continue;
             };
-            if buf.transient {
+            if view.transient {
                 continue;
             }
+            let id = view.presenting;
+            let Some(buf) = self.buffers.get(&id) else {
+                continue;
+            };
             let Some(doc) = self.documents.get(&buf.document) else {
                 continue;
             };
             if let Some(path) = doc.canonical_path.as_deref() {
-                if seen_paths.insert(path) {
-                    out.push(SessionBuffer::File {
-                        path: path.to_path_buf(),
-                    });
+                // A view a driver built over a file — one with no kind of its own — is the
+                // file's editor, which is what selecting its row opens.
+                let kind = view.kind().unwrap_or(ViewKind::Editor);
+                if seen_files.insert((path.to_path_buf(), kind)) {
+                    out.push(SessionView::file(path.to_path_buf(), kind));
                 }
             } else if let Some(source) = doc.virtual_source.as_ref() {
                 let key = source.target.key();
                 if seen_virtual.insert(key.clone()) {
-                    out.push(SessionBuffer::Virtual { key });
+                    out.push(SessionView::Virtual { key });
                 }
             } else if let Some(number) = buf.scratch_number {
                 // Only dirty scratches carry content worth restoring (and therefore a backup).
                 if doc.dirty && seen_scratch.insert(number) {
-                    out.push(SessionBuffer::Scratch { number });
+                    out.push(SessionView::Scratch { number });
                 }
             }
         }
-        for d in &workspace.dormant_buffers {
+        // A path with a live buffer supersedes its dormant rows whatever kind they name: the live
+        // buffer's kept views are what is persisted for it, and any row it did not absorb is stale.
+        let live_paths: std::collections::HashSet<PathBuf> =
+            seen_files.iter().map(|(path, _)| path.clone()).collect();
+        for d in &workspace.dormant_views {
             match &d.source {
                 DormantSource::File(path) => {
-                    if seen_paths.insert(path.as_path()) {
-                        out.push(SessionBuffer::File { path: path.clone() });
+                    let kind = d.kind.unwrap_or(ViewKind::Editor);
+                    if !live_paths.contains(path) && seen_files.insert((path.clone(), kind)) {
+                        out.push(SessionView::file(path.clone(), kind));
                     }
                 }
                 DormantSource::Scratch { number } => {
                     if seen_scratch.insert(*number) {
-                        out.push(SessionBuffer::Scratch { number: *number });
+                        out.push(SessionView::Scratch { number: *number });
                     }
                 }
                 DormantSource::Virtual { key } => {
                     if seen_virtual.insert(key.clone()) {
-                        out.push(SessionBuffer::Virtual { key: key.clone() });
+                        out.push(SessionView::Virtual { key: key.clone() });
                     }
                 }
             }
@@ -1937,24 +2177,51 @@ impl ServerState {
         out
     }
 
-    /// Remove the dormant entry for `canonical` from `workspace_name`, if present. Called when a live
-    /// buffer for that path opens, so the now-loaded file doesn't also show as a dormant row.
-    pub fn promote_dormant(&mut self, workspace_name: &str, canonical: &Path) {
+    /// Remove the dormant entries for `canonical` from `workspace_name`, returning the kinds they
+    /// would have materialised as. Called when a live buffer for that path opens, so the
+    /// now-loaded file doesn't also show as dormant rows — and so the caller can give the buffer
+    /// the views the entries stood for: a reader you kept comes back as a kept reader beside the
+    /// editor the open made, not as a row that vanished.
+    pub fn promote_dormant(
+        &mut self,
+        workspace_name: &str,
+        canonical: &Path,
+    ) -> Vec<Option<ViewKind>> {
+        let mut kinds = Vec::new();
         if let Some(workspace) = self.workspaces.get_mut(workspace_name) {
-            workspace
-                .dormant_buffers
-                .retain(|d| d.path() != Some(canonical));
+            workspace.dormant_views.retain(|d| {
+                if d.path() == Some(canonical) {
+                    kinds.push(d.kind);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        kinds
+    }
+
+    /// Give `buffer_id` the kept views its dormant entries stood for — the kinds
+    /// [`Self::promote_dormant`] returned — beside whatever view its open made. An entry with no
+    /// kind is the editor: what a session written before views had kinds meant, and a plain file's
+    /// only view. Every one of them was kept, or it would not have been in the session to come
+    /// back from, so every one comes back kept — whichever open materialised the file, a preview
+    /// bound by a review included.
+    pub fn restore_dormant_views(&mut self, buffer_id: BufferId, kinds: Vec<Option<ViewKind>>) {
+        for kind in kinds.into_iter() {
+            let kind = kind.unwrap_or(ViewKind::Editor);
+            self.open_view_as(buffer_id, Some(kind), Some(false));
         }
     }
 
-    /// Restore the dormant list's invariant in `workspace_name`: **at most one entry per path, and
-    /// none for a path that already has a live buffer.**
+    /// Restore the dormant list's invariant in `workspace_name`: **at most one entry per path and
+    /// kind, and none for a path that already has a live buffer.**
     ///
     /// `promote_dormant` keeps this at the one moment a path is materialised, which is enough while
     /// entries only ever arrive one at a time. A worktree rebind adds a whole set at once *and*
     /// rewrites the paths of the entries already there, so two of them can land on the same file —
     /// and a live buffer opened by another client can appear beside one. Both show up as a
-    /// duplicated row in the buffers picker.
+    /// duplicated row in the view picker.
     ///
     /// Enforced here rather than trusted at each call site: the rebind has several routes in
     /// (remap, extend, another client's open racing the landing), and an invariant that has to hold
@@ -1969,32 +2236,53 @@ impl ServerState {
         let Some(workspace) = self.workspaces.get_mut(workspace_name) else {
             return;
         };
-        let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        workspace.dormant_buffers.retain(|d| match d.path() {
+        let mut seen: std::collections::HashSet<(PathBuf, Option<ViewKind>)> =
+            std::collections::HashSet::new();
+        workspace.dormant_views.retain(|d| match d.path() {
             // A scratch has no path to collide on; it is identified by its number.
             None => true,
-            Some(path) => !live.contains(path) && seen.insert(path.to_path_buf()),
+            Some(path) => !live.contains(path) && seen.insert((path.to_path_buf(), d.kind)),
         });
     }
 
     /// Remove and return the dormant buffer with `id` in `workspace_name`, if any. Used by
-    /// `buffer/open`'s by-id path to materialize a dormant buffer the picker selected — the caller
-    /// inspects [`DormantBuffer::source`] to decide whether to load a file or rebuild a scratch.
-    pub fn take_dormant(&mut self, workspace_name: &str, id: BufferId) -> Option<DormantBuffer> {
+    /// `view/open`'s by-id path to materialize a dormant buffer the picker selected — the caller
+    /// inspects [`DormantView::source`] to decide whether to load a file or rebuild a scratch.
+    /// The reserved buffer id of `workspace_name`'s dormant row whose reserved view is `view`.
+    pub fn dormant_buffer_of_view(&self, workspace_name: &str, view: ViewId) -> Option<BufferId> {
+        self.workspaces
+            .get(workspace_name)?
+            .dormant_views
+            .iter()
+            .find(|d| d.view == view)
+            .map(|d| d.id)
+    }
+
+    pub fn take_dormant(&mut self, workspace_name: &str, id: BufferId) -> Option<DormantView> {
         let workspace = self.workspaces.get_mut(workspace_name)?;
-        let pos = workspace.dormant_buffers.iter().position(|d| d.id == id)?;
-        Some(workspace.dormant_buffers.remove(pos))
+        let pos = workspace.dormant_views.iter().position(|d| d.id == id)?;
+        Some(workspace.dormant_views.remove(pos))
     }
 
     /// The id of `workspace_name`'s most-recently-used dormant buffer (front of the list), if any.
     /// Used as the activation landing target when the workspace has no live MRU buffer yet (a cold
     /// restore after a restart).
-    pub fn first_dormant_id(&self, workspace_name: &str) -> Option<BufferId> {
+    pub fn first_dormant_buffer(&self, workspace_name: &str) -> Option<BufferId> {
         self.workspaces
             .get(workspace_name)?
-            .dormant_buffers
+            .dormant_views
             .first()
             .map(|d| d.id)
+    }
+
+    /// The reserved view of `workspace_name`'s most recently used dormant row — what a client
+    /// lands on after a cold restore, when nothing is live yet.
+    pub fn first_dormant_view(&self, workspace_name: &str) -> Option<ViewId> {
+        self.workspaces
+            .get(workspace_name)?
+            .dormant_views
+            .first()
+            .map(|d| d.view)
     }
 
     /// Drop the selection-expansion history for one client+buffer. Called from every cursor RPC
@@ -2046,7 +2334,7 @@ impl ServerState {
 
     /// Locate an already-open buffer for the given canonical path, if any. Scoped to a workspace —
     /// two workspaces can independently open the same file as separate buffers, and a path lookup
-    /// during `buffer/open` for workspace A shouldn't latch onto workspace B's existing buffer.
+    /// during `view/open` for workspace A shouldn't latch onto workspace B's existing buffer.
     pub fn buffer_for_path_in_workspace(
         &self,
         workspace_name: &str,
@@ -2126,7 +2414,7 @@ impl ServerState {
         // bookkeeping). Cursors / motion history / tree-selection / virtual-col / scroll are
         // *preserved* — they're the user's place-in-the-buffer memory, and re-attaching to a
         // buffer on workspace re-entry should restore them. The MRU is preserved for the same
-        // reason: the buffer picker filters by active workspace, so cross-workspace MRU entries
+        // reason: the view picker filters by active workspace, so cross-workspace MRU entries
         // don't leak into the UI, but they still let us reattach to "the buffer you last had"
         // when you come back.
         self.searches.retain(|(c, b), _| !in_proj(c, b));
@@ -2163,14 +2451,6 @@ pub struct Buffer {
     /// stay small, stay stable for the buffer's life, and a freed number gets reused. `None` for
     /// file-backed buffers (which display their path instead).
     pub scratch_number: Option<u32>,
-    /// Transient buffers auto-close once no viewport shows them anymore (see
-    /// `viewport_subscribe` / `close_orphaned_transients`). Set at creation when the opening
-    /// client asked for it (picker/goto-def navigation, the bootstrap scratch); cleared —
-    /// "promoted" — by the buffer's first edit, a save, or a user-initiated reload. Never set
-    /// again after creation. Per-buffer, not per-document: an edit arriving through a *sibling*
-    /// buffer doesn't promote this one — if it goes hidden it just detaches, and the content
-    /// survives on the document.
-    pub transient: bool,
 }
 
 /// The shared content of one open file (or scratch): everything derived from *what the text is*
@@ -2189,7 +2469,7 @@ pub struct VirtualSource {
     /// of the canonical-path sharing key.
     pub target: VirtualTarget,
     /// Display name (`abc1234 — subject`, `abc1234:src/main.rs`, `Working changes`), shipped as
-    /// `BufferOpenResult::title`.
+    /// `ViewOpenResult::title`.
     pub title: String,
 }
 
@@ -2584,7 +2864,7 @@ impl Document {
     }
 
     /// Empty document with a target file path attached but no file on disk yet. Used by
-    /// `buffer/open` with `create_if_missing: true` — the file is created by `save_to_disk`
+    /// `view/open` with `create_if_missing: true` — the file is created by `save_to_disk`
     /// on the first save. Language is auto-detected from the extension if not provided.
     pub fn new_at_path(id: DocumentId, canonical: PathBuf, language: Option<String>) -> Self {
         let text = ropey::Rope::new();
@@ -3370,12 +3650,27 @@ pub struct Viewport {
 
 /// What a view is composed of: its elements, in order, each windowing some buffer.
 ///
-/// The entity a client opens, switches between and closes. It is presented by one buffer — the
-/// key it sits under — and for an ordinary file that buffer is all it is: one element over the
-/// whole of it. A patch is a tree of elements over the files it describes, built by its driver.
+/// The entity a client opens, switches between and closes. It is presented by one buffer — its
+/// own document — and for an ordinary file that buffer is all it is: one element over the whole
+/// of it. A patch is a tree of elements over the files it describes, built by its driver. Which
+/// buffer presents a view is a fact recorded here and asked of the table
+/// ([`ServerState::presenting_buffer`]), never derived from the view's id.
 #[derive(Debug, Clone)]
 pub struct View {
+    /// The buffer presenting this view: its own document. For an ordinary file, the file; for a
+    /// patch, the generated text, which no element need window.
+    pub presenting: BufferId,
     pub elements: Vec<ElementBinding>,
+    /// When this view was last opened or subscribed to, on [`ServerState::view_clock`]; `0` for
+    /// one nothing has shown yet. Orders a buffer's views by recency.
+    pub last_used: u64,
+    /// A preview: closes itself once no viewport shows it ([`ServerState::close_orphaned_transients`]),
+    /// and its buffer goes with its last view. Set at creation when the open asked for it — a
+    /// picker or goto-definition navigation, a `Space u` sibling — and cleared, "promoted", by an
+    /// edit made in it, a save, a user-initiated reload, or `Space k`. Never set again after
+    /// creation except by `Space k`. Per **view**: keeping a file's editor leaves a reader you
+    /// only glanced at to close itself.
+    pub transient: bool,
 }
 
 impl View {
@@ -3383,6 +3678,9 @@ impl View {
     /// buffer's length as it changes.
     pub fn whole(buffer_id: BufferId) -> Self {
         View {
+            presenting: buffer_id,
+            last_used: 0,
+            transient: false,
             elements: vec![ElementBinding {
                 buffer_id,
                 lines: ElementLines::Whole,
@@ -3398,6 +3696,9 @@ impl View {
     /// client's subdivision of that one element; the server sees a file, and the cursor in it.
     pub fn reader(buffer_id: BufferId) -> Self {
         View {
+            presenting: buffer_id,
+            last_used: 0,
+            transient: false,
             elements: vec![ElementBinding {
                 buffer_id,
                 lines: ElementLines::Whole,
@@ -3434,6 +3735,9 @@ impl View {
     /// `OwnDocument` extent is told which buffer it is a slice of.
     pub fn from_layout(view_buffer: BufferId, layout: Vec<ElementLayout>) -> Self {
         View {
+            presenting: view_buffer,
+            last_used: 0,
+            transient: false,
             elements: layout.iter().map(|l| l.bind(view_buffer)).collect(),
         }
     }
@@ -3442,6 +3746,9 @@ impl View {
     /// between them — for a generated document no driver built a view over.
     pub fn over_generated(view_buffer: BufferId, g: &crate::patch::GeneratedPatch) -> Self {
         View {
+            presenting: view_buffer,
+            last_used: 0,
+            transient: false,
             elements: g
                 .decorations
                 .elements
@@ -3816,7 +4123,7 @@ impl Viewport {
     /// buffers its elements window. The right question for anything fanning out *to viewers*,
     /// because a patch's viewers are watching the view even though no element windows it.
     pub fn shows(&self, view: &View, id: BufferId) -> bool {
-        self.view_id.presenting_buffer() == id || view.binds(id)
+        view.presenting == id || view.binds(id)
     }
 
     /// Every buffer this viewport shows, each named once — [`Self::shows`] enumerated rather than
@@ -3828,7 +4135,7 @@ impl Viewport {
     /// navigating away from working changes left the patch document and every unfocused element's
     /// buffer behind with nothing showing them and nothing looking for them.
     pub fn shown_buffers(&self, view: &View) -> Vec<BufferId> {
-        let mut out = vec![self.view_id.presenting_buffer()];
+        let mut out = vec![view.presenting];
         for e in &view.elements {
             if !out.contains(&e.buffer_id) {
                 out.push(e.buffer_id);
@@ -3926,15 +4233,16 @@ mod view_layout_tests {
             chrome_above: Default::default(),
             decorations: None,
         };
-        let view = file(3, "patch\n");
+        let patch = file(3, "patch\n");
         s.set_view_layout(
-            view,
+            patch,
             vec![bound(a, 10..14), bound(a, 30..34), bound(b, 10..14)],
         );
+        let view = s.view_presenting(patch).expect("the layout's view");
         let vp = Viewport {
             id: 1,
             client_id: uuid::Uuid::new_v4(),
-            view_id: ViewId(view),
+            view_id: view,
             rows: 10,
             overscan_rows: 0,
             wrap: WrapMode::None,
@@ -3952,7 +4260,7 @@ mod view_layout_tests {
         // Two lines typed into the first hunk of `a`.
         s.shift_element_extents(a, LineShift { at: 12, delta: 2 });
         assert_eq!(
-            extents(&s.view(ViewId(view)).elements),
+            extents(&s.view(view).elements),
             vec![(10, 16), (32, 36), (10, 14)],
             "the hunk grew, the one below it slid, the other file's did not move"
         );
@@ -3971,7 +4279,7 @@ mod view_layout_tests {
         // A deletion below every element of `a` changes nothing.
         s.shift_element_extents(a, LineShift { at: 38, delta: -1 });
         assert_eq!(
-            extents(&s.view(ViewId(view)).elements),
+            extents(&s.view(view).elements),
             vec![(10, 16), (32, 36), (10, 14)]
         );
     }
@@ -4203,8 +4511,8 @@ mod workspace_state_tests {
             base_paths: None,
             paths: paths.clone(),
             workspace_index: Arc::new(WorkspaceIndex::new(paths)),
-            mru_buffers: VecDeque::new(),
-            dormant_buffers: Vec::new(),
+            mru_views: VecDeque::new(),
+            dormant_views: Vec::new(),
             jumplist: None,
             projects: Vec::new(),
         }
@@ -4341,38 +4649,42 @@ mod workspace_state_tests {
         // Dormant: a fresh path, plus one that duplicates a live buffer's path (must be dropped).
         let d1 = s.allocate_buffer_id();
         let d_dup = s.allocate_buffer_id();
-        s.workspaces.get_mut("p").unwrap().dormant_buffers = vec![
-            DormantBuffer {
+        s.workspaces.get_mut("p").unwrap().dormant_views = vec![
+            DormantView {
                 id: d1,
+                view: ViewId(d1),
+                kind: None,
                 source: DormantSource::File(PathBuf::from("/p/c.rs")),
             },
-            DormantBuffer {
+            DormantView {
                 id: d_dup,
+                view: ViewId(d_dup),
+                kind: None,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
             },
         ];
 
-        use crate::config::SessionBuffer;
+        use crate::config::SessionView;
         assert_eq!(
-            s.session_buffers("p"),
+            s.session_views("p"),
             vec![
                 // clean scratch (2) and preview.rs (transient) are both excluded; the dirty
                 // scratch (MRU front) is kept.
-                SessionBuffer::Scratch { number: 1 },
-                SessionBuffer::File {
+                SessionView::Scratch { number: 1 },
+                SessionView::Editor {
                     path: PathBuf::from("/p/b.rs")
-                }, // most-recent non-transient file
-                SessionBuffer::File {
+                }, // most-recent non-transient file, persisted as the view it is
+                SessionView::Editor {
                     path: PathBuf::from("/p/a.rs")
                 },
-                SessionBuffer::File {
+                SessionView::Editor {
                     path: PathBuf::from("/p/c.rs")
                 }, // dormant; /p/a.rs dropped as a dup of the live buffer
             ]
         );
     }
 
-    /// The dormant-registry helpers: `first_dormant_id` is the landing target (front of the list),
+    /// The dormant-registry helpers: `first_dormant_buffer` is the landing target (front of the list),
     /// `take_dormant` removes and returns the entry by id (materialization), and `promote_dormant`
     /// drops a file path once it's loaded.
     #[test]
@@ -4382,18 +4694,26 @@ mod workspace_state_tests {
             .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
         let d1 = s.allocate_buffer_id();
         let d2 = s.allocate_buffer_id();
-        s.workspaces.get_mut("p").unwrap().dormant_buffers = vec![
-            DormantBuffer {
+        s.workspaces.get_mut("p").unwrap().dormant_views = vec![
+            DormantView {
                 id: d1,
+                view: ViewId(d1),
+                kind: None,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
             },
-            DormantBuffer {
+            DormantView {
                 id: d2,
+                view: ViewId(d2),
+                kind: None,
                 source: DormantSource::File(PathBuf::from("/p/b.rs")),
             },
         ];
 
-        assert_eq!(s.first_dormant_id("p"), Some(d1), "front of the list lands");
+        assert_eq!(
+            s.first_dormant_buffer("p"),
+            Some(d1),
+            "front of the list lands"
+        );
         assert_eq!(
             s.take_dormant("p", d1).map(|d| d.source),
             Some(DormantSource::File(PathBuf::from("/p/a.rs")))
@@ -4402,10 +4722,10 @@ mod workspace_state_tests {
             s.take_dormant("p", d1).is_none(),
             "removed; a second take is empty"
         );
-        assert_eq!(s.first_dormant_id("p"), Some(d2));
+        assert_eq!(s.first_dormant_buffer("p"), Some(d2));
         s.promote_dormant("p", Path::new("/p/b.rs"));
         assert_eq!(
-            s.first_dormant_id("p"),
+            s.first_dormant_buffer("p"),
             None,
             "promotion empties the registry"
         );
@@ -4415,25 +4735,29 @@ mod workspace_state_tests {
     /// of the session's buffer list when it's what you were last editing, and that's what a restart
     /// lands you on.
     #[test]
-    fn first_dormant_id_includes_restored_scratches() {
+    fn first_dormant_buffer_includes_restored_scratches() {
         let mut s = ServerState::new();
         s.workspaces
             .insert("p".into(), workspace_entry("p", vec![PathBuf::from("/p")]));
         let scratch = s.allocate_buffer_id();
         let file = s.allocate_buffer_id();
-        s.workspaces.get_mut("p").unwrap().dormant_buffers = vec![
-            DormantBuffer {
+        s.workspaces.get_mut("p").unwrap().dormant_views = vec![
+            DormantView {
                 id: scratch,
+                view: ViewId(scratch),
+                kind: None,
                 source: DormantSource::Scratch { number: 1 },
             },
-            DormantBuffer {
+            DormantView {
                 id: file,
+                view: ViewId(file),
+                kind: None,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
             },
         ];
 
         assert_eq!(
-            s.first_dormant_id("p"),
+            s.first_dormant_buffer("p"),
             Some(scratch),
             "the scratch you were last editing lands, not the file behind it"
         );
@@ -4675,7 +4999,7 @@ mod workspace_state_tests {
             crate::config::WorkspaceSession {
                 contexts: Vec::new(),
                 last_activated_at: 1,
-                buffers: vec![crate::config::SessionBuffer::File {
+                views: vec![crate::config::SessionView::Editor {
                     path: PathBuf::from("/p/a.rs"),
                 }],
             },
@@ -4847,12 +5171,13 @@ mod workspace_state_tests {
         s.clients.insert(client, sess);
         let viewed = s.register_ephemeral_workspace();
         let viewed_buffer = add_buffer(&mut s, &viewed, false);
+        let viewed_view = s.view_presenting(viewed_buffer).expect("a view per buffer");
         let viewport_id = s.allocate_viewport_id();
         s.viewports.insert(
             viewport_id,
             Viewport {
                 id: viewport_id,
-                view_id: ViewId(viewed_buffer),
+                view_id: viewed_view,
                 focused: 0,
                 client_id: uuid::Uuid::new_v4(),
                 rows: 24,
@@ -4866,7 +5191,7 @@ mod workspace_state_tests {
                 anchor: ScrollPosition::default(),
             },
         );
-        s.ensure_view(ViewId(viewed_buffer));
+        s.open_view(viewed_buffer);
 
         let (retired, closed, _stopped) = s.supersede_ephemeral_workspaces();
         assert_eq!(retired, vec![idle.clone()]);

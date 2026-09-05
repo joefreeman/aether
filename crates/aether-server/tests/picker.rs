@@ -2018,18 +2018,17 @@ async fn picker_reset_wipes_persisted_query() {
     drop(server);
 }
 
-// ---- buffer picker -----------------------------------------------------------------------------
+// ---- view picker -----------------------------------------------------------------------------
 
 /// MRU is per-client and the most-recent open lands at position 0. The first item is the
 /// "current" buffer; selecting it is the no-op switch.
 #[tokio::test]
 async fn buffers_picker_orders_by_mru_with_current_first() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let _: BufferOpenResult = send_request::<BufferOpen>(
+    let _: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("README.md".into()),
             language: None,
@@ -2039,11 +2038,10 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         },
     )
     .await;
-    let _: BufferOpenResult = send_request::<BufferOpen>(
+    let _: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/lib.rs".into()),
             language: None,
@@ -2053,11 +2051,10 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         },
     )
     .await;
-    let _: BufferOpenResult = send_request::<BufferOpen>(
+    let _: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
             language: None,
@@ -2073,7 +2070,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
@@ -2082,7 +2079,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         .items()
         .iter()
         .map(|i| {
-            let PickerItem::Buffer { display, .. } = i else {
+            let PickerItem::View { display, .. } = i else {
                 panic!("expected Buffer, got {i:?}")
             };
             display.as_str()
@@ -2096,7 +2093,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         .items()
         .iter()
         .map(|i| {
-            let PickerItem::Buffer {
+            let PickerItem::View {
                 path_index,
                 relative_path,
                 ..
@@ -2120,15 +2117,14 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
 }
 
 /// Selecting an item returns the buffer_id, which is the stable handle the client uses to
-/// attach via `buffer/open { buffer_id }`.
+/// attach via `view/open { buffer_id }`.
 #[tokio::test]
 async fn buffers_picker_select_returns_buffer_id() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
             language: None,
@@ -2143,7 +2139,7 @@ async fn buffers_picker_select_returns_buffer_id() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
@@ -2152,30 +2148,29 @@ async fn buffers_picker_select_returns_buffer_id() {
     let result: PickerSelectResult = send_request::<PickerSelect>(
         &mut ws,
         &PickerSelectParams {
-            kind: PickerKind::Buffers,
+            kind: PickerKind::Views,
             item,
         },
     )
     .await;
-    let PickerSelectResult::Buffer { buffer_id } = result else {
-        panic!("expected Buffer result, got {result:?}");
+    let PickerSelectResult::View { view_id } = result else {
+        panic!("expected View result, got {result:?}");
     };
-    assert_eq!(buffer_id, opened.buffer_id);
+    assert_eq!(view_id, opened.view_id);
 
     drop(server);
 }
 
-/// `buffer/open { buffer_id }` attaches to an already-open buffer without consulting paths —
-/// the path to a scratch buffer is `None`, and this is the only way to switch to it.
+/// `view/open { view_id }` presents an already-open view without consulting paths — the path to
+/// a scratch is `None`, and this is the only way to switch to it.
 #[tokio::test]
 async fn buffer_open_by_id_attaches_to_scratch() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
     // Scratch buffer: no path fields.
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -2187,11 +2182,10 @@ async fn buffer_open_by_id_attaches_to_scratch() {
     .await;
     assert!(scratch.path.is_none());
     // Open a file so the current buffer is different.
-    let _: BufferOpenResult = send_request::<BufferOpen>(
+    let _: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("README.md".into()),
             language: None,
@@ -2202,11 +2196,11 @@ async fn buffer_open_by_id_attaches_to_scratch() {
     )
     .await;
     // Now attach back to the scratch by id — no path fields needed.
-    let reattach: BufferOpenResult = send_request::<BufferOpen>(
+    let reattach: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: Some(scratch.buffer_id),
+            view_id: Some(scratch.view_id),
             path_index: None,
             relative_path: None,
             language: None,
@@ -2229,11 +2223,10 @@ async fn buffer_open_by_id_attaches_to_scratch() {
 #[tokio::test]
 async fn buffers_picker_renders_scratch_placeholder() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -2248,7 +2241,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
@@ -2262,7 +2255,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
         update
             .items()
             .iter()
-            .any(|i| matches!(i, PickerItem::Buffer { display, .. } if display == &expected)),
+            .any(|i| matches!(i, PickerItem::View { display, .. } if display == &expected)),
         "expected display {expected:?} in items: {:?}",
         update.items(),
     );
@@ -2277,9 +2270,8 @@ async fn buffers_picker_renders_scratch_placeholder() {
 async fn scratch_number_is_per_workspace_lowest_unused() {
     // `setup_with_buffer` opens a *file* buffer first, so a later scratch won't have buffer_id 1.
     let (server, mut ws, file_id) = setup_with_buffer("hello\n").await;
-    let scratch_params = || BufferOpenParams {
+    let scratch_params = || ViewOpenParams {
         transient: None,
-        buffer_id: None,
         path_index: None,
         relative_path: None,
         language: None,
@@ -2288,7 +2280,7 @@ async fn scratch_number_is_per_workspace_lowest_unused() {
         ..Default::default()
     };
 
-    let s1: BufferOpenResult = send_request::<BufferOpen>(&mut ws, &scratch_params()).await;
+    let s1: ViewOpenResult = send_request::<ViewOpen>(&mut ws, &scratch_params()).await;
     assert_ne!(s1.buffer_id, file_id);
     assert_eq!(
         s1.scratch_number,
@@ -2297,19 +2289,19 @@ async fn scratch_number_is_per_workspace_lowest_unused() {
         s1.buffer_id
     );
 
-    let s2: BufferOpenResult = send_request::<BufferOpen>(&mut ws, &scratch_params()).await;
+    let s2: ViewOpenResult = send_request::<ViewOpen>(&mut ws, &scratch_params()).await;
     assert_eq!(s2.scratch_number, Some(2));
 
     // Close #1; the next scratch reuses its freed number rather than taking #3.
-    let _: BufferCloseResult = send_request::<BufferClose>(
+    let _: ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(s1.buffer_id),
+        &ViewCloseParams {
+            view_id: s1.view_id,
             open_next: false,
         },
     )
     .await;
-    let s3: BufferOpenResult = send_request::<BufferOpen>(&mut ws, &scratch_params()).await;
+    let s3: ViewOpenResult = send_request::<ViewOpen>(&mut ws, &scratch_params()).await;
     assert_eq!(s3.scratch_number, Some(1), "freed #1 is reused, not #3");
 
     drop(server);
@@ -2320,11 +2312,10 @@ async fn scratch_number_is_per_workspace_lowest_unused() {
 #[tokio::test]
 async fn buffers_picker_pushes_on_dirty_transition() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
             language: None,
@@ -2339,7 +2330,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 24,
@@ -2353,7 +2344,6 @@ async fn buffers_picker_pushes_on_dirty_transition() {
             continuation_marker_width: 1,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2363,13 +2353,13 @@ async fn buffers_picker_pushes_on_dirty_transition() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
     let initial: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let initial_status = match initial.items().first().unwrap() {
-        PickerItem::Buffer { status, .. } => *status,
+        PickerItem::View { status, .. } => *status,
         other => panic!("expected Buffer, got {other:?}"),
     };
     assert_eq!(initial_status, BufferDirtyState::Clean);
@@ -2393,7 +2383,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
         .items()
         .iter()
         .find_map(|i| match i {
-            PickerItem::Buffer {
+            PickerItem::View {
                 buffer_id, status, ..
             } if *buffer_id == opened.buffer_id => Some(*status),
             _ => None,
@@ -2413,11 +2403,10 @@ async fn buffers_picker_pushes_on_dirty_transition() {
 #[tokio::test]
 async fn buffers_picker_no_push_on_subsequent_edits() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
             language: None,
@@ -2430,7 +2419,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 24,
@@ -2444,7 +2433,6 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
             continuation_marker_width: 1,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2453,7 +2441,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
@@ -2508,11 +2496,10 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
 #[tokio::test]
 async fn buffers_picker_pushes_on_save() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/main.rs".into()),
             language: None,
@@ -2525,7 +2512,7 @@ async fn buffers_picker_pushes_on_save() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 24,
@@ -2539,7 +2526,6 @@ async fn buffers_picker_pushes_on_save() {
             continuation_marker_width: 1,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2559,12 +2545,12 @@ async fn buffers_picker_pushes_on_save() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
     let dirty_view: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let saw_dirty = dirty_view.items().iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Unsaved));
+    let saw_dirty = dirty_view.items().iter().any(|i| matches!(i, PickerItem::View { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Unsaved));
     assert!(saw_dirty, "main.rs should be dirty after the edit");
 
     let _: BufferSaveResult = send_request::<BufferSave>(
@@ -2578,7 +2564,7 @@ async fn buffers_picker_pushes_on_save() {
     )
     .await;
     let clean: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let saw_clean = clean.items().iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Clean));
+    let saw_clean = clean.items().iter().any(|i| matches!(i, PickerItem::View { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Clean));
     assert!(
         saw_clean,
         "save should flip dirty back off and re-push the picker"
@@ -2592,11 +2578,10 @@ async fn buffers_picker_pushes_on_save() {
 #[tokio::test]
 async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let first: BufferOpenResult = send_request::<BufferOpen>(
+    let first: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -2606,11 +2591,10 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
         },
     )
     .await;
-    let second: BufferOpenResult = send_request::<BufferOpen>(
+    let second: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -2629,7 +2613,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
@@ -2638,7 +2622,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
         .items()
         .iter()
         .filter_map(|i| match i {
-            PickerItem::Buffer { buffer_id, .. } => Some(*buffer_id),
+            PickerItem::View { buffer_id, .. } => Some(*buffer_id),
             _ => None,
         })
         .collect();
@@ -2666,11 +2650,10 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
 async fn buffers_picker_mru_is_per_workspace_across_clients() {
     let (server, mut ws_a) = setup_buffer_picker_workspace().await;
     // Client A opens README first, then lib.rs — lib.rs is now most-recent in the workspace MRU.
-    let _: BufferOpenResult = send_request::<BufferOpen>(
+    let _: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws_a,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("README.md".into()),
             language: None,
@@ -2680,11 +2663,10 @@ async fn buffers_picker_mru_is_per_workspace_across_clients() {
         },
     )
     .await;
-    let lib_open: BufferOpenResult = send_request::<BufferOpen>(
+    let lib_open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws_a,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("src/lib.rs".into()),
             language: None,
@@ -2711,7 +2693,7 @@ async fn buffers_picker_mru_is_per_workspace_across_clients() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
@@ -2720,7 +2702,7 @@ async fn buffers_picker_mru_is_per_workspace_across_clients() {
         .items()
         .iter()
         .map(|i| {
-            let PickerItem::Buffer { buffer_id, .. } = i else {
+            let PickerItem::View { buffer_id, .. } = i else {
                 panic!("expected Buffer, got {i:?}")
             };
             *buffer_id
@@ -3291,7 +3273,7 @@ async fn picker_explorer_query_is_smartcase() {
 }
 
 /// Selecting a file in the explorer returns `PickerSelectResult::File { path }` with the
-/// absolute path the client should feed into `buffer/open`.
+/// absolute path the client should feed into `view/open`.
 #[tokio::test]
 async fn picker_explorer_select_file_returns_absolute_path() {
     let (server, mut ws, root) = setup_explorer_workspace().await;

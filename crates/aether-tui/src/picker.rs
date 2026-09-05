@@ -23,7 +23,7 @@ use std::collections::HashMap;
 /// `selected` is an index into `items` clamped to keep the highlight on-screen. We only round-trip
 /// when a selection move leaves the cached window — the core's `move_selection` recenters the
 /// fetch, and the shell's `sync_picker` reseeds the scroll so it stays smooth across the shift.
-/// Identity of the client's active entry in a freshly-opened Buffers / Workspaces picker — what
+/// Identity of the client's active entry in a freshly-opened Views / Workspaces picker — what
 /// the initial highlight should step over. See `PickerState::default_skip`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
@@ -60,7 +60,7 @@ pub struct PickerState {
     /// repeats the split group's header).
     pub groups: Vec<GroupSpan>,
     /// Whether this view renders as collapsible groups — mirrored from the core, which takes
-    /// it from `picker/view` rather than the kind (a Jumplist captured from the Files or Buffers
+    /// it from `picker/view` rather than the kind (a Jumplist captured from the Files or Views
     /// picker is flat). Drives the row-space math, the item indent and the sticky pin.
     pub collapsible: bool,
     /// First *view row* rendered by the picker pane — an index into the window's expanded rows
@@ -94,9 +94,9 @@ pub struct PickerState {
     /// `visible_start` so the highlight lands at the same row it was at when the picker closed.
     /// Lifecycle mirrors `resume_target`.
     pub resume_row_offset: Option<usize>,
-    /// When set (Buffers / Workspaces open), the first push with items moves the highlight to the
+    /// When set (Views / Workspaces open), the first push with items moves the highlight to the
     /// first item that *isn't* this client's active buffer/workspace — the thing you'd flip to.
-    /// An identity check, not "skip row 0": the list is shared MRU (Buffers) or name-ordered
+    /// An identity check, not "skip row 0": the list is shared MRU (Views) or name-ordered
     /// (Workspaces), so another client's activity can put any item at the top. Cleared once
     /// applied, or by a query change (the user is steering somewhere else).
     pub default_skip: Option<DefaultSkip>,
@@ -795,7 +795,7 @@ pub enum ItemKey<'a> {
         path_index: u32,
         relative_path: &'a str,
     },
-    Buffer(aether_protocol::BufferId),
+    View(aether_protocol::ViewId),
     Grep {
         path_index: u32,
         relative_path: &'a str,
@@ -886,7 +886,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             path_index: *path_index,
             relative_path: relative_path.as_str(),
         },
-        PickerItem::Buffer { buffer_id, .. } => ItemKey::Buffer(*buffer_id),
+        PickerItem::View { view_id, .. } => ItemKey::View(*view_id),
         PickerItem::GrepHit {
             path_index,
             relative_path,

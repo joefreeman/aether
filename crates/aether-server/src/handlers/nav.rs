@@ -51,7 +51,12 @@ pub fn nav_entry_for(
         .try_doc_of(buffer_id)
         .and_then(|d| d.virtual_source.as_ref())
         .map(|v| v.target.key());
+    // A buffer with no view yet records as one nothing names, which a step back then reopens by
+    // path — a view id is never `0`, so the entry cannot mistake a later view for its own.
+    let view_id =
+        crate::handlers::viewport::client_view_of(s, client_id, buffer_id).unwrap_or_default();
     Some(NavEntry {
+        view_id,
         buffer_id,
         path_index,
         relative_path,
@@ -69,7 +74,7 @@ pub async fn materialise_virtual_key(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     key: &str,
-) -> Option<Result<BufferOpenResult, RpcError>> {
+) -> Option<Result<ViewOpenResult, RpcError>> {
     let target = crate::state::VirtualTarget::parse_key(key)?;
     let params = aether_protocol::git::GitShowParams {
         repo_id: Some(target.repo_id),
@@ -88,14 +93,14 @@ pub async fn materialise_virtual_key(
     Some(shown.opened.ok_or_else(RpcError::nothing_to_show))
 }
 
-/// Open `entry`'s buffer (reopening a closed file by path, else attaching by id) and restore its
-/// full cursor/selection — clamped to the buffer's current bounds — *without* recording a motion
-/// in the per-buffer `z` history. Shared by `nav/back`/`nav/forward` and `nav/goto`.
+/// Open `entry`'s view (the view itself while it is still open, else its file by path) and restore
+/// its full cursor/selection — clamped to the buffer's current bounds — *without* recording a
+/// motion in the per-buffer `z` history. Shared by `nav/back`/`nav/forward` and `nav/goto`.
 async fn navigate_to(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     entry: NavEntry,
-) -> Result<BufferOpenResult, RpcError> {
+) -> Result<ViewOpenResult, RpcError> {
     // A materialised revision has no path to reopen from, so it regenerates from its key — which
     // is stable across restarts (a repo id is its canonical workdir). Re-showing an already-open
     // revision attaches to the same buffer, so this is a switch when it's still there and a
@@ -108,13 +113,16 @@ async fn navigate_to(
             return Ok(result);
         }
     }
-    // Prefer reopening by path (survives a close); fall back to the id (the only handle a scratch
-    // buffer has). `jump_to` is left unset — we restore the full selection below, not a point.
-    let by_path = entry.path_index.is_some() || entry.relative_path.is_some();
-    let open_params = BufferOpenParams {
-        buffer_id: if by_path { None } else { Some(entry.buffer_id) },
-        path_index: entry.path_index,
-        relative_path: entry.relative_path.clone(),
+    // The view itself while it is still open — that says which view of the file you were in, the
+    // reader or the editor, and is the only handle a scratch has. Once it has closed, the path
+    // reopens the file. `jump_to` is left unset — we restore the full selection below, not a
+    // point.
+    let view_is_live = state.lock().await.views.contains_key(&entry.view_id);
+    let by_path = !view_is_live && (entry.path_index.is_some() || entry.relative_path.is_some());
+    let open_params = ViewOpenParams {
+        view_id: view_is_live.then_some(entry.view_id),
+        path_index: entry.path_index.filter(|_| by_path),
+        relative_path: entry.relative_path.clone().filter(|_| by_path),
         absolute_path: None,
         language: None,
         create_if_missing: false,
@@ -125,8 +133,10 @@ async fn navigate_to(
         // buffer is still open (an open never demotes).
         transient: Some(true),
         record_nav_from: None,
+        element: None,
+        kind: None,
     };
-    let mut result = buffer_open(state, ctx, open_params).await?;
+    let mut result = view_open(state, ctx, open_params).await?;
 
     let mut s = state.lock().await;
     result.cursor = restore_cursor(&mut s, ctx.client_id, result.buffer_id, entry.cursor);
@@ -229,7 +239,8 @@ pub async fn nav_goto(
     params: NavGotoParams,
 ) -> Result<NavStepResult, RpcError> {
     let entry = NavEntry {
-        buffer_id: params.buffer_id.unwrap_or(0),
+        view_id: params.view_id.unwrap_or_default(),
+        buffer_id: 0,
         path_index: params.path_index,
         relative_path: params.relative_path,
         virtual_key: params.virtual_key,

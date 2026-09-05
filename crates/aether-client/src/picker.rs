@@ -217,7 +217,7 @@ pub struct PickerState {
     /// `PickerViewResult::collapsible`, and the authority every group-row decision reads (shells
     /// included) in place of [`PickerKind::collapsible`]. Seeded from the kind so the pre-response
     /// frame lays out the same way, then corrected by the first view: a Jumplist captured from the
-    /// Files or Buffers picker has no groups and renders flat.
+    /// Files or view picker has no groups and renders flat.
     pub collapsible: bool,
 }
 
@@ -1012,7 +1012,8 @@ impl PickerState {
 #[derive(PartialEq)]
 pub enum ItemKey<'a> {
     File(u32, &'a str),
-    Buffer(aether_protocol::BufferId),
+    /// A view: a file's editor and its reader are two rows.
+    View(aether_protocol::ViewId),
     Grep(u32, &'a str, u32, u32),
     GitChange(u32, &'a str, u32),
     Diagnostic(u32, u32),
@@ -1104,7 +1105,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             relative_path,
             ..
         } => ItemKey::File(*path_index, relative_path),
-        PickerItem::Buffer { buffer_id, .. } => ItemKey::Buffer(*buffer_id),
+        PickerItem::View { view_id, .. } => ItemKey::View(*view_id),
         PickerItem::GrepHit {
             path_index,
             relative_path,
@@ -1412,7 +1413,7 @@ mod tests {
                 (0..n)
                     .map(|i| PickerItem::Workspace {
                         name: format!("p{i}"),
-                        unsaved_buffers: 0,
+                        unsaved: 0,
                         match_indices: vec![],
                     })
                     .collect(),
@@ -1454,7 +1455,7 @@ mod tests {
         s.generation = 2;
         assert!(!s.apply_update(update(PickerKind::Files, 1, 0, 9, 9)));
         assert!(!s.apply_update(update(PickerKind::Files, 2, 50, 9, 9)));
-        assert!(!s.apply_update(update(PickerKind::Buffers, 2, 0, 9, 9)));
+        assert!(!s.apply_update(update(PickerKind::Views, 2, 0, 9, 9)));
         assert_eq!(s.items.len(), 5);
     }
 
@@ -1465,7 +1466,7 @@ mod tests {
     fn centered_item() -> PickerItem {
         PickerItem::Workspace {
             name: "p3".into(),
-            unsaved_buffers: 0,
+            unsaved: 0,
             match_indices: vec![],
         }
     }
@@ -1990,7 +1991,7 @@ mod tests {
         let mut s = PickerState::new(PickerKind::Grep);
         s.pending_center = Some(PickerItem::Workspace {
             name: "p7".into(),
-            unsaved_buffers: 0,
+            unsaved: 0,
             match_indices: vec![],
         });
         assert!(s.apply_update(update(PickerKind::Grep, 0, 0, 10, 10)));

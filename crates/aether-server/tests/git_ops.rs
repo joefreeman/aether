@@ -436,9 +436,9 @@ async fn setup_checkout_workspace() -> (
 
     let (mut server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
     server.keep_alive(dir);
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -590,9 +590,9 @@ async fn checkout_leaves_a_buffer_open_when_the_file_is_absent_on_the_new_branch
 
     // `only-on-main.rs` exists on main and not on feature.
     commit_file(&repo, "only-on-main.rs", "keep me\n");
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("only-on-main.rs".into()),
             ..Default::default()
@@ -919,9 +919,9 @@ async fn a_passing_hook_runs_and_its_rewrites_are_reconciled() {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -1017,9 +1017,9 @@ async fn an_empty_message_aborts_the_commit() {
 #[tokio::test]
 async fn prepare_commit_resolves_the_repo_from_the_buffer() {
     let (server, mut ws, root, _hooks) = setup_commit_workspace().await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -1336,7 +1336,7 @@ async fn git_log_rows_carry_what_git_show_needs() {
     assert_eq!(repo_id, &root.to_string_lossy().into_owned());
 
     // The hash the row carries is exactly what `git/show` resolves.
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(repo_id.clone()),
@@ -1483,7 +1483,7 @@ async fn git_log_centres_on_the_commit_the_active_buffer_shows() {
     commit_with_message(&repo, "a.rs", "third");
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let shown: BufferOpenResult = show_buffer(
+    let shown: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -2119,7 +2119,7 @@ async fn stash_picker_centres_on_the_entry_being_viewed() {
     assert_eq!(oids.len(), 2);
     let older = oids[1].clone();
 
-    let shown: BufferOpenResult = show_buffer(
+    let shown: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(repo_id.clone()),
@@ -2287,9 +2287,9 @@ fn someone_else_pushes(base: &std::path::Path, origin_url: &str, file: &str) {
 
 /// Open `rel` and return the git status riding its first window.
 async fn git_status_of(ws: &mut Ws, rel: &str) -> aether_protocol::git::GitBufferStatus {
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some(rel.into()),
             ..Default::default()
@@ -2299,7 +2299,7 @@ async fn git_status_of(ws: &mut Ws, rel: &str) -> aether_protocol::git::GitBuffe
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -2313,7 +2313,6 @@ async fn git_status_of(ws: &mut Ws, rel: &str) -> aether_protocol::git::GitBuffe
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2465,7 +2464,7 @@ async fn git_fetch_refuses_a_repo_the_workspace_cannot_reach() {
     // Fetching reaches the network on the user's behalf, so the repo has to be one they actually
     // opened. A repo the active workspace can't see at all is refused outright; the narrower
     // `REPO_NOT_WRITABLE` case (reachable through a buffer but under no root) can't be built here,
-    // because `buffer/open` gives such a buffer no baseline in the first place —
+    // because `view/open` gives such a buffer no baseline in the first place —
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
@@ -2790,9 +2789,9 @@ async fn setup_pull_workspace(
     );
 
     let (server, mut ws) = setup_repos_workspace(vec![ours.clone()]).await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()

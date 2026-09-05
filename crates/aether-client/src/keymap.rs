@@ -430,7 +430,7 @@ pub enum Action {
     /// Copy the active buffer's absolute (canonical) path to the system clipboard.
     CopyAbsolutePath,
     NewScratch,
-    CloseBuffer,
+    CloseView,
     /// `Space z` — open another window onto the same workspace: the GUI spawns a fresh detached `ae
     /// --gui` process dialling the same daemon; the web shell opens a new browser tab on the same
     /// URL. A new client lands on the workspace's MRU buffer (the one you're on), so it
@@ -441,13 +441,13 @@ pub enum Action {
     NewWindow,
     /// `Space Alt-z` — the share-link sibling of `Space z`: copy the web client's URL for the
     /// current buffer to the clipboard (`?workspace=&root=&file=` with the cursor as its `#L:C`
-    /// fragment; `?buffer=` for a scratch). The shell prepends its own base
+    /// fragment; `?view=` for a scratch). The shell prepends its own base
     /// ([`ShellAction::CopyWebUrl`]).
     CopyWebUrl,
 
     // ---- git (the verbs live on the `Space g` sub-leader; see [`KeyContext::LeaderGit`]) ----
     /// `Space i` — toggle the inline diff. On the leader rather than the git sub-leader because
-    /// it's a *view* of the buffer you're in, like `Space v`'s reading view, not an operation on
+    /// it's a *view* of the buffer you're in, like `Space u`'s reading view, not an operation on
     /// the repo: nothing about it writes, and it reads as "inline" rather than as a git verb.
     ToggleDiffView,
     /// `c` / `Alt-c` in Normal — cursor-local hunk navigation, so *not* behind `Space g`: they're
@@ -563,7 +563,7 @@ pub enum Action {
     /// `Space Alt-f` — open Files pre-scoped to the active buffer's directory, seeded as an
     /// ordinary directory filter chip (editable, composable, removable). The buffer-locked
     /// changes/diagnostics *modes* use a dedicated kind instead (see [`PickerKind::GitChangesFile`]).
-    OpenFilesInBufferDir,
+    OpenFilesInFileDir,
     /// `Space Alt-/` — open Grep with the query seeded from the buffer's selection: the
     /// workspace-scoped echo of Normal mode's `Alt-/` (search for selection), just as `Space /`
     /// echoes `/`. A fresh open, so the chip row starts empty like any other; an empty
@@ -599,7 +599,7 @@ pub enum Action {
     ToggleHints,
 
     // ---- markdown reading view ----
-    /// `Space v` — toggle the markdown reading view on the current buffer (markdown only;
+    /// `Space u` — toggle the markdown reading view on the current buffer (markdown only;
     /// remembered per buffer for the session).
     ToggleReadView,
     /// `j`/`k` — focus the next/previous block-grain element (the reading cursor; sends a
@@ -1028,7 +1028,7 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('x'), IgnoreShift(Mods::ALT), A::SelectLine(Direction::Backward), "Selection", "Select line upward"),
     // `%` is Shift-5, so the Shift modifier rides along (like `?`); IgnoreShift matches it in all
     // three clients (iced/web report `shift: true`, some terminals do too).
-    bind!(N, ch('%'), IgnoreShift(Mods::NONE), A::SelectAll, "Selection", "Select whole buffer"),
+    bind!(N, ch('%'), IgnoreShift(Mods::NONE), A::SelectAll, "Selection", "Select all"),
 
     // ---- mode transitions ----
     bind!(N, ch('i'), Exact(Mods::NONE), A::EnterInsert(InsertWhere::SelectionStart), "Mode", "Insert at selection start"),
@@ -1246,12 +1246,12 @@ static READ: &[Binding] = &[
     bind!(R, ch('z'), Exact(Mods::CTRL), A::Undo, "Edit", "Undo"),
     bind!(R, ch('z'), Exact(Mods::CTRL_ALT), A::Redo, "Edit", "Redo"),
     // The editor's adjust-the-value pair, re-declared because Read skips Global. Same action, so
-    // the same key does the same thing on either side of `Space v`.
+    // the same key does the same thing on either side of `Space u`.
     bind!(R, ch('a'), Exact(Mods::CTRL), A::IncrementNumber, "Edit", "Check task item"),
     bind!(R, ch('a'), Exact(Mods::CTRL_ALT), A::DecrementNumber, "Edit", "Uncheck task item"),
 
     // ---- to the editor (transitions; deliberately NOT recording a read-vs-source
-    // preference — Space v remains the "I prefer source" signal) ----
+    // preference — Space u remains the "I prefer source" signal) ----
     bind!(R, ch('i'), Exact(Mods::NONE), A::ReadInsert { at_end: false }, "Mode", "Edit: insert at block/selection start"),
     bind!(R, ch('a'), Exact(Mods::NONE), A::ReadInsert { at_end: true }, "Mode", "Edit: insert at block/selection end"),
     bind!(R, ch('e'), Exact(Mods::CTRL), A::ReadChange, "Edit", "Edit: rewrite selected block(s)"),
@@ -1318,9 +1318,9 @@ static READ: &[Binding] = &[
 #[rustfmt::skip]
 static LEADER: &[Binding] = &[
     bind!(L, ch('f'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Files), "Files", "Find files"),
-    bind!(L, ch('f'), Exact(Mods::ALT), A::OpenFilesInBufferDir, "Files", "Find files in buffer's directory"),
-    bind!(L, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Buffers), "Files", "Switch buffer"),
-    bind!(L, ch('b'), Exact(Mods::ALT), A::NewScratch, "Files", "New scratch buffer"),
+    bind!(L, ch('f'), Exact(Mods::ALT), A::OpenFilesInFileDir, "Files", "Find files in this file's directory"),
+    bind!(L, ch('v'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Views), "Files", "Switch view"),
+    bind!(L, ch('a'), Exact(Mods::NONE), A::NewScratch, "Files", "New scratch"),
     // `g` is the git sub-leader's prefix, so grep moved to `/` (and its selection-seeded sibling to
     // `Alt-/`) — the workspace-scoped echo of Normal's `/` and `Alt-/`. `Space Alt-g` is left
     // unbound on purpose: `g` should read as "git" with no exception to remember.
@@ -1330,7 +1330,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('e'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Explorer), "Files", "File explorer"),
     bind!(L, ch('e'), Exact(Mods::ALT), A::OpenExplorerAtRoot, "Files", "File explorer at workspace root"),
     bind!(L, ch('w'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Workspaces), "Workspace", "Switch workspace"),
-    bind!(L, ch('d'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics in current buffer"),
+    bind!(L, ch('d'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Diagnostics), "Code", "Diagnostics in this file"),
     bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::DiagnosticsWorkspace), "Code", "Workspace diagnostics"),
     bind!(L, ch('j'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Jumplist), "Navigation", "Jumplist"),
     bind!(L, ch('j'), Exact(Mods::ALT), A::ClearJumplist, "Navigation", "Clear jumplist"),
@@ -1365,18 +1365,18 @@ static LEADER: &[Binding] = &[
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
     bind!(L, ch('.'), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
     bind!(L, ch('y'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
-    bind!(L, ch('x'), Exact(Mods::NONE), A::CloseBuffer, "App", "Close buffer"),
-    bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close buffer"),
+    bind!(L, ch('x'), Exact(Mods::NONE), A::CloseView, "App", "Close view"),
+    bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close view"),
     bind!(L, ch('z'), Exact(Mods::NONE), A::NewWindow, "App", "Open another window"),
     bind!(L, ch('z'), Exact(Mods::ALT), A::CopyWebUrl, "App", "Copy web URL"),
     bind!(L, ch('w'), Exact(Mods::ALT), A::OpenPath, "App", "Open file by absolute path"),
     bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
-    bind!(L, ch('k'), Exact(Mods::NONE), A::ToggleKeep, "App", "Keep buffer (toggle transient)"),
+    bind!(L, ch('k'), Exact(Mods::NONE), A::ToggleKeep, "App", "Keep view (toggle transient)"),
     bind!(L, ch('k'), Exact(Mods::ALT), A::Reload, "App", "Reload from disk"),
     bind!(L, ch('p'), Exact(Mods::NONE), A::CopyRelativePath, "App", "Copy relative path"),
     bind!(L, ch('p'), Exact(Mods::ALT), A::CopyAbsolutePath, "App", "Copy absolute path"),
-    bind!(L, ch('v'), Exact(Mods::NONE), A::ToggleReadView, "Read", "Toggle Markdown reading view"),
+    bind!(L, ch('u'), Exact(Mods::NONE), A::ToggleReadView, "Read", "Toggle Markdown reader / editor"),
     // The inline diff sits beside the reading view, not under `Space g`: both are ways of looking
     // at the buffer you're already in, and neither writes anything. `i` for *inline* — `d` on the
     // git sub-leader now abandons a stopped merge, which is not a key to leave a view toggle's
@@ -2021,14 +2021,13 @@ mod tests {
         assert!(git(ch('j'), Mods::NONE).is_none());
 
         // The old single-key homes stay free — a stale reflex does nothing rather than something
-        // else (`t` commit, `u` uncommit). `t` is the exception, spent on hover: an inert landing,
-        // the same argument that let the keybindings picker reclaim `y` below.
-        for (code, mods) in [(ch('t'), Mods::ALT), (ch('u'), Mods::NONE)] {
-            assert!(
-                lookup(KeyContext::Leader, code, mods).is_none(),
-                "{code:?} + {mods:?} must be free on the leader"
-            );
-        }
+        // else (`Alt-t` commit). `t` and `u` are the exceptions, spent on hover and on the reader
+        // toggle: inert landings, the same argument that let the keybindings picker reclaim `y`
+        // below.
+        assert!(
+            lookup(KeyContext::Leader, ch('t'), Mods::ALT).is_none(),
+            "Alt-t must be free on the leader"
+        );
         // `y` (once branches) has since been reclaimed by the keybindings picker. Acceptable
         // because the landing is inert: a stale reflex opens a searchable list of every binding,
         // which answers the question a stale reflex is really asking.

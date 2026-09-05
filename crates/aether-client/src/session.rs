@@ -5,7 +5,7 @@
 use super::effect::{Effects, ToastKind};
 use super::keymap::Action;
 use super::picker::PickerState;
-use aether_protocol::buffer::{BufferOpenResult, BufferReloadResult, BufferSaveResult};
+use aether_protocol::buffer::{BufferReloadResult, BufferSaveResult};
 use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
 use aether_protocol::git::{CommitInfo, GitOperation, GitRepoOperation};
@@ -15,6 +15,7 @@ use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus, Symb
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::SearchSummary;
 use aether_protocol::settings::{MarkdownWidth, ThemeMode};
+use aether_protocol::view::ViewOpenResult;
 use aether_protocol::viewport::{DiagnosticSeverity, ScrollPosition, Window, WrapMode};
 use aether_protocol::workspace::{WorkspaceInfo, WorkspaceProject};
 use aether_protocol::ViewId;
@@ -77,6 +78,9 @@ pub fn boot_backoff(attempt: u32) -> std::time::Duration {
 #[derive(Clone, Debug)]
 pub struct BufferInfo {
     pub buffer_id: BufferId,
+    /// The view the open that produced this presented — see
+    /// [`aether_protocol::view::ViewOpenResult::view_id`].
+    pub view_id: ViewId,
     pub label: String,
     /// Canonical absolute path on disk; `None` for scratch buffers.
     pub path: Option<String>,
@@ -85,7 +89,6 @@ pub struct BufferInfo {
     pub saved_revision: u64,
     pub cursor: CursorState,
     pub scroll: Option<ScrollPosition>,
-    pub transient: bool,
     /// The language server backing this buffer, if any — keys `lsp/status_changed` updates.
     pub lsp_server: Option<LspServerRef>,
     /// The buffer refuses edits, saves and reloads — a *virtual* buffer holding a revision's
@@ -594,7 +597,7 @@ pub enum AppSettingId {
     SoftWrap,
     Ligatures,
     /// Size of the file text itself.
-    BufferFontSize,
+    EditorFontSize,
     /// Size of everything around it — status bar, pickers, dialogs.
     UiFontSize,
     Hints,
@@ -609,7 +612,7 @@ pub enum AppSettingId {
 }
 
 /// Font-size presets the two font-size rows step through (px). Both defaults
-/// ([`aether_protocol::settings::default_buffer_font_size`] and `default_ui_font_size`) are in the
+/// ([`aether_protocol::settings::default_editor_font_size`] and `default_ui_font_size`) are in the
 /// list, so a stored value always lands on a preset and the row's "current" maps cleanly to an
 /// index.
 pub const FONT_SIZE_PRESETS: &[u32] = &[10, 11, 12, 13, 14, 16, 18, 20, 24];
@@ -782,6 +785,8 @@ pub enum AfterSave {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingCommit {
     pub buffer_id: BufferId,
+    /// The message's view — what switching back to it names.
+    pub view_id: ViewId,
     pub repo_id: String,
     /// Must match what the message was prepared with, or the commit would amend a message written
     /// for a new commit (or vice versa).
@@ -802,11 +807,14 @@ pub enum ConfirmAction {
     ReloadDiscard,
     /// Close the buffer despite unsaved changes.
     CloseDiscard,
-    /// Close a specific (unsaved) buffer picked from the Buffers picker, despite its changes. Unlike
+    /// Close a specific (unsaved) buffer picked from the view picker, despite its changes. Unlike
     /// [`CloseDiscard`] (which targets the active buffer), this carries the picked buffer's id — the
     /// picker selection may have moved by the time the confirm resolves. The picker stays open and
     /// re-lists from the server's `picker/update` push.
-    ClosePickerBuffer { buffer_id: BufferId },
+    ClosePickerView {
+        buffer_id: BufferId,
+        view_id: ViewId,
+    },
     /// Trash a file/directory from the Files/Explorer picker (`path/delete`). `noun` is
     /// "file"/"directory" for the success toast; the still-open picker is re-listed after.
     DeletePath { path: String, noun: &'static str },
@@ -919,7 +927,7 @@ pub enum PasteKind {
 
 /// State belonging to whatever the session is currently showing — see [`Session::view`].
 pub struct ViewState {
-    /// What this view *is* — the thing the picker lists, sessions restore, `buffer/close` closes,
+    /// What this view *is* — the thing the picker lists, sessions restore, `view/close` closes,
     /// and `viewport/subscribe` subscribes to.
     ///
     /// Distinct from [`Self::buffer`], which is the buffer currently being **edited**. They are the
@@ -927,6 +935,11 @@ pub struct ViewState {
     /// hunk. Keeping them apart is what lets an edit address the file under the cursor while
     /// closing still closes the patch rather than one of the files it happens to show.
     pub view_id: ViewId,
+    /// The buffer presenting the view — its own document. For an ordinary view the buffer being
+    /// edited; for a patch the generated text, which no element windows and nothing edits. Held
+    /// beside [`Self::view_id`] because nothing derives one from the other: the server answers
+    /// "which buffer presents this view" from its table, and the client is told at open.
+    pub view_buffer: BufferId,
     /// What to call this view in the status bar's file slot — the view's own label, captured when
     /// the view was bound and *not* moved by focus.
     ///
@@ -1006,12 +1019,15 @@ impl ViewState {
     /// the same whenever a view is opened or reopened onto a buffer.
     ///
     /// One operation rather than two assignments, because the two must not drift: a `view_id` left
-    /// pointing at a closed buffer would have `viewport/subscribe` and `buffer/close` addressing
+    /// pointing at a closed buffer would have `viewport/subscribe` and `view/close` addressing
     /// something that no longer exists, silently. Focus moving *within* a multi-buffer view is the
     /// only thing that changes one without the other, and it goes through the focus path.
-    pub fn rebind(&mut self, buffer: BufferInfo) {
-        self.view_id = ViewId(buffer.buffer_id);
-        self.view_transient = buffer.transient;
+    pub fn rebind(&mut self, open: ViewOpenResult, roots: &[String]) {
+        let transient = open.transient;
+        let buffer = buffer_info(open, roots);
+        self.view_id = buffer.view_id;
+        self.view_buffer = buffer.buffer_id;
+        self.view_transient = transient;
         self.view_label = buffer.label.clone();
         self.buffer = buffer;
         self.focused_element = 0;
@@ -1038,7 +1054,7 @@ impl ViewState {
     /// One method rather than two assignments at each rename site, because a `view_label` left on
     /// the old name is invisible until someone reads the status bar.
     pub fn relabel_focused(&mut self, label: String) {
-        if self.buffer.buffer_id == self.view_id.presenting_buffer() {
+        if self.buffer.buffer_id == self.view_buffer {
             self.view_label = label.clone();
         }
         self.buffer.label = label;
@@ -1053,11 +1069,17 @@ impl ViewState {
         crate::grid::ElementLine::new(self.focused_element, self.buffer.cursor.position.line)
     }
 
-    pub fn new(buffer: BufferInfo) -> Self {
+    /// The view an open presented, as the open describes it. The one place a view's own facts —
+    /// its id, whether it is kept — are read off the wire, so nothing can build a view around a
+    /// buffer and leave them behind: every open goes through here or [`Self::rebind`].
+    pub fn from_open(open: ViewOpenResult, roots: &[String]) -> Self {
+        let transient = open.transient;
+        let buffer = buffer_info(open, roots);
         Self {
             // A view opens on its own buffer; focus moves it off only in a multi-buffer view.
-            view_id: ViewId(buffer.buffer_id),
-            view_transient: buffer.transient,
+            view_id: buffer.view_id,
+            view_buffer: buffer.buffer_id,
+            view_transient: transient,
             view_label: buffer.label.clone(),
             buffer,
             mode: Mode::Normal,
@@ -1106,7 +1128,7 @@ pub struct Session {
     /// repo the buffer you're looking at belongs to.
     pub workspace_worktrees: Vec<aether_protocol::workspace::WorkspaceWorktree>,
     /// Set when a `workspace/changed` push lands: another client changed the shape of the workspace
-    /// we are standing in. Consumed by the `buffer/closed` pushes that follow it, so those read as
+    /// we are standing in. Consumed by the `view/closed` pushes that follow it, so those read as
     /// "the workspace moved" rather than "someone closed your file".
     pub(crate) workspace_moved_under_us: bool,
     /// The active workspace's declared projects, mirrored from every `WorkspaceInfo` the server
@@ -1137,10 +1159,10 @@ pub struct Session {
     /// Buffer text size in px — an app-wide setting (`Space,`), seeded from `settings/get` at
     /// boot and synced via `settings/changed`. The GUI/web shells read it each render to size the
     /// buffer text (and reflow); the terminal client ignores it. The core just holds the value.
-    pub buffer_font_size: u32,
+    pub editor_font_size: u32,
     /// UI text size in px — the same deal for everything *around* the buffer (status bar, pickers,
     /// dialogs, hover, toasts, hints), which the GUI/web shells scale from this one number. Sized
-    /// separately from [`Self::buffer_font_size`]: chrome density and code size are different
+    /// separately from [`Self::editor_font_size`]: chrome density and code size are different
     /// preferences.
     pub ui_font_size: u32,
     /// Colour theme — an app-wide setting (`Space,`), seeded from `settings/get` at boot and
@@ -1170,17 +1192,6 @@ pub struct Session {
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
-    /// The kind the next `view/subscribe` asks for — `Some` only when this client's route has
-    /// decided: a jump to a `line:col` lands in the editor, a followed `#anchor` in the reader,
-    /// `Space v` asks for the other one, and an edit transition out of the reader asks for the
-    /// editor. `None` leaves it to the server, which presents a markdown file as it last was, or
-    /// as the app setting says for one never presented. Taken by the shell as it subscribes
-    /// ([`Self::subscribe_kind`]), so it names exactly one presentation.
-    ///
-    /// Which view is showing is then read off the window: a markdown file presented as the reader
-    /// arrives as an element the client lays out, and [`Self::sync_read_presentation`] turns that
-    /// into the reading view. Nothing here remembers the choice — the server does, per file.
-    pub(crate) subscribe_kind: Option<aether_protocol::ui::ViewKind>,
     /// App-wide "open markdown as reading view" setting (`Space,`), seeded from `settings/get`
     /// and synced via `settings/changed`. The server consults its own copy when a file is first
     /// presented; this mirror only feeds the settings overlay.
@@ -1190,9 +1201,6 @@ pub struct Session {
     /// there's no live state to seed here, unlike [`Self::markdown_read_default`], because a width
     /// is the same question for every document.
     pub markdown_width: MarkdownWidth,
-    /// Set just before issuing a jump-shaped open (grep hit, reference, jumplist step) and consumed
-    /// by `adopt_switch`: jump-shaped opens land in the editor, not the reading view.
-    pub(crate) open_route_jumped: bool,
     /// The `#fragment` of a followed cross-file link (`[x](./other.md#section)`), set just before
     /// the open and consumed once the target document's reading view adopts — the heading's
     /// position isn't knowable until the target is fetched and parsed. Cleared by any fresh
@@ -1595,7 +1603,7 @@ pub fn lsp_toast_group(language: &str, workspace_root: &str) -> String {
 /// column of identical ones. Built here so the sites that refuse can't drift apart on either the
 /// wording or the key.
 pub fn read_only_toast() -> Effects {
-    Effects::toast_grouped("Buffer is read-only", ToastKind::Warning, "read-only")
+    Effects::toast_grouped("This view is read-only", ToastKind::Warning, "read-only")
 }
 
 /// Tab stop width used for all cell math (mirrors the value the shells pass to the server on
@@ -1610,7 +1618,8 @@ impl Session {
     /// shell forgets to carry across is simply missing until the next workspace event — which for a
     /// freshly booted client is never. (That's exactly how `projects` came to be empty in the
     /// settings overlay after a restart.) Passing the struct makes new fields flow automatically.
-    pub fn new(workspace: WorkspaceInfo, buffer: BufferInfo) -> Self {
+    pub fn new(workspace: WorkspaceInfo, open: ViewOpenResult) -> Self {
+        let view = ViewState::from_open(open, &workspace.paths);
         Session {
             pending_rpcs: std::collections::HashMap::new(),
             next_token: 0,
@@ -1625,7 +1634,7 @@ impl Session {
             history: InputHistory::default(),
             wrap: WrapMode::Soft,
             ligatures: true,
-            buffer_font_size: aether_protocol::settings::default_buffer_font_size(),
+            editor_font_size: aether_protocol::settings::default_editor_font_size(),
             ui_font_size: aether_protocol::settings::default_ui_font_size(),
             theme: aether_protocol::settings::default_theme(),
             hints_enabled: true,
@@ -1633,10 +1642,8 @@ impl Session {
             worktree_store: String::new(),
             git_operation: None,
             diff_view: false,
-            subscribe_kind: None,
             markdown_read_default: true,
             markdown_width: aether_protocol::settings::default_markdown_width(),
-            open_route_jumped: false,
             pending_read_anchor: None,
             blame_follow_on: None,
             highlight_follow_on: None,
@@ -1647,7 +1654,7 @@ impl Session {
             conn: ConnState::Connected,
             lsp_restart_pending: std::collections::HashSet::new(),
             hints: crate::hints::HintEngine::default(),
-            view: ViewState::new(buffer),
+            view,
         }
     }
 
@@ -1673,9 +1680,9 @@ impl Session {
                         hint: "Coding ligatures in the editor font (→, ≠, ⇒, …)",
                     },
                     AppSettingRow {
-                        id: AppSettingId::BufferFontSize,
-                        label: "Buffer font size",
-                        control: AppSettingControl::Value(self.buffer_font_size),
+                        id: AppSettingId::EditorFontSize,
+                        label: "Editor font size",
+                        control: AppSettingControl::Value(self.editor_font_size),
                         hint: "File text size in pixels (GUI/web; the terminal uses its own font)",
                     },
                     AppSettingRow {
@@ -1694,7 +1701,7 @@ impl Session {
                         id: AppSettingId::MarkdownRead,
                         label: "Markdown reading view",
                         control: AppSettingControl::Toggle(self.markdown_read_default),
-                        hint: "Open Markdown files rendered for reading (Space v toggles per buffer)",
+                        hint: "Open Markdown files rendered for reading (Space u toggles per file)",
                     },
                     AppSettingRow {
                         id: AppSettingId::MarkdownWidth,
@@ -1735,11 +1742,10 @@ impl Session {
             .collect()
     }
 
-    /// The kind the subscribe being issued asks for, if this client's route decided one — see
-    /// [`Self::subscribe_kind`]. Taken: the decision is for one subscribe, and a re-subscribe
-    /// for a wrap toggle or a reconnect must not repeat it.
-    pub fn subscribe_kind(&mut self) -> Option<aether_protocol::ui::ViewKind> {
-        self.subscribe_kind.take()
+    /// Forget a content anchor captured for a re-presentation the shell will not need it for —
+    /// a sibling view that remembers its own scroll positions itself.
+    pub(crate) fn forget_scroll_anchor(&mut self) {
+        self.view.relayout_anchor = None;
     }
 
     /// Capture a content scroll anchor for the current view, ahead of a wrap/diff re-layout. The
@@ -1806,19 +1812,24 @@ impl Session {
                 worktrees: Vec::new(),
                 projects: Vec::new(),
             },
-            BufferInfo {
-                buffer_id: 0,
-                label: String::new(),
-                path: None,
-                language: None,
-                revision: 0,
-                saved_revision: 0,
-                cursor: CursorState::default(),
-                scroll: None,
-                transient: false,
-                lsp_server: None,
-                read_only: false,
-                is_patch: false,
+            // The sentinel open: buffer 0, which the server never assigns, and nothing else.
+            ViewOpenResult {
+                buffer_id: Default::default(),
+                view_id: Default::default(),
+                language: Default::default(),
+                line_count: Default::default(),
+                byte_count: Default::default(),
+                revision: Default::default(),
+                saved_revision: Default::default(),
+                path: Default::default(),
+                scratch_number: Default::default(),
+                cursor: Default::default(),
+                scroll: Default::default(),
+                lsp_server: Default::default(),
+                transient: Default::default(),
+                title: Default::default(),
+                read_only: Default::default(),
+                is_patch: Default::default(),
             },
         )
     }
@@ -1847,15 +1858,15 @@ impl Session {
     /// `tethered()` — and `Space x` on the *patch* then exited the client, leaving the file it was
     /// waiting on still open.
     pub fn tethered_view(&self) -> bool {
-        self.tether == Some(self.view.view_id.presenting_buffer())
+        self.tether == Some(self.view.view_buffer)
     }
 }
 
-/// Build the client-side buffer record from a `buffer/open` result.
+/// Build the client-side buffer record from a `view/open` result.
 /// The display label for a saved buffer at `path`: its workspace-relative location in the canonical
 /// `"[root]: [path]"` form (bare path for single-root workspaces), falling back to the absolute path
 /// when it sits outside every root. This is what the status bar and window title render, so it must
-/// match the buffers picker — both route through [`labels::root_relative_display`]. Shared by
+/// match the view picker — both route through [`labels::root_relative_display`]. Shared by
 /// buffer-open and the save-as rename adoption so both relabel identically.
 pub fn label_for_path(path: &str, roots: &[String]) -> String {
     match strip_longest_root(path, roots) {
@@ -1864,7 +1875,7 @@ pub fn label_for_path(path: &str, roots: &[String]) -> String {
     }
 }
 
-pub fn buffer_info(open: BufferOpenResult, roots: &[String]) -> BufferInfo {
+pub fn buffer_info(open: ViewOpenResult, roots: &[String]) -> BufferInfo {
     // A virtual buffer (a revision materialised by `git/show`) is pathless but named: the server
     // supplies the title, since only it knows what revision this is.
     let label = match (&open.path, &open.title, open.scratch_number) {
@@ -1875,6 +1886,7 @@ pub fn buffer_info(open: BufferOpenResult, roots: &[String]) -> BufferInfo {
     };
     BufferInfo {
         buffer_id: open.buffer_id,
+        view_id: open.view_id,
         label,
         path: open.path,
         language: open.language,
@@ -1882,7 +1894,6 @@ pub fn buffer_info(open: BufferOpenResult, roots: &[String]) -> BufferInfo {
         saved_revision: open.saved_revision,
         cursor: open.cursor,
         scroll: open.scroll,
-        transient: open.transient,
         lsp_server: open.lsp_server,
         read_only: open.read_only,
         is_patch: open.is_patch,

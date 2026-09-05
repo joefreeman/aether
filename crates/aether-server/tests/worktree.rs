@@ -16,12 +16,11 @@ async fn workspace_activate_returns_info_and_unlocks_buffer_ops() {
         .unwrap();
     let mut ws = Ws::connect(&server).await;
 
-    // Before activation, buffer/open should fail with NO_ACTIVE_WORKSPACE (-32002).
-    let pre_err = send_request_expect_err::<BufferOpen>(
+    // Before activation, view/open should fail with NO_ACTIVE_WORKSPACE (-32002).
+    let pre_err = send_request_expect_err::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -49,11 +48,10 @@ async fn workspace_activate_returns_info_and_unlocks_buffer_ops() {
     assert_eq!(activated.workspace.paths.len(), 1);
 
     // Scratch buffer now works.
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -112,11 +110,10 @@ async fn workspace_activate_same_workspace_is_idempotent() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("buf.txt".into()),
             language: None,
@@ -140,11 +137,10 @@ async fn workspace_activate_same_workspace_is_idempotent() {
     assert_eq!(again.workspace.name, "test-proj");
 
     // Re-opening the same path returns the same buffer (state preserved).
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("buf.txt".into()),
             language: None,
@@ -815,18 +811,18 @@ async fn open_buffers_follow_the_switch_and_unsaved_ones_stay_behind() {
 
     // One clean buffer in the repo (should follow), one in the notes root (shouldn't move at all),
     // and one dirty buffer in the repo (should stay behind).
-    let clean: BufferOpenResult = send_request::<BufferOpen>(
+    let clean: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
         },
     )
     .await;
-    let _note: BufferOpenResult = send_request::<BufferOpen>(
+    let _note: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(1),
             relative_path: Some("todo.md".into()),
             ..Default::default()
@@ -834,9 +830,9 @@ async fn open_buffers_follow_the_switch_and_unsaved_ones_stay_behind() {
     )
     .await;
     std::fs::write(repo_root.join("b.rs"), "two\n").unwrap();
-    let dirty: BufferOpenResult = send_request::<BufferOpen>(
+    let dirty: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("b.rs".into()),
             ..Default::default()
@@ -863,12 +859,12 @@ async fn open_buffers_follow_the_switch_and_unsaved_ones_stay_behind() {
     // the other tree, and is still open (and still dirty) at its own path when you unbind.
     let back = bind(&mut ws, std::path::Path::new(&wt.path), "").await;
     assert_eq!(back.workspace.name, "p");
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Buffers)).await;
+    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Views)).await;
     let update = view.update.expect("the view carries its initial window");
     assert!(
         update.items().iter().any(|i| matches!(
             i,
-            PickerItem::Buffer { buffer_id, status, .. }
+            PickerItem::View { buffer_id, status, .. }
                 if *buffer_id == dirty.buffer_id && *status == BufferDirtyState::Unsaved
         )),
         "the unsaved buffer is still open in the context it stayed in, still unsaved"
@@ -898,9 +894,9 @@ async fn a_buffer_in_a_bound_repo_reports_its_checkout_as_a_worktree() {
         path_index: u32,
         rel: &str,
     ) -> Option<aether_protocol::git::GitBufferStatus> {
-        let open: BufferOpenResult = send_request::<BufferOpen>(
+        let open: ViewOpenResult = send_request::<ViewOpen>(
             ws,
-            &BufferOpenParams {
+            &ViewOpenParams {
                 path_index: Some(path_index),
                 relative_path: Some(rel.into()),
                 ..Default::default()
@@ -910,7 +906,7 @@ async fn a_buffer_in_a_bound_repo_reports_its_checkout_as_a_worktree() {
         let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
             ws,
             &ViewportSubscribeParams {
-                buffer_id: aether_protocol::ViewId(open.buffer_id),
+                view_id: open.view_id,
                 cols: 80,
                 rows: 24,
                 overscan_rows: 0,
@@ -924,7 +920,6 @@ async fn a_buffer_in_a_bound_repo_reports_its_checkout_as_a_worktree() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
-                kind: None,
             },
         )
         .await;
@@ -1019,7 +1014,7 @@ async fn a_workspace_whose_worktree_vanished_degrades_to_its_configured_roots() 
 
 #[tokio::test]
 async fn the_tree_you_are_in_is_the_pickers_opening_selection() {
-    // The picker opens *on* where you are, like the buffer picker opens on the current buffer.
+    // The picker opens *on* where you are, like the view picker opens on the current buffer.
     // Since the merge that row is a branch row carrying a current checkout — and the ordering pins
     // it to index 0, which is the default highlight, so Enter-on-open is a no-op with no extra
     // mechanism. In the base the main checkout is already current, so the case worth testing is
@@ -1388,9 +1383,9 @@ async fn the_rebinding_client_lands_on_the_file_it_was_viewing() {
     // that would otherwise be reached first.
     let mut viewing = 0;
     for (_, rel) in [(11u64, "a.rs"), (13, "b.rs")] {
-        let open: BufferOpenResult = send_request::<BufferOpen>(
+        let open: ViewOpenResult = send_request::<ViewOpen>(
             &mut ws,
-            &BufferOpenParams {
+            &ViewOpenParams {
                 path_index: Some(0),
                 relative_path: Some(rel.into()),
                 transient: Some(false),
@@ -1401,7 +1396,7 @@ async fn the_rebinding_client_lands_on_the_file_it_was_viewing() {
         let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
             &mut ws,
             &ViewportSubscribeParams {
-                buffer_id: aether_protocol::ViewId(open.buffer_id),
+                view_id: open.view_id,
                 cols: 80,
                 rows: 24,
                 overscan_rows: 0,
@@ -1415,7 +1410,6 @@ async fn the_rebinding_client_lands_on_the_file_it_was_viewing() {
                 continuation_marker_width: 0,
                 tab_width: 4,
                 diff_view: false,
-                kind: None,
             },
         )
         .await;
@@ -1460,9 +1454,9 @@ async fn a_file_absent_from_the_target_branch_cannot_follow() {
         .worktree
         .unwrap();
     std::fs::write(repo_root.join("only-here.rs"), "fn main() {}\n").unwrap();
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("only-here.rs".into()),
             ..Default::default()
@@ -1527,9 +1521,9 @@ async fn binding_moves_only_the_client_that_asked() {
         repo_root.to_string_lossy(),
         "client 2 is in the base"
     );
-    let open2: BufferOpenResult = send_request::<BufferOpen>(
+    let open2: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws2,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -1595,9 +1589,9 @@ async fn each_context_keeps_its_own_buffers() {
         .worktree
         .unwrap();
 
-    let base_open: BufferOpenResult = send_request::<BufferOpen>(
+    let base_open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -1723,9 +1717,9 @@ async fn the_rebinding_client_lands_on_the_same_file_on_the_new_tree() {
         .worktree
         .unwrap();
 
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -1770,9 +1764,9 @@ async fn removing_the_worktree_you_are_in_returns_you_to_the_configured_roots() 
     );
 
     // A clean buffer in the tree, so the removal has something open to rescue.
-    let _open: BufferOpenResult = send_request::<BufferOpen>(
+    let _open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -1833,9 +1827,9 @@ async fn removal_refuses_while_a_buffer_in_the_tree_has_unsaved_edits() {
         .unwrap();
     let _bound = bind(&mut ws, &repo_root, &wt.name).await;
 
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             ..Default::default()
@@ -2133,7 +2127,7 @@ async fn workspace_rename_moves_the_definition_in_the_store() {
 }
 
 /// A root is a directory. `add_root` is the only RPC that writes one, so this is the boundary that
-/// lets the index, the watcher and `buffer/open`'s `base.join(rel)` treat every root as a tree —
+/// lets the index, the watcher and `view/open`'s `base.join(rel)` treat every root as a tree —
 /// they used to carry their own "what if this is a file" branches, kept alive by refactors from an
 /// era when a workspace was a hand-authored list of arbitrary paths.
 #[tokio::test]

@@ -1,132 +1,12 @@
-//! Buffer lifecycle messages.
+//! Buffer messages: saving, reloading and reading the text a view shows.
+//!
+//! What a client *presents* is a view, and those messages live in [`crate::view`]. These address
+//! the document underneath, which several views can share.
 
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
-use crate::viewport::ScrollPosition;
-use crate::{BufferId, LogicalPosition, Revision};
+use crate::{BufferId, Revision};
 use serde::{Deserialize, Serialize};
-
-// ---- buffer/open --------------------------------------------------------------------------------
-
-pub struct BufferOpen;
-impl RpcMethod for BufferOpen {
-    const NAME: &'static str = "buffer/open";
-    type Params = BufferOpenParams;
-    type Result = BufferOpenResult;
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BufferOpenParams {
-    /// Attach to an already-open buffer by id. When set, `path_index` / `relative_path` /
-    /// `create_if_missing` are ignored — the server returns the existing buffer's state. Errors
-    /// if the id isn't a live buffer. Used by the buffer picker to switch to a scratch buffer
-    /// (which has no path to feed into the path-keyed open flow).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub buffer_id: Option<BufferId>,
-    pub path_index: Option<u32>,
-    pub relative_path: Option<String>,
-    /// Open a file by absolute path, bypassing the `path_index`/`relative_path` workspace-root
-    /// resolution. Set only by the workspace-aware open-from-path flow (`workspace/open_path`) and the
-    /// goto-definition follow path, where the target may lie *outside* the active workspace's roots —
-    /// an "external" buffer. Unlike root-relative opens (which are confined to the workspace boundary
-    /// to block `../` traversal), an absolute-path open is allowed to land outside the roots; the
-    /// server marks the resulting buffer external (trust-restricted LSP). Git is the wider test —
-    /// a file outside every root but inside a repo one of them reaches keeps its baseline, so a
-    /// sibling of your root in the same repo still shows its diff and stages. Mutually
-    /// exclusive with `path_index`/`relative_path`. Ignored when `buffer_id` is set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub absolute_path: Option<String>,
-    pub language: Option<String>,
-    /// When `true` and the target file doesn't exist on disk, the server creates an empty
-    /// buffer with the path set but no file on disk yet — the file gets created on the next
-    /// `buffer/save`. When `false` (the default) the server errors if the file is missing.
-    #[serde(default)]
-    pub create_if_missing: bool,
-    /// Place the cursor here after opening, overriding any persisted `CursorState` for this
-    /// `(client, buffer)`. Coordinates follow the same conventions as the rest of the protocol
-    /// (0-based line, 0-based byte col); out-of-range values are clamped (line to the last line,
-    /// col to the line's end). Used by the grep picker to open + jump in one round trip.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jump_to: Option<LogicalPosition>,
-    /// When set together with `jump_to`, the cursor opens as a *selection* — anchor here, cursor at
-    /// `jump_to` — instead of a point. Same coordinate conventions / clamping as `jump_to`. Used by
-    /// the outline picker to land a symbol's identifier selected. Ignored without `jump_to`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jump_to_anchor: Option<LogicalPosition>,
-    /// Transient-buffer intent. `Some(true)`: if this open *creates* the buffer, mark it
-    /// transient — the server closes it automatically once no viewport shows it anymore, unless
-    /// it's been promoted first (an existing buffer is never demoted). `Some(false)`: promote the
-    /// buffer to permanent. `None` (the default): leave the flag as it is. Buffers are also
-    /// promoted by their first edit, a save, or a user-initiated reload.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transient: Option<bool>,
-    /// Record the jump origin (the buffer the client is leaving) onto this client's nav history
-    /// before switching — `nav/record` folded into the open, so result-style navigation (picker
-    /// selections, goto-definition, fresh scratch) is one round-trip. Ignored if the buffer doesn't
-    /// exist.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub record_nav_from: Option<BufferId>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BufferOpenResult {
-    pub buffer_id: BufferId,
-    pub language: Option<String>,
-    pub line_count: u32,
-    pub byte_count: u64,
-    pub revision: Revision,
-    /// The revision at which this buffer was last persisted to disk (or `0` for a fresh scratch
-    /// buffer). The client derives `dirty` as `revision != saved_revision`.
-    pub saved_revision: Revision,
-    /// Canonical absolute path of the file on disk, when the buffer is backed by one. `None` for
-    /// scratch buffers. Lets the client (e.g. file-browser navigation) work in absolute paths.
-    pub path: Option<String>,
-    /// Small per-workspace display number for a scratch buffer (`(scratch N)`); `None` for
-    /// file-backed buffers. The client renders the buffer label from this rather than `buffer_id`,
-    /// so the numbers stay small and reset as scratches close.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scratch_number: Option<u32>,
-    /// Server-side cursor state for this `(client, buffer)`. `CursorState::default` for a buffer
-    /// the client hasn't touched yet; the prior position for a buffer the client is reopening.
-    #[serde(default)]
-    pub cursor: CursorState,
-    /// Last scroll position recorded for this `(client, buffer)` on a prior viewport subscription
-    /// for this buffer, so reopen restores the prior view. `None` when the client has never had a
-    /// viewport on the buffer, or when this open carried a `jump_to` (grep nav, goto-definition,
-    /// nav history) — the jump moves the cursor, so the saved scroll predates it and would frame
-    /// the wrong region. On `None` the client frames the open cursor (centring on it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scroll: Option<ScrollPosition>,
-    /// The language server backing this buffer, when one is configured for its language and a
-    /// workspace root was found. `None` otherwise. Lets the client show *this buffer's* server
-    /// health (servers are keyed by `(language, workspace_root)`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lsp_server: Option<crate::lsp::LspServerRef>,
-    /// True while the buffer is transient (auto-closes once hidden — see
-    /// [`BufferOpenParams::transient`]). Promotion mid-session is pushed via `buffer/state`.
-    #[serde(default)]
-    pub transient: bool,
-    /// Display name for a **virtual** buffer — one with no path and no scratch number, whose
-    /// content the server materialised from a revision (`git/show`: a commit's diff, or a file as
-    /// of some commit). Rendered verbatim by the client, which otherwise labels a pathless buffer
-    /// `(scratch N)`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    /// The buffer refuses edits, saves and reloads. Set for virtual buffers: their content is a
-    /// snapshot of something immutable, so there is nothing an edit could mean. Enforced
-    /// server-side (`apply_edit` and the save/reload handlers); clients surface it and decline
-    /// early so a keystroke doesn't cost a round trip to be told no.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub read_only: bool,
-    /// This buffer is a **generated patch** (`git/show` on a commit), not merely read-only — a file
-    /// at a revision is read-only too but is ordinary text.
-    ///
-    /// The client needs the distinction for one reason: `Enter` means "follow what's under the
-    /// cursor", and in a patch that resolves through `git/follow_patch_line` rather than through
-    /// the language server. Everything else about a patch is server-side.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub is_patch: bool,
-}
 
 // ---- buffer/save --------------------------------------------------------------------------------
 
@@ -163,78 +43,8 @@ pub struct BufferSaveResult {
     pub revision: Revision,
 }
 
-// ---- buffer/close -------------------------------------------------------------------------------
-
-pub struct BufferClose;
-impl RpcMethod for BufferClose {
-    const NAME: &'static str = "buffer/close";
-    type Params = BufferCloseParams;
-    type Result = BufferCloseResult;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BufferCloseParams {
-    /// The **view** to close. Closing has always addressed the view rather than the text — a patch
-    /// closes as a patch, not as one of the files it happens to window — and the type now says so.
-    /// `#[serde(transparent)]`, so the wire is unchanged.
-    pub buffer_id: crate::ViewId,
-    /// Also open the next buffer (the MRU successor, or a fresh scratch when none remain) and
-    /// return it in `opened` — the close-then-attach client chain folded into one round-trip.
-    #[serde(default)]
-    pub open_next: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BufferCloseResult {
-    /// The next-most-recently-used buffer in this client's MRU after the close. `None` when
-    /// no buffers remain — the client should open a fresh scratch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_buffer_id: Option<BufferId>,
-    /// With `open_next`: the buffer the client should now show, fully opened (the MRU
-    /// successor or a fresh scratch).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opened: Option<BufferOpenResult>,
-}
-
-// ---- buffer/closed (notification) ---------------------------------------------------------------
-
-/// Pushed to a client when a buffer it currently has open is closed by *another* client (a plain
-/// `buffer/close`, or a path/workspace deletion that tore the buffer down). The receiving client
-/// switches to `next_buffer_id` (its MRU top after the close), or opens a fresh scratch when `None`
-/// — the same convention as [`BufferCloseResult`]. Sent to clients with a viewport on the buffer
-/// *and* to clients whose active workspace holds it in its MRU without viewing it — the latter is
-/// what lets a tethered client, including the `ae --web` waiter, exit on a close it didn't witness;
-/// non-matching pushes are ignored client-side, so the broad audience is safe. The client that
-/// initiated the close learns the outcome from its RPC result instead.
-pub struct BufferClosed;
-impl NotificationMethod for BufferClosed {
-    const NAME: &'static str = "buffer/closed";
-    type Params = BufferClosedParams;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BufferClosedParams {
-    /// The buffer that was closed out from under this client.
-    pub buffer_id: BufferId,
-    /// The buffer the client should switch to, or `None` to open a fresh scratch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_buffer_id: Option<BufferId>,
-    /// Where to switch to, as a **path** — preferred over `next_buffer_id` when present.
-    ///
-    /// A worktree rebind knows which file replaces which, but it can only name the replacement by
-    /// reserving a *dormant* id, and a dormant id is not stable: the client that asked for the
-    /// rebind activates immediately afterwards, and if its landing buffer is that same file it
-    /// materialises the entry under a **different** id. Whoever opens second then asks for an id
-    /// that no longer exists.
-    ///
-    /// A path has no such race. `buffer/open` on a path already open returns the existing buffer,
-    /// so both clients converge on one buffer whichever order they arrive in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_path: Option<BufferLocation>,
-}
-
 /// A file inside the workspace, as a root index plus the path relative to that root — the shape
-/// `buffer/open` takes, so a client can pass it straight back.
+/// `view/open` takes, so a client can pass it straight back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferLocation {
     pub path_index: u32,
@@ -267,33 +77,6 @@ pub struct BufferReloadResult {
     pub revision: Revision,
     /// Mtime of the file the reload read from, in unix milliseconds.
     pub saved_at_unix_ms: Option<u64>,
-}
-
-// ---- buffer/set_transient -----------------------------------------------------------------------
-
-pub struct BufferSetTransient;
-impl RpcMethod for BufferSetTransient {
-    const NAME: &'static str = "buffer/set_transient";
-    type Params = BufferSetTransientParams;
-    type Result = BufferSetTransientResult;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BufferSetTransientParams {
-    pub buffer_id: BufferId,
-    /// The transient flag to set. `true` marks the buffer transient (it auto-closes once no
-    /// viewport shows it); `false` pins it permanent. Unlike [`BufferOpenParams::transient`] —
-    /// which only ever *promotes* — this flips the flag either way, driving the `Space k` "keep"
-    /// toggle. The server applies it unconditionally; the client owns the policy that a buffer with
-    /// unsaved edits is never marked transient (auto-close would discard them), mirroring how
-    /// `buffer/close` leaves the discard decision to the client.
-    pub transient: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BufferSetTransientResult {
-    /// The buffer's transient flag after the change — echoes the request so the client can confirm.
-    pub transient: bool,
 }
 
 // ---- buffer/copy & buffer/cut -------------------------------------------------------------------
@@ -386,6 +169,9 @@ pub struct BufferChangedParams {
 
 // ---- buffer/state (notification) ----------------------------------------------------------------
 
+/// Pushed to every client with a viewport on a buffer when the *document*'s state changes: the
+/// saved revision, the external-change flags, or the path a save-as moved it to. Transience is
+/// not among them — it belongs to the view and rides [`crate::view::ViewState`].
 pub struct BufferState;
 impl NotificationMethod for BufferState {
     const NAME: &'static str = "buffer/state";
@@ -408,19 +194,10 @@ pub struct BufferStateParams {
     /// recreates the file) or by the file being recreated externally.
     #[serde(default)]
     pub externally_deleted: bool,
-    /// True while the buffer is transient (auto-closes once hidden). Flips to false when the
-    /// buffer is promoted — by its first edit, a save, a user-initiated reload, or an explicit
-    /// `buffer/open { transient: false }`.
-    #[serde(default)]
-    pub transient: bool,
     /// The buffer's current canonical path on disk (`None` for an unsaved scratch). Carried so a
     /// save-as — which renames the *shared* buffer — relabels every other client viewing it: they
     /// adopt the new path and re-derive their workspace-relative label. Unchanged on in-place
     /// save/reload (the client only adopts a differing path).
     #[serde(default)]
     pub path: Option<String>,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
 }

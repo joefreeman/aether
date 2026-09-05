@@ -1323,13 +1323,14 @@ fn render_item<'a>(
             }
             r.into()
         }
-        PickerItem::Buffer {
+        PickerItem::View {
             buffer_id,
             display,
             status,
             path_index,
             match_indices,
             transient,
+            view_kind,
             ..
         } => {
             let mut r = row![highlighted(
@@ -1349,6 +1350,11 @@ fn render_item<'a>(
                 // `fg_muted`: the dim-but-legible rung between `fg_dim` and `fg` (dark stays
                 // the historic NORD3_BRIGHTER).
                 r = r.push(text("*").size(ui.body()).font(SANS).color(p.fg_muted));
+            }
+            // The kind badge: a file's reader row says so, dim, after the path; its editor row
+            // is the plain one, as every other file's is.
+            if *view_kind == Some(aether_protocol::ui::ViewKind::Reader) {
+                r = r.push(text("reader").size(ui.body()).font(SANS).color(p.fg_dim));
             }
             // Multi-root workspaces: the root's label, dim, after the name — same placement as the
             // Files picker. `path_index` is `None` for scratch/external buffers, so those show none.
@@ -1560,7 +1566,7 @@ fn render_item<'a>(
         }
         PickerItem::Workspace {
             name,
-            unsaved_buffers,
+            unsaved,
             match_indices,
         } => {
             // An ephemeral context renders as an italic "(workspace N)" — to mark it ephemeral, like
@@ -1580,11 +1586,11 @@ fn render_item<'a>(
                 highlighted(name, match_indices, p.fg_bright, SANS, hovered, ui, p)
             };
             // Trailing frost-blue dot when the workspace has unsaved buffers — the same right-aligned
-            // dot the buffer picker shows, so the two pickers read alike.
+            // dot the view picker shows, so the two pickers read alike.
             let mut r = row![label, iced::widget::Space::new().width(Length::Fill),]
                 .spacing(6)
                 .align_y(iced::Alignment::Center);
-            if *unsaved_buffers > 0 {
+            if *unsaved > 0 {
                 r = r.push(
                     text("●")
                         .size(ui.state_dot())
@@ -1942,7 +1948,7 @@ fn render_item<'a>(
             // What the row *is* decides the face: a positioned entry shows a line of file
             // content, which wants the buffer's monospace; a whole-target entry shows the target
             // itself — a path, or `(scratch N)` — which reads as UI text and matches the
-            // Files/Buffers rows it was captured from. `line` is exactly that distinction: an
+            // Files/Views rows it was captured from. `line` is exactly that distinction: an
             // entry with no position has no file content to show.
             let face = if line.is_some() {
                 iced::Font::MONOSPACE

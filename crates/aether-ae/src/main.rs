@@ -110,9 +110,9 @@ struct EditArgs {
     tui: bool,
 
     /// Open the browser client: launch the web editor's URL via the OS and (usually) exit.
-    /// The quick-edit shape (`ae --web file`, no `--workspace`) instead waits for the buffer
+    /// The quick-edit shape (`ae --web file`, no `--workspace`) instead waits for the view
     /// to be closed in the browser, keeping the `$EDITOR` contract — see `web.rs`.
-    #[arg(long, conflicts_with_all = ["gui", "tui", "buffer"])]
+    #[arg(long, conflicts_with_all = ["gui", "tui", "view"])]
     web: bool,
 
     /// Stay attached to the terminal instead of detaching the GUI (a non-tethered `--gui` at a
@@ -133,18 +133,18 @@ struct EditArgs {
     workspace: Option<String>,
 
     /// File or directory to open, optionally with a `:LINE` or `:LINE:COL` suffix to jump to a
-    /// position (`ae src/main.rs:42:10`; 1-based, editor-conventional). Omit for a scratch buffer.
+    /// position (`ae src/main.rs:42:10`; 1-based, editor-conventional). Omit for a scratch.
     ///
     /// Resolved against the working directory; infers the workspace when `--workspace` is absent. A
     /// directory opens the file browser there. A path that literally exists (colon and all) wins over
     /// the `:LINE:COL` interpretation.
     path: Option<String>,
 
-    /// Re-attach to an already-open buffer by id (a scratch with no path), overriding PATH. Hidden:
-    /// buffer ids are daemon-session internals, set by the GUI when it opens a Buffers-picker item in
-    /// a new window (`Ctrl-Enter`), not something to type by hand.
+    /// Present an already-open view by id (a scratch with no path), overriding PATH. Hidden: view
+    /// ids are daemon-session internals, set by the GUI when it opens a picker row in a new window
+    /// (`Ctrl-Enter`), not something to type by hand.
     #[arg(long, hide = true)]
-    buffer: Option<u64>,
+    view: Option<u64>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -191,7 +191,7 @@ fn run_edit(mut edit: EditArgs, version: String) -> anyhow::Result<()> {
     // The quick-edit invocation — a file positional without an explicit `--workspace` — tethers the
     // client to the opened buffer: closing that buffer exits the client, giving `ae file` the
     // `$EDITOR` contract. Naming the workspace (a deliberate session, and what window-spawns always
-    // do) opts out; the shells skip directories and `--buffer` opens.
+    // do) opts out; the shells skip directories and `--view` opens.
     let tether = edit.path.is_some() && edit.workspace.is_none();
     let port = aether_server::ensure_profile_port()?;
     let idle_timeout_secs = aether_server::profile_idle_timeout_secs()?;
@@ -202,16 +202,10 @@ fn run_edit(mut edit: EditArgs, version: String) -> anyhow::Result<()> {
     let server_url = format!("ws://127.0.0.1:{port}");
     if want_gui(&edit) {
         run_gui(
-            workspace,
-            edit.path,
-            jump,
-            edit.buffer,
-            tether,
-            version,
-            server_url,
+            workspace, edit.path, jump, edit.view, tether, version, server_url,
         )
     } else {
-        // `--buffer` is a GUI-spawn internal; the terminal client has no window to seed with it.
+        // `--view` is a GUI-spawn internal; the terminal client has no window to seed with it.
         run_tui(workspace, edit.path, jump, tether, version, server_url)
     }
 }
@@ -286,9 +280,9 @@ fn gui_respawn_args(edit: &EditArgs) -> Vec<std::ffi::OsString> {
         args.push("--workspace".into());
         args.push(ws.into());
     }
-    if let Some(buffer) = edit.buffer {
-        args.push("--buffer".into());
-        args.push(buffer.to_string().into());
+    if let Some(view) = edit.view {
+        args.push("--view".into());
+        args.push(view.to_string().into());
     }
     if let Some(path) = &edit.path {
         args.push(path.into());
@@ -564,7 +558,7 @@ fn terminate(_pid: u32) -> anyhow::Result<()> {
 /// `ae server status` — report whether the server for the active profile is running, plus what it's
 /// doing. Two signals, cheapest first: a pid file (with a liveness check) and a port probe always
 /// print — they work even against a wedged server. When the port actually answers, we additionally
-/// fetch the live `/status` summary (version, clients, buffers, unsaved) over a plain loopback HTTP
+/// fetch the live `/status` summary (version, clients, views, unsaved) over a plain loopback HTTP
 /// GET, and degrade gracefully to the local-only view if that fetch fails.
 fn server_status() -> anyhow::Result<()> {
     let profile = aether_server::active_profile();
@@ -657,13 +651,13 @@ fn server_status() -> anyhow::Result<()> {
                 aether_client::app_info::format_duration_secs(s.uptime_secs)
             );
             println!("  clients:    {}", s.clients);
-            if s.buffers_unsaved > 0 {
+            if s.documents_unsaved > 0 {
                 println!(
-                    "  buffers:    {} open, {} unsaved",
-                    s.buffers_open, s.buffers_unsaved
+                    "  views:      {} open, {} unsaved",
+                    s.views_open, s.documents_unsaved
                 );
             } else {
-                println!("  buffers:    {} open", s.buffers_open);
+                println!("  views:      {} open", s.views_open);
             }
             println!("  workspaces: {}", s.workspaces_active);
             match s.idle_timeout_secs {
@@ -716,14 +710,14 @@ fn run_gui(
     workspace: Option<String>,
     path: Option<String>,
     jump: Option<(u32, u32)>,
-    buffer: Option<u64>,
+    view: Option<u64>,
     tether: bool,
     version: String,
     server_url: String,
 ) -> anyhow::Result<()> {
     // iced owns the main thread and manages its own tokio runtime, so this is a synchronous call —
     // do not wrap it in `runtime().block_on`, which would panic on a nested runtime.
-    aether_iced::run(workspace, path, jump, buffer, tether, version, server_url)
+    aether_iced::run(workspace, path, jump, view, tether, version, server_url)
 }
 
 #[cfg(not(feature = "gui"))]
@@ -732,7 +726,7 @@ fn run_gui(
     _workspace: Option<String>,
     _path: Option<String>,
     _jump: Option<(u32, u32)>,
-    _buffer: Option<u64>,
+    _view: Option<u64>,
     _tether: bool,
     _version: String,
     _server_url: String,
@@ -891,11 +885,11 @@ mod tests {
 
     #[test]
     fn web_conflicts_with_the_native_client_flags() {
-        // `--web` is a sibling of `--gui`/`--tui`; `--buffer` re-attaches are GUI-spawn
-        // internals with no web counterpart; and `--wait` would be a misleading no-op on a
-        // non-tethered web launch (there is no process to hold — the tether shape waits on its
-        // own). All four must refuse to combine rather than half-apply.
-        for conflicting in ["--gui", "--tui", "--buffer=3", "--wait"] {
+        // `--web` is a sibling of `--gui`/`--tui`; `--view` re-attaches are GUI-spawn internals
+        // with no web counterpart; and `--wait` would be a misleading no-op on a non-tethered web
+        // launch (there is no process to hold — the tether shape waits on its own). All four must
+        // refuse to combine rather than half-apply.
+        for conflicting in ["--gui", "--tui", "--view=3", "--wait"] {
             assert!(
                 Cli::try_parse_from(["ae", "--web", conflicting]).is_err(),
                 "--web {conflicting} must be rejected"

@@ -79,10 +79,12 @@ pub struct AppInfo {
     pub idle_timeout_secs: Option<u64>,
     /// Connected clients right now (TUI / GUI / web sessions).
     pub clients: usize,
-    /// Open buffers across all workspaces.
-    pub buffers_open: usize,
-    /// How many open buffers have unsaved edits — what you'd want to know before `ae server stop`.
-    pub buffers_unsaved: usize,
+    /// Open views across all workspaces — what the view picker would list.
+    pub views_open: usize,
+    /// How many open documents have unsaved edits — what you'd want to know before `ae server
+    /// stop`. Counted per document rather than per view: two views of one file share its text, and
+    /// there is one thing to lose.
+    pub documents_unsaved: usize,
     /// Activated (loaded) workspaces.
     pub workspaces_active: usize,
 

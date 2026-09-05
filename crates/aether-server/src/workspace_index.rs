@@ -32,7 +32,7 @@ pub fn workspace_relative_parts(abs: &Path, roots: &[PathBuf]) -> Option<(u32, S
     None
 }
 
-/// The Buffers picker's row `display` — which is also the fuzzy-match haystack (`match_indices`
+/// The view picker's row `display` — which is also the fuzzy-match haystack (`match_indices`
 /// index into it). This is the *bare* workspace-relative path, matching how Files/Grep ship
 /// `relative_path`: root identity is deliberately **not** part of the string, so it isn't part of
 /// the fuzzy match and the client is free to prepend a disambiguated `"[root]: "` label as a

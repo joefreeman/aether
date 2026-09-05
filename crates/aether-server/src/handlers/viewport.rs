@@ -14,23 +14,26 @@ pub async fn viewport_subscribe(
     params: ViewportSubscribeParams,
 ) -> Result<ViewportSubscribeResult, RpcError> {
     let client_id = ctx.client_id;
-    // One named crossing, at the boundary: everything below renders the view's own document and its
-    // elements, all of which are buffer questions. `params.buffer_id` stays a `ViewId` for the two
-    // places that want the view's identity — the `Viewport` it builds and the render it drives.
-    let buffer_id = params.buffer_id.presenting_buffer();
-
     let mut s = state.lock().await;
+    // One named crossing, at the boundary: everything below renders the view's own document and its
+    // elements, all of which are buffer questions. `params.view_id` stays a `ViewId` for the two
+    // places that want the view's identity — the `Viewport` it builds and the render it drives.
+    // Every live buffer has its view from creation, so a view nothing knows is a buffer nothing
+    // knows.
+    let buffer_id = s
+        .try_presenting_buffer(params.view_id)
+        .ok_or_else(|| RpcError::view_not_found(params.view_id))?;
     s.try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    // Showing a view is using it: the buffer's most recently used view is the one an open with no
+    // opinion presents.
+    s.touch_view(params.view_id);
     // The buffer may have been mutated while nothing was viewing it — an edit through a sibling
     // buffer in another workspace, or a reload — and the per-mutation refresh skips buffers with
     // no viewport. This is the moment that stops being true, so re-diff before rendering, or the
     // first frame shows a clean gutter for a modified file and stays wrong until the next edit.
     rediff_git_for_buffer(&mut s, buffer_id);
 
-    // The view exists from the first presentation on, as the kind this presentation asks for; a
-    // driver's view is already there and is what it is.
-    s.present_view(params.buffer_id, params.kind);
     let geom = wrap::WrapGeometry {
         wrap: params.wrap,
         cols: params.cols,
@@ -38,7 +41,7 @@ pub async fn viewport_subscribe(
         tab_width: params.tab_width,
     };
     let (focused, loaded, anchor) = {
-        let view = s.view(params.buffer_id);
+        let view = s.view(params.view_id);
         let last = view.elements.len().saturating_sub(1) as aether_protocol::viewport::FieldId;
         // The element the scroll names is the one being looked at — a patch opened on the file
         // you picked, a session restored where you left it — and so, on a fresh open, the one the
@@ -93,7 +96,7 @@ pub async fn viewport_subscribe(
         viewport_id,
         Viewport {
             id: viewport_id,
-            view_id: params.buffer_id,
+            view_id: params.view_id,
             focused,
             client_id,
             rows: params.rows,
@@ -111,7 +114,7 @@ pub async fn viewport_subscribe(
     // client's sticky setting. Hunks are seeded on open (`load_baseline`) and kept fresh per edit,
     // so they're accurate here without the recompute `git_set_diff_view` does.
     let window = render_viewport(&s, viewport_id, SneakLabels::Shown);
-    s.last_scroll.insert((client_id, params.buffer_id), anchor);
+    s.last_scroll.insert((client_id, params.view_id), anchor);
     tracing::debug!(%client_id, viewport_id, buffer_id, element = anchor.element, line = anchor.line, "viewport subscribed");
 
     // One logical viewport per client: a new subscribe supersedes the client's previous
@@ -134,10 +137,13 @@ pub async fn viewport_subscribe(
                 // and every other file it had opened behind, unreferenced and uncollected.
                 let shown_buffers = match s.try_view(v.view_id) {
                     Some(view) => v.shown_buffers(view),
-                    None => vec![v.view_id.presenting_buffer()],
+                    None => Vec::new(),
                 };
+                // The buffer this subscribe presents is a candidate too: what the collector
+                // decides about a buffer someone is showing is only whether its *hidden* views
+                // go — a `Space u` away from a preview leaves that preview to close itself.
                 for shown in shown_buffers {
-                    if shown != buffer_id && !buffers.contains(&shown) {
+                    if !buffers.contains(&shown) {
                         buffers.push(shown);
                     }
                 }
@@ -145,13 +151,16 @@ pub async fn viewport_subscribe(
         }
         buffers
     };
-    let (closed, stopped_servers) = s.close_orphaned_transients(left_buffers);
+    let (closed, stopped_servers, closed_views) = s.close_orphaned_transients(left_buffers);
     let mut pushes = Vec::new();
-    if !closed.is_empty() {
+    if !closed.is_empty() || !closed_views.is_empty() {
         for &id in &closed {
             tracing::debug!(buffer_id = id, "transient buffer closed (hidden)");
         }
-        pushes.extend(refresh_buffer_pickers(&mut s));
+        for view in &closed_views {
+            tracing::debug!(%view, "transient view closed (hidden)");
+        }
+        pushes.extend(refresh_view_pickers(&mut s));
     }
     if !stopped_servers.is_empty() {
         pushes.extend(refresh_lsp_server_pickers(&mut s));
@@ -402,7 +411,7 @@ fn change_anchors(
 ) -> Vec<(aether_protocol::viewport::FieldId, u32)> {
     let mut out = Vec::new();
     let view = s.view_of(vp);
-    let view_buffer = vp.view_id.presenting_buffer();
+    let view_buffer = view.presenting;
     let generated = s.try_doc_of(view_buffer).and_then(|d| d.generated.as_ref());
     let layout = s.layout_of(&view.elements);
     for (idx, binding) in view.elements.iter().enumerate() {
@@ -512,11 +521,11 @@ pub fn view_element_buffers(
     view_id: Option<aether_protocol::ViewId>,
     focused: BufferId,
 ) -> Vec<BufferId> {
-    let Some(view) = view_id else {
+    let Some(view) = view_id.and_then(|id| s.try_view(id)) else {
         return vec![focused];
     };
     let mut out: Vec<BufferId> = Vec::new();
-    for element in s.view_elements(view).iter() {
+    for element in &view.elements {
         if !out.contains(&element.buffer_id) {
             out.push(element.buffer_id);
         }
@@ -552,18 +561,19 @@ pub fn element_holding(
     let vp = s.viewports.values().find(|vp| {
         vp.client_id == client_id && view_key_of(s, vp.view_id) == Some(view_key.into())
     })?;
-    seat_in(
-        s,
-        vp.view_id.presenting_buffer(),
-        &s.view_of(vp).elements,
-        identity,
-        line,
-    )
+    let view = s.view_of(vp);
+    seat_in(s, view.presenting, &view.elements, identity, line)
 }
 
 /// The [`crate::state::VirtualSource::key`] of a view, when it is a materialised one.
 pub fn view_key_of(s: &ServerState, view: ViewId) -> Option<String> {
-    s.try_doc_of(view.presenting_buffer())?
+    buffer_view_key(s, s.try_presenting_buffer(view)?)
+}
+
+/// [`view_key_of`] for the view `buffer_id` presents — the key is the document's, so it answers for
+/// a buffer whose view nobody has opened yet.
+pub fn buffer_view_key(s: &ServerState, buffer_id: BufferId) -> Option<String> {
+    s.try_doc_of(buffer_id)?
         .virtual_source
         .as_ref()
         .map(|src| src.target.key())
@@ -663,7 +673,7 @@ pub fn seat_in_fresh_view(
     identity: &str,
     line: u32,
 ) -> Option<(aether_protocol::viewport::ViewSeat, LogicalPosition)> {
-    let elements = s.view_elements(ViewId(view_buffer));
+    let elements = s.view_elements_of(view_buffer);
     seat_in(s, view_buffer, &elements, identity, line)
 }
 
@@ -678,7 +688,8 @@ pub fn seat_in_fresh_view(
 /// Returns empty for an ordinary view, which has no outline of this kind — its outline is the
 /// document symbols of the one buffer it shows, and that is answered elsewhere.
 pub fn view_outline(s: &ServerState, vp: &Viewport) -> Vec<OutlineEntry> {
-    view_outline_of(s, vp.view_id.presenting_buffer(), &s.view_of(vp).elements)
+    let view = s.view_of(vp);
+    view_outline_of(s, view.presenting, &view.elements)
 }
 
 /// [`view_outline`] for a view **nobody is subscribed to yet** — the state a jumplist entry finds
@@ -823,6 +834,17 @@ pub fn view_outline_of(
 /// The one question both the breadcrumb and the picker's opening selection ask, so they ask it once.
 /// Answered against the *focused element* first: entries of other elements are other files, and
 /// being "past" one of those says nothing about where the cursor is.
+/// The view `client_id` is looking at `buffer_id` through: its viewport presenting or windowing the
+/// buffer, else the buffer's most recently used view. What a location the client names by buffer
+/// — a nav-history entry, a jumplist step's origin — is turned into a view by.
+pub fn client_view_of(s: &ServerState, client_id: ClientId, buffer_id: BufferId) -> Option<ViewId> {
+    s.viewports
+        .values()
+        .find(|vp| vp.client_id == client_id && vp.shows(s.view_of(vp), buffer_id))
+        .map(|vp| vp.view_id)
+        .or_else(|| s.view_presenting(buffer_id))
+}
+
 pub fn outline_entry_at(
     s: &ServerState,
     client_id: ClientId,
@@ -2054,7 +2076,7 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
     // element windows a real file. Looking on the first *element's* buffer answered `None` the
     // moment the elements stopped being that document, and the rule silently stopped rendering.
     let trailing_chrome: &[Element] = s
-        .try_doc_of(vp.view_id.presenting_buffer())
+        .try_doc_of(s.view_of(vp).presenting)
         .and_then(|d| d.generated.as_ref())
         .map(|g| &g.decorations.trailing_chrome[..])
         .unwrap_or(&[]);
@@ -2573,8 +2595,8 @@ mod subscribe_snapshot_tests {
                 workspace_index: std::sync::Arc::new(crate::workspace_index::WorkspaceIndex::new(
                     vec![root.clone()],
                 )),
-                mru_buffers: std::collections::VecDeque::new(),
-                dormant_buffers: Vec::new(),
+                mru_views: std::collections::VecDeque::new(),
+                dormant_views: Vec::new(),
                 jumplist: None,
                 projects: Vec::new(),
             },
@@ -2664,8 +2686,8 @@ mod subscribe_snapshot_tests {
                 workspace_index: std::sync::Arc::new(crate::workspace_index::WorkspaceIndex::new(
                     vec![root.clone()],
                 )),
-                mru_buffers: std::collections::VecDeque::new(),
-                dormant_buffers: Vec::new(),
+                mru_views: std::collections::VecDeque::new(),
+                dormant_views: Vec::new(),
                 jumplist: None,
                 projects: Vec::new(),
             },
@@ -2726,7 +2748,7 @@ mod subscribe_snapshot_tests {
         diags: Vec<BufferDiagnostic>,
         externally_modified: bool,
         externally_deleted: bool,
-    ) -> (SharedState, ClientId, BufferId) {
+    ) -> (SharedState, ClientId, ViewId) {
         let mut st = ServerState::new();
         let buffer_id = st.allocate_buffer_id();
         st.insert_buffer_with_document(buffer_id, Some(1), false, |d| {
@@ -2739,12 +2761,15 @@ mod subscribe_snapshot_tests {
         if !diags.is_empty() {
             st.diagnostics.insert(buffer_id, diags);
         }
-        (Arc::new(Mutex::new(st)), uuid::Uuid::new_v4(), buffer_id)
+        let view_id = st
+            .view_presenting(buffer_id)
+            .expect("inserting a buffer opens its view");
+        (Arc::new(Mutex::new(st)), uuid::Uuid::new_v4(), view_id)
     }
 
-    fn sub_params(buffer_id: ViewId) -> ViewportSubscribeParams {
+    fn sub_params(view_id: ViewId) -> ViewportSubscribeParams {
         ViewportSubscribeParams {
-            buffer_id,
+            view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -2754,7 +2779,6 @@ mod subscribe_snapshot_tests {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         }
     }
 
@@ -2762,7 +2786,7 @@ mod subscribe_snapshot_tests {
     async fn subscribe_snapshots_existing_diagnostic_counts() {
         // The regression: diagnostics computed before this viewport subscribed must still reach the
         // status bar. They now ride the subscribe response, not only the change-notification.
-        let (state, client_id, buffer_id) = setup(
+        let (state, client_id, view_id) = setup(
             vec![
                 diag(0, DiagnosticSeverity::Error),
                 diag(1, DiagnosticSeverity::Warning),
@@ -2772,7 +2796,7 @@ mod subscribe_snapshot_tests {
             false,
         );
         let mut ctx = ConnectionCtx { client_id };
-        let res = viewport_subscribe(&state, &mut ctx, sub_params(ViewId(buffer_id)))
+        let res = viewport_subscribe(&state, &mut ctx, sub_params(view_id))
             .await
             .unwrap();
         let c = res.buffer_status.diagnostics;
@@ -2783,9 +2807,9 @@ mod subscribe_snapshot_tests {
     async fn subscribe_snapshots_external_change_flags() {
         // A client that starts showing a buffer the watcher already flagged externally-modified must
         // see the flag immediately, not only on the next disk event.
-        let (state, client_id, buffer_id) = setup(Vec::new(), true, false);
+        let (state, client_id, view_id) = setup(Vec::new(), true, false);
         let mut ctx = ConnectionCtx { client_id };
-        let res = viewport_subscribe(&state, &mut ctx, sub_params(ViewId(buffer_id)))
+        let res = viewport_subscribe(&state, &mut ctx, sub_params(view_id))
             .await
             .unwrap();
         assert!(res.buffer_status.externally_modified);
@@ -2794,9 +2818,9 @@ mod subscribe_snapshot_tests {
 
     #[tokio::test]
     async fn subscribe_to_clean_unbacked_buffer_snapshots_empty_status() {
-        let (state, client_id, buffer_id) = setup(Vec::new(), false, false);
+        let (state, client_id, view_id) = setup(Vec::new(), false, false);
         let mut ctx = ConnectionCtx { client_id };
-        let res = viewport_subscribe(&state, &mut ctx, sub_params(ViewId(buffer_id)))
+        let res = viewport_subscribe(&state, &mut ctx, sub_params(view_id))
             .await
             .unwrap();
         let s = &res.buffer_status;
@@ -2925,11 +2949,15 @@ mod tests {
     /// A viewport over a view of one element per buffer, each windowing line 0 of it. The view is
     /// installed in `s`, since that is where the viewport's elements live.
     fn viewport_over(s: &mut ServerState, buffers: Vec<BufferId>) -> Viewport {
-        let view_id = ViewId(buffers.first().copied().unwrap_or_default());
+        let presenting = buffers.first().copied().unwrap_or_default();
+        let view_id = s.allocate_view_id();
         let elements = buffers.len();
         s.views.insert(
             view_id,
             View {
+                presenting,
+                last_used: 0,
+                transient: false,
                 elements: buffers
                     .into_iter()
                     .map(|buffer_id| ElementBinding {
@@ -3265,12 +3293,16 @@ pub async fn view_save(
     let client_id = ctx.client_id;
     let (buffers, focused_buffer) = {
         let s = state.lock().await;
-        let focused = s
+        let focused = match s
             .viewports
             .values()
             .find(|vp| vp.client_id == client_id && vp.view_id == params.view_id)
-            .map(|vp| s.focused_buffer(vp))
-            .unwrap_or_else(|| params.view_id.presenting_buffer());
+        {
+            Some(vp) => s.focused_buffer(vp),
+            None => s
+                .try_presenting_buffer(params.view_id)
+                .ok_or_else(|| RpcError::view_not_found(params.view_id))?,
+        };
         let dirty: Vec<BufferId> = view_element_buffers(&s, Some(params.view_id), focused)
             .into_iter()
             .filter(|id| s.try_doc_of(*id).is_some_and(|d| d.dirty && !d.read_only()))

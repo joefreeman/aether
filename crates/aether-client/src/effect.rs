@@ -85,10 +85,10 @@ pub enum WindowOpen {
         path: String,
         at: Option<(u32, u32)>,
     },
-    /// Re-open an existing buffer by id — a scratch buffer with no path, addressable across clients
-    /// because buffers are daemon-global. Stale-id-safe: the shell falls back to the MRU/scratch if
-    /// the id is gone (the daemon restarted).
-    Buffer(BufferId),
+    /// Present an existing view by id — a scratch with no path, addressable across clients because
+    /// views are daemon-global. Stale-id-safe: the shell falls back to the MRU/scratch if the id is
+    /// gone (the daemon restarted).
+    View(aether_protocol::ViewId),
     /// No specific file: activate the workspace and land on its MRU buffer (the `Space z`
     /// duplicate, and the Workspaces picker's "open this workspace in a new window").
     Workspace,

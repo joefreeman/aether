@@ -37,7 +37,7 @@ import { truncatePath, charBudget } from "./paths";
 import { rootLabels } from "./labels";
 import { renderHoverDoc, mdToPlain, type MdBlock } from "./markdown";
 import type {
-  BufferOpenResult,
+  ViewOpenResult,
   BufferWindow,
   ViewNode,
   CommitRef,
@@ -343,7 +343,7 @@ interface PickerView {
   groups: GroupSpan[];
   /** Whether this view renders as collapsible groups: headers
    * arrive as real `group` window rows and the row space counts them. Core-owned, and a property of
-   * the view rather than the kind — a Jumplist captured from the Files or Buffers picker has no
+   * the view rather than the kind — a Jumplist captured from the Files or view picker has no
    * groups and renders flat. */
   collapsible: boolean;
   total_matches: number;
@@ -448,8 +448,8 @@ interface CoreView {
   wrap: WrapMode;
   diff_view: boolean;
   ligatures: boolean;
-  /** Buffer text size in px (the synced `buffer_font_size` app setting). */
-  buffer_font_size: number;
+  /** Buffer text size in px (the synced `editor_font_size` app setting). */
+  editor_font_size: number;
   /** Chrome text size in px (the synced `ui_font_size` app setting) — status bar, pickers,
    *  dialogs, hover, toasts, hints. */
   ui_font_size: number;
@@ -462,7 +462,7 @@ interface CoreView {
   theme: "dark" | "light";
   window: BufferWindow | null;
   viewport_id: number | null;
-  /** What this view *is* — what `viewport/subscribe` and `buffer/close` address. Distinct from
+  /** What this view *is* — what `viewport/subscribe` and `view/close` address. Distinct from
    *  `buffer`, which is the buffer currently being edited; a patch is one view over many files. */
   view_id: number;
   /** What to call the view in the status bar and the tab title. The view's own label, which focus
@@ -483,7 +483,6 @@ interface CoreView {
     scroll: ScrollPosition | null;
     revision: number;
     saved_revision: number;
-    transient: boolean;
   };
   /** Raw blame for the followed cursor line (server `git/blame_changed` push); formatted here. */
   blame: { line: number; author: string; timestamp: number; is_uncommitted: boolean } | null;
@@ -839,12 +838,16 @@ function describePickerItem(
         bulletStatus: item.git_status,
       };
     }
-    case "buffer": {
+    case "view": {
       // Multi-root: the dim, disambiguated root label after the name — same placement as the Files
       // picker. `display` is the bare relative path (the match haystack), so highlights land on the
       // path, not the label. `path_index` is absent for scratch/external buffers → no suffix.
-      const suffix =
+      const root =
         labels.length > 1 && item.path_index != null ? labels[item.path_index] : undefined;
+      // The kind badge: a file's reader row says so, dim, after the path; its editor row is the
+      // plain one, as every other file's is.
+      const badge = item.view_kind === "reader" ? "reader" : undefined;
+      const suffix = [badge, root].filter(Boolean).join("  ") || undefined;
       return {
         primary: item.display,
         matches: item.match_indices,
@@ -909,7 +912,7 @@ function describePickerItem(
     }
     case "workspace": {
       // Trailing frost-blue dot when the workspace has unsaved buffers — the same dirty indicator
-      // the buffer picker shows, so the two pickers read alike. An ephemeral context renders as an
+      // the view picker shows, so the two pickers read alike. An ephemeral context renders as an
       // italic "(workspace N)" (mirrors the native clients — `labels::workspace_display`, slanted like
       // a transient buffer); its id isn't a meaningful match haystack, so drop the highlight indices.
       const ephemeral = item.name.startsWith(EPHEMERAL_WORKSPACE_PREFIX);
@@ -917,7 +920,7 @@ function describePickerItem(
         primary: workspaceDisplay(item.name),
         matches: ephemeral ? [] : item.match_indices,
         italic: ephemeral,
-        dirty: (item.unsaved_buffers ?? 0) > 0 ? "unsaved" : undefined,
+        dirty: (item.unsaved ?? 0) > 0 ? "unsaved" : undefined,
       };
     }
     case "git_branch": {
@@ -961,7 +964,7 @@ function describePickerItem(
         suffix: dim.join(" · "),
         metaParts: parts,
         // No bullet cell: "which one am I on" is the initial selection, as in the workspace and
-        // buffer pickers, not a column every row pays for.
+        // view pickers, not a column every row pays for.
       };
     }
     case "git_stash": {
@@ -1163,11 +1166,11 @@ export class Shell {
   private cols = 80;
   private rows = 24;
   /** The `#app` root element — its `font-size` is the buffer size (the buffer inherits it), driven
-   *  by the synced `buffer_font_size` app setting. */
+   *  by the synced `editor_font_size` app setting. */
   private rootEl!: HTMLElement;
   /** The font sizes (px) currently applied to the DOM, so `render` re-applies only on a change.
-   *  The authoritative values are the core's `view.buffer_font_size` / `view.ui_font_size`. */
-  private appliedBufferFontSize = 0;
+   *  The authoritative values are the core's `view.editor_font_size` / `view.ui_font_size`. */
+  private appliedEditorFontSize = 0;
   private appliedUiFontSize = 0;
   /** The theme currently stamped on `<html data-theme>` — `render` restamps only on a change. */
   private appliedTheme = "";
@@ -1821,9 +1824,9 @@ export class Shell {
       // context of its own. (Both mirror aether-client's `web_link`.)
       const urlDir = sp.get("dir");
       const urlRoot = Number(sp.get("root")) || 0;
-      const urlBufferRaw = sp.get("buffer");
-      const urlBuffer =
-        urlBufferRaw != null && Number.isInteger(Number(urlBufferRaw)) ? Number(urlBufferRaw) : null;
+      const urlViewRaw = sp.get("view");
+      const urlView =
+        urlViewRaw != null && Number.isInteger(Number(urlViewRaw)) ? Number(urlViewRaw) : null;
       // Which *context* of the workspace: repeated `worktree=<repo id>=<admin name>`. The repo id
       // is a path, which is heavier in a URL than an index would be — but a root index can't be
       // mapped back from a *bound* context, whose roots point into the worktree rather than at the
@@ -1839,9 +1842,9 @@ export class Shell {
       // A URL-directed *buffer* open (file/path/buffer link): it opens separately, so the activate
       // shouldn't also fold a landing buffer in. A `dir` link isn't one — it browses over whatever
       // the workspace lands on, exactly as `ae DIR` does.
-      const directedBuffer = Boolean(urlFile) || urlBuffer != null || Boolean(urlPath);
+      const directedView = Boolean(urlFile) || urlView != null || Boolean(urlPath);
       // Whether the URL named anything at all to open.
-      const directed = directedBuffer || Boolean(urlDir);
+      const directed = directedView || Boolean(urlDir);
       // Workspace selection is explicit. With none specified (and nothing named to open) we DON'T
       // activate one: keep a placeholder session and raise the Workspaces chooser — nothing is
       // rendered behind it. Picking a workspace activates it (PickerSelected → WorkspaceActivated →
@@ -1854,7 +1857,7 @@ export class Shell {
       }
       const jump = this.parseFragment(location.hash); // `#L:C` from a grep-hit / shared-cursor link
       let workspace: WorkspaceInfo;
-      let open: BufferOpenResult;
+      let open: ViewOpenResult;
       // Where the explorer should open once the session exists — the `dir` link's directory.
       let explorerDir: string | null = urlDir;
 
@@ -1886,32 +1889,40 @@ export class Shell {
           // Omitted, not empty, when the URL names none: the server enters whichever context this
           // workspace was last used in.
           worktrees: Object.keys(urlWorktrees).length ? urlWorktrees : undefined,
-          open_last: !directedBuffer,
+          open_last: !directedView,
         });
         workspace = activated.workspace;
-        const lastOrScratch = (): Promise<BufferOpenResult> =>
-          this.client.rpc<BufferOpenResult>("buffer/open", {
-            buffer_id: activated.last_buffer_id ?? null,
+        const lastOrScratch = (): Promise<ViewOpenResult> =>
+          this.client.rpc<ViewOpenResult>("view/open", {
+            view_id: activated.last_view_id ?? null,
             create_if_missing: false,
-            ...(activated.last_buffer_id == null ? { transient: true } : {}),
+            ...(activated.last_view_id == null ? { transient: true } : {}),
           });
+        // An `as=reader|editor` param is the presentation this URL was captured in (a refresh, a
+        // shared reading link) and wins outright; without one the server presents the file as it
+        // was last shown, landing a `#line:col` link in the editor. (Only honored for a
+        // URL-directed open — on a fallback landing the param describes a view we didn't open.)
+        const urlAs = directed ? sp.get("as") : null;
+        const kind =
+          urlAs === "reader" ? { kind: "reader" } : urlAs === "editor" ? { kind: "editor" } : {};
         if (urlFile) {
           try {
-            open = await this.client.rpc<BufferOpenResult>("buffer/open", {
+            open = await this.client.rpc<ViewOpenResult>("view/open", {
               path_index: urlRoot,
               relative_path: urlFile,
               create_if_missing: false,
               ...(jump ? { jump_to: jump } : {}),
+              ...kind,
             });
           } catch {
             this.toast(`Couldn't open ${urlFile}`, "warning");
             open = await lastOrScratch();
           }
-        } else if (urlBuffer != null) {
-          // A scratch-buffer link (`?buffer=<id>`); the id is session-scoped, so fall back if stale.
+        } else if (urlView != null) {
+          // A scratch link (`?view=<id>`); the id is session-scoped, so fall back if stale.
           try {
-            open = await this.client.rpc<BufferOpenResult>("buffer/open", {
-              buffer_id: urlBuffer,
+            open = await this.client.rpc<ViewOpenResult>("view/open", {
+              view_id: urlView,
               create_if_missing: false,
             });
           } catch {
@@ -1923,20 +1934,6 @@ export class Shell {
       }
 
       this.session = WasmSession.bootstrap(workspace, open);
-      // Boot installs the session directly (no adopt_switch), so the markdown reading-view
-      // decision runs here, ahead of the subscribe it decides. A `view=read|source` param is the
-      // presentation this URL was captured in (a refresh, a shared reading link) and wins
-      // outright; without one, a `#line:col` link is jump-shaped and lands in the editor, and a
-      // plain link leaves the choice to the server (the file as it was last shown, else the app
-      // setting). (Only honored for a URL-directed open — on a fallback landing the param
-      // describes a buffer we didn't open.)
-      const urlView = directed ? sp.get("view") : null;
-      if (urlView === "read" || urlView === "source") {
-        this.session.boot_read_presentation_explicit(urlView === "read");
-      } else {
-        const jumpShaped = Boolean(jump && (urlFile || urlPath));
-        this.session.boot_read_presentation(jumpShaped);
-      }
       await this.subscribe(); // derives its scroll from the buffer (open.scroll / cursor)
       // Fetch the persisted app settings (e.g. the soft-wrap default) now that the session is live.
       this.runEffects(this.session.startup() as CoreEffect[]);
@@ -2240,9 +2237,9 @@ export class Shell {
   }
 
   /** Rebuild the session after the socket reconnects (a fresh client_id ⇒ the server dropped this
-   *  client's cursor/selection/viewport). Re-activate the workspace and reopen the current buffer (by
-   *  id, restoring the cursor; a server *restart* invalidates the id, so fall back to the workspace's
-   *  last/scratch). Buffer content + unsaved edits survive a socket drop server-side. */
+   *  client's cursor/selection/viewport). Re-activate the workspace and present the current view
+   *  again (by id, restoring the cursor; a server *restart* invalidates the id, so fall back to the
+   *  workspace's last/scratch). Buffer content + unsaved edits survive a socket drop server-side. */
   private async reestablish(): Promise<void> {
     const snap = this.snapshot;
     if (!snap) return;
@@ -2260,10 +2257,10 @@ export class Shell {
         name: snap.workspace,
         open_last: false,
       });
-      let open: BufferOpenResult;
+      let open: ViewOpenResult;
       try {
-        open = await this.client.rpc<BufferOpenResult>("buffer/open", {
-          buffer_id: snap.buffer.buffer_id,
+        open = await this.client.rpc<ViewOpenResult>("view/open", {
+          view_id: snap.view_id,
           jump_to: snap.buffer.cursor.position,
         });
       } catch {
@@ -2273,7 +2270,7 @@ export class Shell {
         });
         open =
           relanded.opened ??
-          (await this.client.rpc<BufferOpenResult>("buffer/open", { transient: true }));
+          (await this.client.rpc<ViewOpenResult>("view/open", { transient: true }));
       }
       this.session = WasmSession.bootstrap(activated.workspace, open);
       this.connBanner.style.display = "none";
@@ -2580,8 +2577,8 @@ export class Shell {
       this.appliedUiFontSize = uiPx;
       document.documentElement.style.setProperty("--ui-font-size", `${uiPx}px`);
     }
-    if (bufferPx === this.appliedBufferFontSize) return;
-    this.appliedBufferFontSize = bufferPx;
+    if (bufferPx === this.appliedEditorFontSize) return;
+    this.appliedEditorFontSize = bufferPx;
     this.rootEl.style.fontSize = `${bufferPx}px`;
     this.cell = measureCell(this.bufferEl);
     // `onResize` recomputes the grid and, when a viewport is already subscribed, issues the reflow
@@ -2639,7 +2636,7 @@ export class Shell {
     // As content — the element the cursor is in and a line of its buffer — which is what a scroll
     // position is; a row is something only the client can count, once it has the tree.
     // A fresh jump target (no saved scroll) rests near the top — the cross-buffer counterpart of
-    // the in-buffer jump reveal. A pending content anchor (a wrap toggle, `Space v`) wins over
+    // the in-buffer jump reveal. A pending content anchor (a wrap toggle, `Space u`) wins over
     // both: the window loads around it and the view is placed by it when the window arrives.
     const anchor = this.session.relayout_anchor_position() as ScrollPosition | null;
     const scroll: ScrollPosition = anchor ??
@@ -2657,7 +2654,7 @@ export class Shell {
     try {
       res = await this.client.rpc<ViewportSubscribeResult>("view/subscribe", {
         // The *view* is what a viewport subscribes to; its elements may window other buffers.
-        buffer_id: v.view_id,
+        view_id: v.view_id,
         cols: this.cols,
         rows: this.rows,
         overscan_rows: this.rows,
@@ -2670,9 +2667,6 @@ export class Shell {
         tab_width: TAB_WIDTH,
         // Sticky diff view rides the subscribe so it survives a buffer switch.
         diff_view: v.diff_view,
-        // What this route decided, if anything: `Space v`, a jump, a followed anchor, the URL's
-        // `view=`. Absent, the server presents the file as it last was.
-        kind: this.session.subscribe_kind() ?? null,
       });
     } catch {
       return; // a failed subscribe (e.g. raced a buffer close) — a newer one will follow
@@ -2708,7 +2702,7 @@ export class Shell {
     // fighting it — every cursor move fires `RevealCursor`, and in code-heavy documents the
     // grid estimate diverges linearly from the real layout, dragging focus off screen. Gated on
     // the core's state, not this shell's flag: the reveal that frames the cursor as the reading
-    // view is *left* (`Space v`) arrives before the render that clears the flag, and it is the
+    // view is *left* (`Space u`) arrives before the render that clears the flag, and it is the
     // editor's grid that reveal positions.
     const v = this.view();
     if (v.read !== null) return;
@@ -3135,7 +3129,7 @@ export class Shell {
     const v = this.view();
     this.snapshot = v;
     // Adopt the synced font sizes before drawing, so this paint uses the right cell metrics.
-    this.applyFontSizes(v.buffer_font_size, v.ui_font_size);
+    this.applyFontSizes(v.editor_font_size, v.ui_font_size);
     this.applyTheme(v.theme);
     this.renderSearch(v);
     this.renderPrompt(v);
@@ -3149,7 +3143,7 @@ export class Shell {
     // focus and swallow `y`/`n` as native typing.
     this.ensureFocus();
     // No workspace yet (placeholder boot session): the mandatory chooser is the whole UI. Render only
-    // a bare backdrop behind it — no buffer, no status bar — and don't sync a bogus `?buffer=0` URL.
+    // a bare backdrop behind it — no buffer, no status bar — and don't sync a bogus `?view=0` URL.
     if (v.buffer.buffer_id === 0) {
       this.bufferEl.replaceChildren();
       this.statusEl.replaceChildren();
@@ -4432,7 +4426,7 @@ export class Shell {
         return fromPath(item.path_index, item.relative_path);
       case "grep_hit":
         return fromPath(item.path_index, item.relative_path, `#${item.line + 1}:${item.col + 1}`);
-      case "buffer": {
+      case "view": {
         if (item.path_index != null && item.relative_path != null) {
           return fromPath(item.path_index, item.relative_path);
         }
@@ -4442,7 +4436,7 @@ export class Shell {
         const params = new URLSearchParams();
         if (workspace) params.set("workspace", workspace);
         withContext(params, here);
-        params.set("buffer", String(item.buffer_id));
+        params.set("view", String(item.view_id));
         return `${location.pathname}?${params.toString()}`;
       }
       case "dir_entry": {
@@ -4515,9 +4509,9 @@ export class Shell {
       // joined onto root 0.)
       params.set("path", path);
     } else if (!ephemeral) {
-      // A scratch: keyed on the session id, and scoped to the workspace holding it.
+      // A scratch: keyed on the session's view id, and scoped to the workspace holding it.
       if (v.workspace) params.set("workspace", v.workspace);
-      params.set("buffer", String(v.buffer.buffer_id));
+      params.set("view", String(v.view_id));
     }
     // …and a scratch in a temporary context has no address at all (the core's `Space Alt-z` refuses
     // it for the same reason): leave the URL bare, so a reload offers the chooser rather than
@@ -4525,8 +4519,8 @@ export class Shell {
     // Record the presentation for markdown buffers, so a refresh restores what's on screen —
     // without this the `#line:col` cursor restore below reads as a jump-shaped open and a reading
     // view reloads as source.
-    if (v.read) params.set("view", "read");
-    else if (v.buffer.language === "markdown") params.set("view", "source");
+    if (v.read) params.set("as", "reader");
+    else if (v.buffer.language === "markdown") params.set("as", "editor");
     const qs = params.toString();
     return `${location.pathname}${qs ? `?${qs}` : ""}${this.cursorFragment(v.buffer.cursor)}`;
   }

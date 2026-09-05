@@ -9,7 +9,7 @@ use common::*;
 // A buffer opened with `transient: true` (picker / goto-def navigation, the bootstrap scratch)
 // closes itself once no viewport shows it anymore — switching away is what "hides" it, since
 // `viewport/subscribe` supersedes the client's previous viewport. The first edit, a save, or an
-// explicit `buffer/open { transient: false }` (pin) promotes it to a normal buffer.
+// explicit `view/open { transient: false }` (pin) promotes it to a normal buffer.
 
 async fn setup_transient_workspace() -> (aether_server::ServerHandle, Ws) {
     let dir = tempfile::tempdir().unwrap();
@@ -33,7 +33,7 @@ async fn setup_transient_workspace() -> (aether_server::ServerHandle, Ws) {
 
 // ---- buffer/content + buffer/changed (markdown reading view support) ---------------------------
 
-/// `buffer/open` params for a file in the transient-workspace workspace.
+/// `view/open` params for a file in the transient-workspace workspace.
 // ---- buffer/content + buffer/changed (markdown reading view support) ----------------------------
 
 #[tokio::test]
@@ -183,8 +183,8 @@ async fn out_of_window_edit_pushes_buffer_changed() {
         },
     )
     .await;
-    let open: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("doc.md", None)).await;
+    let open: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("doc.md", None)).await;
     let buffer_id = open.buffer_id;
 
     // Client 2: the reader, viewport pinned to the top 10 rows.
@@ -198,18 +198,18 @@ async fn out_of_window_edit_pushes_buffer_changed() {
         },
     )
     .await;
-    let _: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws2, &attach_open_params(buffer_id, None)).await;
     // As the *editor*: presented as the reader the document is loaded whole and nothing is ever
     // outside the window — see `a_markdown_file_is_presented_as_the_reader_by_default`.
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+    let editor: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws2,
-        &ViewportSubscribeParams {
+        &ViewOpenParams {
             kind: Some(aether_protocol::ui::ViewKind::Editor),
-            ..transient_sub_params(buffer_id)
+            ..attach_open_params(buffer_id, None)
         },
     )
     .await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws2, &transient_sub_params(editor.buffer_id)).await;
 
     // Client 1 edits far below client 2's window → client 2 gets the revision-only signal.
     let _: CursorState = send_request::<CursorMove>(
@@ -339,8 +339,8 @@ async fn buffer_asset_route_serves_and_confines() {
         },
     )
     .await;
-    let open: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("doc.md", None)).await;
+    let open: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("doc.md", None)).await;
     let id = open.buffer_id;
     let url = server.ws_url();
 
@@ -363,8 +363,8 @@ async fn buffer_asset_route_serves_and_confines() {
     // the whole relative path as one segment, so the `..` reaches the server un-collapsed).
     std::fs::create_dir_all(dir_path.join("docs")).unwrap();
     std::fs::write(dir_path.join("docs/nested.md"), "![up](../img.png)\n").unwrap();
-    let nested: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("docs/nested.md", None)).await;
+    let nested: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("docs/nested.md", None)).await;
     let (status, _, body) =
         http_get(&url, &format!("/asset/{}/..%2Fimg.png", nested.buffer_id)).await;
     assert!(
@@ -425,10 +425,10 @@ async fn buffer_asset_route_serves_and_confines() {
     drop(server);
 }
 
-/// `buffer/open` params attaching to an existing buffer by id.
-fn attach_open_params(buffer_id: u64, transient: Option<bool>) -> BufferOpenParams {
-    BufferOpenParams {
-        buffer_id: Some(buffer_id),
+/// `view/open` params attaching to an existing buffer by id.
+fn attach_open_params(buffer_id: u64, transient: Option<bool>) -> ViewOpenParams {
+    ViewOpenParams {
+        view_id: Some(view_of(buffer_id)),
         path_index: None,
         relative_path: None,
         language: None,
@@ -445,10 +445,9 @@ fn attach_open_params(buffer_id: u64, transient: Option<bool>) -> BufferOpenPara
 #[tokio::test]
 async fn transient_buffer_closes_on_disconnect() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
-            buffer_id: None,
+        &ViewOpenParams {
             path_index: None,
             relative_path: None,
             language: None,
@@ -478,14 +477,12 @@ async fn transient_buffer_closes_on_disconnect() {
         },
     )
     .await;
-    let err = send_request_expect_err::<BufferOpen>(
-        &mut ws2,
-        &attach_open_params(scratch.buffer_id, None),
-    )
-    .await;
+    let err =
+        send_request_expect_err::<ViewOpen>(&mut ws2, &attach_open_params(scratch.buffer_id, None))
+            .await;
     assert!(
-        err.to_lowercase().contains("buffer"),
-        "attaching to the orphaned transient should fail (got: {err})"
+        err.contains("unknown view_id"),
+        "presenting the orphaned transient should fail (got: {err})"
     );
 }
 
@@ -493,24 +490,23 @@ async fn transient_buffer_closes_on_disconnect() {
 #[tokio::test]
 async fn transient_buffer_closes_when_hidden() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
     assert!(a.transient, "open with transient:true reports the flag");
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
 
     // Switch to b: open + subscribe. The subscribe supersedes a's viewport, hiding a → closed.
-    let b: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("b.txt", None)).await;
+    let b: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", None)).await;
     assert!(!b.transient, "open without the flag is permanent");
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(b.buffer_id)).await;
 
     let err =
-        send_request_expect_err::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, None))
-            .await;
+        send_request_expect_err::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
     assert!(
-        err.contains("unknown buffer_id"),
+        err.contains("unknown view_id"),
         "hidden transient buffer should be closed, got: {err}"
     );
     drop(server);
@@ -520,16 +516,16 @@ async fn transient_buffer_closes_when_hidden() {
 #[tokio::test]
 async fn permanent_buffer_survives_hiding() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
-    let b: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("b.txt", None)).await;
+    let b: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(b.buffer_id)).await;
-    let again: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
+    let again: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
     assert_eq!(again.buffer_id, a.buffer_id);
     drop(server);
 }
@@ -538,8 +534,8 @@ async fn permanent_buffer_survives_hiding() {
 #[tokio::test]
 async fn edit_promotes_transient_buffer() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
     let _: EditResult = send_request::<InputText>(
@@ -554,36 +550,36 @@ async fn edit_promotes_transient_buffer() {
     )
     .await;
 
-    let b: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("b.txt", None)).await;
+    let b: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(b.buffer_id)).await;
 
-    let again: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
+    let again: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
     assert!(!again.transient, "the edit promoted the buffer");
     drop(server);
 }
 
-/// Explicit pin (`buffer/open { transient: false }`) promotes without an edit.
+/// Explicit pin (`view/open { transient: false }`) promotes without an edit.
 #[tokio::test]
 async fn pin_promotes_transient_buffer() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
 
-    let pinned: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, Some(false))).await;
+    let pinned: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, Some(false))).await;
     assert!(!pinned.transient, "pin reports the flag cleared");
 
-    let b: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("b.txt", None)).await;
+    let b: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(b.buffer_id)).await;
-    let again: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
+    let again: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
     assert_eq!(again.buffer_id, a.buffer_id);
     drop(server);
 }
@@ -592,8 +588,8 @@ async fn pin_promotes_transient_buffer() {
 #[tokio::test]
 async fn save_promotes_transient_buffer() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
     let _: BufferSaveResult = send_request::<BufferSave>(
@@ -607,12 +603,12 @@ async fn save_promotes_transient_buffer() {
     )
     .await;
 
-    let b: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("b.txt", None)).await;
+    let b: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(b.buffer_id)).await;
-    let again: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
+    let again: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
     assert!(!again.transient);
     drop(server);
 }
@@ -621,32 +617,32 @@ async fn save_promotes_transient_buffer() {
 #[tokio::test]
 async fn transient_open_does_not_demote_existing_buffer() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let first: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", None)).await;
-    let again: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
+    let first: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let again: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
     assert_eq!(again.buffer_id, first.buffer_id);
     assert!(!again.transient, "an open never demotes a permanent buffer");
     drop(server);
 }
 
-/// `buffer/set_transient` flips the flag *both* ways — including the deliberate demotion
-/// (permanent → transient) that `buffer/open` refuses. Drives the `Space k` keep toggle.
+/// `view/set_transient` flips the flag *both* ways — including the deliberate demotion
+/// (permanent → transient) that `view/open` refuses. Drives the `Space k` keep toggle.
 #[tokio::test]
 async fn set_transient_flips_the_flag_both_ways() {
     let (server, mut ws) = setup_transient_workspace().await;
     // Open a.txt permanent (a fresh non-transient open ⇒ transient: false).
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
     assert!(!a.transient, "a fresh non-transient open is permanent");
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
 
-    // Demote it to transient — the thing `buffer/open` can't do.
-    let demoted: BufferSetTransientResult = send_request::<BufferSetTransient>(
+    // Demote it to transient — the thing `view/open` can't do.
+    let demoted: ViewSetTransientResult = send_request::<ViewSetTransient>(
         &mut ws,
-        &BufferSetTransientParams {
-            buffer_id: a.buffer_id,
+        &ViewSetTransientParams {
+            view_id: a.view_id,
             transient: true,
         },
     )
@@ -656,23 +652,124 @@ async fn set_transient_flips_the_flag_both_ways() {
         "set_transient(true) reports the flag set"
     );
     // Reopening (attach, no intent) reflects the new server-side state.
-    let reopen: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
+    let reopen: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
     assert!(reopen.transient, "the demotion stuck server-side");
 
     // Pin it permanent again.
-    let pinned: BufferSetTransientResult = send_request::<BufferSetTransient>(
+    let pinned: ViewSetTransientResult = send_request::<ViewSetTransient>(
         &mut ws,
-        &BufferSetTransientParams {
-            buffer_id: a.buffer_id,
+        &ViewSetTransientParams {
+            view_id: a.view_id,
             transient: false,
         },
     )
     .await;
     assert!(!pinned.transient);
-    let reopen2: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
+    let reopen2: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
     assert!(!reopen2.transient, "pinned back to permanent");
+
+    drop(server);
+}
+
+/// Transience rides `view/state`, addressed by view id — never `buffer/state`.
+///
+/// One buffer's views disagree about it (keeping a file's reader leaves its editor alone), so a
+/// buffer-addressed push has no single flag to carry. The audience is the viewports on the view
+/// itself.
+#[tokio::test]
+async fn set_transient_pushes_view_state_to_the_presenting_client() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
+
+    let _: ViewSetTransientResult = send_request::<ViewSetTransient>(
+        &mut ws,
+        &ViewSetTransientParams {
+            view_id: a.view_id,
+            transient: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        expect_notification::<ViewState>(&mut ws).await,
+        ViewStateParams {
+            view_id: a.view_id,
+            transient: true,
+        },
+        "the demotion is pushed under the view's own id"
+    );
+
+    // And back: pinning pushes the cleared flag the same way.
+    let _: ViewSetTransientResult = send_request::<ViewSetTransient>(
+        &mut ws,
+        &ViewSetTransientParams {
+            view_id: a.view_id,
+            transient: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        expect_notification::<ViewState>(&mut ws).await,
+        ViewStateParams {
+            view_id: a.view_id,
+            transient: false,
+        }
+    );
+
+    drop(server);
+}
+
+/// The promotion an edit earns is pushed the same way, so a client learns its preview is now kept
+/// without asking. A view that is already permanent has nothing to announce.
+#[tokio::test]
+async fn editing_a_preview_pushes_its_promotion() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
+    assert!(a.transient, "opened as a preview");
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
+
+    let edit = InputTextParams {
+        buffer_id: a.buffer_id,
+        text: "X".into(),
+        select_pasted: false,
+        replace_selection: false,
+        at: Some(SelectionEdge::Start),
+    };
+    let _: EditResult = send_request::<InputText>(&mut ws, &edit).await;
+    assert_eq!(
+        expect_notification::<ViewState>(&mut ws).await,
+        ViewStateParams {
+            view_id: a.view_id,
+            transient: false,
+        },
+        "the first edit promotes the view it was made in"
+    );
+
+    // A second edit has nothing left to promote. Asserting that positively: the next `view/state`
+    // to arrive is the explicit toggle's, not another promotion riding the keystroke.
+    let _: EditResult = send_request::<InputText>(&mut ws, &edit).await;
+    let _: ViewSetTransientResult = send_request::<ViewSetTransient>(
+        &mut ws,
+        &ViewSetTransientParams {
+            view_id: a.view_id,
+            transient: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        expect_notification::<ViewState>(&mut ws).await,
+        ViewStateParams {
+            view_id: a.view_id,
+            transient: true,
+        },
+        "an already-permanent view is not re-announced on every keystroke"
+    );
 
     drop(server);
 }
@@ -681,10 +778,9 @@ async fn set_transient_flips_the_flag_both_ways() {
 #[tokio::test]
 async fn transient_scratch_closes_when_replaced_by_file() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
-            buffer_id: None,
+        &ViewOpenParams {
             path_index: None,
             relative_path: None,
             language: None,
@@ -699,18 +795,16 @@ async fn transient_scratch_closes_when_replaced_by_file() {
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(scratch.buffer_id)).await;
 
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
 
-    let err = send_request_expect_err::<BufferOpen>(
-        &mut ws,
-        &attach_open_params(scratch.buffer_id, None),
-    )
-    .await;
+    let err =
+        send_request_expect_err::<ViewOpen>(&mut ws, &attach_open_params(scratch.buffer_id, None))
+            .await;
     assert!(
-        err.contains("unknown buffer_id"),
+        err.contains("unknown view_id"),
         "hidden transient scratch should be closed, got: {err}"
     );
     drop(server);
@@ -721,8 +815,8 @@ async fn transient_scratch_closes_when_replaced_by_file() {
 #[tokio::test]
 async fn transient_buffer_survives_while_another_client_views_it() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
 
@@ -737,32 +831,31 @@ async fn transient_buffer_survives_while_another_client_views_it() {
         },
     )
     .await;
-    let a2: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws2, &file_open_params("a.txt", Some(true))).await;
+    let a2: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws2, &file_open_params("a.txt", Some(true))).await;
     assert_eq!(a2.buffer_id, a.buffer_id);
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws2, &transient_sub_params(a.buffer_id)).await;
 
     // Client 1 switches away — buffer stays (client 2 still shows it).
-    let b: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("b.txt", None)).await;
+    let b: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(b.buffer_id)).await;
-    let still: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
+    let still: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
     assert!(still.transient, "still transient while client 2 views it");
 
     // Client 2 switches away too — now it's hidden everywhere and closes. (Client 1's attach
     // above didn't resubscribe a viewport, so its viewport is still on b.)
-    let b2: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws2, &file_open_params("b.txt", None)).await;
+    let b2: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws2, &file_open_params("b.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws2, &transient_sub_params(b2.buffer_id)).await;
     let err =
-        send_request_expect_err::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, None))
-            .await;
+        send_request_expect_err::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
     assert!(
-        err.contains("unknown buffer_id"),
+        err.contains("unknown view_id"),
         "expected close once the last viewer left, got: {err}"
     );
     drop(server);
@@ -773,15 +866,15 @@ async fn transient_buffer_survives_while_another_client_views_it() {
 #[tokio::test]
 async fn nav_back_reopens_closed_transient_as_transient() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
     // Switch to b.txt, recording the jump origin (a) on the open itself — the composite the TUI
     // uses for a picker-driven switch (`record_nav_from`, composite A).
-    let b: BufferOpenResult = send_request::<BufferOpen>(
+    let b: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             record_nav_from: Some(a.buffer_id),
             ..file_open_params("b.txt", None)
         },
@@ -810,8 +903,8 @@ async fn nav_back_reopens_closed_transient_as_transient() {
 #[tokio::test]
 async fn reload_promotes_transient_buffer() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
     let _: BufferReloadResult = send_request::<BufferReload>(
@@ -823,24 +916,24 @@ async fn reload_promotes_transient_buffer() {
     )
     .await;
 
-    let b: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("b.txt", None)).await;
+    let b: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(b.buffer_id)).await;
-    let again: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
+    let again: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
     assert!(!again.transient, "the reload promoted the buffer");
     drop(server);
 }
 
-/// The buffers picker carries the transient flag so clients can italicise preview rows.
+/// The view picker carries the transient flag so clients can italicise preview rows.
 #[tokio::test]
 async fn buffers_picker_reports_transient_flag() {
     let (server, mut ws) = setup_transient_workspace().await;
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", None)).await;
-    let b: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("b.txt", Some(true))).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let b: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", Some(true))).await;
     // Keep the transient buffer visible so it survives until the picker reads it.
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(b.buffer_id)).await;
@@ -849,7 +942,7 @@ async fn buffers_picker_reports_transient_flag() {
         &mut ws,
         &PickerViewParams {
             limit: 30,
-            ..view_params(PickerKind::Buffers)
+            ..view_params(PickerKind::Views)
         },
     )
     .await;
@@ -858,7 +951,7 @@ async fn buffers_picker_reports_transient_flag() {
         .items()
         .iter()
         .map(|i| {
-            let PickerItem::Buffer {
+            let PickerItem::View {
                 buffer_id,
                 transient,
                 ..
@@ -1402,11 +1495,10 @@ async fn symbol_path_pushes_the_enclosing_chain_when_the_outline_lands() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -1473,11 +1565,10 @@ async fn symbol_path_seeds_the_subscribe_snapshot() {
         vec![("rust".into(), dummy)],
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("main.rs".into()),
             language: None,
@@ -1497,7 +1588,7 @@ async fn symbol_path_seeds_the_subscribe_snapshot() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 100,
             rows: 40,
             overscan_rows: 0,
@@ -1511,7 +1602,6 @@ async fn symbol_path_seeds_the_subscribe_snapshot() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1530,7 +1620,7 @@ async fn symbol_path_seeds_the_subscribe_snapshot() {
 
 /// A workspace holding `doc.md` — a heading, a line far wider than any test viewport, and a
 /// paragraph — and `a.txt`, with a client attached and the markdown file open.
-async fn setup_reader_workspace() -> (aether_server::ServerHandle, Ws, u64) {
+async fn setup_reader_workspace() -> (aether_server::ServerHandle, Ws, ViewOpenResult) {
     let dir = tempfile::tempdir().unwrap();
     let wide = "x".repeat(120);
     std::fs::write(
@@ -1554,18 +1644,15 @@ async fn setup_reader_workspace() -> (aether_server::ServerHandle, Ws, u64) {
         },
     )
     .await;
-    let open: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("doc.md", None)).await;
-    (server, ws, open.buffer_id)
+    let open: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("doc.md", None)).await;
+    (server, ws, open)
 }
 
-/// A narrow, soft-wrapped, two-row viewport over `buffer_id`, asking for `kind`.
-fn reader_sub_params(
-    buffer_id: u64,
-    kind: Option<aether_protocol::ui::ViewKind>,
-) -> ViewportSubscribeParams {
+/// A narrow, soft-wrapped, two-row viewport over `view_id`.
+fn reader_sub_params(view_id: aether_protocol::ViewId) -> ViewportSubscribeParams {
     ViewportSubscribeParams {
-        buffer_id: aether_protocol::ViewId(buffer_id),
+        view_id,
         cols: 20,
         rows: 2,
         overscan_rows: 0,
@@ -1579,8 +1666,23 @@ fn reader_sub_params(
         continuation_marker_width: 0,
         tab_width: 4,
         diff_view: false,
-        kind,
     }
+}
+
+/// Open `buffer_id` again asking for `kind` — what `Space u` does.
+async fn open_as(
+    ws: &mut Ws,
+    buffer_id: u64,
+    kind: Option<aether_protocol::ui::ViewKind>,
+) -> ViewOpenResult {
+    send_request::<ViewOpen>(
+        ws,
+        &ViewOpenParams {
+            kind,
+            ..attach_open_params(buffer_id, None)
+        },
+    )
+    .await
 }
 
 /// The one editor element of a window over an ordinary file: who lays it out, its height, and the
@@ -1613,14 +1715,24 @@ fn the_element(
     }
 }
 
-/// A markdown file presented with no opinion — a plain open — is the reader, the app setting's
+/// Who lays out the view a subscribe to `view_id` shows.
+async fn layout_owner_of(
+    ws: &mut Ws,
+    view_id: aether_protocol::ViewId,
+) -> aether_protocol::ui::LayoutOwner {
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(ws, &reader_sub_params(view_id)).await;
+    the_element(&sub.window).0
+}
+
+/// A markdown file opened with no opinion — a plain open — is the reader, the app setting's
 /// default: one element the client lays out, sent **unwrapped** (a wire row is a line, however
 /// narrow the viewport) and **whole** (every line, however short the viewport).
 #[tokio::test]
 async fn a_markdown_file_is_presented_as_the_reader_by_default() {
-    let (_server, mut ws, buffer_id) = setup_reader_workspace().await;
+    let (_server, mut ws, open) = setup_reader_workspace().await;
     let sub: ViewportSubscribeResult =
-        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(buffer_id, None)).await;
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(open.view_id)).await;
     let (owner, rows, first_row, lines) = the_element(&sub.window);
     assert_eq!(owner, aether_protocol::ui::LayoutOwner::Client);
     assert_eq!(rows, 6, "one wire row per line, six lines");
@@ -1637,9 +1749,9 @@ async fn a_markdown_file_is_presented_as_the_reader_by_default() {
 #[tokio::test]
 async fn a_window_request_loads_a_reader_element_whole() {
     use aether_protocol::viewport::{SliceRequest, ViewportWindow, ViewportWindowParams};
-    let (_server, mut ws, buffer_id) = setup_reader_workspace().await;
+    let (_server, mut ws, open) = setup_reader_workspace().await;
     let sub: ViewportSubscribeResult =
-        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(buffer_id, None)).await;
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(open.view_id)).await;
     let res: ViewportWindowResult = send_request::<ViewportWindow>(
         &mut ws,
         &ViewportWindowParams {
@@ -1666,34 +1778,85 @@ async fn a_window_request_loads_a_reader_element_whole() {
     );
 }
 
-/// `Space v` asks for the other kind, and the file remembers: a re-subscribe with no opinion
-/// keeps the view as it is, and so does a fresh open of the same file after a close — from any
-/// client. Asked for the reader again, it is the reader again.
+/// A file's editor and its reader are two views. Asked for a kind, an open answers with the
+/// file's view of that kind, making it once; asked for nothing, with the most recently used of
+/// them. Closing one leaves the other and the buffer; closing the last closes the buffer, and a
+/// fresh open of the file starts over from the setting.
 #[tokio::test]
-async fn re_presenting_a_file_is_remembered_across_a_close() {
+async fn a_file_has_an_editor_and_a_reader_and_reopens_in_the_last_used() {
     use aether_protocol::ui::{LayoutOwner, ViewKind};
-    let (server, mut ws, buffer_id) = setup_reader_workspace().await;
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
-        &mut ws,
-        &reader_sub_params(buffer_id, Some(ViewKind::Editor)),
-    )
-    .await;
+    let (server, mut ws, reader) = setup_reader_workspace().await;
+    let buffer_id = reader.buffer_id;
+    assert_eq!(
+        layout_owner_of(&mut ws, reader.view_id).await,
+        LayoutOwner::Client
+    );
+
+    let editor = open_as(&mut ws, buffer_id, Some(ViewKind::Editor)).await;
+    assert_eq!(editor.buffer_id, buffer_id, "the same buffer");
+    assert_ne!(editor.view_id, reader.view_id, "another view of it");
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(editor.view_id)).await;
     let (owner, _, _, lines) = the_element(&sub.window);
     assert_eq!(owner, LayoutOwner::Server);
-    assert!(
-        lines.len() < 6,
-        "the editor loads a screen, not the document: {lines:?}"
+    assert!(lines.len() < 6, "a screen, not the document: {lines:?}");
+    // Asked for again, it is the same view, not a third.
+    assert_eq!(
+        open_as(&mut ws, buffer_id, Some(ViewKind::Editor))
+            .await
+            .view_id,
+        editor.view_id
     );
-    // No opinion keeps it — a wrap toggle or a reconnect must not flip the view.
-    let sub: ViewportSubscribeResult =
-        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(buffer_id, None)).await;
-    assert_eq!(the_element(&sub.window).0, LayoutOwner::Server);
-
-    // Close and reopen from another client: the file comes back as the editor.
-    let _: BufferCloseResult = send_request::<BufferClose>(
+    assert_eq!(
+        open_as(&mut ws, buffer_id, Some(ViewKind::Reader))
+            .await
+            .view_id,
+        reader.view_id
+    );
+    // No opinion: the most recently used — the reader, just asked for.
+    assert_eq!(
+        open_as(&mut ws, buffer_id, None).await.view_id,
+        reader.view_id
+    );
+    // A view named outright is that view.
+    let named: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+        &ViewOpenParams {
+            view_id: Some(editor.view_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        (named.buffer_id, named.view_id),
+        (buffer_id, editor.view_id)
+    );
+
+    // Closing the reader leaves the editor and the buffer.
+    let closed: ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: reader.view_id,
+            open_next: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        closed.next_view_id,
+        Some(editor.view_id),
+        "the editor is still here"
+    );
+    assert_eq!(
+        open_as(&mut ws, buffer_id, None).await.view_id,
+        editor.view_id,
+        "…as its one remaining view"
+    );
+    // Closing the last view closes the buffer; a fresh open from another client starts from the
+    // setting again, in a new view.
+    let _: ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: editor.view_id,
             open_next: false,
         },
     )
@@ -1708,63 +1871,611 @@ async fn re_presenting_a_file_is_remembered_across_a_close() {
         },
     )
     .await;
-    let reopened: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws2, &file_open_params("doc.md", None)).await;
-    let sub: ViewportSubscribeResult =
-        send_request::<ViewportSubscribe>(&mut ws2, &reader_sub_params(reopened.buffer_id, None))
-            .await;
-    assert_eq!(
-        the_element(&sub.window).0,
-        LayoutOwner::Server,
-        "remembered as the editor"
+    let reopened: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws2, &file_open_params("doc.md", None)).await;
+    assert!(
+        reopened.view_id != editor.view_id && reopened.view_id != reader.view_id,
+        "a new view"
     );
-    // Asked for the reader, it is the reader.
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
-        &mut ws2,
-        &reader_sub_params(reopened.buffer_id, Some(ViewKind::Reader)),
-    )
-    .await;
-    assert_eq!(the_element(&sub.window).0, LayoutOwner::Client);
+    assert_eq!(
+        layout_owner_of(&mut ws2, reopened.view_id).await,
+        LayoutOwner::Client,
+        "the setting's kind"
+    );
 }
 
-/// The app setting decides for a file never presented; a file already presented keeps what it
-/// was; a file with no reader — anything but markdown — is the editor whatever is asked.
+/// The app setting decides for a file with no view; a file with one keeps it; a file with no
+/// reader — anything but markdown — is the editor whatever is asked; and a jump lands in the
+/// editor whatever the setting says.
 #[tokio::test]
 async fn the_setting_decides_a_file_never_presented() {
     use aether_protocol::ui::{LayoutOwner, ViewKind};
-    let (server, mut ws, buffer_id) = setup_reader_workspace().await;
-    let sub: ViewportSubscribeResult =
-        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(buffer_id, None)).await;
-    assert_eq!(the_element(&sub.window).0, LayoutOwner::Client);
+    let (server, mut ws, reader) = setup_reader_workspace().await;
+    assert_eq!(
+        layout_owner_of(&mut ws, reader.view_id).await,
+        LayoutOwner::Client
+    );
 
     server.state.lock().await.app_settings.markdown_read = false;
-    let other: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("other.md", None)).await;
-    let sub: ViewportSubscribeResult =
-        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(other.buffer_id, None)).await;
+    let other: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("other.md", None)).await;
     assert_eq!(
-        the_element(&sub.window).0,
+        layout_owner_of(&mut ws, other.view_id).await,
         LayoutOwner::Server,
-        "never presented → the setting"
+        "no view yet → the setting"
     );
-    let sub: ViewportSubscribeResult =
-        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(buffer_id, None)).await;
     assert_eq!(
-        the_element(&sub.window).0,
-        LayoutOwner::Client,
-        "already presented → as it was"
+        open_as(&mut ws, reader.buffer_id, None).await.view_id,
+        reader.view_id,
+        "a view already → as it was"
     );
 
-    let plain: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("a.txt", None)).await;
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+    let text: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let plain = open_as(&mut ws, text.buffer_id, Some(ViewKind::Reader)).await;
+    assert_eq!(
+        layout_owner_of(&mut ws, plain.view_id).await,
+        LayoutOwner::Server,
+        "no reader for a text file"
+    );
+
+    // A jump into a markdown file lands in the editor, however the setting reads.
+    server.state.lock().await.app_settings.markdown_read = true;
+    std::fs::write(
+        server
+            .state
+            .lock()
+            .await
+            .doc_of(reader.buffer_id)
+            .canonical_path
+            .clone()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("third.md"),
+        "# Third\n\nline\n",
+    )
+    .unwrap();
+    let jumped: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &reader_sub_params(plain.buffer_id, Some(ViewKind::Reader)),
+        &ViewOpenParams {
+            jump_to: Some(aether_protocol::LogicalPosition { line: 2, col: 0 }),
+            ..file_open_params("third.md", None)
+        },
     )
     .await;
     assert_eq!(
+        layout_owner_of(&mut ws, jumped.view_id).await,
+        LayoutOwner::Server
+    );
+}
+
+/// A **view** is transient, not a buffer: a preview closes itself once nothing shows it, and a
+/// buffer lives exactly as long as some view uses it.
+mod view_transience {
+    use super::*;
+
+    /// A file opened as a preview, its reader on screen.
+    async fn preview_on_screen() -> (aether_server::ServerHandle, Ws, ViewOpenResult) {
+        let (server, mut ws, first) = setup_reader_workspace().await;
+        // The fixture opened it kept; open a preview of the *other* markdown file instead.
+        let _ = first;
+        let open: ViewOpenResult =
+            send_request::<ViewOpen>(&mut ws, &file_open_params("other.md", Some(true))).await;
+        assert!(open.transient, "opened as a preview");
+        let _: ViewportSubscribeResult =
+            send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(open.view_id)).await;
+        (server, ws, open)
+    }
+
+    async fn view_exists(ws: &mut Ws, view: aether_protocol::ViewId) -> bool {
+        send_request_result::<ViewOpen>(
+            ws,
+            &ViewOpenParams {
+                view_id: Some(view),
+                ..Default::default()
+            },
+        )
+        .await
+        .is_ok()
+    }
+
+    /// `Space u` beside a preview makes a preview: the reader you looked at closes itself the
+    /// moment the editor sibling takes the screen, and the buffer stays for the editor.
+    #[tokio::test]
+    async fn a_hidden_sibling_preview_closes_itself() {
+        use aether_protocol::ui::ViewKind;
+        let (_server, mut ws, reader) = preview_on_screen().await;
+        let editor = open_as(&mut ws, reader.buffer_id, Some(ViewKind::Editor)).await;
+        assert!(editor.transient, "a sibling is a preview too");
+        let _: ViewportSubscribeResult =
+            send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(editor.view_id)).await;
+        assert!(
+            !view_exists(&mut ws, reader.view_id).await,
+            "the hidden reader is gone"
+        );
+        let again = open_as(&mut ws, reader.buffer_id, None).await;
+        assert_eq!(
+            again.view_id, editor.view_id,
+            "the buffer lives on, as its editor"
+        );
+    }
+
+    /// `Space k` keeps the **view**: a kept reader survives being hidden, and its buffer with it.
+    #[tokio::test]
+    async fn a_kept_view_survives_hiding() {
+        use aether_protocol::ui::ViewKind;
+        let (_server, mut ws, reader) = preview_on_screen().await;
+        let kept: ViewSetTransientResult = send_request::<ViewSetTransient>(
+            &mut ws,
+            &ViewSetTransientParams {
+                view_id: reader.view_id,
+                transient: false,
+            },
+        )
+        .await;
+        assert!(!kept.transient);
+        let editor = open_as(&mut ws, reader.buffer_id, Some(ViewKind::Editor)).await;
+        let _: ViewportSubscribeResult =
+            send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(editor.view_id)).await;
+        assert!(
+            view_exists(&mut ws, reader.view_id).await,
+            "kept, so it stays"
+        );
+        assert_eq!(
+            open_as(&mut ws, reader.buffer_id, Some(ViewKind::Reader))
+                .await
+                .view_id,
+            reader.view_id
+        );
+    }
+
+    /// A buffer goes with its last view: hide a preview that is a file's only view and the file
+    /// is no longer open.
+    #[tokio::test]
+    async fn a_buffer_goes_with_its_last_view() {
+        let (_server, mut ws, reader) = preview_on_screen().await;
+        let away: ViewOpenResult =
+            send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+        let _: ViewportSubscribeResult =
+            send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(away.view_id)).await;
+        assert!(!view_exists(&mut ws, reader.view_id).await);
+        assert!(
+            send_request_result::<ViewOpen>(&mut ws, &attach_open_params(reader.buffer_id, None))
+                .await
+                .is_err(),
+            "the buffer closed with its last view"
+        );
+    }
+
+    /// An edit promotes the view it was made in — the one on screen — and not a sibling you only
+    /// glanced at, which closes itself as before.
+    #[tokio::test]
+    async fn an_edit_promotes_the_view_it_was_made_in() {
+        use aether_protocol::ui::ViewKind;
+        let (_server, mut ws, reader) = preview_on_screen().await;
+        // A hidden editor sibling: opened, never shown.
+        let editor = open_as(&mut ws, reader.buffer_id, Some(ViewKind::Editor)).await;
+        // Back on the reader, and type in it.
+        let _: ViewportSubscribeResult =
+            send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(reader.view_id)).await;
+        let _: EditResult = send_request::<InputText>(
+            &mut ws,
+            &InputTextParams {
+                buffer_id: reader.buffer_id,
+                text: "!".into(),
+                select_pasted: false,
+                replace_selection: false,
+                at: Some(SelectionEdge::Start),
+            },
+        )
+        .await;
+        // Look elsewhere: the glanced-at editor closes; the reader you typed in stays.
+        let away: ViewOpenResult =
+            send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+        let _: ViewportSubscribeResult =
+            send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(away.view_id)).await;
+        assert!(
+            !view_exists(&mut ws, editor.view_id).await,
+            "the unshown sibling went"
+        );
+        // Opening the file again lands on the view that remains — the reader, kept.
+        let back: ViewOpenResult = send_request::<ViewOpen>(
+            &mut ws,
+            &ViewOpenParams {
+                absolute_path: reader.path.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(back.view_id, reader.view_id);
+        assert!(!back.transient, "promoted by the edit made in it");
+    }
+}
+
+/// The picker lists **views**: a file's editor and its reader are two rows, most recently used
+/// first, the reader's badged; closing a row closes that view alone.
+#[tokio::test]
+async fn the_picker_lists_a_files_editor_and_reader_as_two_rows() {
+    use aether_protocol::ui::ViewKind;
+    let (_server, mut ws, reader) = setup_reader_workspace().await;
+    let editor = open_as(&mut ws, reader.buffer_id, Some(ViewKind::Editor)).await;
+
+    let rows = |update: &PickerUpdateParams| -> Vec<(u64, u64, Option<ViewKind>, String)> {
+        update
+            .items()
+            .iter()
+            .filter_map(|i| match i {
+                PickerItem::View {
+                    buffer_id,
+                    view_id,
+                    view_kind,
+                    display,
+                    ..
+                } => Some((*buffer_id, view_id.get(), *view_kind, display.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: None,
+            limit: 30,
+            ..view_params(PickerKind::Views)
+        },
+    )
+    .await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(
+        rows(&update),
+        vec![
+            (
+                reader.buffer_id,
+                editor.view_id.get(),
+                Some(ViewKind::Editor),
+                "doc.md".into()
+            ),
+            (
+                reader.buffer_id,
+                reader.view_id.get(),
+                Some(ViewKind::Reader),
+                "doc.md".into()
+            ),
+        ],
+        "two rows for one file, the one used last first, the reader badged"
+    );
+
+    // Closing the editor's row closes that view; the reader's row remains.
+    let _: ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: editor.view_id,
+            open_next: false,
+        },
+    )
+    .await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(
+        rows(&update),
+        vec![(
+            reader.buffer_id,
+            reader.view_id.get(),
+            Some(ViewKind::Reader),
+            "doc.md".into()
+        )]
+    );
+}
+
+/// A view named outright is the view presented, whichever of the file's views was used last: the
+/// picker's editor row, chosen while the reader is the one on screen, answers with the editor.
+#[tokio::test]
+async fn presenting_a_view_by_id_presents_that_view_not_the_files_latest() {
+    use aether_protocol::ui::{LayoutOwner, ViewKind};
+    let (_server, mut ws, reader) = setup_reader_workspace().await;
+    let editor = open_as(&mut ws, reader.buffer_id, Some(ViewKind::Editor)).await;
+    // The reader is the one in use — the file's most recently used view.
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(reader.view_id)).await;
+
+    let chosen: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(editor.view_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        chosen.view_id, editor.view_id,
+        "the row's view, not the reader"
+    );
+    assert_eq!(chosen.buffer_id, reader.buffer_id);
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(chosen.view_id)).await;
+    assert_eq!(
         the_element(&sub.window).0,
         LayoutOwner::Server,
-        "no reader for a text file"
+        "and its window is the editor's"
+    );
+}
+
+/// Closing the last view leaves nothing to return to, so the successor is a placeholder: a
+/// scratch that is transient, as activation's is, gone as soon as something else is shown — not a
+/// scratch you now own, listed in the picker as if you had asked for one.
+#[tokio::test]
+async fn closing_the_last_view_lands_on_a_transient_placeholder() {
+    let (_server, mut ws) = setup_transient_workspace().await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
+    let closed: ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: a.view_id,
+            open_next: true,
+        },
+    )
+    .await;
+    assert_eq!(closed.next_view_id, None, "nothing to return to");
+    let landed = closed.opened.expect("a placeholder is opened");
+    assert!(landed.scratch_number.is_some(), "a scratch");
+    assert!(landed.transient, "a placeholder, not a scratch to keep");
+}
+
+/// Closing the view of a file you are looking at closes the *file* when its only other view is a
+/// preview nobody is showing: the hidden transient sibling goes with it, rather than the close
+/// landing you back in the same file through a view you never saw.
+#[tokio::test]
+async fn closing_a_shown_view_takes_its_hidden_preview_with_it() {
+    use aether_protocol::ui::ViewKind;
+    let (_server, mut ws, reader) = setup_reader_workspace().await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(reader.view_id)).await;
+    // The editor sibling asked for and never shown — the moment between a `Space u` and its
+    // subscribe, held open.
+    let editor = open_as(&mut ws, reader.buffer_id, Some(ViewKind::Editor)).await;
+    assert!(editor.transient, "a sibling opens as a preview");
+
+    let closed: ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: reader.view_id,
+            open_next: true,
+        },
+    )
+    .await;
+    let landed = closed.opened.expect("open_next lands somewhere");
+    assert_ne!(
+        landed.buffer_id, reader.buffer_id,
+        "not the same file through its hidden preview"
+    );
+    assert!(
+        landed.transient && landed.scratch_number.is_some(),
+        "nothing else was open: a placeholder"
+    );
+    let err = send_request_expect_err::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(editor.view_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        err.contains("unknown view_id"),
+        "the preview went with the file: {err}"
+    );
+}
+
+/// A view closed while its buffer stays — the reader closed beside its editor — is still a view
+/// pulled out from under whoever else was presenting it. They are told, as a `view/closed` naming
+/// the view and no buffer, and handed the workspace's next view; without the push their viewport
+/// vanished silently.
+#[tokio::test]
+async fn closing_a_sibling_tells_its_other_viewers() {
+    use aether_protocol::ui::ViewKind;
+    use aether_protocol::view::{ViewClosed, ViewClosedParams};
+    let (server, mut ws, reader) = setup_reader_workspace().await;
+    // A *kept* editor: a preview nobody shows would go with the close (see
+    // `closing_a_shown_view_takes_its_hidden_preview_with_it`).
+    let editor = open_as(&mut ws, reader.buffer_id, Some(ViewKind::Editor)).await;
+    let _ = send_request::<aether_protocol::view::ViewSetTransient>(
+        &mut ws,
+        &aether_protocol::view::ViewSetTransientParams {
+            view_id: editor.view_id,
+            transient: false,
+        },
+    )
+    .await;
+
+    // A second client, presenting the reader.
+    let mut other = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut other,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut other, &reader_sub_params(reader.view_id)).await;
+
+    let closed: ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: reader.view_id,
+            open_next: false,
+        },
+    )
+    .await;
+    assert_eq!(closed.next_view_id, Some(editor.view_id));
+
+    let pushed: ViewClosedParams = expect_notification::<ViewClosed>(&mut other).await;
+    assert_eq!(pushed.view_id, reader.view_id);
+    assert_eq!(pushed.buffer_id, None, "the buffer stays for its editor");
+    assert_eq!(
+        pushed.next_view_id,
+        Some(editor.view_id),
+        "handed the view that remains"
+    );
+    assert_eq!(pushed.next_path, None);
+    drop(server);
+}
+
+/// Sessions record **views**: a file whose reader and editor you kept comes back after a restart
+/// as two dormant rows, the reader's badged; opening one materialises the file as that view and
+/// brings the other back kept beside it.
+#[tokio::test]
+async fn a_kept_reader_and_editor_come_back_as_two_views() {
+    use aether_protocol::ui::{LayoutOwner, ViewKind};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("doc.md"), "# Title\n\nbody\n").unwrap();
+    let sessions_path = root.join("sessions.json");
+    async fn activate(ws: &mut Ws) {
+        let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+            ws,
+            &WorkspaceActivateParams {
+                worktrees: None,
+                name: "p".into(),
+                open_last: false,
+            },
+        )
+        .await;
+    }
+
+    // First life: the reader (kept, a plain open) and its editor sibling, kept with `Space k`.
+    let server = aether_server::spawn_for_test_multi_with_sessions(
+        vec![("p".into(), vec![root.clone()])],
+        Some(sessions_path.clone()),
+    )
+    .await
+    .unwrap();
+    let mut ws = Ws::connect(&server).await;
+    activate(&mut ws).await;
+    let reader: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("doc.md", None)).await;
+    assert_eq!(
+        layout_owner_of(&mut ws, reader.view_id).await,
+        LayoutOwner::Client
+    );
+    let editor = open_as(&mut ws, reader.buffer_id, Some(ViewKind::Editor)).await;
+    let _: ViewSetTransientResult = send_request::<ViewSetTransient>(
+        &mut ws,
+        &ViewSetTransientParams {
+            view_id: editor.view_id,
+            transient: false,
+        },
+    )
+    .await;
+    let entries = |raw: &str| -> Vec<(String, Option<String>)> {
+        let json: serde_json::Value = serde_json::from_str(raw).unwrap();
+        json["workspaces"]["p"]["views"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|v| {
+                        (
+                            v["path"].as_str().unwrap_or("").to_string(),
+                            v["kind"].as_str().map(str::to_string),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let raw = eventually("both views to reach the session file", || {
+        std::fs::read_to_string(&sessions_path)
+            .ok()
+            .filter(|raw| entries(raw).len() == 2)
+    })
+    .await;
+    let canonical = std::fs::canonicalize(root.join("doc.md"))
+        .unwrap()
+        .display()
+        .to_string();
+    assert_eq!(
+        entries(&raw),
+        vec![
+            (canonical.clone(), Some("editor".into())),
+            (canonical.clone(), Some("reader".into())),
+        ],
+        "the editor, used last, first; each named as the view it is: {raw}"
+    );
+    drop(ws);
+    drop(server);
+
+    // Second life: the workspace cold-loads from its config (the test seams pre-register
+    // workspaces, which skips the restore), so the session's two entries come back as two dormant
+    // rows, the reader's badged.
+    let store = root.join("workspaces");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("p.toml"),
+        format!("[[roots]]\npath = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+    let server =
+        aether_server::spawn_for_test_multi_with_sessions(vec![], Some(sessions_path.clone()))
+            .await
+            .unwrap();
+    server.state.lock().await.workspaces_dir = Some(store);
+    let mut ws = Ws::connect(&server).await;
+    activate(&mut ws).await;
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            view_id: None,
+            limit: 30,
+            ..view_params(PickerKind::Views)
+        },
+    )
+    .await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let rows: Vec<(aether_protocol::ViewId, Option<ViewKind>)> = update
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::View {
+                view_id, view_kind, ..
+            } => Some((*view_id, *view_kind)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 2, "two dormant rows: {rows:?}");
+    assert_eq!(rows[0].1, Some(ViewKind::Editor), "the editor's row, first");
+    assert_eq!(
+        rows[1].1,
+        Some(ViewKind::Reader),
+        "the reader's row, badged"
+    );
+
+    // Selecting the reader's row opens the file as its reader…
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(rows[1].0),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        layout_owner_of(&mut ws, opened.view_id).await,
+        LayoutOwner::Client
+    );
+    assert!(!opened.transient, "restored kept");
+    // …and the editor it stood beside comes back kept, as a sibling, not as a vanished row.
+    let editor = open_as(&mut ws, opened.buffer_id, Some(ViewKind::Editor)).await;
+    assert!(
+        !editor.transient,
+        "the kept editor, restored beside the reader"
+    );
+    assert_eq!(
+        layout_owner_of(&mut ws, editor.view_id).await,
+        LayoutOwner::Server
     );
 }

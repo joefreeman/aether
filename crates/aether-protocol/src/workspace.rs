@@ -2,9 +2,8 @@
 //! at a time. The client picks one with `workspace/activate` (also used to switch). `workspace/list`
 //! enumerates the workspaces the server has configured on disk.
 
-use crate::buffer::BufferOpenResult;
 use crate::envelope::{NotificationMethod, RpcMethod};
-use crate::BufferId;
+use crate::view::ViewOpenResult;
 use serde::{Deserialize, Serialize};
 
 /// Enumerate configured workspaces (the `*.toml` files under `$XDG_CONFIG_HOME/aether/workspaces/`).
@@ -65,7 +64,7 @@ pub struct WorkspaceActivateParams {
     /// there is no way for a binding to strand you.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktrees: Option<std::collections::BTreeMap<crate::git::RepoId, String>>,
-    /// Also open the landing buffer — the workspace's `last_buffer_id` when there is one, a fresh
+    /// Also open the landing buffer — the workspace's `last_view_id` when there is one, a fresh
     /// *transient* scratch otherwise — and return it in `opened`. The bootstrap convention
     /// (activate, then land somewhere) folded into one round-trip.
     #[serde(default)]
@@ -75,16 +74,16 @@ pub struct WorkspaceActivateParams {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkspaceActivateResult {
     pub workspace: WorkspaceInfo,
-    /// The most-recently-used buffer in this workspace, if any — scratch or file alike, since the
-    /// point is to put you back where you left off. Resolved from the workspace's MRU (shared by
-    /// every client, so it outlives disconnects), falling back to the most recent session-restored
-    /// dormant buffer. `None` means the workspace holds nothing at all (first visit, or every prior
-    /// buffer closed), and only then should the client spawn a fresh scratch.
+    /// The most-recently-used view in this workspace, if any — scratch or file, editor or reader,
+    /// since the point is to put you back where you left off. Resolved from the workspace's MRU
+    /// (shared by every client, so it outlives disconnects), falling back to the most recent
+    /// session-restored dormant row. `None` means the workspace holds nothing at all (first visit,
+    /// or every prior view closed), and only then should the client spawn a fresh scratch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_buffer_id: Option<BufferId>,
+    pub last_view_id: Option<crate::ViewId>,
     /// With `open_last`: the landing buffer, fully opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub opened: Option<BufferOpenResult>,
+    pub opened: Option<ViewOpenResult>,
     /// The server instance's start time (unix ms) — its identity for restart detection. A client
     /// caches it on activation and compares across reconnects: a changed value means the daemon
     /// restarted (so unsaved buffer state died with it), distinct from a connection that merely
@@ -185,7 +184,7 @@ pub struct WorkspaceCreateParams {
 /// absolute (a leading `~/` is fine): the server will **not** resolve it against its own working
 /// directory, which isn't the user's. (`ae path` resolves its arg client-side before sending.)
 /// Goto-definition into a file outside the active workspace doesn't go through here: it already has an
-/// active workspace to host the guest, so it opens the external buffer directly via `buffer/open`'s
+/// active workspace to host the guest, so it opens the external buffer directly via `view/open`'s
 /// `absolute_path` (same external-buffer machinery, no workspace activation). The server:
 ///
 /// - canonicalizes the path;
@@ -232,11 +231,11 @@ pub struct WorkspaceOpenPathParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transient: Option<bool>,
     /// When `path` doesn't exist, open an empty buffer bound to it instead of failing (the file
-    /// is written at the first save) — same semantics as `buffer/open`'s flag, which this
+    /// is written at the first save) — same semantics as `view/open`'s flag, which this
     /// delegates to. Powers `ae path/to/new-file`; ignored for existing files.
     #[serde(default)]
     pub create_if_missing: bool,
-    /// Land the cursor here, exactly as `buffer/open`'s field of the same name (0-based, clamped
+    /// Land the cursor here, exactly as `view/open`'s field of the same name (0-based, clamped
     /// server-side) — this delegates to it. Powers `ae /etc/hosts:42` and the web client's
     /// `?path=…#L:C`, which previously opened at the top because the jump had nowhere to ride.
     /// Ignored for a directory `path` (there's no file to jump within).
@@ -270,9 +269,9 @@ pub struct WorkspaceAddRootParams {
 /// buffer is dirty (with error code `DIRTY_BUFFERS_PREVENT_REMOVE`). Scratch buffers in the
 /// workspace are unaffected (they have no path and aren't tied to any root).
 ///
-/// The `next_buffer_id` field follows the same convention as `buffer/close`: when the client's
-/// currently-displayed buffer is one of the closed ones, attach to this next id (or spawn a
-/// scratch if `None`).
+/// The `next_view_id` field follows the same convention as `view/close`: when the client's
+/// current view is one of the closed ones, present this next view (or spawn a scratch if
+/// `None`).
 pub struct WorkspaceRemoveRoot;
 impl RpcMethod for WorkspaceRemoveRoot {
     const NAME: &'static str = "workspace/remove_root";
@@ -299,7 +298,7 @@ pub struct WorkspaceRemoveRootResult {
     /// Buffer for the requesting client to attach to if its current buffer was one of the
     /// closed ones. `None` means "no buffers left for you in this workspace — spawn a scratch."
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_buffer_id: Option<crate::BufferId>,
+    pub next_view_id: Option<crate::ViewId>,
 }
 
 /// Declare a project in a workspace: a *directory* whose language server is pinned open while the
@@ -451,10 +450,10 @@ impl NotificationMethod for WorkspaceRenamed {
 /// The client's own RPC results already carry a fresh [`WorkspaceInfo`] whenever *it* changes the
 /// workspace; this is the same payload for changes it didn't make. Without it a second client keeps
 /// the old roots and every path it renders is resolved against a shape the workspace no longer has —
-/// wrong labels, wrong `path_index`, and a `buffer/closed` successor that lands somewhere it can't
+/// wrong labels, wrong `path_index`, and a `view/closed` successor that lands somewhere it can't
 /// describe.
 ///
-/// Sent before the `buffer/closed` pushes that accompany a rebind, so the roots are already current
+/// Sent before the `view/closed` pushes that accompany a rebind, so the roots are already current
 /// when the client opens the successor.
 pub struct WorkspaceChanged;
 impl NotificationMethod for WorkspaceChanged {

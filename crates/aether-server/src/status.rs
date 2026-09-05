@@ -37,8 +37,8 @@ pub fn app_info(s: &crate::state::ServerState, git_version: Option<String>) -> A
         uptime_secs: now.saturating_sub(s.started_at_unix_ms) / 1000,
         idle_timeout_secs: s.idle_timeout.map(|d| d.as_secs()),
         clients: s.clients.len(),
-        buffers_open: s.buffers.len(),
-        buffers_unsaved: s.documents.values().filter(|d| d.dirty).count(),
+        views_open: s.views.len(),
+        documents_unsaved: s.documents.values().filter(|d| d.dirty).count(),
         workspaces_active: s.workspaces.len(),
         git_version,
         paths: paths(),
@@ -118,8 +118,8 @@ mod tests {
             "pid": 1,
             "started_at_unix_ms": 0,
             "clients": 0,
-            "buffers_open": 0,
-            "buffers_unsaved": 0,
+            "views_open": 0,
+            "documents_unsaved": 0,
             "workspaces_active": 0,
             "future_field": "ignored"
         }"#;

@@ -283,13 +283,13 @@ async fn select_word_on_last_word_is_a_stable_end_state() {
 
 #[tokio::test]
 async fn buffer_open_composite_records_nav() {
-    // `record_nav_from` folds the old nav/record -> buffer/open
+    // `record_nav_from` folds the old nav/record -> view/open
     // client chain into one open.
     let (_server, mut ws, origin_id) = setup_with_buffer("alpha beta\n").await;
 
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             relative_path: Some("other.txt".into()),
             path_index: Some(0),
             create_if_missing: true,
@@ -318,9 +318,9 @@ async fn buffer_close_open_next_attaches_in_one_trip() {
     // Closing with `open_next` returns the successor fully opened —
     // the MRU buffer when one exists, a fresh scratch when none remain.
     let (_server, mut ws, first) = setup_with_buffer("one\n").await;
-    let second: BufferOpenResult = send_request::<BufferOpen>(
+    let second: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             relative_path: Some("two.txt".into()),
             path_index: Some(0),
             create_if_missing: true,
@@ -330,23 +330,23 @@ async fn buffer_close_open_next_attaches_in_one_trip() {
     .await;
 
     // Closing the second falls back to the first (MRU successor).
-    let closed: BufferCloseResult = send_request::<BufferClose>(
+    let closed: ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(second.buffer_id),
+        &ViewCloseParams {
+            view_id: second.view_id,
             open_next: true,
         },
     )
     .await;
     let opened = closed.opened.expect("open_next returns the successor");
     assert_eq!(opened.buffer_id, first);
-    assert_eq!(closed.next_buffer_id, Some(first));
+    assert_eq!(closed.next_view_id, Some(opened.view_id));
 
     // Closing the last buffer opens a fresh scratch.
-    let closed: BufferCloseResult = send_request::<BufferClose>(
+    let closed: ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(first),
+        &ViewCloseParams {
+            view_id: view_of(first),
             open_next: true,
         },
     )
@@ -354,7 +354,7 @@ async fn buffer_close_open_next_attaches_in_one_trip() {
     let opened = closed
         .opened
         .expect("open_next opens a scratch when none remain");
-    assert_eq!(closed.next_buffer_id, None);
+    assert_eq!(closed.next_view_id, None);
     assert!(opened.path.is_none(), "fresh scratch has no path");
     assert!(opened.scratch_number.is_some());
 }
@@ -375,15 +375,15 @@ async fn workspace_activate_open_last_lands_in_one_trip() {
         },
     )
     .await;
-    assert_eq!(r.last_buffer_id, Some(buffer_id));
     let opened = r.opened.expect("open_last returns the landing buffer");
     assert_eq!(opened.buffer_id, buffer_id);
+    assert_eq!(r.last_view_id, Some(opened.view_id));
 
     // First visit (no MRU): a fresh TRANSIENT scratch.
-    send_request::<BufferClose>(
+    send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+        &ViewCloseParams {
+            view_id: view_of(buffer_id),
             open_next: false,
         },
     )
@@ -397,7 +397,7 @@ async fn workspace_activate_open_last_lands_in_one_trip() {
         },
     )
     .await;
-    assert_eq!(r.last_buffer_id, None);
+    assert_eq!(r.last_view_id, None);
     let opened = r.opened.expect("open_last opens a scratch on first visit");
     assert!(opened.path.is_none());
     assert!(
@@ -415,11 +415,10 @@ async fn workspace_activate_lands_back_on_a_scratch_you_were_editing() {
     let (_server, mut ws, file_id) = setup_with_buffer("hello\n").await;
 
     // Open a scratch *after* the file, putting it at the front of the MRU.
-    let scratch: BufferOpenResult = send_request::<BufferOpen>(
+    let scratch: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             ..Default::default()
         },
     )
@@ -437,18 +436,18 @@ async fn workspace_activate_lands_back_on_a_scratch_you_were_editing() {
     )
     .await;
     assert_eq!(
-        r.last_buffer_id,
-        Some(scratch.buffer_id),
+        r.last_view_id,
+        Some(scratch.view_id),
         "the scratch you were last in wins over the file behind it"
     );
     let opened = r.opened.expect("open_last returns the landing buffer");
     assert_eq!(opened.buffer_id, scratch.buffer_id);
 
     // Closing it falls back to the file rather than minting a second scratch.
-    send_request::<BufferClose>(
+    send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(scratch.buffer_id),
+        &ViewCloseParams {
+            view_id: scratch.view_id,
             open_next: false,
         },
     )
@@ -462,9 +461,11 @@ async fn workspace_activate_lands_back_on_a_scratch_you_were_editing() {
         },
     )
     .await;
+    let opened = r.opened.expect("open_last returns the landing buffer");
+    assert_eq!(opened.buffer_id, file_id);
     assert_eq!(
-        r.last_buffer_id,
-        Some(file_id),
+        r.last_view_id,
+        Some(opened.view_id),
         "with the scratch gone, the file is the landing target"
     );
 }
@@ -638,9 +639,9 @@ async fn git_blame_line_include_commit_info_resolves_in_one_trip() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("tracked.rs".into()),
             ..Default::default()
@@ -1508,7 +1509,7 @@ async fn input_text_inserts_and_pushes_notification() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1523,7 +1524,6 @@ async fn input_text_inserts_and_pushes_notification() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1585,7 +1585,7 @@ async fn input_delete_backspace_removes_char_before_cursor() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1600,7 +1600,6 @@ async fn input_delete_backspace_removes_char_before_cursor() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1932,11 +1931,10 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -1951,7 +1949,7 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 5,
             overscan_rows: 0,
@@ -1966,7 +1964,6 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2021,11 +2018,10 @@ async fn setup_deferred_parse_buffer() -> (
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("big.rs".into()),
             language: None,
@@ -2039,7 +2035,7 @@ async fn setup_deferred_parse_buffer() -> (
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 5,
             overscan_rows: 0,
@@ -2054,7 +2050,6 @@ async fn setup_deferred_parse_buffer() -> (
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2200,11 +2195,10 @@ async fn setup_deferred_git_buffer(
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("big.rs".into()),
             language: None,
@@ -2217,7 +2211,7 @@ async fn setup_deferred_git_buffer(
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 5,
             overscan_rows: 0,
@@ -2232,7 +2226,6 @@ async fn setup_deferred_git_buffer(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2334,11 +2327,10 @@ async fn match_bracket_motion_jumps_to_pair() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -2406,11 +2398,10 @@ async fn match_bracket_with_extend_selects_to_pair() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -2466,11 +2457,10 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -2525,11 +2515,10 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -2599,11 +2588,10 @@ async fn match_bracket_inner_from_opener_jumps_to_inner_close() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -2658,11 +2646,10 @@ async fn match_bracket_inner_on_empty_pair_is_noop() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -2724,11 +2711,10 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("notes.md".into()),
             language: None,
@@ -2743,7 +2729,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -2757,7 +2743,6 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2796,11 +2781,10 @@ async fn save_in_place_writes_file_and_clears_dirty() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("greet.txt".into()),
             language: None,
@@ -2815,7 +2799,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -2830,7 +2814,6 @@ async fn save_in_place_writes_file_and_clears_dirty() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2919,8 +2902,8 @@ async fn save_as_broadcasts_new_path_to_other_viewers() {
         },
     )
     .await;
-    let a: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws, &file_open_params("orig.txt", None)).await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("orig.txt", None)).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
 
@@ -2935,8 +2918,8 @@ async fn save_as_broadcasts_new_path_to_other_viewers() {
         },
     )
     .await;
-    let a2: BufferOpenResult =
-        send_request::<BufferOpen>(&mut ws2, &file_open_params("orig.txt", None)).await;
+    let a2: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws2, &file_open_params("orig.txt", None)).await;
     assert_eq!(a2.buffer_id, a.buffer_id, "same file → shared buffer");
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws2, &transient_sub_params(a.buffer_id)).await;
@@ -2987,11 +2970,10 @@ async fn save_preserves_crlf_endings() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("windows.txt".into()),
             language: None,
@@ -3042,11 +3024,10 @@ async fn save_scratch_returns_buffer_has_no_path() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: None,
             relative_path: None,
             language: None,
@@ -3151,7 +3132,7 @@ async fn cut_selection_deletes_and_returns_text() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -3166,7 +3147,6 @@ async fn cut_selection_deletes_and_returns_text() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3229,7 +3209,7 @@ async fn input_text_with_select_pasted_makes_selection() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -3244,7 +3224,6 @@ async fn input_text_with_select_pasted_makes_selection() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3283,7 +3262,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -3298,7 +3277,6 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3464,7 +3442,7 @@ async fn dirty_clears_when_undoing_back_past_save() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -3479,7 +3457,6 @@ async fn dirty_clears_when_undoing_back_past_save() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3659,7 +3636,7 @@ async fn join_lines_deletes_break_and_indent() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -3674,7 +3651,6 @@ async fn join_lines_deletes_break_and_indent() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3835,7 +3811,7 @@ async fn unjoin_parked_cursor_agrees_across_push_and_response() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -3849,7 +3825,6 @@ async fn unjoin_parked_cursor_agrees_across_push_and_response() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3929,7 +3904,7 @@ async fn input_text_with_selection_replaces_it() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -3944,7 +3919,6 @@ async fn input_text_with_selection_replaces_it() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5058,7 +5032,7 @@ async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
@@ -5073,7 +5047,6 @@ async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5104,7 +5077,7 @@ async fn visual_line_preserves_visual_column() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
@@ -5119,7 +5092,6 @@ async fn visual_line_preserves_visual_column() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5177,7 +5149,7 @@ async fn visual_line_crosses_logical_line_boundary() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 20,
             rows: 5,
             overscan_rows: 0,
@@ -5192,7 +5164,6 @@ async fn visual_line_crosses_logical_line_boundary() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5237,7 +5208,7 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 5,
             overscan_rows: 0,
@@ -5251,7 +5222,6 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5291,7 +5261,7 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
@@ -5306,7 +5276,6 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5349,7 +5318,7 @@ async fn viewport_set_wrap_changes_visible_rows() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
@@ -5364,7 +5333,6 @@ async fn viewport_set_wrap_changes_visible_rows() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5401,7 +5369,7 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
@@ -5415,7 +5383,6 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5478,7 +5445,7 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 5,
             overscan_rows: 0,
@@ -5492,7 +5459,6 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5550,7 +5516,7 @@ async fn virtual_col_cleared_by_horizontal_motion() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
@@ -5564,7 +5530,6 @@ async fn virtual_col_cleared_by_horizontal_motion() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5634,7 +5599,7 @@ async fn virtual_col_cleared_by_mutation() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
@@ -5648,7 +5613,6 @@ async fn virtual_col_cleared_by_mutation() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5720,7 +5684,7 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 10,
             rows: 5,
             overscan_rows: 0,
@@ -5734,7 +5698,6 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -5976,7 +5939,7 @@ async fn hunk_view(
     std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -5989,7 +5952,7 @@ async fn hunk_view(
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -6003,7 +5966,6 @@ async fn hunk_view(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -6308,7 +6270,7 @@ async fn moving_focus_rescopes_the_active_search() {
     std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -6321,7 +6283,7 @@ async fn moving_focus_rescopes_the_active_search() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 80,
             overscan_rows: 0,
@@ -6335,7 +6297,6 @@ async fn moving_focus_rescopes_the_active_search() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -6508,7 +6469,7 @@ async fn subscribing_to_a_patch_reports_the_element_the_cursor_is_in() {
     std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -6521,7 +6482,7 @@ async fn subscribing_to_a_patch_reports_the_element_the_cursor_is_in() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -6535,7 +6496,6 @@ async fn subscribing_to_a_patch_reports_the_element_the_cursor_is_in() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -6585,7 +6545,7 @@ async fn a_patch_opened_on_a_file_focuses_that_files_element() {
     }
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -6606,7 +6566,7 @@ async fn a_patch_opened_on_a_file_focuses_that_files_element() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -6616,7 +6576,6 @@ async fn a_patch_opened_on_a_file_focuses_that_files_element() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -6674,7 +6633,7 @@ async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
     std::fs::write(root.join("a.rs"), format!("{}\n", changed.join("\n"))).unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -6687,7 +6646,7 @@ async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 24,
             overscan_rows: 0,
@@ -6701,7 +6660,6 @@ async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -6774,7 +6732,7 @@ async fn a_views_reported_height_is_the_rows_it_ships() {
         std::fs::write(root.join(name), format!("{}\n", changed.join("\n"))).unwrap();
     }
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -6790,7 +6748,7 @@ async fn a_views_reported_height_is_the_rows_it_ships() {
     let all: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 400,
             overscan_rows: 0,
@@ -6804,7 +6762,6 @@ async fn a_views_reported_height_is_the_rows_it_ships() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
-            kind: None,
         },
     )
     .await;
@@ -6889,7 +6846,7 @@ async fn every_scrollable_row_comes_back_in_its_window() {
         std::fs::write(root.join(&name), format!("{}\n", changed.join("\n"))).unwrap();
     }
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -6903,7 +6860,7 @@ async fn every_scrollable_row_comes_back_in_its_window() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows,
             // What the real client sends: a screenful of overscan either side.
@@ -6918,7 +6875,6 @@ async fn every_scrollable_row_comes_back_in_its_window() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
-            kind: None,
         },
     )
     .await;
@@ -6968,7 +6924,7 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
         std::fs::write(root.join(&name), format!("{}\n", changed.join("\n"))).unwrap();
     }
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -6982,7 +6938,7 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             // Narrow + soft wrap: what the real client actually runs with.
             cols: 24,
             rows,
@@ -6997,7 +6953,6 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
             continuation_marker_width: 2,
             tab_width: 4,
             diff_view: true,
-            kind: None,
         },
     )
     .await;
@@ -7070,7 +7025,7 @@ async fn a_patch_ends_with_its_closing_rule() {
         std::fs::write(root.join(name), format!("{}\n", changed.join("\n"))).unwrap();
     }
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -7083,7 +7038,7 @@ async fn a_patch_ends_with_its_closing_rule() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 400, // the whole view, so the last row is in this window
             overscan_rows: 0,
@@ -7097,7 +7052,6 @@ async fn a_patch_ends_with_its_closing_rule() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -7139,7 +7093,7 @@ async fn a_patch_ends_with_its_closing_rule() {
     let partial: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 4,
             overscan_rows: 0,
@@ -7153,7 +7107,6 @@ async fn a_patch_ends_with_its_closing_rule() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -7591,11 +7544,10 @@ async fn extending_a_selection_cannot_anchor_outside_the_element() {
     std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let file: BufferOpenResult = send_request::<BufferOpen>(
+    let file: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -7619,7 +7571,7 @@ async fn extending_a_selection_cannot_anchor_outside_the_element() {
     .await;
 
     // Now show the hunk. The head is inside it, so the cursor is kept — anchor and all.
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -7632,7 +7584,7 @@ async fn extending_a_selection_cannot_anchor_outside_the_element() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -7646,7 +7598,6 @@ async fn extending_a_selection_cannot_anchor_outside_the_element() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -7728,7 +7679,7 @@ async fn moving_a_paragraph_cannot_reach_outside_the_hunk() {
     std::fs::write(root.join("a.md"), build(Some(5))).unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let patch: BufferOpenResult = show_buffer(
+    let patch: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -7741,7 +7692,7 @@ async fn moving_a_paragraph_cannot_reach_outside_the_hunk() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            view_id: patch.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -7755,7 +7706,6 @@ async fn moving_a_paragraph_cannot_reach_outside_the_hunk() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -7832,7 +7782,7 @@ async fn motion_undo_refuses_a_position_in_another_hunk() {
     std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: BufferOpenResult = show_buffer(
+    let opened: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
@@ -7845,7 +7795,7 @@ async fn motion_undo_refuses_a_position_in_another_hunk() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            view_id: opened.view_id,
             cols: 120,
             rows: 60,
             overscan_rows: 0,
@@ -7859,7 +7809,6 @@ async fn motion_undo_refuses_a_position_in_another_hunk() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;

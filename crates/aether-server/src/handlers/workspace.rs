@@ -338,9 +338,10 @@ pub async fn activate_context(
         }
     }
 
-    // Ids of restored buffers that carry unsaved content (a backup) and so should be materialized
-    // eagerly after the lock is released — see the restore block below and the loop after it.
-    let mut eager_restore_ids: Vec<BufferId> = Vec::new();
+    // The reserved views of restored buffers that carry unsaved content (a backup) and so should
+    // be materialized eagerly after the lock is released — see the restore block below and the
+    // loop after it.
+    let mut eager_restore_ids: Vec<ViewId> = Vec::new();
 
     // Watch registration deferred until after the lock is released — see below.
     let mut watch_after: Option<(Arc<crate::watcher::WatcherHandle>, Vec<std::path::PathBuf>)> =
@@ -361,8 +362,8 @@ pub async fn activate_context(
                 paths: canonical_paths.clone(),
                 workspace_index,
                 worktrees: bindings.clone(),
-                mru_buffers: std::collections::VecDeque::new(),
-                dormant_buffers: Vec::new(),
+                mru_views: std::collections::VecDeque::new(),
+                dormant_views: Vec::new(),
                 jumplist: None,
                 projects,
             },
@@ -389,14 +390,19 @@ pub async fn activate_context(
                 let entries = sessions
                     .workspaces
                     .get(&params.name)
-                    .map(|sess| sess.buffers_for(&bindings))
+                    .map(|sess| sess.views_for(&bindings))
                     .unwrap_or(&[]);
                 let sources = restore_dormant_sources(entries, &context, s.backups_path.as_deref());
-                let dormant: Vec<crate::state::DormantBuffer> = sources
+                let dormant: Vec<crate::state::DormantView> = sources
                     .into_iter()
-                    .map(|source| crate::state::DormantBuffer {
-                        id: s.allocate_buffer_id(),
-                        source,
+                    .map(|(source, kind)| {
+                        let id = s.allocate_buffer_id();
+                        crate::state::DormantView {
+                            id,
+                            view: s.allocate_view_id(),
+                            kind,
+                            source,
+                        }
                     })
                     .collect();
                 // Which restored entries carry unsaved content (a backup) → eager-materialize.
@@ -414,10 +420,10 @@ pub async fn activate_context(
                         // it regenerates when first viewed, like a dormant file with no backup.
                         crate::state::DormantSource::Virtual { .. } => false,
                     })
-                    .map(|d| d.id)
+                    .map(|d| d.view)
                     .collect();
                 if let Some(proj) = s.workspaces.get_mut(&context) {
-                    proj.dormant_buffers = dormant;
+                    proj.dormant_views = dormant;
                 }
             }
         }
@@ -458,7 +464,7 @@ pub async fn activate_context(
         }
     }
 
-    let last_buffer_id = landing_buffer_id(&s, &context);
+    let last_view_id = landing_view_id(&s, &context);
 
     tracing::info!(
         %client_id,
@@ -493,12 +499,12 @@ pub async fn activate_context(
     // client implemented by hand.
     let opened = if params.open_last {
         Some(
-            buffer_open(
+            view_open(
                 state,
                 ctx,
-                BufferOpenParams {
-                    buffer_id: last_buffer_id,
-                    transient: if last_buffer_id.is_none() {
+                ViewOpenParams {
+                    view_id: last_view_id,
+                    transient: if last_view_id.is_none() {
                         Some(true)
                     } else {
                         None
@@ -514,19 +520,20 @@ pub async fn activate_context(
 
     // Eagerly materialize the restored buffers that carry unsaved content, so they come back as
     // live, dirty buffers (marked unsaved in the picker) rather than clean-looking dormant
-    // rows — the hot-exit promise. Each is opened by id through the normal open path, which loads
-    // the file (or rebuilds the scratch) and overlays the backup. The landing buffer above may have
-    // already materialized one of them; skip it. Best-effort: a single failure mustn't abort
-    // activation (e.g. the rare unreadable file — its content still survives in the backup).
-    for id in eager_restore_ids {
-        if params.open_last && Some(id) == last_buffer_id {
+    // rows — the hot-exit promise. Each is opened by its reserved view through the normal open
+    // path, which loads the file (or rebuilds the scratch) and overlays the backup. The landing
+    // view above may have already materialized one of them; skip it. Best-effort: a single failure
+    // mustn't abort activation (e.g. the rare unreadable file — its content still survives in the
+    // backup).
+    for view in eager_restore_ids {
+        if params.open_last && Some(view) == last_view_id {
             continue;
         }
-        let _ = buffer_open(
+        let _ = view_open(
             state,
             ctx,
-            BufferOpenParams {
-                buffer_id: Some(id),
+            ViewOpenParams {
+                view_id: Some(view),
                 ..Default::default()
             },
         )
@@ -544,36 +551,30 @@ pub async fn activate_context(
             worktrees: wire_bindings(&bindings),
             projects: entry_projects,
         },
-        last_buffer_id,
+        last_view_id,
         opened,
         server_started_at,
     })
 }
 
-/// The buffer a client lands on when it arrives in `context` with nothing specific to open — a
+/// The view a client lands on when it arrives in `context` with nothing specific to open — a
 /// workspace switch, or a directory opened as a temporary context. The MRU lives on
 /// `WorkspaceEntry` (not per-client) so it survives client disconnects: a fresh invocation sees the
-/// same top-of-MRU buffer the prior session left there, and reattaches instead of spawning a fresh
+/// same top-of-MRU view the prior session left there, and reattaches instead of spawning a fresh
 /// scratch on every switch.
 ///
-/// Prefer a still-live MRU buffer; otherwise — a cold restore after a restart, where nothing is
-/// loaded yet — the most-recently-used *dormant* buffer, which `buffer_open` materializes by id.
-/// `None` only when the workspace is genuinely empty (a first ever visit, and always the case for a
-/// freshly minted temporary one), which is the caller's cue to mint a transient scratch.
+/// Prefer a still-live MRU view; otherwise — a cold restore after a restart, where nothing is
+/// loaded yet — the most-recently-used *dormant* row's reserved view, which `view_open`
+/// materializes. `None` only when the workspace is genuinely empty (a first ever visit, and always
+/// the case for a freshly minted temporary one), which is the caller's cue to mint a transient
+/// scratch.
 ///
 /// Deliberately kind-blind: a scratch you were editing is where you left off, and coming back to it
-/// is the point. A fresh scratch is only ever minted when there is no buffer of any kind to return
+/// is the point. A fresh scratch is only ever minted when there is no view of any kind to return
 /// to — a state with no file to prefer — so this never opens a blank scratch over a file.
-fn landing_buffer_id(s: &ServerState, context: &str) -> Option<BufferId> {
-    s.workspaces
-        .get(context)
-        .and_then(|p| {
-            p.mru_buffers
-                .iter()
-                .find(|id| s.buffers.contains_key(id))
-                .copied()
-        })
-        .or_else(|| s.first_dormant_id(context))
+fn landing_view_id(s: &ServerState, context: &str) -> Option<ViewId> {
+    s.mru_view(context)
+        .or_else(|| s.first_dormant_view(context))
 }
 
 /// Persist `workspace_name`'s session — the canonical paths of its open (and still-dormant) buffers,
@@ -605,7 +606,7 @@ pub async fn persist_workspace_session(
     else {
         return;
     };
-    let buffers = s.session_buffers(workspace_name);
+    let buffers = s.session_views(workspace_name);
     let mut sessions = crate::config::load_workspace_sessions_at(&path).unwrap_or_default();
     let entry = sessions.workspaces.entry(name).or_default();
     // One context's buffers, recorded against the bindings that identify it — so two windows in two
@@ -637,22 +638,27 @@ pub async fn persist_workspace_session(
 ///   way: their backup filename is an unreversible path hash, so an unrecorded file backup relies on
 ///   recover-on-open instead. Order: session entries (MRU) first, then recovered scratches ascending.
 fn restore_dormant_sources(
-    entries: &[crate::config::SessionBuffer],
+    entries: &[crate::config::SessionView],
     workspace_name: &str,
     backups_root: Option<&std::path::Path>,
-) -> Vec<crate::state::DormantSource> {
-    use crate::config::SessionBuffer;
+) -> Vec<(
+    crate::state::DormantSource,
+    Option<aether_protocol::ui::ViewKind>,
+)> {
+    use crate::config::SessionView;
     use crate::state::DormantSource;
-    let mut sources: Vec<DormantSource> = entries
+    let mut sources: Vec<(DormantSource, Option<aether_protocol::ui::ViewKind>)> = entries
         .iter()
         .filter_map(|entry| match entry {
-            SessionBuffer::File { path } => {
+            SessionView::Editor { .. } | SessionView::Reader { .. } | SessionView::File { .. } => {
+                let (path, kind) = entry.file_view()?;
                 let has_backup = backups_root.is_some_and(|root| {
                     crate::backup::exists(&crate::backup::file_backup_path(root, path))
                 });
-                (path.exists() || has_backup).then(|| DormantSource::File(path.clone()))
+                (path.exists() || has_backup)
+                    .then(|| (DormantSource::File(path.to_path_buf()), Some(kind)))
             }
-            SessionBuffer::Scratch { number } => {
+            SessionView::Scratch { number } => {
                 let has_backup = backups_root.is_some_and(|root| {
                     crate::backup::exists(&crate::backup::scratch_backup_path(
                         root,
@@ -660,17 +666,19 @@ fn restore_dormant_sources(
                         *number,
                     ))
                 });
-                has_backup.then_some(DormantSource::Scratch { number: *number })
+                has_backup.then_some((DormantSource::Scratch { number: *number }, None))
             }
             // Nothing on disk to check for: a revision is regenerated from the repo on first view,
             // and one that no longer resolves reports itself then rather than being probed here.
-            SessionBuffer::Virtual { key } => Some(DormantSource::Virtual { key: key.clone() }),
+            SessionView::Virtual { key } => {
+                Some((DormantSource::Virtual { key: key.clone() }, None))
+            }
         })
         .collect();
     if let Some(root) = backups_root {
         let known: std::collections::HashSet<u32> = sources
             .iter()
-            .filter_map(|src| match src {
+            .filter_map(|(src, _)| match src {
                 DormantSource::Scratch { number } => Some(*number),
                 DormantSource::File(_) | DormantSource::Virtual { .. } => None,
             })
@@ -685,7 +693,7 @@ fn restore_dormant_sources(
             sources.extend(
                 recovered
                     .into_iter()
-                    .map(|number| DormantSource::Scratch { number }),
+                    .map(|number| (DormantSource::Scratch { number }, None)),
             );
         }
     }
@@ -902,8 +910,8 @@ pub async fn workspace_create(
             // A fresh workspace has no roots, so it reaches no repo and can bind nothing. Its id is
             // its name, which is what `context_id` gives for the empty set.
             workspace_index,
-            mru_buffers: std::collections::VecDeque::new(),
-            dormant_buffers: Vec::new(),
+            mru_views: std::collections::VecDeque::new(),
+            dormant_views: Vec::new(),
             jumplist: None,
             projects: Vec::new(),
         },
@@ -940,7 +948,7 @@ pub async fn workspace_create(
             worktrees: Vec::new(),
             projects: Vec::new(),
         },
-        last_buffer_id: None,
+        last_view_id: None,
         opened: None,
         server_started_at,
     })
@@ -1023,7 +1031,7 @@ pub async fn workspace_open_path(
     let canonical = match std::fs::canonicalize(&raw) {
         Ok(c) => c,
         // A not-yet-existing file (`ae path/to/new-file`): canonicalize the deepest existing
-        // ancestor and keep the missing tail — the delegated `buffer/open` (which gets the same
+        // ancestor and keep the missing tail — the delegated `view/open` (which gets the same
         // `create_if_missing`) binds an empty buffer to it, written at the first save.
         Err(_) if params.create_if_missing => canonicalize_partial(&raw)
             .map_err(|e| RpcError::invalid_path(format!("resolving {}: {e}", raw.display())))?,
@@ -1149,7 +1157,7 @@ pub async fn workspace_open_path(
                         buffers = closed.len(),
                         "superseded idle temporary workspaces"
                     );
-                    superseded_pushes.extend(refresh_buffer_pickers(&mut s));
+                    superseded_pushes.extend(refresh_view_pickers(&mut s));
                 }
                 if !stopped.is_empty() {
                     superseded_pushes.extend(refresh_lsp_server_pickers(&mut s));
@@ -1169,7 +1177,7 @@ pub async fn workspace_open_path(
         if adopted {
             tracing::info!(workspace = %id, root = %adopt_root.display(), "temporary workspace adopted a root");
         }
-        // A file open needs no separate watch registration — `buffer/open` watches the buffer's
+        // A file open needs no separate watch registration — `view/open` watches the buffer's
         // parent directory, which is exactly the root just adopted. A directory open has no such
         // buffer, so register the new root here (after the lock, like `activate_context` does, since
         // registration walks the tree).
@@ -1205,23 +1213,23 @@ pub async fn workspace_open_path(
         // visit to a configured workspace, so `ae DIR` feels the same either side of the boundary.
         let landing = {
             let s = state.lock().await;
-            landing_buffer_id(&s, &workspace_id)
+            landing_view_id(&s, &workspace_id)
         };
-        buffer_open(
+        view_open(
             state,
             ctx,
-            BufferOpenParams {
-                buffer_id: landing,
+            ViewOpenParams {
+                view_id: landing,
                 transient: landing.is_none().then_some(true),
                 ..Default::default()
             },
         )
         .await?
     } else {
-        buffer_open(
+        view_open(
             state,
             ctx,
-            BufferOpenParams {
+            ViewOpenParams {
                 absolute_path: Some(canonical.display().to_string()),
                 transient: params.transient,
                 // The delegate canonicalizes again, and would refuse the unsaved-file path for the
@@ -1260,7 +1268,7 @@ pub async fn workspace_open_path(
             worktrees,
             projects,
         },
-        last_buffer_id: None,
+        last_view_id: None,
         opened: Some(opened),
         server_started_at,
     })
@@ -1278,7 +1286,7 @@ pub async fn workspace_add_root(
     // A root is a directory. This is the only RPC that writes one, so rejecting here (together with
     // the load-time filter in `config::load_workspace_in`) is what lets everything downstream treat
     // `WorkspaceEntry::paths` as directories without re-checking: the index walks them, the watcher
-    // registers them, and `buffer/open` joins a relative path onto them.
+    // registers them, and `view/open` joins a relative path onto them.
     //
     // Safe after canonicalization, which already required the path to exist — so a `false` here
     // means "not a directory", never "not there yet".
@@ -1710,7 +1718,7 @@ pub async fn workspace_remove_root(
 
     // Other clients viewing any of these buffers must be told to switch — capture before teardown.
     let other_clients = clients_affected_by_close(&s, &affected, client_id);
-    // Close the affected buffers (clean ones). Same teardown as buffer/close.
+    // Close the affected buffers (clean ones). Same teardown as view/close.
     for &id in &affected {
         s.close_buffer(id);
     }
@@ -1765,14 +1773,14 @@ pub async fn workspace_remove_root(
     let entry_projects = workspace_project_views(workspace);
 
     // Next buffer for the requesting client: top of workspace MRU, else any remaining buffer in
-    // the workspace. Mirrors buffer/close.
-    let next_buffer_id = next_buffer_for_client(&s, client_id);
+    // the workspace. Mirrors view/close.
+    let next_view_id = next_view_for_client(&s, client_id);
     let watcher = s.watcher.clone();
     // Shape first, then what closed — same order as a worktree rebind, and for the same reason:
     // the close makes a client open its successor, and that open resolves the path against the
     // roots it holds.
     let mut pushes = workspace_changed_pushes(&s, &params.workspace, client_id);
-    pushes.extend(refresh_buffer_pickers(&mut s));
+    pushes.extend(refresh_view_pickers(&mut s));
     pushes.extend(buffer_closed_pushes(&s, &other_clients));
     // Captured before the lock goes: the workspace store is a field on the state so a test
     // can point it at a tempdir instead of the developer's own configured workspaces.
@@ -1806,7 +1814,7 @@ pub async fn workspace_remove_root(
             projects: entry_projects,
         },
         closed_buffer_ids: affected,
-        next_buffer_id,
+        next_view_id,
     })
 }
 
@@ -2087,7 +2095,7 @@ pub async fn path_delete(
         // Client deactivated mid-call — the trash already happened; nothing left to tear down.
         return Ok(PathDeleteResult {
             closed_buffer_ids: Vec::new(),
-            next_buffer_id: None,
+            next_view_id: None,
         });
     };
     let closed = s.buffers_under_path(&workspace_name, &canonical);
@@ -2101,8 +2109,8 @@ pub async fn path_delete(
     if let Some(p) = s.workspaces.get(&workspace_name) {
         p.workspace_index.invalidate();
     }
-    let next_buffer_id = next_buffer_for_client(&s, client_id);
-    let mut pushes = refresh_buffer_pickers(&mut s);
+    let next_view_id = next_view_for_client(&s, client_id);
+    let mut pushes = refresh_view_pickers(&mut s);
     pushes.extend(buffer_closed_pushes(&s, &other_clients));
     drop(s);
     for (sender, notif) in pushes {
@@ -2111,7 +2119,7 @@ pub async fn path_delete(
     tracing::info!(path = %canonical.display(), closed = closed.len(), "path trashed");
     Ok(PathDeleteResult {
         closed_buffer_ids: closed,
-        next_buffer_id,
+        next_view_id,
     })
 }
 
@@ -2140,7 +2148,7 @@ pub async fn workspace_list(
 #[cfg(test)]
 mod restore_tests {
     use super::*;
-    use crate::config::SessionBuffer;
+    use crate::config::SessionView;
     use crate::state::DormantSource;
 
     /// `restore_dormant_sources` decides what comes back as dormant buffers after a restart. Files
@@ -2170,20 +2178,23 @@ mod restore_tests {
         crate::backup::write(&crate::backup::scratch_backup_path(&backups, "p", 5), "s5").unwrap();
 
         let entries = vec![
-            SessionBuffer::File {
+            SessionView::Editor {
                 path: present.clone(),
             },
-            SessionBuffer::File {
+            SessionView::Editor {
                 path: deleted_with_backup.clone(),
             },
-            SessionBuffer::File {
+            SessionView::Editor {
                 path: deleted_no_backup.clone(),
             },
-            SessionBuffer::Scratch { number: 1 },
-            SessionBuffer::Scratch { number: 2 },
+            SessionView::Scratch { number: 1 },
+            SessionView::Scratch { number: 2 },
         ];
 
-        let sources = restore_dormant_sources(&entries, "p", Some(&backups));
+        let sources: Vec<DormantSource> = restore_dormant_sources(&entries, "p", Some(&backups))
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
         assert_eq!(
             sources,
             vec![
@@ -2204,15 +2215,18 @@ mod restore_tests {
     #[test]
     fn restore_dormant_sources_keeps_revisions() {
         let entries = vec![
-            SessionBuffer::Virtual {
+            SessionView::Virtual {
                 key: "/repo@abc1234".into(),
             },
-            SessionBuffer::Virtual {
+            SessionView::Virtual {
                 key: "/repo@abc1234:src/a.rs".into(),
             },
         ];
         // No backups dir at all: a revision doesn't need one, unlike a scratch.
-        let sources = restore_dormant_sources(&entries, "p", None);
+        let sources: Vec<DormantSource> = restore_dormant_sources(&entries, "p", None)
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
         assert_eq!(
             sources,
             vec![
@@ -2234,17 +2248,20 @@ mod restore_tests {
         let present = dir.path().join("a.rs");
         std::fs::write(&present, "x\n").unwrap();
         let entries = vec![
-            SessionBuffer::File {
+            SessionView::Editor {
                 path: present.clone(),
             },
-            SessionBuffer::File {
+            SessionView::Editor {
                 path: dir.path().join("missing.rs"),
             },
-            SessionBuffer::Scratch { number: 1 },
+            SessionView::Scratch { number: 1 },
         ];
         assert_eq!(
             restore_dormant_sources(&entries, "p", None),
-            vec![DormantSource::File(present)]
+            vec![(
+                DormantSource::File(present),
+                Some(aether_protocol::ui::ViewKind::Editor)
+            )]
         );
     }
 }

@@ -52,6 +52,15 @@ impl RpcError {
         )
     }
 
+    /// A view id nothing answers to — closed, or never handed out. The same code as a missing
+    /// buffer: to a client the two are one condition, "what you named is gone".
+    pub fn view_not_found(id: aether_protocol::ViewId) -> Self {
+        Self::new(
+            ErrorCode::BUFFER_NOT_FOUND,
+            format!("unknown view_id: {}", id.get()),
+        )
+    }
+
     pub fn no_active_workspace() -> Self {
         Self::new(
             ErrorCode::NO_ACTIVE_WORKSPACE,

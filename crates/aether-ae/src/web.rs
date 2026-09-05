@@ -8,7 +8,7 @@
 //! The exception is the quick-edit invocation (file positional, no explicit `--workspace` — the
 //! same shape that tethers the native shells): there the process stays alive as a headless
 //! **waiter**. It opens the buffer over the same RPC the shells' boots use — which places the
-//! buffer in this client's workspace context, so the server's `buffer/closed` broadcast reaches
+//! buffer in this client's workspace context, so the server's `view/closed` broadcast reaches
 //! it without any viewport (`clients_affected_by_close`) — and exits 0 when the push reports the
 //! buffer gone. That gives `ae --web file` the `$EDITOR` contract: git waits on the CLI, the
 //! commit message is edited in a browser tab, `Space Alt-x` there closes the buffer, the waiter
@@ -26,10 +26,10 @@
 
 use aether_client::web_link::WebLinkTarget;
 use aether_connection::{ConnectError, Handle, Inbound};
-use aether_protocol::buffer::{
-    BufferClose, BufferCloseParams, BufferClosed, BufferClosedParams, BufferOpen, BufferOpenParams,
-};
 use aether_protocol::envelope::NotificationMethod;
+use aether_protocol::view::{
+    ViewClose, ViewCloseParams, ViewClosed, ViewClosedParams, ViewOpen, ViewOpenParams,
+};
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceOpenPath, WorkspaceOpenPathParams,
 };
@@ -84,7 +84,7 @@ pub fn run(
 ///
 /// The tether opens the buffer from *this* client first, exactly as [`open_in_workspace`] does and
 /// for the same reason: it puts the buffer in a context this client is parked in, which is what
-/// routes the `buffer/closed` broadcast here. The browser's own `workspace/open_path` then **joins**
+/// routes the `view/closed` broadcast here. The browser's own `workspace/open_path` then **joins**
 /// that temporary context (it already holds the path) instead of minting a rival one, so both land
 /// on the same buffer — including a not-yet-existing file, which is created here and attached to
 /// there.
@@ -124,7 +124,7 @@ async fn open_external(
         .ok_or_else(|| anyhow::anyhow!("workspace/open_path returned no buffer"))?;
     open_in_browser(&url);
     println!("Waiting for {abs} to be closed in the browser (Ctrl-C to abort)…");
-    wait_for_close(&handle, &mut inbound, opened.buffer_id).await
+    wait_for_close(&handle, &mut inbound, opened.buffer_id, opened.view_id).await
 }
 
 /// Open the browser on a workspace (or the chooser) with nothing to wait for. The server was
@@ -184,12 +184,12 @@ async fn open_in_workspace(
     }
 
     // The tether: open the buffer from *this* client before the browser exists. That puts it in
-    // this client's workspace context (workspace MRU), which is what routes the `buffer/closed`
+    // this client's workspace context (workspace MRU), which is what routes the `view/closed`
     // broadcast here despite the waiter never subscribing a viewport — and it means the web
     // boot's own open (by root + relative path) attaches to the same buffer, even for a
     // not-yet-existing file (`ae --web path/to/new-file`, create-on-first-save).
     let opened = handle
-        .rpc::<BufferOpen>(BufferOpenParams {
+        .rpc::<ViewOpen>(ViewOpenParams {
             path_index: Some(path_index),
             relative_path: Some(relative_path.clone()),
             create_if_missing: true,
@@ -199,7 +199,7 @@ async fn open_in_workspace(
         .map_err(|e| anyhow::anyhow!("could not open {relative_path}: {e}"))?;
     open_in_browser(&url);
     println!("Waiting for {relative_path} to be closed in the browser (Ctrl-C to abort)…");
-    wait_for_close(&handle, &mut inbound, opened.buffer_id).await
+    wait_for_close(&handle, &mut inbound, opened.buffer_id, opened.view_id).await
 }
 
 /// Block until the tethered buffer is closed (by the browser, another client, or a path
@@ -209,25 +209,26 @@ async fn wait_for_close(
     handle: &Handle,
     inbound: &mut tokio::sync::mpsc::UnboundedReceiver<Inbound>,
     buffer_id: aether_protocol::BufferId,
+    view_id: aether_protocol::ViewId,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             msg = inbound.recv() => match msg {
                 None => bail!("the connection to the server was lost"),
-                Some(Inbound::Notification(n)) if n.method == BufferClosed::NAME => {
-                    let Ok(params) = serde_json::from_value::<BufferClosedParams>(n.params) else {
+                Some(Inbound::Notification(n)) if n.method == ViewClosed::NAME => {
+                    let Ok(params) = serde_json::from_value::<ViewClosedParams>(n.params) else {
                         continue;
                     };
-                    if params.buffer_id == buffer_id {
+                    if params.buffer_id == Some(buffer_id) {
                         return Ok(());
                     }
                 }
                 Some(_) => {}
             },
             _ = tokio::signal::ctrl_c() => {
-                let close = handle.rpc::<BufferClose>(BufferCloseParams {
-                    // The `--web` waiter tethers to one file, whose view is that file.
-                    buffer_id: aether_protocol::ViewId(buffer_id),
+                let close = handle.rpc::<ViewClose>(ViewCloseParams {
+                    // The `--web` waiter tethers to one file, closing the view its open presented.
+                    view_id,
                     open_next: false,
                 });
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), close).await;

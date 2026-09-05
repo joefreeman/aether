@@ -215,7 +215,7 @@ pub fn load_baseline(path: &Path, choices: &BaselineChoices) -> GitBaseline {
 /// The **cheap half** alone: which repo the file is in and that repo's state, with the content left
 /// [pending](GitBaseline::is_pending).
 ///
-/// Used where the content is about to be loaded in the background ([`crate::handlers::buffer_open`]
+/// Used where the content is about to be loaded in the background ([`crate::handlers::view_open`]
 /// past its size limit). Which repo a file is in is a fact about the workspace, not about how
 /// recently it was opened, so it is resolved on the open path however big the file is — every git
 /// verb resolves its repo through this, and deferring it made them all refuse a file that had just
@@ -768,7 +768,7 @@ pub fn list_branches(workdir: &Path) -> Vec<BranchRow> {
 /// Sort bucket for [`list_branches`]: where you are, the main checkout, the family's other
 /// worktrees, then branches no tree holds.
 ///
-/// Current-first is how Buffers and Workspaces already land their selection — the default highlight
+/// Current-first is how Views and Workspaces already land their selection — the default highlight
 /// is index 0, so "where you are" being first makes Enter-on-open a no-op without any extra
 /// mechanism. Pinning rather than sectioning is deliberate: splitting the list into "has a tree" and
 /// "doesn't" scatters the branches you are looking for across two places, where pinning keeps them
@@ -786,7 +786,7 @@ fn checkout_rank(row: &BranchRow) -> u8 {
 /// represent ([`detached_worktrees`]), in one ordering.
 ///
 /// Sorted as a whole rather than appended, so "where you are" stays at index 0 even when where you
-/// are is a detached tree — the default highlight is index 0, which is how Buffers and Workspaces
+/// are is a detached tree — the default highlight is index 0, which is how Views and Workspaces
 /// already land their selection, and it makes Enter-on-open a no-op.
 ///
 /// Kept separate from `list_branches` so that function stays what its name says. Callers that want

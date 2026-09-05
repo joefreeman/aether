@@ -517,7 +517,7 @@ fn windowed_preview(
 
 /// Convert a byte range within `preview` to the char-index offsets the match covers. Char
 /// offsets are what the protocol's `match_indices` field uses (consistent with the existing
-/// Files/Buffers pickers).
+/// Files/view pickers).
 fn byte_range_to_char_offsets(preview: &str, byte_start: usize, byte_end: usize) -> Vec<u32> {
     let mut out = Vec::new();
     for (ci, (bo, _)) in preview.char_indices().enumerate() {

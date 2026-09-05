@@ -13,7 +13,7 @@ A modal text editor with a client–server architecture for Linux and macOS. Nat
 - LSP support (diagnostics, hover, go-to-definition, references, document/workspace symbols, formatting)
 - Git integration (gutter, inline diff, blame, hunk staging, remotes, commit, branch switching, worktrees, history, stashes)
 - Markdown reader mode
-- Fuzzy pickers (files, buffers, symbols, diagnostics, git changes), workspace grep
+- Fuzzy pickers (files, views, symbols, diagnostics, git changes), workspace grep
 - File explorer, cross-file jump history, workspace switching
 - Native, terminal and web clients with consistent keymaps and behaviour
 
@@ -87,7 +87,7 @@ These move the view, not the cursor, and work the same in the reading view.
 | --- | --- |
 | `,` | Collapse selection |
 | `r`/`Alt-r` | Reverse selection (swap cursor and anchor) / orient it forward |
-| `%` | Select whole buffer |
+| `%` | Select all |
 | `q`/`Alt-q` | Expand/contract selection to syntax node |
 | `x`/`Alt-x` | Select line downward/upward |
 | `z`/`Alt-z` | Undo/redo cursor motion |
@@ -152,10 +152,11 @@ both following the file's own indent style. `Alt-←`/`Alt-→` move by word, an
 
 ### Markdown reading view
 
-`Space v` renders the current Markdown buffer — headings, tables, images, links and highlighted
+`Space u` renders the current Markdown file — headings, tables, images, links and highlighted
 code fences — as a read-only view with its own keys. The reading position *is* the cursor, so
-toggling back lands where you were reading. A file opens in whichever view you last had it in;
-the `markdown_read` setting (`Space ,`) decides for a file you have never opened.
+toggling back lands where you were reading. A file's editor and its reader are two views, each
+keeping its own scroll position; opening the file lands in whichever you used last, and the
+`markdown_read` setting (`Space ,`) decides for a file with neither open.
 
 `o`/`Alt-o` step the document outline — the same outline the breadcrumb and `Space o` show, which
 comes from the language server. Heading navigation therefore needs a Markdown language server
@@ -163,7 +164,7 @@ configured; the rest of the reading view works without one.
 
 | Key | Action |
 | --- | --- |
-| `Space v` | Toggle the reading view |
+| `Space u` | Toggle the reading view |
 | `j`/`k` | Focus next/previous element |
 | `l`/`h` | Focus next/previous link in the block |
 | `o`/`Alt-o` | Next/previous heading |
@@ -192,20 +193,20 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 
 | Chord | Action |
 | --- | --- |
-| `Space f`/`Space Alt-f` | Find files / in buffer's directory |
-| `Space b`/`Space Alt-b` | Switch buffer / new scratch buffer |
+| `Space f`/`Space Alt-f` | Find files / in this file's directory |
+| `Space v`/`Space a` | Switch view / new scratch |
 | `Space /`/`Space Alt-/` | Grep workspace / for current selection |
 | `Space e`/`Space Alt-e` | File explorer / at workspace root |
 | `Space w`/`Space Alt-w` | Switch workspace / open file by absolute path |
 | `Space j`/`Space Alt-j` | Jumplist (`Ctrl-j` in any picker captures its results into it) / clear it |
 | `Space p`/`Space Alt-p` | Copy relative/absolute path |
 | `Space s`/`Space Alt-s` | Save / save as |
-| `Space k`/`Space Alt-k` | Keep buffer (toggle transient) / reload from disk |
-| `Space x`/`Space Alt-x` | Close buffer / save and close it |
-| `Space z`/`Space Alt-z` | Open another window / copy this buffer's web URL |
+| `Space k`/`Space Alt-k` | Keep view (toggle transient) / reload from disk |
+| `Space x`/`Space Alt-x` | Close view / save and close it |
+| `Space z`/`Space Alt-z` | Open another window / copy this view's web URL |
 | `Space ,`/`Space .` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
-| `Space q`/`Space Alt-q` | Quit / save current buffer and quit |
+| `Space q`/`Space Alt-q` | Quit / save and quit |
 | `Space y`/`Space ?` | Show keyboard shortcuts / about this build |
 
 ### Git
@@ -245,7 +246,7 @@ scopes — plain takes the change under the cursor (or the selected lines), Alt 
 | `Space r` | Go to references |
 | `d`/`Alt-d` | Next/previous diagnostic |
 | `Space n` | Diagnostic at cursor |
-| `Space d`/`Space Alt-d` | Diagnostics: current buffer / workspace |
+| `Space d`/`Space Alt-d` | Diagnostics: this file / workspace |
 | `Space o`/`Space Alt-o` | Document / workspace symbols |
 | `Space l` | LSP servers (status, restart) |
 | `Ctrl-f` | Format document |
@@ -289,7 +290,7 @@ terminal client; no terminal but a display set (a desktop launcher) means the GU
 A `path` is resolved against the current working directory; if it falls outside every configured
 workspace it opens as a standalone file. A directory opens the file browser there.
 
-Opening a file that way — `ae file`, with no `-w` — *tethers* the client to that buffer: closing it
+Opening a file that way — `ae file`, with no `-w` — *tethers* the client to that file's view: closing it
 (`Space x`, or `Space Alt-x` to save first) exits the client, so `ae` works as an `$EDITOR` for git
 and anything else that waits for the process to finish.
 

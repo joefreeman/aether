@@ -22,8 +22,8 @@ use aether_client::keymap::{
 };
 use aether_client::reveal::{PendingReveal, RevealTarget, Settled};
 use aether_client::session::{
-    boot_backoff, buffer_info, reconnect_backoff, ConfirmKind, ConnState, HoverText, Mode, Pending,
-    Prompt, Session,
+    boot_backoff, reconnect_backoff, ConfirmKind, ConnState, HoverText, Mode, Pending, Prompt,
+    Session,
 };
 use aether_client::update::Event as CoreEvent;
 use aether_protocol::coords::VisualRow;
@@ -117,7 +117,7 @@ struct Reestablished {
     /// shell recovers into the workspace chooser rather than failing.
     restore: Option<(
         aether_protocol::workspace::WorkspaceInfo,
-        aether_protocol::buffer::BufferOpenResult,
+        aether_protocol::view::ViewOpenResult,
     )>,
     restarted: bool,
 }
@@ -249,7 +249,7 @@ pub struct Shell {
     /// The (profile-resolved) WebSocket address every boot dial and reconnect dials.
     server_url: String,
     /// A window landed in a reading view this shell has not laid out yet, so its placement — the
-    /// content anchor of a `Space v`, or the subscribe's scroll — waits for `read_view` to measure
+    /// content anchor of a `Space u`, or the subscribe's scroll — waits for `read_view` to measure
     /// the document: a row cannot be found in rows nobody has counted.
     read_place_pending: bool,
     /// The focus last revealed, so the view scrolls only when the focus *changes* (manual
@@ -828,7 +828,6 @@ impl Shell {
                     // The dial landed: swap the dummy transport for the real one and install the
                     // bootstrapped session over the connecting placeholder, then subscribe + fire
                     // startup effects — the same setup the old synchronous boot did inline.
-                    let jumped = self.boot.as_ref().is_some_and(|s| s.jump.is_some());
                     self.boot = None;
                     self.boot_attempt = 0;
                     self.handle = b.handle;
@@ -837,10 +836,6 @@ impl Shell {
                     self.pending_subscribe = None;
                     self.session = b.session;
                     self.state = b.state;
-                    // Boot installs the session directly (no `adopt_switch`), so the markdown
-                    // reading-view default is applied here; an `ae file:line` launch is jump-shaped
-                    // and lands in the editor.
-                    self.session.boot_read_presentation(jumped);
                     self.sent_grid = Some(self.grid());
                     self.subscribe();
                     self.run_effects(b.startup);
@@ -1598,7 +1593,7 @@ impl Shell {
             .send::<ViewportSubscribe>(ViewportSubscribeParams {
                 // The *view* is what a viewport subscribes to: the server builds its element
                 // bindings from it, and a patch's elements window files the view merely shows.
-                buffer_id: self.session.view.view_id,
+                view_id: self.session.view.view_id,
                 cols,
                 rows,
                 overscan_rows: rows,
@@ -1608,7 +1603,6 @@ impl Shell {
                 continuation_marker_width: 2,
                 tab_width: TAB_WIDTH,
                 diff_view: self.session.diff_view,
-                kind: self.session.subscribe_kind(),
             });
         self.inflight.insert(id, Continuation::Subscribed);
         self.pending_subscribe = Some(id);
@@ -2015,15 +2009,15 @@ impl Shell {
     fn spawn_reconnect(&mut self, attempt: u32) {
         let workspace = self.session.workspace.clone();
         let path = self.session.view.buffer.path.clone();
-        let buffer_id = self.session.view.buffer.buffer_id;
-        let transient = self.session.view.buffer.transient;
+        let view_id = self.session.view.view_id;
+        let transient = self.session.view.view_transient;
         let cursor = self.session.view.buffer.cursor.position;
         let version = env!("CARGO_PKG_VERSION").to_string();
         let server_url = self.server_url.clone();
         self.pending.push(Box::pin(async move {
             Done::Reconnected(Box::new(
                 dial(
-                    attempt, workspace, path, buffer_id, transient, cursor, version, server_url,
+                    attempt, workspace, path, view_id, transient, cursor, version, server_url,
                 )
                 .await,
             ))
@@ -2340,7 +2334,7 @@ impl Shell {
             self.read_cache = Some((key.0, key.1, key.2, key.3, std::sync::Arc::new(rows)));
         }
         let rows = self.read_cache.as_ref().expect("just filled").4.clone();
-        // A placement the window's adoption left for this layout: the content anchor a `Space v`
+        // A placement the window's adoption left for this layout: the content anchor a `Space u`
         // captured, else the subscribe's scroll — the same two answers the editor places by.
         if std::mem::take(&mut self.read_place_pending) {
             let scroll = self.subscribe_scroll;
@@ -2788,7 +2782,7 @@ impl Shell {
             } else {
                 PickerItem::Workspace {
                     name: label,
-                    unsaved_buffers: 0,
+                    unsaved: 0,
                     match_indices: Vec::new(),
                 }
             };
@@ -3168,13 +3162,13 @@ async fn dial(
     attempt: u32,
     workspace: String,
     path: Option<String>,
-    buffer_id: u64,
+    view_id: aether_protocol::ViewId,
     transient: bool,
     cursor: aether_protocol::LogicalPosition,
     version: String,
     server_url: String,
 ) -> Result<Reestablished, ReconnectError> {
-    use aether_protocol::buffer::{BufferOpen, BufferOpenParams};
+    use aether_protocol::view::{ViewOpen, ViewOpenParams};
     use aether_protocol::workspace::{WorkspaceActivate, WorkspaceActivateParams};
 
     tokio::time::sleep(reconnect_backoff(attempt)).await;
@@ -3217,7 +3211,7 @@ async fn dial(
     };
     let params = match &path {
         Some(p) => aether_client::session::strip_longest_root(p, &activated.workspace.paths).map(
-            |(path_index, relative_path)| BufferOpenParams {
+            |(path_index, relative_path)| ViewOpenParams {
                 path_index: Some(path_index),
                 relative_path: Some(relative_path),
                 transient: transient.then_some(true),
@@ -3225,19 +3219,19 @@ async fn dial(
                 ..Default::default()
             },
         ),
-        None => Some(BufferOpenParams {
-            buffer_id: Some(buffer_id),
+        None => Some(ViewOpenParams {
+            view_id: Some(view_id),
             ..Default::default()
         }),
     };
     let mut open = None;
     if let Some(params) = params {
-        open = handle.rpc::<BufferOpen>(params).await.ok();
+        open = handle.rpc::<ViewOpen>(params).await.ok();
     }
     let open = match open {
         Some(o) => o,
         None => handle
-            .rpc::<BufferOpen>(BufferOpenParams {
+            .rpc::<ViewOpen>(ViewOpenParams {
                 transient: Some(true),
                 ..Default::default()
             })
@@ -3265,7 +3259,7 @@ pub async fn bootstrap(
     cols: u16,
     rows: u16,
 ) -> Result<(Session, AppState, Effects)> {
-    use aether_protocol::buffer::{BufferOpen, BufferOpenParams};
+    use aether_protocol::view::{ViewOpen, ViewOpenParams};
     use aether_protocol::LogicalPosition;
     let jump_to = jump.map(|(line, col)| LogicalPosition { line, col });
     use aether_protocol::picker::PickerKind;
@@ -3307,9 +3301,8 @@ pub async fn bootstrap(
                     let open = opened
                         .opened
                         .ok_or_else(|| anyhow::anyhow!("workspace/open_path returned no buffer"))?;
-                    let buffer = buffer_info(open, &workspace_paths);
                     let workspace_name = opened.workspace.name.clone();
-                    let mut session = Session::new(opened.workspace, buffer);
+                    let mut session = Session::new(opened.workspace, open);
                     // Launched to edit this file: tether the client to it, so closing it quits
                     // rather than dropping to the chooser. A directory is a session, not an errand:
                     // it lands on a scratch with the explorer over it, and has nothing to tether to.
@@ -3368,7 +3361,7 @@ pub async fn bootstrap(
                         // launch jumps to `jump_to` here.
                         Some((path_index, relative_path)) => {
                             handle
-                                .rpc::<BufferOpen>(BufferOpenParams {
+                                .rpc::<ViewOpen>(ViewOpenParams {
                                     path_index: Some(path_index),
                                     relative_path: Some(relative_path),
                                     create_if_missing: true,
@@ -3399,9 +3392,8 @@ pub async fn bootstrap(
                 })?,
             };
 
-            let buffer = buffer_info(open, &workspace_paths);
             let workspace_name = activated.workspace.name.clone();
-            let mut session = Session::new(activated.workspace, buffer);
+            let mut session = Session::new(activated.workspace, open);
             // A quick-edit launch (`ae file`, workspace *inferred* from the path — `tether` is
             // never set alongside an explicit `--workspace`): tether the client to the opened file,
             // so closing it exits. A missing path is a file to create and tethers too; a directory
@@ -3805,8 +3797,9 @@ mod scroll_tests {
             buffer_status: Default::default(),
             focus: aether_protocol::viewport::ViewportFocusElementResult {
                 element: 0,
-                buffer: aether_protocol::buffer::BufferOpenResult {
+                buffer: aether_protocol::view::ViewOpenResult {
                     buffer_id: 7,
+                    view_id: aether_protocol::ViewId(7),
                     language: None,
                     line_count: 20,
                     byte_count: 200,

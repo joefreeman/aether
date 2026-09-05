@@ -27,14 +27,17 @@ pub struct AppSettings {
     /// font features. The server stores it but doesn't act on it.
     #[serde(default = "default_ligatures")]
     pub ligatures: bool,
-    /// Buffer text size in px — the file content itself. Another client-side render choice the
-    /// server only stores: the GUI/web clients render the buffer at this size (and reflow soft-wrap
+    /// Editor text size in px — the file content itself. Another client-side render choice the
+    /// server only stores: the GUI/web clients render the text at this size (and reflow soft-wrap
     /// to the new width); the terminal client ignores it (the terminal owns its font). The overlay
     /// steps it through a small set of preset sizes.
-    #[serde(default = "default_buffer_font_size")]
-    pub buffer_font_size: u32,
+    ///
+    /// The alias is what a `settings.toml` written before the setting was renamed still keys this
+    /// by, so an existing config keeps loading rather than silently reverting to the default.
+    #[serde(default = "default_editor_font_size", alias = "buffer_font_size")]
+    pub editor_font_size: u32,
     /// UI text size in px — everything *around* the buffer (status bar, pickers, dialogs, hover,
-    /// toasts, hints). Sized independently of [`Self::buffer_font_size`] so the chrome can stay
+    /// toasts, hints). Sized independently of [`Self::editor_font_size`] so the chrome can stay
     /// compact while the code is large, or vice versa. Same story otherwise: client-side render
     /// only, GUI/web honour it, the terminal ignores it.
     #[serde(default = "default_ui_font_size")]
@@ -101,11 +104,11 @@ fn default_ligatures() -> bool {
     true
 }
 
-pub const fn default_buffer_font_size() -> u32 {
+pub const fn default_editor_font_size() -> u32 {
     14
 }
 
-/// A notch below the buffer default: the chrome is dense (status bar, picker rows) and reads as
+/// A notch below the editor default: the chrome is dense (status bar, picker rows) and reads as
 /// secondary to the text, which is what the hand-tuned sizes it replaced already assumed.
 pub const fn default_ui_font_size() -> u32 {
     13
@@ -162,7 +165,7 @@ impl Default for AppSettings {
         AppSettings {
             wrap: default_wrap(),
             ligatures: default_ligatures(),
-            buffer_font_size: default_buffer_font_size(),
+            editor_font_size: default_editor_font_size(),
             ui_font_size: default_ui_font_size(),
             hints: default_hints(),
             markdown_read: default_markdown_read(),

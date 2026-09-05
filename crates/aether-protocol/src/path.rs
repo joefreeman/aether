@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Refuses if the target — or, for a directory, anything under it — is open in a buffer with
 /// unsaved changes (`DIRTY_BUFFERS_PREVENT_DELETE`, with `data.dirty_buffer_ids`). Clean buffers
-/// under the path are closed; `next_buffer_id` follows the `buffer/close` convention for the
+/// under the path are closed; `next_view_id` follows the `view/close` convention for the
 /// requesting client.
 pub struct PathDelete;
 impl RpcMethod for PathDelete {
@@ -35,5 +35,5 @@ pub struct PathDeleteResult {
     /// If the requesting client's current buffer was one of the closed ones, attach to this next
     /// id (or spawn a scratch when `None`). Mirrors `workspace/remove_root`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub next_buffer_id: Option<BufferId>,
+    pub next_view_id: Option<crate::ViewId>,
 }

@@ -23,10 +23,10 @@ use crate::keymap::{
 };
 use crate::picker::{PickerMsg, PickerState, Reveal};
 use crate::theme;
-use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
 use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::Granularity;
 use aether_protocol::envelope::RpcMethod;
+use aether_protocol::view::{ViewOpen, ViewOpenParams, ViewOpenResult};
 
 use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::PickerKind;
@@ -41,7 +41,7 @@ use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceOpenPath,
     WorkspaceOpenPathParams,
 };
-use aether_protocol::{BufferId, LogicalPosition};
+use aether_protocol::LogicalPosition;
 use iced::widget::{column, container, row, text};
 use iced::{keyboard, window, Element, Event, Length, Size, Subscription, Task};
 
@@ -87,10 +87,10 @@ pub struct ConnectingBootstrap {
     /// an external open goes through `workspace/open_path`, which carries no jump. `None` for a bare
     /// file open.
     pub jump_to: Option<LogicalPosition>,
-    /// Re-open an existing buffer by id instead of a file — the scratch-buffer "open in new window"
-    /// (`--buffer <id>`). Takes precedence over `file`; the id is daemon-session scoped, so a stale
+    /// Present an existing view by id instead of a file — the scratch "open in new window"
+    /// (`--view <id>`). Takes precedence over `file`; the id is daemon-session scoped, so a stale
     /// one falls back to the workspace's MRU/scratch.
-    pub buffer_id: Option<BufferId>,
+    pub view_id: Option<aether_protocol::ViewId>,
     /// Tether the client to the buffer `file` opens: the quick-edit invocation — a file positional
     /// without an explicit `--workspace` — where closing that buffer exits the window. Windows
     /// opened from inside the editor ([`Shell::open_target`]) never tether.
@@ -115,7 +115,7 @@ pub struct SessionBootstrap {
     /// than field-by-field: boot is the one path that seeds a session without a
     /// `sync_workspace_info`, so anything dropped here stays missing for the client's lifetime.
     pub workspace: aether_protocol::workspace::WorkspaceInfo,
-    pub buffer: BufferInfo,
+    pub open: ViewOpenResult,
     /// Set when the CLI path was a directory: the absolute dir to open the file explorer at,
     /// over the transient scratch in `buffer`. `None` for the file / no-path cases.
     pub explorer_dir: Option<String>,
@@ -142,7 +142,7 @@ pub struct Reestablished {
     /// The restored workspace + landing buffer, or `None` when the workspace is gone — renamed or
     /// removed by another client while we were disconnected. The socket is fine, so the shell
     /// recovers into the boot chooser rather than failing.
-    pub restore: Option<(WorkspaceInfo, BufferOpenResult)>,
+    pub restore: Option<(WorkspaceInfo, ViewOpenResult)>,
     pub server_url: String,
     pub server_started_at: u64,
 }
@@ -669,8 +669,8 @@ impl App {
             }
             Bootstrap::Session(b) => {
                 let pump = pump(b.inbound.clone());
-                let tether = b.tethered.then_some(b.buffer.buffer_id);
-                let mut session = Session::new(b.workspace, b.buffer);
+                let tether = b.tethered.then_some(b.open.buffer_id);
+                let mut session = Session::new(b.workspace, b.open);
                 session.tether = tether;
                 // Fetch persisted app settings (e.g. the soft-wrap default) as the session comes up.
                 let startup = session.startup();
@@ -964,7 +964,6 @@ impl App {
     fn update_connecting(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Booted(Ok(Bootstrap::Session(b))) => {
-                let jump_boot = self.boot_args.as_ref().is_some_and(|a| a.jump_to.is_some());
                 self.boot_args = None;
                 self.boot_attempt = 0;
                 self.server_started_at = b.server_started_at;
@@ -972,8 +971,8 @@ impl App {
                 self.inbound = b.inbound.clone();
                 self.inflight.clear();
                 self.pending_subscribe = None;
-                let tether = b.tethered.then_some(b.buffer.buffer_id);
-                self.session = Session::new(b.workspace, b.buffer);
+                let tether = b.tethered.then_some(b.open.buffer_id);
+                self.session = Session::new(b.workspace, b.open);
                 self.session.tether = tether;
                 // The connecting editor already laid out (recording cell metrics) without
                 // subscribing, so its Layout may not fire again — subscribe explicitly now that
@@ -990,11 +989,6 @@ impl App {
                 };
                 // Fetch the persisted app settings (e.g. the soft-wrap default) on this connection.
                 let startup = startup.and(self.session.startup());
-                // Boot installs the session directly (no `adopt_switch`), so the markdown
-                // reading-view default is applied here; an `ae file:line` launch is jump-shaped and
-                // lands in the editor.
-                let jumped = jump_boot;
-                self.session.boot_read_presentation(jumped);
                 // A document the desktop handed us during boot wins over the workspace's MRU
                 // buffer — it is the reason this window exists.
                 let startup = startup.and(self.drain_os_opens());
@@ -1097,7 +1091,7 @@ impl App {
                 // is on-screen (it may sit below a restored scroll after a `jump_to` open).
                 let scroll = self.subscribe_scroll;
                 let read_fx = self.session.adopt_subscribe(res);
-                // A wrap toggle or a `Space v` left a content anchor pending: restore the view to
+                // A wrap toggle or a `Space u` left a content anchor pending: restore the view to
                 // it (the same content on screen across the re-presentation), superseding the
                 // reveal the subscribe would otherwise do.
                 if let Some(px) = self.resolve_anchor_px() {
@@ -2105,7 +2099,7 @@ impl App {
                             iced::widget::scrollable::AbsoluteOffset { x: dx, y: 0.0 },
                         );
                     }
-                    let line = self.session.buffer_font_size as f32 * READ_SCALE * 1.6;
+                    let line = self.session.editor_font_size as f32 * READ_SCALE * 1.6;
                     let vh = (self.visible_rows() as f32).max(1.0)
                         * self.cell.map(|c| c.height).unwrap_or(line);
                     let mag = match unit {
@@ -2198,7 +2192,7 @@ impl App {
         self.fetch_in_flight = false;
         self.refetch_queued = false;
         self.pending_reveal.abandon();
-        // A pending content anchor (a wrap toggle, `Space v`) wins: load a window around its
+        // A pending content anchor (a wrap toggle, `Space u`) wins: load a window around its
         // reference line so it resolves precisely once the window arrives. Otherwise restore the
         // buffer's saved scroll, else open near the cursor.
         let scroll = self
@@ -2226,12 +2220,11 @@ impl App {
         if let Some(old) = self.pending_subscribe.take() {
             self.inflight.remove(&old);
         }
-        let kind = self.session.subscribe_kind();
         let id = self.rpc::<ViewportSubscribe>(
             ViewportSubscribeParams {
                 // The *view* is what a viewport subscribes to: the server builds its element
                 // bindings from it, and a patch's elements window files the view merely shows.
-                buffer_id: self.session.view.view_id,
+                view_id: self.session.view.view_id,
                 cols,
                 rows,
                 overscan_rows: rows,
@@ -2241,7 +2234,6 @@ impl App {
                 continuation_marker_width: grid::CONTINUATION_MARKER_COLS,
                 tab_width: TAB_WIDTH,
                 diff_view: self.session.diff_view,
-                kind,
             },
             Message::Subscribed,
         );
@@ -2281,8 +2273,8 @@ impl App {
         let server_url = self.server_url.clone();
         let workspace = s.workspace.clone();
         let path = s.view.buffer.path.clone();
-        let buffer_id = s.view.buffer.buffer_id;
-        let transient = s.view.buffer.transient;
+        let view_id = s.view.view_id;
+        let transient = s.view.view_transient;
         let cursor = s.view.buffer.cursor.position;
         self.task(
             async move {
@@ -2333,7 +2325,7 @@ impl App {
                 };
                 let params = match &path {
                     Some(p) => strip_longest_root(p, &activated.workspace.paths).map(
-                        |(path_index, relative_path)| BufferOpenParams {
+                        |(path_index, relative_path)| ViewOpenParams {
                             path_index: Some(path_index),
                             relative_path: Some(relative_path),
                             // The old session's transient stayed a preview; reopen it as one
@@ -2343,23 +2335,23 @@ impl App {
                             ..Default::default()
                         },
                     ),
-                    // A scratch has no path; reopening by id recovers its content when the
-                    // daemon stayed up across the drop.
-                    None => Some(BufferOpenParams {
-                        buffer_id: Some(buffer_id),
+                    // A scratch has no path; presenting its view again recovers its content when
+                    // the daemon stayed up across the drop.
+                    None => Some(ViewOpenParams {
+                        view_id: Some(view_id),
                         ..Default::default()
                     }),
                 };
                 let mut open = None;
                 if let Some(params) = params {
-                    open = handle.rpc::<BufferOpen>(params).await.ok();
+                    open = handle.rpc::<ViewOpen>(params).await.ok();
                 }
                 let open = match open {
                     Some(o) => o,
                     // The buffer is gone (daemon restarted; a dead scratch, or the file moved)
                     // — fall back to a fresh transient scratch placeholder.
                     None => handle
-                        .rpc::<BufferOpen>(BufferOpenParams {
+                        .rpc::<ViewOpen>(ViewOpenParams {
                             transient: Some(true),
                             ..Default::default()
                         })
@@ -2799,7 +2791,7 @@ impl App {
     // ---- view ----------------------------------------------------------------------------------
 
     /// The chrome's sizing scale, from the `ui_font_size` app setting. Every chrome size in the
-    /// view goes through this (the buffer has its own `buffer_font_size`, read by the editor
+    /// view goes through this (the buffer has its own `editor_font_size`, read by the editor
     /// widget) — see [`theme::Ui`].
     fn ui(&self) -> theme::Ui {
         theme::Ui::new(self.session.ui_font_size)
@@ -2856,7 +2848,7 @@ impl App {
                         tab_width: TAB_WIDTH,
                         measured: &self.measured,
                         ligatures: self.session.ligatures,
-                        font_size: self.session.buffer_font_size as f32,
+                        font_size: self.session.editor_font_size as f32,
                     },
                     Message::Editor,
                 );
@@ -4457,7 +4449,7 @@ impl App {
         // Upright even on a slanted transient label, like the terminal client.
         if self.session.tethered() {
             // `fg_muted`: the dim-but-legible rung (dark stays the historic NORD3_BRIGHTER) —
-            // see the buffer picker's tether star.
+            // see the view picker's tether star.
             left = left.push(t(" *".into(), p.fg_muted));
             used += 2;
         }
@@ -5309,7 +5301,7 @@ impl App {
         let Some(read) = self.session.view.read.as_ref() else {
             return iced::widget::Space::new().into();
         };
-        let body = self.session.buffer_font_size as f32 * READ_SCALE;
+        let body = self.session.editor_font_size as f32 * READ_SCALE;
         let measure = read_measure_px(&self.session, body);
         // Two projections of the one server cursor: the block bar always marks the reading
         // position; the target pill inverts the interactive span the cursor sits inside, on top of
@@ -6838,7 +6830,6 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                 })
                 .await
                 .map_err(|e| e.to_string())?;
-            let workspace_paths = opened.workspace.paths.clone();
             let open = opened
                 .opened
                 .ok_or_else(|| "workspace/open_path returned no buffer".to_string())?;
@@ -6848,7 +6839,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                 client_version: args.client_version,
                 server_url: args.server_url,
                 server_started_at: opened.server_started_at,
-                buffer: buffer_info(open, &workspace_paths),
+                open,
                 workspace: opened.workspace,
                 explorer_dir: directory.then(|| abs.display().to_string()),
                 // A directory is a session, not an errand — nothing to tether to.
@@ -6888,22 +6879,22 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
         None => None,
     };
 
-    let open = if let Some(bid) = args.buffer_id {
-        // The scratch-buffer "open in new window": re-attach to the buffer by id (buffers are
-        // daemon-global, so a fresh client can reach it). The id is daemon-session scoped, so a stale
-        // one — the daemon restarted since the picker row was built — falls back to the MRU/scratch.
+    let open = if let Some(view_id) = args.view_id {
+        // The scratch "open in new window": present the view by id (views are daemon-global, so a
+        // fresh client can reach it). The id is daemon-session scoped, so a stale one — the daemon
+        // restarted since the picker row was built — falls back to the MRU/scratch.
         match handle
-            .rpc::<BufferOpen>(BufferOpenParams {
-                buffer_id: Some(bid),
+            .rpc::<ViewOpen>(ViewOpenParams {
+                view_id: Some(view_id),
                 ..Default::default()
             })
             .await
         {
             Ok(open) => open,
             Err(_) => handle
-                .rpc::<BufferOpen>(BufferOpenParams {
-                    buffer_id: activated.last_buffer_id,
-                    transient: activated.last_buffer_id.is_none().then_some(true),
+                .rpc::<ViewOpen>(ViewOpenParams {
+                    view_id: activated.last_view_id,
+                    transient: activated.last_view_id.is_none().then_some(true),
                     ..Default::default()
                 })
                 .await
@@ -6918,7 +6909,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                     // missing file, like the terminal client). A `path:line:col` launch (or a
                     // grep-hit "open in new window") jumps to `jump_to` here.
                     Some((path_index, relative_path)) => handle
-                        .rpc::<BufferOpen>(BufferOpenParams {
+                        .rpc::<ViewOpen>(ViewOpenParams {
                             path_index: Some(path_index),
                             relative_path: Some(relative_path),
                             create_if_missing: true,
@@ -6947,9 +6938,9 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
             // the most recent buffer; only a workspace with nothing to return to gets the transient
             // scratch placeholder.
             _ => handle
-                .rpc::<BufferOpen>(BufferOpenParams {
-                    buffer_id: activated.last_buffer_id,
-                    transient: activated.last_buffer_id.is_none().then_some(true),
+                .rpc::<ViewOpen>(ViewOpenParams {
+                    view_id: activated.last_view_id,
+                    transient: activated.last_view_id.is_none().then_some(true),
                     ..Default::default()
                 })
                 .await
@@ -6968,15 +6959,15 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
         client_version: args.client_version,
         server_url: args.server_url,
         server_started_at,
-        buffer: buffer_info(open, &workspace_paths),
+        open,
         workspace: activated.workspace,
         explorer_dir,
         // Quick-edit launch (`ae file`, workspace inferred — `tether` is never set alongside an
         // explicit `--workspace`, and window-spawns always pass one): tether to the opened file.
         // A missing path is a file to create and tethers too; directory args (explorer over a
-        // scratch) and `--buffer` re-attaches have no file.
+        // scratch) and `--view` re-attaches have no file.
         tethered: args.tether
-            && args.buffer_id.is_none()
+            && args.view_id.is_none()
             && resolved.as_ref().is_some_and(|p| !p.is_dir()),
     })))
 }
@@ -7103,13 +7094,13 @@ impl Shell {
     /// Never tethered: the tether is the CLI's `$EDITOR` contract, and a window opened from inside
     /// the editor is not an errand someone is waiting on.
     fn open_target(&mut self, target: WindowTarget) -> Task<ShellMessage> {
-        let (file, jump_to, buffer_id) = match target.open {
+        let (file, jump_to, view_id) = match target.open {
             WindowOpen::Path { path, at } => (
                 Some(path),
                 at.map(|(line, col)| aether_protocol::LogicalPosition { line, col }),
                 None,
             ),
-            WindowOpen::Buffer(id) => (None, None, Some(id)),
+            WindowOpen::View(id) => (None, None, Some(id)),
             WindowOpen::Workspace => (None, None, None),
         };
         self.open(Bootstrap::Connecting(ConnectingBootstrap {
@@ -7117,7 +7108,7 @@ impl Shell {
             worktrees: target.worktrees,
             file,
             jump_to,
-            buffer_id,
+            view_id,
             tether: false,
             client_version: self.client_version.clone(),
             server_url: self.server_url.clone(),
@@ -7933,7 +7924,7 @@ mod tests {
                 (0..30)
                     .map(|i| PickerItem::Workspace {
                         name: format!("p{i}"),
-                        unsaved_buffers: 0,
+                        unsaved: 0,
                         match_indices: vec![],
                     })
                     .collect(),
@@ -8024,7 +8015,7 @@ mod tests {
             workspace: None,
             file: None,
             jump_to: None,
-            buffer_id: None,
+            view_id: None,
             tether: false,
             client_version: "test".into(),
             server_url: "ws://127.0.0.1:2385".into(),
@@ -8137,7 +8128,7 @@ mod tests {
                 workspace: None,
                 file: None,
                 jump_to: None,
-                buffer_id: None,
+                view_id: None,
                 tether: false,
                 client_version: "test".into(),
                 server_url: "ws://127.0.0.1:0".into(),

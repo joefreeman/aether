@@ -892,9 +892,9 @@ async fn search_clear_removes_active_search() {
     drop(server);
 }
 
-// -------- buffer/open jump_to --------------------------------------------------------------------
+// -------- view/open jump_to --------------------------------------------------------------------
 
-/// `buffer/open { jump_to }` lands the returned cursor at the requested position and persists it
+/// `view/open { jump_to }` lands the returned cursor at the requested position and persists it
 /// so a follow-up open without `jump_to` resumes from the same spot.
 #[tokio::test]
 async fn buffer_open_jump_to_places_and_persists_cursor() {
@@ -914,11 +914,10 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
     )
     .await;
 
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -932,11 +931,11 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
     assert_eq!(opened.cursor.anchor, LogicalPosition { line: 1, col: 2 });
 
     // Reopen without jump_to — should resume the just-set position, not snap to origin.
-    let reopen: BufferOpenResult = send_request::<BufferOpen>(
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: Some(opened.buffer_id),
+            view_id: Some(opened.view_id),
             path_index: None,
             relative_path: None,
             language: None,
@@ -951,7 +950,7 @@ async fn buffer_open_jump_to_places_and_persists_cursor() {
     drop(server);
 }
 
-/// `buffer/open { jump_to }` clamps line past EOF and col past line end — used by the grep
+/// `view/open { jump_to }` clamps line past EOF and col past line end — used by the grep
 /// picker when a persisted hit's coordinates have drifted out from under the file.
 #[tokio::test]
 async fn buffer_open_jump_to_clamps_out_of_range() {
@@ -972,11 +971,10 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
     .await;
 
     // Line 99 doesn't exist; col 99 is past any line. Server should clamp to (last_line, line_end).
-    let opened: BufferOpenResult = send_request::<BufferOpen>(
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             language: None,
@@ -1002,11 +1000,10 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
 /// composite A); pass `None` when the open is just following a back/forward step (which must not
 /// record).
 async fn nav_open_file(ws: &mut Ws, file: &str, record_from: Option<u64>) -> (u64, u64) {
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some(file.into()),
             language: None,
@@ -1020,7 +1017,7 @@ async fn nav_open_file(ws: &mut Ws, file: &str, record_from: Option<u64>) -> (u6
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -1034,7 +1031,6 @@ async fn nav_open_file(ws: &mut Ws, file: &str, record_from: Option<u64>) -> (u6
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -1175,10 +1171,10 @@ async fn nav_goto_reopens_by_path() {
     .await;
     let (buf_a, _) = nav_open_file(&mut ws, "a.txt", None).await;
     // Close it so the stale buffer_id forces the path fallback.
-    send_request::<BufferClose>(
+    send_request::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(buf_a),
+        &ViewCloseParams {
+            view_id: view_of(buf_a),
             open_next: false,
         },
     )
@@ -1188,7 +1184,7 @@ async fn nav_goto_reopens_by_path() {
         &mut ws,
         &NavGotoParams {
             virtual_key: None,
-            buffer_id: Some(buf_a), // stale on purpose
+            view_id: Some(view_of(buf_a)), // stale on purpose
             path_index: Some(0),
             relative_path: Some("a.txt".into()),
             cursor: CursorState {

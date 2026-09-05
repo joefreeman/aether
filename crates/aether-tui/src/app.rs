@@ -175,7 +175,7 @@ pub struct AppState {
     /// protocol is unaware.
     pub root_labels: Vec<String>,
     /// The session's [tether](aether_client::session::Session::tether), mirrored each sync so the
-    /// Buffers picker can mark the tethered row with the same dim ` *` as the status bar.
+    /// view picker can mark the tethered row with the same dim ` *` as the status bar.
     pub tether: Option<BufferId>,
     /// The long-running git operation in flight, mirrored from the session each sync. Session-level
     /// rather than per-editor: it belongs to a repo, not to the buffer that happens to be open.
@@ -508,7 +508,7 @@ pub enum ConfirmAction {
     OverwriteSaveAs,
     /// Close `buffer_id` despite it being dirty. After closing, the client picks the next
     /// MRU buffer or spawns a scratch.
-    CloseBuffer { buffer_id: BufferId },
+    CloseView { buffer_id: BufferId },
     /// Retry `Ctrl-s` (in-place save) with `overwrite: true` after the server reported the
     /// file changed or was removed on disk. Routes through `save_buffer_force`.
     OverwriteExternalChange,
@@ -610,15 +610,15 @@ pub struct EditorState {
     /// Canonical absolute path of this buffer's file on disk, if any.
     pub file_path: Option<String>,
     pub file_label: String,
-    /// The buffer's language id (e.g. `"rust"`), from `buffer/open`. `None` for unknown/plain-text
+    /// The buffer's language id (e.g. `"rust"`), from `view/open`. `None` for unknown/plain-text
     /// buffers. Used for language-scoped UI (e.g. the "no formatter for {lang}" note).
     pub language: Option<String>,
-    /// The language server backing this buffer, from `buffer/open` — its `(language,
+    /// The language server backing this buffer, from `view/open` — its `(language,
     /// workspace_root)` key. `None` when no server is attached. Selects *which* server's health the
     /// status bar shows (language alone is ambiguous when a workspace runs several same-language
     /// servers at different roots).
     pub lsp_server: Option<LspServerRef>,
-    /// The buffer auto-closes once hidden (server-side flag, from `buffer/open` and `buffer/state`
+    /// The buffer auto-closes once hidden (server-side flag, from `view/open` and `buffer/state`
     /// pushes). Shown by italicising the status-bar file label; promoted to permanent by the
     /// first edit, a save, or a reload (`Space r`).
     pub transient: bool,

@@ -169,7 +169,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         dim_backdrop(f.buffer_mut(), chunks[0]);
     }
     // The unified picker overlay sits on top of either screen — same renderer for Files /
-    // Buffers / Grep / Explorer / Workspaces.
+    // Views / Grep / Explorer / Workspaces.
     if state.picker.open {
         draw_picker_overlay(f, state, chunks[0]);
     }
@@ -2907,13 +2907,14 @@ fn picker_item_spans(
     // Buffer rows get a leading dim `{label}: ` prefix for multi-root workspaces, matching the
     // status bar / title and the other clients. `display` (the match haystack) is the bare
     // relative path, so the highlight lands only on the path, not the prefix.
-    if let PickerItem::Buffer {
+    if let PickerItem::View {
         buffer_id,
         display,
         status,
         path_index,
         match_indices,
         transient,
+        view_kind,
         ..
     } = item
     {
@@ -2924,6 +2925,7 @@ fn picker_item_spans(
             *status,
             *transient,
             tether == Some(*buffer_id),
+            *view_kind,
             root_labels,
             highlighted,
             max_width,
@@ -3158,7 +3160,7 @@ fn picker_item_spans(
     let (display_raw, match_indices, dot_color, italic, dim) = match item {
         PickerItem::Workspace {
             name,
-            unsaved_buffers,
+            unsaved,
             match_indices,
         } => {
             // An ephemeral context shows as an italic "(workspace N)"; its internal id isn't a
@@ -3173,12 +3175,12 @@ fn picker_item_spans(
                 },
                 // Frost-blue dot when the workspace has unsaved buffers, matching the unsaved
                 // buffer-dot colour; nothing when clean.
-                (*unsaved_buffers > 0).then_some(c(th().state_unsaved)),
+                (*unsaved > 0).then_some(c(th().state_unsaved)),
                 ephemeral,
                 false,
             )
         }
-        PickerItem::Buffer { .. }
+        PickerItem::View { .. }
         | PickerItem::File { .. }
         | PickerItem::GrepHit { .. }
         | PickerItem::JumplistEntry { .. }
@@ -3421,7 +3423,7 @@ fn file_item_spans(
     spans
 }
 
-/// One Buffers-picker row: the buffer's path highlighted by `match_indices`, then (multi-root only)
+/// One view-picker row: the buffer's path highlighted by `match_indices`, then (multi-root only)
 /// the disambiguated root label dim after the name — same placement as the Files picker — and a
 /// flush-right dirty dot. `display` is the bare relative path (the match haystack), so the
 /// highlight lands only on the path, never the label. Transient buffers slant; the session's tether
@@ -3434,6 +3436,7 @@ fn buffer_item_spans(
     status: BufferDirtyState,
     transient: bool,
     tethered: bool,
+    view_kind: Option<aether_protocol::ui::ViewKind>,
     root_labels: &[String],
     highlighted: bool,
     max_width: usize,
@@ -3466,9 +3469,15 @@ fn buffer_item_spans(
     // The tether mark: a dim ` *` after the path, before the root label — matching the status bar.
     // Upright even on a slanted transient row.
     let tether_mark = if tethered { " *" } else { "" };
+    // The kind badge: a file's reader row says so, dim, after the path; its editor row is the
+    // plain one, as every other file's is.
+    let badge = match view_kind {
+        Some(aether_protocol::ui::ViewKind::Reader) => "  reader",
+        _ => "",
+    };
 
-    // Reserve the dot region (` • ` = 3 cols) plus the tether mark and the suffix from the
-    // path's truncation budget.
+    // Reserve the dot region (` • ` = 3 cols) plus the tether mark, the badge and the suffix from
+    // the path's truncation budget.
     let dot_w = if buffer_dirty_dot_color(status).is_some() {
         3
     } else {
@@ -3477,6 +3486,7 @@ fn buffer_item_spans(
     let path_budget = max_width
         .saturating_sub(dot_w)
         .saturating_sub(tether_mark.width())
+        .saturating_sub(badge.width())
         .saturating_sub(suffix.width());
     let (path, indices) = truncate_path_with_indices(display, match_indices, path_budget);
 
@@ -3484,6 +3494,9 @@ fn buffer_item_spans(
     push_styled_with_match_indices(&mut spans, &path, &indices, base, match_style);
     if !tether_mark.is_empty() {
         spans.push(Span::styled(tether_mark.to_string(), label_style));
+    }
+    if !badge.is_empty() {
+        spans.push(Span::styled(badge.to_string(), label_style));
     }
     if !suffix.is_empty() {
         spans.push(Span::styled(suffix, label_style));
@@ -8152,8 +8165,8 @@ mod tests {
                     uptime_secs: 90,
                     idle_timeout_secs: None,
                     clients: 1,
-                    buffers_open: 2,
-                    buffers_unsaved: 0,
+                    views_open: 2,
+                    documents_unsaved: 0,
                     workspaces_active: 1,
                     git_version: Some("git version 2.43.0".into()),
                     paths: Default::default(),
@@ -9044,7 +9057,7 @@ mod tests {
         use aether_protocol::picker::SymbolKind;
         let spans = symbol_item_spans(
             SymbolRow {
-                name: "BufferOpenParams",
+                name: "ViewOpenParams",
                 kind: SymbolKind::Struct,
                 detail: "",
                 depth: 0,
@@ -9055,10 +9068,7 @@ mod tests {
             40,
         );
         let text = spans_text(&spans);
-        assert!(
-            text.starts_with("BufferOpenParams"),
-            "name renders: {text:?}"
-        );
+        assert!(text.starts_with("ViewOpenParams"), "name renders: {text:?}");
         assert!(text.trim_end().ends_with("struct"));
     }
 
@@ -9265,7 +9275,7 @@ mod tests {
         assert_eq!(text, spans_text(&grep));
     }
 
-    /// A whole-target entry — a file or buffer captured from the Files/Buffers picker — has no line
+    /// A whole-target entry — a file or buffer captured from the Files/view picker — has no line
     /// to show, so the row renders the path alone with no trailing number and no reserved gap for
     /// one.
     #[test]
@@ -9286,12 +9296,14 @@ mod tests {
         assert_eq!(text.width(), 40, "still padded to the full row width");
     }
 
-    /// The Buffers picker marks the session's tether with the status bar's dim ` *` after the path
+    /// The view picker marks the session's tether with the status bar's dim ` *` after the path
     /// (closing that row exits the client); other rows are unmarked.
     #[test]
     fn buffers_picker_marks_the_tethered_row() {
-        let item = |id: u64| PickerItem::Buffer {
+        let item = |id: u64| PickerItem::View {
             buffer_id: id,
+            view_id: aether_protocol::ViewId(id),
+            view_kind: None,
             display: "notes.md".into(),
             status: aether_protocol::picker::BufferDirtyState::Clean,
             path_index: None,

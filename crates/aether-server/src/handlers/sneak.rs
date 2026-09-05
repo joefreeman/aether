@@ -523,30 +523,27 @@ pub fn collect_cursor_search_update(
 pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) -> PendingPushes {
     let mut pushes = Vec::new();
     // Fan out per attached buffer: the document state (saved revision, external flags, path) is
-    // shared, but each sibling's viewers hear it under their own buffer id — and with that
-    // buffer's own transient flag.
+    // shared, but each sibling's viewers hear it under their own buffer id.
     for id in s.doc_siblings(buffer_id) {
         let Some(buf) = s.try_doc_of(id) else {
             continue;
         };
-        let transient = s.buffers.get(&id).map(|b| b.transient).unwrap_or(false);
-        let params = BufferStateParams {
-            buffer_id: id,
-            saved_revision: buf.saved_revision(),
-            saved_at_unix_ms: buf.last_modified_unix_ms,
-            externally_modified: buf.externally_modified,
-            externally_deleted: buf.externally_deleted,
-            transient,
-            // Lets a save-as rename follow to every other client viewing this shared buffer.
-            path: buf.canonical_path.as_ref().map(|p| p.display().to_string()),
-        };
-        let json = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
         let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
         for vp in s.viewports.values() {
             if vp.shows(s.view_of(vp), id) {
                 clients.insert(vp.client_id);
             }
         }
+        let params = BufferStateParams {
+            buffer_id: id,
+            saved_revision: buf.saved_revision(),
+            saved_at_unix_ms: buf.last_modified_unix_ms,
+            externally_modified: buf.externally_modified,
+            externally_deleted: buf.externally_deleted,
+            // Lets a save-as rename follow to every other client viewing this shared buffer.
+            path: buf.canonical_path.as_ref().map(|p| p.display().to_string()),
+        };
+        let params = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
         pushes.extend(clients.into_iter().filter_map(|cid| {
             let session = s.clients.get(&cid)?;
             Some((
@@ -554,7 +551,7 @@ pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) 
                 Notification {
                     jsonrpc: JsonRpc,
                     method: BufferState::NAME.into(),
-                    params: json.clone(),
+                    params: params.clone(),
                 },
             ))
         }));
@@ -562,33 +559,73 @@ pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) 
     pushes
 }
 
-/// Promote a transient buffer to permanent. Called from every buffer-mutation handler (the
-/// first edit is what makes a previewed buffer worth keeping) and from `buffer/save`. Returns
-/// the `buffer/state` pushes telling viewers the flag flipped; empty when the buffer wasn't
-/// transient (the common case) or doesn't exist.
-pub fn promote_transient(s: &mut ServerState, buffer_id: BufferId) -> PendingPushes {
-    match s.buffers.get_mut(&buffer_id) {
-        Some(buf) if buf.transient => {
-            buf.transient = false;
-            collect_buffer_state_pushes(s, buffer_id)
-        }
-        _ => Vec::new(),
+/// Build the `view/state` pushes for every client presenting one of these views.
+///
+/// Transience is the view's, so the audience is the viewports on the view itself rather than
+/// everyone showing its buffer: a file's reader is kept or dropped without touching its editor,
+/// and a client watching the sibling has no business hearing the flag move.
+pub(crate) fn collect_view_state_pushes(s: &ServerState, view_ids: &[ViewId]) -> PendingPushes {
+    let mut pushes = Vec::new();
+    for &view_id in view_ids {
+        let Some(view) = s.views.get(&view_id) else {
+            continue;
+        };
+        let params = serde_json::to_value(ViewStateParams {
+            view_id,
+            transient: view.transient,
+        })
+        .unwrap_or(serde_json::Value::Null);
+        let clients: std::collections::HashSet<ClientId> = s
+            .viewports
+            .values()
+            .filter(|vp| vp.view_id == view_id)
+            .map(|vp| vp.client_id)
+            .collect();
+        pushes.extend(clients.into_iter().filter_map(|cid| {
+            let session = s.clients.get(&cid)?;
+            Some((
+                session.outbound.clone(),
+                Notification {
+                    jsonrpc: JsonRpc,
+                    method: ViewState::NAME.into(),
+                    params: params.clone(),
+                },
+            ))
+        }));
     }
+    pushes
 }
 
-/// Apply a `buffer/open { transient }` intent to an *existing* buffer: `Some(false)` pins
-/// (promotes) it; `Some(true)` / `None` leave it alone — an open never demotes a permanent
-/// buffer to transient. Returns the promotion's `buffer/state` pushes (usually empty).
-pub fn pin_buffer_if_requested(
+/// Promote the transient views an edit of `buffer_id` is a keep-signal for — see
+/// [`ServerState::promote_views_of`]. Called from every buffer-mutation handler (the first edit
+/// is what makes a previewed view worth keeping) and from `buffer/save`. Returns the `view/state`
+/// pushes telling viewers the flag flipped; empty when nothing was transient (the common case) or
+/// the buffer doesn't exist.
+pub fn promote_transient(s: &mut ServerState, buffer_id: BufferId) -> PendingPushes {
+    let promoted = s.promote_views_of(buffer_id);
+    collect_view_state_pushes(s, &promoted)
+}
+
+/// Apply a `view/open { transient }` intent to the view an open of an *existing* buffer
+/// presents: `Some(false)` pins (promotes) it; `Some(true)` / `None` leave it alone — an open never
+/// demotes a permanent view to transient. Returns the promotion's `view/state` pushes (usually
+/// empty).
+pub fn pin_view_if_requested(
     s: &mut ServerState,
-    buffer_id: BufferId,
+    view_id: ViewId,
     transient: Option<bool>,
 ) -> PendingPushes {
-    if transient == Some(false) {
-        promote_transient(s, buffer_id)
-    } else {
-        Vec::new()
+    if transient != Some(false) {
+        return Vec::new();
     }
+    let Some(view) = s.views.get_mut(&view_id) else {
+        return Vec::new();
+    };
+    if !view.transient {
+        return Vec::new();
+    }
+    view.transient = false;
+    collect_view_state_pushes(s, &[view_id])
 }
 
 /// Recompute every active search on this buffer after a mutation. Returns the pushes (search
@@ -664,27 +701,28 @@ pub fn byte_to_logical(buf: &Document, byte_idx: usize) -> aether_protocol::Logi
 
 /// The buffer a client should land on after its current one is closed: the top of its active
 /// workspace's MRU, else any remaining buffer in that workspace, else the most-recently-used *dormant*
-/// buffer (a session-restored file `buffer/open` materializes by id), else `None` (caller opens a
+/// buffer (a session-restored file `view/open` materializes by id), else `None` (caller opens a
 /// scratch). The dormant fallback means closing your last live buffer after a session restore drops
-/// you back onto a restored file rather than a blank scratch. Shared by `buffer/close` and the
+/// you back onto a restored file rather than a blank scratch. Shared by `view/close` and the
 /// deletion paths so the requesting client and any other clients that were viewing the buffer
 /// resolve their next buffer identically.
-pub fn next_buffer_for_client(s: &ServerState, client_id: ClientId) -> Option<BufferId> {
+pub fn next_view_for_client(s: &ServerState, client_id: ClientId) -> Option<ViewId> {
     let workspace_name = s.active_workspace(client_id).map(|p| p.id.clone());
-    s.active_workspace(client_id)
-        .and_then(|p| p.mru_buffers.front().copied())
+    workspace_name
+        .as_deref()
+        .and_then(|name| s.mru_view(name))
         .or_else(|| {
             workspace_name.as_deref().and_then(|name| {
                 s.buffer_workspaces
                     .iter()
-                    .find(|(_, pname)| pname.as_str() == name)
-                    .map(|(id, _)| *id)
+                    .filter(|(_, pname)| pname.as_str() == name)
+                    .find_map(|(id, _)| s.view_presenting(*id))
             })
         })
         .or_else(|| {
             workspace_name
                 .as_deref()
-                .and_then(|name| s.first_dormant_id(name))
+                .and_then(|name| s.first_dormant_view(name))
         })
 }
 
@@ -704,7 +742,7 @@ pub fn clients_affected_by_close(
     s: &ServerState,
     buffer_ids: &[BufferId],
     except: ClientId,
-) -> Vec<(ClientId, BufferId)> {
+) -> Vec<AffectedByClose> {
     let mut seen: std::collections::HashSet<(ClientId, BufferId)> =
         std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -714,7 +752,11 @@ pub fn clients_affected_by_close(
         }
         for &id in buffer_ids {
             if vp.shows(s.view_of(vp), id) && seen.insert((vp.client_id, id)) {
-                out.push((vp.client_id, id));
+                out.push(AffectedByClose {
+                    client_id: vp.client_id,
+                    view_id: vp.view_id,
+                    buffer_id: id,
+                });
             }
         }
     }
@@ -730,13 +772,76 @@ pub fn clients_affected_by_close(
         else {
             continue;
         };
-        for id in ws.mru_buffers.iter().filter(|id| targets.contains(id)) {
-            if seen.insert((client_id, *id)) {
-                out.push((client_id, *id));
+        for (view_id, id) in ws
+            .mru_views
+            .iter()
+            .filter_map(|v| Some((*v, s.try_presenting_buffer(*v)?)))
+            .filter(|(_, id)| targets.contains(id))
+        {
+            if seen.insert((client_id, id)) {
+                out.push(AffectedByClose {
+                    client_id,
+                    view_id,
+                    buffer_id: id,
+                });
             }
         }
     }
     out
+}
+
+/// One client a buffer close reaches, and the view it reached it through — the one its viewport
+/// presented, or the workspace MRU entry a tether rides — so the `view/closed` push can name what
+/// the client held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffectedByClose {
+    pub client_id: ClientId,
+    pub view_id: ViewId,
+    pub buffer_id: BufferId,
+}
+
+/// The clients, other than `except`, with a viewport presenting `view_id` — who has to be told
+/// when that one view closes while its buffer stays (a file's reader closed beside its editor).
+/// Capture BEFORE the close, which drops those viewports.
+pub fn clients_presenting_view(
+    s: &ServerState,
+    view_id: ViewId,
+    except: ClientId,
+) -> Vec<ClientId> {
+    let mut out: Vec<ClientId> = s
+        .viewports
+        .values()
+        .filter(|vp| vp.client_id != except && vp.view_id == view_id)
+        .map(|vp| vp.client_id)
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The `view/closed` pushes for a view that closed while its buffer stayed: each client lands on
+/// its own next view. Call AFTER the close so the successor reflects the settled MRU.
+pub fn view_closed_pushes(s: &ServerState, view_id: ViewId, clients: &[ClientId]) -> PendingPushes {
+    clients
+        .iter()
+        .filter_map(|&client_id| {
+            let session = s.clients.get(&client_id)?;
+            let params = ViewClosedParams {
+                view_id,
+                buffer_id: None,
+                next_view_id: next_view_for_client(s, client_id),
+                next_path: None,
+            };
+            Some((
+                session.outbound.clone(),
+                Notification {
+                    jsonrpc: JsonRpc,
+                    method: ViewClosed::NAME.into(),
+                    params: serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
+                },
+            ))
+        })
+        .collect()
 }
 
 /// `workspace/changed` for every *other* client standing in `workspace_id`, carrying the shape it
@@ -797,10 +902,10 @@ pub fn workspace_changed_pushes(
         .collect()
 }
 
-/// Build the `buffer/closed` pushes for the clients captured by [`clients_affected_by_close`],
+/// Build the `view/closed` pushes for the clients captured by [`clients_affected_by_close`],
 /// telling each which buffer to switch to. Call AFTER teardown so each next-buffer reflects the
 /// settled MRU. Clients that have since disconnected are skipped.
-pub fn buffer_closed_pushes(s: &ServerState, affected: &[(ClientId, BufferId)]) -> PendingPushes {
+pub fn buffer_closed_pushes(s: &ServerState, affected: &[AffectedByClose]) -> PendingPushes {
     buffer_closed_pushes_with(s, affected, &Default::default())
 }
 
@@ -829,37 +934,44 @@ fn workspace_location_of(
 /// rather than an id, because the id it could offer — a reserved dormant entry — is not stable:
 /// the initiating client activates straight after the rebind, and a landing buffer on that same
 /// file materialises the entry under a different id, leaving whoever opens second asking for one
-/// that no longer exists. `buffer/open` on a path already open returns the existing buffer, so both
+/// that no longer exists. `view/open` on a path already open returns the existing buffer, so both
 /// clients converge whichever order they arrive in.
 pub fn buffer_closed_pushes_with(
     s: &ServerState,
-    affected: &[(ClientId, BufferId)],
+    affected: &[AffectedByClose],
     successor: &std::collections::HashMap<BufferId, std::path::PathBuf>,
 ) -> PendingPushes {
     affected
         .iter()
-        .filter_map(|&(client_id, buffer_id)| {
-            let session = s.clients.get(&client_id)?;
-            let next_path = successor
-                .get(&buffer_id)
-                .and_then(|path| workspace_location_of(s, client_id, path));
-            let params = BufferClosedParams {
-                buffer_id,
-                // Only as the fallback: a path wins when there is one.
-                next_buffer_id: next_path
-                    .is_none()
-                    .then(|| next_buffer_for_client(s, client_id))
-                    .flatten(),
-                next_path,
-            };
-            Some((
-                session.outbound.clone(),
-                Notification {
-                    jsonrpc: JsonRpc,
-                    method: BufferClosed::NAME.into(),
-                    params: serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
-                },
-            ))
-        })
+        .filter_map(
+            |&AffectedByClose {
+                 client_id,
+                 view_id,
+                 buffer_id,
+             }| {
+                let session = s.clients.get(&client_id)?;
+                let next_path = successor
+                    .get(&buffer_id)
+                    .and_then(|path| workspace_location_of(s, client_id, path));
+                let params = ViewClosedParams {
+                    view_id,
+                    buffer_id: Some(buffer_id),
+                    // Only as the fallback: a path wins when there is one.
+                    next_view_id: next_path
+                        .is_none()
+                        .then(|| next_view_for_client(s, client_id))
+                        .flatten(),
+                    next_path,
+                };
+                Some((
+                    session.outbound.clone(),
+                    Notification {
+                        jsonrpc: JsonRpc,
+                        method: ViewClosed::NAME.into(),
+                        params: serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
+                    },
+                ))
+            },
+        )
         .collect()
 }

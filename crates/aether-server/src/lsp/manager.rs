@@ -121,7 +121,7 @@ pub struct LspHandle {
     /// release the other's hold.
     pub pinned_by: HashSet<String>,
     /// Every buffer attached to this server — registered by [`LspManager::register_doc`] on
-    /// `buffer/open` and dropped by [`LspManager::notify_close`]. Buffers that arrive before the
+    /// `view/open` and dropped by [`LspManager::notify_close`]. Buffers that arrive before the
     /// handshake are opened in bulk once it lands; the set is not pruned after that, so it stays the
     /// full attachment list rather than only the waiting ones.
     ///
@@ -187,7 +187,7 @@ impl LspManager {
     /// Mark `key`'s server as project-pinned, so losing its last buffer won't reap it.
     ///
     /// Separate from [`Self::ensure`] because the two orders both happen: a project usually creates
-    /// the handle and pins it in one go, but a server lazily launched by an earlier `buffer/open`
+    /// the handle and pins it in one go, but a server lazily launched by an earlier `view/open`
     /// is already there and just needs the flag. A no-op if the handle is gone.
     pub fn pin(&mut self, key: &LspServerKey, workspace: &str) {
         if let Some(h) = self.servers.get_mut(key) {

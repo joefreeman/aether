@@ -100,7 +100,7 @@ pub struct Content<'a> {
     /// Coding ligatures on: code-text runs shape with [`text::Shaping::Advanced`] (forming `=>`,
     /// `!=`, … from the JetBrains Mono font); off uses `Basic` (no ligatures, same metrics).
     pub ligatures: bool,
-    /// Buffer text size in px — the `buffer_font_size` app setting (the chrome around this widget
+    /// Buffer text size in px — the `editor_font_size` app setting (the chrome around this widget
     /// scales from `ui_font_size` instead; see [`crate::theme::Ui`]). Drives the cell measurement
     /// and glyph size; the cell height is `font_size * LINE_HEIGHT_FACTOR`.
     pub font_size: f32,

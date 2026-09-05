@@ -532,7 +532,7 @@ fn with_match_bracket(buf: &Document, mut cursor: CursorState) -> CursorState {
 /// counter. Any motion that grows, shrinks, or shifts the selection drops the indicator on the
 /// next response.
 ///
-/// A *whole-target* entry (captured from the Files or Buffers picker) has no position to match
+/// A *whole-target* entry (captured from the Files or view picker) has no position to match
 /// against, so the weaker rule applies: being in its buffer at all is being on it. The counter then
 /// reads as "file k of N", which is what a captured file list means, and it survives moving around
 /// inside the file rather than blinking out on the first motion.
@@ -1270,7 +1270,7 @@ pub async fn apply_edit_reporting(
     let edit_last_excl = old_last_line.saturating_add(1);
     let pushes: PendingPushes = collect_doc_edit_pushes(&s, buffer_id, edit_first, edit_last_excl);
 
-    // Re-push any open Buffers pickers only when the dirty flag flipped (typically the first
+    // Re-push any open view pickers only when the dirty flag flipped (typically the first
     // edit after a save). The picker row renders dirty + display only, so per-keystroke edits
     // mid-burst don't need pushes.
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
@@ -1350,7 +1350,7 @@ pub fn workspace_candidates(
     let mut out: Vec<picker_state::WorkspaceCandidate> = names
         .iter()
         .map(|name| picker_state::WorkspaceCandidate {
-            unsaved_buffers: s.unsaved_buffer_count(name),
+            unsaved: s.unsaved_buffer_count(name),
             name: name.clone(),
         })
         .collect();
@@ -1363,7 +1363,7 @@ pub fn workspace_candidates(
     ephemeral.sort();
     for id in ephemeral {
         out.push(picker_state::WorkspaceCandidate {
-            unsaved_buffers: s.unsaved_buffer_count(&id),
+            unsaved: s.unsaved_buffer_count(&id),
             name: id,
         });
     }

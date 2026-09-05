@@ -89,7 +89,7 @@ pub enum LspReadiness {
 // ---- lsp/goto_definition ------------------------------------------------------------------------
 
 /// Resolve the definition of the symbol at the client's cursor. Cursor-relative (no position on
-/// the wire). The client navigates to the returned location itself (`buffer/open` + jump).
+/// the wire). The client navigates to the returned location itself (`view/open` + jump).
 pub struct LspGotoDefinition;
 impl RpcMethod for LspGotoDefinition {
     const NAME: &'static str = "lsp/goto_definition";
@@ -156,7 +156,7 @@ pub struct LspDocumentHighlightParams {
 }
 
 /// Identifies the language server backing a buffer — its `(language, workspace_root)` key. Returned
-/// in `buffer/open` so the client can show *this buffer's* server health: servers are keyed by
+/// in `view/open` so the client can show *this buffer's* server health: servers are keyed by
 /// `(language, workspace_root)`, so language alone is ambiguous when a monorepo runs several
 /// same-language servers at different roots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

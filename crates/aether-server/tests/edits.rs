@@ -749,11 +749,10 @@ async fn newline_and_indent_adds_one_level_after_opening_brace() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -813,11 +812,10 @@ async fn newline_and_indent_suppresses_brace_inside_comment() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -892,11 +890,10 @@ async fn newline_and_indent_engine_dedents_after_closing_brace() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -953,11 +950,10 @@ async fn newline_and_indent_engine_python_def() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.py".into()),
             language: None,
@@ -1015,11 +1011,10 @@ async fn newline_and_indent_detects_two_space_indent_in_rust_file() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -1075,11 +1070,10 @@ async fn newline_and_indent_uses_language_default_for_empty_file() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.go".into()),
             language: None,
@@ -1170,11 +1164,10 @@ async fn toggle_comment_adds_prefix_to_rust_line() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -1229,11 +1222,10 @@ async fn toggle_comment_strips_when_already_commented() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -1289,11 +1281,10 @@ async fn toggle_comment_multi_line_selection_lines_up_prefixes() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.py".into()),
             language: None,
@@ -1351,11 +1342,10 @@ async fn toggle_comment_markdown_cursor_only_wraps_line_in_block() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.md".into()),
             language: None,
@@ -1411,11 +1401,10 @@ async fn toggle_comment_partial_selection_in_js_block_wraps() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
             language: None,
@@ -1471,11 +1460,10 @@ async fn toggle_comment_block_unwrap_strips_wrappers() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
             language: None,
@@ -1533,11 +1521,10 @@ async fn toggle_comment_whole_line_selection_extends_to_cover_added_prefix() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -1596,11 +1583,10 @@ async fn toggle_comment_block_wrap_reselects_the_wrapped_content() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
             language: None,
@@ -1660,11 +1646,10 @@ async fn toggle_comment_block_wrap_selection_ending_at_newline() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.go".into()),
             language: None,
@@ -1744,11 +1729,10 @@ async fn toggle_comment_multi_line_block_wrap_sets_correct_cursor_position() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.ts".into()),
             language: None,
@@ -1807,11 +1791,10 @@ async fn toggle_comment_block_style_wraps_multi_line_partial_selection() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
             language: None,
@@ -1870,11 +1853,10 @@ async fn toggle_comment_round_trip_partial_selection() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
             language: None,
@@ -1945,11 +1927,10 @@ async fn toggle_comment_cursor_inside_block_comment_unwraps() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
             language: None,
@@ -2009,11 +1990,10 @@ async fn toggle_comment_block_unwrap_collapses_in_insert_mode() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
             language: None,
@@ -2075,11 +2055,10 @@ async fn toggle_comment_insert_round_trips_in_markdown() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.md".into()),
             language: None,
@@ -2144,11 +2123,10 @@ async fn toggle_comment_insert_keeps_caret_on_its_character() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             language: None,
@@ -2209,11 +2187,10 @@ async fn toggle_comment_css_cursor_only_wraps_line_in_block() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.css".into()),
             language: None,
@@ -2272,11 +2249,10 @@ async fn toggle_comment_block_wrap_collapses_in_insert_mode() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.css".into()),
             language: None,
@@ -2335,11 +2311,10 @@ async fn toggle_comment_block_only_language_is_noop_on_empty_line() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.md".into()),
             language: None,
@@ -2385,11 +2360,10 @@ async fn toggle_comment_is_noop_for_json() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.json".into()),
             language: None,
@@ -2724,11 +2698,10 @@ async fn toggle_comment_block_style_wraps_single_char_selection() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
             language: None,
@@ -2789,11 +2762,10 @@ async fn toggle_comment_block_style_is_noop_without_block_tokens() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.py".into()),
             language: None,
@@ -2839,11 +2811,10 @@ async fn toggle_comment_line_style_comments_lines_of_partial_selection() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("a.js".into()),
             language: None,
@@ -2889,7 +2860,7 @@ async fn input_delete_line_removes_line_with_newline() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -2903,7 +2874,6 @@ async fn input_delete_line_removes_line_with_newline() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2939,7 +2909,7 @@ async fn input_change_line_blanks_content_keeps_newline() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -2953,7 +2923,6 @@ async fn input_change_line_blanks_content_keeps_newline() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -2988,7 +2957,7 @@ async fn input_replace_line_swaps_content() {
     let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -3002,7 +2971,6 @@ async fn input_replace_line_swaps_content() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3043,7 +3011,7 @@ async fn subscribe_full(ws: &mut Ws, buffer_id: u64) -> ViewportSubscribeResult 
     send_request::<ViewportSubscribe>(
         ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 80,
             rows: 10,
             overscan_rows: 0,
@@ -3057,7 +3025,6 @@ async fn subscribe_full(ws: &mut Ws, buffer_id: u64) -> ViewportSubscribeResult 
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await
@@ -3554,11 +3521,10 @@ async fn git_blame_line_reports_committed_author() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("tracked.rs".into()),
             language: None,
@@ -3604,11 +3570,10 @@ async fn git_blame_line_is_none_without_repo() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("loose.rs".into()),
             language: None,
@@ -3651,11 +3616,10 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
             language: None,
@@ -3668,7 +3632,7 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -3682,7 +3646,6 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -3774,11 +3737,10 @@ async fn blame_follow_pushes_on_enable_and_cursor_moves() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
             language: None,
@@ -3869,11 +3831,10 @@ async fn diff_view_carries_intraline_emphasis_on_modified_pairs() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
             language: None,
@@ -3886,7 +3847,7 @@ async fn diff_view_carries_intraline_emphasis_on_modified_pairs() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -3900,7 +3861,6 @@ async fn diff_view_carries_intraline_emphasis_on_modified_pairs() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
-            kind: None,
         },
     )
     .await;
@@ -3959,11 +3919,10 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
             language: None,
@@ -3978,7 +3937,7 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
     let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -3992,7 +3951,6 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -4010,7 +3968,7 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -4024,7 +3982,6 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: true,
-            kind: None,
         },
     )
     .await;
@@ -4067,11 +4024,10 @@ async fn git_status_counts_ride_the_window() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
             language: None,
@@ -4084,7 +4040,7 @@ async fn git_status_counts_ride_the_window() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -4098,7 +4054,6 @@ async fn git_status_counts_ride_the_window() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -4167,11 +4122,10 @@ async fn git_status_splits_staged_and_unstaged() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
             language: None,
@@ -4184,7 +4138,7 @@ async fn git_status_splits_staged_and_unstaged() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -4198,7 +4152,6 @@ async fn git_status_splits_staged_and_unstaged() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -4249,11 +4202,10 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
         },
     )
     .await;
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             transient: None,
-            buffer_id: None,
             path_index: Some(0),
             relative_path: Some("edit.rs".into()),
             language: None,
@@ -4266,7 +4218,7 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(open.buffer_id),
+            view_id: open.view_id,
             cols: 80,
             rows: 24,
             overscan_rows: 0,
@@ -4280,7 +4232,6 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -4326,7 +4277,7 @@ async fn setup_with_viewport(
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
-            buffer_id: aether_protocol::ViewId(buffer_id),
+            view_id: view_of(buffer_id),
             cols: 200,
             rows: 50,
             overscan_rows: 0,
@@ -4340,7 +4291,6 @@ async fn setup_with_viewport(
             continuation_marker_width: 0,
             tab_width: 4,
             diff_view: false,
-            kind: None,
         },
     )
     .await;
@@ -4903,12 +4853,11 @@ async fn workspace_session_persisted_on_activate_and_open() {
         },
     )
     .await;
-    let _open: BufferOpenResult = send_request::<BufferOpen>(
+    let _open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
-            buffer_id: None,
             transient: None,
             language: None,
             create_if_missing: false,
@@ -4936,9 +4885,9 @@ async fn workspace_session_persisted_on_activate_and_open() {
         "activation stamps a time: {raw}"
     );
     let canonical = std::fs::canonicalize(root.join("a.rs")).unwrap();
-    let buffers = p["buffers"].as_array().unwrap();
+    let buffers = p["views"].as_array().unwrap();
     assert_eq!(buffers.len(), 1, "one buffer recorded: {raw}");
-    assert_eq!(buffers[0]["kind"], "file");
+    assert_eq!(buffers[0]["kind"], "editor");
     assert_eq!(
         buffers[0]["path"].as_str().unwrap(),
         canonical.display().to_string(),
@@ -4948,7 +4897,7 @@ async fn workspace_session_persisted_on_activate_and_open() {
     drop(server);
 }
 
-/// `buffer/close` on an id that's neither a live buffer nor a dormant session row still errors with
+/// `view/close` on an id that's neither a live buffer nor a dormant session row still errors with
 /// `buffer_not_found`. Guards the fall-through of the dormant-close branch added for `Ctrl-d` on a
 /// dormant picker row — a bogus id must not be silently swallowed. (The dormant-close *success* path
 /// is driven by cold session restore, which only happens when a workspace is loaded from on-disk
@@ -4957,10 +4906,10 @@ async fn workspace_session_persisted_on_activate_and_open() {
 #[tokio::test]
 async fn buffer_close_unknown_id_errors() {
     let (server, mut ws) = setup_buffer_picker_workspace().await;
-    let msg = send_request_expect_err::<BufferClose>(
+    let msg = send_request_expect_err::<ViewClose>(
         &mut ws,
-        &BufferCloseParams {
-            buffer_id: aether_protocol::ViewId(999_999),
+        &ViewCloseParams {
+            view_id: aether_protocol::ViewId(999_999),
             open_next: false,
         },
     )
@@ -4973,7 +4922,7 @@ async fn buffer_close_unknown_id_errors() {
 }
 
 /// A transient preview (the default file-picker open) is NOT persisted; pressing `Space k` to keep
-/// it (buffer/set_transient false) promotes it to a permanent working buffer and persists it. This
+/// it (`view/set_transient` false) promotes it to a permanent working view and persists it. This
 /// is the keep→persist path — without the persist hook, kept buffers never reach the session file.
 #[tokio::test]
 async fn keeping_a_transient_buffer_persists_it() {
@@ -5000,9 +4949,9 @@ async fn keeping_a_transient_buffer_persists_it() {
     .await;
 
     // Open as a transient preview (what the file picker does).
-    let open: BufferOpenResult = send_request::<BufferOpen>(
+    let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
-        &BufferOpenParams {
+        &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("a.rs".into()),
             transient: Some(true),
@@ -5014,7 +4963,7 @@ async fn keeping_a_transient_buffer_persists_it() {
 
     let buffers_in_session = |raw: &str| -> Vec<String> {
         let json: serde_json::Value = serde_json::from_str(raw).unwrap();
-        json["workspaces"]["p"]["buffers"]
+        json["workspaces"]["p"]["views"]
             .as_array()
             .map(|a| {
                 a.iter()
@@ -5036,10 +4985,10 @@ async fn keeping_a_transient_buffer_persists_it() {
     );
 
     // Keep it (Space k) → promote to permanent.
-    let _kept: BufferSetTransientResult = send_request::<BufferSetTransient>(
+    let _kept: ViewSetTransientResult = send_request::<ViewSetTransient>(
         &mut ws,
-        &BufferSetTransientParams {
-            buffer_id: open.buffer_id,
+        &ViewSetTransientParams {
+            view_id: open.view_id,
             transient: false,
         },
     )

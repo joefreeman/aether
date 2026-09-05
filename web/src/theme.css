@@ -136,7 +136,7 @@
      `--ui-font-size`, which shell.ts sets from the `ui_font_size` app setting. 13px is its default
      and the size every chrome rule below was hand-tuned at, so the other tiers are expressed as
      ratios of it — the 12/11 secondary shades and the 14/15/16 headings keep their relationship at
-     any base. The buffer text is a separate setting (`buffer_font_size`), applied to #app.
+     any base. The buffer text is a separate setting (`editor_font_size`), applied to #app.
      Pixel dimensions that *hold* chrome text (panel widths, the popover cap) scale the same way;
      pure whitespace (padding, gaps) stays fixed — it doesn't clip. */
   --ui-font-size: 13px;

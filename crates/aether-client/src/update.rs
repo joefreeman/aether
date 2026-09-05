@@ -32,12 +32,12 @@ use super::session::{
 use super::transport::RpcError;
 use aether_protocol::app::{AppInfoGet, AppInfoParams};
 use aether_protocol::buffer::{
-    BufferChanged, BufferChangedParams, BufferClose, BufferCloseParams, BufferClosed,
-    BufferClosedParams, BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut, BufferCutResult,
-    BufferOpen, BufferOpenParams, BufferOpenResult, BufferReload, BufferReloadParams, BufferSave,
-    BufferSaveParams, BufferSetTransient, BufferSetTransientParams, BufferState, BufferStateParams,
-    CopyScope,
+    BufferChanged, BufferChangedParams, BufferCopy, BufferCopyParams, BufferCopyResult, BufferCut,
+    BufferCutResult, BufferReload, BufferReloadParams, BufferSave, BufferSaveParams, BufferState,
+    BufferStateParams, CopyScope,
 };
+// `ViewState` is the session's here; the protocol notification of that name is spelled out at its
+// one use site rather than aliased into the crate's vocabulary.
 use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
@@ -129,6 +129,10 @@ use aether_protocol::sneak::{
     SneakUpdateResult,
 };
 use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
+use aether_protocol::view::{
+    ViewClose, ViewCloseParams, ViewClosed, ViewClosedParams, ViewOpen, ViewOpenParams,
+    ViewOpenResult, ViewSetTransient, ViewSetTransientParams, ViewStateParams,
+};
 use aether_protocol::viewport::{
     DiagnosticSeverity, Element, FocusStep, FocusTarget, NavigateGrain, ViewSave, ViewSaveParams,
     ViewportFocusElement, ViewportFocusElementParams, ViewportFocusElementResult,
@@ -185,14 +189,17 @@ pub enum Event {
     ClipboardRead(PasteKind, Option<String>),
     /// A buffer switch resolved (close, new scratch, path opens): rebind to this buffer. An open
     /// picker survives the switch (see [`Session::adopt_switch`]) — closing it is the pick path's
-    /// own job — so the Buffers picker closing the active buffer keeps its list up.
-    Switched(Result<BufferOpenResult, String>),
+    /// own job — so the view picker closing the active buffer keeps its list up.
+    Switched(Result<ViewOpenResult, String>),
     /// A `git/show` resolved: an ordinary switch onto the materialised buffer, or — for the
     /// working-changes view of a clean tree, the only target that can answer with nothing — a
     /// toast, since there is no buffer and never was one.
     Shown(Result<aether_protocol::git::GitShowResult, String>),
     /// `Enter` in a patch resolved (or didn't) to a file at a revision.
     PatchLineFollowed(Result<GitFollowPatchLineResult, String>),
+    /// `view/open` for the current buffer's other view (`Space u`, an edit transition out of
+    /// the reader) resolved: adopt the sibling, or report the failure.
+    SiblingOpened(Result<ViewOpenResult, String>),
     /// A `syntax/highlight_snippet` result for one fenced code block of the reading view, keyed
     /// by the fence's span start at `(buffer, revision)` parse time — stale results are dropped.
     ReadHighlights {
@@ -381,20 +388,20 @@ pub enum Event {
     /// ran off the ends (both benign stops).
     GroupSet(Result<Option<GroupRunRows>, String>, GroupLanding),
     /// `path/delete` (Explorer/Files trash) resolved. `noun` labels the success toast; the
-    /// open picker re-lists. Buffer closes for the deleted path arrive via the `buffer/closed`
+    /// open picker re-lists. Buffer closes for the deleted path arrive via the `view/closed`
     /// push, which already switches us off a deleted current buffer.
     PathDeleted {
         noun: &'static str,
         result: Result<PathDeleteResult, String>,
     },
-    /// `buffer/set_transient` (the `Space k` keep toggle) resolved. The bool is the buffer's new
-    /// transient flag; the toast confirms it (`self.view.buffer.transient` itself rides the `buffer/state`
+    /// `view/set_transient` (the `Space k` keep toggle) resolved. The bool is the view's new
+    /// transient flag; the toast confirms it (`view_transient` itself rides the `view/state`
     /// push). Errors surface as an error toast.
     KeepToggled(Result<bool, String>),
     /// `directory/create` (Explorer "+ Create … name/") resolved: navigate into the new directory.
     DirCreated(Result<DirectoryCreateResult, String>),
     /// Workspace switch resolved: the activated workspace + the buffer to land on.
-    WorkspaceActivated(Result<(WorkspaceInfo, BufferOpenResult), String>),
+    WorkspaceActivated(Result<(WorkspaceInfo, ViewOpenResult), String>),
     /// `workspace/create` resolved: the new workspace is active. A fresh workspace has no roots, so
     /// `opened` may be absent — the handler then keeps the current buffer and opens the settings
     /// overlay to add a root.
@@ -414,15 +421,15 @@ pub enum Event {
     /// `workspace/delete` (from the workspace switcher) resolved: toast success — the refreshed list
     /// arrives via a `picker/update` push — or surface the refusal (active / dirty).
     WorkspaceDeleted(Result<(), String>),
-    /// `buffer/close` resolved for a buffer in an *ephemeral* ("(workspace N)") context, closed
+    /// `view/close` resolved for a buffer in an *ephemeral* ("(workspace N)") context, closed
     /// without an `open_next` scratch. Carries the workspace's next remaining buffer: `Some` →
     /// attach to it; `None` → the context is empty, so leave it (quit on native, chooser on web —
     /// see [`App::leave_ephemeral_workspace`]).
-    EphemeralClosed(Result<Option<BufferId>, String>),
-    /// `buffer/close` resolved for the [tether](Session::tether): the client's job is done, so
+    EphemeralClosed(Result<Option<ViewId>, String>),
+    /// `view/close` resolved for the [tether](Session::tether): the client's job is done, so
     /// exit. No successor to adopt — the close was issued without `open_next`.
     TetherClosed(Result<(), String>),
-    /// `buffer/set_transient` resolved for the un-keep that *releases* the tether (`Space k` on
+    /// `view/set_transient` resolved for the un-keep that *releases* the tether (`Space k` on
     /// the tethered buffer): drop the tether — one-way — and toast the release. The transient
     /// flag itself rides the `buffer/state` push, as with [`Event::KeepToggled`].
     TetherReleased(Result<bool, String>),
@@ -452,7 +459,7 @@ pub enum Event {
     /// daemon's start stamp (discovery data the shell holds).
     Reestablished {
         workspace: WorkspaceInfo,
-        open: BufferOpenResult,
+        open: ViewOpenResult,
         restarted: bool,
     },
     /// A fire-and-forget RPC completed; result ignored.
@@ -737,7 +744,7 @@ impl Session {
                     // was — the transition is the *edit's* to make, not the keypress's.
                     self.read_exit_for_edit();
                     self.view.mode = Mode::Insert;
-                    fx = fx.and(self.represent_as(aether_protocol::ui::ViewKind::Editor));
+                    fx = fx.and(self.open_sibling(aether_protocol::ui::ViewKind::Editor));
                 } else if let Some(reason) = r.reason {
                     fx = fx.and(Effects::toast_grouped(
                         reason,
@@ -785,6 +792,8 @@ impl Session {
             }
 
             Event::Switched(Ok(open)) => self.adopt_open(open),
+            Event::SiblingOpened(Ok(open)) => self.adopt_sibling(open),
+            Event::SiblingOpened(Err(e)) => self.open_failed(e),
 
             // Worded for the working tree because that is the only target that can answer nothing:
             // a commit or a file at a revision always materialises, and one that can't be
@@ -832,10 +841,10 @@ impl Session {
 
             // Last/only buffer of an ephemeral context closed (no scratch was spawned).
             Event::EphemeralClosed(Ok(Some(next))) => {
-                // A sibling buffer still lives in this ephemeral context — attach to it.
-                self.request_str::<BufferOpen>(
-                    BufferOpenParams {
-                        buffer_id: Some(next),
+                // Another view still lives in this ephemeral context — present it.
+                self.request_str::<ViewOpen>(
+                    ViewOpenParams {
+                        view_id: Some(next),
                         ..Default::default()
                     },
                     Event::Switched,
@@ -918,10 +927,7 @@ impl Session {
                 _,
             ) => {
                 let shown = match opened {
-                    Some(open) => {
-                        self.open_route_jumped = false;
-                        self.adopt_navigation(*open)
-                    }
+                    Some(open) => self.adopt_navigation(*open),
                     None => Effects::none(),
                 };
                 let msg = if skipped > 1 {
@@ -938,9 +944,9 @@ impl Session {
                         // A step is jump-shaped exactly when its entry carries a position — the
                         // same test `open_path_at` applies, so `]` and Enter on the same row present
                         // the target identically. A positioned entry (a grep hit, a diagnostic)
-                        // lands in the editor, where its line:col means something; a whole-target
-                        // entry is "open this file", so a markdown one reads.
-                        self.open_route_jumped = t.position.is_some();
+                        // opened with a `jump_to`, which the server lands in the editor, where a
+                        // line:col means something; a whole-target entry is "open this file", so
+                        // a markdown one comes back as it last was.
                         skipped.and(self.adopt_navigation(open))
                     }
                     None => skipped, // open:true is always sent; defensive
@@ -1228,8 +1234,8 @@ impl Session {
                     let repo_id = prepared.repo_id.clone();
                     // Not transient: a preview auto-closes when hidden, and a half-written commit
                     // message vanishing because you glanced at another file would be its own bug.
-                    let mut fx = self.request_str::<BufferOpen>(
-                        BufferOpenParams {
+                    let mut fx = self.request_str::<ViewOpen>(
+                        ViewOpenParams {
                             absolute_path: Some(prepared.path),
                             transient: Some(false),
                             record_nav_from: Some(self.view.buffer.buffer_id),
@@ -1241,12 +1247,13 @@ impl Session {
                     // `Switched` attach it (see `adopt_pending_commit`).
                     self.pending_commit = Some(PendingCommit {
                         buffer_id: 0,
+                        view_id: ViewId::default(),
                         repo_id,
                         amend,
                     });
                     fx.push(Effect::Toast {
                         title: summary,
-                        body: Some("Write the message, then close this buffer".into()),
+                        body: Some("Write the message, then close this view".into()),
                         kind: ToastKind::Info,
                         group: None,
                     });
@@ -1262,7 +1269,7 @@ impl Session {
                 // strand them in a buffer they can't leave without writing something.
                 Ok(res) if res.empty_message => {
                     self.pending_commit = None;
-                    self.close_buffer()
+                    self.close_view()
                         .and(Effects::toast("Commit abandoned", ToastKind::Info))
                 }
                 Ok(res) => {
@@ -1280,7 +1287,7 @@ impl Session {
                                 .unwrap_or_default()
                                 .to_string();
                             let short: String = commit.commit.chars().take(7).collect();
-                            let mut fx = self.close_buffer();
+                            let mut fx = self.close_view();
                             // What the commit *concluded*, when it was part of something bigger.
                             // A rebase that stopped again is the case worth spelling out: the
                             // commit worked, and there is more to resolve before it's over.
@@ -1331,7 +1338,7 @@ impl Session {
                         Effects::toast("Nothing in progress to abandon", ToastKind::Info)
                     }
                     GitAbortStatus::BlockedByDirtyBuffers => Effects::toast_detail(
-                        format!("{} unsaved buffer(s)", res.blocked.len()),
+                        format!("{} unsaved file(s)", res.blocked.len()),
                         "Save first, then retry",
                         ToastKind::Warning,
                     ),
@@ -1409,12 +1416,12 @@ impl Session {
                         let mut detail = String::new();
                         let moved = res.refreshed.reloaded.len();
                         if moved > 0 {
-                            detail.push_str(&format!("Reloaded {moved} buffer(s)"));
+                            detail.push_str(&format!("Reloaded {moved} file(s)"));
                         }
                         if !res.refreshed.missing.is_empty() {
                             if detail.is_empty() {
                                 detail.push_str(&format!(
-                                    "{} buffer(s) not on this branch",
+                                    "{} file(s) not on this branch",
                                     res.refreshed.missing.len()
                                 ));
                             } else {
@@ -1432,7 +1439,7 @@ impl Session {
                     }
                     // The one refusal with a concrete next step, so it gets one.
                     GitCheckoutStatus::BlockedByDirtyBuffers => Effects::toast_detail(
-                        format!("{} unsaved buffer(s)", res.blocked.len()),
+                        format!("{} unsaved file(s)", res.blocked.len()),
                         "Save first, then retry",
                         ToastKind::Warning,
                     ),
@@ -1765,7 +1772,7 @@ impl Session {
                         Effects::toast("No remote configured", ToastKind::Info)
                     }
                     GitPullStatus::BlockedByDirtyBuffers => Effects::toast_detail(
-                        format!("{} unsaved buffer(s)", r.blocked.len()),
+                        format!("{} unsaved file(s)", r.blocked.len()),
                         "Save first, then retry",
                         ToastKind::Warning,
                     ),
@@ -2048,7 +2055,7 @@ impl Session {
             },
 
             // Selections open in place: the window shows one buffer, and the one being
-            // replaced is a `Space b` away (buffers persist server-side). Opens are
+            // replaced is a `Space v` away (buffers persist server-side). Opens are
             // transient previews — switching away from one closes it.
             Event::PickerSelected { result: Ok(result) } => match result {
                 PickerSelectResult::File { path } => self.open_path_at(path, None, None),
@@ -2057,13 +2064,13 @@ impl Session {
                     position,
                     anchor,
                 } => self.open_path_at(path, Some(position), anchor),
-                PickerSelectResult::Buffer { buffer_id } => {
-                    if buffer_id == self.view.buffer.buffer_id {
+                PickerSelectResult::View { view_id } => {
+                    if view_id == self.view.view_id {
                         return Effects::none(); // already showing it
                     }
-                    self.request_str::<BufferOpen>(
-                        BufferOpenParams {
-                            buffer_id: Some(buffer_id),
+                    self.request_str::<ViewOpen>(
+                        ViewOpenParams {
+                            view_id: Some(view_id),
                             record_nav_from: Some(self.view.buffer.buffer_id),
                             ..Default::default()
                         },
@@ -2072,10 +2079,10 @@ impl Session {
                 }
 
                 // The pathless counterpart of `FileAt`: a generated patch was materialised, not
-                // loaded, so its rows can only be addressed by buffer id. Usually the buffer
-                // you're already reading — `Space c` lists that patch's own hunks — which makes
-                // this a jump rather than a switch, and no nav-history entry: browser history is
-                // for moving *between* files, and the jumplist already covers moving within one.
+                // loaded, so its rows can only be addressed by the view. Usually the view you're
+                // already reading — `Space c` lists that patch's own hunks — which makes this a
+                // jump rather than a switch, and no nav-history entry: browser history is for
+                // moving *between* files, and the jumplist already covers moving within one.
                 // Inside the view already open: focus the element, then land the cursor in it —
                 // the same pair, in the same order, that a click uses. Focus first because the
                 // server resolves a cursor against whichever element holds it, so setting first
@@ -2094,10 +2101,7 @@ impl Session {
                 // said either way — never the row's file in an editor.
                 PickerSelectResult::Gone { open } => {
                     let shown = match open {
-                        Some(open) => {
-                            self.open_route_jumped = false;
-                            self.adopt_navigation(*open)
-                        }
+                        Some(open) => self.adopt_navigation(*open),
                         None => Effects::none(),
                     };
                     shown.and(Effects::toast_grouped(
@@ -2106,14 +2110,11 @@ impl Session {
                         "jumplist",
                     ))
                 }
-                PickerSelectResult::BufferAt {
-                    buffer_id,
-                    position,
-                } => self.request_str::<BufferOpen>(
-                    BufferOpenParams {
-                        buffer_id: Some(buffer_id),
+                PickerSelectResult::ViewAt { view_id, position } => self.request_str::<ViewOpen>(
+                    ViewOpenParams {
+                        view_id: Some(view_id),
                         jump_to: Some(position),
-                        record_nav_from: (buffer_id != self.view.buffer.buffer_id)
+                        record_nav_from: (view_id != self.view.view_id)
                             .then_some(self.view.buffer.buffer_id),
                         ..Default::default()
                     },
@@ -2136,7 +2137,7 @@ impl Session {
                         |r| {
                             Event::WorkspaceActivated(r.and_then(|a| {
                                 let opened = a.opened.ok_or_else(|| {
-                                    "workspace/activate returned no landing buffer".to_string()
+                                    "workspace/activate returned no landing view".to_string()
                                 })?;
                                 Ok((a.workspace, opened))
                             }))
@@ -2204,7 +2205,7 @@ impl Session {
                     // A fresh workspace has no roots and so no landing buffer — open a scratch so the
                     // user lands in *some* editor (and the previous workspace's buffer doesn't linger
                     // behind the new workspace). `adopt_switch` leaves the settings overlay open.
-                    None => self.request::<BufferOpen>(BufferOpenParams::default(), move |__r| {
+                    None => self.request::<ViewOpen>(ViewOpenParams::default(), move |__r| {
                         Event::Switched(__r.map_err(|e| e.message))
                     }),
                 });
@@ -2330,16 +2331,18 @@ impl Session {
                         if closed.is_empty() {
                             String::new()
                         } else {
-                            format!("Closed {} buffer(s)", closed.len())
+                            format!("Closed {} file(s)", closed.len())
                         },
                         ToastKind::Success,
                     );
                     // If our current buffer was one of the closed ones, switch to the server-
                     // indicated next buffer (or a fresh scratch).
                     if closed.contains(&self.view.buffer.buffer_id) {
-                        fx = fx.and(self.request::<BufferOpen>(
-                            BufferOpenParams {
-                                buffer_id: r.next_buffer_id,
+                        fx = fx.and(self.request::<ViewOpen>(
+                            ViewOpenParams {
+                                view_id: r.next_view_id,
+                                // Nothing left to land on: a placeholder, not a scratch to keep.
+                                transient: r.next_view_id.is_none().then_some(true),
                                 ..Default::default()
                             },
                             move |__r| Event::Switched(__r.map_err(|e| e.message)),
@@ -2560,7 +2563,7 @@ impl Session {
             Event::PathDeleted { noun, result } => match result {
                 Err(e) => Effects::error_detail("Delete failed", e),
                 Ok(_) => {
-                    // Any close of *our* buffer rides the `buffer/closed` push (it switches us
+                    // Any close of *our* buffer rides the `view/closed` push (it switches us
                     // to the server's successor). Here we just confirm and re-list the picker.
                     let mut fx = Effects::toast(format!("Trashed {noun}"), ToastKind::Success);
                     if let Some(kind) = self.picker.as_ref().map(|p| p.kind) {
@@ -2678,7 +2681,7 @@ impl Session {
                 self.workspace_worktrees = workspace.worktrees;
                 self.workspace_projects = workspace.projects;
                 let same_file = open.path == self.view.buffer.path;
-                self.view.rebind(buffer_info(open, &self.workspace_paths));
+                self.view.rebind(open, &self.workspace_paths);
                 // Buffer ids don't survive a daemon restart: remap the tether onto the reopened
                 // buffer when it's the same file we were tethered to, else drop it — a stale id
                 // could collide with an unrelated new buffer and exit under the user.
@@ -2756,7 +2759,7 @@ impl Session {
             })) => {
                 self.view.buffer.revision = result.revision;
                 self.view.buffer.saved_revision = result.revision;
-                self.view.buffer.transient = false; // saving promotes a transient buffer
+                self.view.view_transient = false; // saving promotes the view it was made in
                 self.view.externally_modified = false;
                 self.view.externally_deleted = false;
                 let note = match target {
@@ -2796,7 +2799,7 @@ impl Session {
                     AfterSave::Quit => fx.push(Effect::Exit),
                     // Save-and-close (`Space Alt-x`): the buffer is clean now, so this close
                     // never re-prompts — and when the buffer is the tether, it exits the client.
-                    AfterSave::Close => fx = fx.and(self.close_buffer()),
+                    AfterSave::Close => fx = fx.and(self.close_view()),
                 }
                 fx
             }
@@ -2830,7 +2833,7 @@ impl Session {
                 match after {
                     AfterSave::Nothing => {}
                     AfterSave::Quit => fx.push(Effect::Exit),
-                    AfterSave::Close => fx = fx.and(self.close_buffer()),
+                    AfterSave::Close => fx = fx.and(self.close_view()),
                 }
                 fx
             }
@@ -2843,7 +2846,7 @@ impl Session {
             Event::ReloadTried(Ok(ReloadTry::Reloaded(r))) => {
                 self.view.buffer.revision = r.revision;
                 self.view.buffer.saved_revision = r.revision;
-                self.view.buffer.transient = false; // reloading promotes, like save
+                self.view.view_transient = false; // reloading promotes, like save
                 self.view.externally_modified = false;
                 self.view.externally_deleted = false;
                 Effects::toast(format!("Reloaded (rev {})", r.revision), ToastKind::Success)
@@ -3034,7 +3037,7 @@ impl Session {
         };
         // A request naming a buffer the server no longer has is **stale by definition**, and the
         // server is the authority on buffer lifetime: it has already closed that buffer and either
-        // has told us (`buffer/closed`) or is about to. Anything we had in flight over it — a
+        // has told us (`view/closed`) or is about to. Anything we had in flight over it — a
         // viewport scroll, an edit, a status refresh — is about a buffer that stopped existing
         // mid-round-trip.
         //
@@ -3234,13 +3237,14 @@ impl Session {
     }
 
     /// Land on a buffer an open answered with — the common tail of every `Switched`-shaped result.
-    fn adopt_open(&mut self, open: BufferOpenResult) -> Effects {
+    fn adopt_open(&mut self, open: ViewOpenResult) -> Effects {
         // A commit prepared just before this open has been waiting for its buffer id (the open is
         // what mints it). Anything else clears the wait: the user navigated away instead, so there
         // is no commit buffer to confirm.
         if let Some(pending) = self.pending_commit.as_mut() {
             if pending.buffer_id == 0 {
                 pending.buffer_id = open.buffer_id;
+                pending.view_id = open.view_id;
             }
         }
         self.adopt_navigation(open)
@@ -3248,9 +3252,6 @@ impl Session {
 
     /// An open that failed, from whichever RPC was asked to do it.
     fn open_failed(&mut self, e: String) -> Effects {
-        // A failed jump-shaped open must not leave its flag armed for the next (unrelated)
-        // switch — it would wrongly land a markdown file in the editor.
-        self.open_route_jumped = false;
         Effects::error_detail("Open failed", e)
     }
 
@@ -3265,21 +3266,23 @@ impl Session {
     /// ([`Self::adopt_switch`]). One definition so every cursor-moving navigation scrolls its
     /// target into view the same way; genuine buffer switches (close, new-scratch, workspace change)
     /// always land on a different `buffer_id`, so routing them here is just a switch.
-    pub fn adopt_navigation(&mut self, open: BufferOpenResult) -> Effects {
-        if open.buffer_id == self.view.buffer.buffer_id {
-            // Same buffer — the open-route flag (a cross-buffer concern) must not leak into the
-            // next genuine switch.
-            self.open_route_jumped = false;
-            if self.pending_read_anchor.is_some() && self.view.read.is_some() {
-                // `[x](./this-file.md#section)`: the target is the document already on
-                // screen, so the anchor resolves against the live parse — no refetch fires.
-                return self.consume_read_anchor();
-            }
-            self.pending_read_anchor = None;
-            self.jump_to_cursor(open.cursor)
-        } else {
-            self.adopt_switch(open)
+    pub fn adopt_navigation(&mut self, open: ViewOpenResult) -> Effects {
+        if open.buffer_id != self.view.buffer.buffer_id {
+            return self.adopt_switch(open);
         }
+        // The same file through its *other* view — the picker's editor row chosen while the
+        // reader is on screen — is the sibling, not a move within this one: the window has to
+        // change even though the buffer, and the cursor in it, do not.
+        if open.view_id != self.view.view_id {
+            return self.adopt_sibling(open);
+        }
+        if self.pending_read_anchor.is_some() && self.view.read.is_some() {
+            // `[x](./this-file.md#section)`: the target is the document already on
+            // screen, so the anchor resolves against the live parse — no refetch fires.
+            return self.consume_read_anchor();
+        }
+        self.pending_read_anchor = None;
+        self.jump_to_cursor(open.cursor)
     }
 
     /// Rebind the session to a freshly opened buffer: reset all per-buffer state (modal,
@@ -3292,7 +3295,7 @@ impl Session {
     /// and a picker-initiated close of the active buffer wants the list kept open. A buffer-scoped
     /// picker (outline, diagnostics) that should dismiss on a buffer change is the picker's own call,
     /// not a side effect of the switch.
-    pub fn adopt_switch(&mut self, open: BufferOpenResult) -> Effects {
+    pub fn adopt_switch(&mut self, open: ViewOpenResult) -> Effects {
         // A sneak session is keyed `(client, buffer)` *server-side*, so dropping this side of it
         // would leave the outgoing buffer's labels live: switch away mid-sneak and back, and they
         // render again with nothing here thinking it is sneaking. Cancel before the swap, while the
@@ -3301,11 +3304,11 @@ impl Session {
         // One assignment, where this was sixteen hand-written resets that nothing checked. Anything
         // that must *survive* a switch — the sticky presentation preferences, the mirrors of
         // server-side follows — lives on the session and is untouched here by construction.
-        self.view = ViewState::new(buffer_info(open, &self.workspace_paths));
+        self.view = ViewState::from_open(open, &self.workspace_paths);
         // Not view state, but bound to whatever was on screen when it opened, so a switch dismisses
         // it: a modal prompt is the session's, and it has nowhere to return to.
         self.prompt = None;
-        self.sync_presentation_on_switch();
+        self.sync_read_anchor_on_switch();
         sneak_fx.and(Effects::one(Effect::Resubscribe))
     }
 
@@ -3321,65 +3324,56 @@ impl Session {
         self.request::<SneakCancel>(SneakCancelParams { buffer_id }, |_r| Event::Noop)
     }
 
-    /// Decide what the freshly adopted buffer's subscribe asks for. Markdown buffers are the
-    /// server's to present — as the file last was, or as the app setting says — with two overrides
-    /// that this client's route knows and the server cannot, one each way:
-    ///
-    /// - A **jump-shaped** open (grep hit, reference, a positioned jumplist entry) lands in the
-    ///   editor — it is going to a `line:col`, which only means something over the source.
-    /// - An open carrying a **read anchor** (`[x](./other.md#section)`) lands in the reading
-    ///   view — the slug resolves against the rendered document, and landing anywhere else would
-    ///   silently drop it.
-    ///
-    /// Both are one-shot: they name this subscribe's kind and nothing else. Non-markdown buffers
-    /// have only the editor, and the server presents them so whatever is asked.
-    fn sync_presentation_on_switch(&mut self) {
-        let jumped = std::mem::replace(&mut self.open_route_jumped, false);
+    /// A freshly adopted view starts without a reading view: whether it is one is its window's
+    /// to say ([`Self::sync_read_presentation`]). A pending cross-file anchor can only land in the
+    /// reading view of a markdown file, so a switch to anything else drops it.
+    fn sync_read_anchor_on_switch(&mut self) {
         self.view.read = None;
-        let is_md = self.view.buffer.language.as_deref() == Some("markdown");
-        self.subscribe_kind = if !is_md {
-            // A pending cross-file anchor can only land in a reading view; this switch went to
-            // a non-markdown target, so drop it.
+        if self.view.buffer.language.as_deref() != Some("markdown") {
             self.pending_read_anchor = None;
-            None
-        } else if self.pending_read_anchor.is_some() {
-            Some(aether_protocol::ui::ViewKind::Reader)
-        } else if jumped {
-            Some(aether_protocol::ui::ViewKind::Editor)
-        } else {
-            None
-        };
-    }
-
-    /// Apply the open-route presentation rules to a freshly *booted* session: `ae file.md` launches
-    /// install the session directly, never passing through `adopt_switch`, so the shells call this
-    /// once after boot and **before** subscribing. `jumped` = the launch carried a jump target
-    /// (`ae file:line`), which lands in the editor like any other jump.
-    pub fn boot_read_presentation(&mut self, jumped: bool) {
-        self.open_route_jumped = jumped;
-        self.sync_presentation_on_switch();
-    }
-
-    /// [`Self::boot_read_presentation`] with an explicit read/source choice, overriding the
-    /// open-route rules: the web shell records the current presentation in the URL (`view=`), so a
-    /// refresh restores exactly what was on screen — the `#line:col` cursor restore in the same URL
-    /// must not read as a jump-shaped open.
-    pub fn boot_read_presentation_explicit(&mut self, read: bool) {
-        self.boot_read_presentation(false);
-        if self.view.buffer.language.as_deref() == Some("markdown") {
-            self.subscribe_kind = Some(if read {
-                aether_protocol::ui::ViewKind::Reader
-            } else {
-                aether_protocol::ui::ViewKind::Editor
-            });
         }
     }
 
-    /// Re-present the current view as `kind`, keeping what is on screen where it is: the content
-    /// anchor captured ahead of the subscribe is what the shell positions the new window by.
-    fn represent_as(&mut self, kind: aether_protocol::ui::ViewKind) -> Effects {
-        self.subscribe_kind = Some(kind);
-        Effects::one(Effect::SaveContentAnchor).and(Effects::one(Effect::Resubscribe))
+    /// Ask for the current view's sibling — its file's editor, or its reader. Named as this view
+    /// plus the other kind: the server finds its buffer's view of that kind or makes one and
+    /// answers with it; [`Self::adopt_sibling`] takes it up. The content anchor captured first
+    /// keeps the same lines on screen when the sibling has no scroll of its own to come back to.
+    fn open_sibling(&mut self, kind: aether_protocol::ui::ViewKind) -> Effects {
+        Effects::one(Effect::SaveContentAnchor).and(self.request_str::<ViewOpen>(
+            ViewOpenParams {
+                view_id: Some(self.view.view_id),
+                kind: Some(kind),
+                ..Default::default()
+            },
+            Event::SiblingOpened,
+        ))
+    }
+
+    /// Adopt the sibling view an [`Self::open_sibling`] answered with: the same buffer, another
+    /// view of it. Not a switch — the cursor is the buffer's and shared by both views, and a mode
+    /// an edit transition set stays set — and not a same-buffer move either, which would keep
+    /// the window: the view is new, so the shell re-subscribes, at the view's own remembered
+    /// scroll when it has one, else where the content anchor says. The reading view, if this was
+    /// one, goes: the new window decides whether the sibling is.
+    fn adopt_sibling(&mut self, open: ViewOpenResult) -> Effects {
+        if open.buffer_id != self.view.buffer.buffer_id {
+            return self.adopt_switch(open);
+        }
+        let sneak_fx = self.cancel_sneak_on(self.view.buffer.buffer_id);
+        // The whole rebind, not the fields a sibling happens to differ in. Copying its id and
+        // scroll off the open one by one left the kept flag behind: the status bar said the
+        // editor was kept because the reader had been, the picker said it was not, and the first
+        // `Space k` "released" a view that was never kept.
+        let remembered_scroll = open.scroll.is_some();
+        self.view.rebind(open, &self.workspace_paths);
+        if remembered_scroll {
+            self.forget_scroll_anchor();
+        }
+        self.view.read = None;
+        if self.view.mode == Mode::Read {
+            self.view.mode = Mode::Normal;
+        }
+        sneak_fx.and(Effects::one(Effect::Resubscribe))
     }
 
     /// An edit of our own changed the text under the reading view's parse, and its new cursor is
@@ -3403,7 +3397,7 @@ impl Session {
     /// here: an element of that kind under the cursor puts the session in the reading view over
     /// the lines it carries, re-parsing whenever they change (an edit, an undo, another client's
     /// change — all of them arrive as a pushed window, so nothing is fetched); an ordinary editor
-    /// takes the reading view down. Nothing else decides which view is showing: `Space v` and the
+    /// takes the reading view down. Nothing else decides which view is showing: `Space u` and the
     /// edit transitions only *ask*, through the subscribe, and adopt whatever comes back.
     ///
     /// A partial load — the element has more lines than the window carries — is a window still
@@ -3560,7 +3554,7 @@ impl Session {
     /// Crossing into another buffer changes everything the view says about what it is showing —
     /// path, label, read-only, revision — so the whole `BufferInfo` is rebuilt through the same path
     /// an open uses. `view_id` deliberately does *not* move: the view is still the patch, and it is
-    /// what `buffer/close` and `viewport/subscribe` go on addressing.
+    /// what `view/close` and `viewport/subscribe` go on addressing.
     fn adopt_focus(&mut self, r: ViewportFocusElementResult) -> bool {
         let moved = r.element != self.view.focused_element;
         self.view.focused_element = r.element;
@@ -3598,7 +3592,7 @@ impl Session {
     /// and travelled correctly still looked like nothing happening.
     fn seat_in_view_element(
         &mut self,
-        open: Option<BufferOpenResult>,
+        open: Option<ViewOpenResult>,
         element: aether_protocol::viewport::FieldId,
         buffer_id: BufferId,
         position: LogicalPosition,
@@ -3608,10 +3602,7 @@ impl Session {
         // an index into *that* view's tree and focusing it means nothing until it is on screen.
         // Absent whenever the view was already showing, which is the ordinary case.
         let adopt = match open {
-            Some(open) => {
-                self.open_route_jumped = true;
-                self.adopt_navigation(open)
-            }
+            Some(open) => self.adopt_navigation(open),
             None => Effects::none(),
         };
         adopt.and(self.seat_in_focused_view(element, buffer_id, position, anchor))
@@ -3758,7 +3749,7 @@ impl Session {
         }
     }
 
-    pub fn close_buffer(&mut self) -> Effects {
+    pub fn close_view(&mut self) -> Effects {
         // Closing the prepared message *is* the commit — the `$EDITOR` contract, where git reads
         // the file once the editor exits and aborts if the message came back empty. So this fires
         // the commit instead of the close; `Event::Committed` clears the pending entry and calls
@@ -3768,7 +3759,7 @@ impl Session {
         if let Some(pending) = self
             .pending_commit
             .clone()
-            .filter(|p| p.buffer_id == self.view.view_id.presenting_buffer())
+            .filter(|p| p.buffer_id == self.view.view_buffer)
         {
             return self.request_str::<GitCommit>(
                 GitCommitParams {
@@ -3778,35 +3769,35 @@ impl Session {
                 Event::Committed,
             );
         }
-        self.forget_commit_buffer(self.view.view_id.presenting_buffer());
+        self.forget_commit_buffer(self.view.view_buffer);
         if self.tethered_view() {
-            return self.request_str::<BufferClose>(
-                BufferCloseParams {
-                    buffer_id: self.view.view_id,
+            return self.request_str::<ViewClose>(
+                ViewCloseParams {
+                    view_id: self.view.view_id,
                     open_next: false,
                 },
                 |r| Event::TetherClosed(r.map(|_| ())),
             );
         }
         if aether_protocol::is_ephemeral_workspace_id(&self.workspace) {
-            return self.request_str::<BufferClose>(
-                BufferCloseParams {
-                    buffer_id: self.view.view_id,
+            return self.request_str::<ViewClose>(
+                ViewCloseParams {
+                    view_id: self.view.view_id,
                     open_next: false,
                 },
-                |r| Event::EphemeralClosed(r.map(|closed| closed.next_buffer_id)),
+                |r| Event::EphemeralClosed(r.map(|closed| closed.next_view_id)),
             );
         }
-        self.request_str::<BufferClose>(
-            BufferCloseParams {
-                buffer_id: self.view.view_id,
+        self.request_str::<ViewClose>(
+            ViewCloseParams {
+                view_id: self.view.view_id,
                 open_next: true,
             },
             |r| {
                 Event::Switched(r.and_then(|closed| {
                     closed
                         .opened
-                        .ok_or_else(|| "buffer/close returned no successor".into())
+                        .ok_or_else(|| "view/close returned no successor".into())
                 }))
             },
         )
@@ -3831,7 +3822,7 @@ impl Session {
     /// buffers have no path, so it warns instead.
     fn copy_buffer_path(&mut self, absolute: bool) -> Effects {
         let Some(path) = self.view.buffer.path.as_deref() else {
-            return Effects::toast("Scratch buffer has no path", ToastKind::Warning);
+            return Effects::toast("A scratch has no path", ToastKind::Warning);
         };
         let text = if absolute {
             path.to_string()
@@ -3860,7 +3851,7 @@ impl Session {
     /// Copy the web client's URL for the current view (`Space Alt-z`): a file buffer becomes the
     /// root-relative `?workspace=&root=&file=` link with the cursor as its 1-based `#L:C`
     /// fragment (a shared-cursor link — the web boot jumps there); a scratch becomes a
-    /// `?workspace=&buffer=` link. A file with no workspace to be relative to — one outside every
+    /// `?workspace=&view=` link. A file with no workspace to be relative to — one outside every
     /// root, or any file in an ephemeral (no-workspace) context — becomes an absolute `?path=`
     /// link, which the web boot opens exactly as `ae PATH` does. Only a *pathless* buffer in a
     /// temporary context has nothing to address. The shell prepends its own base URL and writes the
@@ -3891,18 +3882,18 @@ impl Session {
                     },
                 ),
             },
-            // A scratch is reachable only by id, which is scoped to the workspace it lives in — and
-            // a temporary context is not something a link can name (its id is recycled).
+            // A scratch is reachable only by its view id, which is scoped to the workspace it lives
+            // in — and a temporary context is not something a link can name (its id is recycled).
             None if !named => {
                 return Effects::toast_detail(
                     "No web URL",
-                    "This scratch buffer isn't in a workspace",
+                    "This scratch isn't in a workspace",
                     ToastKind::Warning,
                 )
             }
             None => web_link(
                 Some(&self.workspace),
-                WebLinkTarget::Buffer(self.view.buffer.buffer_id),
+                WebLinkTarget::View(self.view.view_id),
             ),
         };
         // Grouped with the path copies: the copy gestures update one toast rather than stacking.
@@ -3925,6 +3916,18 @@ impl Session {
         jump_to: Option<LogicalPosition>,
         jump_to_anchor: Option<LogicalPosition>,
     ) -> Effects {
+        self.open_path_as(path, jump_to, jump_to_anchor, None)
+    }
+
+    /// [`Self::open_path_at`] asking for a kind of view — the reader, for a followed `#anchor`,
+    /// which only a rendered document can land.
+    fn open_path_as(
+        &mut self,
+        path: String,
+        jump_to: Option<LogicalPosition>,
+        jump_to_anchor: Option<LogicalPosition>,
+        kind: Option<aether_protocol::ui::ViewKind>,
+    ) -> Effects {
         // Any fresh open invalidates a not-yet-landed cross-file anchor (`read_follow_link`
         // re-arms after this call for its own open).
         self.pending_read_anchor = None;
@@ -3933,11 +3936,8 @@ impl Session {
                 Some((idx, rel)) => (Some(idx), Some(rel), None),
                 None => (None, None, Some(path)),
             };
-        // A jump-shaped open (a grep hit, a reference) is a working context — it lands in the
-        // editor even when the target is markdown.
-        self.open_route_jumped = jump_to.is_some();
-        self.request_str::<BufferOpen>(
-            BufferOpenParams {
+        self.request_str::<ViewOpen>(
+            ViewOpenParams {
                 path_index,
                 relative_path,
                 absolute_path,
@@ -3945,6 +3945,10 @@ impl Session {
                 jump_to_anchor,
                 transient: Some(true),
                 record_nav_from: Some(self.view.buffer.buffer_id),
+                // A jump-shaped open (a grep hit, a reference) is a working context: the server
+                // lands a `jump_to` in the editor even when the target is markdown. `kind` is
+                // for the one route with its own opinion, a followed `#anchor`.
+                kind,
                 ..Default::default()
             },
             Event::Switched,
@@ -4212,10 +4216,10 @@ impl Session {
         self.history.reset();
         let buffer_id = self.view.buffer.buffer_id;
         let has_center_override = center_on_override.is_some();
-        // Buffers / Workspaces / Explorer / LspServers all open with the highlight on "where you
+        // Views / Workspaces / Explorer / LspServers all open with the highlight on "where you
         // are" — the active buffer/workspace/file/language-server — matched by item key via the
         // `effective_center_on` echo (the display-only fields below are ignored by the match).
-        // Buffers: the active *view* (key is `buffer_id`) — `view_id`, not the focused element's
+        // Views: the active *view* (key is `buffer_id`) — `view_id`, not the focused element's
         // buffer. The picker lists views, so in a composed one the row to land on is the patch
         // itself; centring on `view.buffer` highlighted whichever file the cursor happened to be
         // in, or nothing at all when that file had no row of its own.
@@ -4223,8 +4227,10 @@ impl Session {
         // Explorer: the active buffer's filename, so the listing lands on the current file.
         // LspServers: the active buffer's own language server (key is `language` + `workspace_root`).
         let center_on = center_on_override.or(match kind {
-            PickerKind::Buffers => Some(PickerItem::Buffer {
-                buffer_id: self.view.view_id.presenting_buffer(),
+            PickerKind::Views => Some(PickerItem::View {
+                buffer_id: self.view.view_buffer,
+                view_id: self.view.view_id,
+                view_kind: None,
                 display: String::new(),
                 status: Default::default(),
                 path_index: None,
@@ -4234,7 +4240,7 @@ impl Session {
             }),
             PickerKind::Workspaces => Some(PickerItem::Workspace {
                 name: self.workspace.clone(),
-                unsaved_buffers: 0,
+                unsaved: 0,
                 match_indices: Vec::new(),
             }),
             PickerKind::Explorer => self.view.buffer.path.as_deref().and_then(|path| {
@@ -4327,7 +4333,7 @@ impl Session {
         );
         // Every open starts the list at the top. A kind that wants to land somewhere else centres
         // via the `effective_center_on` echo, which arrives with the response and reveals *after*
-        // this — the same order Buffers and the Explorer have always opened in.
+        // this — the same order Views and the Explorer have always opened in.
         Effects::one(Effect::PickerScrollReset).and(request)
     }
 
@@ -4335,7 +4341,7 @@ impl Session {
     /// chip, visible/editable/removable, composable with globs. Falls back to an unscoped open for
     /// scratch buffers or files outside every root. (Grep's `Space Alt-/` is the unrelated
     /// [`Session::open_grep_from_selection`].)
-    pub fn open_files_in_buffer_dir(&mut self) -> Effects {
+    pub fn open_files_in_file_dir(&mut self) -> Effects {
         let seed = self
             .view
             .buffer
@@ -5418,7 +5424,7 @@ impl Session {
                 },
             }),
             // A file-backed buffer opens by path, like a Files row.
-            PickerItem::Buffer {
+            PickerItem::View {
                 path_index: Some(pi),
                 relative_path: Some(rel),
                 ..
@@ -5430,12 +5436,12 @@ impl Session {
                     at: None,
                 },
             }),
-            // A scratch buffer (no path) re-opens by id against the shared daemon — but only when the
-            // workspace is CLI-addressable (the new `ae` must activate it before `buffer/open`-by-id).
-            PickerItem::Buffer { buffer_id, .. } => here.map(|ws| WindowTarget {
+            // A scratch (no path) re-opens by view id against the shared daemon — but only when the
+            // workspace is CLI-addressable (the new `ae` must activate it before the open).
+            PickerItem::View { view_id, .. } => here.map(|ws| WindowTarget {
                 workspace: Some(ws),
                 worktrees: mine,
-                open: WindowOpen::Buffer(*buffer_id),
+                open: WindowOpen::View(*view_id),
             }),
             // An explorer *file* (a directory navigates within the picker instead). The listing dir
             // is absolute, so join the leaf name for the absolute path.
@@ -5592,7 +5598,7 @@ impl Session {
             } => {
                 // The row *is* the revision, so this needs no resolution: `git/show` materialises
                 // the commit as a read-only virtual buffer and the result adopts exactly like a
-                // `buffer/open` (same shape), so the picker closes onto the diff.
+                // `view/open` (same shape), so the picker closes onto the diff.
                 //
                 // From a *file's* history the row also names that file, and the cursor lands on its
                 // changes — you asked about one path, not about everything the commit touched.
@@ -5886,18 +5892,18 @@ impl Session {
             {
                 return self.picker_stage_delete();
             }
-            // Ctrl-d in the Buffers picker closes the highlighted row in place (no open) — a live
+            // Ctrl-d in the view picker closes the highlighted row in place (no open) — a live
             // buffer or a dormant (session-restored) one alike, the server resolves which. It shares
-            // the `Ctrl-d` key with the delete-file gesture above but not the kind (Buffers vs
+            // the `Ctrl-d` key with the delete-file gesture above but not the kind (Views vs
             // Files/Explorer/Workspaces), so the two guards stay disjoint; closing a buffer just
             // drops it from the list, it doesn't delete anything on disk. The picker stays open (see
-            // `picker_close_buffer`). NOT `Ctrl-x` (tempting for the `Space x` mnemonic): every GUI
+            // `picker_close_view`). NOT `Ctrl-x` (tempting for the `Space x` mnemonic): every GUI
             // shell's focused query input claims Ctrl-x as its native Cut and swallows it before the
             // core ever sees it — the iced forward gate in `app.rs` only forwards keys the input left
             // uncaptured, and the web `routeOverlayKey` clip filter drops Ctrl-c/v/x/a outright. Only
             // the TUI (which forwards every Ctrl chord) would see it. Ctrl-d dodges all three.
             // GitBranches: Ctrl-d deletes the highlighted branch behind a confirm — the same
-            // gesture Explorer/Files/Workspaces and Buffers use for "remove the highlighted thing".
+            // gesture Explorer/Files/Workspaces and Views use for "remove the highlighted thing".
             KeyCode::Char('d') if mods.ctrl && p.kind == PickerKind::GitBranches => {
                 let Some(PickerItem::GitBranch {
                     repo_id,
@@ -6065,9 +6071,9 @@ impl Session {
                 });
                 return Effects::none();
             }
-            KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Buffers => {
-                let fx = self.observe_picker_cmd(PickerCmd::CloseBuffer);
-                return fx.and(self.picker_close_buffer());
+            KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Views => {
+                let fx = self.observe_picker_cmd(PickerCmd::CloseView);
+                return fx.and(self.picker_close_view());
             }
             // Ctrl-j: capture the picker's filtered results into the jumplist and jump to the
             // highlighted row — `]`/`[` then step the captured set. Position-shaped kinds only
@@ -6587,7 +6593,7 @@ impl Session {
                 Event::WorkspaceActivated(r.and_then(|a| {
                     a.opened
                         .map(|open| (a.workspace, open))
-                        .ok_or_else(|| "open_path returned no buffer".into())
+                        .ok_or_else(|| "open_path returned no view".into())
                 }))
             },
         )
@@ -6775,20 +6781,25 @@ impl Session {
                 }
                 Effects::none()
             }
+            aether_protocol::view::ViewState::NAME => {
+                // Transience is the view's, so it arrives addressed by view id: a file's reader
+                // and its editor are kept and dropped independently, and only the view this
+                // client presents has an answer we can apply.
+                if let Ok(p) = serde_json::from_value::<ViewStateParams>(n.params) {
+                    if p.view_id == self.view.view_id {
+                        self.view.view_transient = p.transient;
+                    }
+                }
+                Effects::none()
+            }
             BufferState::NAME => {
                 let Ok(p) = serde_json::from_value::<BufferStateParams>(n.params) else {
                     return Effects::none();
                 };
-                // A push about the view's *own* document — which for a composed view is not the
-                // focused buffer — still moves the view's transient flag.
-                if p.buffer_id == self.view.view_id.presenting_buffer() {
-                    self.view.view_transient = p.transient;
-                }
                 if p.buffer_id != self.view.buffer.buffer_id {
                     return Effects::none();
                 }
                 self.view.buffer.saved_revision = p.saved_revision;
-                self.view.buffer.transient = p.transient;
                 // A save-as renames the shared buffer; follow it — adopt the new path and re-derive
                 // the label. Only on an actual change, so in-place save/reload pushes are no-ops
                 // (and a legacy server omitting `path` never clobbers our label).
@@ -6809,7 +6820,7 @@ impl Session {
                 if !was_external && p.externally_deleted {
                     Effects::toast_grouped_detail(
                         "File removed on disk",
-                        "Save to recreate it, or close the buffer",
+                        "Save to recreate it, or close the view",
                         ToastKind::Warning,
                         group,
                     )
@@ -6945,20 +6956,23 @@ impl Session {
                 }
                 restart_toast.map_or_else(Effects::none, Effects::one)
             }
-            BufferClosed::NAME => {
-                // Another client (or a path/workspace deletion) closed a buffer; if it's ours,
-                // switch to the server-indicated next buffer (or a fresh scratch).
-                let Ok(p) = serde_json::from_value::<BufferClosedParams>(n.params) else {
+            ViewClosed::NAME => {
+                // Another client (or a path/workspace deletion) closed a view; if it's ours,
+                // switch to the server-indicated next view (or a fresh scratch).
+                let Ok(p) = serde_json::from_value::<ViewClosedParams>(n.params) else {
                     return Effects::none();
                 };
-                // The tether closed out from under us: this client's job is over, however the close
-                // happened (the future `ae --web file` waiter rides this).
-                if self.tether == Some(p.buffer_id) {
-                    return Effects::one(Effect::Exit);
+                // The buffer went with the view when the view was its last. The tether closed out
+                // from under us: this client's job is over, however the close happened (the
+                // future `ae --web file` waiter rides this). And however it went, the message
+                // buffer is gone — so is the commit it was for.
+                if let Some(buffer_id) = p.buffer_id {
+                    if self.tether == Some(buffer_id) {
+                        return Effects::one(Effect::Exit);
+                    }
+                    self.forget_commit_buffer(buffer_id);
                 }
-                // However it went, the message buffer is gone — so is the commit it was for.
-                self.forget_commit_buffer(p.buffer_id);
-                if p.buffer_id != self.view.buffer.buffer_id {
+                if p.view_id != self.view.view_id {
                     return Effects::none();
                 }
                 let moved = std::mem::take(&mut self.workspace_moved_under_us);
@@ -6968,15 +6982,15 @@ impl Session {
                     // describing a problem that isn't one.
                     Effects::none()
                 } else {
-                    Effects::toast("Buffer closed by another client", ToastKind::Warning)
+                    Effects::toast("View closed by another client", ToastKind::Warning)
                 };
 
                 // In an ephemeral context, don't fall back to a fresh scratch when nothing remains
-                // — leave the context, same as closing it ourselves (see `close_buffer`). This is
+                // — leave the context, same as closing it ourselves (see `close_view`). This is
                 // the multi-client case: another client closed the shared external file we were
                 // both viewing, and there's no other buffer in this throwaway context to land on.
                 if aether_protocol::is_ephemeral_workspace_id(&self.workspace)
-                    && p.next_buffer_id.is_none()
+                    && p.next_view_id.is_none()
                 {
                     return fx.and(self.leave_ephemeral_workspace());
                 }
@@ -6985,15 +6999,17 @@ impl Session {
                 // same file on the new tree, and a path is the only stable way to say that — the
                 // id it could offer is a dormant placeholder the initiating client's own landing
                 // buffer may already have materialised under a different id.
-                let (buffer_id, path_index, relative_path) = match p.next_path {
+                let (view_id, path_index, relative_path) = match p.next_path {
                     Some(loc) => (None, Some(loc.path_index), Some(loc.relative_path)),
-                    None => (p.next_buffer_id, None, None),
+                    None => (p.next_view_id, None, None),
                 };
-                fx.and(self.request::<BufferOpen>(
-                    BufferOpenParams {
-                        buffer_id,
+                fx.and(self.request::<ViewOpen>(
+                    ViewOpenParams {
+                        view_id,
                         path_index,
                         relative_path,
+                        // Nothing left to land on: a placeholder, not a scratch to keep.
+                        transient: (view_id.is_none() && path_index.is_none()).then_some(true),
                         ..Default::default()
                     },
                     move |__r| Event::Switched(__r.map_err(|e| e.message)),
@@ -7002,13 +7018,13 @@ impl Session {
             aether_protocol::workspace::WorkspaceChanged::NAME => {
                 // Another client changed the shape of the workspace we are standing in — today,
                 // by rebinding a worktree, which moves every root at once. Adopt it before the
-                // `buffer/closed` that follows makes us open something under the new roots: paths
+                // `view/closed` that follows makes us open something under the new roots: paths
                 // are rendered against this list, so a stale one mislabels everything it resolves.
                 let Ok(info) = serde_json::from_value::<WorkspaceInfo>(n.params) else {
                     return Effects::none();
                 };
                 self.sync_workspace_info(info);
-                // The `buffer/closed` pushes that follow a shape change are not "another client
+                // The `view/closed` pushes that follow a shape change are not "another client
                 // closed your file" — the workspace moved and took its buffers with it. Consumed by
                 // the next close so it words itself correctly. One-shot and best-effort: a shape
                 // change that closes nothing leaves it set, which at worst silences one later
@@ -7493,7 +7509,7 @@ impl Session {
     /// directory (`path/delete`), or forget a workspace (`workspace/delete`) from the switcher. The
     /// absolute path comes from the picker's listed directory (Explorer) or the entry's workspace
     /// root (Files). The picker stays open under the confirm; the refreshed listing arrives via a
-    /// `buffer/closed` / `picker/update` push.
+    /// `view/closed` / `picker/update` push.
     pub fn picker_stage_delete(&mut self) -> Effects {
         // A highlighted workspace: the server refuses to delete the active one (the rug-pull guard),
         // so don't even stage a doomed confirm — say why and bail.
@@ -7557,19 +7573,20 @@ impl Session {
         Effects::none()
     }
 
-    /// `Ctrl-d` in the Buffers picker: close the highlighted buffer without opening it. Unsaved
-    /// buffers go through a discard confirm first (mirroring the editor's own close); clean and
-    /// externally-changed buffers (no in-buffer edits to lose) close straight away. The picker stays
-    /// open and re-lists from the server's `picker/update` push.
-    pub fn picker_close_buffer(&mut self) -> Effects {
+    /// `Ctrl-d` in the view picker: close the highlighted view without opening it. A view whose
+    /// text is unsaved goes through a discard confirm first (mirroring the editor's own close);
+    /// clean and externally-changed ones (no in-buffer edits to lose) close straight away. The
+    /// picker stays open and re-lists from the server's `picker/update` push.
+    pub fn picker_close_view(&mut self) -> Effects {
         let Some(p) = &self.picker else {
             return Effects::none();
         };
-        if p.kind != PickerKind::Buffers {
+        if p.kind != PickerKind::Views {
             return Effects::none();
         }
-        let Some(PickerItem::Buffer {
+        let Some(PickerItem::View {
             buffer_id,
+            view_id,
             status,
             display,
             ..
@@ -7577,44 +7594,42 @@ impl Session {
         else {
             return Effects::none();
         };
-        let buffer_id = *buffer_id;
+        let (buffer_id, view_id) = (*buffer_id, *view_id);
         if matches!(status, BufferDirtyState::Unsaved) {
             self.prompt = Some(Prompt::Confirm {
                 kind: ConfirmKind::DiscardOnClose {
                     label: display.clone(),
                 },
-                action: ConfirmAction::ClosePickerBuffer { buffer_id },
+                action: ConfirmAction::ClosePickerView { buffer_id, view_id },
             });
             return Effects::none();
         }
-        self.close_picker_buffer(buffer_id)
+        self.close_picker_view(buffer_id, view_id)
     }
 
-    /// Fire `buffer/close` for a buffer chosen in the picker. `open_next` is set only when the
+    /// Fire `view/close` for a buffer chosen in the picker. `open_next` is set only when the
     /// closed buffer is the editor's active one — then the server attaches the viewport to the next
     /// MRU buffer (or a fresh scratch) and we adopt it; closing a background buffer leaves the editor
     /// untouched. Either way the picker stays open and re-lists from the server's refresh push (the
     /// switch doesn't tear it down — see [`Self::adopt_switch`]). Closing the
     /// [tether](Session::tether) — active or backgrounded — exits the client instead, like every
     /// other close path.
-    fn close_picker_buffer(&mut self, buffer_id: BufferId) -> Effects {
-        // The row came from the Buffers picker, which lists views — so this id names a view. It
-        // arrives as a raw `BufferId` because `ConfirmAction` carries it through a round trip; the
-        // crossing is spelled at each use rather than retyping that enum here.
-        let view_id = ViewId(buffer_id);
+    fn close_picker_view(&mut self, buffer_id: BufferId, view_id: ViewId) -> Effects {
+        // The row names its view — the one closing addresses — and its buffer, which is what the
+        // tether is.
         if self.tether == Some(buffer_id) {
-            return self.request_str::<BufferClose>(
-                BufferCloseParams {
-                    buffer_id: view_id,
+            return self.request_str::<ViewClose>(
+                ViewCloseParams {
+                    view_id,
                     open_next: false,
                 },
                 |r| Event::TetherClosed(r.map(|_| ())),
             );
         }
         let closing_active = view_id == self.view.view_id;
-        self.request_str::<BufferClose>(
-            BufferCloseParams {
-                buffer_id: view_id,
+        self.request_str::<ViewClose>(
+            ViewCloseParams {
+                view_id,
                 open_next: closing_active,
             },
             move |r| {
@@ -7622,7 +7637,7 @@ impl Session {
                     Event::Switched(r.and_then(|closed| {
                         closed
                             .opened
-                            .ok_or_else(|| "buffer/close returned no successor".into())
+                            .ok_or_else(|| "view/close returned no successor".into())
                     }))
                 } else {
                     // Background buffer: nothing to adopt — the picker refresh rides a separate push.
@@ -7674,7 +7689,7 @@ impl Session {
         // File: address it under a workspace root, then open with create-on-save. Creating a
         // file is a terminal pick — you land in the new buffer — so drop the explorer first
         // (`Event::Switched`'s adopt deliberately leaves pickers open, which is right for the
-        // Buffers picker's close-and-relist but would strand the explorer over the new file).
+        // view picker's close-and-relist but would strand the explorer over the new file).
         // Creating a *directory* instead steps into it and keeps exploring, and the
         // outside-roots refusal above keeps the explorer up so the name can be fixed.
         let Some((path_index, relative_path)) = strip_longest_root(&abs, &self.workspace_paths)
@@ -7686,8 +7701,8 @@ impl Session {
         };
         let from = self.view.buffer.buffer_id;
         let hide = self.close_picker();
-        hide.and(self.request_str::<BufferOpen>(
-            BufferOpenParams {
+        hide.and(self.request_str::<ViewOpen>(
+            ViewOpenParams {
                 path_index: Some(path_index),
                 relative_path: Some(relative_path),
                 create_if_missing: true,
@@ -8445,8 +8460,8 @@ impl Session {
         let right = code == KeyCode::Right || (mods.alt && code == KeyCode::Char('l'));
         if left || right {
             return match self.app_setting_rows().get(selected).map(|r| r.id) {
-                Some(AppSettingId::BufferFontSize) => {
-                    self.set_buffer_font_size(step_font_size(self.buffer_font_size, right, false))
+                Some(AppSettingId::EditorFontSize) => {
+                    self.set_editor_font_size(step_font_size(self.editor_font_size, right, false))
                 }
                 Some(AppSettingId::UiFontSize) => {
                     self.set_ui_font_size(step_font_size(self.ui_font_size, right, false))
@@ -8491,7 +8506,7 @@ impl Session {
         // Both font sizes are likewise client-side: the GUI/web shells read them each render — the
         // buffer size re-measures the cell + reflows, the UI size rescales the chrome (the terminal
         // ignores both). Adopting the values is enough; the re-render after this event applies them.
-        self.buffer_font_size = settings.buffer_font_size;
+        self.editor_font_size = settings.editor_font_size;
         self.ui_font_size = settings.ui_font_size;
         // Hints likewise: the engine reads the flag before observing/sampling, and the shells stop
         // rendering the corner hint when it's off.
@@ -8556,8 +8571,8 @@ impl Session {
             // Font sizes: activating either row cycles to the next preset (wrapping). Like ligatures
             // they're shell-render-only — set the value + persist, and the GUI/web re-render applies
             // it. `step` lets the Left/Right keys pass a non-wrapping direction.
-            AppSettingId::BufferFontSize => {
-                self.set_buffer_font_size(step_font_size(self.buffer_font_size, true, true))
+            AppSettingId::EditorFontSize => {
+                self.set_editor_font_size(step_font_size(self.editor_font_size, true, true))
             }
             AppSettingId::UiFontSize => {
                 self.set_ui_font_size(step_font_size(self.ui_font_size, true, true))
@@ -8565,7 +8580,7 @@ impl Session {
             // Hints: same flip (and toast) as `Space Alt-h`.
             AppSettingId::Hints => self.toggle_hints(),
             // Markdown reading view default: applies to files never presented (the server
-            // remembers how each file was last shown; `Space v` re-presents without touching the
+            // remembers how each file was last shown; `Space u` re-presents without touching the
             // setting). Flip + persist.
             AppSettingId::MarkdownRead => {
                 self.markdown_read_default = !self.markdown_read_default;
@@ -8626,7 +8641,7 @@ impl Session {
         AppSettings {
             wrap: self.wrap,
             ligatures: self.ligatures,
-            buffer_font_size: self.buffer_font_size,
+            editor_font_size: self.editor_font_size,
             ui_font_size: self.ui_font_size,
             hints: self.hints_enabled,
             markdown_read: self.markdown_read_default,
@@ -8645,13 +8660,13 @@ impl Session {
     }
 
     /// Persist a new buffer text size + apply it (the GUI/web re-render reads
-    /// `self.buffer_font_size`, re-measures its cell and reflows). No-op when unchanged. Shared by
+    /// `self.editor_font_size`, re-measures its cell and reflows). No-op when unchanged. Shared by
     /// the row's activate-cycle and the Left/Right stepper.
-    fn set_buffer_font_size(&mut self, font_size: u32) -> Effects {
-        if font_size == self.buffer_font_size {
+    fn set_editor_font_size(&mut self, font_size: u32) -> Effects {
+        if font_size == self.editor_font_size {
             return Effects::none();
         }
-        self.buffer_font_size = font_size;
+        self.editor_font_size = font_size;
         self.persist_app_settings()
     }
 
@@ -8867,8 +8882,10 @@ impl Session {
             ),
             ConfirmAction::AbandonOperation { buffer_id } => self.abort_operation(buffer_id),
             ConfirmAction::ReloadDiscard => self.reload(true),
-            ConfirmAction::CloseDiscard => self.close_buffer(),
-            ConfirmAction::ClosePickerBuffer { buffer_id } => self.close_picker_buffer(buffer_id),
+            ConfirmAction::CloseDiscard => self.close_view(),
+            ConfirmAction::ClosePickerView { buffer_id, view_id } => {
+                self.close_picker_view(buffer_id, view_id)
+            }
             ConfirmAction::DeletePath { path, noun } => self
                 .request_str::<PathDelete>(PathDeleteParams { path }, move |result| {
                     Event::PathDeleted { noun, result }
@@ -9894,7 +9911,7 @@ impl Session {
             A::Reload => {
                 if self.view.buffer.path.is_none() {
                     return Effects::toast_detail(
-                        "Scratch buffer has no path",
+                        "A scratch has no path",
                         "There's nothing on disk to reload",
                         ToastKind::Warning,
                     );
@@ -9914,9 +9931,10 @@ impl Session {
                             ToastKind::Warning,
                         );
                     }
-                    return self.request_str::<BufferSetTransient>(
-                        BufferSetTransientParams {
-                            buffer_id,
+                    let view_id = self.view.view_id;
+                    return self.request_str::<ViewSetTransient>(
+                        ViewSetTransientParams {
+                            view_id,
                             transient: true,
                         },
                         |r| Event::TetherReleased(r.map(|res| res.transient)),
@@ -9940,9 +9958,9 @@ impl Session {
                 if target && dirty {
                     return Effects::none();
                 }
-                self.request_str::<BufferSetTransient>(
-                    BufferSetTransientParams {
-                        buffer_id: self.view.view_id.presenting_buffer(),
+                self.request_str::<ViewSetTransient>(
+                    ViewSetTransientParams {
+                        view_id: self.view.view_id,
                         transient: target,
                     },
                     |r| Event::KeepToggled(r.map(|res| res.transient)),
@@ -9954,15 +9972,15 @@ impl Session {
             A::NewScratch => {
                 // Opening a fresh scratch is a buffer switch — record the origin so Alt-Left
                 // returns (folded into the open's `record_nav_from`).
-                self.request_str::<BufferOpen>(
-                    BufferOpenParams {
+                self.request_str::<ViewOpen>(
+                    ViewOpenParams {
                         record_nav_from: Some(buffer_id),
                         ..Default::default()
                     },
                     Event::Switched,
                 )
             }
-            A::CloseBuffer => {
+            A::CloseView => {
                 // The whole **view**, not just the element under the cursor. A composed view holds
                 // several documents, and asking only about the focused one meant closing a
                 // working-changes view with unsaved edits in a hunk you had scrolled past went
@@ -9988,7 +10006,7 @@ impl Session {
                     return Effects::none();
                 }
 
-                self.close_buffer()
+                self.close_view()
             }
             // Spawning the new process is irreducibly shell-side (and GUI-only) — the shell reads
             // the workspace/path from its session and detaches a sibling `ae --gui`. The core just
@@ -10165,13 +10183,13 @@ impl Session {
                     if pending.buffer_id == self.view.buffer.buffer_id {
                         return Effects::toast_detail(
                             "Already writing this commit",
-                            "Close the buffer to commit",
+                            "Close the view to commit",
                             ToastKind::Info,
                         );
                     }
-                    let mut fx = self.request_str::<BufferOpen>(
-                        BufferOpenParams {
-                            buffer_id: Some(pending.buffer_id),
+                    let mut fx = self.request_str::<ViewOpen>(
+                        ViewOpenParams {
+                            view_id: Some(pending.view_id),
                             record_nav_from: Some(self.view.buffer.buffer_id),
                             ..Default::default()
                         },
@@ -10201,7 +10219,7 @@ impl Session {
             // ---- pickers ----
             A::OpenPicker(PickerKind::Explorer) => self.open_explorer(false),
             A::OpenPicker(kind) => self.open_picker(kind, None, None, false, None),
-            A::OpenFilesInBufferDir => self.open_files_in_buffer_dir(),
+            A::OpenFilesInFileDir => self.open_files_in_file_dir(),
             A::OpenGrepFromSelection => self.open_grep_from_selection(),
             A::OpenExplorerAtRoot => self.open_explorer(true),
 
@@ -10211,9 +10229,9 @@ impl Session {
             //
             // **Composed view, cursor in a bound element** — the element windows a real file and the
             // cursor is already inside that file's document, so the most-wanted destination is the
-            // file itself: promote it to its own view. No new operation is needed for that, which is
-            // the pleasant part — the buffer is open, the cursor is in it, so opening it *as the
-            // view* is an ordinary `buffer/open`. The test is structural rather than a kind flag:
+            // file itself: promote it to its own view. That is an ordinary `view/open`, naming this
+            // view and the element — the file is named through the view because a file at a
+            // revision has no path of its own. The test is structural rather than a kind flag:
             // "the buffer I am editing is not the one I opened" is exactly what composed means.
             //
             // This spends `Enter` on the file rather than on go-to-definition, knowingly. Inside a
@@ -10221,14 +10239,15 @@ impl Session {
             // language server), which is what makes the trade affordable — `Enter` twice gets you
             // there, and `Ctrl-Enter` is not available as a shortcut because it already means
             // "activate in a new window" in the reading view.
-            A::Activate if self.view.buffer.buffer_id != self.view.view_id.presenting_buffer() => {
+            A::Activate if self.view.buffer.buffer_id != self.view.view_buffer => {
                 // Not transient: you asked for this file, so it stays. `record_nav_from` is the
                 // view, so `Backspace` returns to the review rather than to the file you were
                 // already in.
-                let from = self.view.view_id.presenting_buffer();
-                self.request_str::<BufferOpen>(
-                    BufferOpenParams {
-                        buffer_id: Some(self.view.buffer.buffer_id),
+                let from = self.view.view_buffer;
+                self.request_str::<ViewOpen>(
+                    ViewOpenParams {
+                        view_id: Some(self.view.view_id),
+                        element: Some(self.view.focused_element),
                         record_nav_from: Some(from),
                         ..Default::default()
                     },
@@ -10343,7 +10362,7 @@ impl Session {
         }
     }
 
-    /// Toggle the reading view on the current buffer (`Space v`): ask the server for the other
+    /// Toggle the reading view on the current buffer (`Space u`): ask the server for the other
     /// kind, which it remembers for the file. Non-markdown buffers toast instead.
     fn toggle_read_view(&mut self) -> Effects {
         if self.view.buffer.language.as_deref() != Some("markdown") {
@@ -10359,9 +10378,9 @@ impl Session {
             // then captured has the cursor on screen, and the editor opens showing it: what
             // leaving the reader always did.
             return Effects::one(Effect::RevealCursor(RevealStyle::Jump))
-                .and(self.represent_as(aether_protocol::ui::ViewKind::Editor));
+                .and(self.open_sibling(aether_protocol::ui::ViewKind::Editor));
         }
-        self.represent_as(aether_protocol::ui::ViewKind::Reader)
+        self.open_sibling(aether_protocol::ui::ViewKind::Reader)
     }
 
     /// Step the reading focus (`j`/`k`, `Tab`, `o` — the predicate picks the element class) and
@@ -10545,8 +10564,8 @@ impl Session {
     }
 
     /// Leave the reading view for the editor, locally and at once — the caller sets the
-    /// destination mode, and asks the server for the editor with [`Self::represent_as`], or the
-    /// next pushed window would bring the reading view straight back.
+    /// destination mode, and asks for the editor's view with [`Self::open_sibling`], or the next
+    /// pushed window would bring the reading view straight back.
     fn read_exit_for_edit(&mut self) {
         self.view.read = None;
         if self.view.mode == Mode::Read {
@@ -10584,7 +10603,7 @@ impl Session {
         };
         self.read_exit_for_edit();
         self.view.mode = Mode::Insert;
-        let fx = self.represent_as(aether_protocol::ui::ViewKind::Editor);
+        let fx = self.open_sibling(aether_protocol::ui::ViewKind::Editor);
         fx.and(match target {
             Some(position) => self.move_motion(Motion::Goto { position }, false),
             None => self.enter_insert_at(if at_end {
@@ -10623,7 +10642,7 @@ impl Session {
         self.read_exit_for_edit();
         self.view.mode = Mode::Insert;
         let buffer_id = self.view.buffer.buffer_id;
-        self.represent_as(aether_protocol::ui::ViewKind::Editor)
+        self.open_sibling(aether_protocol::ui::ViewKind::Editor)
             .and(self.request_str::<CursorSet>(
                 CursorSetParams {
                     buffer_id,
@@ -10961,7 +10980,7 @@ impl Session {
     }
 
     /// Land an in-document *jump* — an anchor or footnote follow — as a nav-recorded move:
-    /// re-open the current buffer with `record_nav_from` + `jump_to`, the same `buffer/open`
+    /// re-open the current buffer with `record_nav_from` + `jump_to`, the same `view/open`
     /// composite cross-file follows and goto-definition ride, so `Backspace` returns. The
     /// same-buffer open is "a move, not a switch": nothing is discarded client- or
     /// server-side (see `adopt_navigation` and the handler's already-open branch), and jumps
@@ -11075,8 +11094,13 @@ impl Session {
         };
         match self.read_resolve_path(path_part) {
             Some(path) => {
-                // Set *after* the open — `open_path_at` clears any stale anchor at entry.
-                let fx = self.open_path_at(path, None, None);
+                // An anchor asks for the reader outright: only a rendered document can land a
+                // heading slug, whatever the file was last shown as. Set *after* the open —
+                // `open_path_as` clears any stale anchor at entry.
+                let kind = fragment
+                    .is_some()
+                    .then_some(aether_protocol::ui::ViewKind::Reader);
+                let fx = self.open_path_as(path, None, None, kind);
                 self.pending_read_anchor = fragment;
                 fx
             }
@@ -11587,12 +11611,12 @@ fn pull_summary(result: &GitPullResult) -> (String, String) {
     let mut detail = String::new();
     let moved = result.refreshed.reloaded.len();
     if moved > 0 {
-        detail.push_str(&format!("Reloaded {moved} buffer(s)"));
+        detail.push_str(&format!("Reloaded {moved} file(s)"));
     }
     if !result.refreshed.missing.is_empty() {
         let gone = result.refreshed.missing.len();
         if detail.is_empty() {
-            detail.push_str(&format!("{gone} buffer(s) now gone"));
+            detail.push_str(&format!("{gone} file(s) now gone"));
         } else {
             detail.push_str(&format!(", {gone} now gone"));
         }
@@ -11621,7 +11645,7 @@ fn lsp_readiness_message(readiness: LspReadiness) -> Option<(&'static str, &'sta
         // The body is the part that saves a trip: each of these has a different cause, and only
         // one of them is worth waiting out.
         LspReadiness::NoServer => Some((
-            "No language server for this buffer",
+            "No language server for this file",
             "Aether has no server configured for this language",
         )),
         LspReadiness::Starting => Some((
@@ -11690,50 +11714,46 @@ mod tests {
         }
     }
 
-    /// A link anchor decides the subscribe: `[x](./other.md#section)` lands in the reading view
+    /// A link anchor decides the open: `[x](./other.md#section)` asks for the reader outright,
     /// whatever the file was last shown as, because a heading slug only resolves against the
-    /// rendered document — landing in the editor would silently drop it. A jump-shaped open asks
-    /// for the editor the same way; a plain open asks for nothing and takes the server's answer.
+    /// rendered document — landing in the editor would silently drop it. A plain link asks for
+    /// nothing and takes the server's answer.
     #[test]
-    fn the_route_decides_what_a_switch_asks_for() {
-        use aether_protocol::ui::ViewKind;
+    fn a_followed_anchor_asks_for_the_reader() {
         let mut s = reading_session();
-        let _ = s.read_follow_link("./other.md#section-two");
+        let fx = s.read_follow_link("./other.md#section-two");
+        let open =
+            fx.0.iter()
+                .find_map(|e| match e {
+                    Effect::Request { method, params, .. } if *method == "view/open" => {
+                        Some(params.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the link target opens");
+        assert_eq!(open["kind"], serde_json::json!("reader"));
         assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
 
-        // The open lands on a markdown buffer: the armed anchor asks for the reader.
-        s.view.buffer.buffer_id += 1;
-        s.view.buffer.language = Some("markdown".into());
-        s.open_route_jumped = true; // …and outranks a jump-shaped route
-        s.sync_presentation_on_switch();
-        assert_eq!(s.subscribe_kind(), Some(ViewKind::Reader));
-        assert!(
-            s.view.read.is_none(),
-            "the view is fresh until its window arrives"
-        );
-        assert!(s.pending_read_anchor.is_some(), "still armed for the parse");
-
-        // A jump-shaped open asks for the editor.
         let mut s = reading_session();
-        s.view.buffer.language = Some("markdown".into());
-        s.open_route_jumped = true;
-        s.sync_presentation_on_switch();
-        assert_eq!(s.subscribe_kind(), Some(ViewKind::Editor));
-        assert!(!s.open_route_jumped, "one-shot");
+        let fx = s.read_follow_link("./plain.md");
+        let open =
+            fx.0.iter()
+                .find_map(|e| match e {
+                    Effect::Request { method, params, .. } if *method == "view/open" => {
+                        Some(params.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the link target opens");
+        assert!(open.get("kind").is_none(), "no anchor, no opinion");
 
-        // A plain open asks for nothing: the server presents the file as it last was.
-        let mut s = reading_session();
-        s.view.buffer.language = Some("markdown".into());
-        s.sync_presentation_on_switch();
-        assert_eq!(s.subscribe_kind(), None);
-
-        // A non-markdown target drops the anchor: nothing could land it.
+        // A switch to a non-markdown target drops a pending anchor: nothing could land it.
         let mut s = reading_session();
         let _ = s.read_follow_link("./other.md#section-two");
         s.view.buffer.language = Some("rust".into());
-        s.sync_presentation_on_switch();
-        assert_eq!(s.subscribe_kind(), None);
+        s.sync_read_anchor_on_switch();
         assert_eq!(s.pending_read_anchor, None);
+        assert!(s.view.read.is_none());
     }
 
     /// The reading view is a consequence of the window: an element the client lays out puts the
@@ -11799,7 +11819,7 @@ mod tests {
         let fx = s.read_follow_link("./other.md#section-two");
         assert!(
             fx.0.iter()
-                .any(|e| matches!(e, Effect::Request { method, .. } if *method == "buffer/open")),
+                .any(|e| matches!(e, Effect::Request { method, .. } if *method == "view/open")),
             "the link target opens"
         );
         assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
@@ -11907,12 +11927,12 @@ mod tests {
         let open =
             fx.0.iter()
                 .find_map(|e| match e {
-                    Effect::Request { method, params, .. } if *method == "buffer/open" => {
+                    Effect::Request { method, params, .. } if *method == "view/open" => {
                         Some(params.clone())
                     }
                     _ => None,
                 })
-                .expect("an in-document anchor rides buffer/open");
+                .expect("an in-document anchor rides view/open");
         assert_eq!(
             open["record_nav_from"],
             serde_json::json!(s.view.buffer.buffer_id),
@@ -11957,7 +11977,7 @@ mod tests {
         let fx = s.read_follow_link("/other.md#section-two");
         assert!(
             fx.0.iter()
-                .any(|e| matches!(e, Effect::Request { method, .. } if *method == "buffer/open")),
+                .any(|e| matches!(e, Effect::Request { method, .. } if *method == "view/open")),
             "a root-relative link opens"
         );
         assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
@@ -12098,9 +12118,11 @@ mod tests {
     fn picker_item_target_reopens_a_scratch_buffer_by_id() {
         assert_eq!(
             target_of(
-                PickerKind::Buffers,
-                PickerItem::Buffer {
+                PickerKind::Views,
+                PickerItem::View {
                     buffer_id: 7,
+                    view_id: ViewId(7),
+                    view_kind: None,
                     display: "(scratch 1)".into(),
                     status: aether_protocol::picker::BufferDirtyState::default(),
                     path_index: None,
@@ -12113,7 +12135,7 @@ mod tests {
             Some(WindowTarget {
                 workspace: Some("proj".into()),
                 worktrees: Vec::new(),
-                open: WindowOpen::Buffer(7),
+                open: WindowOpen::View(ViewId(7)),
             })
         );
     }
@@ -12125,7 +12147,7 @@ mod tests {
                 PickerKind::Workspaces,
                 PickerItem::Workspace {
                     name: "other".into(),
-                    unsaved_buffers: 0,
+                    unsaved: 0,
                     match_indices: vec![],
                 },
                 0,
@@ -12299,17 +12321,18 @@ mod tests {
         );
     }
 
-    /// A scratch buffer has no path but is web-addressable as a `?buffer=` link (the same form
-    /// the web client's own picker share links use for scratches).
+    /// A scratch has no path but is web-addressable as a `?view=` link (the same form the web
+    /// client's own picker share links use for scratches).
     #[test]
-    fn copy_web_url_links_a_scratch_by_buffer_id() {
+    fn copy_web_url_links_a_scratch_by_view_id() {
         let mut s = web_url_session();
         s.view.buffer.path = None;
         s.view.buffer.buffer_id = 7;
+        s.view.view_id = ViewId(70);
         let fx = s.copy_web_url();
         assert_eq!(
             copied_web_url(&fx).as_deref(),
-            Some("?workspace=proj&buffer=7")
+            Some("?workspace=proj&view=70")
         );
     }
 

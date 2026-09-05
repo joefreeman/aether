@@ -222,7 +222,7 @@ pub const SCROLLBAR_INLINE_W: f32 = 3.0;
 
 /// Chrome sizing, derived from the `ui_font_size` app setting (`Space ,`). Every size in the chrome
 /// — status bar, pickers, dialogs, hover, toasts, hints — goes through here, so the whole UI scales
-/// as one knob. The buffer text is *not* chrome: it has its own setting (`buffer_font_size`) that
+/// as one knob. The buffer text is *not* chrome: it has its own setting (`editor_font_size`) that
 /// the editor widget reads directly.
 ///
 /// The hand-tuned literals the chrome was built from (13 body, 12 secondary, 14 heading, 24px picker

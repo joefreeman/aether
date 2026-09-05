@@ -25,8 +25,13 @@ use std::sync::Arc;
 /// `ServerState.buffers` + per-client MRU. The buffer set changes often enough that we don't
 /// pin an `Arc` snapshot like the file picker does — just rebuild.
 #[derive(Debug, Clone)]
-pub struct BufferCandidate {
+pub struct ViewCandidate {
     pub buffer_id: BufferId,
+    /// The row's view: what selecting the row presents and what closing it closes. A file's
+    /// editor and its reader are two rows sharing `buffer_id`.
+    pub view_id: aether_protocol::ViewId,
+    /// Which kind of view the row is — the badge. `None` for a driver's view and a dormant row.
+    pub view_kind: Option<aether_protocol::ui::ViewKind>,
     /// Display string used for both rendering and fuzzy matching. Workspace-relative for
     /// file-backed buffers; `(scratch N)` for scratch buffers.
     pub display: String,
@@ -51,11 +56,11 @@ pub struct WorkspaceCandidate {
     pub name: String,
     /// Open buffers in this workspace with unsaved edits, counted when the candidate is built.
     /// `0` for a workspace with no loaded/dirty buffers.
-    pub unsaved_buffers: u32,
+    pub unsaved: u32,
 }
 
 /// One explorer-picker entry. Children of the picker's `current_path` directory; rebuilt by
-/// each `picker/view` (Explorer always re-lists, like Buffers always rebuilds — directories
+/// each `picker/view` (Explorer always re-lists, like Views always rebuilds — directories
 /// can change underneath us and there's no point caching them).
 #[derive(Debug, Clone)]
 pub struct ExplorerEntry {
@@ -112,7 +117,7 @@ pub struct GrepHitCandidate {
     /// render without re-resolving against workspace roots on every push.
     pub relative_path: String,
     /// Absolute canonical path. Returned via `PickerSelectResult::FileAt` for the client to feed
-    /// into `buffer/open`.
+    /// into `view/open`.
     pub abs_path: String,
     /// 0-based line number within the file.
     pub line: u32,
@@ -140,7 +145,7 @@ pub struct GitChangeCandidate {
     pub path_index: u32,
     /// Path relative to `roots[path_index]` (forward-slash). The file-group key.
     pub relative_path: String,
-    /// Absolute path, returned via `PickerSelectResult::FileAt` for `buffer/open`.
+    /// Absolute path, returned via `PickerSelectResult::FileAt` for `view/open`.
     pub abs_path: String,
     /// Position of this hunk within its file's change list (0-based, anchor order).
     pub hunk_index: u32,
@@ -173,7 +178,8 @@ pub struct GitChangeCandidate {
 /// file header.
 #[derive(Debug, Clone)]
 pub struct PatchRowTarget {
-    pub buffer: BufferId,
+    /// The view the patch is presented in — the only address a row over generated text has.
+    pub view: aether_protocol::ViewId,
     /// The **same place, addressed as a real file line** — the element that windows it and the line
     /// within that element's buffer. `None` for a row over generated text with no file behind it (a
     /// deletion, a binary swap), which can only be addressed as a patch line.
@@ -630,7 +636,7 @@ impl From<KeybindingEntry> for KeybindingCandidate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchStrategy {
     /// Nucleo fuzzy match. Ranking is by score descending; match indices are the char
-    /// positions nucleo highlighted. Used by Files and Buffers.
+    /// positions nucleo highlighted. Used by Files and Views.
     Fuzzy,
     /// Smart-case prefix match. Natural candidate order preserved; match indices are the
     /// first N chars of the haystack (where N = query char count). Used by Explorer.
@@ -659,7 +665,7 @@ pub enum PickerCandidates {
         git_status: Arc<Vec<Option<aether_protocol::git::GitStatus>>>,
     },
     /// Open buffers in MRU order (most-recent first). Cheap to rebuild — small N, no I/O.
-    Buffers(Vec<BufferCandidate>),
+    Views(Vec<ViewCandidate>),
     /// Grep matches in walker + line order. Grows as the streaming search runs; rerank is a
     /// no-op (the query is the search, so the candidate set already *is* the match set).
     Grep(Vec<GrepHitCandidate>),
@@ -740,7 +746,7 @@ impl PickerCandidates {
     pub fn len(&self) -> usize {
         match self {
             PickerCandidates::Files { files, .. } => files.len(),
-            PickerCandidates::Buffers(v) => v.len(),
+            PickerCandidates::Views(v) => v.len(),
             PickerCandidates::Grep(v) => v.len(),
             PickerCandidates::Explorer(e) => e.entries.len(),
             PickerCandidates::ExplorerRoots(v) => v.len(),
@@ -769,7 +775,7 @@ impl PickerCandidates {
                 *files = Default::default();
                 *git_status = Default::default();
             }
-            PickerCandidates::Buffers(v) => v.clear(),
+            PickerCandidates::Views(v) => v.clear(),
             PickerCandidates::Grep(v) => v.clear(),
             PickerCandidates::Explorer(e) => e.entries.clear(),
             PickerCandidates::ExplorerRoots(v) => v.clear(),
@@ -792,7 +798,7 @@ impl PickerCandidates {
     pub fn kind(&self) -> PickerKind {
         match self {
             PickerCandidates::Files { .. } => PickerKind::Files,
-            PickerCandidates::Buffers(_) => PickerKind::Buffers,
+            PickerCandidates::Views(_) => PickerKind::Views,
             PickerCandidates::Grep(_) => PickerKind::Grep,
             PickerCandidates::Explorer(_) => PickerKind::Explorer,
             PickerCandidates::ExplorerRoots(_) => PickerKind::Explorer,
@@ -821,7 +827,7 @@ impl PickerCandidates {
     pub fn display_at(&self, idx: usize) -> &str {
         match self {
             PickerCandidates::Files { files, .. } => &files[idx].relative_path,
-            PickerCandidates::Buffers(v) => &v[idx].display,
+            PickerCandidates::Views(v) => &v[idx].display,
             PickerCandidates::Grep(v) => &v[idx].preview,
             PickerCandidates::Explorer(e) => &e.entries[idx].name,
             PickerCandidates::ExplorerRoots(v) => &v[idx].basename,
@@ -851,7 +857,7 @@ impl PickerCandidates {
     }
 
     /// Build the protocol-level `PickerItem` for candidate `idx`. `match_indices` is supplied by
-    /// the fuzzy matcher for Files/Buffers/Explorer/Workspaces and ignored for Grep (the candidate
+    /// the fuzzy matcher for Files/Views/Explorer/Workspaces and ignored for Grep (the candidate
     /// already carries the ripgrep-computed match positions, which we use verbatim).
     pub fn make_item(&self, idx: usize, match_indices: Vec<u32>) -> PickerItem {
         match self {
@@ -861,10 +867,12 @@ impl PickerCandidates {
                 match_indices,
                 git_status: git_status.get(idx).copied().flatten(),
             },
-            PickerCandidates::Buffers(v) => {
+            PickerCandidates::Views(v) => {
                 let c = &v[idx];
-                PickerItem::Buffer {
+                PickerItem::View {
                     buffer_id: c.buffer_id,
+                    view_id: c.view_id,
+                    view_kind: c.view_kind,
                     display: c.display.clone(),
                     status: c.status,
                     path_index: c.path.as_ref().map(|(i, _)| *i),
@@ -899,7 +907,7 @@ impl PickerCandidates {
             },
             PickerCandidates::Workspaces(v) => PickerItem::Workspace {
                 name: v[idx].name.clone(),
-                unsaved_buffers: v[idx].unsaved_buffers,
+                unsaved: v[idx].unsaved,
                 match_indices,
             },
             PickerCandidates::Diagnostics(v) => {
@@ -1088,8 +1096,8 @@ impl PickerCandidates {
             ) => files
                 .iter()
                 .position(|c| c.path_index == *path_index && c.relative_path == *relative_path),
-            (PickerCandidates::Buffers(v), PickerItem::Buffer { buffer_id, .. }) => {
-                v.iter().position(|c| c.buffer_id == *buffer_id)
+            (PickerCandidates::Views(v), PickerItem::View { view_id, .. }) => {
+                v.iter().position(|c| c.view_id == *view_id)
             }
             (
                 PickerCandidates::Grep(v),
@@ -1215,7 +1223,7 @@ impl PickerCandidates {
     pub fn match_strategy(&self) -> MatchStrategy {
         match self {
             PickerCandidates::Files { .. }
-            | PickerCandidates::Buffers(_)
+            | PickerCandidates::Views(_)
             | PickerCandidates::Workspaces(_)
             | PickerCandidates::Diagnostics(_)
             | PickerCandidates::LspServers(_)
@@ -1251,8 +1259,8 @@ impl PickerCandidates {
             PickerCandidates::Files { files, .. } => Some(PickerSelectResult::File {
                 path: files[idx].abs.clone(),
             }),
-            PickerCandidates::Buffers(v) => Some(PickerSelectResult::Buffer {
-                buffer_id: v[idx].buffer_id,
+            PickerCandidates::Views(v) => Some(PickerSelectResult::View {
+                view_id: v[idx].view_id,
             }),
             PickerCandidates::Grep(v) => {
                 let c = &v[idx];
@@ -1370,17 +1378,17 @@ impl PickerCandidates {
                     (Some(path), None) => PickerSelectResult::File {
                         path: path.to_string(),
                     },
-                    // Pathless *with* a position: a captured scratch buffer, or a change captured
-                    // from a patch — attached by id and jumped to. Dropping the position here made
+                    // Pathless *with* a position: a captured scratch, or a change captured from
+                    // a patch — presented by view id and jumped to. Dropping the position here made
                     // selecting one a plain attach, which the client discards outright when the
                     // buffer is the one already focused: the row did nothing at all.
-                    (None, Some(position)) => PickerSelectResult::BufferAt {
-                        buffer_id: e.target.buffer_id()?,
+                    (None, Some(position)) => PickerSelectResult::ViewAt {
+                        view_id: e.target.view_id()?,
                         position,
                     },
                     // Pathless whole-target: attach and land wherever the cursor last sat.
-                    (None, None) => PickerSelectResult::Buffer {
-                        buffer_id: e.target.buffer_id()?,
+                    (None, None) => PickerSelectResult::View {
+                        view_id: e.target.view_id()?,
                     },
                 })
             }
@@ -1414,8 +1422,8 @@ fn git_change_select(c: &GitChangeCandidate, re: Option<&regex::Regex>) -> Picke
                 open: None, // the view is the one on screen; nothing to reopen
             },
             // Generated text with no file behind it — the patch itself is the only address.
-            None => PickerSelectResult::BufferAt {
-                buffer_id: p.buffer,
+            None => PickerSelectResult::ViewAt {
+                view_id: p.view,
                 position,
             },
         },
