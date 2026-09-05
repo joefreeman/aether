@@ -196,41 +196,54 @@ export type ViewNode =
     };
 
 /** What the shell measured of an element it laid out itself — mirrors `grid::MeasuredElement`:
- *  the wire row of the first loaded line, the row within the element each loaded line starts on
- *  (the first is `first_row`; unloaded lines above count one row each), and the row after the last
- *  loaded line's rows. */
+ *  the wire row of the first loaded line, the offset within the element each loaded line starts
+ *  at (the first is `first_row` rows down; unloaded lines above count one row each), and the
+ *  offset after the last loaded line. Offsets are in the `Measured`'s units. */
 export interface MeasuredElement {
   first_row: number;
   starts: number[];
   end: number;
 }
 
-/** Per element, keyed by field id — mirrors `grid::Measured`. Empty while every element is
- *  server-laid-out, which is every element today. */
-export type Measured = Record<number, MeasuredElement>;
+/** Mirrors `grid::Measured`: the resolution every height and offset of the view's vertical layout
+ *  is counted in — `units_per_row` units make one row — and, per element keyed by field id, what
+ *  the shell measured of the elements it laid out itself. The terminal counts whole rows; this
+ *  shell counts thousandths of one, so a block of prose lands where it was drawn, while every row
+ *  the server laid out is exactly `units_per_row`. */
+export interface Measured {
+  units_per_row: number;
+  elements: Record<number, MeasuredElement>;
+}
+
+/** Whole rows, nothing measured — every shell's starting point. */
+export const WHOLE_ROWS: Measured = { units_per_row: 1, elements: {} };
 
 function measuredOf(n: ViewNode, measured: Measured): MeasuredElement | undefined {
-  return n.node === "editor" && n.laid_out_by === "client" ? measured[n.element] : undefined;
+  return n.node === "editor" && n.laid_out_by === "client"
+    ? measured.elements[n.element]
+    : undefined;
 }
 
-/** Rows an editor node occupies: the tree's count, or the measured height for one the client
- *  laid out — unloaded lines at one row each, loaded ones as measured. */
+/** Units an editor node occupies: the tree's row count at this resolution, or the measured
+ *  height for one the client laid out — unloaded lines at one row each, loaded ones as measured. */
 function editorHeight(n: ViewNode & { node: "editor" }, measured: Measured): number {
+  const unit = measured.units_per_row;
   const m = measuredOf(n, measured);
-  if (!m) return n.rows;
+  if (!m) return n.rows * unit;
   const loaded = m.starts.length;
   const before = m.first_row;
-  const measuredRows = Math.max(0, m.end - (m.starts[0] ?? before));
-  return before + measuredRows + Math.max(0, n.rows - before - loaded);
+  const measuredUnits = Math.max(0, m.end - (m.starts[0] ?? before * unit));
+  return before * unit + measuredUnits + Math.max(0, n.rows - before - loaded) * unit;
 }
 
-/** The row within an editor node that wire row `row` starts on. */
+/** The offset within an editor node that wire row `row` starts at. */
 export function offsetOf(n: ViewNode, row: number, measured: Measured): number {
+  const unit = measured.units_per_row;
   const m = measuredOf(n, measured);
-  if (!m) return row;
+  if (!m) return row * unit;
   const i = row - m.first_row;
-  if (i < 0) return row;
-  return i < m.starts.length ? m.starts[i] : m.end + (i - m.starts.length);
+  if (i < 0) return row * unit;
+  return i < m.starts.length ? m.starts[i] : m.end + (i - m.starts.length) * unit;
 }
 
 /** Every rendered line of a view, in order — for the paths that want lines and no structure. */
@@ -273,17 +286,18 @@ export type PaintedRow = { at: number } & (
     }
 );
 
-/** Rows the whole view occupies: chrome, one row each, every editor's height — the tree's, or the
- *  shell's own measurement for an element the client laid out. Mirrors `grid::total_rows`. */
-export function totalRows(root: ViewNode, measured: Measured = {}): number {
+/** Units the whole view occupies: chrome, one row each, every editor's height — the tree's, or
+ *  the shell's own measurement for an element the client laid out — at the measured resolution.
+ *  Mirrors `grid::total_rows`. */
+export function totalRows(root: ViewNode, measured: Measured = WHOLE_ROWS): number {
   let total = 0;
   walkRows(root, measured, (_, rows) => (total += rows));
   return total;
 }
 
-/** One pass over the tree in painting order, telling `f` each node's row count: an editor's
- *  height, one for chrome or any inline element standing on its own, nothing for a stack. Mirrors
- *  `grid::walk_rows`. */
+/** One pass over the tree in painting order, telling `f` each node's height in units: an editor's
+ *  height, one row for chrome or any inline element standing on its own, nothing for a stack.
+ *  Mirrors `grid::walk_rows`. */
 function walkRows(n: ViewNode, measured: Measured, f: (node: ViewNode, rows: number) => void): void {
   if (n.node === "stack") n.children.forEach((c) => walkRows(c, measured, f));
   else if (n.node === "editor") f(n, editorHeight(n, measured));
@@ -291,7 +305,7 @@ function walkRows(n: ViewNode, measured: Measured, f: (node: ViewNode, rows: num
   // standing on its own. An editor nested in one would be drawn as a single chrome row while
   // `nodeLines` still counted its lines; the Rust builder asserts against that shape, and this
   // mirror inherits the same expectation rather than re-deriving it.
-  else f(n, 1);
+  else f(n, measured.units_per_row);
 }
 
 /** Every loaded visual row of the view, top to bottom, each at its absolute row. Mirrors
@@ -299,33 +313,36 @@ function walkRows(n: ViewNode, measured: Measured, f: (node: ViewNode, rows: num
  *  shapes. Chrome occupies one row; an editor's loaded lines sit `first_row` rows into it and the
  *  rest of its height is unloaded — absent here, so consecutive entries need not be consecutive
  *  rows. */
-export function paintedRows(root: ViewNode, measured: Measured = {}): PaintedRow[] {
+export function paintedRows(root: ViewNode, measured: Measured = WHOLE_ROWS): PaintedRow[] {
   const out: PaintedRow[] = [];
+  const unit = measured.units_per_row;
   const total = nodeLines(root).length;
   let seen = 0;
   let at = 0;
   walkRows(root, measured, (n, height) => {
     if (n.node === "editor") {
       const clientLaidOut = n.laid_out_by === "client";
-      let row = at + n.first_row;
+      let row = at + n.first_row * unit;
       n.lines.forEach((line, i) => {
         // Where the shell put the line — or, unmeasured, one row per line.
         if (clientLaidOut) row = at + offsetOf(n, n.first_row + i, measured);
-        (line.baseline_above ?? []).forEach((brow, index) =>
-          out.push({ at: row++, kind: "baseline", element: n.element, line, index, row: brow }),
-        );
+        (line.baseline_above ?? []).forEach((brow, index) => {
+          out.push({ at: row, kind: "baseline", element: n.element, line, index, row: brow });
+          row += unit;
+        });
         seen += 1;
-        line.visual_rows.forEach((wrow, rowIndex) =>
+        line.visual_rows.forEach((wrow, rowIndex) => {
           out.push({
-            at: row++,
+            at: row,
             kind: "text",
             element: n.element,
             line,
             row: wrow,
             rowIndex,
             lastLine: seen === total,
-          }),
-        );
+          });
+          row += unit;
+        });
       });
     } else out.push({ at, kind: "chrome", node: n });
     at += height;

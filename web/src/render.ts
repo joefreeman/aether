@@ -684,15 +684,17 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
   // tested specification — the three painters each used to walk the tree themselves and disagreed
   // about where rows landed. Rows nothing is loaded at — an element the viewport has not reached,
   // a fetch still in flight — are a gap the same height, so everything below keeps its row.
+  // Offsets are in the measured resolution; a row is `units_per_row` of them.
+  const unit = measured.units_per_row;
   let next = 0;
   for (const item of paintedRows(window.root, measured)) {
     if (item.at > next) {
       const gap = document.createElement("div");
       gap.className = "row-gap";
-      gap.style.height = `${(item.at - next) * rowHeightPx}px`;
+      gap.style.height = `${((item.at - next) / unit) * rowHeightPx}px`;
       frag.appendChild(gap);
     }
-    next = item.at + 1;
+    next = item.at + unit;
     if (item.kind === "chrome") {
       frag.appendChild(chromeRow(item.node));
       continue;

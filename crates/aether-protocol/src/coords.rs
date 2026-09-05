@@ -71,7 +71,9 @@ impl std::fmt::Display for ElementRow {
     }
 }
 
-/// A painted **screen row** of the whole view — the client's scroll coordinate.
+/// A painted **screen row** of the whole view — the client's scroll coordinate — at the shell's
+/// resolution: a terminal counts whole rows, a pixel shell thousandths of one (the client's
+/// `grid::Measured::units_per_row`). The server never sees one.
 ///
 /// Distinct from a line because a line is not a row: soft wrap turns one line into several, the
 /// inline diff's phantom baseline rows and a patch's chrome occupy rows while belonging to no line

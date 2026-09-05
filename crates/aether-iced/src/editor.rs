@@ -5,7 +5,7 @@
 //! font, converts mouse positions to `(visual row, display col)` cells, and publishes
 //! [`EditorEvent`]s; the app maps cells to buffer positions with `grid` and the loaded
 //! `Window`. Scrolling is native-feel: the app owns a pixel offset into the full document
-//! height (`grid::total_rows` × cell height), this widget just draws each loaded row at its
+//! height (`grid::total_rows` units × the unit's pixels), this widget just draws each loaded row at its
 //! absolute row under that offset — the same virtual-scroll model as the web client.
 
 use crate::grid;
@@ -68,7 +68,7 @@ fn highlight_font(kind: Option<&str>) -> Font {
 
 /// Line height for buffer text — the web client's `14px/1.4`; the measured cell height (and
 /// therefore every row) includes this spacing. Relative, so it scales with the font size.
-const LINE_HEIGHT_FACTOR: f32 = 1.4;
+pub(crate) const LINE_HEIGHT_FACTOR: f32 = 1.4;
 const EDITOR_LINE_HEIGHT: text::LineHeight = text::LineHeight::Relative(LINE_HEIGHT_FACTOR);
 
 /// What the app gives the widget to draw — borrowed views of app state.
@@ -386,6 +386,7 @@ where
             return;
         };
         let scroll = self.content.scroll_px;
+        let unit_px = self.unit_px(cell);
         let cursor_pos = self.content.cursor.position;
         let (sel_min, sel_max) = selection_endpoints(&self.content.cursor);
         // A point cursor is the 1-char selection of the char under it (Helix-style): under a
@@ -434,7 +435,7 @@ where
         // nothing is loaded. It no longer walks the lines counting chrome and phantoms as it goes
         // — the count the terminal, this shell and the browser each did differently.
         for (abs_row, item) in grid::painted_rows(window, self.content.measured) {
-            let y = bounds.y + PAD + abs_row.get() as f32 * cell.height - scroll;
+            let y = bounds.y + PAD + abs_row.get() as f32 * unit_px - scroll;
             if y + cell.height < bounds.y || y > bounds.y + bounds.height {
                 continue;
             }
@@ -1207,7 +1208,7 @@ where
             self.content.tab_width,
             self.content.measured,
         ) {
-            let y = bounds.y + PAD + row.get() as f32 * cell.height - scroll;
+            let y = bounds.y + PAD + row.get() as f32 * unit_px - scroll;
             if y + cell.height >= bounds.y && y <= bounds.y + bounds.height {
                 let x = text_x(dcol);
                 // Underscore while a capture is armed takes precedence over insert/normal.
@@ -1311,8 +1312,8 @@ where
         // taller than the viewport. Geometry from the shared `scrollbar::thumb` (same as the TUI
         // and picker); appearance pulled from the theme's scrollable catalog — the exact style
         // the picker/popover scrollbars use, so they match including hover/drag highlighting.
-        let content_h =
-            PAD * 2.0 + grid::total_rows(&window.root, self.content.measured) as f32 * cell.height;
+        let content_h = PAD * 2.0
+            + grid::total_rows(&window.root, self.content.measured) as f32 * self.unit_px(cell);
         if let Some((thumb_y, thumb_h)) = crate::core::scrollbar::thumb(
             bounds.height as f64,
             content_h as f64,
@@ -1398,10 +1399,16 @@ fn scrollbar_rail<Theme: iced::widget::scrollable::Catalog>(
 }
 
 impl<'a, Message> EditorView<'a, Message> {
-    /// Pixel position → (absolute visual row, display col).
+    /// Pixels per unit of the shared vertical layout: an editor row is one cell tall, at
+    /// `measured.row()` units.
+    fn unit_px(&self, cell: Size) -> f32 {
+        cell.height / self.content.measured.row() as f32
+    }
+
+    /// Pixel position → (absolute visual row in layout units, display col).
     fn cell_at(&self, position: Point, bounds: Rectangle, cell: Size) -> (i64, u32) {
-        let row =
-            ((self.content.scroll_px + (position.y - bounds.y) - PAD) / cell.height).floor() as i64;
+        let row = ((self.content.scroll_px + (position.y - bounds.y) - PAD) / self.unit_px(cell))
+            .floor() as i64;
         let col = ((position.x - bounds.x + self.content.scroll_x_px) / cell.width).floor() as i64
             - GUTTER_COLS as i64;
         (row, col.max(0) as u32)
@@ -1412,8 +1419,8 @@ impl<'a, Message> EditorView<'a, Message> {
     /// TUI and picker; this returns just the pieces the drag math needs.
     fn scrollbar_metrics(&self, state: &State, bounds: Rectangle) -> Option<(f32, f32)> {
         let (cell, window) = (state.cell?, self.content.window?);
-        let content_h =
-            PAD * 2.0 + grid::total_rows(&window.root, self.content.measured) as f32 * cell.height;
+        let content_h = PAD * 2.0
+            + grid::total_rows(&window.root, self.content.measured) as f32 * self.unit_px(cell);
         let (_, thumb_h) = crate::core::scrollbar::thumb(
             bounds.height as f64,
             content_h as f64,

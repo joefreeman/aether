@@ -5,7 +5,8 @@
 //!
 //! Focus (the reading cursor) is derived core-side from the server cursor and arrives as a
 //! source byte span: the node whose `data-espan` matches gets `.md-focus`. The shell scrolls
-//! the focused node into view when the focus *changes* (`revealFocus`).
+//! the focused node into view when the focus *changes*, off the shared layout the shell measured
+//! this document into (`Shell.measureReader` / `revealBlock`).
 
 import type { MdBlock, MdInline, MdSpan } from "./markdown";
 import { highlightClass } from "./render";
@@ -103,28 +104,6 @@ export function markFocus(
       }
     }
   }
-}
-
-/** The scroll target that reveals the focused node — `null` when it's already comfortably
- *  visible. The shell applies it through its own `scrollTopTo`, so reveals glide exactly like
- *  the editor's (smooth when short, snap when far).
- *
- *  Deliberately not `scrollIntoView(block: "nearest")`: nearest leaves a downward step pinned
- *  flush to the bottom edge, and any later layout shift (an image finishing its load above)
- *  pushes it off screen with no focus change to trigger a re-reveal. Instead: when the element
- *  isn't comfortably visible, rest its top ~20% down the viewport — the editor's jump
- *  placement, so reading `j`-steps hold a steady eye line. */
-export function revealFocus(container: HTMLElement, span: MdSpan | null): number | null {
-  if (!span) return null;
-  const target = container.querySelector(`[data-espan="${spanKey(span)}"]`);
-  if (!(target instanceof HTMLElement)) return null;
-  const c = container.getBoundingClientRect();
-  const t = target.getBoundingClientRect();
-  const margin = Math.min(48, c.height * 0.08);
-  if (t.top >= c.top + margin && t.bottom <= c.bottom - margin) return null; // comfortably visible
-  // Rest ~20% down; an element taller than the viewport pins nearer the top instead.
-  const rest = Math.min(c.height * 0.2, Math.max(margin, c.height - t.height - margin));
-  return container.scrollTop + (t.top - c.top - rest);
 }
 
 /** Fill a <code> element with highlighted runs (editor hl-* classes; gaps stay plain). */

@@ -207,19 +207,33 @@ impl WasmSession {
     /// anchor's cursor move); run them.
     pub fn adopt_subscribe(&mut self, res: JsValue) -> Result<JsValue, JsValue> {
         let res: ViewportSubscribeResult = from_js(res)?;
-        to_js(&effects_to_json(self.inner.adopt_subscribe(res)))
+        let fx = self.inner.adopt_subscribe(res);
+        self.prune_measured();
+        to_js(&effects_to_json(fx))
+    }
+
+    /// Drop measurements of elements the window no longer lays out client-side — a view
+    /// re-presented as the editor, a switch to another view — so no stale height positions a
+    /// window it was never measured for. On every window adoption, as the terminal does.
+    fn prune_measured(&mut self) {
+        if let Some(w) = self.inner.view.window.as_ref() {
+            aether_client::grid::prune_measured(&mut self.measured, &w.root);
+        }
     }
 
     /// Adopt a window from a geometry RPC (`view/window`/`view/set_wrap`/`view/resize`). Returns
     /// `Effect[]`, as [`Self::adopt_subscribe`] does.
     pub fn adopt_window(&mut self, res: JsValue) -> Result<JsValue, JsValue> {
         let res: ViewportWindowResult = from_js(res)?;
-        to_js(&effects_to_json(self.inner.adopt_window(res)))
+        let fx = self.inner.adopt_window(res);
+        self.prune_measured();
+        to_js(&effects_to_json(fx))
     }
 
     /// Report the on-screen line range (the shell owns the pixel scroll) so sneak scopes its labels
-    /// to what's actually visible. `top_visual_row` is absolute; `viewport_rows` is the visible
-    /// height in rows.
+    /// to what's actually visible. `top_visual_row` is the absolute offset at the top of the
+    /// viewport and `viewport_rows` its height, both in the shell's units
+    /// ([`WasmSession::set_resolution`]).
     pub fn set_visible_lines(&mut self, top_visual_row: u32, viewport_rows: u32) {
         // The wasm boundary speaks plain numbers — JS has no newtypes — so the coordinate
         // spaces are named here, once, on the way in.
@@ -267,9 +281,71 @@ impl WasmSession {
         Ok(())
     }
 
+    /// The resolution every offset crossing this boundary is counted in: how many units make one
+    /// row of the editor's grid. The browser scrolls by the pixel, so the shell sets a thousand and
+    /// measures its blocks to the thousandth of a row; the server's rows convert exactly.
+    pub fn set_resolution(&mut self, units_per_row: u32) {
+        self.measured.units_per_row = units_per_row.max(1);
+    }
+
+    /// The measured table as it stands, for the shell to paint from — refreshed after every
+    /// adoption (which may have pruned it) and every measurement.
+    pub fn measured(&self) -> Result<JsValue, JsValue> {
+        measured_to_js(&self.measured)
+    }
+
+    /// Record where the shell drew the reading view's blocks: `spans` is one `[start, end, top]`
+    /// per rendered block node — its source byte span and the offset its top sits at within the
+    /// scrolled content, in units — and `end` is the content's full height. The core turns that
+    /// into the line starts the grid scrolls, reveals and anchors by, by the same rule the
+    /// terminal applies to its own layout. Answers with the whole table.
+    pub fn set_read_measured(
+        &mut self,
+        element: u32,
+        spans: JsValue,
+        end: u32,
+    ) -> Result<JsValue, JsValue> {
+        let spans: Vec<(u32, u32, u32)> = from_js(spans)?;
+        if let Some(read) = self.inner.view.read.as_ref() {
+            let line_count = read.text.split('\n').count() as u32;
+            let measured = aether_client::read_layout::measured_from_spans(
+                spans,
+                |byte| read.pos_of(byte).line,
+                line_count,
+                0,
+                end,
+            );
+            self.measured.elements.insert(element, measured);
+        }
+        measured_to_js(&self.measured)
+    }
+
+    /// Where a reading-view block sits in the view: the offsets its first line starts at and the
+    /// line after its last begins — the element's end when it is the last block — in units. What
+    /// a reveal frames. `null` until the block's element is measured.
+    pub fn read_block_extent(&self, start: u32, end: u32) -> Result<JsValue, JsValue> {
+        let (Some(w), Some(read)) = (
+            self.inner.view.window.as_ref(),
+            self.inner.view.read.as_ref(),
+        ) else {
+            return Ok(JsValue::NULL);
+        };
+        let element = self.inner.view.focused_element;
+        match aether_client::read_layout::block_rows(
+            w,
+            element,
+            |byte| read.pos_of(byte).line,
+            (start, end),
+            &self.measured,
+        ) {
+            Some((top, bottom)) => to_js(&json!([top.get(), bottom.get()])),
+            None => Ok(JsValue::NULL),
+        }
+    }
+
     /// Capture a content scroll anchor before a wrap/diff re-layout (in response to the
-    /// `SaveContentAnchor` effect). `top_row` is the absolute visual row at the top of the viewport
-    /// (`(scrollTop - pad) / lineHeight`); `viewport_rows` its height in rows.
+    /// `SaveContentAnchor` effect). `top_row` is the absolute offset at the top of the viewport
+    /// and `viewport_rows` its height, both in units.
     pub fn capture_scroll_anchor(&mut self, top_row: u32, viewport_rows: u32) {
         self.inner
             .capture_scroll_anchor(VisualRow(top_row), viewport_rows, &self.measured);
@@ -312,7 +388,8 @@ impl WasmSession {
         use aether_client::grid;
         let w = self.inner.view.window.as_ref()?;
         let row = if sub_row > 0.0 {
-            grid::line_top_row(w, element, line, &self.measured).map(|r| r.get() as f32 + sub_row)
+            grid::line_top_row(w, element, line, &self.measured)
+                .map(|r| r.get() as f32 + sub_row * self.measured.units_per_row as f32)
         } else {
             grid::line_block_start(w, element, line, &self.measured).map(|r| r.get() as f32)
         };
@@ -1057,6 +1134,14 @@ fn to_js<T: serde::Serialize>(v: &T) -> Result<JsValue, JsValue> {
         .serialize_missing_as_null(true);
     v.serialize(&ser)
         .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// The measured table as the shell's `Measured` — keyed by element id, which is a number: JSON
+/// spells map keys as strings, which is what a JS object wants and what a direct serialisation of
+/// a numeric-keyed map refuses to produce.
+fn measured_to_js(measured: &aether_client::grid::Measured) -> Result<JsValue, JsValue> {
+    let value = serde_json::to_value(measured).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    to_js(&value)
 }
 
 fn from_js<T: serde::de::DeserializeOwned>(v: JsValue) -> Result<T, JsValue> {

@@ -31,6 +31,7 @@ use aether_protocol::view::{ViewOpen, ViewOpenParams, ViewOpenResult};
 use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::PickerKind;
 use aether_protocol::search::SearchSummary;
+use aether_protocol::settings::MarkdownWidth;
 use aether_protocol::viewport::{
     ScrollPosition, ViewportResize, ViewportResizeParams, ViewportSetWrap, ViewportSetWrapParams,
     ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindow,
@@ -281,6 +282,10 @@ impl OverlayField {
 
 /// A widget id belonging to one window — `name` qualified by the window it is rendered in. See
 /// [`OverlayField::id`] for why every id in this shell is scoped this way.
+/// The shared vertical layout's resolution — units per editor row. One editor row is one cell
+/// tall; the reading view's proportional blocks measure to the nearest thousandth of a row.
+const UNITS_PER_ROW: u32 = 1000;
+
 pub(crate) fn scoped_id(window: window::Id, name: &str) -> iced::advanced::widget::Id {
     iced::advanced::widget::Id::from(format!("{name}#{window}"))
 }
@@ -396,9 +401,9 @@ pub enum Message {
     /// A remote reading-view image download resolved: raw bytes (sniffed raster-vs-SVG on receipt)
     /// or an error, keyed by URL.
     RemoteImageFetched(String, Result<Vec<u8>, String>),
-    /// The [`ReadRevealProbe`] measured the focused block: `Some(offset)` = scroll the read
-    /// view there; `None` = already comfortably visible.
-    ReadRevealMeasured(Option<f32>),
+    /// The [`ReadMeasureProbe`] measured the reading view as laid out (`None`: no read
+    /// scrollable this frame), and what to do on the refreshed layout table.
+    ReadMeasured(Option<ReadGeometry>, ReadThen),
     /// The read scrollable scrolled (any cause — our glide ticks or the user's wheel): its
     /// new offset and scroll range, mirrored for targeting/clamping.
     ReadScrolled {
@@ -520,7 +525,9 @@ pub struct App {
     // these). Grid last sent, the scroll a subscribe asked for, and the fetch-coordination flags.
     sent_grid: Option<(u32, u32)>,
     subscribe_scroll: ScrollPosition,
-    /// What this shell has measured of the elements it lays out itself — none yet.
+    /// The shared vertical layout at this shell's resolution ([`UNITS_PER_ROW`] units per editor
+    /// row): server-rendered editors count rows, the reading view's blocks are measured off the
+    /// widgets ([`ReadMeasureProbe`]) into it.
     measured: grid::Measured,
     fetch_in_flight: bool,
     refetch_queued: bool,
@@ -537,11 +544,11 @@ pub struct App {
     /// The reading-view focus last revealed (`(buffer, span.start, span.end)`), so the document
     /// scrolls only when the focus *changes*.
     read_last_focus: Option<(u64, u32, u32)>,
-    /// The pending reveal is a *placement* — the first into a freshly-appeared document (a
-    /// cross-file landing, or the reading view just opening) — so it snaps instead of gliding
-    /// (the editor's cross-buffer jump contract, [`RevealStyle::Jump`]). Armed at the
-    /// focus-change trigger, consumed by `ReadRevealMeasured`.
-    read_reveal_snap: bool,
+    /// The read scrollable's viewport height as last measured (0 before the first probe).
+    read_view_h: f32,
+    /// The document geometry the layout table was last measured for — see
+    /// [`Self::read_geometry_key`]; a change schedules a fresh measure.
+    read_measure_key: Option<ReadGeometryKey>,
     /// A pending click-focus target (span start): when the focus change lands on it, the reveal
     /// snap is skipped — the clicked element was visible, so scrolling would only jolt.
     read_click_target: Option<u32>,
@@ -633,14 +640,15 @@ impl App {
             scroll_anchor: None,
             sent_grid: None,
             subscribe_scroll: ScrollPosition::default(),
-            measured: grid::Measured::default(),
+            measured: grid::Measured::at_resolution(UNITS_PER_ROW),
             fetch_in_flight: false,
             refetch_queued: false,
             pending_reveal: PendingReveal::default(),
             chased_window: false,
             picker_scroll_y: 0.0,
             read_last_focus: None,
-            read_reveal_snap: false,
+            read_view_h: 0.0,
+            read_measure_key: None,
             read_click_target: None,
             read_scroll_px: 0.0,
             read_scroll_max: None,
@@ -840,7 +848,7 @@ impl App {
         // and a window resized before the first buffer opens must still be measured.
         if let Message::WindowResized(size) = message {
             self.window_size = size;
-            return Task::none();
+            return self.read_refresh_if_stale();
         }
         // Boot-connecting (no socket yet): input is parked; only the dial result moves us on.
         let task = if self.boot_args.is_some() {
@@ -850,8 +858,20 @@ impl App {
         };
         // After every update, snap focus to the overlay field that should own the keyboard (web
         // parity: `ensureFocus`). Only fires a focus operation when the target *changes*, so it
-        // doesn't fight the user (e.g. re-grab focus every keystroke).
-        Task::batch([task, self.sync_focus()])
+        // doesn't fight the user (e.g. re-grab focus every keystroke). And keep the reading
+        // view's layout table current with what it depends on.
+        Task::batch([task, self.sync_focus(), self.read_refresh_if_stale()])
+    }
+
+    /// Re-measure the reading view when its geometry key moved on from the last measure — a
+    /// re-parse, a resize, a type-size change, an image arriving (each changes block heights).
+    /// A measure any path schedules stamps the key, so this never doubles one up.
+    fn read_refresh_if_stale(&mut self) -> Task<Message> {
+        if self.session.view.read.is_some() && self.read_geometry_key() != self.read_measure_key {
+            self.read_measure(ReadThen::Refresh)
+        } else {
+            Task::none()
+        }
     }
 
     /// The overlay `text_input` that should hold focus right now, given session state. Mirrors the
@@ -1103,6 +1123,15 @@ impl App {
                 // is on-screen (it may sit below a restored scroll after a `jump_to` open).
                 let scroll = self.subscribe_scroll;
                 let read_fx = self.session.adopt_subscribe(res);
+                self.prune_measured();
+                if self.session.view.read.is_some() {
+                    // The reading view's geometry is its widgets' — measure it as laid out,
+                    // then place ([`Self::read_place_subscribed`]), which also rests the
+                    // focus it lands on; the focus-change trigger in `run_core` stands down.
+                    self.read_last_focus = self.read_focus_key();
+                    let measure = self.read_measure(ReadThen::Placement);
+                    return Task::batch([measure, self.run_core(read_fx)]);
+                }
                 // A wrap toggle or a `Space u` left a content anchor pending: restore the view to
                 // it (the same content on screen across the re-presentation), superseding the
                 // reveal the subscribe would otherwise do.
@@ -1111,23 +1140,13 @@ impl App {
                     self.clamp_scroll();
                     self.pending_reveal.abandon();
                 } else {
-                    if let (Some(cell), Some(w)) = (self.cell, self.session.view.window.as_ref()) {
-                        // The *block's* first row, so a line's chrome comes with it — see
-                        // `grid::line_block_start`. A scroll restored from inside the line's own rows
-                        // goes back to that row; a line the server clamped away leaves the element it
-                        // named as where the view opens.
-                        let row = if scroll.sub_row > 0.0 {
-                            grid::line_top_row(w, scroll.element, scroll.line, &self.measured)
-                                .map(|r| r.get() as f32 + scroll.sub_row)
-                        } else {
-                            grid::line_block_start(w, scroll.element, scroll.line, &self.measured)
-                                .map(|r| r.get() as f32)
-                        };
-                        if let Some(row) = row.or_else(|| {
-                            grid::element_start_row(w, scroll.element, &self.measured)
-                                .map(|r| r.get() as f32)
-                        }) {
-                            self.scroll_px = row * cell.height;
+                    // The *block's* first row, so a line's chrome comes with it — see
+                    // `grid::line_block_start`. A scroll restored from inside the line's own rows
+                    // goes back to that row; a line the server clamped away leaves the element it
+                    // named as where the view opens.
+                    if self.cell.is_some() {
+                        if let Some(row) = self.remembered_row(scroll) {
+                            self.scroll_px = self.px_of_units(row);
                         }
                     }
                     self.clamp_scroll();
@@ -1161,9 +1180,15 @@ impl App {
             Message::WindowUpdate(Ok(res)) => {
                 self.fetch_in_flight = false;
                 let read_fx = self.session.adopt_window(res);
+                self.prune_measured();
                 // A wrap toggle left a content anchor pending: restore the view to it (same content
                 // on screen across the reflow), suppressing the reveal/center this fetch would do.
-                let anchored = if let Some(px) = self.resolve_anchor_px() {
+                // The reading view resolves it once its widgets are measured.
+                let mut measure = Task::none();
+                let anchored = if self.session.view.read.is_some() {
+                    measure = self.read_measure(ReadThen::Anchor);
+                    true
+                } else if let Some(px) = self.resolve_anchor_px() {
                     self.scroll_px = px;
                     true
                 } else {
@@ -1184,7 +1209,7 @@ impl App {
                 // `maybe_fetch` no-ops when it does cover.
                 self.refetch_queued = false;
                 let fetch = self.maybe_fetch();
-                Task::batch([fetch, self.run_core(read_fx)])
+                Task::batch([measure, fetch, self.run_core(read_fx)])
             }
             Message::WindowUpdate(Err(e)) => {
                 self.fetch_in_flight = false;
@@ -1325,17 +1350,29 @@ impl App {
                 self.remote_images.insert(url, entry);
                 Task::none()
             }
-            Message::ReadRevealMeasured(offset) => match offset {
-                // Through the read glide: smooth when short, snap when far — the editor's
-                // reveal feel. A placement (fresh document) snaps outright.
-                Some(y) => {
-                    let smooth = !std::mem::take(&mut self.read_reveal_snap);
-                    self.read_scroll_to(y, smooth)
+            Message::ReadMeasured(geometry, then) => match geometry {
+                // A measure the reading view outlived (it closed in the same frame) has nothing
+                // to fold in — and must not touch a content anchor the editor now owns.
+                Some(_) if self.session.view.read.is_none() => Task::none(),
+                Some(geometry) => {
+                    self.adopt_read_geometry(geometry);
+                    match then {
+                        ReadThen::Refresh => Task::none(),
+                        ReadThen::Placement => self.read_place_subscribed(),
+                        ReadThen::Anchor => {
+                            match self.session.resolve_scroll_anchor(&self.measured) {
+                                Some(row) => {
+                                    let px = self.px_of_units(row.get() as f32);
+                                    self.read_scroll_to(px, false)
+                                }
+                                None => Task::none(),
+                            }
+                        }
+                        ReadThen::Reveal { span, smooth } => self.read_reveal_block(span, smooth),
+                        ReadThen::Place(place) => self.read_place_block(place),
+                    }
                 }
-                None => {
-                    self.read_reveal_snap = false;
-                    Task::none()
-                }
+                None => Task::none(),
             },
             Message::ReadScrolled { y, max } => {
                 // An offset the glide didn't emit is user input (wheel/drag): snap the glide
@@ -1345,6 +1382,9 @@ impl App {
                 }
                 self.read_scroll_px = y;
                 self.read_scroll_max = Some(max);
+                // The core's notion of what's on screen follows the wheel (the web's `onScroll`).
+                let (top, visible) = (self.scroll_top_units(), self.visible_units());
+                self.session.set_visible_lines(top, visible, &self.measured);
                 Task::none()
             }
             Message::Noop => Task::none(),
@@ -1569,15 +1609,9 @@ impl App {
                 }
                 Effect::SaveScrollAnchor => self.scroll_anchor = Some(self.scroll_px),
                 Effect::SaveContentAnchor => {
-                    if let Some(cell) = self.cell {
-                        let top_row =
-                            VisualRow((self.scroll_px / cell.height).round().max(0.0) as u32);
-                        self.session.capture_scroll_anchor(
-                            top_row,
-                            self.visible_rows(),
-                            &self.measured,
-                        );
-                    }
+                    let (top, visible) = (self.scroll_top_units(), self.visible_units());
+                    self.session
+                        .capture_scroll_anchor(top, visible, &self.measured);
                 }
                 Effect::ShowHover(content) => {
                     self.hover_below.set(None); // re-pick orientation for this fresh hover
@@ -1595,7 +1629,12 @@ impl App {
                 Effect::WindowAdopted => {
                     // Diff toggle re-layout: restore the view to the pending content anchor (same
                     // content on screen) if there is one; otherwise clamp + reveal as before.
-                    if let Some(px) = self.resolve_anchor_px() {
+                    self.prune_measured();
+                    if self.session.view.read.is_some() {
+                        // Measured once the widgets have laid the new document out; a pending
+                        // content anchor resolves there.
+                        tasks.push(self.read_measure(ReadThen::Anchor));
+                    } else if let Some(px) = self.resolve_anchor_px() {
                         self.scroll_px = px;
                         self.clamp_scroll();
                     } else {
@@ -1658,20 +1697,14 @@ impl App {
             }
         }
         // Reading-view focus reveal: when the focused element changed (a `j`/`k` step, an
-        // outline jump, search `n`), glide the document toward it. Widget layout heights aren't
-        // knowable here, so position approximates as the focus span's fraction of the source —
-        // the best-effort contract.
-        if let Some(read) = self.session.view.read.as_ref() {
+        // outline jump, search `n`), glide the document toward it. Widget layout isn't knowable
+        // here, so the reveal measures first ([`ReadMeasureProbe`]) and rests the block on the
+        // refreshed layout table.
+        let mut read_measure: Option<ReadThen> = None;
+        if self.session.view.read.is_some() {
             // Keyed to the Enter target when the cursor sits inside one (a Tab step must
             // reveal the link, not just its paragraph), else the block-grain position.
-            let cursor = self.session.view.buffer.cursor.position;
-            let focus = read
-                .target_focus(cursor)
-                .or_else(|| read.block_focus(cursor))
-                .map(|i| {
-                    let sp = read.elements[i].span();
-                    (read.buffer_id, sp.start, sp.end)
-                });
+            let focus = self.read_focus_key();
             if focus != self.read_last_focus {
                 // A reveal into a buffer this view hasn't revealed in yet — a cross-file
                 // landing, or the reading view just appearing — is a placement, not a
@@ -1683,29 +1716,32 @@ impl App {
                     _ => false,
                 };
                 self.read_last_focus = focus;
-                if let Some((_, start, _)) = focus {
+                if let Some((_, start, end)) = focus {
                     // A click-focus landing skips the reveal (the element was under the
                     // pointer).
                     if self.read_click_target.take() == Some(start) {
                         // consumed
                     } else {
-                        // Measure the focused block's real position, then scroll to it via
-                        // `ReadRevealMeasured` — block heights vary wildly (images, code
-                        // panels), so no source-derived approximation survives contact.
-                        self.read_reveal_snap = fresh;
-                        tasks.push(
-                            iced::advanced::widget::operate(ReadRevealProbe::reveal(self.window))
-                                .map(Message::ReadRevealMeasured),
-                        );
+                        // Block heights vary wildly (images, code panels), so no
+                        // source-derived approximation survives contact: measure, then rest.
+                        read_measure = Some(ReadThen::Reveal {
+                            span: (start, end),
+                            smooth: !fresh,
+                        });
                     }
                 }
             }
         } else {
             self.read_last_focus = None;
+            self.read_measure_key = None;
             // The read scrollable is gone with its widget state — drop the glide + mirrors.
             self.read_scroll_anim = None;
             self.read_scroll_px = 0.0;
             self.read_scroll_max = None;
+            self.read_view_h = 0.0;
+        }
+        if let Some(then) = read_measure {
+            tasks.push(self.read_measure(then));
         }
         // Remote-image fetch fan-out: once per parse, download any http(s) display image the
         // document references; results land as `RemoteImageFetched` and paint in as they arrive.
@@ -1922,13 +1958,10 @@ impl App {
         // through `OverlayInput`, not here, so this never fights click-to-position-then-type.)
         let query_before = self.session.picker.as_ref().map(|p| p.query.clone());
         let visible_rows = self.visible_rows();
-        // Report the on-screen line range so sneak scopes labels to what's visible (the core owns no
-        // pixel scroll). `scroll_px / cell.height` is the absolute top visual row.
-        if let Some(cell) = self.cell {
-            let top_row = VisualRow((self.scroll_px / cell.height).round().max(0.0) as u32);
-            self.session
-                .set_visible_lines(top_row, visible_rows, &self.measured);
-        }
+        // Report the on-screen line range so sneak scopes labels to what's visible (the core owns
+        // no pixel scroll): the active scroller's offset and extent in layout units.
+        let (top, visible) = (self.scroll_top_units(), self.visible_units());
+        self.session.set_visible_lines(top, visible, &self.measured);
         let fx = self.session.on_key(code, mods, text, visible_rows);
         let mut task = self.run_core(fx);
         let field_after = self.overlay_field_snapshot();
@@ -2113,8 +2146,7 @@ impl App {
                         );
                     }
                     let line = self.session.editor_font_size as f32 * READ_SCALE * 1.6;
-                    let vh = (self.visible_rows() as f32).max(1.0)
-                        * self.cell.map(|c| c.height).unwrap_or(line);
+                    let vh = self.read_viewport_px().max(line);
                     let mag = match unit {
                         ScrollUnit::Line => line,
                         ScrollUnit::Half => (vh * 0.5).max(line),
@@ -2152,14 +2184,10 @@ impl App {
                 self.maybe_fetch()
             }
             A::PlaceCursor(place) => {
-                // Reading view: edge-matched placement of the focused block — measured
-                // against real widget geometry by the reveal probe, in explicit mode.
+                // Reading view: edge-matched placement of the focused block, on the layout
+                // table measured off the widgets first.
                 if self.session.view.read.is_some() {
-                    return iced::advanced::widget::operate(ReadRevealProbe::placing(
-                        self.window,
-                        place,
-                    ))
-                    .map(Message::ReadRevealMeasured);
+                    return self.read_measure(ReadThen::Place(place));
                 }
                 let task = self.place_cursor(place);
                 Task::batch([task, self.maybe_fetch()])
@@ -2464,9 +2492,9 @@ impl App {
     /// the new `scroll_px`. `None` when no anchor is pending (or no cell metrics yet) — the caller
     /// then falls back to clamp + reveal-cursor.
     fn resolve_anchor_px(&mut self) -> Option<f32> {
-        let cell = self.cell?;
+        self.cell?;
         let row = self.session.resolve_scroll_anchor(&self.measured)?;
-        Some(row.get() as f32 * cell.height)
+        Some(self.px_of_units(row.get() as f32))
     }
 
     fn max_scroll_x_px(&self) -> f32 {
@@ -2481,8 +2509,8 @@ impl App {
 
     fn max_scroll_px(&self) -> f32 {
         match (&self.session.view.window, self.cell) {
-            (Some(w), Some(cell)) => (PAD * 2.0
-                + grid::total_rows(&w.root, &self.measured) as f32 * cell.height
+            (Some(w), Some(_)) => (PAD * 2.0
+                + self.px_of_units(grid::total_rows(&w.root, &self.measured) as f32)
                 - self.view_size.height)
                 .max(0.0),
             _ => 0.0,
@@ -2545,6 +2573,9 @@ impl App {
         } else {
             self.read_scroll_anim = None;
             self.read_anim_last = target;
+            // Mirrored ahead of the widget's `on_scroll`, so a reveal computed in the same
+            // update (a placement's) sees where the document is about to be.
+            self.read_scroll_px = target;
             iced::widget::operation::scroll_to(
                 read_scroll_id(self.window),
                 iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: target },
@@ -2561,6 +2592,240 @@ impl App {
             .unwrap_or(self.read_scroll_px)
     }
 
+    // ---- the shared vertical layout, in this shell's pixels ----------------------------------
+
+    /// Pixels per unit of the layout: an editor row (`cell.height`, or the font's line height
+    /// before the editor widget has laid out) is [`UNITS_PER_ROW`] units.
+    fn unit_px(&self) -> f32 {
+        let row = self.cell.map_or(
+            self.session.editor_font_size as f32 * editor::LINE_HEIGHT_FACTOR,
+            |c| c.height,
+        );
+        row / UNITS_PER_ROW as f32
+    }
+
+    fn px_of_units(&self, units: f32) -> f32 {
+        units * self.unit_px()
+    }
+
+    fn units_of_px(&self, px: f32) -> f32 {
+        px / self.unit_px()
+    }
+
+    /// The reading view's viewport height in px — the scrollable's bounds as last measured,
+    /// the pane's before the first measure.
+    fn read_viewport_px(&self) -> f32 {
+        if self.read_view_h > 0.0 {
+            self.read_view_h
+        } else {
+            self.view_size.height
+        }
+    }
+
+    /// The active scroller's offset (the reading view's, else the editor's) as the layout's top
+    /// visible row.
+    fn scroll_top_units(&self) -> VisualRow {
+        let px = if self.session.view.read.is_some() {
+            self.read_scroll_px
+        } else {
+            self.scroll_px
+        };
+        VisualRow(self.units_of_px(px).round().max(0.0) as u32)
+    }
+
+    /// The active scroller's viewport height in layout units (at least one row).
+    fn visible_units(&self) -> u32 {
+        let px = if self.session.view.read.is_some() {
+            self.read_viewport_px()
+        } else {
+            self.view_size.height - PAD
+        };
+        (self.units_of_px(px).round().max(0.0) as u32).max(UNITS_PER_ROW)
+    }
+
+    /// The row a subscribe's remembered position lands on — the line's top plus its fractional
+    /// sub-row, the line's block when whole, the element's start when the line isn't loaded.
+    fn remembered_row(&self, scroll: ScrollPosition) -> Option<f32> {
+        let w = self.session.view.window.as_ref()?;
+        let row = if scroll.sub_row > 0.0 {
+            grid::line_top_row(w, scroll.element, scroll.line, &self.measured)
+                .map(|r| r.get() as f32 + scroll.sub_row * self.measured.row() as f32)
+        } else {
+            grid::line_block_start(w, scroll.element, scroll.line, &self.measured)
+                .map(|r| r.get() as f32)
+        };
+        row.or_else(|| {
+            grid::element_start_row(w, scroll.element, &self.measured).map(|r| r.get() as f32)
+        })
+    }
+
+    /// Drop layout measurements for elements the window no longer has.
+    fn prune_measured(&mut self) {
+        if let Some(w) = self.session.view.window.as_ref() {
+            grid::prune_measured(&mut self.measured, &w.root);
+        }
+    }
+
+    // ---- the reading view on the shared layout -----------------------------------------------
+
+    /// The reading-view focus as `(buffer, span.start, span.end)`: the Enter target when the
+    /// cursor sits inside one, else the block — what a reveal rests and a focus change is
+    /// detected on.
+    fn read_focus_key(&self) -> Option<(u64, u32, u32)> {
+        let read = self.session.view.read.as_ref()?;
+        let cursor = self.session.view.buffer.cursor.position;
+        read.target_focus(cursor)
+            .or_else(|| read.block_focus(cursor))
+            .map(|i| {
+                let sp = read.elements[i].span();
+                (read.buffer_id, sp.start, sp.end)
+            })
+    }
+
+    /// What the reading view's layout depends on: the document (by revision), the window, the
+    /// type size and measure, and the images that have arrived (each changes block heights).
+    fn read_geometry_key(&self) -> Option<ReadGeometryKey> {
+        let read = self.session.view.read.as_ref()?;
+        Some((
+            read.buffer_id,
+            read.revision,
+            self.window_size.width.to_bits(),
+            self.window_size.height.to_bits(),
+            self.session.editor_font_size,
+            self.session.markdown_width,
+            self.remote_images.len(),
+        ))
+    }
+
+    /// Measure the reading view as laid out — every stamped block's top and the scrollable's
+    /// geometry — and act on the refreshed layout table (`then`). The runtime runs widget
+    /// operations after rebuilding the view, so the probe always sees the current document.
+    fn read_measure(&mut self, then: ReadThen) -> Task<Message> {
+        let Some(read) = self.session.view.read.as_ref() else {
+            return Task::none();
+        };
+        let ids = read_span_ids(self.window, &read.blocks);
+        self.read_measure_key = self.read_geometry_key();
+        iced::advanced::widget::operate(ReadMeasureProbe::new(self.window, ids))
+            .map(move |geometry| Message::ReadMeasured(geometry, then))
+    }
+
+    /// Fold a probe's measurements into the layout table: block tops in px become the read
+    /// element's per-line starts in units ([`read_layout::measured_from_spans`]); the
+    /// scrollable's geometry refreshes the scroll mirrors.
+    fn adopt_read_geometry(&mut self, geometry: ReadGeometry) {
+        let unit = self.unit_px();
+        let element = self.session.view.focused_element;
+        let measured = self.session.view.read.as_ref().map(|read| {
+            let line_count = read.text.split('\n').count() as u32;
+            let spans = geometry
+                .spans
+                .iter()
+                .map(|&(start, end, top)| (start, end, (top / unit).round().max(0.0) as u32));
+            aether_client::read_layout::measured_from_spans(
+                spans,
+                |byte| read.pos_of(byte).line,
+                line_count,
+                0,
+                (geometry.content_h / unit).round().max(0.0) as u32,
+            )
+        });
+        tracing::debug!(
+            blocks = geometry.spans.len(),
+            content_h = geometry.content_h,
+            view_h = geometry.view_h,
+            offset = geometry.offset,
+            lines = measured.as_ref().map_or(0, |m| m.starts.len()),
+            "reading view measured"
+        );
+        if let Some(measured) = measured {
+            self.measured.elements.insert(element, measured);
+        }
+        self.read_view_h = geometry.view_h;
+        self.read_scroll_max = Some((geometry.content_h - geometry.view_h).max(0.0));
+        if self.read_scroll_anim.is_none() {
+            self.read_scroll_px = geometry.offset;
+        }
+    }
+
+    /// A block's `(top, bottom)` in the read scrollable's px, off the layout table.
+    fn read_block_px(&self, span: (u32, u32)) -> Option<(f32, f32)> {
+        let w = self.session.view.window.as_ref()?;
+        let read = self.session.view.read.as_ref()?;
+        let (top, bottom) = aether_client::read_layout::block_rows(
+            w,
+            self.session.view.focused_element,
+            |byte| read.pos_of(byte).line,
+            span,
+            &self.measured,
+        )?;
+        Some((
+            self.px_of_units(top.get() as f32),
+            self.px_of_units(bottom.get() as f32),
+        ))
+    }
+
+    /// Rest a block ~20% down the reading view unless it's already comfortably visible
+    /// ([`read_layout::reveal_offset`]) — through the glide when short, a snap when far or when
+    /// `smooth` is off (a placement into a fresh document).
+    fn read_reveal_block(&mut self, span: (u32, u32), smooth: bool) -> Task<Message> {
+        let Some((top, bottom)) = self.read_block_px(span) else {
+            return Task::none();
+        };
+        let scroll = self.read_scroll_px;
+        let height = self.read_viewport_px();
+        match aether_client::read_layout::reveal_offset(
+            top - scroll,
+            bottom - scroll,
+            scroll,
+            height,
+        ) {
+            Some(y) => self.read_scroll_to(y, smooth),
+            None => Task::none(),
+        }
+    }
+
+    /// `;` / `Alt-;` in the reading view: edge-matched placement of the focused block
+    /// ([`read_layout::place_offset`]).
+    fn read_place_block(&mut self, place: ViewportPlace) -> Task<Message> {
+        let Some((_, start, end)) = self.read_focus_key() else {
+            return Task::none();
+        };
+        let Some((top, bottom)) = self.read_block_px((start, end)) else {
+            return Task::none();
+        };
+        let scroll = self.read_scroll_px;
+        let height = self.read_viewport_px();
+        let y = aether_client::read_layout::place_offset(
+            top - scroll,
+            bottom - scroll,
+            scroll,
+            height,
+            place,
+        );
+        self.read_scroll_to(y, true)
+    }
+
+    /// The reading view's half of `Message::Subscribed`, once measured: restore a pending
+    /// content anchor (the same document's editor, `Space u`), else the subscribe's remembered
+    /// position — then rest the focused block, which a remembered position can leave off screen.
+    fn read_place_subscribed(&mut self) -> Task<Message> {
+        if let Some(row) = self.session.resolve_scroll_anchor(&self.measured) {
+            self.pending_reveal.abandon();
+            let px = self.px_of_units(row.get() as f32);
+            return self.read_scroll_to(px, false);
+        }
+        let mut tasks = Vec::new();
+        if let Some(row) = self.remembered_row(self.subscribe_scroll) {
+            let px = self.px_of_units(row);
+            tasks.push(self.read_scroll_to(px, false));
+        }
+        if let Some((_, start, end)) = self.read_focus_key() {
+            tasks.push(self.read_reveal_block((start, end), false));
+        }
+        Task::batch(tasks)
+    }
+
     /// Fetch a new window when the view nears the loaded range's edge (web's `onScroll`).
     fn maybe_fetch(&mut self) -> Task<Message> {
         // No window fetches while the socket is down — the RPC would fail instantly and (on the
@@ -2568,15 +2833,15 @@ impl App {
         if self.session.conn != ConnState::Connected {
             return Task::none();
         }
-        let (Some(window), Some(cell), Some(viewport_id)) = (
+        let (Some(window), Some(_), Some(viewport_id)) = (
             &self.session.view.window,
             self.cell,
             self.session.view.viewport_id,
         ) else {
             return Task::none();
         };
-        let top_row = VisualRow((((self.scroll_px - PAD) / cell.height).floor()).max(0.0) as u32);
-        let visible = self.visible_rows();
+        let top_row = VisualRow(self.units_of_px(self.scroll_px - PAD).floor().max(0.0) as u32);
+        let visible = self.visible_units();
         // The client lays the view out from the tree, so it knows which elements the viewport
         // reaches and which of their rows; it asks for those — a screen either side, so the next
         // half-screen of scrolling asks nothing — and the server answers with the lines they are.
@@ -2710,7 +2975,7 @@ impl App {
             return false;
         };
         let h = cell.height;
-        let top = PAD + row.get() as f32 * h;
+        let top = PAD + self.px_of_units(row.get() as f32);
         let view_h = self.view_size.height;
         // Already fully visible → don't disturb the view.
         if top >= self.scroll_px && top + h <= self.scroll_px + view_h {
@@ -2734,7 +2999,7 @@ impl App {
             return false;
         };
         let h = cell.height;
-        let top = PAD + row.get() as f32 * h;
+        let top = PAD + self.px_of_units(row.get() as f32);
         // Overscroll by half a row so the cursor lands just inside the edge.
         let margin = h / 2.0;
         let view_h = self.view_size.height;
@@ -2785,7 +3050,7 @@ impl App {
     /// the loaded window (the caller pulls it in first otherwise); reports `false` if its cell is
     /// unknown, on the same terms as [`Self::reveal_cursor`].
     fn place_cursor_in_window(&mut self, place: ViewportPlace) -> bool {
-        let (Some(cell), Some(window)) = (self.cell, &self.session.view.window) else {
+        let (Some(_), Some(window)) = (self.cell, &self.session.view.window) else {
             return false;
         };
         let Some((row, _, _)) = grid::position_cell(
@@ -2797,10 +3062,8 @@ impl App {
         ) else {
             return false;
         };
-        self.scroll_to_px(
-            PAD + row.get() as f32 * cell.height - self.view_size.height * place.fraction(),
-            true,
-        );
+        let top = PAD + self.px_of_units(row.get() as f32);
+        self.scroll_to_px(top - self.view_size.height * place.fraction(), true);
         true
     }
 
@@ -4243,7 +4506,7 @@ impl App {
                 }
                 None => HoverPlace::Bottom(view_h - MARGIN),
                 Some((row, _, _)) => {
-                    let line_top = PAD + row.get() as f32 * cell.height - self.scroll_px;
+                    let line_top = PAD + self.px_of_units(row.get() as f32) - self.scroll_px;
                     let line_bottom = line_top + cell.height;
                     // Orientation is decided once (the first frame, line on-screen) and retained, so
                     // the popover never flips sides mid-scroll: below if it fits there, else above if
@@ -5192,11 +5455,45 @@ fn read_scroll_id(window: window::Id) -> iced::advanced::widget::Id {
     scoped_id(window, "read-view")
 }
 
-/// The container wrapping the block that carries the reading-position bar this frame — the
-/// [`ReadRevealProbe`]'s measurement anchor. Exactly one per view (the focused band, or the
-/// focused list item's wrapper).
-fn read_focus_id(window: window::Id) -> iced::advanced::widget::Id {
-    scoped_id(window, "read-focus")
+/// A reading-view block's container id, keyed by its source span — what the
+/// [`ReadMeasureProbe`] collects. Every block at every depth and every list item is stamped.
+fn read_span_id(window: window::Id, span: MdSpan) -> iced::advanced::widget::Id {
+    scoped_id(window, &format!("read-span-{}:{}", span.start, span.end))
+}
+
+/// The ids [`read_span_id`] stamps for `blocks`, back to their spans — the probe's lookup
+/// table: every block at every depth (list items' and quotes' content included) and every
+/// list item.
+fn read_span_ids(
+    window: window::Id,
+    blocks: &[MdBlock],
+) -> std::collections::HashMap<iced::advanced::widget::Id, (u32, u32)> {
+    fn walk(
+        window: window::Id,
+        blocks: &[MdBlock],
+        out: &mut std::collections::HashMap<iced::advanced::widget::Id, (u32, u32)>,
+    ) {
+        for b in blocks {
+            let sp = b.span();
+            out.insert(read_span_id(window, sp), (sp.start, sp.end));
+            match b {
+                MdBlock::List { items, .. } => {
+                    for item in items {
+                        out.insert(
+                            read_span_id(window, item.span),
+                            (item.span.start, item.span.end),
+                        );
+                        walk(window, &item.blocks, out);
+                    }
+                }
+                MdBlock::Quote { content, .. } => walk(window, content, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    walk(window, blocks, &mut out);
+    out
 }
 
 /// The *focused* code panel's horizontal scrollable — Left/Right pan it; at most one panel carries
@@ -5212,57 +5509,74 @@ fn read_code_scroll_id(window: window::Id) -> iced::advanced::widget::Id {
 /// scheme allow-list drops it.
 const READ_ARM_PREFIX: &str = "aether-arm:";
 
-/// Measure-then-reveal for the reading view: captures the read scrollable's viewport + current
-/// offset and the [`read_focus_id`] container's real bounds (scrollable children operate in
-/// untranslated content coordinates), and finishes with the absolute offset that rests the block
-/// ~20% down the viewport — `None` when it's already comfortably visible. Replaces the
-/// source-byte-fraction snap, which drifted off screen as soon as images and code panels made block
-/// heights non-uniform. Safe to run from the reveal task: the winit runtime executes widget
-/// operations *after* rebuilding the view, so the probe always measures the freshly focused block.
-struct ReadRevealProbe {
+/// What the reading view's widgets measure to, in the read scrollable's content space: every
+/// stamped block's `(span.start, span.end, top px)`, the content and viewport heights, and the
+/// current offset.
+#[derive(Debug, Clone)]
+pub struct ReadGeometry {
+    spans: Vec<(u32, u32, f32)>,
+    content_h: f32,
+    view_h: f32,
+    offset: f32,
+}
+
+/// What the reading view's layout was measured for ([`App::read_geometry_key`]).
+type ReadGeometryKey = (u64, u64, u32, u32, u32, MarkdownWidth, usize);
+
+/// What to do once a [`ReadMeasureProbe`] has refreshed the layout table.
+#[derive(Debug, Clone, Copy)]
+pub enum ReadThen {
+    /// Nothing — the table is fresh for the next visible-lines report or content anchor.
+    Refresh,
+    /// A subscribe landed: place the document ([`App::read_place_subscribed`]).
+    Placement,
+    /// A window arrived with a content anchor possibly pending: restore it.
+    Anchor,
+    /// The focus moved: rest the block, gliding when `smooth`.
+    Reveal { span: (u32, u32), smooth: bool },
+    /// `;` / `Alt-;`: edge-matched placement of the focused block.
+    Place(ViewportPlace),
+}
+
+/// The reading view's layout probe: collects the read scrollable's viewport, offset and content
+/// bounds, and every [`read_span_id`]-stamped container's bounds (scrollable children operate in
+/// untranslated content coordinates), finishing with a [`ReadGeometry`] the app folds into the
+/// shared layout table. Safe to run from the reveal task: the winit runtime executes widget
+/// operations *after* rebuilding the view, so the probe always measures the current document.
+struct ReadMeasureProbe {
     /// The window being measured — the ids it matches are scoped to it.
     window: window::Id,
+    ids: std::collections::HashMap<iced::advanced::widget::Id, (u32, u32)>,
     /// The read scrollable's `(viewport, current translation, content bounds)`.
     viewport: Option<(iced::Rectangle, iced::Vector, iced::Rectangle)>,
-    focus: Option<iced::Rectangle>,
-    /// `None` = reveal (skip when comfortably visible, rest ~20% down); `Some(place)` =
-    /// explicit edge-matched placement (`;`/`Alt-;`): always reposition, leaving
-    /// [`ViewportPlace::READ_GAP`] between the view's edge and the block's matching edge
-    /// (top-to-top for `Upper`, bottom-to-bottom for `Lower`).
-    place: Option<ViewportPlace>,
+    blocks: Vec<((u32, u32), iced::Rectangle)>,
 }
 
-impl ReadRevealProbe {
-    /// Reveal mode: leave a comfortably visible block alone, otherwise rest it ~20% down.
-    fn reveal(window: window::Id) -> Self {
+impl ReadMeasureProbe {
+    fn new(
+        window: window::Id,
+        ids: std::collections::HashMap<iced::advanced::widget::Id, (u32, u32)>,
+    ) -> Self {
         Self {
             window,
+            ids,
             viewport: None,
-            focus: None,
-            place: None,
-        }
-    }
-
-    /// Explicit edge-matched placement (`;` / `Alt-;`): always reposition.
-    fn placing(window: window::Id, place: ViewportPlace) -> Self {
-        Self {
-            place: Some(place),
-            ..Self::reveal(window)
+            blocks: Vec::new(),
         }
     }
 }
 
-impl iced::advanced::widget::Operation<Option<f32>> for ReadRevealProbe {
+impl iced::advanced::widget::Operation<Option<ReadGeometry>> for ReadMeasureProbe {
     fn traverse(
         &mut self,
-        operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<Option<f32>>),
+        operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<Option<ReadGeometry>>),
     ) {
         operate(self);
     }
 
     fn container(&mut self, id: Option<&iced::advanced::widget::Id>, bounds: iced::Rectangle) {
-        if id == Some(&read_focus_id(self.window)) {
-            self.focus = Some(bounds);
+        if let Some(&span) = id.and_then(|id| self.ids.get(id)) {
+            self.blocks.push((span, bounds));
         }
     }
 
@@ -5279,33 +5593,22 @@ impl iced::advanced::widget::Operation<Option<f32>> for ReadRevealProbe {
         }
     }
 
-    fn finish(&self) -> iced::advanced::widget::operation::Outcome<Option<f32>> {
+    fn finish(&self) -> iced::advanced::widget::operation::Outcome<Option<ReadGeometry>> {
         use iced::advanced::widget::operation::Outcome;
-        let (Some((view, translation, content)), Some(focus)) = (self.viewport, self.focus) else {
+        let Some((view, translation, content)) = self.viewport else {
             return Outcome::Some(None);
         };
-        let y = focus.y - content.y; // the block's y in content space
-        let top = y - translation.y; // …relative to the viewport
-        let margin = 48.0_f32.min(view.height * 0.08);
-        if let Some(place) = self.place {
-            // Explicit edge-matched placement: READ_GAP between the view edge and the block's
-            // matching edge — a tall block placed "near the bottom" really ends there.
-            let gap = view.height * ViewportPlace::READ_GAP;
-            let raw = match place {
-                ViewportPlace::Upper => y - gap,
-                ViewportPlace::Lower => (y + focus.height) - (view.height - gap),
-            };
-            let offset = raw.clamp(0.0, (content.height - view.height).max(0.0));
-            return Outcome::Some(Some(offset));
-        }
-        if top >= margin && top + focus.height <= view.height - margin {
-            return Outcome::Some(None); // comfortably visible — don't fight manual scrolling
-        }
-        // Rest ~20% down (the editor's jump placement); an element taller than the viewport
-        // pins nearer the top. Mirrors the web shell's revealFocus math.
-        let rest = (view.height * 0.2).min((view.height - focus.height - margin).max(margin));
-        let offset = (y - rest).clamp(0.0, (content.height - view.height).max(0.0));
-        Outcome::Some(Some(offset))
+        let spans = self
+            .blocks
+            .iter()
+            .map(|((start, end), b)| (*start, *end, (b.y - content.y).max(0.0)))
+            .collect();
+        Outcome::Some(Some(ReadGeometry {
+            spans,
+            content_h: content.height,
+            view_h: view.height,
+            offset: translation.y,
+        }))
     }
 }
 
@@ -5600,16 +5903,13 @@ impl App {
                         .into(),
                     ))
                     .on_press(ReadMsg::Click(item.span.start));
-                    // The focused item anchors the reveal probe (item grain, not the list).
-                    col = col.push(if item_focused {
-                        Element::from(
-                            container(area)
-                                .width(Length::Fill)
-                                .id(read_focus_id(self.window)),
-                        )
-                    } else {
-                        area.into()
-                    });
+                    // Stamped for the layout probe at item grain (a list is one block, its
+                    // items are the stops).
+                    col = col.push(
+                        container(area)
+                            .width(Length::Fill)
+                            .id(read_span_id(self.window, item.span)),
+                    );
                 }
                 col.into()
             }
@@ -5840,14 +6140,12 @@ impl App {
         } else {
             el
         };
-        // Always wrapped, only the *id* is conditional: adding a container on focus alone would
-        // reflow the block as the reading position moved past it.
-        let anchored = container(el).width(Length::Fill);
-        if block == Some(b.span()) {
-            anchored.id(read_focus_id(self.window)).into()
-        } else {
-            anchored.into()
-        }
+        // Stamped with its span for the layout probe (the web's `data-espan`) — every block at
+        // every depth, so a nested paragraph measures at its own top.
+        container(el)
+            .width(Length::Fill)
+            .id(read_span_id(self.window, b.span()))
+            .into()
     }
 
     /// The width a reading-view table can take before it starts scrolling: the measure-capped
@@ -8196,5 +8494,42 @@ mod tests {
             560.0,
             "before the first resize event, the ceiling stands in"
         );
+    }
+
+    /// The probe's lookup table stamps every block at every depth plus every list item — a
+    /// nested paragraph measures at its own top, an item at its marker.
+    #[test]
+    fn read_span_ids_cover_every_block_and_item() {
+        let md = "# T\n\n- one\n\n  inner para\n- two\n\n> quoted\n";
+        let blocks = crate::core::markdown::parse(md);
+        let window = window::Id::unique();
+        let ids = read_span_ids(window, &blocks);
+        let mut spans: Vec<(u32, u32)> = ids.values().copied().collect();
+        spans.sort();
+        let mut expect = Vec::new();
+        fn walk(blocks: &[MdBlock], out: &mut Vec<(u32, u32)>) {
+            for b in blocks {
+                out.push((b.span().start, b.span().end));
+                match b {
+                    MdBlock::List { items, .. } => {
+                        for item in items {
+                            out.push((item.span.start, item.span.end));
+                            walk(&item.blocks, out);
+                        }
+                    }
+                    MdBlock::Quote { content, .. } => walk(content, out),
+                    _ => {}
+                }
+            }
+        }
+        walk(&blocks, &mut expect);
+        expect.sort();
+        expect.dedup();
+        assert_eq!(spans, expect);
+        // The heading, the list, its two items, the nested paragraph, the quote and its
+        // paragraph — seven distinct stops, every one addressable by its own id.
+        assert!(spans.len() >= 7, "{spans:?}");
+        let (start, end) = spans[1];
+        assert!(ids.contains_key(&read_span_id(window, MdSpan { start, end })));
     }
 }

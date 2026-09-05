@@ -1942,20 +1942,45 @@ pub fn measured_element(
     pad_top: u32,
     pad_bottom: u32,
 ) -> crate::grid::MeasuredElement {
-    let line_count = line_count.max(1) as usize;
-    // Per line: the span length of the innermost block seen so far, and that block's first row.
-    let mut innermost: Vec<Option<(u32, u32)>> = vec![None; line_count];
-    for (row, r) in rows.iter().enumerate() {
-        let Some(e) = r.element.and_then(|i| elements.get(i)) else {
-            continue;
-        };
+    let spans = rows.iter().enumerate().filter_map(|(row, r)| {
+        let e = r.element.and_then(|i| elements.get(i))?;
         let span = e.span();
-        let len = span.end.saturating_sub(span.start);
-        let first = line_of(span.start) as usize;
-        let last = line_of(span.end.saturating_sub(1).max(span.start)) as usize;
+        Some((span.start, span.end, row as u32))
+    });
+    measured_from_spans(
+        spans,
+        line_of,
+        line_count,
+        pad_top,
+        (rows.len() as u32)
+            .saturating_add(pad_top)
+            .saturating_add(pad_bottom),
+    )
+}
+
+/// [`measured_element`] from wherever a shell knows its blocks' places: each block as its source
+/// byte span and the offset within the element it starts at, in whatever unit the shell measures
+/// in — a terminal's rows, a browser's block tops in thousandths of a row. The terminal derives
+/// them from its own layout rows; a pixel shell reads them off what it drew. Same rule either way:
+/// a line takes the innermost block covering it, lines no block covers start where the previous
+/// line did, and line 0 starts at offset 0 with the top padding riding on it.
+pub fn measured_from_spans(
+    spans: impl IntoIterator<Item = (u32, u32, u32)>,
+    line_of: impl Fn(u32) -> u32,
+    line_count: u32,
+    pad_top: u32,
+    end: u32,
+) -> crate::grid::MeasuredElement {
+    let line_count = line_count.max(1) as usize;
+    // Per line: the span length of the innermost block seen so far, and where that block starts.
+    let mut innermost: Vec<Option<(u32, u32)>> = vec![None; line_count];
+    for (start, end, at) in spans {
+        let len = end.saturating_sub(start);
+        let first = line_of(start) as usize;
+        let last = line_of(end.saturating_sub(1).max(start)) as usize;
         for slot in innermost.iter_mut().take(last + 1).skip(first) {
             if slot.is_none_or(|(have, _)| len < have) {
-                *slot = Some((len, row as u32));
+                *slot = Some((len, at));
             }
         }
     }
@@ -1964,7 +1989,7 @@ pub fn measured_element(
     for (line, slot) in innermost.iter().enumerate() {
         let at = match slot {
             _ if line == 0 => 0,
-            Some((_, row)) => row.saturating_add(pad_top).max(prev),
+            Some((_, at)) => at.saturating_add(pad_top).max(prev),
             None => prev,
         };
         starts.push(at);
@@ -1973,10 +1998,71 @@ pub fn measured_element(
     crate::grid::MeasuredElement {
         first_row: aether_protocol::coords::ElementRow::ZERO,
         starts,
-        end: (rows.len() as u32)
-            .saturating_add(pad_top)
-            .saturating_add(pad_bottom),
+        end,
     }
+}
+
+/// The rows a reading-view block occupies at the shell's resolution — `(top, bottom)`: the top
+/// row of its first source line, and the top row of the line after its last (the element's end
+/// when the block closes the document). `None` until the element is measured, or when its lines
+/// aren't in the window. `line_of` maps a source byte to its line, as the reading view knows it.
+pub fn block_rows(
+    window: &aether_protocol::viewport::Window,
+    element: aether_protocol::viewport::FieldId,
+    line_of: impl Fn(u32) -> u32,
+    span: (u32, u32),
+    measured: &crate::grid::Measured,
+) -> Option<(
+    aether_protocol::coords::VisualRow,
+    aether_protocol::coords::VisualRow,
+)> {
+    use crate::grid;
+    let (start, end) = span;
+    let first = line_of(start);
+    let last = line_of(end.saturating_sub(1).max(start));
+    let top = grid::line_top_row(window, element, first, measured)?;
+    let bottom = grid::line_top_row(window, element, last + 1, measured).or_else(|| {
+        let node = window.root.editors().into_iter().find(|n| {
+            matches!(n, aether_protocol::viewport::Element::Editor { element: e, .. } if *e == element)
+        })?;
+        let start = grid::element_start_row(window, element, measured)?;
+        Some(start.saturating_add(measured.height(node)))
+    });
+    Some((top, bottom.unwrap_or(top)))
+}
+
+/// Where a pixel shell's reader scrolls to show a block at rest. `top`/`bottom` are the block's
+/// edges relative to the viewport's top, `scroll` the current offset and `height` the viewport's,
+/// all in one length unit. `None` when the block already sits comfortably inside both edges (a
+/// margin's worth), else the offset that rests it ~20% down — nearer the top when it's taller
+/// than that leaves room for. The browser shell's `revealBlock` mirrors this in TypeScript.
+pub fn reveal_offset(top: f32, bottom: f32, scroll: f32, height: f32) -> Option<f32> {
+    let margin = 48.0_f32.min(height * 0.08);
+    if top >= margin && bottom <= height - margin {
+        return None;
+    }
+    let rest = (height * 0.2).min((height - (bottom - top) - margin).max(margin));
+    Some((scroll + top - rest).max(0.0))
+}
+
+/// The offset for an explicit edge-matched placement of a block (`;` / `Alt-;`) in a pixel
+/// shell's reader: [`ViewportPlace::READ_GAP`] of the viewport between its edge and the block's
+/// matching edge — top-to-top for `Upper`, bottom-to-bottom for `Lower` — so a tall block placed
+/// "near the bottom" really ends there. Same units as [`reveal_offset`].
+pub fn place_offset(
+    top: f32,
+    bottom: f32,
+    scroll: f32,
+    height: f32,
+    place: crate::keymap::ViewportPlace,
+) -> f32 {
+    use crate::keymap::ViewportPlace;
+    let gap = height * ViewportPlace::READ_GAP;
+    let raw = match place {
+        ViewportPlace::Upper => scroll + top - gap,
+        ViewportPlace::Lower => scroll + bottom - (height - gap),
+    };
+    raw.max(0.0)
 }
 
 #[cfg(test)]
@@ -2022,5 +2108,49 @@ mod measure_tests {
         let m = measured_element(&[], &[], |_| 0, 3, 2, 2);
         assert_eq!(m.starts, vec![0, 0, 0]);
         assert_eq!(m.end, 4);
+    }
+
+    /// A block inside both margins is left alone; one below the fold rests ~20% down; one taller
+    /// than the rest position pins nearer the top, never above the margin.
+    #[test]
+    fn reveal_rests_a_block_a_fifth_down_or_leaves_it() {
+        let h = 500.0;
+        assert_eq!(reveal_offset(100.0, 200.0, 1000.0, h), None);
+        // 10 past the bottom margin (500 * 0.08 = 40): moves — and a 370-tall block leaves
+        // only 90 of rest above it (500 - 370 - 40), short of the usual 100.
+        assert_eq!(
+            reveal_offset(100.0, 470.0, 1000.0, h),
+            Some(1000.0 + 100.0 - 90.0)
+        );
+        // Below the fold: its top lands 20% (100) down.
+        assert_eq!(reveal_offset(700.0, 750.0, 1000.0, h), Some(1600.0));
+        // Taller than the room below the 20% rest: rest = max(margin, h - block - margin).
+        let rest = (h - 400.0 - 40.0).max(40.0); // 60
+        assert_eq!(
+            reveal_offset(700.0, 1100.0, 1000.0, h),
+            Some(1000.0 + 700.0 - rest)
+        );
+        // Never scrolls above the document's start.
+        assert_eq!(reveal_offset(-300.0, -250.0, 20.0, h), Some(0.0));
+    }
+
+    /// Upper matches the block's top to the gap below the view's top; Lower its bottom to the
+    /// gap above the view's bottom.
+    #[test]
+    fn placement_matches_the_named_edge() {
+        use crate::keymap::ViewportPlace;
+        let gap = 500.0 * ViewportPlace::READ_GAP;
+        assert_eq!(
+            place_offset(300.0, 600.0, 1000.0, 500.0, ViewportPlace::Upper),
+            1300.0 - gap
+        );
+        assert_eq!(
+            place_offset(300.0, 600.0, 1000.0, 500.0, ViewportPlace::Lower),
+            1600.0 - (500.0 - gap)
+        );
+        assert_eq!(
+            place_offset(-900.0, -800.0, 100.0, 500.0, ViewportPlace::Upper),
+            0.0
+        );
     }
 }

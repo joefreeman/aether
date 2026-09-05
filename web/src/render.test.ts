@@ -14,6 +14,7 @@
 import { describe, expect, it } from "vitest";
 import { renderBuffer } from "./render";
 import { totalRows } from "./protocol";
+import { WHOLE_ROWS } from "./protocol";
 import type { BufferWindow, CursorState, LogicalLineRender, Measured, ViewNode } from "./protocol";
 
 const line = (n: number, text: string): LogicalLineRender => ({
@@ -60,7 +61,7 @@ function painted(window: BufferWindow, opts: { cursor?: CursorState; focused?: n
     spacerHeightPx: 0,
     contentTopPx: 0,
     rowHeightPx: 0,
-    measured: {},
+    measured: WHOLE_ROWS,
     blame: null,
     diffView: false,
     focusedElement: opts.focused ?? 0,
@@ -142,7 +143,7 @@ describe("the buffer painter", () => {
       spacerHeightPx: 0,
       contentTopPx: 0,
       rowHeightPx: 10,
-      measured: {},
+      measured: WHOLE_ROWS,
       blame: null,
       diffView: false,
       focusedElement: 0,
@@ -192,9 +193,11 @@ describe("the buffer painter", () => {
       );
     };
     // Unmeasured: one row per line, two rows into the element (row 1 is the heading).
-    expect(paint({})).toEqual(["a.md", "gap 20px", "two", "three", "four"]);
+    expect(paint(WHOLE_ROWS)).toEqual(["a.md", "gap 20px", "two", "three", "four"]);
     // Measured: line 3 laid out three rows tall, so line 4 moves down by two.
-    expect(paint({ 0: { first_row: 2, starts: [2, 3, 6], end: 8 } })).toEqual([
+    expect(
+      paint({ units_per_row: 1, elements: { 0: { first_row: 2, starts: [2, 3, 6], end: 8 } } }),
+    ).toEqual([
       "a.md",
       "gap 20px",
       "two",
@@ -202,7 +205,9 @@ describe("the buffer painter", () => {
       "gap 20px",
       "four",
     ]);
-    expect(totalRows(w.root, { 0: { first_row: 2, starts: [2, 3, 6], end: 8 } })).toBe(1 + 2 + 6 + 5);
+    expect(
+      totalRows(w.root, { units_per_row: 1, elements: { 0: { first_row: 2, starts: [2, 3, 6], end: 8 } } }),
+    ).toBe(1 + 2 + 6 + 5);
   });
 
   /// The closing rule hangs off the *last rendered row*, not off a line number. Asking
@@ -254,7 +259,7 @@ describe("the buffer painter", () => {
       spacerHeightPx: 0,
       contentTopPx: 0,
       rowHeightPx: 0,
-      measured: {},
+      measured: WHOLE_ROWS,
       blame: null,
       diffView: false,
       focusedElement: 1,
@@ -296,7 +301,7 @@ describe("the buffer painter", () => {
       spacerHeightPx: 0,
       contentTopPx: 0,
       rowHeightPx: 0,
-      measured: {},
+      measured: WHOLE_ROWS,
       blame: null,
       diffView: false,
       focusedElement: 0,

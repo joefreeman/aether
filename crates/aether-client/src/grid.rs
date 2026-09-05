@@ -146,51 +146,85 @@ impl ElementLine {
 /// Absent from here, the element is taken at one row per line, which is what the server counted
 /// and a serviceable estimate until the shell has measured.
 ///
-/// Rows are the unit throughout, in every shell. A pixel shell reports a prose element's height
-/// rounded up to whole rows and positions its blocks at pixel precision inside that; the slack is
-/// at most a row at the element's foot, and the scroll model stays one arithmetic in one unit.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The unit throughout is the **row at the shell's resolution**: [`Self::units_per_row`] units
+/// make one row. A terminal counts whole rows and sets it to 1. A pixel shell sets it to 1000 and
+/// measures in thousandths of a row — a fiftieth of a pixel at any sane row height — so a block
+/// of prose lands where the shell drew it, not rounded to the nearest row, while everything the
+/// server laid out still converts exactly: a wrapped row is `units_per_row` units, and the server
+/// never learns the resolution. One integer arithmetic serves every shell; the resolution is the
+/// shell's to choose.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Measured {
+    /// How many units one row is — the resolution every height and offset here is counted in.
+    /// Never 0.
+    pub units_per_row: u32,
     pub elements: std::collections::HashMap<FieldId, MeasuredElement>,
 }
 
+impl Default for Measured {
+    /// Whole rows, nothing measured: the terminal's, and every shell's before it has laid an
+    /// element out.
+    fn default() -> Self {
+        Measured {
+            units_per_row: 1,
+            elements: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Measured {
+    /// Nothing measured, at `units_per_row` units to the row.
+    pub fn at_resolution(units_per_row: u32) -> Self {
+        Measured {
+            units_per_row: units_per_row.max(1),
+            elements: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// One client-laid-out element as measured: where each loaded line starts within it, and where
-/// the loaded slice ends. Lines outside the loaded slice — which the shell has not seen — count one
-/// row each, exactly as the tree counts them, so the rows above the slice are `first_row` rows.
+/// the loaded slice ends, in the units of the [`Measured`] holding it. Lines outside the loaded
+/// slice — which the shell has not seen — count one row each, exactly as the tree counts them, so
+/// the units above the slice are `first_row` rows' worth.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeasuredElement {
     /// The wire row of the first loaded line: the editor's `first_row`.
     pub first_row: ElementRow,
-    /// For each loaded line, the row within the element it starts on, ascending. The first is
-    /// `first_row` — the unloaded lines above it are one row each.
+    /// For each loaded line, the offset within the element it starts at, ascending. The first is
+    /// `first_row` rows down — the unloaded lines above it are one row each.
     pub starts: Vec<u32>,
-    /// The row after the last loaded line's last row.
+    /// The offset after the last loaded line's last unit.
     pub end: u32,
 }
 
 impl MeasuredElement {
-    /// The element's height in rows, given its line count (`rows` as the server sent it): the
-    /// unloaded lines at one row each, the loaded ones as measured.
-    pub fn rows(&self, lines: u32) -> u32 {
+    /// The element's height, given its line count (`rows` as the server sent it): the unloaded
+    /// lines at one row each, the loaded ones as measured.
+    pub fn height(&self, lines: u32, units_per_row: u32) -> u32 {
         let loaded = self.starts.len() as u32;
         let before = self.first_row.get();
-        let measured = self
-            .end
-            .saturating_sub(self.starts.first().copied().unwrap_or(before));
-        before + measured + lines.saturating_sub(before + loaded)
+        let measured = self.end.saturating_sub(
+            self.starts
+                .first()
+                .copied()
+                .unwrap_or(before * units_per_row),
+        );
+        before * units_per_row + measured + lines.saturating_sub(before + loaded) * units_per_row
     }
 
-    /// The wire row sitting `offset` rows into the element.
-    fn row_at(&self, offset: u32) -> ElementRow {
+    /// The wire row sitting `offset` units into the element.
+    fn row_at(&self, offset: u32, units_per_row: u32) -> ElementRow {
         let first = self.first_row.get();
         let Some(&start) = self.starts.first() else {
-            return ElementRow(offset);
+            return ElementRow(offset / units_per_row);
         };
         if offset < start {
-            return ElementRow(offset);
+            return ElementRow(offset / units_per_row);
         }
         if offset >= self.end {
-            return ElementRow(first + self.starts.len() as u32 + (offset - self.end));
+            return ElementRow(
+                first + self.starts.len() as u32 + (offset - self.end) / units_per_row,
+            );
         }
         let idx = self
             .starts
@@ -199,15 +233,15 @@ impl MeasuredElement {
         ElementRow(first + idx as u32)
     }
 
-    /// The row within the element that wire row `row` starts on.
-    fn offset_of(&self, row: ElementRow) -> u32 {
+    /// The offset within the element that wire row `row` starts at.
+    fn offset_of(&self, row: ElementRow, units_per_row: u32) -> u32 {
         let first = self.first_row.get();
         let Some(i) = row.get().checked_sub(first) else {
-            return row.get();
+            return row.get() * units_per_row;
         };
         match self.starts.get(i as usize) {
             Some(start) => *start,
-            None => self.end + (i - self.starts.len() as u32),
+            None => self.end + (i - self.starts.len() as u32) * units_per_row,
         }
     }
 }
@@ -226,32 +260,41 @@ impl Measured {
         }
     }
 
-    /// Rows `node` occupies: the tree's count, or the measured height for an element the client
-    /// laid out.
+    /// Units `node` occupies: the tree's row count at this resolution, or the measured height for
+    /// an element the client laid out.
     pub fn height(&self, node: &Element) -> u32 {
         match (node, self.of(node)) {
-            (Element::Editor { rows, .. }, Some(m)) => m.rows(*rows),
-            (Element::Editor { rows, .. }, None) => *rows,
+            (Element::Editor { rows, .. }, Some(m)) => m.height(*rows, self.units_per_row),
+            (Element::Editor { rows, .. }, None) => rows * self.units_per_row,
             (Element::Stack { .. }, _) => 0,
-            _ => 1,
+            _ => self.units_per_row,
         }
     }
 
-    /// Which wire row of `node` sits `offset` rows into it — the row the server numbers, which is
+    /// Which wire row of `node` sits `offset` units into it — the row the server numbers, which is
     /// the row a fetch is asked by.
     pub fn row_at(&self, node: &Element, offset: u32) -> ElementRow {
         self.of(node)
-            .map_or(ElementRow(offset), |m| m.row_at(offset))
+            .map_or(ElementRow(offset / self.units_per_row), |m| {
+                m.row_at(offset, self.units_per_row)
+            })
     }
 
-    /// The row within `node` that wire row `row` starts on.
+    /// The offset within `node` that wire row `row` starts at.
     pub fn offset_of(&self, node: &Element, row: ElementRow) -> u32 {
-        self.of(node).map_or(row.get(), |m| m.offset_of(row))
+        self.of(node).map_or(row.get() * self.units_per_row, |m| {
+            m.offset_of(row, self.units_per_row)
+        })
+    }
+
+    /// One row, in this resolution's units.
+    pub fn row(&self) -> u32 {
+        self.units_per_row
     }
 }
 
-/// Rows the whole view occupies: chrome, one row each, every server-laid-out editor's height, and
-/// every client-laid-out element as measured.
+/// Units the whole view occupies: chrome, one row each, every server-laid-out editor's height, and
+/// every client-laid-out element as measured — all at the shell's resolution.
 ///
 /// What a scroller is sized to and what the scroll limit is taken from. The server used to send
 /// this; it cannot once a view holds an element the client laid out, and it never needed to — the
@@ -299,7 +342,7 @@ pub fn element_start_row_of(
     found
 }
 
-/// The slices a viewport showing rows `top..top+rows` needs, `overscan` rows either side: one per
+/// The slices a viewport showing `top..top+extent` needs, `overscan` units either side: one per
 /// editor the span reaches, each named by row within that editor.
 ///
 /// This is the request a client makes while scrolling. It knows where every editor starts from the
@@ -311,12 +354,13 @@ pub fn element_start_row_of(
 pub fn slices_for(
     root: &Element,
     top: VisualRow,
-    rows: u32,
+    extent: u32,
     overscan: u32,
     measured: &Measured,
 ) -> Vec<SliceRequest> {
     let lo = top.get().saturating_sub(overscan);
-    let hi = top.get().saturating_add(rows).saturating_add(overscan);
+    let hi = top.get().saturating_add(extent).saturating_add(overscan);
+    let unit = measured.row();
     let mut out = Vec::new();
     let mut at = 0u32;
     walk_rows(root, measured, &mut |node, height| {
@@ -332,9 +376,11 @@ pub fn slices_for(
             if a < b {
                 let (from, rows) = match laid_out_by {
                     LayoutOwner::Client => (ElementRow::ZERO, (*lines).max(1)),
+                    // A partial row at either edge is fetched whole: the first row the span
+                    // touches to the last.
                     LayoutOwner::Server => {
-                        let from = measured.row_at(node, a - start);
-                        let to = measured.row_at(node, b - start);
+                        let from = ElementRow((a - start) / unit);
+                        let to = ElementRow((b - start).div_ceil(unit));
                         (from, to.get().saturating_sub(from.get()).max(1))
                     }
                 };
@@ -425,9 +471,11 @@ fn walk_rows<'a>(node: &'a Element, measured: &Measured, f: &mut impl FnMut(&'a 
                 "an Editor inside a Row/Chrome: representable, but the row model cannot give \
                  it rows of its own — see the module docs on `ui::Element`"
             );
-            f(node, 1)
+            f(node, measured.row())
         }
-        Element::Text { .. } | Element::Space { .. } | Element::Fill { .. } => f(node, 1),
+        Element::Text { .. } | Element::Space { .. } | Element::Fill { .. } => {
+            f(node, measured.row())
+        }
     }
 }
 
@@ -547,6 +595,7 @@ pub fn painted_rows_of<'a>(
     measured: &Measured,
 ) -> Vec<(VisualRow, PaintedRow<'a>)> {
     let total_lines: usize = root.lines().len();
+    let unit = measured.row();
     let mut out = Vec::new();
     let mut at = 0u32;
     let mut seen = 0usize;
@@ -566,7 +615,7 @@ pub fn painted_rows_of<'a>(
                             ..
                         }
                     );
-                let mut row = at.saturating_add(first_row.get());
+                let mut row = at.saturating_add(first_row.get().saturating_mul(unit));
                 for (i, line) in lines.iter().enumerate() {
                     if client_laid_out {
                         // Where the shell put the line — or, unmeasured, one row per line.
@@ -584,7 +633,7 @@ pub fn painted_rows_of<'a>(
                                 row: baseline,
                             },
                         ));
-                        row = row.saturating_add(1);
+                        row = row.saturating_add(unit);
                     }
                     seen += 1;
                     for (row_index, wrapped) in line.visual_rows.iter().enumerate() {
@@ -598,7 +647,7 @@ pub fn painted_rows_of<'a>(
                                 last_line: seen == total_lines,
                             },
                         ));
-                        row = row.saturating_add(1);
+                        row = row.saturating_add(unit);
                     }
                 }
             }
@@ -669,10 +718,10 @@ pub fn line_block_start(
     Some(rows[start].0)
 }
 
-/// The line owning absolute row `abs_row`, and how many of that line's rows sit above it (the
+/// The line owning absolute offset `abs_row`, and how many of that line's rows sit above it (the
 /// sub-row offset into the line — phantom rows included). A chrome row resolves to the line below
-/// it; a row nothing is loaded at resolves to the nearest loaded line at or before it, else the
-/// first loaded line after it.
+/// it; an offset nothing is loaded at resolves to the nearest loaded line at or before it, else
+/// the first loaded line after it.
 ///
 /// Resolved from [`painted_rows`], so it cannot disagree with what a shell draws.
 pub fn line_at_row(
@@ -680,8 +729,23 @@ pub fn line_at_row(
     abs_row: VisualRow,
     measured: &Measured,
 ) -> (FieldId, u32, u32) {
+    let (element, line, sub_row, _) = line_at_offset(window, abs_row, measured);
+    (element, line, sub_row)
+}
+
+/// [`line_at_row`], with the offset the resolved row itself starts at — `abs_row` when the
+/// answer is a row and not a fallback — so a caller can say how far into the row the offset sits.
+/// A painted content row's line: `(element, logical line, row index within the line's block)`.
+type LineRow = (FieldId, u32, u32);
+
+fn line_at_offset(
+    window: &Window,
+    abs_row: VisualRow,
+    measured: &Measured,
+) -> (FieldId, u32, u32, VisualRow) {
     let rows = painted_rows(window, measured);
-    let content = |item: &PaintedRow<'_>| -> Option<(FieldId, u32, u32)> {
+    let unit = measured.row();
+    let content = |item: &PaintedRow<'_>| -> Option<LineRow> {
         match item {
             PaintedRow::Chrome(_) => None,
             PaintedRow::Baseline {
@@ -702,59 +766,70 @@ pub fn line_at_row(
             )),
         }
     };
-    let mut before: Option<(FieldId, u32, u32)> = None;
-    let mut after: Option<(FieldId, u32, u32)> = None;
-    let mut on_chrome = false;
+    // The last painted row starting at or before the offset, and whether the offset is *on* it —
+    // within the row's own unit of height — or in whatever follows it: a client-laid-out line's
+    // further rows, or a gap nothing is loaded at. Chrome on the row above a gap does not claim
+    // the gap.
+    let mut before: Option<(LineRow, VisualRow)> = None;
+    let mut on: Option<(Option<LineRow>, VisualRow)> = None;
+    let mut after: Option<(LineRow, VisualRow)> = None;
     for (at, item) in &rows {
-        let Some(here) = content(item) else {
-            on_chrome |= *at == abs_row;
-            continue;
-        };
-        if *at == abs_row {
-            return here;
-        }
-        if *at < abs_row {
-            before = Some(here);
+        if *at <= abs_row {
+            let here = content(item);
+            on = (abs_row < at.saturating_add(unit)).then_some((here, *at));
+            if let Some(h) = here {
+                before = Some((h, *at));
+            }
         } else if after.is_none() {
-            after = Some(here);
+            if let Some(h) = content(item) {
+                after = Some((h, *at));
+            }
         }
     }
-    // A chrome row belongs to the line it introduces — the one below it; a row nothing is loaded
-    // at belongs to whatever is nearest above.
-    let nearest = if on_chrome {
-        after.or(before)
-    } else {
-        before.or(after)
+    // A chrome row belongs to the line it introduces — the one below it; an offset nothing is
+    // loaded at belongs to whatever is nearest above.
+    let nearest = match on {
+        Some((Some(here), at)) => Some((here, at)),
+        Some((None, _)) => after.or(before),
+        None => before.or(after),
     };
-    nearest.unwrap_or_else(|| {
-        // Nothing loaded. The answer is a *buffer* line, and the first editor's own start is the
-        // only honest one.
-        (
-            0,
-            window
-                .root
-                .editors()
-                .first()
-                .and_then(|n| match n {
-                    Element::Editor {
-                        first_buffer_line, ..
-                    } => Some(*first_buffer_line),
-                    _ => None,
-                })
-                .unwrap_or(0),
-            0,
-        )
-    })
+    nearest
+        .map(|((element, line, sub), at)| (element, line, sub, at))
+        .unwrap_or_else(|| {
+            // Nothing loaded. The answer is a *buffer* line, and the first editor's own start is
+            // the only honest one.
+            (
+                0,
+                window
+                    .root
+                    .editors()
+                    .first()
+                    .and_then(|n| match n {
+                        Element::Editor {
+                            first_buffer_line, ..
+                        } => Some(*first_buffer_line),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                0,
+                abs_row,
+            )
+        })
 }
 
-/// Where a viewport's top row is, as content — what a window request reports so the server can
-/// restore the view there. The line at the row and how far into its rows the top sits.
+/// Where a viewport's top is, as content — what a window request reports so the server can
+/// restore the view there. The line at the offset and how far into its rows the top sits; a
+/// shell scrolled part-way into a row reports the fraction, so it comes back to the pixel.
 pub fn anchor_at(window: &Window, top: VisualRow, measured: &Measured) -> ScrollPosition {
-    let (element, line, sub_row) = line_at_row(window, top, measured);
+    let (element, line, sub_row, at) = line_at_offset(window, top, measured);
+    let into = top
+        .get()
+        .saturating_sub(at.get())
+        .min(measured.row().saturating_sub(1));
     ScrollPosition {
         element,
         line,
-        sub_row: sub_row as f32,
+        sub_row: sub_row as f32 + into as f32 / measured.row() as f32,
     }
 }
 
@@ -800,7 +875,7 @@ impl ScrollAnchor {
 
 /// Capture a [`ScrollAnchor`] for the current view: pin the cursor if it's visible (so the user's
 /// focus stays put), else pin the top visible line (so the content stays put). `top_row` is the
-/// absolute visual row at the top of the viewport; `viewport_rows` its height.
+/// absolute offset at the top of the viewport; `viewport_rows` its height, in the same units.
 pub fn capture_scroll_anchor(
     window: &Window,
     top_row: VisualRow,
@@ -856,7 +931,7 @@ pub fn resolve_scroll_anchor(
                 .find(|(at, _)| *at == ElementLine::new(anchored, logical_line))
                 .map(|(_, line)| line_rows(line))
                 .unwrap_or(1);
-            top.saturating_add(sub_row.min(height.saturating_sub(1)))
+            top.saturating_add(sub_row.min(height.saturating_sub(1)) * measured.row())
         }
     }
 }
@@ -2272,6 +2347,76 @@ mod tests {
             rows,
             vec!["0 chrome a.md", "3 L2", "4 L3", "7 L4", "14 chrome b.rs"],
             "line 3 starts at row 4 and takes three rows, so line 4 starts at row 7"
+        );
+    }
+
+    /// The same view at a pixel shell's resolution — a thousand units to the row. Chrome and every
+    /// row the server laid out are whole rows; the prose sits wherever the shell drew it, to the
+    /// unit; an offset part-way into a row reports how far, and a viewport reaching part-way into
+    /// the server's rows fetches them whole.
+    #[test]
+    fn a_pixel_resolution_counts_thousandths_of_a_row() {
+        let mut w = window(0, 0, vec![]);
+        w.root = Element::Stack {
+            children: vec![
+                chrome("a.md"),
+                prose(0, 2, 10, 2..5),
+                chrome("b.rs"),
+                editor(1, 0, 3, vec![line(0, vec![row(0, 0, "code")])]),
+            ],
+        };
+        let mut m = Measured::at_resolution(1000);
+        // Lines 2..5 loaded two rows in; the shell drew them 1, 3.5 and 2 rows tall.
+        m.elements.insert(
+            0,
+            MeasuredElement {
+                first_row: ElementRow(2),
+                starts: vec![2000, 3000, 6500],
+                end: 8500,
+            },
+        );
+        assert_eq!(
+            total_rows(&w.root, &m),
+            1000 + (2000 + 6500 + 5000) + 1000 + 3000
+        );
+        assert_eq!(
+            element_start_row(&w, 1, &m),
+            Some(VisualRow(1000 + 13500 + 1000))
+        );
+        let rows: Vec<String> = painted_rows(&w, &m)
+            .into_iter()
+            .map(|(at, item)| match item {
+                PaintedRow::Chrome(n) => format!("{at} chrome {}", chrome_text(n)),
+                PaintedRow::Text { line, .. } => format!("{at} L{}", line.logical_line),
+                PaintedRow::Baseline { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "0 chrome a.md",
+                "3000 L2",
+                "4000 L3",
+                "7500 L4",
+                "14500 chrome b.rs",
+                "15500 L0"
+            ]
+        );
+        // An offset inside line 3's three and a half rows is line 3's; the anchor says how far in.
+        assert_eq!(line_at_row(&w, VisualRow(5200), &m).1, 3);
+        let anchor = anchor_at(&w, VisualRow(4250), &m);
+        assert_eq!((anchor.element, anchor.line), (0, 3));
+        assert!((anchor.sub_row - 0.25).abs() < 1e-6, "{}", anchor.sub_row);
+        // The chrome row above the editor is the editor's first line, at any offset on it.
+        assert_eq!(line_at_row(&w, VisualRow(14900), &m).0, 1);
+        // A viewport from 0.7 rows into the editor to 1.7 rows in wants rows 1 and 2 whole.
+        let slices = slices_for(&w.root, VisualRow(15500 + 1700), 1000, 0, &m);
+        assert_eq!(
+            slices
+                .iter()
+                .map(|s| (s.element, s.from_row, s.rows))
+                .collect::<Vec<_>>(),
+            vec![(1, ElementRow(1), 2)]
         );
     }
 

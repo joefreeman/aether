@@ -30,7 +30,7 @@ import init, {
 } from "./wasm/aether_web";
 import { RpcClient, type ConnState } from "./client";
 import { renderBuffer } from "./render";
-import { applyFenceHighlights, markFocus, renderReadView, revealFocus, type ReadDoc } from "./read";
+import { applyFenceHighlights, markFocus, renderReadView, type ReadDoc } from "./read";
 import { decodeRow } from "./text";
 import { statusIcon, severityIcon, lspStateClass, type IconKind } from "./icons";
 import { truncatePath, charBudget } from "./paths";
@@ -62,6 +62,7 @@ import type {
   ViewportWindowResult,
   WrapMode,
 } from "./protocol";
+import { WHOLE_ROWS } from "./protocol";
 // Row arithmetic shared with the core: a chrome row occupies a screen row like any other.
 import { REPO_OPERATION_LABELS } from "./protocol";
 
@@ -73,6 +74,11 @@ const CONTINUATION_MARKER_WIDTH = 2;
 // path) are segment-elided to this cap, consistently with the native clients.
 const TITLE_LABEL_MAX = 60;
 const BUFFER_PAD = 8; // px of breathing room above the first line / below the last (virtual)
+/** The resolution this shell counts the view's vertical layout in — see `Measured`: a thousand
+ *  units to one editor row, so a reading-view block measured off the DOM lands where it was drawn
+ *  (a fiftieth of a pixel at any sane row height) while every row the server laid out stays an
+ *  exact thousand. Every offset that crosses into the core is in these units. */
+const UNITS_PER_ROW = 1000;
 // Vertical breathing room between picker group runs (after each group except the last). Must
 // match `--picker-group-gap` in theme.css — the CSS renders it (section margins), this constant
 // keeps the virtual-scroll geometry honest about it (see `applyGeometry`).
@@ -1261,7 +1267,7 @@ export class Shell {
   /** What this shell has measured of the elements it lays out itself — none yet: every element
    *  the browser shows is server-laid-out. Handed to the core (`set_measured`) whenever it changes,
    *  so the layout it scrolls and fetches by is the one painted. */
-  private measured: Measured = {};
+  private measured: Measured = WHOLE_ROWS;
   /** True while the markdown reading view owns the buffer element. */
   private readActive = false;
   /** The focus last revealed (`buffer:start:end`), so the view scrolls only on focus changes. */
@@ -1753,6 +1759,9 @@ export class Shell {
     this.cell = measureCell(this.bufferEl);
 
     this.bufferEl.addEventListener("scroll", () => this.onScroll(), { passive: true });
+    // An image finishing its load moves every block below it: measure the reader again so the
+    // shared layout follows the document as drawn. `load` does not bubble; capture it.
+    this.bufferEl.addEventListener("load", () => this.measureReader(), true);
     this.bufferEl.addEventListener("mousedown", (e) => this.onBufferMouseDown(e));
     // Reading view: a click on a rendered element sets the reading selection (focus). A `click`
     // rather than mousedown, so a text-selection drag (native selection is enabled in read
@@ -1850,7 +1859,7 @@ export class Shell {
       // rendered behind it. Picking a workspace activates it (PickerSelected → WorkspaceActivated →
       // adopt_switch) and the editor first appears then. Matches the native shells' no-args start.
       if (specified === null && !directed) {
-        this.session = new WasmSession();
+        this.adoptSession(new WasmSession());
         this.runEffects(this.session.open_workspaces() as CoreEffect[]);
         this.capture.focus();
         return;
@@ -1933,7 +1942,7 @@ export class Shell {
         }
       }
 
-      this.session = WasmSession.bootstrap(workspace, open);
+      this.adoptSession(WasmSession.bootstrap(workspace, open));
       await this.subscribe(); // derives its scroll from the buffer (open.scroll / cursor)
       // Fetch the persisted app settings (e.g. the soft-wrap default) now that the session is live.
       this.runEffects(this.session.startup() as CoreEffect[]);
@@ -2246,7 +2255,7 @@ export class Shell {
     // Reconnected while still choosing a workspace (no workspace activated yet): just re-raise the
     // chooser on the fresh connection rather than activating an empty-named workspace.
     if (snap.buffer.buffer_id === 0) {
-      this.session = new WasmSession();
+      this.adoptSession(new WasmSession());
       this.connBanner.style.display = "none";
       this.runEffects(this.session.open_workspaces() as CoreEffect[]);
       this.capture.focus();
@@ -2272,7 +2281,7 @@ export class Shell {
           relanded.opened ??
           (await this.client.rpc<ViewOpenResult>("view/open", { transient: true }));
       }
-      this.session = WasmSession.bootstrap(activated.workspace, open);
+      this.adoptSession(WasmSession.bootstrap(activated.workspace, open));
       this.connBanner.style.display = "none";
       await this.subscribe();
       // The session was rebuilt on the fresh connection — re-fetch the persisted app settings.
@@ -2325,7 +2334,7 @@ export class Shell {
           // Diff toggle re-layout: restore the view to the pending content anchor (same content on
           // screen) if there is one; otherwise reveal the cursor as before.
           const row = this.session.resolve_scroll_anchor();
-          if (row != null) this.scrollTopTo(row * this.cell.h + BUFFER_PAD, false);
+          if (row != null) this.scrollTopTo(this.pxOfUnits(row), false);
           else this.revealCursor();
           break;
         }
@@ -2343,8 +2352,7 @@ export class Shell {
           break;
         case "SaveContentAnchor": {
           // Capture the top-of-viewport content anchor before a wrap/diff re-layout.
-          const topRow = Math.max(0, Math.round((this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h));
-          this.session.capture_scroll_anchor(topRow, this.visibleRows());
+          this.session.capture_scroll_anchor(this.unitsOfPx(this.bufferEl.scrollTop), this.visibleUnits());
           break;
         }
         case "RestoreScrollAnchor":
@@ -2376,7 +2384,7 @@ export class Shell {
           // it (web never launches with a file, so it always lands here). Discard the now
           // buffer-less session and re-raise the mandatory Workspaces chooser — the same reset the
           // reconnect-while-choosing path uses, so no stale buffer lingers behind the picker.
-          this.session = new WasmSession();
+          this.adoptSession(new WasmSession());
           this.runEffects(this.session.open_workspaces() as CoreEffect[]);
           this.capture.focus();
           break;
@@ -2616,11 +2624,12 @@ export class Shell {
     }
     if (epoch !== this.viewportEpoch) return; // superseded
     this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
+    this.refreshMeasured();
     this.render();
     // Restore the view to the content anchor captured before the toggle (same content on screen
     // across the reflow); fall back to revealing the cursor when none is pending.
     const row = this.session.resolve_scroll_anchor();
-    if (row != null) this.scrollTopTo(row * this.cell.h + BUFFER_PAD, false);
+    if (row != null) this.scrollTopTo(this.pxOfUnits(row), false);
     else this.revealCursor();
   }
 
@@ -2673,6 +2682,7 @@ export class Shell {
     }
     if (epoch !== this.viewportEpoch) return; // superseded by a newer subscribe — drop this window
     this.runEffects(this.session.adopt_subscribe(res) as CoreEffect[]);
+    this.refreshMeasured();
     this.render();
     // A subscribe replaces the whole window (a buffer switch / wrap toggle), so it snaps — there's no
     // scroll to animate. Same-buffer *moves* (grep next-hit, cursor motions) animate via the
@@ -2684,20 +2694,30 @@ export class Shell {
     // re-presentation — and supersedes the reveal.
     const anchored = this.session.resolve_scroll_anchor();
     if (anchored != null) {
-      this.bufferEl.scrollTop = anchored * this.cell.h + BUFFER_PAD;
+      this.bufferEl.scrollTop = this.pxOfUnits(anchored);
       return;
     }
     const row = this.session.subscribe_top_row(scroll.element, scroll.line, scroll.sub_row);
     if (row != null) {
-      this.bufferEl.scrollTop = row * this.cell.h + BUFFER_PAD;
+      this.bufferEl.scrollTop = this.pxOfUnits(row);
     }
-    this.revealCursor();
+    // The reading view frames its focused *block*, not the cursor's row — the placement above
+    // has just overridden the reveal the render made, so make it again from where the view now
+    // stands. The editor reveals its cursor.
+    const placed = this.view();
+    if (placed.read) {
+      const span = placed.read.target_span ?? placed.read.focus_span;
+      if (span) this.revealBlock(span, false);
+    } else {
+      this.revealCursor();
+    }
   }
 
   /** After a cursor-moving action: load around the cursor if it left the loaded window, paint, then
    *  reveal it — `follow` scrolls the minimum, `jump` rests it near the top (animating if short). */
   private async ensureCursorVisible(style: "follow" | "jump"): Promise<void> {
-    // The reading view owns its scroll: `revealFocus` positions the focused element from the
+    // The reading view reveals by *block*, not by cursor row: `revealBlock` frames the focused
+    // block off the shared layout when the focus changes (see `render`). The cursor-row reveal here
     // *rendered* layout. This editor-grid math (rows × cell.h) is meaningless there and was
     // fighting it — every cursor move fires `RevealCursor`, and in code-heavy documents the
     // grid estimate diverges linearly from the real layout, dragging focus off screen. Gated on
@@ -2725,6 +2745,7 @@ export class Shell {
       }
       if (epoch !== this.viewportEpoch) return; // a resubscribe superseded this fetch
       this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
+    this.refreshMeasured();
     }
     this.render();
     if (style === "jump") this.revealCursorJump();
@@ -2736,11 +2757,11 @@ export class Shell {
   private revealCursorJump(): void {
     const cursorRow = this.cursorAbsoluteVisualRow();
     if (cursorRow === null) return;
-    const topRow = (this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h;
-    const visible = this.visibleRows();
-    if (cursorRow >= topRow && cursorRow < topRow + visible) return; // already visible
+    const top = ((this.bufferEl.scrollTop - this.contentTop()) / this.cell.h) * UNITS_PER_ROW;
+    const visible = this.visibleUnits();
+    if (cursorRow >= top && cursorRow + UNITS_PER_ROW <= top + visible) return; // already visible
     const above = Math.floor(visible * CURSOR_REST_FRACTION);
-    this.scrollTopTo((cursorRow - above) * this.cell.h + BUFFER_PAD, true);
+    this.scrollTopTo(this.pxOfUnits(cursorRow - above), true);
   }
 
   /** Native scroll event: fetch a new window when the view nears the loaded window's edge. */
@@ -2799,7 +2820,8 @@ export class Shell {
   }
 
   private onScroll(): void {
-    // The reading view scrolls natively — no window prefetch (the whole document is local).
+    // The reading view is one element loaded whole — a scroll never reaches unloaded rows, so
+    // there is nothing to prefetch.
     if (this.readActive) return;
     // The popover tracks its line via CSS `position: sticky` (it lives in the buffer's spacer), so
     // scrolling needs no repositioning here — just the window prefetch below.
@@ -2807,12 +2829,12 @@ export class Shell {
     // animation firing scroll events would otherwise spin doomed fetches for the reconnect window.
     const viewportId = this.snapshot?.viewport_id;
     if (!this.snapshot?.window || viewportId == null || this.fetchInFlight || !this.connected) return;
-    const topRow = Math.max(0, Math.round((this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h));
-    const visible = this.visibleRows();
+    const top = this.unitsOfPx(this.bufferEl.scrollTop);
+    const visible = this.visibleUnits();
     // The core knows the layout, so it decides: fetch when the rows the screen reaches — plus a
     // half-screen margin, so the fetch lands before the scroll reaches unloaded rows — are not all
     // loaded, asking for a screen either side so the next half-screen of scrolling asks nothing.
-    const req = this.session.window_request(topRow, visible, Math.floor(visible / 2), visible) as {
+    const req = this.session.window_request(top, visible, Math.floor(visible / 2), visible) as {
       anchor: ScrollPosition;
       slices: SliceRequest[];
     } | null;
@@ -2831,6 +2853,7 @@ export class Shell {
           this.fetchInFlight = false;
           if (epoch !== this.viewportEpoch) return; // a resubscribe superseded this fetch
           this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
+    this.refreshMeasured();
           this.render();
           this.onScroll(); // re-check in case the view moved further while fetching
         },
@@ -2897,24 +2920,25 @@ export class Shell {
       }
       if (epoch !== this.viewportEpoch) return; // a resubscribe superseded this fetch
       this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
+    this.refreshMeasured();
       this.render();
     }
     const row = this.cursorAbsoluteVisualRow();
     if (row === null) return;
-    const above = Math.floor(this.visibleRows() * fraction);
-    this.scrollTopTo((row - above) * this.cell.h + BUFFER_PAD, true);
+    const above = Math.floor(this.visibleUnits() * fraction);
+    this.scrollTopTo(this.pxOfUnits(row - above), true);
   }
 
   private revealCursor(): void {
     const cursorRow = this.cursorAbsoluteVisualRow();
     if (cursorRow === null) return;
-    const topRow = (this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h;
-    const visible = this.visibleRows();
-    const margin = this.cell.h / 2;
-    if (cursorRow < topRow) {
-      this.scrollTopTo(cursorRow * this.cell.h - margin + BUFFER_PAD, true);
-    } else if (cursorRow >= topRow + visible) {
-      this.scrollTopTo((cursorRow - visible + 1) * this.cell.h + margin + BUFFER_PAD, true);
+    const top = ((this.bufferEl.scrollTop - this.contentTop()) / this.cell.h) * UNITS_PER_ROW;
+    const visible = this.visibleUnits();
+    const margin = UNITS_PER_ROW / 2;
+    if (cursorRow < top) {
+      this.scrollTopTo(this.pxOfUnits(cursorRow - margin), true);
+    } else if (cursorRow + UNITS_PER_ROW > top + visible) {
+      this.scrollTopTo(this.pxOfUnits(cursorRow - visible + UNITS_PER_ROW + margin), true);
     }
     const v = this.snapshot;
     if (v && v.wrap === "none") {
@@ -2978,6 +3002,7 @@ export class Shell {
       .then(
         (res) => {
           this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
+    this.refreshMeasured();
           this.render();
         },
         () => {},
@@ -3055,6 +3080,79 @@ export class Shell {
     return Math.max(1, Math.floor(this.bufferEl.clientHeight / this.cell.h));
   }
 
+  /** Install a fresh core session: it counts the view's layout at this shell's resolution from
+   *  its first window, and the painter's mirror of its measured table starts empty. */
+  private adoptSession(session: WasmSession): void {
+    session.set_resolution(UNITS_PER_ROW);
+    this.session = session;
+    this.measured = { units_per_row: UNITS_PER_ROW, elements: {} };
+  }
+
+  /** Re-read the core's measured table into the painter's mirror — after every adoption, which
+   *  may have pruned it, and every measurement. */
+  private refreshMeasured(): void {
+    this.measured = this.session.measured() as Measured;
+  }
+
+  /** Where the scrolled content's offset 0 sits in the scroller: the editor grid starts below its
+   *  padding; the reading view's document is the scrolled content itself, padding and all. */
+  private contentTop(): number {
+    return this.readActive ? 0 : BUFFER_PAD;
+  }
+
+  /** A view offset (in the core's units) as a `scrollTop`. */
+  private pxOfUnits(units: number): number {
+    return (units / UNITS_PER_ROW) * this.cell.h + this.contentTop();
+  }
+
+  /** A `scrollTop` as a view offset in the core's units, to the unit. */
+  private unitsOfPx(px: number): number {
+    return Math.max(0, Math.round(((px - this.contentTop()) / this.cell.h) * UNITS_PER_ROW));
+  }
+
+  /** The viewport's height in units. */
+  private visibleUnits(): number {
+    return Math.max(UNITS_PER_ROW, Math.round((this.bufferEl.clientHeight / this.cell.h) * UNITS_PER_ROW));
+  }
+
+  /** Measure the reading view as drawn — each block node's top within the scrolled content — into
+   *  the core's table, so the grid scrolls, reveals and anchors the document by where its lines
+   *  really are. Runs after every rebuild or patch of the reader's DOM and whenever an image
+   *  finishes loading, since that moves everything below it. */
+  private measureReader(): void {
+    const v = this.snapshot;
+    const root = this.bufferEl.querySelector(":scope > .md-read");
+    if (!v?.read || !(root instanceof HTMLElement)) return;
+    const el = this.bufferEl;
+    const origin = el.getBoundingClientRect().top + el.clientTop - el.scrollTop;
+    const spans: [number, number, number][] = [];
+    for (const node of root.querySelectorAll("[data-espan]")) {
+      if (!(node instanceof HTMLElement)) continue;
+      const [start, end] = (node.getAttribute("data-espan") ?? "").split(":").map(Number);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+      const top = node.getBoundingClientRect().top - origin;
+      spans.push([start, end, Math.max(0, Math.round((top / this.cell.h) * UNITS_PER_ROW))]);
+    }
+    const end = Math.round((el.scrollHeight / this.cell.h) * UNITS_PER_ROW);
+    this.measured = this.session.set_read_measured(v.focused_element, spans, end) as Measured;
+  }
+
+  /** Bring a reading-view block on screen, framed the way the reader always framed it: left alone
+   *  while comfortably visible, else rested about a fifth of the way down (a block taller than the
+   *  viewport pins nearer the top). The block's place comes from the shared layout, not the DOM. */
+  private revealBlock(span: { start: number; end: number }, smooth: boolean): void {
+    const extent = this.session.read_block_extent(span.start, span.end) as [number, number] | null;
+    if (!extent) return;
+    const el = this.bufferEl;
+    const height = el.clientHeight;
+    const top = this.pxOfUnits(extent[0]) - el.scrollTop;
+    const bottom = this.pxOfUnits(extent[1]) - el.scrollTop;
+    const margin = Math.min(48, height * 0.08);
+    if (top >= margin && bottom <= height - margin) return; // comfortably visible
+    const rest = Math.min(height * 0.2, Math.max(margin, height - (bottom - top) - margin));
+    this.scrollTopTo(el.scrollTop + (top - rest), smooth);
+  }
+
   /** Absolute visual row of the cursor in the view, or null if its line isn't loaded. The core
    *  answers off the shared layout, so it is the row the painter draws the cursor on. */
   private cursorAbsoluteVisualRow(): number | null {
@@ -3123,8 +3221,7 @@ export class Shell {
     // Report the on-screen line range to the core (it owns no pixel scroll) so sneak scopes its
     // labels to what's actually visible rather than the overscan-padded window.
     if (this.session && this.cell) {
-      const topRow = Math.max(0, Math.round((this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h));
-      this.session.set_visible_lines(topRow, this.visibleRows());
+      this.session.set_visible_lines(this.unitsOfPx(this.bufferEl.scrollTop), this.visibleUnits());
     }
     const v = this.view();
     this.snapshot = v;
@@ -3184,7 +3281,9 @@ export class Shell {
         // treatment): native new-tab affordances for modified/middle clicks.
         v.read.internalHref = (href) => this.readLinkUrl(href, v);
         renderReadView(this.bufferEl, v.read);
+        this.measureReader();
       } else {
+        const before = this.bufferEl.scrollHeight;
         applyFenceHighlights(this.bufferEl, v.read);
         markFocus(
           this.bufferEl,
@@ -3192,6 +3291,8 @@ export class Shell {
           v.read.target_span,
           v.read.selection_span ?? null,
         );
+        // A fence painting in changes no heights; one arriving from the loading placeholder does.
+        if (this.bufferEl.scrollHeight !== before) this.measureReader();
       }
       // Reveal keyed on the target when the cursor sits inside one (a Tab step must reveal
       // the link, not just its paragraph), else the block bar.
@@ -3208,8 +3309,7 @@ export class Shell {
           this.lastReadFocus === null ||
           this.lastReadFocus.split(":")[0] !== String(v.read.buffer_id);
         this.lastReadFocus = focusKey;
-        const target = revealFocus(this.bufferEl, revealSpan);
-        if (target !== null) this.scrollTopTo(target, !fresh);
+        if (revealSpan) this.revealBlock(revealSpan, !fresh);
       }
       return;
     }
@@ -3223,7 +3323,8 @@ export class Shell {
       insertMode: v.mode === "insert",
       awaitingKey: v.pending !== null || (v.count ?? 0) > 0 || v.sneak_active,
       contentWidthPx: v.wrap === "none" ? this.cell.w * (v.window.max_line_width + 2) : 0,
-      spacerHeightPx: this.session.total_rows() * this.cell.h + BUFFER_PAD * 2,
+      spacerHeightPx:
+        (this.session.total_rows() / this.measured.units_per_row) * this.cell.h + BUFFER_PAD * 2,
       contentTopPx: BUFFER_PAD,
       rowHeightPx: this.cell.h,
       measured: this.measured,
