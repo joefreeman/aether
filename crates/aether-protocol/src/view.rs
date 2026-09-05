@@ -41,7 +41,9 @@ pub struct ViewOpenParams {
     pub element: Option<u32>,
     /// Which view of a markdown file to present: its editor, or its reader. `None` leaves it to
     /// the server — the file's most recently used view, else one created per the app setting —
-    /// except that a `jump_to` open lands in the editor, where a `line:col` means something. A
+    /// except that a `jump_to` open lands in the editor, where a `line:col` means something,
+    /// unless the client has the file's reader on screen: a jump inside the document being read
+    /// (its outline, a reference, a grep hit) stays on the page. A
     /// client sends `Some` only when its route decided: `Space u` asks for the sibling, a followed
     /// `#anchor` for the reader, the web shell's `view=` URL for what it recorded. The file's view
     /// of that kind is reused when it has one, else created. Ignored for any other file, and for a

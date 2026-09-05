@@ -926,15 +926,34 @@ fn open_scroll(
 }
 
 /// The view an open of `buffer_id` presents — see [`ServerState::open_view_as`]: the kind the
-/// caller asked for, else the editor for a `jump_to` (a `line:col` means nothing over a rendered
-/// document), else the file's most recently used view. Every open reports it, and every open
-/// decides it here.
-fn presented_view(s: &mut ServerState, buffer_id: BufferId, params: &ViewOpenParams) -> ViewId {
-    let kind = params.kind.or(params
-        .jump_to
-        .is_some()
-        .then_some(aether_protocol::ui::ViewKind::Editor));
-    s.open_view_as(buffer_id, kind, params.transient)
+/// caller asked for; else, for a `jump_to`, the reader the client has the file on screen in when
+/// it does (a jump inside the document being read — its outline, a reference, a grep hit — stays
+/// on the page) and otherwise the editor (a `line:col` means nothing over a rendered document the
+/// client isn't on); else the file's most recently used view. Every open reports it, and every
+/// open decides it here.
+fn presented_view(
+    s: &mut ServerState,
+    client_id: Option<ClientId>,
+    buffer_id: BufferId,
+    params: &ViewOpenParams,
+) -> ViewId {
+    use aether_protocol::ui::ViewKind;
+    let jumped = params.jump_to.is_some().then(|| {
+        let reading = client_id.is_some_and(|c| {
+            s.viewports.values().any(|vp| {
+                let view = s.view_of(vp);
+                vp.client_id == c
+                    && view.presenting == buffer_id
+                    && view.kind() == Some(ViewKind::Reader)
+            })
+        });
+        if reading {
+            ViewKind::Reader
+        } else {
+            ViewKind::Editor
+        }
+    });
+    s.open_view_as(buffer_id, params.kind.or(jumped), params.transient)
 }
 
 /// Materialize a dormant *scratch* buffer (selected by id from the picker, or landed on at activate):
@@ -992,7 +1011,7 @@ async fn open_restored_scratch(
     };
     s.documents.insert(doc_id, doc);
     s.buffers.insert(id, buf);
-    result.view_id = presented_view(&mut s, id, &params);
+    result.view_id = presented_view(&mut s, client_id, id, &params);
     result.transient = s.view(result.view_id).transient;
     s.buffer_workspaces
         .insert(id, active_workspace_name.clone());
@@ -2007,7 +2026,7 @@ async fn view_open_inner(
             .map(|a| motion::clamp_position(doc, a));
         let cursor =
             resolve_open_cursor(&mut s, client_id, buffer_id, clamped_jump, clamped_anchor);
-        let view_id = presented_view(&mut s, buffer_id, &params);
+        let view_id = presented_view(&mut s, client_id, buffer_id, &params);
         let scroll = open_scroll(&s, client_id, view_id, params.jump_to);
         let mut pushes = pin_view_if_requested(&mut s, view_id, params.transient);
         let result = ViewOpenResult {
@@ -2100,7 +2119,7 @@ async fn view_open_inner(
                 };
                 s.documents.insert(doc_id, doc);
                 s.buffers.insert(id, buf);
-                result.view_id = presented_view(&mut s, id, &params);
+                result.view_id = presented_view(&mut s, client_id, id, &params);
                 result.transient = s.view(result.view_id).transient;
                 s.buffer_workspaces
                     .insert(id, active_workspace_name.clone());
@@ -2196,7 +2215,7 @@ async fn view_open_inner(
                 Some(c) => wrap_for_response(&s, c, existing, cursor),
                 None => cursor,
             };
-            let view_id = presented_view(&mut s, existing, &params);
+            let view_id = presented_view(&mut s, client_id, existing, &params);
             let scroll = open_scroll(&s, client_id, view_id, params.jump_to);
             let mut pushes = pin_view_if_requested(&mut s, view_id, params.transient);
             let result = ViewOpenResult {
@@ -2425,7 +2444,7 @@ async fn view_open_inner(
         Some(c) => wrap_for_response(&s, c, id, cursor),
         None => cursor,
     };
-    let view_id = presented_view(&mut s, id, &params);
+    let view_id = presented_view(&mut s, client_id, id, &params);
     // The views its dormant rows stood for — a kept reader beside the editor — come back kept.
     s.restore_dormant_views(id, dormant_kinds);
     let doc = s.doc_of(id);

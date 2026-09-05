@@ -1950,6 +1950,50 @@ async fn the_setting_decides_a_file_never_presented() {
     );
 }
 
+/// A jump into the document you are reading stays on the page: the outline picker, a reference,
+/// a grep hit into the reader on screen land in *it*, with the cursor moved — not in its editor.
+/// The jump-lands-in-the-editor rule holds for a file the client has open but is not looking at.
+#[tokio::test]
+async fn a_jump_into_the_reader_on_screen_stays_in_it() {
+    let (_server, mut ws, reader) = setup_reader_workspace().await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(reader.view_id)).await;
+    let jumped: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            jump_to: Some(aether_protocol::LogicalPosition { line: 4, col: 0 }),
+            ..file_open_params("doc.md", None)
+        },
+    )
+    .await;
+    assert_eq!(
+        jumped.view_id, reader.view_id,
+        "the reader on screen takes the jump"
+    );
+    assert_eq!(jumped.cursor.position.line, 4, "and the cursor moved in it");
+
+    // Open but off screen (never presented by a viewport): the jump makes the editor.
+    let other: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("other.md", None)).await;
+    let jumped: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            jump_to: Some(aether_protocol::LogicalPosition { line: 0, col: 2 }),
+            ..file_open_params("other.md", None)
+        },
+    )
+    .await;
+    assert_ne!(
+        jumped.view_id, other.view_id,
+        "not the reader nobody is looking at"
+    );
+    assert_eq!(
+        layout_owner_of(&mut ws, jumped.view_id).await,
+        aether_protocol::ui::LayoutOwner::Server,
+        "an editor"
+    );
+}
+
 /// A **view** is transient, not a buffer: a preview closes itself once nothing shows it, and a
 /// buffer lives exactly as long as some view uses it.
 mod view_transience {

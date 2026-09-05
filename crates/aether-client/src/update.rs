@@ -3946,8 +3946,9 @@ impl Session {
                 transient: Some(true),
                 record_nav_from: Some(self.view.buffer.buffer_id),
                 // A jump-shaped open (a grep hit, a reference) is a working context: the server
-                // lands a `jump_to` in the editor even when the target is markdown. `kind` is
-                // for the one route with its own opinion, a followed `#anchor`.
+                // lands a `jump_to` in the editor even when the target is markdown — unless the
+                // reader of that file is what's on screen, where the jump stays on the page.
+                // `kind` is for the one route with its own opinion, a followed `#anchor`.
                 kind,
                 ..Default::default()
             },
