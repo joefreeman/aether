@@ -9,7 +9,7 @@
 //!   1. Render/view types embedded in the `View` that `view()` returns (the viewport render chain,
 //!      cursor, diagnostics, LSP status, picker items) — consumed by render.ts / shell.ts.
 //!   2. The handful of results from RPCs the shell issues *directly* (bootstrap: workspace/list,
-//!      workspace/activate, buffer/open; geometry: viewport/subscribe|scroll|scroll_to_row|resize),
+//!      workspace/activate, buffer/open; geometry: view/subscribe|window|resize),
 //!      because their params need pixels or they run before the core exists.
 //!
 //! Keep field names exactly matching the serde wire format.
@@ -28,9 +28,28 @@ export interface LogicalPosition {
 
 export type WrapMode = "soft" | "none";
 
+/** Where a viewport's top is, as **content**: the element it is in, a line of that element's
+ *  buffer, and how far into the line's rows it sits. What a subscribe opens at, what a window
+ *  request reports, and what a reopen restores — never a row, which only the client can count. */
 export interface ScrollPosition {
-  logical_line: number;
+  element: number;
+  line: number;
   sub_row: number;
+}
+
+/** One element's rows a viewport reaches, by row within that element — mirrors `SliceRequest`. */
+export interface SliceRequest {
+  element: number;
+  from_row: number;
+  rows: number;
+}
+
+/** `view/window`: the slices a client's viewport reaches, and where its top is as content. Built
+ *  by the core (`window_request`) from the tree it holds; the shell only sends it. */
+export interface ViewportWindowParams {
+  viewport_id: ViewportId;
+  anchor: ScrollPosition;
+  slices: SliceRequest[];
 }
 
 export interface Highlight {
@@ -161,50 +180,16 @@ export type ViewNode =
       node: "editor";
       element: number;
       /** The buffer this element windows, and its **total** visual row count — of which `lines` is
-       *  the slice currently loaded. Together they let the shell lay out and scroll a view from the
-       *  tree alone, requesting more of a buffer only as its element scrolls into range. */
+       *  the slice currently loaded, starting `first_row` rows into the element. Together they let
+       *  the shell lay out and scroll a view from the tree alone, requesting more of a buffer only
+       *  as its element scrolls into range. Mirrors `Element::Editor`. */
       buffer: number;
       rows: number;
-      /** A line of **`buffer`**, not of the view — see `BufferWindow.first_view_line`. */
+      first_row: number;
+      /** A line of **`buffer`**, not of the view: in a patch these match no view numbering. */
       first_buffer_line: number;
       lines: LogicalLineRender[];
     };
-
-/** One row-producing item of a view, in order — mirrors `grid::RowItem`.
- *
- *  A chrome row occupies a screen row exactly as a phantom baseline row does, but belongs to no
- *  logical line, which is why rows can no longer simply be summed per line.
- *
- *  A line carries its element because a logical line number is unique only *within* an element once
- *  elements window different buffers. The lookups below still match on the number alone — correct
- *  while every element windows one document, and what changes when focus arrives to supply the
- *  element (the Rust side already threads it through `grid::position_cell`/`hit_test`). */
-export type RowItem =
-  | { kind: "chrome" }
-  | { kind: "line"; element: number; line: LogicalLineRender };
-
-export function rowItems(root: ViewNode): RowItem[] {
-  const out: RowItem[] = [];
-  const walk = (n: ViewNode) => {
-    if (n.node === "stack") n.children.forEach(walk);
-    else if (n.node === "editor")
-      for (const line of n.lines) out.push({ kind: "line", element: n.element, line });
-    // A row/chrome group is one screen row — its children share it — as is any inline element
-    // standing on its own. An editor nested in one would be drawn as a single chrome row while
-    // `nodeLines` still counted its lines; the Rust builder asserts against that shape, and this
-    // mirror inherits the same expectation rather than re-deriving it.
-    else out.push({ kind: "chrome" });
-  };
-  walk(root);
-  return out;
-}
-
-/** Visual rows an item occupies. Mirrors `grid::RowItem::rows`. */
-export function itemRows(i: RowItem): number {
-  return i.kind === "chrome"
-    ? 1
-    : (i.line.baseline_above?.length ?? 0) + i.line.visual_rows.length;
-}
 
 /** Every rendered line of a view, in order — for the paths that want lines and no structure. */
 export function nodeLines(n: ViewNode): LogicalLineRender[] {
@@ -226,13 +211,12 @@ export function inlineOf(n: ViewNode): ViewNode[] {
   return [];
 }
 
-/** What a painter draws on one visual row — mirrors `grid::PaintedRow`.
+/** What a painter draws on one visual row, and the absolute row it sits on — mirrors
+ *  `grid::PaintedRow` paired with its `VisualRow`.
  *
- *  Every row of a view is exactly one of these, in the order `paintedRows` produces. Replaces the
- *  old `chromeByLine`, which keyed chrome by the logical line beneath it: two elements windowing
- *  different files both start at, say, line 10, so their headings collapsed onto one key and the
- *  first file lost its own. */
-export type PaintedRow =
+ *  Every loaded row of a view is exactly one of these, in the order `paintedRows` produces; the
+ *  rows between two entries that are not consecutive are loaded by nobody and painted blank. */
+export type PaintedRow = { at: number } & (
   | { kind: "chrome"; node: ViewNode }
   | { kind: "baseline"; element: number; line: LogicalLineRender; index: number; row: BaselineRow }
   | {
@@ -241,48 +225,66 @@ export type PaintedRow =
       line: LogicalLineRender;
       row: WrappedRow;
       rowIndex: number;
-      /** The final rendered row of the whole view — what a closing rule hangs off. Positional, not
-       *  `logical_line + 1 === view_line_count`, which compares a buffer line to a view line. */
+      /** The final rendered row of the whole view. Positional, not `logical_line + 1 === some
+       *  line count`, which compares a buffer line to a count of the wrong space. */
       lastLine: boolean;
-    };
+    }
+);
 
-/** Every visual row of the loaded window, top to bottom. Mirrors `grid::painted_rows`; the Rust
- *  side is the specification and is tested against these same shapes. */
+/** Rows the whole view occupies: chrome, one row each, and every editor's `rows`, loaded or not.
+ *  Mirrors `grid::total_rows`. */
+export function totalRows(root: ViewNode): number {
+  let total = 0;
+  walkRows(root, (_, rows) => (total += rows));
+  return total;
+}
+
+/** One pass over the tree in painting order, telling `f` each node's row count: an editor's
+ *  `rows`, one for chrome or any inline element standing on its own, nothing for a stack. Mirrors
+ *  `grid::walk_rows`. */
+function walkRows(n: ViewNode, f: (node: ViewNode, rows: number) => void): void {
+  if (n.node === "stack") n.children.forEach((c) => walkRows(c, f));
+  else if (n.node === "editor") f(n, n.rows);
+  // A row/chrome group is one screen row — its children share it — as is any inline element
+  // standing on its own. An editor nested in one would be drawn as a single chrome row while
+  // `nodeLines` still counted its lines; the Rust builder asserts against that shape, and this
+  // mirror inherits the same expectation rather than re-deriving it.
+  else f(n, 1);
+}
+
+/** Every loaded visual row of the view, top to bottom, each at its absolute row. Mirrors
+ *  `grid::painted_rows`; the Rust side is the specification and is tested against these same
+ *  shapes. Chrome occupies one row; an editor's loaded lines sit `first_row` rows into it and the
+ *  rest of its height is unloaded — absent here, so consecutive entries need not be consecutive
+ *  rows. */
 export function paintedRows(root: ViewNode): PaintedRow[] {
   const out: PaintedRow[] = [];
-  let pending: ViewNode[] = [];
-  const editors: { element: number; lines: LogicalLineRender[]; chrome: ViewNode[] }[] = [];
-  const walk = (n: ViewNode) => {
-    if (n.node === "stack") n.children.forEach(walk);
-    else if (n.node === "editor") {
-      editors.push({ element: n.element, lines: n.lines, chrome: pending });
-      pending = [];
-    } else pending.push(n);
-  };
-  walk(root);
-  const total = editors.reduce((n, e) => n + e.lines.length, 0);
+  const total = nodeLines(root).length;
   let seen = 0;
-  for (const e of editors) {
-    for (const node of e.chrome) out.push({ kind: "chrome", node });
-    for (const line of e.lines) {
-      (line.baseline_above ?? []).forEach((row, index) =>
-        out.push({ kind: "baseline", element: e.element, line, index, row }),
-      );
-      seen += 1;
-      line.visual_rows.forEach((row, rowIndex) =>
-        out.push({
-          kind: "text",
-          element: e.element,
-          line,
-          row,
-          rowIndex,
-          lastLine: seen === total,
-        }),
-      );
-    }
-  }
-  // Chrome with no editor below it is the patch's closing rule.
-  for (const node of pending) out.push({ kind: "chrome", node });
+  let at = 0;
+  walkRows(root, (n, height) => {
+    if (n.node === "editor") {
+      let row = at + n.first_row;
+      for (const line of n.lines) {
+        (line.baseline_above ?? []).forEach((brow, index) =>
+          out.push({ at: row++, kind: "baseline", element: n.element, line, index, row: brow }),
+        );
+        seen += 1;
+        line.visual_rows.forEach((wrow, rowIndex) =>
+          out.push({
+            at: row++,
+            kind: "text",
+            element: n.element,
+            line,
+            row: wrow,
+            rowIndex,
+            lastLine: seen === total,
+          }),
+        );
+      }
+    } else out.push({ at, kind: "chrome", node: n });
+    at += height;
+  });
   return out;
 }
 
@@ -334,19 +336,10 @@ export const changeConflict = (c?: LineChange): ConflictLine | null =>
 export const changePatchSide = (c?: LineChange): PatchLine | null =>
   c?.kind === "patch" ? c.side : null;
 
+/** A view as the server renders it: the tree, which carries every element's height and each
+ *  loaded slice's place within its element, plus the view-wide facts riding along. No geometry of
+ *  the view as a whole: the shell lays it out from the tree (`paintedRows`, `totalRows`). */
 export interface BufferWindow {
-  /** The slice of the **view** loaded, in view lines — indices into the concatenation of its
-   *  elements' extents. Not lines of any file: in a patch these match no buffer's numbering.
-   *  Mirrors `aether_protocol::coords::ViewLine`. */
-  first_view_line: number;
-  last_view_line_exclusive: number;
-  /** How many lines the **view** has: its elements' extents, summed. */
-  view_line_count: number;
-  max_scroll_view_line: number;
-  /** Total visual rows in the view (real + diff phantom + chrome) — sizes the native scroller. */
-  total_visual_rows: number;
-  /** Visual row where first_view_line begins — positions the window in the scroller. */
-  first_visual_row: number;
   /** Display cols of the widest line — sizes the native horizontal scroller (no-wrap). 0 under soft wrap. */
   max_line_width: number;
   /** Buffer-level Git status (branch + staged/unstaged counts) for the status bar; absent outside a repo. */
@@ -527,7 +520,7 @@ export interface LspServerStatus {
   progress?: LspProgress[];
 }
 
-// ---- geometry RPC results (viewport/subscribe, scroll, scroll_to_row, resize) -------------------
+// ---- geometry RPC results (view/subscribe, window, resize) --------------------------------------
 
 /** Which element of a view holds the cursor, and the buffer it windows — the reply to
  *  `view/focus_element`, and what a composed view's subscribe carries so a client binds to the

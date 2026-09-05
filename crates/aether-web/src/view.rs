@@ -544,7 +544,7 @@ mod tests {
     /// browser beyond `RuntimeError: unreachable executed` (see `install_panic_hook`).
     #[test]
     fn rendering_a_patch_view_walks_its_tree_without_panicking() {
-        use aether_protocol::coords::{ViewLine, VisualRow};
+        use aether_protocol::coords::ElementRow;
         use aether_protocol::viewport::{Element, LogicalLineRender, Segment, Window, WrappedRow};
         let mut s = WasmSession::new();
         let line = |n: u32| LogicalLineRender {
@@ -570,12 +570,6 @@ mod tests {
         };
         let w = Window {
             other_elements_dirty: false,
-            first_view_line: ViewLine(0),
-            last_view_line_exclusive: ViewLine(4),
-            view_line_count: 4,
-            max_scroll_view_line: ViewLine(0),
-            total_visual_rows: 6,
-            first_visual_row: VisualRow(0),
             max_line_width: 0,
             git_status: None,
             root: Element::Stack {
@@ -585,6 +579,7 @@ mod tests {
                         element: 0,
                         buffer: 7,
                         rows: 2,
+                        first_row: ElementRow(0),
                         first_buffer_line: 16,
                         lines: vec![line(16), line(17)],
                     },
@@ -593,6 +588,7 @@ mod tests {
                         element: 1,
                         buffer: 8,
                         rows: 2,
+                        first_row: ElementRow(0),
                         first_buffer_line: 40,
                         lines: vec![line(40), line(41)],
                     },

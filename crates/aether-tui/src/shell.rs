@@ -6,7 +6,8 @@
 //!
 //! Geometry mirrors the iced shell with rows for pixels: the scroll position is a visual
 //! row (`top_visual_row`), reveals overscroll by one row, and window fetches go through
-//! `viewport/scroll_to_row` when the view nears the loaded range's edge.
+//! `view/window` — the slices the viewport reaches, off the tree — when the view nears the loaded
+//! rows' edge.
 
 use crate::app::{
     AppState, BlameState, EditorMode, EditorState, HoverBlock, HoverBody, HoverPopup,
@@ -25,12 +26,12 @@ use aether_client::session::{
     Prompt, Session,
 };
 use aether_client::update::Event as CoreEvent;
-use aether_protocol::coords::{ViewLine, VisualRow};
+use aether_protocol::coords::VisualRow;
 
 use aether_protocol::viewport::{
-    ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScrollToRow,
-    ViewportScrollToRowParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
-    ViewportWindowAtCursor, ViewportWindowAtCursorParams, ViewportWindowResult, Window, WrapMode,
+    ScrollPosition, ViewportResize, ViewportResizeParams, ViewportSubscribe,
+    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindow, ViewportWindowAtCursor,
+    ViewportWindowAtCursorParams, ViewportWindowParams, ViewportWindowResult, Window, WrapMode,
 };
 use anyhow::Result;
 use crossterm::event::{
@@ -77,8 +78,8 @@ enum Continuation {
     /// so a reply from a burst of subscribes (e.g. `<`/`>` grep jumps) that survives to dispatch
     /// is always the live one — never a since-deleted viewport_id.
     Subscribed,
-    /// A window-returning viewport call (`scroll_to_row` / `scroll` / `resize`) — one chasing the
-    /// *scroll* position.
+    /// A window-returning viewport call (`view/window` / `view/set_wrap` / `view/resize`) — one
+    /// chasing the *scroll* position.
     Window,
     /// A window-returning call made to chase the **cursor**: the answer an owed reveal is waiting
     /// for. Distinct from [`Continuation::Window`] because only this reply can prove a cursor
@@ -304,10 +305,7 @@ pub async fn run(
         scroll_anchor: None,
         scroll_col: 0,
         sent_grid: None,
-        subscribe_scroll: ScrollPosition {
-            logical_line: ViewLine::ZERO,
-            sub_row: 0.0,
-        },
+        subscribe_scroll: ScrollPosition::default(),
         fetch_in_flight: false,
         refetch_queued: false,
         pending_reveal: PendingReveal::default(),
@@ -701,11 +699,27 @@ impl Shell {
                             if let Some(w) = self.session.view.window.as_ref() {
                                 // The *block's* first row, so a line's chrome comes with it: a
                                 // patch opened at line 0 shows its first file heading rather than
-                                // starting just below it.
-                                if let Some(row) = aether_client::grid::block_start_of_view_line(
-                                    w,
-                                    scroll.logical_line,
-                                ) {
+                                // starting just below it. A scroll restored from inside the
+                                // line's own rows goes back to that row.
+                                let row = if scroll.sub_row > 0.0 {
+                                    aether_client::grid::line_top_row(
+                                        w,
+                                        scroll.element,
+                                        scroll.line,
+                                    )
+                                    .map(|r| r.saturating_add(scroll.sub_row as u32))
+                                } else {
+                                    aether_client::grid::line_block_start(
+                                        w,
+                                        scroll.element,
+                                        scroll.line,
+                                    )
+                                };
+                                // The line may have been clamped away by the server; the element
+                                // it named is still where the view opens.
+                                if let Some(row) = row.or_else(|| {
+                                    aether_client::grid::element_start_row(w, scroll.element)
+                                }) {
                                     self.top_visual_row = row;
                                 }
                             }
@@ -1526,18 +1540,21 @@ impl Shell {
         self.pending_reveal.abandon();
         // A pending relayout anchor (wrap toggle) wins: load a window around its reference line so
         // the anchor can be resolved precisely once it arrives. Otherwise restore the buffer's
-        // saved scroll, else center on the cursor.
-        let scroll = if let Some(line) = self.session.relayout_anchor_line() {
-            ScrollPosition {
-                logical_line: self.view_line_for(line),
-                sub_row: 0.0,
-            }
+        // saved scroll, else open near the cursor.
+        let scroll = if let Some(position) = self.session.relayout_anchor_position() {
+            position
         } else {
             self.session.view.buffer.scroll.unwrap_or(ScrollPosition {
+                element: self.session.view.focused_element,
                 // A fresh jump target (no saved scroll) rests near the top — the cross-buffer
                 // counterpart of the in-buffer jump reveal.
-                logical_line: self
-                    .view_line_for(self.session.view.buffer.cursor.position.line)
+                line: self
+                    .session
+                    .view
+                    .buffer
+                    .cursor
+                    .position
+                    .line
                     .saturating_sub((rows as f32 * CURSOR_REST_FRACTION) as u32),
                 sub_row: 0.0,
             })
@@ -1559,6 +1576,7 @@ impl Shell {
                 rows,
                 overscan_rows: rows,
                 scroll,
+                focus: self.session.subscribe_focus(),
                 wrap: self.session.wrap,
                 continuation_marker_width: 2,
                 tab_width: TAB_WIDTH,
@@ -1568,30 +1586,12 @@ impl Shell {
         self.pending_subscribe = Some(id);
     }
 
-    /// A cursor's **buffer** line named as a **view** line, for the requests that scroll by one.
-    ///
-    /// Exact while the window has the line loaded. When it doesn't — which is precisely when a
-    /// fetch-around-the-cursor is being issued — the number is carried across unchanged: the two
-    /// spaces coincide for every single-element view, and for a patch the server clamps into the
-    /// view and the follow-up window lands somewhere sane rather than nowhere. It stops being an
-    /// approximation when scrolling moves client-side and requests name an element.
-    fn view_line_for(&self, line: u32) -> ViewLine {
-        self.session
-            .view
-            .window
-            .as_ref()
-            .and_then(|w| {
-                aether_client::grid::view_line_of(w, self.session.view.focused_element, line)
-            })
-            .unwrap_or(ViewLine(line))
-    }
-
+    /// The furthest a viewport may scroll: the view's last row on the screen's last row. Off the
+    /// tree, which says how tall every element is whether or not its lines are loaded.
     fn max_scroll_row(&self) -> VisualRow {
         match &self.session.view.window {
             Some(w) => VisualRow(
-                w.total_visual_rows
-                    .saturating_sub(self.visible_rows())
-                    .min(w.total_visual_rows),
+                aether_client::grid::total_rows(&w.root).saturating_sub(self.visible_rows()),
             ),
             None => VisualRow::ZERO,
         }
@@ -1611,24 +1611,23 @@ impl Shell {
         self.scroll_to_row(target);
     }
 
-    /// Fetch a new window when the view nears the loaded range's edge (iced's
-    /// `maybe_fetch`, row units).
+    /// Fetch when the rows the screen reaches are not all loaded (iced's `maybe_fetch`, in rows).
+    ///
+    /// The client lays the view out from the tree, so it knows which elements the viewport
+    /// reaches and which of their rows; it asks for those — a screen either side, so the next
+    /// half-screen of scrolling asks nothing — and the server answers with the lines they are.
+    /// The check itself allows a half-screen margin, so the fetch lands before the scroll reaches
+    /// rows nothing is loaded at.
     fn maybe_fetch(&mut self) {
         let (Some(window), Some(viewport_id)) =
             (&self.session.view.window, self.session.view.viewport_id)
         else {
             return;
         };
-        let loaded_start = window.first_visual_row;
-        let loaded_end = loaded_start.saturating_add(loaded_rows(window));
-        let margin = self.visible_rows();
         let visible = self.visible_rows();
         let top_row = self.top_visual_row;
-        let need_above =
-            loaded_start > VisualRow::ZERO && top_row < loaded_start.saturating_add(margin);
-        let need_below = loaded_end.get() < window.total_visual_rows
-            && top_row.saturating_add(visible) > loaded_end.saturating_sub(margin);
-        if !(need_above || need_below) {
+        let needed = aether_client::grid::slices_for(&window.root, top_row, visible, visible / 2);
+        if aether_client::grid::loaded_covers(&window.root, &needed) {
             return;
         }
         if self.fetch_in_flight {
@@ -1636,12 +1635,13 @@ impl Shell {
             return;
         }
         self.fetch_in_flight = true;
-        let id = self
-            .handle
-            .send::<ViewportScrollToRow>(ViewportScrollToRowParams {
-                viewport_id,
-                top_visual_row: top_row,
-            });
+        let slices = aether_client::grid::slices_for(&window.root, top_row, visible, visible);
+        let anchor = aether_client::grid::anchor_at(window, top_row);
+        let id = self.handle.send::<ViewportWindow>(ViewportWindowParams {
+            viewport_id,
+            anchor,
+            slices,
+        });
         self.inflight.insert(id, Continuation::Window);
     }
 
@@ -1654,7 +1654,8 @@ impl Shell {
         let line = self.session.view.buffer.cursor.position.line;
         // Per element: a cursor line is a line of *its element's* buffer, and comparing it against
         // the window's view-line range says "not loaded" for a line sitting in plain sight.
-        let loaded = aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line);
+        let loaded =
+            aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line);
         tracing::debug!(
             ?style,
             line,
@@ -1786,10 +1787,6 @@ impl Shell {
             self.session.view.focused_element,
             self.session.view.buffer.cursor.position,
         );
-        let (wf, wl) = (
-            window.first_view_line.get(),
-            window.last_view_line_exclusive.get(),
-        );
         let visible = self.visible_rows();
         tracing::debug!(
             element = self.session.view.focused_element,
@@ -1797,8 +1794,6 @@ impl Shell {
             ?resolved,
             top = self.top_visual_row.get(),
             visible,
-            window_first = wf,
-            window_last = wl,
             "reveal jump"
         );
         let Some(row) = resolved else {
@@ -2435,21 +2430,42 @@ impl Shell {
     /// fetch it triggered still asks about where the user actually is.
     fn paintable_row(&self, w: &Window) -> VisualRow {
         let top = self.top_visual_row.get();
-        let first = w.first_visual_row.get();
-        let loaded_end = first + loaded_rows(w);
-        // Inside the loaded range — including its last rows, where the screen is only partly filled
-        // while the fetch that fills it is in flight. Painting the *right* region half-empty beats
-        // painting the wrong one whole: pulling back to the last full screen here would drag the
-        // view backwards on every scroll and snap forward when the window landed.
-        if top >= first && top < loaded_end {
+        let visible = self.visible_rows();
+        let rows = aether_client::grid::painted_rows(w);
+        // The rows lines are loaded at. Chrome does not count as loaded: every element's chrome is
+        // in the tree whether its lines are or not, and a heading over blank rows is not content.
+        let is_content =
+            |i: usize| !matches!(rows[i].1, aether_client::grid::PaintedRow::Chrome(_));
+        let content: Vec<usize> = (0..rows.len()).filter(|i| is_content(*i)).collect();
+        // Anything loaded on screen — including the last rows of a slice, where the screen is only
+        // partly filled while the fetch that fills it is in flight. Painting the *right* region
+        // half-empty beats painting the wrong one whole: pulling back to the last full screen here
+        // would drag the view backwards on every scroll and snap forward when the window landed.
+        let on_screen = |i: &usize| {
+            let at = rows[*i].0.get();
+            at >= top && at < top.saturating_add(visible)
+        };
+        if content.iter().any(on_screen) {
             return VisualRow(top);
         }
-        // Outside it entirely: there is nothing at that row to draw. Show the nearest edge — for a
-        // scroll past the end, the last screenful the window holds.
+        // Nothing at all: there is nothing at those rows to draw. Show the nearest loaded edge —
+        // for a scroll past the end, the last screenful the window holds — with the chrome
+        // standing directly against that edge, since it is part of the same block.
+        let (Some(&fi), Some(&li)) = (content.first(), content.last()) else {
+            return VisualRow(top);
+        };
+        let (mut fi, mut li) = (fi, li);
+        while fi > 0 && rows[fi - 1].0.get() + 1 == rows[fi].0.get() {
+            fi -= 1;
+        }
+        while li + 1 < rows.len() && rows[li + 1].0.get() == rows[li].0.get() + 1 {
+            li += 1;
+        }
+        let (first, last) = (rows[fi].0.get(), rows[li].0.get());
         VisualRow(if top < first {
             first
         } else {
-            loaded_end.saturating_sub(self.visible_rows()).max(first)
+            (last + 1).saturating_sub(visible).max(first)
         })
     }
 
@@ -2461,13 +2477,10 @@ impl Shell {
         // buffers reads as a flash, worst on same-file grep `<`/`>` jumps where it's
         // conceptually just a cursor move.
         let prev = self.state.editor.as_ref().filter(|_| window.is_none());
-        // The *index* of the top line in the flattened list, not its logical line: a logical line
-        // identifies a line only within its element, so it cannot index the list once a view spans
-        // several files.
-        let (scroll_line_index, scroll_skip_rows) = match (window, prev) {
-            (Some(w), _) => line_at_row(w, self.paintable_row(w)),
-            (None, Some(p)) => (p.scroll_line_index, p.scroll_skip_rows),
-            (None, None) => (0, 0),
+        let paint_top = match (window, prev) {
+            (Some(w), _) => self.paintable_row(w),
+            (None, Some(p)) => p.paint_top,
+            (None, None) => VisualRow::ZERO,
         };
         EditorState {
             mode: match s.view.mode {
@@ -2481,18 +2494,8 @@ impl Shell {
             buffer_id: s.view.buffer.buffer_id,
             viewport_id: s.view.viewport_id.unwrap_or(0),
             cursor: s.view.buffer.cursor,
-            scroll_line_index,
-            scroll_skip_rows,
+            paint_top,
             focused_element: self.session.view.focused_element,
-            lines: window
-                .map(|w| {
-                    aether_client::grid::window_lines(w)
-                        .into_iter()
-                        .map(|(at, line)| (at, line.clone()))
-                        .collect()
-                })
-                .or_else(|| prev.map(|p| p.lines.clone()))
-                .unwrap_or_default(),
             root: window
                 .map(|w| w.root.clone())
                 .or_else(|| prev.map(|p| p.root.clone()))
@@ -2500,43 +2503,16 @@ impl Shell {
                     element: 0,
                     buffer: 0,
                     rows: 0,
+                    first_row: aether_protocol::coords::ElementRow::ZERO,
                     first_buffer_line: 0,
                     lines: Vec::new(),
                 }),
-            chrome_above: window
-                .map(|w| {
-                    aether_client::grid::chrome_by_line_index(&w.root)
-                        .0
-                        .into_iter()
-                        .map(|(k, v)| (k, v.into_iter().cloned().collect()))
-                        .collect()
-                })
-                .or_else(|| prev.map(|p| p.chrome_above.clone()))
-                .unwrap_or_default(),
-            trailing_chrome: window
-                .map(|w| {
-                    aether_client::grid::chrome_by_line_index(&w.root)
-                        .1
-                        .into_iter()
-                        .cloned()
-                        .collect()
-                })
-                .or_else(|| prev.map(|p| p.trailing_chrome.clone()))
-                .unwrap_or_default(),
-            line_count: window
-                .map(|w| w.view_line_count)
-                .or(prev.map(|p| p.line_count))
-                .unwrap_or(0),
             git_status: window
                 .and_then(|w| w.git_status.clone())
                 .or_else(|| prev.and_then(|p| p.git_status.clone())),
-            max_scroll_view_line: window
-                .map(|w| w.max_scroll_view_line)
-                .or(prev.map(|p| p.max_scroll_view_line))
-                .unwrap_or(ViewLine::ZERO),
-            total_visual_rows: window
-                .map(|w| w.total_visual_rows)
-                .or(prev.map(|p| p.total_visual_rows))
+            total_rows: window
+                .map(|w| aether_client::grid::total_rows(&w.root))
+                .or(prev.map(|p| p.total_rows))
                 .unwrap_or(0),
             // `top_visual_row` is absolute (whole-buffer) already; while a switch is in flight
             // (no window) keep the previous frame's value so the thumb doesn't jump.
@@ -2986,17 +2962,6 @@ fn save_as_view(
 
 // ---- helpers -------------------------------------------------------------------------------
 
-/// Visual rows of every loaded line — phantom deleted rows (inline diff view) included,
-/// via the core's grid math (the same fns the iced shell scrolls with).
-fn loaded_rows(window: &Window) -> u32 {
-    // Every row-producing item, not just the lines: a chrome row occupies a screen row too, and
-    // leaving it out here would make the loaded window read as shorter than it draws.
-    aether_client::grid::row_items(window)
-        .iter()
-        .map(aether_client::grid::RowItem::rows)
-        .sum()
-}
-
 /// The absolute visual row of the cursor's cell — past any phantom rows, since the cursor never
 /// lands on them.
 ///
@@ -3008,22 +2973,6 @@ fn cursor_visual_row(
     pos: aether_protocol::LogicalPosition,
 ) -> Option<VisualRow> {
     aether_client::grid::position_cell(window, element, pos, TAB_WIDTH).map(|(row, _, _)| row)
-}
-
-/// Resolve a buffer-absolute visual row to `(logical_line, rows_hidden_above)` for the
-/// renderer's `scroll_view_line`/`scroll_skip_rows` pair. Line heights count the whole
-/// block (phantom rows + wrapped content rows), matching how the renderer skips.
-/// The top line's **index in the flattened list** and how many of its rows are scrolled above.
-///
-/// An index rather than a logical line: see [`aether_client::grid::line_index_at_row`]. Painting
-/// walks the list from here, taking each line's identity *from the line*.
-fn line_at_row(window: &Window, row: VisualRow) -> (usize, u32) {
-    aether_client::grid::line_index_at_row(window, row).unwrap_or((
-        aether_client::grid::window_lines(window)
-            .len()
-            .saturating_sub(1),
-        0,
-    ))
 }
 
 /// crossterm key event → the core's `(KeyCode, Mods, typed text)`.
@@ -3462,6 +3411,7 @@ mod scroll_tests {
                 element: i as u32,
                 buffer: *buffer,
                 rows: *height,
+                first_row: aether_protocol::coords::ElementRow::ZERO,
                 first_buffer_line: *first,
                 lines: if loaded.contains(&i) {
                     (*first..*first + *height).map(line).collect()
@@ -3470,15 +3420,8 @@ mod scroll_tests {
                 },
             });
         }
-        let total: u32 = elements.iter().map(|e| e.2 + 1).sum();
         Window {
-                other_elements_dirty: false,
-            first_view_line: ViewLine(0),
-            last_view_line_exclusive: ViewLine(total),
-            view_line_count: elements.iter().map(|e| e.2).sum(),
-            max_scroll_view_line: ViewLine(0),
-            total_visual_rows: total,
-            first_visual_row: VisualRow(0),
+            other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
             root: Element::Stack { children },
@@ -3509,10 +3452,7 @@ mod scroll_tests {
             scroll_anchor: None,
             scroll_col: 0,
             sent_grid: None,
-            subscribe_scroll: ScrollPosition {
-                logical_line: ViewLine::ZERO,
-                sub_row: 0.0,
-            },
+            subscribe_scroll: ScrollPosition::default(),
             fetch_in_flight: false,
             refetch_queued: false,
             pending_reveal: PendingReveal::default(),
@@ -3736,15 +3676,32 @@ mod scroll_tests {
     fn a_view_opens_showing_the_chrome_above_its_first_line() {
         let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 30)], &[0, 1]), 0, 0);
         sh.top_visual_row = VisualRow(999); // whatever it was before the subscribe lands
-        sh.subscribe_scroll = ScrollPosition {
-            logical_line: ViewLine::ZERO,
-            sub_row: 0.0,
-        };
+        sh.subscribe_scroll = ScrollPosition::default();
         let res = aether_protocol::viewport::ViewportSubscribeResult {
             viewport_id: 1,
             window: window_of(&[(7, 0, 20), (8, 0, 30)], &[0, 1]),
             buffer_status: Default::default(),
-            focus: None,
+            focus: aether_protocol::viewport::ViewportFocusElementResult {
+                element: 0,
+                buffer: aether_protocol::buffer::BufferOpenResult {
+                    buffer_id: 7,
+                    language: None,
+                    line_count: 20,
+                    byte_count: 200,
+                    revision: 1,
+                    saved_revision: 1,
+                    path: Some("/repo/a.rs".into()),
+                    scratch_number: None,
+                    cursor: Default::default(),
+                    scroll: None,
+                    lsp_server: None,
+                    transient: false,
+                    title: None,
+                    read_only: false,
+                    is_patch: false,
+                },
+                buffer_status: Default::default(),
+            },
         };
         sh.on_response(
             Continuation::Subscribed,
@@ -3761,33 +3718,32 @@ mod scroll_tests {
     /// Scrolling to the end reaches the end: the last row of the view lands on the last row of the
     /// screen.
     ///
-    /// The scroll bound is `total_visual_rows` — the height the *server* reports — while every row
-    /// the painter resolves is counted off the **tree** it was sent. The two have to be the same
-    /// number. When the tree was shorter (chrome for elements not opening in view was left out of
-    /// it), the scroll kept going after the content had run out: the last rows were unreachable.
+    /// The scroll bound and every row the painter resolves are both counted off the **tree** —
+    /// the one height there is. When the bound came from the server and the tree was shorter
+    /// (chrome for elements not opening in view was left out of it), the scroll kept going after
+    /// the content had run out: the last rows were unreachable.
     #[test]
     fn scrolling_to_the_end_reaches_the_end() {
         let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]), 0, 0);
-        let total = sh.session.view.window.as_ref().unwrap().total_visual_rows;
-        // The tree and the reported height must agree — the server's half of this is pinned by
-        // `a_views_height_is_the_height_of_the_tree_at_every_scroll`.
-        let painted: u32 = aether_client::grid::row_items(sh.session.view.window.as_ref().unwrap())
-            .iter()
-            .map(aether_client::grid::RowItem::rows)
-            .sum();
+        let w = sh.session.view.window.as_ref().unwrap();
+        let total = aether_client::grid::total_rows(&w.root);
+        // Everything loaded, so every row of the view is a row the painter has.
         assert_eq!(
-            painted, total,
+            aether_client::grid::painted_rows(w).len() as u32,
+            total,
             "the fixture is only honest if the tree is the view"
         );
 
         sh.scroll_by(10_000);
-        let w = sh.session.view.window.as_ref().unwrap();
-        let (idx, skip) = line_at_row(w, sh.top_visual_row);
-        let (first_row, _) = aether_client::grid::scroll_top(&w.root, idx, skip);
         assert_eq!(
-            first_row + sh.visible_rows(),
+            sh.top_visual_row.get() + sh.visible_rows(),
             total,
             "the last screenful ends exactly at the view's last row"
+        );
+        let ed = sh.editor_view();
+        assert_eq!(
+            ed.paint_top, sh.top_visual_row,
+            "and it is painted from there, not pulled back"
         );
     }
 
@@ -3806,10 +3762,12 @@ mod scroll_tests {
         // Through the real path — what the painter is actually handed each frame.
         let ed = sh.editor_view();
         let w = sh.session.view.window.as_ref().unwrap();
-        let loaded_rows_here = loaded_rows(w);
-        let (first_row, _) =
-            aether_client::grid::scroll_top(&ed.root, ed.scroll_line_index, ed.scroll_skip_rows);
-        let painted_from_there = w.first_visual_row.get() + loaded_rows_here - first_row;
+        let loaded_rows_here = aether_client::grid::painted_rows(w).len() as u32;
+        let first_row = ed.paint_top.get();
+        let painted_from_there = aether_client::grid::painted_rows_of(&ed.root)
+            .iter()
+            .filter(|(at, _)| at.get() >= first_row && at.get() < first_row + sh.visible_rows())
+            .count() as u32;
         // A screenful, or everything the window holds when it holds less than a screen.
         assert_eq!(
             painted_from_there,

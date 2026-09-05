@@ -1,7 +1,6 @@
 //! `sneak/*` — the `s`/`S` word-jump: candidate collection, label assignment, and selection.
 
 use super::*;
-use aether_protocol::coords::ViewLine;
 
 /// `sneak/update` — set or refine the sneak query. Recomputes the matching word-starts within the
 /// named viewport's visible range, (re)assigns labels (keeping survivors' labels stable), stores
@@ -454,63 +453,21 @@ pub fn collect_viewport_refresh(
     buffer_id: BufferId,
 ) -> PendingPushes {
     let mut pushes = Vec::new();
-    let buf = match s.try_doc_of(buffer_id) {
-        Some(b) => b,
-        None => return pushes,
-    };
-    let revision = buf.revision;
+    if s.try_doc_of(buffer_id).is_none() {
+        return pushes;
+    }
     for vp in s.viewports.values() {
-        if vp.client_id != client_id || !vp.binds(buffer_id) {
+        if vp.client_id != client_id || !s.view_of(vp).binds(buffer_id) {
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
             continue;
         };
-        // The **view's** length, not the buffer's — see `build_lines_changed_notif`.
-        let view_lines = ViewLayout::of(&vp.elements, |id| s.doc_of(id).line_count()).line_count();
-        let new_first = vp.first_view_line.min(ViewLine(view_lines));
-        let new_last_excl = vp
-            .last_view_line_exclusive
-            .min(ViewLine(view_lines))
-            .max(new_first);
-        let window = render_window(
-            s,
-            client_id,
-            vp.view_id,
-            &vp.elements,
-            vp.focused,
-            new_first,
-            new_last_excl,
-            vp.wrap_geometry(),
-            vp.rows,
-            vp.diff_view,
-            SneakLabels::Shown,
-        );
-        let params = ViewportLinesChangedParams {
-            viewport_id: vp.id,
-            buffer: buffer_id,
-            revision,
-            range: LogicalLineRange {
-                start_view_line: vp.first_view_line,
-                end_view_line_exclusive: vp.last_view_line_exclusive,
-            },
-            total_visual_rows: window.total_visual_rows,
-            first_visual_row: window.first_visual_row,
-            max_line_width: window.max_line_width,
-            root: window.root,
-            view_line_count: window.view_line_count,
-            max_scroll_view_line: window.max_scroll_view_line,
-            git_status: window.git_status,
-            other_elements_dirty: window.other_elements_dirty,
-            cursor: lines_changed_cursor(s, vp),
-        };
+        // A search refresh carries the labels: unlike the post-edit broadcast, a sneak session is
+        // exactly what may be live here.
         pushes.push((
             sender,
-            Notification {
-                jsonrpc: JsonRpc,
-                method: ViewportLinesChanged::NAME.into(),
-                params: serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
-            },
+            build_lines_changed_notif(s, vp, lines_changed_cursor(s, vp), SneakLabels::Shown),
         ));
     }
     pushes
@@ -586,7 +543,7 @@ pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) 
         let json = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
         let mut clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
         for vp in s.viewports.values() {
-            if vp.shows(id) {
+            if vp.shows(s.view_of(vp), id) {
                 clients.insert(vp.client_id);
             }
         }
@@ -732,29 +689,36 @@ pub fn next_buffer_for_client(s: &ServerState, client_id: ClientId) -> Option<Bu
 }
 
 /// `(client, buffer)` pairs for every client *other than* `except` affected by closing
-/// `buffer_ids`: clients with a viewport on one (the push hands them a successor to switch to),
-/// plus clients whose active workspace context holds one in its MRU — those may have it as their
-/// *tether*, which must exit even while the client is viewing something else. Capture this BEFORE
-/// tearing the buffers down — teardown drops the viewports and MRU entries this reads. At most one
-/// entry per `(client, buffer)` pair; non-matching pushes are ignored client-side, so the broad
-/// audience is safe.
+/// `buffer_ids`: clients with a viewport showing one (the push hands them a successor to switch
+/// to), plus clients whose active workspace context holds one in its MRU — those may have it as
+/// their *tether*, which must exit even while the client is viewing something else. Capture this
+/// BEFORE tearing the buffers down — teardown drops the viewports and MRU entries this reads. At
+/// most one entry per `(client, buffer)` pair; non-matching pushes are ignored client-side, so the
+/// broad audience is safe.
+///
+/// A viewport is affected by everything it **shows** — the view it presents and every buffer its
+/// elements window — not only by the focused element's buffer. Matching the focused buffer alone
+/// left a client whose review windowed the closed file uninformed while its viewport was torn down
+/// underneath it.
 pub fn clients_affected_by_close(
     s: &ServerState,
     buffer_ids: &[BufferId],
     except: ClientId,
 ) -> Vec<(ClientId, BufferId)> {
-    let targets: std::collections::HashSet<BufferId> = buffer_ids.iter().copied().collect();
     let mut seen: std::collections::HashSet<(ClientId, BufferId)> =
         std::collections::HashSet::new();
     let mut out = Vec::new();
     for vp in s.viewports.values() {
-        if vp.client_id != except
-            && targets.contains(&vp.buffer_id())
-            && seen.insert((vp.client_id, vp.buffer_id()))
-        {
-            out.push((vp.client_id, vp.buffer_id()));
+        if vp.client_id == except {
+            continue;
+        }
+        for &id in buffer_ids {
+            if vp.shows(s.view_of(vp), id) && seen.insert((vp.client_id, id)) {
+                out.push((vp.client_id, id));
+            }
         }
     }
+    let targets: std::collections::HashSet<BufferId> = buffer_ids.iter().copied().collect();
     for (&client_id, session) in &s.clients {
         if client_id == except {
             continue;

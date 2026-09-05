@@ -510,6 +510,20 @@ pub fn resolve_motion(scope: &Scope, current: LogicalPosition, motion: &Motion) 
             }
             scope.clamp(*position)
         }
+        // `N Alt-g`: the N-th line from the **field's** end. Refuses like `Goto` when the field has
+        // fewer lines than that — a line above the field is not a destination either. The client
+        // used to count back from the *view's* line count, a number of the wrong space in any
+        // composed view.
+        Motion::LineFromEnd { count } => {
+            let Some(line) = scope
+                .last_line()
+                .checked_sub(count.saturating_sub(1))
+                .filter(|line| scope.contains_line(*line))
+            else {
+                return current;
+            };
+            LogicalPosition { line, col: 0 }
+        }
         // The word walks read `scope.text()`, so they run out of text at the element's edge instead
         // of stepping into the next hunk's file. Same for `WordEnd` and `FindChar` below.
         Motion::Word {

@@ -24,7 +24,7 @@ use crate::keymap::{
 use crate::picker::{PickerMsg, PickerState, Reveal};
 use crate::theme;
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
-use aether_protocol::coords::{ViewLine, VisualRow};
+use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::Granularity;
 use aether_protocol::envelope::RpcMethod;
 
@@ -32,10 +32,10 @@ use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::PickerKind;
 use aether_protocol::search::SearchSummary;
 use aether_protocol::viewport::{
-    ScrollPosition, ViewportResize, ViewportResizeParams, ViewportScrollToRow,
-    ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
-    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowAtCursor,
-    ViewportWindowAtCursorParams, ViewportWindowResult, Window, WrapMode,
+    ScrollPosition, ViewportResize, ViewportResizeParams, ViewportSetWrap, ViewportSetWrapParams,
+    ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindow,
+    ViewportWindowAtCursor, ViewportWindowAtCursorParams, ViewportWindowParams,
+    ViewportWindowResult, WrapMode,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceOpenPath,
@@ -619,10 +619,7 @@ impl App {
             scroll_anim: None,
             scroll_anchor: None,
             sent_grid: None,
-            subscribe_scroll: ScrollPosition {
-                logical_line: ViewLine::ZERO,
-                sub_row: 0.0,
-            },
+            subscribe_scroll: ScrollPosition::default(),
             fetch_in_flight: false,
             refetch_queued: false,
             pending_reveal: PendingReveal::default(),
@@ -1089,7 +1086,7 @@ impl App {
                 tracing::debug!(
                     viewport_id = res.viewport_id,
                     lines = aether_client::grid::window_lines(&res.window).len(),
-                    total_visual_rows = res.window.total_visual_rows,
+                    total_rows = grid::total_rows(&res.window.root),
                     "viewport subscribed"
                 );
                 // Position the view at the scroll the subscribe asked for (restored or
@@ -1099,9 +1096,20 @@ impl App {
                 self.session.adopt_subscribe(res);
                 if let (Some(cell), Some(w)) = (self.cell, self.session.view.window.as_ref()) {
                     // The *block's* first row, so a line's chrome comes with it — see
-                    // `grid::block_start_of_view_line`.
-                    if let Some(row) = grid::block_start_of_view_line(w, scroll.logical_line) {
-                        self.scroll_px = (row.get() as f32 + scroll.sub_row) * cell.height;
+                    // `grid::line_block_start`. A scroll restored from inside the line's own rows
+                    // goes back to that row; a line the server clamped away leaves the element it
+                    // named as where the view opens.
+                    let row = if scroll.sub_row > 0.0 {
+                        grid::line_top_row(w, scroll.element, scroll.line)
+                            .map(|r| r.get() as f32 + scroll.sub_row)
+                    } else {
+                        grid::line_block_start(w, scroll.element, scroll.line)
+                            .map(|r| r.get() as f32)
+                    };
+                    if let Some(row) = row.or_else(|| {
+                        grid::element_start_row(w, scroll.element).map(|r| r.get() as f32)
+                    }) {
+                        self.scroll_px = row * cell.height;
                     }
                 }
                 self.clamp_scroll();
@@ -2169,10 +2177,16 @@ impl App {
         self.refetch_queued = false;
         self.pending_reveal.abandon();
         let scroll = self.session.view.buffer.scroll.unwrap_or(ScrollPosition {
+            element: self.session.view.focused_element,
             // A fresh jump target (no saved scroll) rests near the top — the cross-buffer
             // counterpart of the in-buffer jump reveal.
-            logical_line: self
-                .view_line_for(self.session.view.buffer.cursor.position.line)
+            line: self
+                .session
+                .view
+                .buffer
+                .cursor
+                .position
+                .line
                 .saturating_sub((rows as f32 * CURSOR_REST_FRACTION) as u32),
             sub_row: 0.0,
         });
@@ -2192,6 +2206,7 @@ impl App {
                 rows,
                 overscan_rows: rows,
                 scroll,
+                focus: self.session.subscribe_focus(),
                 wrap: self.session.wrap,
                 continuation_marker_width: grid::CONTINUATION_MARKER_COLS,
                 tab_width: TAB_WIDTH,
@@ -2382,18 +2397,6 @@ impl App {
 
     // ---- scroll / view sync -----------------------------------------------------------------
 
-    /// A cursor's **buffer** line named as a **view** line, for the requests that scroll by one.
-    /// Mirrors the terminal shell's helper of the same name — exact while the line is loaded,
-    /// carried across unchanged when it isn't (which is exactly when a fetch is being issued).
-    fn view_line_for(&self, line: u32) -> ViewLine {
-        self.session
-            .view
-            .window
-            .as_ref()
-            .and_then(|w| grid::view_line_of(w, self.session.view.focused_element, line))
-            .unwrap_or(ViewLine(line))
-    }
-
     fn visible_rows(&self) -> u32 {
         match self.cell {
             Some(cell) => (((self.view_size.height - PAD) / cell.height) as u32).max(1),
@@ -2437,7 +2440,7 @@ impl App {
 
     fn max_scroll_px(&self) -> f32 {
         match (&self.session.view.window, self.cell) {
-            (Some(w), Some(cell)) => (PAD * 2.0 + w.total_visual_rows as f32 * cell.height
+            (Some(w), Some(cell)) => (PAD * 2.0 + grid::total_rows(&w.root) as f32 * cell.height
                 - self.view_size.height)
                 .max(0.0),
             _ => 0.0,
@@ -2531,15 +2534,14 @@ impl App {
             return Task::none();
         };
         let top_row = VisualRow((((self.scroll_px - PAD) / cell.height).floor()).max(0.0) as u32);
-        let loaded_start = window.first_visual_row;
-        let loaded_end = loaded_start.saturating_add(loaded_rows(window));
-        let margin = self.visible_rows();
         let visible = self.visible_rows();
-        let need_above =
-            loaded_start > VisualRow::ZERO && top_row < loaded_start.saturating_add(margin);
-        let need_below = loaded_end.get() < window.total_visual_rows
-            && top_row.saturating_add(visible) > loaded_end.saturating_sub(margin);
-        if !(need_above || need_below) {
+        // The client lays the view out from the tree, so it knows which elements the viewport
+        // reaches and which of their rows; it asks for those — a screen either side, so the next
+        // half-screen of scrolling asks nothing — and the server answers with the lines they are.
+        // The check itself allows a half-screen margin, so the fetch lands before the scroll
+        // reaches rows nothing is loaded at.
+        let needed = grid::slices_for(&window.root, top_row, visible, visible / 2);
+        if grid::loaded_covers(&window.root, &needed) {
             return Task::none();
         }
         if self.fetch_in_flight {
@@ -2547,10 +2549,13 @@ impl App {
             return Task::none();
         }
         self.fetch_in_flight = true;
-        self.rpc::<ViewportScrollToRow>(
-            ViewportScrollToRowParams {
+        let slices = grid::slices_for(&window.root, top_row, visible, visible);
+        let anchor = grid::anchor_at(window, top_row);
+        self.rpc::<ViewportWindow>(
+            ViewportWindowParams {
                 viewport_id,
-                top_visual_row: top_row,
+                anchor,
+                slices,
             },
             Message::WindowUpdate,
         );
@@ -4856,15 +4861,6 @@ fn core_key_message(code: KeyCode) -> Message {
         mods: Mods::NONE,
         text,
     }
-}
-
-fn loaded_rows(window: &Window) -> u32 {
-    // Chrome rows occupy screen rows too, so the loaded height counts every row-producing
-    // item, not only the lines.
-    grid::row_items(window)
-        .iter()
-        .map(grid::RowItem::rows)
-        .sum()
 }
 
 /// Where the hover popover hangs relative to the cursor line: `Top(y)` puts its top edge at `y`

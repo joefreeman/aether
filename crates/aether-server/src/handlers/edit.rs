@@ -6,7 +6,6 @@
 //! are inseparable from the multi-step apply they drive.
 
 use super::*;
-use aether_protocol::coords::ViewLine;
 
 pub async fn input_move_lines_once(
     state: &SharedState,
@@ -139,8 +138,7 @@ pub async fn input_move_lines_once(
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
-    let pushes: PendingPushes =
-        collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
+    let pushes: PendingPushes = collect_doc_edit_pushes(&s, buffer_id, edit_first, edit_last_excl);
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
     // LSP: full-document sync.
@@ -333,7 +331,7 @@ async fn input_join_lines_once(
         let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
         search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
         refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
-        let pushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+        let pushes = collect_doc_lines_changed_pushes(&s, buffer_id);
         let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
         // LSP: full-document sync.
         notify_lsp_change(&mut s, buffer_id);
@@ -473,7 +471,7 @@ pub async fn apply_undo_or_redo(
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     // LSP: the rope was swapped wholesale — tell the server so its diagnostics aren't stale.
     notify_lsp_change(&mut s, buffer_id);
-    let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+    let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id);
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
@@ -1268,8 +1266,7 @@ pub async fn apply_edit_reporting(
     // Collect notifications for all viewports whose pushed range intersects the edit.
     let edit_first = old_first_line;
     let edit_last_excl = old_last_line.saturating_add(1);
-    let pushes: PendingPushes =
-        collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
+    let pushes: PendingPushes = collect_doc_edit_pushes(&s, buffer_id, edit_first, edit_last_excl);
 
     // Re-push any open Buffers pickers only when the dirty flag flipped (typically the first
     // edit after a save). The picker row renders dirty + display only, so per-keystroke edits
@@ -1304,16 +1301,16 @@ pub async fn apply_edit_reporting(
 /// the edit didn't intersect, so a whole-document consumer (the markdown reading view) still hears
 /// about every mutation without a window render. Clients that draw the pushed window ignore the
 /// notification.
-pub fn push_buffer_changed(
-    s: &ServerState,
-    vp: &Viewport,
-    buffer_id: BufferId,
-    revision: Revision,
-    pushes: &mut PendingPushes,
-) {
+///
+/// About the **focused element's** buffer, at that buffer's own revision — the one buffer the
+/// receiving client tracks a revision for. See [`build_lines_changed_notif`] for why it is neither
+/// the view nor the buffer that was edited.
+pub fn push_buffer_changed(s: &ServerState, vp: &Viewport, pushes: &mut PendingPushes) {
     let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
         return;
     };
+    let buffer_id = s.focused_buffer(vp);
+    let revision = s.doc_of(buffer_id).revision;
     pushes.push((
         sender,
         Notification {
@@ -1375,8 +1372,9 @@ pub fn workspace_candidates(
 /// decorated the same way RPC responses are (`wrap_for_response`). `None` when the client has no
 /// cursor on the buffer — the client then keeps its local state.
 pub fn lines_changed_cursor(s: &ServerState, vp: &Viewport) -> Option<CursorState> {
-    let cursor = s.cursors.get(&(vp.client_id, vp.buffer_id())).copied()?;
-    Some(wrap_for_response(s, vp.client_id, vp.buffer_id(), cursor))
+    let buffer_id = s.focused_buffer(vp);
+    let cursor = s.cursors.get(&(vp.client_id, buffer_id)).copied()?;
+    Some(wrap_for_response(s, vp.client_id, buffer_id, cursor))
 }
 
 /// Full-window `viewport/lines_changed` pushes for every viewport on any buffer of `buffer_id`'s
@@ -1391,7 +1389,6 @@ pub fn lines_changed_cursor(s: &ServerState, vp: &Viewport) -> Option<CursorStat
 pub fn collect_doc_edit_pushes(
     s: &ServerState,
     buffer_id: BufferId,
-    revision: Revision,
     edit_first: u32,
     edit_last_excl: u32,
 ) -> PendingPushes {
@@ -1401,11 +1398,11 @@ pub fn collect_doc_edit_pushes(
     }
     let attached = s.doc_siblings(buffer_id);
     for vp in s.viewports.values() {
-        if !attached.iter().any(|id| vp.shows(*id)) {
+        if !attached.iter().any(|id| vp.shows(s.view_of(vp), *id)) {
             continue;
         }
         if !vp.diff_view && !edit_touches_window(s, vp, &attached, edit_first, edit_last_excl) {
-            push_buffer_changed(s, vp, vp.buffer_id(), revision, &mut pushes);
+            push_buffer_changed(s, vp, &mut pushes);
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
@@ -1413,7 +1410,7 @@ pub fn collect_doc_edit_pushes(
         };
         pushes.push((
             sender,
-            build_lines_changed_notif(s, vp, revision, lines_changed_cursor(s, vp)),
+            build_lines_changed_notif(s, vp, lines_changed_cursor(s, vp), SneakLabels::Hidden),
         ));
     }
     pushes
@@ -1437,18 +1434,14 @@ pub fn clamp_doc_cursors(s: &mut ServerState, buffer_id: BufferId) {
     }
 }
 
-pub fn collect_doc_lines_changed_pushes(
-    s: &ServerState,
-    buffer_id: BufferId,
-    revision: Revision,
-) -> PendingPushes {
+pub fn collect_doc_lines_changed_pushes(s: &ServerState, buffer_id: BufferId) -> PendingPushes {
     let mut pushes: PendingPushes = Vec::new();
     if s.try_doc_of(buffer_id).is_none() {
         return pushes;
     }
     let attached = s.doc_siblings(buffer_id);
     for vp in s.viewports.values() {
-        if !attached.iter().any(|id| vp.shows(*id)) {
+        if !attached.iter().any(|id| vp.shows(s.view_of(vp), *id)) {
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
@@ -1456,70 +1449,40 @@ pub fn collect_doc_lines_changed_pushes(
         };
         pushes.push((
             sender,
-            build_lines_changed_notif(s, vp, revision, lines_changed_cursor(s, vp)),
+            build_lines_changed_notif(s, vp, lines_changed_cursor(s, vp), SneakLabels::Hidden),
         ));
     }
     pushes
 }
 
+/// The `view/lines_changed` push for one viewport: the whole rendered view, plus **whose** revision
+/// moved.
+///
+/// `buffer` and `revision` are the **focused element's** — the same buffer the `cursor` beside them
+/// is about. A view is not one buffer, so "the view's revision" is not a well-formed idea, and the
+/// client tracks a revision for exactly one buffer: the one its cursor is in. Naming the view here
+/// (as this once did) meant a composed view never adopted a revision from a push at all, so another
+/// client's edit to the focused file left this client's dirty dot stale. Naming the *edited* buffer
+/// would be wrong the other way: an edit to an unfocused element would file that buffer's revision
+/// against the focused one, and the next push for it would look stale and be dropped.
+///
+/// `sneak_labels` says whether the render carries sneak labels: the post-edit broadcast never does
+/// (a sneak session can't coexist with an edit by the same client), a search refresh always does.
 pub fn build_lines_changed_notif(
     s: &ServerState,
     vp: &Viewport,
-    revision: Revision,
     cursor: Option<CursorState>,
+    sneak_labels: SneakLabels,
 ) -> Notification {
-    // The view, not the focused element's buffer: this push carries the whole rendered view, and
-    // its revision and line count are the view's. Saying otherwise would have a client file one
-    // buffer's revision against another — the very thing `buffer` exists to prevent.
-    let buffer_id = vp.view_id;
-    // Clamped against the **view's** length, not its own document's. For a bound patch the generated
-    // document is far longer than the view built over it, so clamping against the document let the
-    // pushed range run past the view's real end, where every element clips to nothing.
-    let view_lines = ViewLayout::of(&vp.elements, |id| s.doc_of(id).line_count()).line_count();
-    let new_first = vp.first_view_line.min(ViewLine(view_lines));
-    let new_last_excl = vp
-        .last_view_line_exclusive
-        .min(ViewLine(view_lines))
-        .max(new_first);
-    let window = render_window(
-        s,
-        vp.client_id,
-        vp.view_id,
-        &vp.elements,
-        vp.focused,
-        new_first,
-        new_last_excl,
-        vp.wrap_geometry(),
-        vp.rows,
-        vp.diff_view,
-        // Post-edit / async broadcast path: a sneak session can't coexist with an edit by the same
-        // client, so labels never ride this render. They reappear on the next sneak/update.
-        SneakLabels::Hidden,
-    );
+    let buffer_id = s.focused_buffer(vp);
+    let revision = s.doc_of(buffer_id).revision;
+    // Over the slices the viewport has loaded, which the edit's line shift has already moved.
+    let window = render_window(s, vp, sneak_labels);
     let params = ViewportLinesChangedParams {
         viewport_id: vp.id,
-        // Behaviour preserved verbatim across the `ViewId` split, because the two sides of this
-        // field disagree and the disagreement predates the type. The server says the revision "is
-        // the view's" (above); the client adopts only when `p.buffer` equals the buffer it is
-        // *editing* (`update.rs`, "the revision belongs to `p.buffer`, which is not always the
-        // view's"). Those coincide for an ordinary view and never for a composed one, so a
-        // composed view's revision is not adopted from this push at all. Whether the fix is to
-        // send the focused element's buffer or to widen the client's test is a live question, not
-        // a rename decision.
-        buffer: buffer_id.presenting_buffer(),
+        buffer: buffer_id,
         revision,
-        range: LogicalLineRange {
-            start_view_line: vp.first_view_line,
-            end_view_line_exclusive: vp.last_view_line_exclusive,
-        },
-        total_visual_rows: window.total_visual_rows,
-        first_visual_row: window.first_visual_row,
-        max_line_width: window.max_line_width,
-        root: window.root,
-        view_line_count: window.view_line_count,
-        max_scroll_view_line: window.max_scroll_view_line,
-        git_status: window.git_status,
-        other_elements_dirty: window.other_elements_dirty,
+        window,
         cursor,
     };
     Notification {

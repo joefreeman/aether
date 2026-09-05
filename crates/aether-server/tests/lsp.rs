@@ -2,7 +2,6 @@
 
 mod common;
 
-use aether_protocol::coords::{ViewLine, VisualRow};
 use common::*;
 
 // ---- real-LSP verification ---------------------------------------------------------------------
@@ -38,6 +37,7 @@ async fn run_lsp_diagnostics(
                     let p: ViewportLinesChangedParams =
                         serde_json::from_value(n.params).expect("typed params");
                     let diags: Vec<(DiagnosticSeverity, String)> = p
+                        .window
                         .root
                         .lines()
                         .into_iter()
@@ -366,7 +366,7 @@ async fn wait_for_buffer_diagnostic(
         let view: PickerViewResult = send_request::<PickerView>(
             ws,
             &PickerViewParams {
-                    view_id: None,
+                view_id: None,
                 buffer_id: Some(buffer_id),
                 ..view_params(PickerKind::Diagnostics)
             },
@@ -396,7 +396,7 @@ async fn wait_for_buffer_diag_present(ws: &mut Ws, buffer_id: u64, want: bool) {
         let view: PickerViewResult = send_request::<PickerView>(
             ws,
             &PickerViewParams {
-                    view_id: None,
+                view_id: None,
                 buffer_id: Some(buffer_id),
                 ..view_params(PickerKind::Diagnostics)
             },
@@ -521,7 +521,7 @@ async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
         let view = send_request::<PickerView>(
             ws,
             &PickerViewParams {
-                    view_id: None,
+                view_id: None,
                 reset: PickerReset::Keep,
                 ..view_params(PickerKind::WorkspaceSymbols)
             },
@@ -548,7 +548,7 @@ async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
                 let view = send_request::<PickerView>(
                     ws,
                     &PickerViewParams {
-                            view_id: None,
+                        view_id: None,
                         reset: PickerReset::Keep,
                         ..view_params(PickerKind::WorkspaceSymbols)
                     },
@@ -806,7 +806,7 @@ async fn poll_symbol_view(ws: &mut Ws, done: impl Fn(&[PickerItem]) -> bool) -> 
         let view = send_request::<PickerView>(
             ws,
             &PickerViewParams {
-                    view_id: None,
+                view_id: None,
                 reset: PickerReset::Keep,
                 ..view_params(PickerKind::WorkspaceSymbols)
             },
@@ -954,7 +954,7 @@ async fn workspace_symbol_dir_scope_prunes_the_fanout_and_filter_changes_reuse_i
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::WorkspaceSymbols)
         },
@@ -968,7 +968,7 @@ async fn workspace_symbol_dir_scope_prunes_the_fanout_and_filter_changes_reuse_i
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::WorkspaceSymbols)
         },
@@ -1190,7 +1190,7 @@ async fn workspace_symbols_capture_to_the_jumplist() {
     let items = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::WorkspaceSymbols)
         },
@@ -1349,7 +1349,7 @@ async fn workspace_symbol_groups_stay_contiguous_and_step_to_every_file() {
     .await;
 
     let view = |reset| PickerViewParams {
-            view_id: None,
+        view_id: None,
         reset,
         ..view_params(PickerKind::WorkspaceSymbols)
     };
@@ -2172,7 +2172,7 @@ async fn references_picker_lists_all_uses() {
             let view = send_request::<PickerView>(
                 &mut ws,
                 &PickerViewParams {
-                        view_id: None,
+                    view_id: None,
                     limit: 30,
                     buffer_id: Some(buffer_id),
                     ..view_params(PickerKind::References)
@@ -2312,7 +2312,7 @@ async fn references_picker_waits_out_a_starting_server() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             limit: 30,
             buffer_id: Some(buffer_id),
             ..view_params(PickerKind::References)
@@ -2387,7 +2387,7 @@ async fn document_symbols_picker_fills_and_centers_deep() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             limit: 30,
             buffer_id: Some(buffer_id),
             ..view_params(PickerKind::DocumentSymbols)
@@ -2851,9 +2851,9 @@ async fn http_rejects_foreign_host() {
     drop(server);
 }
 
-/// The viewport reports the buffer's total visual-row height and the window's first visual row, so
-/// a native-scrolling client can size a full-document scroller and position the loaded window. Under
-/// no-wrap the total equals the logical line count; first_visual_row tracks first_view_line.
+/// The tree says how tall the view is and where the loaded slice sits in its element, so a
+/// native-scrolling client can size a full-document scroller and position the loaded window. Under
+/// no-wrap a row is a line, so a slice from row 50 starts at line 50.
 #[tokio::test]
 async fn viewport_reports_visual_extent_and_scrolls_by_row() {
     let content: String = (0..100).map(|i| format!("line {i}\n")).collect();
@@ -2867,9 +2867,11 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
             rows: 10,
             overscan_rows: 10,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -2877,31 +2879,18 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
         },
     )
     .await;
-    // No-wrap: one visual row per logical line; window starts at the top.
-    assert_eq!(sub.window.total_visual_rows, sub.window.view_line_count);
-    assert_eq!(
-        sub.window.first_visual_row,
-        aether_protocol::coords::VisualRow(0)
-    );
+    // No-wrap: one row per logical line; the slice starts at the top.
+    assert_eq!(loaded_lines(&sub.window).0, 0);
+    assert_eq!(first_loaded_row(&sub.window), 0);
     // Widest line is "line 10".."line 99" — 7 cols.
     assert_eq!(sub.window.max_line_width, 7);
     let viewport_id = sub.viewport_id;
 
-    // Scroll so visual row 50 is at the top.
-    let res: ViewportWindowResult = send_request::<ViewportScrollToRow>(
-        &mut ws,
-        &ViewportScrollToRowParams {
-            viewport_id,
-            top_visual_row: VisualRow(50),
-        },
-    )
-    .await;
-    // Under no-wrap, first_visual_row == first_view_line, and line 50 is in the loaded window.
-    assert_eq!(
-        res.window.first_visual_row.get(),
-        res.window.first_view_line.get()
-    );
-    assert!(res.window.first_view_line <= aether_protocol::coords::ViewLine(50));
+    // Scroll so row 50 is at the top.
+    let res = window_from_row(&mut ws, viewport_id, 50, 10).await;
+    // Under no-wrap, row 50 of the one element is line 50, and it is in the loaded slice.
+    assert_eq!(first_loaded_row(&res.window), 50);
+    assert!(loaded_lines(&res.window).0 <= 50);
     assert!(res
         .window
         .root
@@ -2912,9 +2901,137 @@ async fn viewport_reports_visual_extent_and_scrolls_by_row() {
     drop(server);
 }
 
-/// Under soft wrap, total_visual_rows counts the wrapped rows, exceeding the logical line count.
+/// `o`/`Alt-o` over an ordinary buffer go through the **view** too, and the view — having no outline
+/// of its own — steps the buffer's document symbols exactly as the motion did: the identifier lands
+/// selected, Shift grows the selection to it, and past the last symbol nothing moves.
 #[tokio::test]
-async fn viewport_total_visual_rows_counts_wrapped_rows() {
+async fn an_ordinary_views_outline_is_its_document_symbols() {
+    use aether_protocol::lsp::{LspSymbolPathChanged, LspSymbolPathChangedParams};
+    use aether_protocol::viewport::{
+        FocusStep, NavigateGrain, ViewportFocusElementResult, ViewportNavigateChange,
+        ViewportNavigateChangeParams,
+    };
+    use aether_server::{DummyDocSymbol, DummyLspConfig, DummyRange};
+    use std::time::Duration;
+
+    let content = "fn alpha() {}\n\nfn beta() {}\n";
+    let dir = lay_out(&[("main.rs", content)]);
+    let symbol = |name: &str, line: u32, end: u32| DummyDocSymbol {
+        name: name.into(),
+        kind: 12,
+        range: DummyRange {
+            line,
+            character: 0,
+            end_line: line,
+            end_character: end + 5,
+        },
+        selection: DummyRange::on(line, 3, end),
+    };
+    let dummy = DummyLspConfig {
+        document_symbols: vec![symbol("alpha", 0, 8), symbol("beta", 2, 7)],
+        ..Default::default()
+    };
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "outline-view",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
+    let open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+    // Inside `alpha`; the breadcrumb push is the signal that the outline has been cached.
+    set_cursor(&mut ws, buffer_id, 0, 4).await;
+    let _: LspSymbolPathChangedParams =
+        expect_notification_within::<LspSymbolPathChanged>(&mut ws, Duration::from_secs(10)).await;
+    set_cursor(&mut ws, buffer_id, 0, 0).await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(buffer_id),
+            cols: 100,
+            rows: 40,
+            overscan_rows: 0,
+            scroll: ScrollPosition::default(),
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let step = |direction, extend| ViewportNavigateChangeParams {
+        viewport_id: sub.viewport_id,
+        direction,
+        count: Some(1),
+        grain: NavigateGrain::Outline,
+        extend,
+    };
+
+    // `o` from the top: alpha's identifier, selected.
+    let first: ViewportFocusElementResult =
+        send_request::<ViewportNavigateChange>(&mut ws, &step(FocusStep::Next, false)).await;
+    assert_eq!(
+        first.element, 0,
+        "an ordinary view has one element, and stays in it"
+    );
+    assert_eq!(
+        first.buffer.cursor.anchor,
+        LogicalPosition { line: 0, col: 3 }
+    );
+    assert_eq!(first.buffer.cursor.position.line, 0);
+    assert!(
+        first.buffer.cursor.position.col > 3,
+        "the identifier is selected"
+    );
+
+    // `o` again: beta.
+    let second: ViewportFocusElementResult =
+        send_request::<ViewportNavigateChange>(&mut ws, &step(FocusStep::Next, false)).await;
+    assert_eq!(
+        second.buffer.cursor.anchor,
+        LogicalPosition { line: 2, col: 3 }
+    );
+    assert_eq!(second.buffer.cursor.position.line, 2);
+
+    // Past the last symbol nothing moves — the reply says where the cursor still is.
+    let stuck: ViewportFocusElementResult =
+        send_request::<ViewportNavigateChange>(&mut ws, &step(FocusStep::Next, false)).await;
+    assert_eq!(stuck.buffer.cursor, second.buffer.cursor);
+
+    // `Shift-Alt-o` grows the selection back over alpha: the cursor goes to alpha's name start
+    // while the selection's far edge stays where it was.
+    let grown: ViewportFocusElementResult =
+        send_request::<ViewportNavigateChange>(&mut ws, &step(FocusStep::Previous, true)).await;
+    assert_eq!(
+        grown.buffer.cursor.position,
+        LogicalPosition { line: 0, col: 3 }
+    );
+    assert_eq!(
+        grown.buffer.cursor.anchor.line, 2,
+        "extend keeps the selection's other edge"
+    );
+
+    drop(server);
+}
+
+/// Under soft wrap, the element's height counts the wrapped rows, exceeding the logical line count.
+#[tokio::test]
+async fn a_views_height_counts_wrapped_rows() {
     let content = format!("{}\nshort\n", "x".repeat(30));
     let (server, mut ws, buffer_id) = setup_with_buffer(&content).await;
 
@@ -2926,9 +3043,11 @@ async fn viewport_total_visual_rows_counts_wrapped_rows() {
             rows: 5,
             overscan_rows: 5,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -2938,10 +3057,10 @@ async fn viewport_total_visual_rows_counts_wrapped_rows() {
     .await;
     // The 30-char line wraps to several rows, so the total exceeds the 3 logical lines.
     assert!(
-        sub.window.total_visual_rows > sub.window.view_line_count,
-        "total_visual_rows {} should exceed line_count {}",
-        sub.window.total_visual_rows,
-        sub.window.view_line_count
+        total_rows(&sub.window) > sub.window.root.lines().len() as u32,
+        "total rows {} should exceed line count {}",
+        total_rows(&sub.window),
+        sub.window.root.lines().len()
     );
     // Soft wrap never overflows horizontally, so no max-line-width is reported.
     assert_eq!(sub.window.max_line_width, 0);
@@ -2971,9 +3090,11 @@ async fn closing_a_buffer_notifies_other_clients_viewing_it() {
                 rows: 10,
                 overscan_rows: 0,
                 scroll: ScrollPosition {
-                    logical_line: ViewLine(0),
+                    element: 0,
+                    line: 0,
                     sub_row: 0.0,
                 },
+                focus: None,
                 wrap: WrapMode::Soft,
                 continuation_marker_width: 0,
                 tab_width: 4,
@@ -3084,9 +3205,11 @@ async fn closing_a_buffer_notifies_non_viewing_workspace_clients() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -3463,9 +3586,11 @@ async fn a_composed_views_status_snapshot_describes_the_focused_file() {
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: aether_protocol::coords::ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -3474,8 +3599,8 @@ async fn a_composed_views_status_snapshot_describes_the_focused_file() {
     )
     .await;
     assert!(
-        sub.focus.is_some(),
-        "the view windows a real file, so it answers with a focused element"
+        sub.focus.buffer.path.is_some(),
+        "the view windows a real file, so it answers with a focused element over it"
     );
     assert_eq!(
         sub.buffer_status.diagnostics.errors, 1,
@@ -3569,9 +3694,11 @@ async fn navigate_diagnostic_refuses_one_outside_the_focused_hunk() {
             rows: 60,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: aether_protocol::coords::ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,

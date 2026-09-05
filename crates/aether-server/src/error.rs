@@ -124,6 +124,13 @@ impl RpcError {
         Self::new(ErrorCode::GIT_SHOW_FAILED, "no working changes to show")
     }
 
+    /// Whether this is [`Self::nothing_to_show`] — a clean tree, not a git failure. Code and
+    /// message both, since the code is shared with every other way `git show` can fail.
+    pub fn is_nothing_to_show(&self) -> bool {
+        let nothing = Self::nothing_to_show();
+        self.code == nothing.code && self.message == nothing.message
+    }
+
     pub fn read_only_buffer(buffer_id: aether_protocol::BufferId) -> Self {
         Self::new(
             ErrorCode::READ_ONLY_BUFFER,

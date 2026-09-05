@@ -6,7 +6,6 @@ use aether_client::effect::{Effect, Effects, ShellAction, ToastKind};
 use aether_client::keymap::{KeyCode, Mods};
 use aether_client::session::Session;
 use aether_client::transport::RpcError;
-use aether_protocol::coords::{ViewLine, VisualRow};
 use aether_protocol::ViewId;
 use serde_json::json;
 
@@ -219,22 +218,16 @@ fn ordinary_motion_follows_but_goto_line_jumps() {
 #[test]
 fn goto_line_from_end_counts_up_from_the_bottom() {
     use aether_protocol::viewport::Window;
-    // The client needs the buffer's line count (carried on the window) to count from the bottom.
     let mut s = session();
     s.view.window = Some(Window {
-            other_elements_dirty: false,
-        first_view_line: ViewLine(0),
-        last_view_line_exclusive: ViewLine(40),
-        view_line_count: 100,
-        max_scroll_view_line: ViewLine(60),
-        total_visual_rows: 100,
-        first_visual_row: VisualRow(0),
+        other_elements_dirty: false,
         max_line_width: 0,
         git_status: None,
         root: aether_protocol::viewport::Element::Editor {
             element: 0,
             buffer: 0,
             rows: 0,
+            first_row: aether_protocol::coords::ElementRow(0),
             first_buffer_line: 0,
             lines: vec![],
         },
@@ -254,11 +247,13 @@ fn goto_line_from_end_counts_up_from_the_bottom() {
     // line instead of a clamped guess.
     assert_eq!(alt_g(&mut s)["kind"], "buffer_end");
 
-    // Counted, it stays an absolute jump: `3 Alt-g` is three lines up from the end, 100 - 3 = 97.
+    // Counted, `3 Alt-g` is three lines up from the end — and the server counts, from the end of
+    // the *field*: the client no longer knows a line count to subtract from, since a view's height
+    // is rows of every element, not lines of one buffer.
     let _ = key(&mut s, '3');
     let counted = alt_g(&mut s);
-    assert_eq!(counted["kind"], "goto");
-    assert_eq!(counted["position"]["line"].as_u64().unwrap(), 97);
+    assert_eq!(counted["kind"], "line_from_end");
+    assert_eq!(counted["count"].as_u64().unwrap(), 3);
 
     // And its mirror: bare `g` asks for the field's start rather than absolute line 0.
     let fx = s.on_key(KeyCode::Char('g'), Mods::NONE, Some("g".into()), ROWS);
@@ -290,16 +285,140 @@ fn search_and_diagnostic_navigation_reveal_as_jumps() {
     assert_eq!(reveal_style(&fx), Some(RevealStyle::Jump));
 }
 
+/// A step that found its entry gone from the review says so and stays put — or shows the review
+/// when it had to be brought back to look — and never opens the entry's file in an editor.
+#[test]
+fn a_gone_jumplist_entry_toasts_instead_of_opening_the_file() {
+    use aether_client::update::Event;
+    use aether_protocol::jumplist::{JumplistStepResult, JumplistStepScope};
+
+    let mut s = session();
+    let before = s.view.buffer.buffer_id;
+    let fx = s.on_event(Event::JumplistStepped(
+        Ok(JumplistStepResult::Gone {
+            index: 2,
+            total: 4,
+            skipped: 1,
+            opened: None,
+        }),
+        aether_protocol::cursor::Direction::Forward,
+        JumplistStepScope::Full,
+    ));
+    assert_eq!(
+        toast_messages(&fx),
+        vec!["This entry is no longer in the review"]
+    );
+    assert!(
+        fx.0.iter().all(|e| !matches!(e, Effect::Request { .. })),
+        "nothing is opened"
+    );
+    assert_eq!(s.view.buffer.buffer_id, before);
+
+    // Several passed over, and the review reopened to look: it is shown, and the toast counts.
+    let mut s = session();
+    let fx = s.on_event(Event::JumplistStepped(
+        Ok(JumplistStepResult::Gone {
+            index: 4,
+            total: 4,
+            skipped: 3,
+            opened: Some(Box::new(aether_protocol::buffer::BufferOpenResult {
+                buffer_id: 9,
+                language: None,
+                line_count: 40,
+                byte_count: 400,
+                revision: 1,
+                saved_revision: 1,
+                path: None,
+                scratch_number: None,
+                cursor: Default::default(),
+                scroll: None,
+                lsp_server: None,
+                transient: true,
+                title: Some("Working changes".into()),
+                read_only: true,
+                is_patch: true,
+            })),
+        }),
+        aether_protocol::cursor::Direction::Forward,
+        JumplistStepScope::Full,
+    ));
+    assert_eq!(s.view.buffer.buffer_id, 9, "the review is shown");
+    assert_eq!(
+        toast_messages(&fx),
+        vec!["3 entries are no longer in the review"]
+    );
+}
+
+/// A step that passed over gone entries on the way to one still there lands, and says how many.
+#[test]
+fn a_step_over_gone_entries_lands_and_counts_them() {
+    use aether_client::update::Event;
+    use aether_protocol::jumplist::{JumplistStepResult, JumplistStepScope, JumplistStepTarget};
+    use aether_protocol::viewport::ViewSeat;
+
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    let fx = s.on_event(Event::JumplistStepped(
+        Ok(JumplistStepResult::Moved(Box::new(JumplistStepTarget {
+            path: Some("/repo/a.rs".into()),
+            buffer_id: None,
+            position: Some(aether_protocol::LogicalPosition { line: 42, col: 0 }),
+            anchor: None,
+            index: 3,
+            total: 4,
+            opened: None,
+            seat: Some(ViewSeat {
+                element: 1,
+                buffer_id: 5,
+            }),
+            skipped: 2,
+        }))),
+        aether_protocol::cursor::Direction::Forward,
+        JumplistStepScope::Full,
+    ));
+    assert_eq!(
+        toast_messages(&fx),
+        vec!["Skipped 2 entries that are no longer in the review"]
+    );
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::Request { method, .. } if *method == "element/set")),
+        "and it still seats"
+    );
+}
+
+/// Enter on a jumplist row whose change is gone from its review toasts rather than opening the
+/// row's file.
+#[test]
+fn selecting_a_gone_jumplist_row_toasts() {
+    use aether_client::update::Event;
+    use aether_protocol::picker::PickerSelectResult;
+
+    let mut s = session();
+    let fx = s.on_event(Event::PickerSelected {
+        result: Ok(PickerSelectResult::Gone { open: None }),
+    });
+    assert_eq!(
+        toast_messages(&fx),
+        vec!["This entry is no longer in the review"]
+    );
+    assert!(
+        fx.0.iter().all(|e| !matches!(e, Effect::Request { .. })),
+        "nothing is opened"
+    );
+}
+
 #[test]
 fn shift_extends_hunk_and_diagnostic_navigation() {
     // Plain `c`/`d` collapse to the target (no extend on the wire); Shift grows the selection.
     let press = |c: char, mods: Mods| -> serde_json::Value {
         let mut s = session();
+        s.view.viewport_id = Some(7);
         let fx = s.on_key(KeyCode::Char(c), mods, None, ROWS);
         the_request(&fx).2
     };
 
-    // `c` → git/navigate_hunk, no extend; `Shift-c` → extend: true.
+    // `c` → view/navigate_change, no extend; `Shift-c` → extend: true.
     assert_eq!(press('c', Mods::NONE)["extend"], json!(null));
     assert_eq!(press('c', Mods::SHIFT)["extend"], json!(true));
     // `Alt-c` (prev) likewise gains extend under Shift-Alt.
@@ -319,28 +438,25 @@ fn shift_extends_hunk_and_diagnostic_navigation() {
 fn shift_extends_symbol_navigation() {
     let press = |mods: Mods| -> serde_json::Value {
         let mut s = session();
+        s.view.viewport_id = Some(7);
         let fx = s.on_key(KeyCode::Char('o'), mods, None, ROWS);
         let (_, method, params) = the_request(&fx);
-        assert_eq!(method, "element/move");
+        assert_eq!(method, "view/navigate_change");
         params
     };
     let shift_alt = Mods {
         shift: true,
         ..Mods::ALT
     };
-    // `o`/`Alt-o` move; `Shift-o`/`Shift-Alt-o` extend the selection (same motion, extend flag set).
-    assert_eq!(
-        press(Mods::NONE)["motion"]["kind"],
-        json!("next_navigation_unit")
-    );
-    assert_eq!(press(Mods::NONE)["extend_selection"], json!(false));
-    assert_eq!(press(Mods::SHIFT)["extend_selection"], json!(true));
-    assert_eq!(
-        press(Mods::ALT)["motion"]["kind"],
-        json!("prev_navigation_unit")
-    );
-    assert_eq!(press(Mods::ALT)["extend_selection"], json!(false));
-    assert_eq!(press(shift_alt)["extend_selection"], json!(true));
+    // `o`/`Alt-o` step the view's outline — whatever kind of view it is, the view answers —
+    // and `Shift-o`/`Shift-Alt-o` extend the selection (same step, extend flag set).
+    assert_eq!(press(Mods::NONE)["grain"], json!("outline"));
+    assert_eq!(press(Mods::NONE)["direction"], json!("next"));
+    assert_eq!(press(Mods::NONE)["extend"], json!(null));
+    assert_eq!(press(Mods::SHIFT)["extend"], json!(true));
+    assert_eq!(press(Mods::ALT)["direction"], json!("previous"));
+    assert_eq!(press(Mods::ALT)["extend"], json!(null));
+    assert_eq!(press(shift_alt)["extend"], json!(true));
 }
 
 #[test]
@@ -1069,14 +1185,11 @@ fn a_lines_changed_push_for_another_buffer_leaves_our_revision_alone() {
                 "viewport_id": 7,
                 "buffer": buffer,
                 "revision": revision,
-                "range": {"start_view_line": 0, "end_view_line_exclusive": 0},
-                "root": {"node": "editor", "element": 0, "buffer": buffer, "rows": 0,
-                         "first_buffer_line": 0, "lines": []},
-                "view_line_count": 0,
-                "max_scroll_view_line": 0,
-                "total_visual_rows": 0,
-                "first_visual_row": 0,
-                "max_line_width": 0,
+                "window": {
+                    "root": {"node": "editor", "element": 0, "buffer": buffer, "rows": 0,
+                             "first_row": 0, "first_buffer_line": 0, "lines": []},
+                    "max_line_width": 0,
+                },
             }),
         })
     };
@@ -1108,13 +1221,11 @@ fn lines_changed_push_adopts_the_server_cursor() {
             "viewport_id": 7,
             "buffer": 0,
             "revision": 9,
-            "range": {"start_view_line": 0, "end_view_line_exclusive": 6},
-            "root": {"node": "editor", "element": 0, "buffer": 3, "rows": 0, "first_buffer_line": 0, "lines": []},
-            "view_line_count": 6,
-            "max_scroll_view_line": 0,
-            "total_visual_rows": 6,
-            "first_visual_row": 0,
-            "max_line_width": 0,
+            "window": {
+                "root": {"node": "editor", "element": 0, "buffer": 3, "rows": 6, "first_row": 0,
+                         "first_buffer_line": 0, "lines": []},
+                "max_line_width": 0,
+            },
         });
         if !cursor.is_null() {
             params["cursor"] = cursor;
@@ -2838,19 +2949,14 @@ fn diff_toggle_toast_is_grouped() {
     // updates one toast instead of stacking on/off pairs.
     let mut s = session();
     let window = Window {
-            other_elements_dirty: false,
-        first_view_line: ViewLine(0),
-        last_view_line_exclusive: ViewLine(0),
-        view_line_count: 0,
-        max_scroll_view_line: ViewLine(0),
-        total_visual_rows: 0,
-        first_visual_row: VisualRow(0),
+        other_elements_dirty: false,
         max_line_width: 0,
         git_status: None,
         root: aether_protocol::viewport::Element::Editor {
             element: 0,
             buffer: 0,
             rows: 0,
+            first_row: aether_protocol::coords::ElementRow(0),
             first_buffer_line: 0,
             lines: vec![],
         },
@@ -4060,6 +4166,7 @@ fn jumplist_step_adopts_the_opened_entry() {
             total: 17,
             opened: Some(open),
             seat: None,
+            skipped: 0,
         }))),
         Direction::Forward,
         aether_protocol::jumplist::JumplistStepScope::Full,
@@ -6385,13 +6492,7 @@ fn abandoning_a_stopped_operation_confirms_and_names_it() {
     use aether_protocol::viewport::Window;
 
     let window = |operation| Window {
-            other_elements_dirty: false,
-        first_view_line: ViewLine(0),
-        last_view_line_exclusive: ViewLine(1),
-        view_line_count: 1,
-        max_scroll_view_line: ViewLine(0),
-        total_visual_rows: 1,
-        first_visual_row: VisualRow(0),
+        other_elements_dirty: false,
         max_line_width: 0,
         git_status: Some(GitBufferStatus {
             operation,
@@ -6401,6 +6502,7 @@ fn abandoning_a_stopped_operation_confirms_and_names_it() {
             element: 0,
             buffer: 0,
             rows: 0,
+            first_row: aether_protocol::coords::ElementRow(0),
             first_buffer_line: 0,
             lines: vec![],
         },
@@ -7129,18 +7231,13 @@ fn space_k_refuses_a_view_with_another_element_dirty() {
     // ...but the view knows something else in it is not.
     s.view.window = Some(aether_protocol::viewport::Window {
         other_elements_dirty: true,
-        first_view_line: ViewLine(0),
-        last_view_line_exclusive: ViewLine(1),
-        view_line_count: 1,
-        max_scroll_view_line: ViewLine(0),
-        total_visual_rows: 1,
-        first_visual_row: VisualRow(0),
         max_line_width: 0,
         git_status: None,
         root: aether_protocol::viewport::Element::Editor {
             element: 0,
             buffer: 0,
             rows: 0,
+            first_row: aether_protocol::coords::ElementRow(0),
             first_buffer_line: 0,
             lines: vec![],
         },
@@ -11808,6 +11905,7 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
                 total: 2,
                 opened: Some(opened(buffer_id, path)),
                 seat: None,
+                skipped: 0,
             }))),
             Direction::Forward,
             JumplistStepScope::Full,
@@ -12787,11 +12885,11 @@ fn the_patch_views_revert_refusal_does_not_deny_the_repo() {
 
 // ---- composed views bind to the buffer their focused element windows -----------------------------
 
-/// A subscribe result whose element windows `element_buffer`, optionally carrying the focus the
-/// server resolved for it.
+/// A subscribe result whose element windows `element_buffer`, carrying the focus the server
+/// resolved for it.
 fn subscribe_over(
     element_buffer: u64,
-    focus: Option<aether_protocol::viewport::ViewportFocusElementResult>,
+    focus: aether_protocol::viewport::ViewportFocusElementResult,
 ) -> aether_protocol::viewport::ViewportSubscribeResult {
     use aether_protocol::viewport::{Element, Window};
     aether_protocol::viewport::ViewportSubscribeResult {
@@ -12799,13 +12897,7 @@ fn subscribe_over(
         buffer_status: Default::default(),
         focus,
         window: Window {
-                other_elements_dirty: false,
-            first_view_line: ViewLine(0),
-            last_view_line_exclusive: ViewLine(3),
-            view_line_count: 3,
-            max_scroll_view_line: ViewLine(0),
-            total_visual_rows: 3,
-            first_visual_row: VisualRow(0),
+            other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
             root: Element::Editor {
@@ -12813,6 +12905,7 @@ fn subscribe_over(
                 buffer: element_buffer,
                 rows: 3,
                 // A hunk, so the element's lines are nowhere near the view's own line 0.
+                first_row: aether_protocol::coords::ElementRow(0),
                 first_buffer_line: 17,
                 lines: vec![],
             },
@@ -12866,7 +12959,7 @@ fn focus_on(
 fn subscribing_to_a_composed_view_binds_to_its_elements_buffer() {
     let mut s = session();
     let view_buffer = s.view.buffer.buffer_id;
-    s.adopt_subscribe(subscribe_over(9, Some(focus_on(1, 9, 17))));
+    s.adopt_subscribe(subscribe_over(9, focus_on(1, 9, 17)));
     assert_eq!(
         s.view.buffer.buffer_id, 9,
         "the view acts on the file its element windows, not on the patch document"
@@ -12897,7 +12990,7 @@ fn subscribing_to_a_composed_view_binds_to_its_elements_buffer() {
 #[test]
 fn focusing_another_element_adopts_its_buffer_status() {
     let mut s = session();
-    s.adopt_subscribe(subscribe_over(9, Some(focus_on(0, 9, 17))));
+    s.adopt_subscribe(subscribe_over(9, focus_on(0, 9, 17)));
     // Element 0's status, as a subscribe would have left it.
     s.view.symbol_path = vec![aether_protocol::lsp::SymbolCrumb {
         name: "fn left_behind".into(),
@@ -12909,16 +13002,15 @@ fn focusing_another_element_adopts_its_buffer_status() {
     };
 
     let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
-    let token = fx
-        .0
-        .iter()
-        .find_map(|e| match e {
-            Effect::Request { token, method, .. } if *method == "view/focus_element" => {
-                Some(*token)
-            }
-            _ => None,
-        })
-        .expect("Tab focuses the next element");
+    let token =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::Request { token, method, .. } if *method == "view/focus_element" => {
+                    Some(*token)
+                }
+                _ => None,
+            })
+            .expect("Tab focuses the next element");
     let _ = s.on_rpc_result(
         token,
         Ok(json!({
@@ -12950,7 +13042,11 @@ fn focusing_another_element_adopts_its_buffer_status() {
 
     assert_eq!(s.view.buffer.buffer_id, 11, "focus crossed into b.rs");
     assert_eq!(
-        s.view.symbol_path.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        s.view
+            .symbol_path
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
         ["fn arrived"],
         "the breadcrumb is the new element's, not the one Tab left"
     );
@@ -12965,14 +13061,15 @@ fn focusing_another_element_adopts_its_buffer_status() {
     );
 }
 
-/// An ordinary editor view — one element, windowing the buffer it *is* — is left alone. The server
-/// says nothing about focus there, because there is nothing the subscriber doesn't already know.
+/// An ordinary editor view — one element, windowing the buffer it *is* — keeps its binding. The
+/// server still names the focused element (0, over that same buffer), and the session takes the
+/// element without re-describing a buffer it already holds.
 #[test]
 fn subscribing_to_an_ordinary_view_changes_no_binding() {
     let mut s = session();
     let bound = s.view.buffer.buffer_id;
     let cursor = s.view.buffer.cursor.position;
-    s.adopt_subscribe(subscribe_over(bound, None));
+    s.adopt_subscribe(subscribe_over(bound, focus_on(0, bound, cursor.line)));
     assert_eq!(s.view.buffer.buffer_id, bound);
     assert_eq!(s.view.focused_element, 0);
     assert_eq!(
@@ -12992,7 +13089,7 @@ fn subscribing_to_an_ordinary_view_changes_no_binding() {
 #[test]
 fn a_press_in_another_element_focuses_it_before_setting_the_cursor() {
     let mut s = session();
-    s.adopt_subscribe(subscribe_over(9, Some(focus_on(0, 9, 17))));
+    s.adopt_subscribe(subscribe_over(9, focus_on(0, 9, 17)));
     // A second element, windowing another buffer, is what the click lands in.
     if let Some(w) = s.view.window.as_mut() {
         let aether_protocol::viewport::Element::Editor { .. } = &w.root else {
@@ -13005,6 +13102,7 @@ fn a_press_in_another_element_focuses_it_before_setting_the_cursor() {
                     element: 1,
                     buffer: 12,
                     rows: 3,
+                    first_row: aether_protocol::coords::ElementRow(0),
                     first_buffer_line: 40,
                     lines: vec![],
                 },
@@ -13036,7 +13134,7 @@ fn a_press_in_another_element_focuses_it_before_setting_the_cursor() {
 #[test]
 fn a_press_in_the_focused_element_only_sets_the_cursor() {
     let mut s = session();
-    s.adopt_subscribe(subscribe_over(9, Some(focus_on(0, 9, 17))));
+    s.adopt_subscribe(subscribe_over(9, focus_on(0, 9, 17)));
     let fx = s.pointer_press(
         0,
         aether_protocol::LogicalPosition { line: 18, col: 0 },
@@ -13063,7 +13161,7 @@ fn a_press_in_the_focused_element_only_sets_the_cursor() {
 fn closing_a_composed_view_asks_about_unsaved_edits_in_any_element() {
     use aether_client::session::{ConfirmKind, Prompt};
     let mut s = session();
-    s.adopt_subscribe(subscribe_over(9, Some(focus_on(0, 9, 17))));
+    s.adopt_subscribe(subscribe_over(9, focus_on(0, 9, 17)));
     // The focused element is clean...
     s.view.buffer.revision = 1;
     s.view.buffer.saved_revision = 1;
@@ -13107,7 +13205,7 @@ fn closing_a_composed_view_asks_about_unsaved_edits_in_any_element() {
 #[test]
 fn enter_in_a_composed_view_opens_the_focused_elements_file() {
     let mut s = session();
-    s.adopt_subscribe(subscribe_over(9, Some(focus_on(0, 9, 17))));
+    s.adopt_subscribe(subscribe_over(9, focus_on(0, 9, 17)));
     let view_buffer = s.view.view_id.presenting_buffer();
     assert_ne!(
         s.view.buffer.buffer_id, view_buffer,
@@ -13139,7 +13237,8 @@ fn enter_in_a_composed_view_opens_the_focused_elements_file() {
 fn enter_in_an_ordinary_view_still_goes_to_the_definition() {
     let mut s = session();
     let bound = s.view.buffer.buffer_id;
-    s.adopt_subscribe(subscribe_over(bound, None));
+    let line = s.view.buffer.cursor.position.line;
+    s.adopt_subscribe(subscribe_over(bound, focus_on(0, bound, line)));
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
     assert!(
         find_request(&fx, "lsp/goto_definition").is_some(),
@@ -13157,18 +13256,20 @@ fn enter_in_an_ordinary_view_still_goes_to_the_definition() {
 #[test]
 fn read_mode_headings_use_the_same_outline_as_the_editor() {
     let mut s = read_session();
+    s.view.viewport_id = Some(7);
     let fx = s.on_key(KeyCode::Char('o'), Mods::NONE, Some("o".into()), ROWS);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(
-        method, "element/move",
+        method, "view/navigate_change",
         "the reading view asks the server to step the outline, not its own parse"
     );
-    assert_eq!(params["motion"]["kind"], json!("next_navigation_unit"));
+    assert_eq!(params["grain"], json!("outline"));
+    assert_eq!(params["direction"], json!("next"));
 
     let fx = s.on_key(KeyCode::Char('o'), Mods::ALT, Some("o".into()), ROWS);
     let (_t, method, params) = the_request(&fx);
-    assert_eq!(method, "element/move");
-    assert_eq!(params["motion"]["kind"], json!("prev_navigation_unit"));
+    assert_eq!(method, "view/navigate_change");
+    assert_eq!(params["direction"], json!("previous"));
 }
 
 /// Selecting an outline row focuses its element *and* lands the cursor — in that order.
@@ -13185,7 +13286,7 @@ fn selecting_a_view_row_focuses_its_element_then_sets_the_cursor() {
     use aether_protocol::picker::PickerSelectResult;
 
     let mut s = session();
-    s.adopt_subscribe(subscribe_over(9, Some(focus_on(0, 9, 17))));
+    s.adopt_subscribe(subscribe_over(9, focus_on(0, 9, 17)));
 
     // Drive a real select and answer it with a `ViewElement`. The picker's kind is irrelevant — the
     // client dispatches on the *result*, which is the point of the variant.
@@ -13216,14 +13317,13 @@ fn selecting_a_view_row_focuses_its_element_then_sets_the_cursor() {
         open: None,
     };
 
-    let methods: Vec<&str> = fx
-        .0
-        .iter()
-        .filter_map(|e| match e {
-            Effect::Request { method, .. } => Some(*method),
-            _ => None,
-        })
-        .collect();
+    let methods: Vec<&str> =
+        fx.0.iter()
+            .filter_map(|e| match e {
+                Effect::Request { method, .. } => Some(*method),
+                _ => None,
+            })
+            .collect();
     assert_eq!(
         methods,
         vec!["view/focus_element", "element/set"],

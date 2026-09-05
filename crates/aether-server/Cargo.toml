@@ -64,5 +64,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# The client's own row maths, so the tests that model a scrolling client use the real geometry.
+aether-client.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 git2.workspace = true

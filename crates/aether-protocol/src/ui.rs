@@ -63,15 +63,18 @@ pub enum Element {
     /// A window onto a buffer. `lines` are its rendered lines, starting at `first_buffer_line`.
     ///
     /// `buffer` and `rows` describe the element as a whole, not the window: `rows` is its **total**
-    /// visual row count, of which `lines` is the slice currently loaded. Together they are what
-    /// lets a client lay the view out and scroll it without asking the server — it knows how tall
-    /// every element is, and which buffer to request more of when one scrolls into range.
+    /// row count, of which `lines` is the slice currently loaded, and `first_row` is where that
+    /// slice starts within the element — the rows of its lines above `first_buffer_line`, wrapped
+    /// rows and phantoms alike. Together they are what lets a client lay the view out and scroll it
+    /// without asking the server: it knows how tall every element is, where each loaded slice sits
+    /// inside its element, and which element to request more of when one scrolls into range.
     ///
     /// `first_buffer_line` is a line of **`buffer`**, not of the view. See [`crate::coords`].
     Editor {
         element: FieldId,
         buffer: crate::BufferId,
         rows: u32,
+        first_row: crate::coords::ElementRow,
         first_buffer_line: u32,
         lines: Vec<LogicalLineRender>,
     },

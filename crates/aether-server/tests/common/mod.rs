@@ -7,7 +7,7 @@
 //! both the re-exported protocol surface and the fixtures. Without these two allows, each
 //! binary would fail `clippy -D warnings` for the helpers its siblings need.
 #![allow(dead_code, unused_imports)]
-pub use aether_protocol::coords::{ViewLine, VisualRow};
+pub use aether_protocol::coords::{ElementRow, VisualRow};
 
 pub use aether_protocol::buffer::{
     BufferChanged, BufferChangedParams, BufferClose, BufferCloseParams, BufferCloseResult,
@@ -102,10 +102,10 @@ pub use aether_protocol::viewport::{
     BaselineRow, ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, EmphasisRange, PatchLine,
 };
 pub use aether_protocol::viewport::{
-    ChromeKind, ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
-    ViewportResizeParams, ViewportScroll, ViewportScrollParams, ViewportScrollToRow,
-    ViewportScrollToRowParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
-    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, WrapMode,
+    ChromeKind, ScrollPosition, SliceRequest, ViewportLinesChanged, ViewportLinesChangedParams,
+    ViewportResize, ViewportResizeParams, ViewportSetWrap, ViewportSetWrapParams,
+    ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindow,
+    ViewportWindowParams, ViewportWindowResult, WrapMode,
 };
 pub use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProject,
@@ -355,7 +355,7 @@ pub async fn await_response<M: RpcMethod>(ws: &mut Ws, id: u64) -> M::Result {
 /// omitting it is refused rather than falling back to the workspace.
 pub fn view_params_on(kind: PickerKind, buffer_id: u64) -> PickerViewParams {
     PickerViewParams {
-            view_id: None,
+        view_id: None,
         buffer_id: Some(buffer_id),
         ..view_params(kind)
     }
@@ -363,7 +363,7 @@ pub fn view_params_on(kind: PickerKind, buffer_id: u64) -> PickerViewParams {
 
 pub fn view_params(kind: PickerKind) -> PickerViewParams {
     PickerViewParams {
-            view_id: None,
+        view_id: None,
         kind,
         reset: PickerReset::All,
         offset: 0,
@@ -480,9 +480,11 @@ pub async fn buffer_text(ws: &mut Ws, buffer_id: u64) -> String {
             rows: 100,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -664,7 +666,7 @@ pub async fn expand_file_group(
     let window = send_request::<PickerView>(
         ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             reset: PickerReset::Keep,
             ..view_params(kind)
         },
@@ -697,7 +699,7 @@ pub async fn expand_file_group(
     let view = send_request::<PickerView>(
         ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             reset: PickerReset::Keep,
             ..view_params(kind)
         },
@@ -967,9 +969,11 @@ pub async fn open_and_subscribe_with_lsp(
             rows: 40,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -1157,9 +1161,11 @@ pub fn transient_sub_params(buffer_id: u64) -> ViewportSubscribeParams {
         rows: 10,
         overscan_rows: 0,
         scroll: ScrollPosition {
-            logical_line: ViewLine(0),
+            element: 0,
+            line: 0,
             sub_row: 0.0,
         },
+        focus: None,
         wrap: WrapMode::None,
         continuation_marker_width: 0,
         tab_width: 4,
@@ -1386,9 +1392,11 @@ async fn window_with_diff(
             rows: 40,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -1396,7 +1404,23 @@ async fn window_with_diff(
         },
     )
     .await;
-    sub.window
+    // A subscribe loads a screen of one element; these helpers answer for the whole (small) view.
+    whole_view(ws, sub.viewport_id, sub.window).await
+}
+
+/// Load every row of the view on `viewport_id`, as a client tall enough to show it all would.
+pub async fn whole_view(
+    ws: &mut Ws,
+    viewport_id: u64,
+    window: aether_protocol::viewport::Window,
+) -> aether_protocol::viewport::Window {
+    let total = total_rows(&window);
+    if total == 0 {
+        return window;
+    }
+    window_at(ws, viewport_id, &window, 0, total, 0)
+        .await
+        .window
 }
 
 pub async fn resolve_conflict(
@@ -1436,4 +1460,98 @@ pub fn chrome_nodes(window: &aether_protocol::viewport::Window) -> Vec<&Element>
     let mut out = Vec::new();
     walk(&window.root, &mut out);
     out
+}
+
+// -------- view geometry, the client's way ----------------------------------------------------------
+//
+// The server no longer says how tall a view is or where a slice sits on screen: the tree does, and
+// the client's shared row maths reads it. Tests that model a client use the same functions, so a
+// disagreement between the tree and the client's reading of it fails here rather than on screen.
+
+/// Rows the whole view occupies — chrome, one row each, and every editor's height.
+pub fn total_rows(window: &aether_protocol::viewport::Window) -> u32 {
+    aether_client::grid::total_rows(&window.root)
+}
+
+/// The lines the first editor carrying any has loaded, as `(first, last exclusive)`.
+pub fn loaded_lines(window: &aether_protocol::viewport::Window) -> (u32, u32) {
+    window
+        .root
+        .editors()
+        .into_iter()
+        .find_map(|n| match n {
+            Element::Editor { lines, .. } if !lines.is_empty() => Some((
+                lines[0].logical_line,
+                lines[lines.len() - 1].logical_line + 1,
+            )),
+            _ => None,
+        })
+        .unwrap_or((0, 0))
+}
+
+/// The absolute row the first loaded slice starts on — the element's start plus the slice's row
+/// within it.
+pub fn first_loaded_row(window: &aether_protocol::viewport::Window) -> u32 {
+    aether_client::grid::painted_rows(window)
+        .into_iter()
+        .find_map(|(at, item)| match item {
+            aether_client::grid::PaintedRow::Chrome(_) => None,
+            _ => Some(at.get()),
+        })
+        .unwrap_or(0)
+}
+
+/// How many rows the loaded slices paint, chrome included — what a client can put on screen.
+pub fn painted_rows(window: &aether_protocol::viewport::Window) -> u32 {
+    aether_client::grid::painted_rows(window).len() as u32
+}
+
+/// Load the slices a client showing rows `top..top+rows` (with `overscan` each side) would ask for,
+/// exactly as the real client computes them from the tree it holds.
+pub async fn window_at(
+    ws: &mut Ws,
+    viewport_id: u64,
+    current: &aether_protocol::viewport::Window,
+    top: u32,
+    rows: u32,
+    overscan: u32,
+) -> ViewportWindowResult {
+    let slices = aether_client::grid::slices_for(&current.root, VisualRow(top), rows, overscan);
+    let anchor = aether_client::grid::anchor_at(current, VisualRow(top));
+    send_request::<ViewportWindow>(
+        ws,
+        &ViewportWindowParams {
+            viewport_id,
+            anchor,
+            slices,
+        },
+    )
+    .await
+}
+
+/// [`window_at`] for a single-element, unwrapped view, where row `top` of the view is line `top`:
+/// one slice of element 0 from that row.
+pub async fn window_from_row(
+    ws: &mut Ws,
+    viewport_id: u64,
+    top: u32,
+    rows: u32,
+) -> ViewportWindowResult {
+    send_request::<ViewportWindow>(
+        ws,
+        &ViewportWindowParams {
+            viewport_id,
+            anchor: ScrollPosition {
+                element: 0,
+                line: top,
+                sub_row: 0.0,
+            },
+            slices: vec![SliceRequest {
+                element: 0,
+                from_row: ElementRow(top),
+                rows,
+            }],
+        },
+    )
+    .await
 }

@@ -7,7 +7,6 @@ use crate::app::{
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_client::session::{AppSettingControl, ConnState};
 use aether_client::theme::{Rgb, Theme};
-use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::{CommitRef, CommitRefKind, GitStatus};
 use aether_protocol::lsp::{LspProgress, LspStatus, SymbolCrumb};
@@ -5226,13 +5225,13 @@ fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
 }
 
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
-    // When the buffer is taller than the viewport, carve the rightmost column for a scrollbar
-    // (drawn last, below). The decision uses the whole-buffer `total_visual_rows` from the
-    // server's window, which is independent of this 1-col narrowing — so it can't flicker. The
-    // narrowing clips content by one column rather than reflowing it (the server wrapped to the
-    // full width); acceptable, and only while the bar is shown.
-    let total_visual_rows = state.ed().total_visual_rows;
-    let needs_scrollbar = total_visual_rows as usize > area.height as usize;
+    // When the view is taller than the viewport, carve the rightmost column for a scrollbar (drawn
+    // last, below). The decision uses the view's whole height — which the tree says, and which is
+    // independent of this 1-col narrowing — so it can't flicker. The narrowing clips content by one
+    // column rather than reflowing it (the server wrapped to the full width); acceptable, and only
+    // while the bar is shown.
+    let total_rows = state.ed().total_rows;
+    let needs_scrollbar = total_rows as usize > area.height as usize;
     let area = if needs_scrollbar {
         Rect {
             width: area.width.saturating_sub(1),
@@ -5242,7 +5241,6 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         area
     };
 
-    let top = state.ed().scroll_line_index;
     let selection = ordered_selection(&state.ed().cursor, state.ed().mode);
     // Where the cursor is, as a pair. Everything decided against it compares pairs.
     let cursor_at = aether_client::grid::ElementLine::new(
@@ -5273,88 +5271,59 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         None
     };
 
-    let mut lines: Vec<Line> = Vec::with_capacity(viewport_rows);
-    let mut line_index = top;
-
-    // Visual rows of the top logical line hidden above the viewport (sub-line scroll offset),
-    // clamped to that line's whole block — chrome above it included, since the scroll moves through
-    // those rows too. The clamp lives in `grid::scroll_top`, which the cursor and click maths read
-    // the top row from, so the three cannot disagree about which row screen row 0 is.
-    let mut skip_rows =
-        aether_client::grid::scroll_top(&state.ed().root, top, state.ed().scroll_skip_rows).1;
-
-    'outer: loop {
-        if lines.len() >= viewport_rows {
-            break;
+    // A generated patch's chrome row — a file or hunk separator, the rule closing the view, the
+    // blank between them — at the row the tree puts it on. Chrome is a sibling of the elements, so
+    // it needs no line to hang off: the rule closing a patch is painted on the view's last row
+    // whether or not the lines above it are loaded.
+    let chrome_row = |node: &Element| -> Line<'static> {
+        match node {
+            Element::Chrome {
+                kind,
+                rail,
+                children: content,
+            } => Line::from(chrome_virtual_row_spans(
+                *kind,
+                *rail,
+                content,
+                viewport_cols,
+            )),
+            other => Line::raw(other.text_content()),
         }
-        if line_index >= state.ed().lines.len() {
-            break;
-        }
-        let (at, render) = &state.ed().lines[line_index];
+    };
+
+    // Inline diff: a phantom "deleted" row renders above the line it belongs to. It occupies a
+    // screen row but carries no cursor position. Each band is a visible change, so it gets a red
+    // change-*bar* in the gutter (matching add/modify), rather than the compact `▔` top-marker
+    // used when there's no band.
+    let baseline_row = |brow: &aether_protocol::viewport::BaselineRow| -> Line<'static> {
+        let mut spans =
+            deleted_virtual_row_spans(&brow.text, viewport_cols, brow.stage, &brow.emphasis);
+        // Deletion bar in the git gutter column: bright red unstaged, dimmed red staged.
+        spans.insert(
+            0,
+            gutter_bar(stage_color(
+                brow.stage,
+                c(th().git_deleted),
+                c(th().git_staged_deleted),
+            )),
+        );
+        Line::from(spans)
+    };
+
+    // One (possibly wrapped) row of a line's own text.
+    let text_row = |element: aether_protocol::viewport::FieldId,
+                    render: &aether_protocol::viewport::LogicalLineRender,
+                    vrow: &WrappedRow,
+                    vrow_idx: usize|
+     -> Line<'static> {
         // The line's identity comes from the line, not from a counter: logical lines are unique
         // only within an element, so a view spanning several files has no single ascending run.
         let logical_line = render.logical_line;
         // The pair, never the number. A selection — and the block cursor, which is drawn as one —
         // belongs to the focused element alone.
-        let on_cursor_element = at.element == cursor_at.element;
-        let on_cursor_line = *at == cursor_at;
+        let on_cursor_element = element == cursor_at.element;
+        let on_cursor_line = on_cursor_element && logical_line == cursor_at.line;
 
-        // Inline diff: phantom "deleted" rows render above the line's real content. They occupy
-        // screen rows (and so are counted here) but carry no cursor position. Each band is a
-        // visible change, so it gets a red change-*bar* in the gutter (matching add/modify),
-        // rather than the compact `▔` top-marker used when there's no band.
-        // A generated patch's chrome stands above this line as a tree sibling; the inline diff's
-        // phantom rows belong to the line itself. The two never coexist — a patch has no baseline
-        // of its own — so their order relative to each other never comes up.
-        for node in state
-            .ed()
-            .chrome_above
-            .get(&line_index)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-        {
-            if skip_rows > 0 {
-                skip_rows -= 1;
-                continue;
-            }
-            if lines.len() >= viewport_rows {
-                break 'outer;
-            }
-            if let Element::Chrome {
-                kind,
-                rail,
-                children: content,
-            } = node
-            {
-                lines.push(Line::from(chrome_virtual_row_spans(
-                    *kind,
-                    *rail,
-                    content,
-                    viewport_cols,
-                )));
-            }
-        }
-        for brow in &render.baseline_above {
-            if skip_rows > 0 {
-                skip_rows -= 1;
-                continue;
-            }
-            if lines.len() >= viewport_rows {
-                break 'outer;
-            }
-            let mut spans =
-                deleted_virtual_row_spans(&brow.text, viewport_cols, brow.stage, &brow.emphasis);
-            // Deletion bar in the git gutter column: bright red unstaged, dimmed red staged.
-            spans.insert(
-                0,
-                gutter_bar(stage_color(
-                    brow.stage,
-                    c(th().git_deleted),
-                    c(th().git_staged_deleted),
-                )),
-            );
-            lines.push(Line::from(spans));
-        }
         // The gutter change-bar reflects this line's marker (always on). With the diff view on, a
         // pure-deletion anchor's `▔` is redundant (the band above already shows it), so suppress
         // it. The diff-view background tint is separate and only applies while the view is on.
@@ -5416,251 +5385,249 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 .map(|d| d.severity)
                 .max_by_key(|s| severity_rank(*s))
         };
-        for (vrow_idx, vrow) in render.visual_rows.iter().enumerate() {
-            if skip_rows > 0 {
-                skip_rows -= 1;
-                continue; // hidden above the viewport by the sub-line scroll offset
-            }
-            if lines.len() >= viewport_rows {
-                break 'outer;
-            }
-            let is_last_vrow_of_line = vrow_idx == last_vrow_idx;
-            let segment = match vrow.segments.first() {
-                Some(s) => s,
-                None => {
-                    // Empty line — paint a trailing cell when the line's newline (at col 0) falls
-                    // in the selection: the range starts at/before this line and ends at/after it.
-                    // `>=` (not `>`) so a selection ending *on* the empty line — including a point
-                    // cursor parked there — still highlights its newline.
-                    let empty_newline_selected = is_last_vrow_of_line
-                        && selection
-                            .is_some_and(|(s, e)| s.line <= logical_line && e.line >= logical_line);
-                    // An empty line's newline is at byte 0; a diagnostic there underlines the cell.
-                    let eol_diag = is_last_vrow_of_line
-                        .then(|| eol_diag_at(vrow.byte_offset))
-                        .flatten();
-                    let mut spans: Vec<Span<'static>> = Vec::new();
-                    if empty_newline_selected || eol_diag.is_some() {
-                        let mut style = if empty_newline_selected {
-                            Style::default().bg(c(th().bg_visual)).fg(c(th().fg_faint))
-                        } else {
-                            Style::default()
-                        };
-                        if let Some(sev) = eol_diag {
-                            style = style
-                                .add_modifier(Modifier::UNDERLINED)
-                                .underline_color(diag_color(sev));
-                        }
-                        spans.push(Span::styled(
-                            if empty_newline_selected { "↵" } else { " " },
-                            style,
-                        ));
-                    }
-                    let show_blame = on_cursor_line && is_last_vrow_of_line;
-                    append_eol_blame(
-                        &mut spans,
-                        show_blame.then_some(blame_text.as_deref()).flatten(),
-                    );
-                    apply_line_tint(&mut spans, line_tint, viewport_cols);
-                    lines.push(prepend_gutter(
-                        gutter_mark,
-                        render.change.stage(),
-                        render.change.conflict(),
-                        render.change.patch_side(),
-                        spans,
-                    ));
-                    continue;
-                }
-            };
-            let row_text_len = segment.text.len() as u32;
-            // The trailing "newline cell" represents the line's implicit `\n` and is painted
-            // when that `\n` falls inside the selection. The `\n` is at byte col
-            // `line_text_len` (just past the last char); the selection covers it when either:
-            //   - the selection continues past this whole line (`e.line > logical_line`), or
-            //   - the cursor / anchor sits *on* the `\n` cell (`e.col >= line_text_len`) —
-            //     not merely on the last real char.
-            let highlight_trailing_newline = is_last_vrow_of_line
-                && on_cursor_element
-                && selection.is_some_and(|(s, e)| {
-                    s.line <= logical_line
-                        && (e.line > logical_line
-                            || (e.line == logical_line && e.col >= vrow.byte_offset + row_text_len))
-                });
-            // The selection — which is also how the block cursor is drawn — belongs to the focused
-            // element alone. Without this the same line number in another file gets a second block.
-            let sel_on_row = selection.filter(|_| on_cursor_element).and_then(|(s, e)| {
-                selection_on_visual_row(logical_line, vrow.byte_offset, row_text_len, s, e)
-            });
-            let matches_on_row =
-                matches_on_visual_row(vrow.byte_offset, row_text_len, &render.search_matches);
-            let emphasis_on_row =
-                emphasis_on_visual_row(vrow.byte_offset, row_text_len, render.change.emphasis());
-            let diags_on_row =
-                diagnostics_on_visual_row(vrow.byte_offset, row_text_len, &render.diagnostics);
-            let brackets_on_row = bracket_positions_on_visual_row(
-                logical_line,
-                vrow.byte_offset,
-                row_text_len,
-                state.ed().cursor.match_bracket,
-            );
-
-            // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
-            // bytes when scroll_col == 0 (the common case), so this is a no-op under soft wrap.
-            let (clipped_text, clipped_highlights, clipped_sel, clipped_matches, clipped_diags) =
-                clip_horizontal(
-                    &segment.text,
-                    &segment.highlights,
-                    sel_on_row,
-                    &matches_on_row,
-                    &diags_on_row,
-                    scroll_col,
-                );
-            let clipped_brackets: Vec<u32> = brackets_on_row
-                .iter()
-                .filter(|b| **b >= scroll_col)
-                .map(|b| b - scroll_col)
-                .collect();
-            // Intra-line diff emphasis, horizontally scroll-adjusted like the brackets (no-op
-            // under soft wrap where scroll_col is 0).
-            let clipped_emphasis: Vec<(u32, u32)> = emphasis_on_row
-                .iter()
-                .filter(|&&(_, e)| e > scroll_col)
-                .map(|&(s, e)| (s.saturating_sub(scroll_col), e - scroll_col))
-                .collect();
-            // Sneak targets, row-relative then horizontally scroll-adjusted (no-op when scroll_col
-            // is 0). The label is dropped if its cell scrolled out of view.
-            let clipped_sneak: Vec<(u32, u32, u32, Option<char>)> =
-                sneak_targets_on_visual_row(vrow.byte_offset, row_text_len, &render.sneak_targets)
-                    .into_iter()
-                    .filter_map(|(s, e, pe, label)| {
-                        if e <= scroll_col {
-                            return None;
-                        }
-                        let label = if s >= scroll_col { label } else { None };
-                        Some((
-                            s.saturating_sub(scroll_col),
-                            e - scroll_col,
-                            pe.saturating_sub(scroll_col),
-                            label,
-                        ))
-                    })
-                    .collect();
-
-            // Continuation row when byte_offset > 0. Prepend the marker; the server already
-            // reserved this width when wrapping.
-            let is_continuation = vrow.byte_offset > 0;
-            let marker_width = if is_continuation {
-                CONTINUATION_MARKER_WIDTH
-            } else {
-                0
-            };
-            let indent = vrow.continuation_indent;
-            let prefix_width = marker_width
-                .saturating_add(indent)
-                .min(viewport_cols as u32) as u16;
-            let body_width = viewport_cols.saturating_sub(prefix_width);
-
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            if is_continuation {
-                spans.push(Span::styled(
-                    CONTINUATION_MARKER.to_string(),
-                    Style::default().fg(c(th().fg_faint)),
-                ));
-            }
-            if indent > 0 {
-                spans.push(Span::raw(" ".repeat(indent as usize)));
-            }
-            spans.extend(build_spans(
-                &clipped_text,
-                &clipped_highlights,
-                clipped_sel,
-                &clipped_matches,
-                &clipped_emphasis,
-                // A patch line's emphasis follows its own side's hue; everywhere else the change
-                // is a *modification* of one line, so the olive pair applies.
-                match render.change.patch_side() {
-                    Some(side) => c(th().patch_emphasis_bg(side)),
-                    None => stage_color(
-                        render.change.stage(),
-                        c(th().git_modified_emph_bg),
-                        c(th().git_staged_modified_emph_bg),
-                    ),
-                },
-                &clipped_brackets,
-                &clipped_diags,
-                &clipped_sneak,
-                body_width,
-            ));
-            // The EOL cell after the last char: the newline glyph when selected, and/or a
-            // diagnostic underline when one is clamped to the line end (it has no real char to
-            // mark). When neither applies, nothing is drawn here.
-            let eol_diag = is_last_vrow_of_line
-                .then(|| eol_diag_at(vrow.byte_offset + row_text_len))
-                .flatten();
-            if highlight_trailing_newline || eol_diag.is_some() {
-                let mut style = if highlight_trailing_newline {
-                    Style::default().bg(c(th().bg_visual)).fg(c(th().fg_faint))
-                } else {
-                    Style::default()
-                };
-                if let Some(sev) = eol_diag {
-                    style = style
-                        .add_modifier(Modifier::UNDERLINED)
-                        .underline_color(diag_color(sev));
-                }
-                spans.push(Span::styled(
-                    if highlight_trailing_newline {
-                        "↵"
+        let is_last_vrow_of_line = vrow_idx == last_vrow_idx;
+        let segment = match vrow.segments.first() {
+            Some(s) => s,
+            None => {
+                // Empty line — paint a trailing cell when the line's newline (at col 0) falls
+                // in the selection: the range starts at/before this line and ends at/after it.
+                // `>=` (not `>`) so a selection ending *on* the empty line — including a point
+                // cursor parked there — still highlights its newline.
+                let empty_newline_selected = is_last_vrow_of_line
+                    && on_cursor_element
+                    && selection
+                        .is_some_and(|(s, e)| s.line <= logical_line && e.line >= logical_line);
+                // An empty line's newline is at byte 0; a diagnostic there underlines the cell.
+                let eol_diag = is_last_vrow_of_line
+                    .then(|| eol_diag_at(vrow.byte_offset))
+                    .flatten();
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                if empty_newline_selected || eol_diag.is_some() {
+                    let mut style = if empty_newline_selected {
+                        Style::default().bg(c(th().bg_visual)).fg(c(th().fg_faint))
                     } else {
-                        " "
-                    },
-                    style,
-                ));
-            }
-            let show_blame = on_cursor_line && is_last_vrow_of_line;
-            append_eol_blame(
-                &mut spans,
-                show_blame.then_some(blame_text.as_deref()).flatten(),
-            );
-            apply_line_tint(&mut spans, line_tint, viewport_cols);
-            lines.push(prepend_gutter(
-                gutter_mark,
-                render.change.stage(),
-                render.change.conflict(),
-                render.change.patch_side(),
-                spans,
-            ));
-            // Closing chrome, after the line's own rows — a patch's final rule, which has no
-            // line below to sit above.
-            //
-            // Decided structurally: "is this the last rendered line?" — not
-            // `logical_line + 1 == line_count`, which compares a *buffer* line to the **view's**
-            // line count and so never matched for a view whose last element doesn't end its file.
-            // The window carries this chrome only when it reaches the view's end, so the last
-            // rendered line is the right place for it whenever it is here at all.
-            let is_last_rendered_line = line_index + 1 == state.ed().lines.len();
-            if is_last_vrow_of_line && is_last_rendered_line {
-                for node in &state.ed().trailing_chrome {
-                    if lines.len() >= viewport_rows {
-                        break 'outer;
+                        Style::default()
+                    };
+                    if let Some(sev) = eol_diag {
+                        style = style
+                            .add_modifier(Modifier::UNDERLINED)
+                            .underline_color(diag_color(sev));
                     }
-                    if let Element::Chrome {
-                        kind,
-                        rail,
-                        children: content,
-                    } = node
-                    {
-                        lines.push(Line::from(chrome_virtual_row_spans(
-                            *kind,
-                            *rail,
-                            content,
-                            viewport_cols,
-                        )));
-                    }
+                    spans.push(Span::styled(
+                        if empty_newline_selected { "↵" } else { " " },
+                        style,
+                    ));
                 }
+                let show_blame = on_cursor_line && is_last_vrow_of_line;
+                append_eol_blame(
+                    &mut spans,
+                    show_blame.then_some(blame_text.as_deref()).flatten(),
+                );
+                apply_line_tint(&mut spans, line_tint, viewport_cols);
+                return prepend_gutter(
+                    gutter_mark,
+                    render.change.stage(),
+                    render.change.conflict(),
+                    render.change.patch_side(),
+                    spans,
+                );
             }
+        };
+        let row_text_len = segment.text.len() as u32;
+        // The trailing "newline cell" represents the line's implicit `\n` and is painted
+        // when that `\n` falls inside the selection. The `\n` is at byte col
+        // `line_text_len` (just past the last char); the selection covers it when either:
+        //   - the selection continues past this whole line (`e.line > logical_line`), or
+        //   - the cursor / anchor sits *on* the `\n` cell (`e.col >= line_text_len`) —
+        //     not merely on the last real char.
+        let highlight_trailing_newline = is_last_vrow_of_line
+            && on_cursor_element
+            && selection.is_some_and(|(s, e)| {
+                s.line <= logical_line
+                    && (e.line > logical_line
+                        || (e.line == logical_line && e.col >= vrow.byte_offset + row_text_len))
+            });
+        // The selection — which is also how the block cursor is drawn — belongs to the focused
+        // element alone. Without this the same line number in another file gets a second block.
+        let sel_on_row = selection.filter(|_| on_cursor_element).and_then(|(s, e)| {
+            selection_on_visual_row(logical_line, vrow.byte_offset, row_text_len, s, e)
+        });
+        let matches_on_row =
+            matches_on_visual_row(vrow.byte_offset, row_text_len, &render.search_matches);
+        let emphasis_on_row =
+            emphasis_on_visual_row(vrow.byte_offset, row_text_len, render.change.emphasis());
+        let diags_on_row =
+            diagnostics_on_visual_row(vrow.byte_offset, row_text_len, &render.diagnostics);
+        let brackets_on_row = bracket_positions_on_visual_row(
+            logical_line,
+            vrow.byte_offset,
+            row_text_len,
+            state.ed().cursor.match_bracket,
+        );
+
+        // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
+        // bytes when scroll_col == 0 (the common case), so this is a no-op under soft wrap.
+        let (clipped_text, clipped_highlights, clipped_sel, clipped_matches, clipped_diags) =
+            clip_horizontal(
+                &segment.text,
+                &segment.highlights,
+                sel_on_row,
+                &matches_on_row,
+                &diags_on_row,
+                scroll_col,
+            );
+        let clipped_brackets: Vec<u32> = brackets_on_row
+            .iter()
+            .filter(|b| **b >= scroll_col)
+            .map(|b| b - scroll_col)
+            .collect();
+        // Intra-line diff emphasis, horizontally scroll-adjusted like the brackets (no-op
+        // under soft wrap where scroll_col is 0).
+        let clipped_emphasis: Vec<(u32, u32)> = emphasis_on_row
+            .iter()
+            .filter(|&&(_, e)| e > scroll_col)
+            .map(|&(s, e)| (s.saturating_sub(scroll_col), e - scroll_col))
+            .collect();
+        // Sneak targets, row-relative then horizontally scroll-adjusted (no-op when scroll_col
+        // is 0). The label is dropped if its cell scrolled out of view.
+        let clipped_sneak: Vec<(u32, u32, u32, Option<char>)> =
+            sneak_targets_on_visual_row(vrow.byte_offset, row_text_len, &render.sneak_targets)
+                .into_iter()
+                .filter_map(|(s, e, pe, label)| {
+                    if e <= scroll_col {
+                        return None;
+                    }
+                    let label = if s >= scroll_col { label } else { None };
+                    Some((
+                        s.saturating_sub(scroll_col),
+                        e - scroll_col,
+                        pe.saturating_sub(scroll_col),
+                        label,
+                    ))
+                })
+                .collect();
+
+        // Continuation row when byte_offset > 0. Prepend the marker; the server already
+        // reserved this width when wrapping.
+        let is_continuation = vrow.byte_offset > 0;
+        let marker_width = if is_continuation {
+            CONTINUATION_MARKER_WIDTH
+        } else {
+            0
+        };
+        let indent = vrow.continuation_indent;
+        let prefix_width = marker_width
+            .saturating_add(indent)
+            .min(viewport_cols as u32) as u16;
+        let body_width = viewport_cols.saturating_sub(prefix_width);
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if is_continuation {
+            spans.push(Span::styled(
+                CONTINUATION_MARKER.to_string(),
+                Style::default().fg(c(th().fg_faint)),
+            ));
         }
-        line_index += 1;
+        if indent > 0 {
+            spans.push(Span::raw(" ".repeat(indent as usize)));
+        }
+        spans.extend(build_spans(
+            &clipped_text,
+            &clipped_highlights,
+            clipped_sel,
+            &clipped_matches,
+            &clipped_emphasis,
+            // A patch line's emphasis follows its own side's hue; everywhere else the change
+            // is a *modification* of one line, so the olive pair applies.
+            match render.change.patch_side() {
+                Some(side) => c(th().patch_emphasis_bg(side)),
+                None => stage_color(
+                    render.change.stage(),
+                    c(th().git_modified_emph_bg),
+                    c(th().git_staged_modified_emph_bg),
+                ),
+            },
+            &clipped_brackets,
+            &clipped_diags,
+            &clipped_sneak,
+            body_width,
+        ));
+        // The EOL cell after the last char: the newline glyph when selected, and/or a
+        // diagnostic underline when one is clamped to the line end (it has no real char to
+        // mark). When neither applies, nothing is drawn here.
+        let eol_diag = is_last_vrow_of_line
+            .then(|| eol_diag_at(vrow.byte_offset + row_text_len))
+            .flatten();
+        if highlight_trailing_newline || eol_diag.is_some() {
+            let mut style = if highlight_trailing_newline {
+                Style::default().bg(c(th().bg_visual)).fg(c(th().fg_faint))
+            } else {
+                Style::default()
+            };
+            if let Some(sev) = eol_diag {
+                style = style
+                    .add_modifier(Modifier::UNDERLINED)
+                    .underline_color(diag_color(sev));
+            }
+            spans.push(Span::styled(
+                if highlight_trailing_newline {
+                    "↵"
+                } else {
+                    " "
+                },
+                style,
+            ));
+        }
+        let show_blame = on_cursor_line && is_last_vrow_of_line;
+        append_eol_blame(
+            &mut spans,
+            show_blame.then_some(blame_text.as_deref()).flatten(),
+        );
+        apply_line_tint(&mut spans, line_tint, viewport_cols);
+        prepend_gutter(
+            gutter_mark,
+            render.change.stage(),
+            render.change.conflict(),
+            render.change.patch_side(),
+            spans,
+        )
+    };
+
+    // Every loaded row of the view at its absolute row, off the shared layout: chrome on its own
+    // row, a loaded slice `first_row` rows into its element, a row nothing is loaded at absent. The
+    // screen is the run from `paint_top`, blank wherever the list has no row. The cursor and click
+    // maths read the same list, so the three cannot disagree about which row shows what — the
+    // painter walking the lines itself and summing chrome as it went is how they used to.
+    let top = state.ed().paint_top.get();
+    let painted = aether_client::grid::painted_rows_of(&state.ed().root);
+    let mut next = painted
+        .iter()
+        .position(|(at, _)| at.get() >= top)
+        .unwrap_or(painted.len());
+    let mut lines: Vec<Line> = Vec::with_capacity(viewport_rows);
+    for screen_row in 0..viewport_rows as u32 {
+        let want = top.saturating_add(screen_row);
+        while next < painted.len() && painted[next].0.get() < want {
+            next += 1;
+        }
+        let item = match painted.get(next) {
+            Some((at, item)) if at.get() == want => item,
+            _ => {
+                lines.push(Line::default());
+                continue;
+            }
+        };
+        lines.push(match item {
+            aether_client::grid::PaintedRow::Chrome(node) => chrome_row(node),
+            aether_client::grid::PaintedRow::Baseline { row, .. } => baseline_row(row),
+            aether_client::grid::PaintedRow::Text {
+                element,
+                line,
+                row,
+                row_index,
+                ..
+            } => text_row(*element, line, row, *row_index),
+        });
     }
 
     // Paint the whole buffer area with the Nord base style: spans without explicit fg/bg
@@ -5672,7 +5639,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 
     // The editor scrollbar, in the column reserved above. Same glyphs/colours as the picker
     // and overlays. `top_visual_row` is the absolute viewport-top row; the thumb reflects how
-    // far through the whole buffer that is.
+    // far through the whole view that is.
     if needs_scrollbar {
         let scrollbar = Rect {
             x: area.x + area.width,
@@ -5684,7 +5651,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             f,
             scrollbar,
             u64::from(state.ed().top_visual_row.get()),
-            u64::from(total_visual_rows),
+            u64::from(total_rows),
             area.height as u64,
         );
     }
@@ -7449,10 +7416,10 @@ fn exclusive_end_of(state: &AppState, pos: LogicalPosition) -> LogicalPosition {
     // (a buffer line and a view line), and subtracting them indexed off the end of the list for any
     // view whose first element does not start at line 0.
     let ed = state.ed();
-    let Some(render) = aether_client::grid::row_items_of(&ed.root)
+    let Some(render) = aether_client::grid::painted_rows_of(&ed.root)
         .into_iter()
-        .find_map(|item| match item {
-            aether_client::grid::RowItem::Line { element, line }
+        .find_map(|(_, item)| match item {
+            aether_client::grid::PaintedRow::Text { element, line, .. }
                 if element == ed.focused_element && line.logical_line == pos.line =>
             {
                 Some(line)
@@ -7672,12 +7639,11 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
     // The row painted at the top of the viewport. Rows are read off the shared layout rather than
     // re-counted here: chrome occupies screen rows and belongs to no line, and every walk that
     // summed per-line heights of its own placed the cursor rows away from where it was drawn.
-    let (top_row, _) =
-        aether_client::grid::scroll_top(&ed.root, ed.scroll_line_index, ed.scroll_skip_rows);
+    let top_row = ed.paint_top.get();
 
     // The pair, not the number: a logical line names a line only within its own element, so two
     // files' hunks both have a line 10 and the cursor would be drawn on whichever came first.
-    let rows = aether_client::grid::painted_rows_of(&ed.root, VisualRow::ZERO);
+    let rows = aether_client::grid::painted_rows_of(&ed.root);
     let (at, row) = rows.iter().find_map(|(at, item)| match item {
         aether_client::grid::PaintedRow::Text {
             element,
@@ -7766,10 +7732,10 @@ pub fn screen_to_logical(
     let screen_col = screen_col.saturating_sub(GUTTER_WIDTH);
     // The row clicked, in the shared layout's coordinates — the inverse of what
     // `cursor_visual_position` does, off the same list, so the two cannot map a row differently.
-    let (top_row, _) =
-        aether_client::grid::scroll_top(&ed.root, ed.scroll_line_index, ed.scroll_skip_rows);
+    let top_row = ed.paint_top.get();
     let want = top_row + screen_row as u32;
-    for (at, item) in aether_client::grid::painted_rows_of(&ed.root, VisualRow::ZERO) {
+    let rows = aether_client::grid::painted_rows_of(&ed.root);
+    for (at, item) in &rows {
         if at.get() < want {
             continue;
         }
@@ -7781,7 +7747,7 @@ pub fn screen_to_logical(
             // of the real line it sits above (they have no addressable position of their own).
             aether_client::grid::PaintedRow::Baseline { element, line, .. } => {
                 return Some((
-                    element,
+                    *element,
                     LogicalPosition {
                         line: line.logical_line,
                         col: 0,
@@ -7792,7 +7758,7 @@ pub fn screen_to_logical(
                 element, line, row, ..
             } => {
                 return Some((
-                    element,
+                    *element,
                     LogicalPosition {
                         line: line.logical_line,
                         col: byte_at_screen_col(state, row, screen_col),
@@ -7801,16 +7767,26 @@ pub fn screen_to_logical(
             }
         }
     }
-    // Click is past the last line we have rendered — clamp to the end of the focused element's
-    // buffer. Deliberately the focused element, not element 0: past the end is nowhere, so the
-    // least surprising answer is "where you already were".
-    Some((
-        state.ed().focused_element,
-        LogicalPosition {
-            line: state.ed().line_count.saturating_sub(1),
-            col: u32::MAX,
-        },
-    ))
+    // Past the last row anything is loaded at — the view's end, or rows a fetch hasn't filled.
+    // Nowhere to land, so the least surprising answer is the end of the nearest line above; with
+    // nothing loaded at all, "where you already were".
+    let above = rows.iter().rev().find_map(|(_, item)| match item {
+        aether_client::grid::PaintedRow::Baseline { element, line, .. }
+        | aether_client::grid::PaintedRow::Text { element, line, .. } => {
+            Some((*element, line.logical_line))
+        }
+        aether_client::grid::PaintedRow::Chrome(_) => None,
+    });
+    Some(match above {
+        Some((element, line)) => (
+            element,
+            LogicalPosition {
+                line,
+                col: u32::MAX,
+            },
+        ),
+        None => (ed.focused_element, ed.cursor.position),
+    })
 }
 
 /// Walk the visual row's text by display width to find the byte offset (within the logical line)
@@ -10341,7 +10317,7 @@ mod tests {
 #[cfg(test)]
 mod painter_tests {
     use super::*;
-    use aether_protocol::coords::{ViewLine, VisualRow};
+    use aether_protocol::coords::{ElementRow, VisualRow};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -10382,13 +10358,7 @@ mod painter_tests {
             children: vec![UiElement::text(text, Vec::new())],
         };
         let window = aether_protocol::viewport::Window {
-                other_elements_dirty: false,
-            first_view_line: ViewLine(0),
-            last_view_line_exclusive: ViewLine(7),
-            view_line_count: 7,
-            max_scroll_view_line: ViewLine(0),
-            total_visual_rows: 9,
-            first_visual_row: VisualRow(0),
+            other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
             root: Element::Stack {
@@ -10399,31 +10369,24 @@ mod painter_tests {
                         element: 0,
                         buffer: 7,
                         rows: lines.len() as u32,
+                        first_row: ElementRow::ZERO,
                         first_buffer_line: 16,
                         lines: lines.clone(),
                     },
                 ],
             },
         };
+        editor_over(window.root, 0)
+    }
 
+    /// The editor state `Shell::editor_view` derives from a window with this tree, painting from
+    /// row `top`.
+    fn editor_over(root: Element, top: u32) -> crate::app::EditorState {
         let mut ed = crate::app::test_editor_state();
-        ed.lines = aether_client::grid::window_lines(&window)
-            .into_iter()
-            .map(|(at, line)| (at, line.clone()))
-            .collect();
-        ed.chrome_above = aether_client::grid::chrome_by_line_index(&window.root)
-            .0
-            .into_iter()
-            .map(|(k, v)| (k, v.into_iter().cloned().collect()))
-            .collect();
-        ed.trailing_chrome = aether_client::grid::chrome_by_line_index(&window.root)
-            .1
-            .into_iter()
-            .cloned()
-            .collect();
-        ed.total_visual_rows = window.total_visual_rows;
-        ed.scroll_line_index = 0;
-        ed.root = window.root;
+        ed.total_rows = aether_client::grid::total_rows(&root);
+        ed.paint_top = VisualRow(top);
+        ed.top_visual_row = VisualRow(top);
+        ed.root = root;
         ed
     }
 
@@ -10459,13 +10422,7 @@ mod painter_tests {
             children: vec![UiElement::text(text, Vec::new())],
         };
         let window = aether_protocol::viewport::Window {
-                other_elements_dirty: false,
-            first_view_line: ViewLine(0),
-            last_view_line_exclusive: ViewLine(2),
-            view_line_count: 2,
-            max_scroll_view_line: ViewLine(0),
-            total_visual_rows: 4,
-            first_visual_row: VisualRow(0),
+            other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
             root: Element::Stack {
@@ -10475,6 +10432,7 @@ mod painter_tests {
                         element: 0,
                         buffer: 7,
                         rows: 1,
+                        first_row: ElementRow::ZERO,
                         first_buffer_line: 10,
                         lines: vec![line(10, "from alpha")],
                     },
@@ -10483,26 +10441,14 @@ mod painter_tests {
                         element: 1,
                         buffer: 8,
                         rows: 1,
+                        first_row: ElementRow::ZERO,
                         first_buffer_line: 10,
                         lines: vec![line(10, "from beta")],
                     },
                 ],
             },
         };
-        let mut ed = crate::app::test_editor_state();
-        ed.lines = aether_client::grid::window_lines(&window)
-            .into_iter()
-            .map(|(at, line)| (at, line.clone()))
-            .collect();
-        ed.chrome_above = aether_client::grid::chrome_by_line_index(&window.root)
-            .0
-            .into_iter()
-            .map(|(k, v)| (k, v.into_iter().cloned().collect()))
-            .collect();
-        ed.line_count = 2;
-        ed.total_visual_rows = 4;
-        ed.scroll_line_index = 0;
-        ed.root = window.root.clone();
+        let ed = editor_over(window.root, 0);
 
         let body = painted(&crate::app::test_state(ed)).join("\n");
         for want in ["alpha.rs", "from alpha", "beta.rs", "from beta"] {
@@ -10528,13 +10474,7 @@ mod painter_tests {
         };
         // Both files show lines 10 and 11 — the collision that made one cursor into two.
         let window = aether_protocol::viewport::Window {
-                other_elements_dirty: false,
-            first_view_line: ViewLine(0),
-            last_view_line_exclusive: ViewLine(4),
-            view_line_count: 4,
-            max_scroll_view_line: ViewLine(0),
-            total_visual_rows: 6,
-            first_visual_row: VisualRow(0),
+            other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
             root: Element::Stack {
@@ -10544,6 +10484,7 @@ mod painter_tests {
                         element: 0,
                         buffer: 7,
                         rows: 2,
+                        first_row: ElementRow::ZERO,
                         first_buffer_line: 10,
                         lines: vec![line(10, "alpha ten"), line(11, "alpha eleven")],
                     },
@@ -10552,26 +10493,14 @@ mod painter_tests {
                         element: 1,
                         buffer: 8,
                         rows: 2,
+                        first_row: ElementRow::ZERO,
                         first_buffer_line: 10,
                         lines: vec![line(10, "beta ten"), line(11, "beta eleven")],
                     },
                 ],
             },
         };
-        let mut ed = crate::app::test_editor_state();
-        ed.lines = aether_client::grid::window_lines(&window)
-            .into_iter()
-            .map(|(at, line)| (at, line.clone()))
-            .collect();
-        ed.chrome_above = aether_client::grid::chrome_by_line_index(&window.root)
-            .0
-            .into_iter()
-            .map(|(k, v)| (k, v.into_iter().cloned().collect()))
-            .collect();
-        ed.root = window.root.clone();
-        ed.line_count = 4;
-        ed.total_visual_rows = 6;
-        ed.scroll_line_index = 0;
+        let mut ed = editor_over(window.root, 0);
         // The cursor sits on line 10 of the *second* file.
         ed.focused_element = 1;
         ed.cursor.position = LogicalPosition { line: 10, col: 0 };
@@ -10619,13 +10548,7 @@ mod painter_tests {
         let a: Vec<LogicalLineRender> = (16..20).map(|n| line(n, &format!("a{n}"))).collect();
         let b: Vec<LogicalLineRender> = (0..3).map(|n| line(n, &format!("b{n}"))).collect();
         let window = aether_protocol::viewport::Window {
-                other_elements_dirty: false,
-            first_view_line: ViewLine(0),
-            last_view_line_exclusive: ViewLine(7),
-            view_line_count: 7,
-            max_scroll_view_line: ViewLine(0),
-            total_visual_rows: 11,
-            first_visual_row: VisualRow(0),
+            other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
             root: Element::Stack {
@@ -10636,6 +10559,7 @@ mod painter_tests {
                         element: 0,
                         buffer: 7,
                         rows: 4,
+                        first_row: ElementRow::ZERO,
                         first_buffer_line: 16,
                         lines: a,
                     },
@@ -10645,29 +10569,14 @@ mod painter_tests {
                         element: 1,
                         buffer: 8,
                         rows: 3,
+                        first_row: ElementRow::ZERO,
                         first_buffer_line: 0,
                         lines: b,
                     },
                 ],
             },
         };
-        let build = |scroll: usize| {
-            let mut ed = crate::app::test_editor_state();
-            ed.lines = aether_client::grid::window_lines(&window)
-                .into_iter()
-                .map(|(at, line)| (at, line.clone()))
-                .collect();
-            ed.chrome_above = aether_client::grid::chrome_by_line_index(&window.root)
-                .0
-                .into_iter()
-                .map(|(k, v)| (k, v.into_iter().cloned().collect()))
-                .collect();
-            ed.line_count = 7;
-            ed.total_visual_rows = 11;
-            ed.scroll_line_index = scroll;
-            ed.root = window.root.clone();
-            ed
-        };
+        let build = |top: u32| editor_over(window.root.clone(), top);
 
         // Unscrolled: both files, both headings, in order.
         let body = painted(&crate::app::test_state(build(0))).join("\n");
@@ -10681,10 +10590,11 @@ mod painter_tests {
             "files paint in view order:\n{body}"
         );
 
-        // Scrolled past the first file: the second is still reachable.
-        let body = painted(&crate::app::test_state(build(4))).join("\n");
+        // Scrolled past the first file — to the row its heading is on: the second is still
+        // reachable.
+        let body = painted(&crate::app::test_state(build(6))).join("\n");
         assert!(
-            body.contains("b0"),
+            body.contains("b.rs") && body.contains("b0"),
             "scrolling reaches the second file:\n{body}"
         );
         assert!(
@@ -10746,7 +10656,7 @@ mod painter_tests {
                 match_bracket: None,
                 jumplist_position: None,
             };
-            ed.scroll_skip_rows = skip;
+            ed.paint_top = VisualRow(skip);
             let state = crate::app::test_state(ed);
 
             let (row, _) = cursor_visual_position(&state, 24).expect("the cursor is on screen");
@@ -10775,7 +10685,7 @@ mod painter_tests {
         // rows the click maths has to move through just as the painter does.
         for skip in 0..=2 {
             let mut ed = patch_editor_state();
-            ed.scroll_skip_rows = skip;
+            ed.paint_top = VisualRow(skip);
             let state = crate::app::test_state(ed);
             let rows = painted(&state);
             for (want_line, text) in [(16u32, "fn f17() {}"), (18, "fn f19() {}")] {
@@ -10799,21 +10709,23 @@ mod painter_tests {
 
     /// The patch's closing rule is painted after the view's last line.
     ///
-    /// It hangs off the last *rendered* line, decided positionally. The test it replaced —
-    /// `logical_line + 1 == line_count` — compared a buffer line to the **view's** line count, so
-    /// for a patch whose last element windows the middle of a file it never matched: the view ended
-    /// on its last line of text with nothing to say it had ended, and (once the row was counted in
-    /// the view's height) with a blank row where the rule should be.
+    /// The rule is a node of the tree after the last element, so it lands on the row the tree puts
+    /// it on — the view's last. The test this replaced hung it off the last *rendered* line, and
+    /// before that off `logical_line + 1 == line_count`, which compared a buffer line to the
+    /// **view's** line count and never matched for a patch whose last element windows the middle
+    /// of a file: the view ended on its last line of text with nothing to say it had ended.
     #[test]
     fn a_patchs_closing_rule_is_painted_after_its_last_line() {
         let mut ed = patch_editor_state();
-        // The element windows lines 16..23 of a file — nowhere near the view's own line count.
-        ed.line_count = 25_172;
-        ed.trailing_chrome = vec![Element::Chrome {
+        let Element::Stack { children } = &mut ed.root else {
+            panic!("the fixture is a stack");
+        };
+        children.push(Element::Chrome {
             kind: ChromeKind::Rule,
             rail: RailJoin::Closes,
             children: vec![UiElement::fill('═')],
-        }];
+        });
+        ed.total_rows = aether_client::grid::total_rows(&ed.root);
         let state = crate::app::test_state(ed);
         let rows = painted(&state);
         let last_text = rows

@@ -2,7 +2,6 @@
 
 mod common;
 
-use aether_protocol::coords::{ViewLine, VisualRow};
 use common::*;
 
 // ---- (preamble) --------------------------------------------------------------------------------
@@ -170,9 +169,11 @@ async fn buffer_open_restores_cursor_and_scroll() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -194,17 +195,7 @@ async fn buffer_open_restores_cursor_and_scroll() {
         },
     )
     .await;
-    let _: ViewportWindowResult = send_request::<ViewportScroll>(
-        &mut ws,
-        &ViewportScrollParams {
-            viewport_id,
-            scroll: ScrollPosition {
-                logical_line: ViewLine(8),
-                sub_row: 0.0,
-            },
-        },
-    )
-    .await;
+    let _ = window_from_row(&mut ws, viewport_id, 8, 10).await;
 
     // Reopen the same path (file-browser navigation pattern). The server should report the
     // prior cursor and scroll so the client can restore the view.
@@ -225,17 +216,17 @@ async fn buffer_open_restores_cursor_and_scroll() {
     assert_eq!(reopen.buffer_id, buffer_id);
     assert_eq!(reopen.cursor.position, cursor_target);
     let scroll = reopen.scroll.expect("scroll restored on reopen");
-    assert_eq!(scroll.logical_line, ViewLine(8));
+    assert_eq!(scroll.line, 8);
 
     drop(server);
 }
 
-/// Scrolling via `viewport/scroll_to_row` (the row-based path nearly every wheel/page scroll takes,
-/// as the client refetches near the loaded edge) must also be restored on reopen — not just the
-/// logical-line `viewport/scroll`. Regression: `scroll_to_row` updated the viewport but forgot the
-/// restore map, so switching back to a buffer jumped to where it was first opened.
+/// Scrolling via `view/window` (the path every wheel/page scroll takes, as the client refetches
+/// near the loaded edge) must be restored on reopen, not only the position a subscribe opened at.
+/// Regression: the scroll fetch updated the viewport but forgot the restore map, so switching back
+/// to a buffer jumped to where it was first opened.
 #[tokio::test]
-async fn buffer_open_restores_scroll_from_scroll_to_row() {
+async fn buffer_open_restores_scroll_from_a_window_request() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.txt");
     let mut content = String::new();
@@ -280,9 +271,11 @@ async fn buffer_open_restores_scroll_from_scroll_to_row() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -291,15 +284,8 @@ async fn buffer_open_restores_scroll_from_scroll_to_row() {
     )
     .await;
 
-    // Scroll by visual row (no wrap → visual row 20 == logical line 20).
-    let _: ViewportWindowResult = send_request::<ViewportScrollToRow>(
-        &mut ws,
-        &ViewportScrollToRowParams {
-            viewport_id: sub.viewport_id,
-            top_visual_row: VisualRow(20),
-        },
-    )
-    .await;
+    // Scroll by row (no wrap → row 20 of the one element is line 20).
+    let _ = window_from_row(&mut ws, sub.viewport_id, 20, 10).await;
 
     let reopen: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws,
@@ -318,8 +304,7 @@ async fn buffer_open_restores_scroll_from_scroll_to_row() {
     assert_eq!(reopen.buffer_id, buffer_id);
     let scroll = reopen.scroll.expect("scroll restored on reopen");
     assert_eq!(
-        scroll.logical_line,
-        ViewLine(20),
+        scroll.line, 20,
         "a row-based scroll is restored on reopen, not just logical-line scrolls"
     );
 
@@ -379,9 +364,11 @@ async fn buffer_open_jump_drops_saved_scroll() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -389,18 +376,8 @@ async fn buffer_open_jump_drops_saved_scroll() {
         },
     )
     .await;
-    // Record a non-default scroll for this (client, buffer).
-    let _: ViewportWindowResult = send_request::<ViewportScroll>(
-        &mut ws,
-        &ViewportScrollParams {
-            viewport_id: sub.viewport_id,
-            scroll: ScrollPosition {
-                logical_line: ViewLine(8),
-                sub_row: 0.0,
-            },
-        },
-    )
-    .await;
+    // Record a non-default scroll for this (client, view).
+    let _ = window_from_row(&mut ws, sub.viewport_id, 8, 10).await;
 
     // Reopen the same buffer with a jump (the grep-navigate pattern): the cursor lands on the
     // jump target, and the stale scroll is dropped.
@@ -478,9 +455,11 @@ async fn buffer_open_isolates_scroll_per_client() {
                 rows: 10,
                 overscan_rows: 0,
                 scroll: ScrollPosition {
-                    logical_line: ViewLine(0),
+                    element: 0,
+                    line: 0,
                     sub_row: 0.0,
                 },
+                focus: None,
                 wrap: WrapMode::None,
                 continuation_marker_width: 0,
                 tab_width: 4,
@@ -495,28 +474,8 @@ async fn buffer_open_isolates_scroll_per_client() {
     let (mut ws_b, buf_b, vp_b) = connect().await;
     assert_eq!(buf_a, buf_b, "shared buffer, deduped by canonical path");
 
-    let _: ViewportWindowResult = send_request::<ViewportScroll>(
-        &mut ws_a,
-        &ViewportScrollParams {
-            viewport_id: vp_a,
-            scroll: ScrollPosition {
-                logical_line: ViewLine(5),
-                sub_row: 0.0,
-            },
-        },
-    )
-    .await;
-    let _: ViewportWindowResult = send_request::<ViewportScroll>(
-        &mut ws_b,
-        &ViewportScrollParams {
-            viewport_id: vp_b,
-            scroll: ScrollPosition {
-                logical_line: ViewLine(17),
-                sub_row: 0.0,
-            },
-        },
-    )
-    .await;
+    let _ = window_from_row(&mut ws_a, vp_a, 5, 10).await;
+    let _ = window_from_row(&mut ws_b, vp_b, 17, 10).await;
 
     let reopen_a: BufferOpenResult = send_request::<BufferOpen>(
         &mut ws_a,
@@ -546,8 +505,8 @@ async fn buffer_open_isolates_scroll_per_client() {
         },
     )
     .await;
-    assert_eq!(reopen_a.scroll.expect("a").logical_line, ViewLine(5));
-    assert_eq!(reopen_b.scroll.expect("b").logical_line, ViewLine(17));
+    assert_eq!(reopen_a.scroll.expect("a").line, 5);
+    assert_eq!(reopen_b.scroll.expect("b").line, 17);
 
     drop(server);
 }
@@ -742,9 +701,11 @@ async fn viewport_subscribe_renders_window() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -754,9 +715,10 @@ async fn viewport_subscribe_renders_window() {
     )
     .await;
 
-    assert_eq!(sub.window.first_view_line, ViewLine(0));
+    let (first, last) = loaded_lines(&sub.window);
+    assert_eq!(first, 0);
     // 5 newlines in our content => ropey reports 6 lines (final empty).
-    assert!(sub.window.last_view_line_exclusive >= ViewLine(5));
+    assert!(last >= 5);
 
     let line0 = &sub.window.root.lines()[0];
     assert_eq!(line0.logical_line, 0);
@@ -808,9 +770,11 @@ async fn viewport_subscribe_wraps_long_line() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -889,9 +853,11 @@ async fn viewport_scroll_returns_new_window() {
             rows: 5,
             overscan_rows: 2,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -900,21 +866,13 @@ async fn viewport_scroll_returns_new_window() {
         },
     )
     .await;
-    assert_eq!(sub.window.first_view_line, ViewLine(0));
+    assert_eq!(loaded_lines(&sub.window).0, 0);
 
-    let scrolled: ViewportWindowResult = send_request::<ViewportScroll>(
-        &mut ws,
-        &ViewportScrollParams {
-            viewport_id: sub.viewport_id,
-            scroll: ScrollPosition {
-                logical_line: ViewLine(20),
-                sub_row: 0.0,
-            },
-        },
-    )
-    .await;
-    assert_eq!(scrolled.window.first_view_line, ViewLine(18)); // 20 - overscan(2)
-    assert!(scrolled.window.last_view_line_exclusive >= ViewLine(25));
+    // A client showing line 20 with two rows of overscan asks from row 18.
+    let scrolled = window_from_row(&mut ws, sub.viewport_id, 18, 12).await;
+    let (first, last) = loaded_lines(&scrolled.window);
+    assert_eq!(first, 18);
+    assert!(last >= 25);
     let first_text = &scrolled.window.root.lines()[2].visual_rows[0].segments[0].text;
     assert_eq!(first_text, "line 20");
 }
@@ -971,9 +929,11 @@ async fn the_socket_logs_pushes_it_read_past() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -1013,7 +973,7 @@ async fn the_socket_logs_pushes_it_read_past() {
         "B's socket should have logged the lines_changed push it read past"
     );
     assert!(
-        pushes.iter().any(|p| p.root.lines().iter().any(|l| l
+        pushes.iter().any(|p| p.window.root.lines().iter().any(|l| l
             .visual_rows
             .iter()
             .any(|r| r.segments.iter().any(|s| s.text.contains('X'))))),

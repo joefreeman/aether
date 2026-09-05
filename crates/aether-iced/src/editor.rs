@@ -5,8 +5,8 @@
 //! font, converts mouse positions to `(visual row, display col)` cells, and publishes
 //! [`EditorEvent`]s; the app maps cells to buffer positions with `grid` and the loaded
 //! `Window`. Scrolling is native-feel: the app owns a pixel offset into the full document
-//! height (`total_visual_rows × cell height`), this widget just draws the loaded window at its
-//! absolute position under that offset — the same virtual-scroll model as the web client.
+//! height (`grid::total_rows` × cell height), this widget just draws each loaded row at its
+//! absolute row under that offset — the same virtual-scroll model as the web client.
 
 use crate::grid;
 use crate::theme;
@@ -16,8 +16,7 @@ use aether_protocol::cursor::CursorState;
 // other clashing protocol names in this file already are.
 use aether_protocol::ui::{Element as ViewElement, RailJoin};
 use aether_protocol::viewport::{
-    BaselineRow, ChromeKind, ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage,
-    LogicalLineRender, PatchLine, Window,
+    ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, LogicalLineRender, PatchLine, Window,
 };
 use aether_protocol::LogicalPosition;
 use iced::advanced::widget::{tree, Tree};
@@ -426,184 +425,462 @@ where
             }
         };
 
-        // A patch's chrome is a tree sibling; the inline diff's phantom rows belong to the line.
-        // Both draw above the line's content and hold no cursor position, so they are walked as one
-        // sequence here — the two never coexist anyway, since a patch has no baseline of its own.
-        let (chrome_above, trailing_chrome) = grid::chrome_by_line_index(&window.root);
-        enum Row<'a> {
-            Chrome(&'a ViewElement),
-            Baseline(&'a BaselineRow),
-        }
-        let mut abs_row = window.first_visual_row;
-        let lines = grid::window_lines(window);
-        let last_line_idx = lines.len().saturating_sub(1);
         let cursor_at = grid::ElementLine::new(self.content.focused_element, cursor_pos.line);
-        for (line_idx, (at, line)) in lines.iter().enumerate() {
-            // The pair, never the number: `at == cursor_at` asks about *this* element's line.
-            let on_cursor_line = *at == cursor_at;
-            let draw_sel = draw_selection && at.element == self.content.focused_element;
-            let is_last_line = line_idx == last_line_idx;
-            let above: Vec<Row<'_>> = chrome_above
-                .get(&line_idx)
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
-                .iter()
-                .map(|n| Row::Chrome(n))
-                .chain(line.baseline_above.iter().map(Row::Baseline))
-                .collect();
-            for v in &above {
-                let y = bounds.y + PAD + abs_row.get() as f32 * cell.height - scroll;
-                abs_row = abs_row.saturating_add(1);
-                if y + cell.height < bounds.y || y > bounds.y + bounds.height {
-                    continue;
-                }
-                let (v_text, v_stage, v_emphasis) = match v {
-                    // A generated patch's chrome. It carries a band — starting in the gutter, since
-                    // the gutter belongs to the rows the cursor can reach — so that "unreachable"
-                    // reads as a band rather than as text the cursor mysteriously skips.
-                    Row::Chrome(ViewElement::Chrome { rail, children, .. }) => {
+        // Every loaded row of the view at its absolute row, off the shared layout: chrome on a row
+        // of its own, a loaded slice `first_row` rows into its element, the inline diff's phantom
+        // rows above their line. The widget draws whatever is at each row, and nothing where
+        // nothing is loaded. It no longer walks the lines counting chrome and phantoms as it goes
+        // — the count the terminal, this shell and the browser each did differently.
+        for (abs_row, item) in grid::painted_rows(window) {
+            let y = bounds.y + PAD + abs_row.get() as f32 * cell.height - scroll;
+            if y + cell.height < bounds.y || y > bounds.y + bounds.height {
+                continue;
+            }
+            // Chrome and phantom rows first — both draw a full-width band and hold no cursor
+            // position — then a line's own text rows.
+            let (element, line, row, row_idx) = match item {
+                // A generated patch's chrome. It carries a band — starting in the gutter, since
+                // the gutter belongs to the rows the cursor can reach — so that "unreachable"
+                // reads as a band rather than as text the cursor mysteriously skips.
+                grid::PaintedRow::Chrome(ViewElement::Chrome { rail, children, .. }) => {
+                    fill(
+                        renderer,
+                        Rectangle {
+                            x: bounds.x,
+                            y,
+                            width: bounds.width,
+                            height: cell.height,
+                        },
+                        p.patch_chrome_bg,
+                    );
+                    // A left rail down the file's chrome, in the gutter column, so the heading
+                    // rows read as belonging to the file above them rather than floating in the
+                    // diff. *Which* join to draw is the server's call now (`RailJoin`); this is
+                    // only the GUI's alphabet for it — the terminal spells the same thing with
+                    // box-drawing glyphs.
+                    let rail_x = bounds.x + cell.width * 0.25;
+                    let rule_y = y + (cell.height * 0.5).floor();
+                    let (rail_y, rail_h) = match rail {
+                        RailJoin::Detached => (y, 0.0),
+                        // Corner into the rule: a stub above it would read as a line to nowhere.
+                        RailJoin::Opens => (rule_y, cell.height - (rule_y - y)),
+                        // The mirror: the rail arrives from above and stops at the rule.
+                        RailJoin::Closes => (y, rule_y - y),
+                        RailJoin::Tees => (y, cell.height),
+                    };
+                    if rail_h > 0.0 {
                         fill(
                             renderer,
                             Rectangle {
-                                x: bounds.x,
-                                y,
-                                width: bounds.width,
-                                height: cell.height,
+                                x: rail_x,
+                                y: rail_y,
+                                width: 1.0,
+                                height: rail_h,
                             },
-                            p.patch_chrome_bg,
+                            p.fg_faint,
                         );
-                        // A left rail down the file's chrome, in the gutter column, so the heading
-                        // rows read as belonging to the file above them rather than floating in the
-                        // diff. *Which* join to draw is the server's call now (`RailJoin`); this is
-                        // only the GUI's alphabet for it — the terminal spells the same thing with
-                        // box-drawing glyphs.
-                        let rail_x = bounds.x + cell.width * 0.25;
-                        let rule_y = y + (cell.height * 0.5).floor();
-                        let (rail_y, rail_h) = match rail {
-                            RailJoin::Detached => (y, 0.0),
-                            // Corner into the rule: a stub above it would read as a line to nowhere.
-                            RailJoin::Opens => (rule_y, cell.height - (rule_y - y)),
-                            // The mirror: the rail arrives from above and stops at the rule.
-                            RailJoin::Closes => (y, rule_y - y),
-                            RailJoin::Tees => (y, cell.height),
-                        };
-                        if rail_h > 0.0 {
-                            fill(
-                                renderer,
-                                Rectangle {
-                                    x: rail_x,
-                                    y: rail_y,
-                                    width: 1.0,
-                                    height: rail_h,
-                                },
-                                p.fg_faint,
-                            );
-                        }
-                        let mut col = 0u32;
-                        for widget in children.iter().flat_map(ViewElement::inline) {
-                            match widget {
-                                ViewElement::Space { cols } => col += *cols as u32,
-                                // A rule is a hairline to the right edge, not a repeated glyph:
-                                // the element says "absorb the slack", and pixels spell that
-                                // differently from cells.
-                                ViewElement::Fill { .. } => {
-                                    // A fill that *starts* the row is the rule opening or closing a
-                                    // block ("a rule is the fill and nothing else — the rail sits
-                                    // outside the content width"), so it is drawn from the rail
-                                    // rather than from the first content column: the two have to
-                                    // meet, which is what the terminal's `┌`/`├`/`└` spells with a
-                                    // glyph whose horizontal arm leaves the cell the vertical line
-                                    // is in. Starting it at the content edge left the corner open,
-                                    // with the rule floating a gutter away from the rail.
-                                    //
-                                    // A fill that follows text still starts where the text left off
-                                    // — otherwise the rule would strike through it.
-                                    let x = if col == 0 { rail_x } else { text_x(col) };
-                                    fill(
+                    }
+                    let mut col = 0u32;
+                    for widget in children.iter().flat_map(ViewElement::inline) {
+                        match widget {
+                            ViewElement::Space { cols } => col += *cols as u32,
+                            // A rule is a hairline to the right edge, not a repeated glyph:
+                            // the element says "absorb the slack", and pixels spell that
+                            // differently from cells.
+                            ViewElement::Fill { .. } => {
+                                // A fill that *starts* the row is the rule opening or closing a
+                                // block ("a rule is the fill and nothing else — the rail sits
+                                // outside the content width"), so it is drawn from the rail
+                                // rather than from the first content column: the two have to
+                                // meet, which is what the terminal's `┌`/`├`/`└` spells with a
+                                // glyph whose horizontal arm leaves the cell the vertical line
+                                // is in. Starting it at the content edge left the corner open,
+                                // with the rule floating a gutter away from the rail.
+                                //
+                                // A fill that follows text still starts where the text left off
+                                // — otherwise the rule would strike through it.
+                                let x = if col == 0 { rail_x } else { text_x(col) };
+                                fill(
+                                    renderer,
+                                    Rectangle {
+                                        x,
+                                        y: rule_y,
+                                        width: bounds.x + bounds.width - x,
+                                        height: 1.0,
+                                    },
+                                    p.fg_faint,
+                                );
+                            }
+                            // `inline()` yields only leaves, so nothing else can appear here.
+                            ViewElement::Text { text, highlights } => {
+                                // Runs split at the server's span boundaries; the gaps between
+                                // spans fall back to the muted foreground, since chrome is
+                                // never plain body text.
+                                let mut runs: Vec<(usize, usize, Option<&str>)> = Vec::new();
+                                let mut pos = 0usize;
+                                for h in highlights {
+                                    let a = (h.start as usize).min(text.len());
+                                    let b = (h.end as usize).min(text.len());
+                                    if a > pos {
+                                        runs.push((pos, a, None));
+                                    }
+                                    if b > a {
+                                        runs.push((a, b, Some(h.kind.as_str())));
+                                    }
+                                    pos = pos.max(b);
+                                }
+                                if pos < text.len() {
+                                    runs.push((pos, text.len(), None));
+                                }
+                                for (a, b, kind) in runs {
+                                    let color = kind
+                                        .and_then(|k| theme::highlight_color(p.mode, k))
+                                        .unwrap_or(p.fg_muted);
+                                    draw_text_run(
                                         renderer,
-                                        Rectangle {
-                                            x,
-                                            y: rule_y,
-                                            width: bounds.x + bounds.width - x,
-                                            height: 1.0,
-                                        },
-                                        p.fg_faint,
+                                        text[a..b].to_string(),
+                                        Point::new(
+                                            text_x(col + text[..a].chars().count() as u32),
+                                            y,
+                                        ),
+                                        cell,
+                                        color,
+                                        highlight_font(kind),
+                                        content_clip,
+                                        text_shaping,
                                     );
                                 }
-                                // `inline()` yields only leaves, so nothing else can appear here.
-                                ViewElement::Text { text, highlights } => {
-                                    // Runs split at the server's span boundaries; the gaps between
-                                    // spans fall back to the muted foreground, since chrome is
-                                    // never plain body text.
-                                    let mut runs: Vec<(usize, usize, Option<&str>)> = Vec::new();
-                                    let mut pos = 0usize;
-                                    for h in highlights {
-                                        let a = (h.start as usize).min(text.len());
-                                        let b = (h.end as usize).min(text.len());
-                                        if a > pos {
-                                            runs.push((pos, a, None));
-                                        }
-                                        if b > a {
-                                            runs.push((a, b, Some(h.kind.as_str())));
-                                        }
-                                        pos = pos.max(b);
-                                    }
-                                    if pos < text.len() {
-                                        runs.push((pos, text.len(), None));
-                                    }
-                                    for (a, b, kind) in runs {
-                                        let color = kind
-                                            .and_then(|k| theme::highlight_color(p.mode, k))
-                                            .unwrap_or(p.fg_muted);
-                                        draw_text_run(
-                                            renderer,
-                                            text[a..b].to_string(),
-                                            Point::new(
-                                                text_x(col + text[..a].chars().count() as u32),
-                                                y,
-                                            ),
-                                            cell,
-                                            color,
-                                            highlight_font(kind),
-                                            content_clip,
-                                            text_shaping,
-                                        );
-                                    }
-                                    col += text.chars().count() as u32;
-                                }
-                                _ => {}
+                                col += text.chars().count() as u32;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // A file boundary is the heaviest break in the buffer, so it trails a rule
+                    // out to the right edge. Section headings deliberately don't — they used
+                    // to, and it chopped the file into equal-looking pieces, flattening the one
+                    // hierarchy the view has.
+                    continue;
+                }
+                // A bare inline node on a row of its own: representable, never composed.
+                grid::PaintedRow::Chrome(_) => continue,
+                grid::PaintedRow::Baseline { row: b, .. } => {
+                    let (v_text, v_stage, v_emphasis) = (&b.text, b.stage, &b.emphasis);
+                    let staged = v_stage == DiffStage::Staged;
+                    let (bg, fg, bar) = if staged {
+                        (
+                            p.git_staged_deleted_bg,
+                            p.git_staged_deleted,
+                            p.git_staged_deleted,
+                        )
+                    } else {
+                        (p.git_deleted_bg, p.git_deleted, p.git_deleted)
+                    };
+                    fill(
+                        renderer,
+                        Rectangle {
+                            x: bounds.x,
+                            y,
+                            width: bounds.width,
+                            height: cell.height,
+                        },
+                        bg,
+                    );
+                    fill(
+                        renderer,
+                        Rectangle {
+                            x: bounds.x,
+                            y,
+                            width: cell.width * 0.5,
+                            height: cell.height,
+                        },
+                        bar,
+                    );
+                    // Intra-line emphasis: a stronger red fill over the removed sub-ranges, whose
+                    // text switches to the normal foreground (red-on-red is illegible on the vivid
+                    // fill; matches the terminal and the web's `.deleted-phantom .diff-emph`). Byte →
+                    // column mirrors the flat tab expansion applied to the text runs.
+                    let col_of = |byte: usize| -> u32 {
+                        let mut col = 0u32;
+                        for (i, ch) in v_text.char_indices() {
+                            if i >= byte {
+                                break;
+                            }
+                            col += if ch == '\t' {
+                                self.content.tab_width
+                            } else {
+                                1
+                            };
+                        }
+                        col
+                    };
+                    if !v_emphasis.is_empty() {
+                        let emph_bg = if staged {
+                            p.git_staged_deleted_emph_bg
+                        } else {
+                            p.git_deleted_emph_bg
+                        };
+                        let inset = emphasis_inset(cell.height);
+                        for r in v_emphasis {
+                            let (s, e) = (col_of(r.start as usize), col_of(r.end as usize));
+                            if e > s {
+                                fill_content_rounded(
+                                    renderer,
+                                    Rectangle {
+                                        x: text_x(s) - 1.0,
+                                        y: y + inset,
+                                        width: (e - s) as f32 * cell.width + 2.0,
+                                        height: cell.height - 2.0 * inset,
+                                    },
+                                    emph_bg,
+                                    emphasis_radius(cell.height),
+                                );
                             }
                         }
-                        // A file boundary is the heaviest break in the buffer, so it trails a rule
-                        // out to the right edge. Section headings deliberately don't — they used
-                        // to, and it chopped the file into equal-looking pieces, flattening the one
-                        // hierarchy the view has.
-                        continue;
                     }
-                    Row::Baseline(b) => (&b.text, b.stage, &b.emphasis),
-                    // `chrome_by_line_index` only ever yields chrome nodes.
-                    Row::Chrome(_) => unreachable!("a chrome row is a ViewElement::Chrome"),
+                    // The row's text as segments split at the emphasis boundaries (one run when
+                    // there's no emphasis), each at its own column so the runs stay aligned.
+                    let mut segments: Vec<(usize, usize, bool)> = Vec::new();
+                    let mut pos = 0usize;
+                    for r in v_emphasis {
+                        let (s, e) = (
+                            (r.start as usize).min(v_text.len()),
+                            (r.end as usize).min(v_text.len()),
+                        );
+                        if s > pos {
+                            segments.push((pos, s, false));
+                        }
+                        if e > s {
+                            segments.push((s, e, true));
+                        }
+                        pos = pos.max(e);
+                    }
+                    if pos < v_text.len() {
+                        segments.push((pos, v_text.len(), false));
+                    }
+                    for (s, e, emph) in segments {
+                        let seg = v_text[s..e]
+                            .replace('\t', &" ".repeat(self.content.tab_width as usize));
+                        draw_text_run(
+                            renderer,
+                            seg,
+                            Point::new(text_x(col_of(s)), y),
+                            cell,
+                            if emph { p.fg } else { fg },
+                            EDITOR_FONT,
+                            content_clip,
+                            text_shaping,
+                        );
+                    }
+                    continue;
+                }
+                grid::PaintedRow::Text {
+                    element,
+                    line,
+                    row,
+                    row_index,
+                    ..
+                } => (element, line, row, row_index),
+            };
+            // The pair, never the number: `at == cursor_at` asks about *this* element's line.
+            let at = grid::ElementLine::new(element, line.logical_line);
+            let on_cursor_line = at == cursor_at;
+            let draw_sel = draw_selection && element == self.content.focused_element;
+            let n_rows = line.visual_rows.len();
+            let row_bounds = Rectangle {
+                x: bounds.x,
+                y,
+                width: bounds.width,
+                height: cell.height,
+            };
+
+            let cells = grid::row_cells(row, self.content.tab_width);
+
+            // Line background, under everything else: the diff-view change tint, the
+            // cursor-line tint, or — on the cursor's changed line — the variant that keeps
+            // the change colour visible (web's `.row.cursor-line.added-bg` precedence).
+            let staged = line.change.stage() == DiffStage::Staged;
+            let diff_bg = if self.content.diff_view {
+                match (line.change.marker(), staged) {
+                    (Some(DiffMarker::Added), false) => Some(p.git_added_bg),
+                    (Some(DiffMarker::Modified), false) => Some(p.git_modified_bg),
+                    (Some(DiffMarker::Added), true) => Some(p.git_staged_added_bg),
+                    (Some(DiffMarker::Modified), true) => Some(p.git_staged_modified_bg),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            // A conflict's side tints outrank the diff ones and ignore the diff-view toggle:
+            // the sides are how the file is read at all. They can't actually collide — the
+            // server masks the diff out of the blocks — but the ordering says which wins if the
+            // two ever did. The marker lines and the diff3 base section fall through to the
+            // ordinary backgrounds; see the terminal's `conflict_bg`.
+            let conflict_bg = match (line.change.conflict(), on_cursor_line) {
+                (Some(ConflictLine::Ours), false) => Some(p.git_conflict_ours_bg),
+                (Some(ConflictLine::Ours), true) => Some(p.cursor_line_conflict_ours_bg),
+                (Some(ConflictLine::Theirs), false) => Some(p.git_conflict_theirs_bg),
+                (Some(ConflictLine::Theirs), true) => Some(p.cursor_line_conflict_theirs_bg),
+                _ => None,
+            };
+            // A generated patch's own sides, ungated like the conflict tints and for the same
+            // reason: the buffer *is* a diff. Deliberately the diff view's own colours (the
+            // core's `Theme::patch_line_bg` says the same in the palette's Rgb space); the two
+            // can never land on the same line, since a patch has no baseline to be diffed
+            // against.
+            let patch_bg = match (line.change.patch_side(), on_cursor_line) {
+                // Staged changes take the dimmed pair: the hue says which side, the
+                // brightness whether it still needs staging. Only the working-tree diff has
+                // the distinction; a commit's patch is always unstaged.
+                (Some(PatchLine::Added), false) if staged => Some(p.git_staged_added_bg),
+                (Some(PatchLine::Added), true) if staged => Some(p.cursor_line_staged_added_bg),
+                (Some(PatchLine::Removed), false) if staged => Some(p.git_staged_deleted_bg),
+                (Some(PatchLine::Removed), true) if staged => Some(p.cursor_line_staged_deleted_bg),
+                (Some(PatchLine::Added), false) => Some(p.git_added_bg),
+                (Some(PatchLine::Added), true) => Some(p.cursor_line_added_bg),
+                (Some(PatchLine::Removed), false) => Some(p.git_deleted_bg),
+                (Some(PatchLine::Removed), true) => Some(p.cursor_line_deleted_bg),
+                (None, _) => None,
+            };
+            let row_bg = conflict_bg.or(patch_bg).or(
+                match (on_cursor_line, diff_bg, line.change.marker(), staged) {
+                    (false, bg, ..) => bg,
+                    (true, None, ..) => Some(p.cursor_line_bg),
+                    (true, Some(_), Some(DiffMarker::Added), false) => Some(p.cursor_line_added_bg),
+                    (true, Some(_), Some(DiffMarker::Modified), false) => {
+                        Some(p.cursor_line_modified_bg)
+                    }
+                    (true, Some(_), Some(DiffMarker::Added), true) => {
+                        Some(p.cursor_line_staged_added_bg)
+                    }
+                    (true, Some(_), Some(DiffMarker::Modified), true) => {
+                        Some(p.cursor_line_staged_modified_bg)
+                    }
+                    (true, Some(_), ..) => Some(p.cursor_line_bg),
+                },
+            );
+            if let Some(bg) = row_bg {
+                fill(renderer, row_bounds, bg);
+            }
+
+            // Intra-line diff emphasis: the stronger change fill over the line tint, under
+            // the search/selection/cursor fills below (same stacking as the terminal). The
+            // spans are kept — the text pass lifts comment-coloured glyphs inside them, and
+            // the fill is deliberately vivid enough to survive the cursor-line variant tint.
+            let emph_spans: Vec<(u32, u32)> = line
+                .change
+                .emphasis()
+                .iter()
+                .filter_map(|r| grid::byte_range_span(&cells, r.start, r.end))
+                .collect();
+            if !emph_spans.is_empty() {
+                // A patch line's emphasis follows its own side's hue; everywhere else the
+                // change is a *modification* of one line, so the olive pair applies.
+                let emph_bg = match line.change.patch_side() {
+                    Some(PatchLine::Added) => p.git_added_emph_bg,
+                    Some(PatchLine::Removed) => p.git_deleted_emph_bg,
+                    None if staged => p.git_staged_modified_emph_bg,
+                    None => p.git_modified_emph_bg,
                 };
-                let staged = v_stage == DiffStage::Staged;
-                let (bg, fg, bar) = if staged {
-                    (
-                        p.git_staged_deleted_bg,
-                        p.git_staged_deleted,
-                        p.git_staged_deleted,
-                    )
-                } else {
-                    (p.git_deleted_bg, p.git_deleted, p.git_deleted)
-                };
-                fill(
+                let inset = emphasis_inset(cell.height);
+                for &(s, e) in &emph_spans {
+                    fill_content_rounded(
+                        renderer,
+                        Rectangle {
+                            x: text_x(s) - 1.0,
+                            y: y + inset,
+                            width: (e - s) as f32 * cell.width + 2.0,
+                            height: cell.height - 2.0 * inset,
+                        },
+                        emph_bg,
+                        emphasis_radius(cell.height),
+                    );
+                }
+            }
+
+            // Search-match fills: the quiet dim fill, under selection and cursor (matching
+            // the web's search-hit < selection < cursor stacking). The spans are kept — the
+            // text pass below lifts comment-coloured glyphs inside them.
+            let hit_spans: Vec<(u32, u32)> = line
+                .search_matches
+                .iter()
+                .filter_map(|m| grid::byte_range_span(&cells, m.start, m.end))
+                .collect();
+            for &(start, end) in &hit_spans {
+                fill_content(
                     renderer,
                     Rectangle {
-                        x: bounds.x,
+                        x: text_x(start),
                         y,
-                        width: bounds.width,
+                        width: (end - start) as f32 * cell.width,
                         height: cell.height,
                     },
-                    bg,
+                    p.fill_dim,
                 );
+            }
+
+            // Sneak word-jump targets: a dim tint over each candidate word (like a search
+            // hit), plus a bright match-emphasis "chip" over the typed prefix. Tuple is
+            // `(start_dcol, end_dcol, prefix_end_dcol, label)`; the label glyph and chip blanks
+            // are drawn in/after the text pass below.
+            let sneak_spans: Vec<(u32, u32, u32, Option<char>)> = line
+                .sneak_targets
+                .iter()
+                .filter_map(|t| {
+                    let (s, e) = grid::byte_range_span(&cells, t.start, t.end)?;
+                    let pe = if t.prefix_end > t.start {
+                        grid::byte_range_span(&cells, t.start, t.prefix_end).map_or(s, |(_, pe)| pe)
+                    } else {
+                        s
+                    };
+                    Some((s, e, pe, t.label))
+                })
+                .collect();
+            for &(start, end, prefix_end, _) in &sneak_spans {
+                fill_content(
+                    renderer,
+                    Rectangle {
+                        x: text_x(start),
+                        y,
+                        width: (end - start) as f32 * cell.width,
+                        height: cell.height,
+                    },
+                    p.fill_dim,
+                );
+                if prefix_end > start {
+                    // Typed prefix: a cooler, brighter band over the word tint...
+                    fill_content(
+                        renderer,
+                        Rectangle {
+                            x: text_x(start),
+                            y,
+                            width: (prefix_end - start) as f32 * cell.width,
+                            height: cell.height,
+                        },
+                        p.sneak_prefix_bg,
+                    );
+                    // ...with just the label's first cell bright on top.
+                    fill_content(
+                        renderer,
+                        Rectangle {
+                            x: text_x(start),
+                            y,
+                            width: cell.width,
+                            height: cell.height,
+                        },
+                        p.match_highlight,
+                    );
+                }
+            }
+
+            // Gutter change-bar. Under the diff view, removed lines render as phantom
+            // rows above, so no Deleted marker is needed on the anchor line.
+            let gutter_marker = line
+                .change
+                .marker()
+                .filter(|m| !(self.content.diff_view && *m == DiffMarker::Deleted));
+            if line.change.conflict().is_some() {
+                // One unbroken bar down the whole block: the gutter says "conflict here", the
+                // side tints say which half is which.
                 fill(
                     renderer,
                     Rectangle {
@@ -612,665 +889,308 @@ where
                         width: cell.width * 0.5,
                         height: cell.height,
                     },
-                    bar,
+                    p.git_conflict_marker,
                 );
-                // Intra-line emphasis: a stronger red fill over the removed sub-ranges, whose
-                // text switches to the normal foreground (red-on-red is illegible on the vivid
-                // fill; matches the terminal and the web's `.deleted-phantom .diff-emph`). Byte →
-                // column mirrors the flat tab expansion applied to the text runs.
-                let col_of = |byte: usize| -> u32 {
-                    let mut col = 0u32;
-                    for (i, ch) in v_text.char_indices() {
-                        if i >= byte {
-                            break;
-                        }
-                        col += if ch == '\t' {
-                            self.content.tab_width
-                        } else {
-                            1
-                        };
-                    }
-                    col
-                };
-                if !v_emphasis.is_empty() {
-                    let emph_bg = if staged {
-                        p.git_staged_deleted_emph_bg
-                    } else {
-                        p.git_deleted_emph_bg
-                    };
-                    let inset = emphasis_inset(cell.height);
-                    for r in v_emphasis {
-                        let (s, e) = (col_of(r.start as usize), col_of(r.end as usize));
-                        if e > s {
-                            fill_content_rounded(
-                                renderer,
-                                Rectangle {
-                                    x: text_x(s) - 1.0,
-                                    y: y + inset,
-                                    width: (e - s) as f32 * cell.width + 2.0,
-                                    height: cell.height - 2.0 * inset,
-                                },
-                                emph_bg,
-                                emphasis_radius(cell.height),
-                            );
-                        }
-                    }
-                }
-                // The row's text as segments split at the emphasis boundaries (one run when
-                // there's no emphasis), each at its own column so the runs stay aligned.
-                let mut segments: Vec<(usize, usize, bool)> = Vec::new();
-                let mut pos = 0usize;
-                for r in v_emphasis {
-                    let (s, e) = (
-                        (r.start as usize).min(v_text.len()),
-                        (r.end as usize).min(v_text.len()),
-                    );
-                    if s > pos {
-                        segments.push((pos, s, false));
-                    }
-                    if e > s {
-                        segments.push((s, e, true));
-                    }
-                    pos = pos.max(e);
-                }
-                if pos < v_text.len() {
-                    segments.push((pos, v_text.len(), false));
-                }
-                for (s, e, emph) in segments {
-                    let seg =
-                        v_text[s..e].replace('\t', &" ".repeat(self.content.tab_width as usize));
-                    draw_text_run(
-                        renderer,
-                        seg,
-                        Point::new(text_x(col_of(s)), y),
-                        cell,
-                        if emph { p.fg } else { fg },
-                        EDITOR_FONT,
-                        content_clip,
-                        text_shaping,
-                    );
-                }
-            }
-
-            let n_rows = line.visual_rows.len();
-            for (row_idx, row) in line.visual_rows.iter().enumerate() {
-                let y = bounds.y + PAD + abs_row.get() as f32 * cell.height - scroll;
-                abs_row = abs_row.saturating_add(1);
-                if y + cell.height < bounds.y || y > bounds.y + bounds.height {
-                    continue;
-                }
-                let row_bounds = Rectangle {
-                    x: bounds.x,
-                    y,
-                    width: bounds.width,
-                    height: cell.height,
-                };
-
-                let cells = grid::row_cells(row, self.content.tab_width);
-
-                // Line background, under everything else: the diff-view change tint, the
-                // cursor-line tint, or — on the cursor's changed line — the variant that keeps
-                // the change colour visible (web's `.row.cursor-line.added-bg` precedence).
+            } else if let Some(side) = line.change.patch_side() {
+                // A generated patch marks its own sides. Dropping the `+`/`-` columns left the
+                // background tint as the only signal of which side a line is; the bar carries
+                // it too, and dims for a change already staged.
                 let staged = line.change.stage() == DiffStage::Staged;
-                let diff_bg = if self.content.diff_view {
-                    match (line.change.marker(), staged) {
-                        (Some(DiffMarker::Added), false) => Some(p.git_added_bg),
-                        (Some(DiffMarker::Modified), false) => Some(p.git_modified_bg),
-                        (Some(DiffMarker::Added), true) => Some(p.git_staged_added_bg),
-                        (Some(DiffMarker::Modified), true) => Some(p.git_staged_modified_bg),
-                        _ => None,
-                    }
-                } else {
-                    None
+                let color = match (side, staged) {
+                    (PatchLine::Added, false) => p.git_added,
+                    (PatchLine::Added, true) => p.git_staged_added,
+                    (PatchLine::Removed, false) => p.git_deleted,
+                    (PatchLine::Removed, true) => p.git_staged_deleted,
                 };
-                // A conflict's side tints outrank the diff ones and ignore the diff-view toggle:
-                // the sides are how the file is read at all. They can't actually collide — the
-                // server masks the diff out of the blocks — but the ordering says which wins if the
-                // two ever did. The marker lines and the diff3 base section fall through to the
-                // ordinary backgrounds; see the terminal's `conflict_bg`.
-                let conflict_bg = match (line.change.conflict(), on_cursor_line) {
-                    (Some(ConflictLine::Ours), false) => Some(p.git_conflict_ours_bg),
-                    (Some(ConflictLine::Ours), true) => Some(p.cursor_line_conflict_ours_bg),
-                    (Some(ConflictLine::Theirs), false) => Some(p.git_conflict_theirs_bg),
-                    (Some(ConflictLine::Theirs), true) => Some(p.cursor_line_conflict_theirs_bg),
-                    _ => None,
-                };
-                // A generated patch's own sides, ungated like the conflict tints and for the same
-                // reason: the buffer *is* a diff. Deliberately the diff view's own colours (the
-                // core's `Theme::patch_line_bg` says the same in the palette's Rgb space); the two
-                // can never land on the same line, since a patch has no baseline to be diffed
-                // against.
-                let patch_bg = match (line.change.patch_side(), on_cursor_line) {
-                    // Staged changes take the dimmed pair: the hue says which side, the
-                    // brightness whether it still needs staging. Only the working-tree diff has
-                    // the distinction; a commit's patch is always unstaged.
-                    (Some(PatchLine::Added), false) if staged => Some(p.git_staged_added_bg),
-                    (Some(PatchLine::Added), true) if staged => Some(p.cursor_line_staged_added_bg),
-                    (Some(PatchLine::Removed), false) if staged => Some(p.git_staged_deleted_bg),
-                    (Some(PatchLine::Removed), true) if staged => {
-                        Some(p.cursor_line_staged_deleted_bg)
-                    }
-                    (Some(PatchLine::Added), false) => Some(p.git_added_bg),
-                    (Some(PatchLine::Added), true) => Some(p.cursor_line_added_bg),
-                    (Some(PatchLine::Removed), false) => Some(p.git_deleted_bg),
-                    (Some(PatchLine::Removed), true) => Some(p.cursor_line_deleted_bg),
-                    (None, _) => None,
-                };
-                let row_bg = conflict_bg.or(patch_bg).or(
-                    match (on_cursor_line, diff_bg, line.change.marker(), staged) {
-                        (false, bg, ..) => bg,
-                        (true, None, ..) => Some(p.cursor_line_bg),
-                        (true, Some(_), Some(DiffMarker::Added), false) => {
-                            Some(p.cursor_line_added_bg)
-                        }
-                        (true, Some(_), Some(DiffMarker::Modified), false) => {
-                            Some(p.cursor_line_modified_bg)
-                        }
-                        (true, Some(_), Some(DiffMarker::Added), true) => {
-                            Some(p.cursor_line_staged_added_bg)
-                        }
-                        (true, Some(_), Some(DiffMarker::Modified), true) => {
-                            Some(p.cursor_line_staged_modified_bg)
-                        }
-                        (true, Some(_), ..) => Some(p.cursor_line_bg),
-                    },
-                );
-                if let Some(bg) = row_bg {
-                    fill(renderer, row_bounds, bg);
-                }
-
-                // Intra-line diff emphasis: the stronger change fill over the line tint, under
-                // the search/selection/cursor fills below (same stacking as the terminal). The
-                // spans are kept — the text pass lifts comment-coloured glyphs inside them, and
-                // the fill is deliberately vivid enough to survive the cursor-line variant tint.
-                let emph_spans: Vec<(u32, u32)> = line
-                    .change
-                    .emphasis()
-                    .iter()
-                    .filter_map(|r| grid::byte_range_span(&cells, r.start, r.end))
-                    .collect();
-                if !emph_spans.is_empty() {
-                    // A patch line's emphasis follows its own side's hue; everywhere else the
-                    // change is a *modification* of one line, so the olive pair applies.
-                    let emph_bg = match line.change.patch_side() {
-                        Some(PatchLine::Added) => p.git_added_emph_bg,
-                        Some(PatchLine::Removed) => p.git_deleted_emph_bg,
-                        None if staged => p.git_staged_modified_emph_bg,
-                        None => p.git_modified_emph_bg,
-                    };
-                    let inset = emphasis_inset(cell.height);
-                    for &(s, e) in &emph_spans {
-                        fill_content_rounded(
-                            renderer,
-                            Rectangle {
-                                x: text_x(s) - 1.0,
-                                y: y + inset,
-                                width: (e - s) as f32 * cell.width + 2.0,
-                                height: cell.height - 2.0 * inset,
-                            },
-                            emph_bg,
-                            emphasis_radius(cell.height),
-                        );
-                    }
-                }
-
-                // Search-match fills: the quiet dim fill, under selection and cursor (matching
-                // the web's search-hit < selection < cursor stacking). The spans are kept — the
-                // text pass below lifts comment-coloured glyphs inside them.
-                let hit_spans: Vec<(u32, u32)> = line
-                    .search_matches
-                    .iter()
-                    .filter_map(|m| grid::byte_range_span(&cells, m.start, m.end))
-                    .collect();
-                for &(start, end) in &hit_spans {
-                    fill_content(
-                        renderer,
-                        Rectangle {
-                            x: text_x(start),
-                            y,
-                            width: (end - start) as f32 * cell.width,
-                            height: cell.height,
-                        },
-                        p.fill_dim,
-                    );
-                }
-
-                // Sneak word-jump targets: a dim tint over each candidate word (like a search
-                // hit), plus a bright match-emphasis "chip" over the typed prefix. Tuple is
-                // `(start_dcol, end_dcol, prefix_end_dcol, label)`; the label glyph and chip blanks
-                // are drawn in/after the text pass below.
-                let sneak_spans: Vec<(u32, u32, u32, Option<char>)> = line
-                    .sneak_targets
-                    .iter()
-                    .filter_map(|t| {
-                        let (s, e) = grid::byte_range_span(&cells, t.start, t.end)?;
-                        let pe = if t.prefix_end > t.start {
-                            grid::byte_range_span(&cells, t.start, t.prefix_end)
-                                .map_or(s, |(_, pe)| pe)
-                        } else {
-                            s
-                        };
-                        Some((s, e, pe, t.label))
-                    })
-                    .collect();
-                for &(start, end, prefix_end, _) in &sneak_spans {
-                    fill_content(
-                        renderer,
-                        Rectangle {
-                            x: text_x(start),
-                            y,
-                            width: (end - start) as f32 * cell.width,
-                            height: cell.height,
-                        },
-                        p.fill_dim,
-                    );
-                    if prefix_end > start {
-                        // Typed prefix: a cooler, brighter band over the word tint...
-                        fill_content(
-                            renderer,
-                            Rectangle {
-                                x: text_x(start),
-                                y,
-                                width: (prefix_end - start) as f32 * cell.width,
-                                height: cell.height,
-                            },
-                            p.sneak_prefix_bg,
-                        );
-                        // ...with just the label's first cell bright on top.
-                        fill_content(
-                            renderer,
-                            Rectangle {
-                                x: text_x(start),
-                                y,
-                                width: cell.width,
-                                height: cell.height,
-                            },
-                            p.match_highlight,
-                        );
-                    }
-                }
-
-                // Gutter change-bar. Under the diff view, removed lines render as phantom
-                // rows above, so no Deleted marker is needed on the anchor line.
-                let gutter_marker = line
-                    .change
-                    .marker()
-                    .filter(|m| !(self.content.diff_view && *m == DiffMarker::Deleted));
-                if line.change.conflict().is_some() {
-                    // One unbroken bar down the whole block: the gutter says "conflict here", the
-                    // side tints say which half is which.
-                    fill(
-                        renderer,
-                        Rectangle {
-                            x: bounds.x,
-                            y,
-                            width: cell.width * 0.5,
-                            height: cell.height,
-                        },
-                        p.git_conflict_marker,
-                    );
-                } else if let Some(side) = line.change.patch_side() {
-                    // A generated patch marks its own sides. Dropping the `+`/`-` columns left the
-                    // background tint as the only signal of which side a line is; the bar carries
-                    // it too, and dims for a change already staged.
-                    let staged = line.change.stage() == DiffStage::Staged;
-                    let color = match (side, staged) {
-                        (PatchLine::Added, false) => p.git_added,
-                        (PatchLine::Added, true) => p.git_staged_added,
-                        (PatchLine::Removed, false) => p.git_deleted,
-                        (PatchLine::Removed, true) => p.git_staged_deleted,
-                    };
-                    fill(
-                        renderer,
-                        Rectangle {
-                            x: bounds.x,
-                            y,
-                            width: cell.width * 0.5,
-                            height: cell.height,
-                        },
-                        color,
-                    );
-                } else if let Some(marker) = gutter_marker {
-                    let color = gutter_color(p, marker, line.change.stage());
-                    if marker == DiffMarker::Deleted {
-                        // A pure deletion sits *between* this surviving line and the one above,
-                        // so mark it with a small triangle straddling this line's top boundary
-                        // rather than a full-height bar — a bar reads as "this line changed",
-                        // which it didn't. Mirrors the web's `.gutter.deleted::before`.
-                        fill_triangle_right(renderer, bounds.x, y, color);
-                    } else {
-                        fill(
-                            renderer,
-                            Rectangle {
-                                x: bounds.x,
-                                y,
-                                width: cell.width * 0.5,
-                                height: cell.height,
-                            },
-                            color,
-                        );
-                    }
-                }
-
-                // Selection: the saturated visual-selection fill, over the dim search-hit fill
-                // (terminal/web parity — hit < selection < cursor).
-                if draw_sel {
-                    if let Some((start, end)) = grid::row_selection_span(
-                        line.logical_line,
-                        row,
-                        row_idx + 1 == n_rows,
-                        sel_min,
-                        sel_max,
-                        self.content.tab_width,
-                    ) {
-                        fill_content(
-                            renderer,
-                            Rectangle {
-                                x: text_x(start),
-                                y,
-                                width: (end - start) as f32 * cell.width,
-                                height: cell.height,
-                            },
-                            p.bg_visual,
-                        );
-                    }
-                }
-
-                // Match-bracket highlight cells.
-                if let Some((open, close)) = self.content.cursor.match_bracket {
-                    for pos in [open, close] {
-                        if pos.line == line.logical_line {
-                            if let Some((r, dcol, width)) = grid::position_cell(
-                                window,
-                                self.content.focused_element,
-                                pos,
-                                self.content.tab_width,
-                            ) {
-                                if r.saturating_add(1) == abs_row {
-                                    fill_content(
-                                        renderer,
-                                        Rectangle {
-                                            x: text_x(dcol),
-                                            y,
-                                            width: width as f32 * cell.width,
-                                            height: cell.height,
-                                        },
-                                        p.fill_dim,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Continuation marker.
-                if row.byte_offset > 0 {
-                    draw_run(
-                        renderer,
-                        CONTINUATION_MARKER.to_string(),
-                        Point::new(text_x(0), y),
-                        cell,
-                        p.fg_faint,
-                        content_clip,
-                    );
-                }
-
-                // Text, as runs of identical highlight kind. "Inside a search hit" is part
-                // of the run key: comments are the palette's dimmest rung — barely legible
-                // against the dim hit fill — so a match inside one would vanish. Lift just
-                // that text to the normal foreground (the web's `.search-hit.hl-comment`
-                // rule; every other syntax colour reads fine on the fill).
-                let in_hit = |dcol: u32| {
-                    hit_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
-                        || emph_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
-                        || sneak_spans
-                            .iter()
-                            .any(|&(s, e, _, _)| dcol >= s && dcol < e)
-                };
-                // Only the label's first cell is blanked (the label glyph is drawn over it after);
-                // the rest of the typed prefix renders normally on its band.
-                let is_label_cell =
-                    |dcol: u32| sneak_spans.iter().any(|&(s, _, pe, _)| s == dcol && pe > s);
-                // A conflict marker line is scenery, not code: whatever the grammar made of
-                // `<<<<<<< HEAD` is noise, so the whole row takes the marker colour.
-                let marker_line = line.change.conflict() == Some(ConflictLine::Marker);
-                let mut run = String::new();
-                let mut run_start: u32 = 0;
-                let mut run_kind: Option<&str> = None;
-                let mut run_hit = false;
-                let flush = |run: &mut String,
-                             start: u32,
-                             kind: Option<&str>,
-                             hit: bool,
-                             renderer: &mut Renderer| {
-                    if run.is_empty() {
-                        return;
-                    }
-                    let mut color = if marker_line {
-                        p.git_conflict_marker
-                    } else {
-                        kind.and_then(|k| theme::highlight_color(p.mode, k))
-                            .unwrap_or(p.fg)
-                    };
-                    if hit && Some(color) == theme::highlight_color(p.mode, "comment") {
-                        color = p.fg;
-                    }
-                    draw_text_run(
-                        renderer,
-                        std::mem::take(run),
-                        Point::new(text_x(start), y),
-                        cell,
-                        color,
-                        highlight_font(kind),
-                        content_clip,
-                        text_shaping,
-                    );
-                };
-                // Byte offset where the row's trailing whitespace run begins (row end if none) —
-                // only spaces from here on get the `·` glyph, matching the terminal client.
-                let trailing_ws_start = {
-                    let mut start = grid::row_end_byte(row);
-                    for c in cells.iter().rev() {
-                        if c.ch == ' ' || c.ch == '\t' {
-                            start = c.byte;
-                        } else {
-                            break;
-                        }
-                    }
-                    start
-                };
-                for c in &cells {
-                    // Selected whitespace gets a muted indicator glyph over the selection
-                    // fill (terminal parity): `→` for tabs, `·` for trailing spaces. Drawn as its
-                    // own run so the next text run repositions itself past the tab's full width.
-                    let selected =
-                        draw_sel && pos_in_selection(line.logical_line, c.byte, sel_min, sel_max);
-                    let glyph = if selected && c.ch == '\t' {
-                        Some("→")
-                    } else if selected && c.ch == ' ' && c.byte >= trailing_ws_start {
-                        Some("·")
-                    } else {
-                        None
-                    };
-                    if let Some(g) = glyph {
-                        flush(&mut run, run_start, run_kind, run_hit, renderer);
-                        draw_run(
-                            renderer,
-                            g.to_string(),
-                            Point::new(text_x(c.dcol), y),
-                            cell,
-                            p.fg_faint,
-                            content_clip,
-                        );
-                        continue;
-                    }
-                    let hit = in_hit(c.dcol);
-                    if run.is_empty() {
-                        run_start = c.dcol;
-                        run_kind = c.kind;
-                        run_hit = hit;
-                    } else if c.kind != run_kind || hit != run_hit {
-                        flush(&mut run, run_start, run_kind, run_hit, renderer);
-                        run_start = c.dcol;
-                        run_kind = c.kind;
-                        run_hit = hit;
-                    }
-                    if is_label_cell(c.dcol) {
-                        // Blank the label cell; the label glyph is drawn over it after.
-                        for _ in 0..c.width.max(1) {
-                            run.push(' ');
-                        }
-                    } else if c.ch == '\t' {
-                        for _ in 0..c.width {
-                            run.push(' ');
-                        }
-                    } else {
-                        run.push(c.ch);
-                    }
-                }
-                flush(&mut run, run_start, run_kind, run_hit, renderer);
-
-                // Sneak labels: the dark glyph on the bright first cell. The rest of the typed
-                // prefix already rendered in the text pass, over its cooler band.
-                for &(start, _end, prefix_end, label) in &sneak_spans {
-                    if prefix_end > start {
-                        if let Some(lbl) = label {
-                            draw_run(
-                                renderer,
-                                lbl.to_string(),
-                                Point::new(text_x(start), y),
-                                cell,
-                                p.fg_on_accent,
-                                content_clip,
-                            );
-                        }
-                    }
-                }
-
-                // Selected newline: a muted `↵` at the line's end on its last visual row, when the
-                // consumed `\n` falls in the selection (terminal parity). `row_selection_span`
-                // already painted the cell's fill; only the glyph is drawn here.
-                let nl_selected = draw_sel
-                    && row_idx + 1 == n_rows
-                    && pos_in_selection(
-                        line.logical_line,
-                        grid::row_end_byte(row),
-                        sel_min,
-                        sel_max,
-                    );
-                if nl_selected {
-                    let end_dcol = cells
-                        .last()
-                        .map(|c| c.dcol + c.width)
-                        .unwrap_or_else(|| grid::row_prefix_cols(row));
-                    draw_run(
-                        renderer,
-                        "↵".to_string(),
-                        Point::new(text_x(end_dcol), y),
-                        cell,
-                        p.fg_faint,
-                        content_clip,
-                    );
-                }
-
-                // Cursor-line blame: dim virtual text after the line's last row.
-                if let Some((bline, btext)) = &self.content.blame {
-                    // Blame follows the cursor, so it belongs to the cursor's element too.
-                    if *at == grid::ElementLine::new(self.content.focused_element, *bline)
-                        && row_idx + 1 == n_rows
-                    {
-                        let end = cells.last().map(|c| c.dcol + c.width).unwrap_or(0);
-                        draw_run(
-                            renderer,
-                            btext.to_string(),
-                            Point::new(text_x(end + 3), y),
-                            cell,
-                            p.fg_dim,
-                            content_clip,
-                        );
-                    }
-                }
-
-                // Diagnostics underline: 2px line under the span (zero-width ones widened to
-                // one cell so they're visible). A diagnostic clamped to the line end (e.g.
-                // "expected ;") has no real char to mark, so underline the virtual EOL cell —
-                // where the newline glyph sits — on the line's last visual row.
-                let row_end = grid::row_end_byte(row);
-                let eol_dcol = cells
-                    .last()
-                    .map(|c| c.dcol + c.width)
-                    .unwrap_or_else(|| grid::row_prefix_cols(row));
-                for diag in &line.diagnostics {
-                    let span = if row_idx + 1 == n_rows && diag.start >= row_end {
-                        Some((eol_dcol, eol_dcol + 1))
-                    } else {
-                        grid::byte_range_span(&cells, diag.start, diag.end.max(diag.start + 1))
-                    };
-                    if let Some((start, end)) = span {
-                        fill_wavy(
-                            renderer,
-                            text_x(start),
-                            y + cell.height - 2.0,
-                            (end - start).max(1) as f32 * cell.width,
-                            theme::diagnostic_color(p.mode, diag.severity),
-                            content_left,
-                        );
-                    }
-                }
-            }
-
-            // Closing chrome, drawn after the last line's own rows — a patch's final rule, which
-            // has no trailing line to sit above. Decided structurally: "is this the last rendered
-            // line?", not `logical_line + 1 == view_line_count`, which compares a buffer line to a
-            // view line and so never matched for a view whose last element does not end its file.
-            let closing: &[&ViewElement] = if is_last_line { &trailing_chrome } else { &[] };
-            for v in closing.iter().copied() {
-                let y = bounds.y + PAD + abs_row.get() as f32 * cell.height - scroll;
-                abs_row = abs_row.saturating_add(1);
-                if y + cell.height < bounds.y || y > bounds.y + bounds.height {
-                    continue;
-                }
                 fill(
                     renderer,
                     Rectangle {
                         x: bounds.x,
                         y,
-                        width: bounds.width,
+                        width: cell.width * 0.5,
                         height: cell.height,
                     },
-                    p.patch_chrome_bg,
+                    color,
                 );
-                let rail_x = bounds.x + cell.width * 0.25;
-                let rule_y = y + (cell.height * 0.5).floor();
-                let closes = matches!(
-                    v,
-                    ViewElement::Chrome {
-                        kind: ChromeKind::Rule,
-                        ..
-                    }
-                );
-                // On the closing rule the rail runs in from above and *stops*, reaching only as far
-                // as the horizontal it corners into; the blank above it carries the rail through.
-                fill(
-                    renderer,
-                    Rectangle {
-                        x: rail_x,
-                        y,
-                        width: 1.0,
-                        height: if closes { rule_y - y } else { cell.height },
-                    },
-                    p.fg_faint,
-                );
-                if closes {
+            } else if let Some(marker) = gutter_marker {
+                let color = gutter_color(p, marker, line.change.stage());
+                if marker == DiffMarker::Deleted {
+                    // A pure deletion sits *between* this surviving line and the one above,
+                    // so mark it with a small triangle straddling this line's top boundary
+                    // rather than a full-height bar — a bar reads as "this line changed",
+                    // which it didn't. Mirrors the web's `.gutter.deleted::before`.
+                    fill_triangle_right(renderer, bounds.x, y, color);
+                } else {
                     fill(
                         renderer,
                         Rectangle {
-                            x: rail_x,
-                            y: rule_y,
-                            width: bounds.width - (rail_x - bounds.x),
-                            height: 1.0,
+                            x: bounds.x,
+                            y,
+                            width: cell.width * 0.5,
+                            height: cell.height,
                         },
+                        color,
+                    );
+                }
+            }
+
+            // Selection: the saturated visual-selection fill, over the dim search-hit fill
+            // (terminal/web parity — hit < selection < cursor).
+            if draw_sel {
+                if let Some((start, end)) = grid::row_selection_span(
+                    line.logical_line,
+                    row,
+                    row_idx + 1 == n_rows,
+                    sel_min,
+                    sel_max,
+                    self.content.tab_width,
+                ) {
+                    fill_content(
+                        renderer,
+                        Rectangle {
+                            x: text_x(start),
+                            y,
+                            width: (end - start) as f32 * cell.width,
+                            height: cell.height,
+                        },
+                        p.bg_visual,
+                    );
+                }
+            }
+
+            // Match-bracket highlight cells.
+            if let Some((open, close)) = self.content.cursor.match_bracket {
+                for pos in [open, close] {
+                    if pos.line == line.logical_line {
+                        if let Some((r, dcol, width)) = grid::position_cell(
+                            window,
+                            self.content.focused_element,
+                            pos,
+                            self.content.tab_width,
+                        ) {
+                            if r == abs_row {
+                                fill_content(
+                                    renderer,
+                                    Rectangle {
+                                        x: text_x(dcol),
+                                        y,
+                                        width: width as f32 * cell.width,
+                                        height: cell.height,
+                                    },
+                                    p.fill_dim,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Continuation marker.
+            if row.byte_offset > 0 {
+                draw_run(
+                    renderer,
+                    CONTINUATION_MARKER.to_string(),
+                    Point::new(text_x(0), y),
+                    cell,
+                    p.fg_faint,
+                    content_clip,
+                );
+            }
+
+            // Text, as runs of identical highlight kind. "Inside a search hit" is part
+            // of the run key: comments are the palette's dimmest rung — barely legible
+            // against the dim hit fill — so a match inside one would vanish. Lift just
+            // that text to the normal foreground (the web's `.search-hit.hl-comment`
+            // rule; every other syntax colour reads fine on the fill).
+            let in_hit = |dcol: u32| {
+                hit_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
+                    || emph_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
+                    || sneak_spans
+                        .iter()
+                        .any(|&(s, e, _, _)| dcol >= s && dcol < e)
+            };
+            // Only the label's first cell is blanked (the label glyph is drawn over it after);
+            // the rest of the typed prefix renders normally on its band.
+            let is_label_cell =
+                |dcol: u32| sneak_spans.iter().any(|&(s, _, pe, _)| s == dcol && pe > s);
+            // A conflict marker line is scenery, not code: whatever the grammar made of
+            // `<<<<<<< HEAD` is noise, so the whole row takes the marker colour.
+            let marker_line = line.change.conflict() == Some(ConflictLine::Marker);
+            let mut run = String::new();
+            let mut run_start: u32 = 0;
+            let mut run_kind: Option<&str> = None;
+            let mut run_hit = false;
+            let flush = |run: &mut String,
+                         start: u32,
+                         kind: Option<&str>,
+                         hit: bool,
+                         renderer: &mut Renderer| {
+                if run.is_empty() {
+                    return;
+                }
+                let mut color = if marker_line {
+                    p.git_conflict_marker
+                } else {
+                    kind.and_then(|k| theme::highlight_color(p.mode, k))
+                        .unwrap_or(p.fg)
+                };
+                if hit && Some(color) == theme::highlight_color(p.mode, "comment") {
+                    color = p.fg;
+                }
+                draw_text_run(
+                    renderer,
+                    std::mem::take(run),
+                    Point::new(text_x(start), y),
+                    cell,
+                    color,
+                    highlight_font(kind),
+                    content_clip,
+                    text_shaping,
+                );
+            };
+            // Byte offset where the row's trailing whitespace run begins (row end if none) —
+            // only spaces from here on get the `·` glyph, matching the terminal client.
+            let trailing_ws_start = {
+                let mut start = grid::row_end_byte(row);
+                for c in cells.iter().rev() {
+                    if c.ch == ' ' || c.ch == '\t' {
+                        start = c.byte;
+                    } else {
+                        break;
+                    }
+                }
+                start
+            };
+            for c in &cells {
+                // Selected whitespace gets a muted indicator glyph over the selection
+                // fill (terminal parity): `→` for tabs, `·` for trailing spaces. Drawn as its
+                // own run so the next text run repositions itself past the tab's full width.
+                let selected =
+                    draw_sel && pos_in_selection(line.logical_line, c.byte, sel_min, sel_max);
+                let glyph = if selected && c.ch == '\t' {
+                    Some("→")
+                } else if selected && c.ch == ' ' && c.byte >= trailing_ws_start {
+                    Some("·")
+                } else {
+                    None
+                };
+                if let Some(g) = glyph {
+                    flush(&mut run, run_start, run_kind, run_hit, renderer);
+                    draw_run(
+                        renderer,
+                        g.to_string(),
+                        Point::new(text_x(c.dcol), y),
+                        cell,
                         p.fg_faint,
+                        content_clip,
+                    );
+                    continue;
+                }
+                let hit = in_hit(c.dcol);
+                if run.is_empty() {
+                    run_start = c.dcol;
+                    run_kind = c.kind;
+                    run_hit = hit;
+                } else if c.kind != run_kind || hit != run_hit {
+                    flush(&mut run, run_start, run_kind, run_hit, renderer);
+                    run_start = c.dcol;
+                    run_kind = c.kind;
+                    run_hit = hit;
+                }
+                if is_label_cell(c.dcol) {
+                    // Blank the label cell; the label glyph is drawn over it after.
+                    for _ in 0..c.width.max(1) {
+                        run.push(' ');
+                    }
+                } else if c.ch == '\t' {
+                    for _ in 0..c.width {
+                        run.push(' ');
+                    }
+                } else {
+                    run.push(c.ch);
+                }
+            }
+            flush(&mut run, run_start, run_kind, run_hit, renderer);
+
+            // Sneak labels: the dark glyph on the bright first cell. The rest of the typed
+            // prefix already rendered in the text pass, over its cooler band.
+            for &(start, _end, prefix_end, label) in &sneak_spans {
+                if prefix_end > start {
+                    if let Some(lbl) = label {
+                        draw_run(
+                            renderer,
+                            lbl.to_string(),
+                            Point::new(text_x(start), y),
+                            cell,
+                            p.fg_on_accent,
+                            content_clip,
+                        );
+                    }
+                }
+            }
+
+            // Selected newline: a muted `↵` at the line's end on its last visual row, when the
+            // consumed `\n` falls in the selection (terminal parity). `row_selection_span`
+            // already painted the cell's fill; only the glyph is drawn here.
+            let nl_selected = draw_sel
+                && row_idx + 1 == n_rows
+                && pos_in_selection(line.logical_line, grid::row_end_byte(row), sel_min, sel_max);
+            if nl_selected {
+                let end_dcol = cells
+                    .last()
+                    .map(|c| c.dcol + c.width)
+                    .unwrap_or_else(|| grid::row_prefix_cols(row));
+                draw_run(
+                    renderer,
+                    "↵".to_string(),
+                    Point::new(text_x(end_dcol), y),
+                    cell,
+                    p.fg_faint,
+                    content_clip,
+                );
+            }
+
+            // Cursor-line blame: dim virtual text after the line's last row.
+            if let Some((bline, btext)) = &self.content.blame {
+                // Blame follows the cursor, so it belongs to the cursor's element too.
+                if at == grid::ElementLine::new(self.content.focused_element, *bline)
+                    && row_idx + 1 == n_rows
+                {
+                    let end = cells.last().map(|c| c.dcol + c.width).unwrap_or(0);
+                    draw_run(
+                        renderer,
+                        btext.to_string(),
+                        Point::new(text_x(end + 3), y),
+                        cell,
+                        p.fg_dim,
+                        content_clip,
+                    );
+                }
+            }
+
+            // Diagnostics underline: 2px line under the span (zero-width ones widened to
+            // one cell so they're visible). A diagnostic clamped to the line end (e.g.
+            // "expected ;") has no real char to mark, so underline the virtual EOL cell —
+            // where the newline glyph sits — on the line's last visual row.
+            let row_end = grid::row_end_byte(row);
+            let eol_dcol = cells
+                .last()
+                .map(|c| c.dcol + c.width)
+                .unwrap_or_else(|| grid::row_prefix_cols(row));
+            for diag in &line.diagnostics {
+                let span = if row_idx + 1 == n_rows && diag.start >= row_end {
+                    Some((eol_dcol, eol_dcol + 1))
+                } else {
+                    grid::byte_range_span(&cells, diag.start, diag.end.max(diag.start + 1))
+                };
+                if let Some((start, end)) = span {
+                    fill_wavy(
+                        renderer,
+                        text_x(start),
+                        y + cell.height - 2.0,
+                        (end - start).max(1) as f32 * cell.width,
+                        theme::diagnostic_color(p.mode, diag.severity),
+                        content_left,
                     );
                 }
             }
@@ -1387,7 +1307,7 @@ where
         // taller than the viewport. Geometry from the shared `scrollbar::thumb` (same as the TUI
         // and picker); appearance pulled from the theme's scrollable catalog — the exact style
         // the picker/popover scrollbars use, so they match including hover/drag highlighting.
-        let content_h = PAD * 2.0 + window.total_visual_rows as f32 * cell.height;
+        let content_h = PAD * 2.0 + grid::total_rows(&window.root) as f32 * cell.height;
         if let Some((thumb_y, thumb_h)) = crate::core::scrollbar::thumb(
             bounds.height as f64,
             content_h as f64,
@@ -1487,7 +1407,7 @@ impl<'a, Message> EditorView<'a, Message> {
     /// TUI and picker; this returns just the pieces the drag math needs.
     fn scrollbar_metrics(&self, state: &State, bounds: Rectangle) -> Option<(f32, f32)> {
         let (cell, window) = (state.cell?, self.content.window?);
-        let content_h = PAD * 2.0 + window.total_visual_rows as f32 * cell.height;
+        let content_h = PAD * 2.0 + grid::total_rows(&window.root) as f32 * cell.height;
         let (_, thumb_h) = crate::core::scrollbar::thumb(
             bounds.height as f64,
             content_h as f64,

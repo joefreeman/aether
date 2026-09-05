@@ -5,7 +5,7 @@
 //!   input → WasmSession.on_key / on_event / on_rpc_result → Effect[] → execute → render(view())
 //!
 //! Semantic RPCs are core-issued (an `Effect.Request` we send over the socket, feeding the result
-//! back through `on_rpc_result`). Geometry RPCs (`viewport/subscribe`/`scroll_to_row`/`scroll`) are
+//! back through `on_rpc_result`). Geometry RPCs (`view/subscribe`/`view/window`/`view/resize`) are
 //! shell-issued — their params need pixels — but their results are adopted by the core
 //! (`adopt_subscribe`/`adopt_window`); the shell then does the pixel positioning.
 //!
@@ -54,13 +54,15 @@ import type {
   WorkspaceInfo,
   WorkspaceListResult,
   ScrollPosition,
+  SliceRequest,
+  ViewportWindowParams,
   SymbolKind,
   ViewportSubscribeResult,
   ViewportWindowResult,
   WrapMode,
 } from "./protocol";
 // Row arithmetic shared with the core: a chrome row occupies a screen row like any other.
-import { itemRows, rowItems, REPO_OPERATION_LABELS } from "./protocol";
+import { REPO_OPERATION_LABELS } from "./protocol";
 
 const GUTTER_COLS = 1;
 const TAB_WIDTH = 4;
@@ -578,10 +580,9 @@ interface AppSettingsView {
 
 /** Whether `line` of `element` is among the lines this window carries.
  *
- *  The window's `first_view_line`/`last_view_line_exclusive` are *view* coordinates — an
- *  index into the view's concatenated lines — while a cursor's line belongs to its element's own
- *  buffer. In a patch the two are unrelated, so a range test reports "not loaded" for a line in
- *  plain sight, and refetching around it fetches nothing. Mirrors `grid::line_is_loaded`. */
+ *  Per element: a cursor's line belongs to its element's own buffer, and in a patch two elements
+ *  both have a line 12. A test on the number alone reports "not loaded" for a line in plain sight,
+ *  and refetching around it fetches nothing. Mirrors `grid::line_is_loaded`. */
 function lineIsLoaded(w: BufferWindow, element: number, line: number): boolean {
   const editors = (function walk(n: ViewNode): ViewNode[] {
     if (n.node === "stack") return n.children.flatMap(walk);
@@ -1260,7 +1261,7 @@ export class Shell {
   /** The document last rendered (`buffer:revision:loading`) — the DOM-rebuild key. */
   private lastReadDoc: string | null = null;
   /** Socket up? Gates scroll-driven window prefetches — while down, a smooth-scroll animation fires
-   *  ~60 scroll events/sec and each `viewport/scroll_to_row` rejects instantly, spinning the CPU. */
+   *  ~60 scroll events/sec and each `view/window` rejects instantly, spinning the CPU. */
   private connected = true;
   /** A left-button drag-select is in progress (mousedown → mouseup), extending the selection. */
   private dragging = false;
@@ -2628,16 +2629,16 @@ export class Shell {
     this.recomputeGrid();
     const v = this.view();
     if (v.buffer.buffer_id === 0) return; // placeholder session — no buffer to subscribe to yet
-    // Position the new viewport at the buffer's restored scroll, else centre the cursor — which, for
+    // Position the new viewport at the buffer's restored scroll, else near the cursor — which, for
     // a grep/goto jump, sits on the target. Derived FRESH from the current buffer every time (never a
     // cached value), so a jump always loads the window containing its target and the reveal lands.
-    // Named as a *view* line, which is what a scroll position is: a composed view's cursor is a
-    // buffer line of the element it focuses, and in a patch the two spaces are unrelated.
-    const cursorLine = this.session.view_line_for(v.buffer.cursor.position.line);
+    // As content — the element the cursor is in and a line of its buffer — which is what a scroll
+    // position is; a row is something only the client can count, once it has the tree.
     // A fresh jump target (no saved scroll) rests near the top — the cross-buffer counterpart of
     // the in-buffer jump reveal.
-    const scroll = v.buffer.scroll ?? {
-      logical_line: Math.max(0, cursorLine - Math.floor(this.rows * CURSOR_REST_FRACTION)),
+    const scroll: ScrollPosition = v.buffer.scroll ?? {
+      element: v.focused_element,
+      line: Math.max(0, v.buffer.cursor.position.line - Math.floor(this.rows * CURSOR_REST_FRACTION)),
       sub_row: 0,
     };
     const epoch = ++this.viewportEpoch;
@@ -2651,6 +2652,9 @@ export class Shell {
         rows: this.rows,
         overscan_rows: this.rows,
         scroll,
+        // Which element already holds the cursor, when this re-presents a view the session has a
+        // window for; a fresh open leaves it to the server, which takes it from the scroll.
+        focus: this.session.subscribe_focus() ?? null,
         wrap: v.wrap,
         continuation_marker_width: CONTINUATION_MARKER_WIDTH,
         tab_width: TAB_WIDTH,
@@ -2668,11 +2672,10 @@ export class Shell {
     // cursor-move path (RevealCursor → revealCursor → scrollTopTo), not here.
     // The *block's* first row, so a line's chrome comes with it: a patch opened at its first line
     // shows the file heading that introduces it rather than starting just below it. The core
-    // answers, in view space — asking the window for `(element, buffer line)` here is what put the
-    // working-changes view a whole heading down from the top the other shells opened it at.
-    const row = this.session.block_start_of_view_line(scroll.logical_line);
+    // answers off the layout it holds, so this is the row the painter puts that line on.
+    const row = this.session.subscribe_top_row(scroll.element, scroll.line, scroll.sub_row);
     if (row != null) {
-      this.bufferEl.scrollTop = (row + scroll.sub_row) * this.cell.h + BUFFER_PAD;
+      this.bufferEl.scrollTop = row * this.cell.h + BUFFER_PAD;
     }
     this.revealCursor();
   }
@@ -2785,28 +2788,27 @@ export class Shell {
     // scrolling needs no repositioning here — just the window prefetch below.
     // Skip the prefetch while disconnected: the RPC would reject instantly, and a smooth-scroll
     // animation firing scroll events would otherwise spin doomed fetches for the reconnect window.
-    const w = this.snapshot?.window;
-    if (!w || this.fetchInFlight || !this.connected) return;
-    const topRow = Math.round((this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h);
-    const loadedStart = w.first_visual_row;
-    const loadedEnd = loadedStart + this.loadedVisualRows(w);
-    const margin = this.rows;
+    const viewportId = this.snapshot?.viewport_id;
+    if (!this.snapshot?.window || viewportId == null || this.fetchInFlight || !this.connected) return;
+    const topRow = Math.max(0, Math.round((this.bufferEl.scrollTop - BUFFER_PAD) / this.cell.h));
     const visible = this.visibleRows();
-    const needAbove = loadedStart > 0 && topRow < loadedStart + margin;
-    const needBelow = loadedEnd < w.total_visual_rows && topRow + visible > loadedEnd - margin;
-    if (needAbove || needBelow) this.fetchByRow(topRow);
+    // The core knows the layout, so it decides: fetch when the rows the screen reaches — plus a
+    // half-screen margin, so the fetch lands before the scroll reaches unloaded rows — are not all
+    // loaded, asking for a screen either side so the next half-screen of scrolling asks nothing.
+    const req = this.session.window_request(topRow, visible, Math.floor(visible / 2), visible) as {
+      anchor: ScrollPosition;
+      slices: SliceRequest[];
+    } | null;
+    if (req) this.fetchWindow({ viewport_id: viewportId, ...req });
   }
 
-  /** Fetch the window around an absolute visual row; content is absolutely placed so scrollTop is
-   *  unchanged (no jump). */
-  private fetchByRow(topRow: number): void {
+  /** Fetch the slices a scroll reached; every row keeps its place in the scroller, so scrollTop
+   *  is unchanged (no jump). */
+  private fetchWindow(params: ViewportWindowParams): void {
     const epoch = this.viewportEpoch;
     this.fetchInFlight = true;
     this.client
-      .rpc<ViewportWindowResult>("view/scroll_to_row", {
-        viewport_id: this.snapshot?.viewport_id,
-        top_visual_row: Math.max(0, topRow),
-      })
+      .rpc<ViewportWindowResult>("view/window", params)
       .then(
         (res) => {
           this.fetchInFlight = false;
@@ -3036,35 +3038,10 @@ export class Shell {
     return Math.max(1, Math.floor(this.bufferEl.clientHeight / this.cell.h));
   }
 
-  private loadedVisualRows(w: BufferWindow): number {
-    // Every row-producing item, not just the lines: a chrome row occupies a screen row too.
-    return rowItems(w.root).reduce((n, item) => n + itemRows(item), 0);
-  }
-
-  /** Absolute visual-row index of the cursor in the document, or null if its line isn't loaded. */
+  /** Absolute visual row of the cursor in the view, or null if its line isn't loaded. The core
+   *  answers off the shared layout, so it is the row the painter draws the cursor on. */
   private cursorAbsoluteVisualRow(): number | null {
-    const v = this.snapshot;
-    if (!v?.window) return null;
-    const cl = v.buffer.cursor.position.line;
-    if (!lineIsLoaded(v.window, v.focused_element, cl)) return null;
-    let row = v.window.first_visual_row;
-    for (const item of rowItems(v.window.root)) {
-      if (item.kind === "chrome") {
-        row += 1;
-        continue;
-      }
-      const l = item.line;
-      const above = l.baseline_above?.length ?? 0;
-      if (item.element === v.focused_element && l.logical_line === cl) {
-        let idx = 0;
-        for (let i = 0; i < l.visual_rows.length; i++) {
-          if (l.visual_rows[i].byte_offset <= v.buffer.cursor.position.col) idx = i;
-        }
-        return row + above + idx;
-      }
-      row += above + l.visual_rows.length;
-    }
-    return null;
+    return this.session.cursor_row() ?? null;
   }
 
   // ---- render ---------------------------------------------------------------------------------
@@ -3229,8 +3206,9 @@ export class Shell {
       insertMode: v.mode === "insert",
       awaitingKey: v.pending !== null || (v.count ?? 0) > 0 || v.sneak_active,
       contentWidthPx: v.wrap === "none" ? this.cell.w * (v.window.max_line_width + 2) : 0,
-      spacerHeightPx: v.window.total_visual_rows * this.cell.h + BUFFER_PAD * 2,
-      contentTopPx: v.window.first_visual_row * this.cell.h + BUFFER_PAD,
+      spacerHeightPx: this.session.total_rows() * this.cell.h + BUFFER_PAD * 2,
+      contentTopPx: BUFFER_PAD,
+      rowHeightPx: this.cell.h,
       // The blame data arrives via the server's `git/blame_changed` push (blame follow) and
       // rides the core view; format the label here — "3w ago" needs a wall clock. Shown on the
       // cursor line in Normal mode only, and only when the followed line is still the cursor's.

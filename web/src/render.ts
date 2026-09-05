@@ -632,10 +632,13 @@ export interface RenderOpts {
   awaitingKey: boolean;
   /** Full content width in px for native horizontal scroll (no-wrap), or 0 to fit the container. */
   contentWidthPx: number;
-  /** Full-document scroll height in px (total_visual_rows × lineHeight) — sizes the scroller. */
+  /** Full-document scroll height in px (`totalRows` × row height, plus padding) — sizes the
+   *  scroller. */
   spacerHeightPx: number;
-  /** Absolute top of the loaded window inside the scroller (first_visual_row × lineHeight). */
+  /** Where row 0 of the view sits inside the scroller — the padding above it. */
   contentTopPx: number;
+  /** One row's height in px: what the rows nothing is loaded at are sized by. */
+  rowHeightPx: number;
   /** End-of-line git blame for the cursor line, or null. */
   blame: string | null;
   /** Inline diff view on — gates the line-background tint (the gutter change-bar is always on). */
@@ -649,7 +652,19 @@ export interface RenderOpts {
  *  buffer surface — a shadow root in the browser (see `Shell.bufferSurface`), a plain element in
  *  tests; both satisfy the `:scope > .buffer-spacer` lookup and `replaceChildren` used below. */
 export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOpts): void {
-  const { window, cursor, insertMode, awaitingKey, contentWidthPx, spacerHeightPx, contentTopPx, blame, diffView, focusedElement } = opts;
+  const {
+    window,
+    cursor,
+    insertMode,
+    awaitingKey,
+    contentWidthPx,
+    spacerHeightPx,
+    contentTopPx,
+    rowHeightPx,
+    blame,
+    diffView,
+    focusedElement,
+  } = opts;
   // The cursor's appearance is decided once here: an underscore while waiting for the next key of a
   // chord (overriding mode), else a bar in Insert, else a block. `makeSpan` just appends this class.
   const cursorClass = awaitingKey ? "cursor pending" : insertMode ? "cursor insert" : "cursor";
@@ -661,9 +676,19 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
 
   const frag = document.createDocumentFragment();
   // One walk of the shared row layout: chrome, phantom and text rows in the order every shell must
-  // draw them. `paintedRows` mirrors `grid::painted_rows`, which is the tested specification — the
-  // three painters each used to walk the tree themselves and disagreed about where rows landed.
+  // draw them, each at its absolute row. `paintedRows` mirrors `grid::painted_rows`, which is the
+  // tested specification — the three painters each used to walk the tree themselves and disagreed
+  // about where rows landed. Rows nothing is loaded at — an element the viewport has not reached,
+  // a fetch still in flight — are a gap the same height, so everything below keeps its row.
+  let next = 0;
   for (const item of paintedRows(window.root)) {
+    if (item.at > next) {
+      const gap = document.createElement("div");
+      gap.className = "row-gap";
+      gap.style.height = `${(item.at - next) * rowHeightPx}px`;
+      frag.appendChild(gap);
+    }
+    next = item.at + 1;
     if (item.kind === "chrome") {
       frag.appendChild(chromeRow(item.node));
       continue;

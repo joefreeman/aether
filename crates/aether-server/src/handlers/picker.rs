@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 /// Build the buffer-picker candidate list for `client_id`: every buffer belonging to the
 /// client's active workspace, MRU first, then any workspace buffers the client hasn't touched yet
 /// (e.g. opened by another client of the same workspace) in buffer-id order. `(scratch N)`
@@ -1109,15 +1108,31 @@ fn build_outline_candidates(
             };
             // The element's own buffer and line, when it windows a real file — what everything
             // acting on this row actually wants.
-            let file = vp
+            let file = s
+                .view_of(vp)
                 .elements
                 .get(e.element as usize)
                 .filter(|b| b.buffer_id != view_buffer)
                 .map(|b| (e.element, b.buffer_id, e.line));
+            // And the file itself, for a jumplist entry to keep: a working-tree file by its path,
+            // a file at a revision by the key that re-materialises it.
+            let durable = e.identity.clone().map(|identity| {
+                let target = if identity.starts_with('/') {
+                    crate::jumplist::JumplistTarget::File {
+                        path_index: None,
+                        relative_path: None,
+                        abs_path: identity,
+                    }
+                } else {
+                    crate::jumplist::JumplistTarget::View { key: identity }
+                };
+                (target, e.file_lines.start)
+            });
             crate::picker::GitChangeCandidate::for_patch(
                 crate::picker::PatchRowTarget {
                     buffer: view_buffer,
                     file,
+                    durable,
                     line_of: vec![e.patch_line],
                 },
                 e.file,
@@ -1183,6 +1198,7 @@ fn build_patch_change_candidates(
                     // No viewport here, so no element to resolve against: this builder runs for a
                     // cursor that has not entered one.
                     file: None,
+                    durable: None,
                     line_of,
                 },
                 file.path().to_string(),
@@ -1580,7 +1596,9 @@ pub async fn picker_view(
             Some(buffer_id) => {
                 let s = state.lock().await;
                 let mut out = Vec::new();
-                for id in crate::handlers::viewport::view_element_buffers(&s, params.view_id, buffer_id) {
+                for id in
+                    crate::handlers::viewport::view_element_buffers(&s, params.view_id, buffer_id)
+                {
                     out.extend(build_diagnostic_candidates(&s, id));
                 }
                 picker_state::PickerCandidates::Diagnostics(out)
@@ -1630,9 +1648,12 @@ pub async fn picker_view(
                     let vp = s
                         .viewports
                         .values()
-                        .find(|v| v.client_id == client_id && v.shows(view_buffer));
-                    vp.filter(|_| s.try_doc_of(view_buffer).is_some_and(|d| d.generated.is_some()))
-                        .map(|v| build_outline_candidates(&s, v, &s.doc_of(view_buffer).text))
+                        .find(|v| v.client_id == client_id && v.shows(s.view_of(v), view_buffer));
+                    vp.filter(|_| {
+                        s.try_doc_of(view_buffer)
+                            .is_some_and(|d| d.generated.is_some())
+                    })
+                    .map(|v| build_outline_candidates(&s, v, &s.doc_of(view_buffer).text))
                 }
                 None => None,
             };
@@ -2252,8 +2273,11 @@ pub async fn picker_view(
                 }),
                 picker_state::PickerCandidates::Jumplist(entries),
             ) if !entries.is_empty() => {
-                let location =
-                    crate::jumplist::location_of(abs_path.as_deref(), *buffer_id, view_key.as_deref());
+                let location = crate::jumplist::location_of(
+                    abs_path.as_deref(),
+                    *buffer_id,
+                    view_key.as_deref(),
+                );
                 let idx = crate::jumplist::nearest_index(entries, location, *leading_edge);
                 Some(picker.candidates.make_item(idx, Vec::new()))
             }
@@ -2658,7 +2682,7 @@ pub async fn picker_select(
     let ordinary = picker_state::resolve_select(picker, &params.item);
     drop(s);
     if let Some((view_key, identity, position)) = landing {
-        if let Some((open, seat)) = land_in_captured_view(
+        match land_in_captured_view(
             state,
             ctx,
             client_id,
@@ -2669,12 +2693,24 @@ pub async fn picker_select(
         )
         .await?
         {
-            return Ok(PickerSelectResult::ViewElement {
-                element: seat.element,
-                buffer_id: seat.buffer_id,
+            Landing::Seated {
+                open,
+                seat,
                 position,
-                open: open.map(Box::new),
-            });
+            } => {
+                return Ok(PickerSelectResult::ViewElement {
+                    element: seat.element,
+                    buffer_id: seat.buffer_id,
+                    position,
+                    open: open.map(Box::new),
+                })
+            }
+            Landing::Gone { open } => {
+                return Ok(PickerSelectResult::Gone {
+                    open: open.map(Box::new),
+                })
+            }
+            Landing::NoView => {}
         }
     }
     ordinary.ok_or_else(|| {
@@ -2704,6 +2740,22 @@ fn jumplist_landing(
     ))
 }
 
+/// Where a jumplist row captured from a composed view lands.
+enum Landing {
+    /// In the view: which element, and where in its buffer. `open` is the view itself, reopened,
+    /// when nothing was showing it — the client adopts it before seating.
+    Seated {
+        open: Option<BufferOpenResult>,
+        seat: aether_protocol::viewport::ViewSeat,
+        position: LogicalPosition,
+    },
+    /// The view was reached — on screen, or reopened (`open`) — and no longer holds the entry:
+    /// the change was staged, committed or reverted since the capture. Nowhere to land, and
+    /// nowhere else to go: the entry is a place *in that view*.
+    Gone { open: Option<BufferOpenResult> },
+    /// Not on screen and not to be reopened here.
+    NoView,
+}
 
 /// Where a jumplist row captured from a composed view lands — reopening that view when nothing is
 /// showing it.
@@ -2713,9 +2765,11 @@ fn jumplist_landing(
 /// idea of what to do when the view was gone. Two derivations of "where does this row land" is what
 /// every bug in this area has been, so there is now one, and both routes call it.
 ///
-/// `Ok(None)` when the row names no view, when reopening is not allowed here, or when the view can
-/// no longer be materialised — the caller then falls back to the entry's own file target, which is
-/// the same place reached the only other way there is.
+/// An entry that names a view is never answered with anything but that view. It used to fall back
+/// to opening the entry's file in a plain editor when the view could not place it — which is where
+/// every jump went the moment the view's elements stopped windowing their files — so the same
+/// key took you to the review or out of it depending on state nobody could see. Now the view says
+/// [`Landing::Gone`], and the client says so.
 ///
 /// `reopen` is the caller's licence to materialise: a step that was told not to open anything still
 /// wants a seat if the view happens to be on screen, but must not conjure it back otherwise.
@@ -2727,45 +2781,70 @@ async fn land_in_captured_view(
     identity: &str,
     line: u32,
     reopen: bool,
-) -> Result<Option<(Option<BufferOpenResult>, aether_protocol::viewport::ViewSeat)>, RpcError> {
+) -> Result<Landing, RpcError> {
     {
         let s = state.lock().await;
-        if let Some(seat) =
+        if let Some((seat, position)) =
             crate::handlers::viewport::element_holding(&s, client_id, view_key, identity, line)
         {
-            return Ok(Some((None, seat))); // already on screen: nothing to open
+            return Ok(Landing::Seated {
+                open: None, // already on screen: nothing to open
+                seat,
+                position,
+            });
+        }
+        // On screen, but without the entry.
+        if s.viewports.values().any(|vp| {
+            vp.client_id == client_id
+                && crate::handlers::viewport::view_key_of(&s, vp.view_id).as_deref()
+                    == Some(view_key)
+        }) {
+            return Ok(Landing::Gone { open: None });
         }
     }
     if !reopen {
-        return Ok(None);
+        return Ok(Landing::NoView);
     }
-    let Some(mut opened) = crate::handlers::nav::materialise_virtual_key(state, ctx, view_key)
-        .await
-        .transpose()?
-    else {
-        return Ok(None);
+    let opened = match crate::handlers::nav::materialise_virtual_key(state, ctx, view_key).await {
+        Some(Ok(opened)) => opened,
+        // A working tree gone clean has nothing left to show: the entry, and every other entry of
+        // the view, is gone.
+        Some(Err(e)) if e.is_nothing_to_show() => return Ok(Landing::Gone { open: None }),
+        Some(Err(e)) => return Err(e),
+        None => return Ok(Landing::Gone { open: None }),
     };
-    // The elements are rebuilt with the view, which is why the entry stores a key and a path and
-    // never an element id.
     let s = state.lock().await;
-    let Some(seat) = crate::handlers::viewport::seat_in_fresh_view(&s, opened.buffer_id, identity, line)
+    Ok(seat_in_reopened(&s, opened, identity, line))
+}
+
+/// Seat in a view that has just been (re)materialised — the elements are rebuilt with it, which is
+/// why an entry stores a key and a file and never an element id.
+fn seat_in_reopened(
+    s: &ServerState,
+    mut opened: BufferOpenResult,
+    identity: &str,
+    line: u32,
+) -> Landing {
+    let Some((seat, position)) =
+        crate::handlers::viewport::seat_in_fresh_view(s, opened.buffer_id, identity, line)
     else {
-        return Ok(None);
+        return Landing::Gone { open: Some(opened) };
     };
     // **Frame the reopen on the seat.** The client subscribes to the view it has just adopted, and
-    // a subscribe derives its focused element from the line the view is scrolled to — so a reopen
+    // a fresh subscribe takes its focused element from the one the scroll names — so a reopen
     // framed at the top focuses element 0 and quietly undoes the focus this jump asked for. That is
     // what "the first `]` takes me to the view but not to the entry" was: the seat was correct and
     // then overwritten a moment later by the client's own subscribe.
-    if let Some(view_line) =
-        crate::handlers::viewport::view_line_in_fresh_view(&s, opened.buffer_id, seat.element, line)
-    {
-        opened.scroll = Some(aether_protocol::viewport::ScrollPosition {
-            logical_line: view_line,
-            sub_row: 0.0,
-        });
+    opened.scroll = Some(aether_protocol::viewport::ScrollPosition {
+        element: seat.element,
+        line: position.line,
+        sub_row: 0.0,
+    });
+    Landing::Seated {
+        open: Some(opened),
+        seat,
+        position,
     }
-    Ok(Some((Some(opened), seat)))
 }
 
 /// Re-seat a jumplist jump inside the view it was captured from.
@@ -3007,11 +3086,13 @@ pub async fn jumplist_capture(
     // rows: every row of a patch picker is a row *of that view*.
     let view_key = patch_view.and_then(|v| crate::handlers::viewport::view_key_of(s, v));
     for entry in &mut list.entries {
+        // Every row of a patch picker is a row of that view, whatever it addresses.
+        if view_key.is_some() {
+            entry.view = view_key.clone();
+        }
         let Some(buffer_id) = entry.target.buffer_id() else {
             continue;
         };
-        // Only the rows that had a buffer behind them came from inside a view.
-        entry.view = view_key.clone();
         let doc = s.try_doc_of(buffer_id);
         let abs_path = doc
             .and_then(|d| d.canonical_path.as_ref())
@@ -3141,7 +3222,7 @@ pub async fn jumplist_step(
     params: JumplistStepParams,
 ) -> Result<JumplistStepResult, RpcError> {
     let client_id = ctx.client_id;
-    let (mut target, open_params, landing) = {
+    let (mut target, open_params, landing, idx) = {
         let s = state.lock().await;
         let buffer = s
             .try_doc_of(params.buffer_id)
@@ -3210,70 +3291,170 @@ pub async fn jumplist_step(
                 }
             },
         };
-        let entry = &list.entries[idx];
-        // What this entry needs in order to land in the view it was captured from. Resolved after
-        // the lock by `land_in_captured_view` — the same call the picker's own Enter makes, so the
-        // two cannot disagree about where a row goes.
-        // Which element of the view to land in, named the way the view itself names its elements'
-        // buffers: a path for a working-tree file, a virtual key for a file at a revision.
-        let landing = match (entry.view.clone(), entry.target.identity(), entry.position) {
-            (Some(view), Some(identity), Some(position)) => {
-                Some((view, identity.to_string(), position.line))
-            }
-            _ => None,
-        };
-        let target = JumplistStepTarget {
-            path: entry.abs_path().map(str::to_string),
-            buffer_id: entry.target.buffer_id(),
-            position: entry.position,
-            anchor: entry.anchor,
-            index: idx as u32 + 1,
-            total: list.entries.len() as u32,
-            opened: None,
-            seat: None,
-        };
-        // Built whether or not it is used: it only describes the entry, and whether the view can be
-        // landed in is not known until the lock is gone.
-        // Not for a view-addressed entry: it names no file, and `jumplist_open_params` answers a
-        // pathless, id-less target with a *scratch* buffer — which is what a commit-patch step
-        // opened once its dead buffer id stopped erroring.
-        let open_params = (params.open && entry.target.view_key().is_none())
-            .then(|| jumplist_open_params(&s, client_id, entry, params.buffer_id));
-        (target, open_params, landing)
+        let (target, open_params, landing) = step_plan(&s, client_id, &params, idx);
+        (target, open_params, landing, idx)
     };
-    // Composite post-step. Landing in the view the row came from wins: that is where the row *is*,
-    // and its file is reached through the view, as one of the windows onto it. `params.open` is the
-    // licence to reopen a view that has gone — without it a step still seats in one already on
-    // screen, but conjures nothing back.
-    let landed = match landing {
-        Some((view_key, identity, line)) => {
-            match land_in_captured_view(
-                state,
-                ctx,
-                client_id,
-                &view_key,
-                &identity,
-                line,
-                params.open,
-            )
-                .await?
-            {
-                Some((open, seat)) => {
-                    target.seat = Some(seat);
-                    target.opened = open;
-                    true
-                }
-                None => false,
-            }
-        }
-        None => false,
-    };
-    // Only when there was no view to land in. Opening the file is the fallback, and doing it as
-    // well would drop a bare editor over the view just seated in — which is what `]` used to do.
-    if !landed {
+    let total = target.total;
+    // Composite post-step. An entry captured from a view lands *in* that view: that is where the
+    // row is, and its file is reached through the view, as one of the windows onto it.
+    // `params.open` is the licence to reopen a view that has gone — without it a step still seats
+    // in one already on screen, but conjures nothing back.
+    let Some((view_key, identity, line)) = landing else {
         if let Some(open_params) = open_params {
             target.opened = Some(buffer_open(state, ctx, open_params).await?);
         }
+        return Ok(JumplistStepResult::Moved(Box::new(target)));
+    };
+    let mut landing = land_in_captured_view(
+        state,
+        ctx,
+        client_id,
+        &view_key,
+        &identity,
+        line,
+        params.open,
+    )
+    .await?;
+    // An entry the view no longer holds is stepped **over**, or the key would stick on it: the
+    // step is cursor-relative, and a landing that moved nothing leaves the next press choosing the
+    // same entry again. The view is reached once; the entries after it are looked up in it directly.
+    let mut skipped = 0u32;
+    let mut reopened: Option<BufferOpenResult> = None;
+    let mut idx = idx;
+    loop {
+        match landing {
+            Landing::Seated {
+                open,
+                seat,
+                position,
+            } => {
+                target.seat = Some(seat);
+                target.opened = open.or(reopened);
+                // The line as the element's buffer numbers it. Translated, the captured selection
+                // means nothing.
+                if target.position.map(|p| p.line) != Some(position.line) {
+                    target.anchor = None;
+                }
+                target.position = Some(position);
+                target.skipped = skipped;
+                return Ok(JumplistStepResult::Moved(Box::new(target)));
+            }
+            Landing::NoView => return Ok(JumplistStepResult::Moved(Box::new(target))),
+            Landing::Gone { open } => {
+                skipped += 1;
+                reopened = reopened.or(open);
+                let next = match params.direction {
+                    Direction::Forward => idx + 1,
+                    Direction::Backward => idx.wrapping_sub(1),
+                };
+                let s = state.lock().await;
+                if s.jumplist(client_id)
+                    .is_none_or(|l| next >= l.entries.len())
+                {
+                    return Ok(JumplistStepResult::Gone {
+                        index: idx as u32 + 1,
+                        total,
+                        skipped,
+                        opened: reopened.map(Box::new),
+                    });
+                }
+                idx = next;
+                let (next_target, _, next_landing) = step_plan(&s, client_id, &params, idx);
+                target = next_target;
+                landing = match next_landing {
+                    Some((key, identity, line)) if key == view_key => {
+                        match crate::handlers::viewport::element_holding(
+                            &s, client_id, &view_key, &identity, line,
+                        )
+                        .or_else(|| {
+                            let view = reopened.as_ref()?.buffer_id;
+                            crate::handlers::viewport::seat_in_fresh_view(&s, view, &identity, line)
+                        }) {
+                            Some((seat, position)) => Landing::Seated {
+                                open: None,
+                                seat,
+                                position,
+                            },
+                            None => Landing::Gone { open: None },
+                        }
+                    }
+                    // An entry of another view, or of a file: the walk continues through it in the
+                    // ordinary way, without the reopened view — which the client is not shown.
+                    Some((key, identity, line)) => {
+                        drop(s);
+                        land_in_captured_view(
+                            state,
+                            ctx,
+                            client_id,
+                            &key,
+                            &identity,
+                            line,
+                            params.open,
+                        )
+                        .await?
+                    }
+                    None => {
+                        let open_params = (params.open).then(|| {
+                            jumplist_open_params(
+                                &s,
+                                client_id,
+                                &s.jumplist(client_id).unwrap().entries[idx],
+                                params.buffer_id,
+                            )
+                        });
+                        drop(s);
+                        if let Some(open_params) = open_params {
+                            target.opened = Some(buffer_open(state, ctx, open_params).await?);
+                        }
+                        target.skipped = skipped;
+                        return Ok(JumplistStepResult::Moved(Box::new(target)));
+                    }
+                };
+            }
+        }
     }
-    Ok(JumplistStepResult::Moved(Box::new(target)))
+}
+
+/// What landing on entry `idx` takes: how it names the view it came from (key, file identity, file
+/// line), the target as the client sees it, and the open a file-shaped entry needs. Resolved after
+/// the lock by `land_in_captured_view` — the same call the picker's own Enter makes, so the two
+/// cannot disagree about where a row goes.
+fn step_plan(
+    s: &ServerState,
+    client_id: ClientId,
+    params: &JumplistStepParams,
+    idx: usize,
+) -> (
+    JumplistStepTarget,
+    Option<BufferOpenParams>,
+    Option<(String, String, u32)>,
+) {
+    let list = s.jumplist(client_id).expect("a captured list");
+    let entry = &list.entries[idx];
+    // Which element of the view to land in, named the way the view itself names its elements'
+    // buffers: a path for a working-tree file, a virtual key for a file at a revision.
+    let landing = match (entry.view.clone(), entry.target.identity(), entry.position) {
+        (Some(view), Some(identity), Some(position)) => {
+            Some((view, identity.to_string(), position.line))
+        }
+        _ => None,
+    };
+    let target = JumplistStepTarget {
+        path: entry.abs_path().map(str::to_string),
+        buffer_id: entry.target.buffer_id(),
+        position: entry.position,
+        anchor: entry.anchor,
+        index: idx as u32 + 1,
+        total: list.entries.len() as u32,
+        opened: None,
+        seat: None,
+        skipped: 0,
+    };
+    // Built whether or not it is used: it only describes the entry. Not for a view-addressed
+    // entry: it names no file, and `jumplist_open_params` answers a pathless, id-less target with
+    // a *scratch* buffer — which is what a commit-patch step opened once its dead buffer id stopped
+    // erroring.
+    let open_params = (params.open && landing.is_none() && entry.target.view_key().is_none())
+        .then(|| jumplist_open_params(s, client_id, entry, params.buffer_id));
+    (target, open_params, landing)
 }

@@ -2,13 +2,13 @@
 //! server has no notion of mode.
 
 use aether_client::session::ConnState;
-use aether_protocol::coords::{ViewLine, VisualRow};
+use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::{CursorState, Direction, Granularity};
 use aether_protocol::git::GitBufferStatus;
 use aether_protocol::input::SurroundTarget;
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus};
 use aether_protocol::search::SearchSummary;
-use aether_protocol::viewport::{DiagnosticSeverity, LogicalLineRender, WrapMode};
+use aether_protocol::viewport::{DiagnosticSeverity, WrapMode};
 use aether_protocol::{BufferId, LogicalPosition, ViewportId};
 use anyhow::{Context, Result};
 use crossterm::cursor::SetCursorStyle;
@@ -523,52 +523,27 @@ pub struct EditorState {
     pub buffer_id: BufferId,
     pub viewport_id: ViewportId,
     pub cursor: CursorState,
-    /// Index of the top line in the window's **flattened** line list.
-    ///
-    /// An index rather than a logical line: a logical line identifies a line only within its
-    /// element, so once a view spans several files it cannot address the list at all.
-    pub scroll_line_index: usize,
-    /// Visual rows of the top line hidden above the viewport — the
-    /// fractional part of the scroll position. Lets scrolling advance by *visual* rows (so it
-    /// doesn't jump over a wrapped line's rows or a diff hunk's phantom deleted rows) while the
-    /// server stays logical-line based. Always `< ` the top line's visual height; reset to 0 by
-    /// any logical-line-aligned scroll (cursor jumps, window refetches).
-    pub scroll_skip_rows: u32,
-    /// The view's rendered lines, each paired with **where it is** — which element, which of
-    /// that element's lines. Never a bare line: a logical line number names a line in every
-    /// element at once, and comparing one to the cursor's is how the same bug got written eight
-    /// times. See [`aether_client::grid::ElementLine`].
-    pub lines: Vec<(aether_client::grid::ElementLine, LogicalLineRender)>,
+    /// The absolute row the painter starts from: the scroll itself, or — while the scroll rests
+    /// somewhere nothing is loaded — the nearest loaded edge, so the screen shows something until
+    /// the fetch lands. See `Shell::paintable_row`.
+    pub paint_top: VisualRow,
     /// Which editor element holds the live cursor — the session's `focused_element`, mirrored here
     /// so the painter can name a line without guessing. A logical line number identifies a line only
     /// *within* an element.
     pub focused_element: aether_protocol::viewport::FieldId,
-    /// The window's tree. Held alongside the flattened `lines` because the row arithmetic has to
-    /// count chrome rows, which belong to no line — summing per-line heights silently drops them.
+    /// The window's tree: everything the painter draws, at the rows the shared layout
+    /// ([`aether_client::grid::painted_rows_of`]) puts each thing on — chrome on a row of its own,
+    /// a loaded slice `first_row` rows into its element. There is no flattened line list beside
+    /// it: painting from one meant re-counting chrome and phantom rows here, and the cursor and
+    /// click maths each counting them again, differently.
     pub root: aether_protocol::viewport::Element,
-    /// A generated patch's chrome, keyed by the **index** of the line it stands above in the
-    /// flattened line list, plus whatever trails the last line. Keyed by index rather than by
-    /// logical line because two elements windowing different files both start at, say, line 10 —
-    /// and keying by the number lost one of their headings. See `grid::chrome_by_line_index`.
-    pub chrome_above: std::collections::HashMap<usize, Vec<aether_protocol::viewport::Element>>,
-    pub trailing_chrome: Vec<aether_protocol::viewport::Element>,
-    /// Total logical lines in the buffer, kept fresh from every viewport response /
-    /// `viewport/lines_changed` notification.
-    pub line_count: u32,
-    /// Buffer-wide Git change summary (added/modified/deleted line counts vs HEAD) for the status
-    /// bar, refreshed alongside `line_count` from every window the server sends.
-
     /// Buffer-level Git status (branch + staged/unstaged counts) for the status bar; `None` outside
-    /// a repo. Refreshed from every window, like `git_changes`.
+    /// a repo. Refreshed from every window.
     pub git_status: Option<GitBufferStatus>,
-    /// Highest legal `scroll_view_line` — server-computed so it accounts for wrap, putting
-    /// the buffer's last visual row at the bottom of the viewport.
-    pub max_scroll_view_line: ViewLine,
-    /// Total visual rows in the whole buffer (wrapped rows + diff phantoms), from the window.
-    /// Drives the editor scrollbar's thumb size; `0` means unknown (no window yet).
-    pub total_visual_rows: u32,
-    /// Absolute visual row at the top of the viewport (accounts for wrap and `scroll_skip_rows`).
-    /// The editor scrollbar's thumb position.
+    /// Rows the whole view occupies — chrome and every element's full height, loaded or not — off
+    /// the tree. Drives the editor scrollbar's thumb size; `0` means unknown (no window yet).
+    pub total_rows: u32,
+    /// Absolute visual row at the top of the viewport. The editor scrollbar's thumb position.
     pub top_visual_row: VisualRow,
     pub wrap: WrapMode,
     /// Inline diff view toggle. Server-authoritative (per-viewport); mirrored here so the
@@ -684,30 +659,25 @@ pub enum BufferStatusKind {
 #[cfg(test)]
 pub(crate) fn test_editor_state() -> EditorState {
     EditorState {
-            other_elements_dirty: false,
+        other_elements_dirty: false,
         root: aether_protocol::viewport::Element::Editor {
             element: 0,
             buffer: 0,
             rows: 0,
+            first_row: aether_protocol::coords::ElementRow::ZERO,
             first_buffer_line: 0,
             lines: Vec::new(),
         },
-        chrome_above: Default::default(),
-        trailing_chrome: Vec::new(),
         transient: false,
         tethered: false,
         mode: EditorMode::Normal,
         buffer_id: 1,
         viewport_id: 1,
         cursor: Default::default(),
-        scroll_line_index: 0,
-        scroll_skip_rows: 0,
+        paint_top: VisualRow::ZERO,
         focused_element: 0,
-        lines: Vec::new(),
-        line_count: 0,
         git_status: None,
-        max_scroll_view_line: ViewLine::ZERO,
-        total_visual_rows: 0,
+        total_rows: 0,
         top_visual_row: VisualRow::ZERO,
         wrap: aether_protocol::viewport::WrapMode::None,
         diff_view: false,
@@ -1298,30 +1268,25 @@ mod tests {
     /// The rest is filled with sensible defaults.
     fn stub_editor_state(label: &str) -> EditorState {
         EditorState {
-                other_elements_dirty: false,
+            other_elements_dirty: false,
             root: aether_protocol::viewport::Element::Editor {
                 element: 0,
                 buffer: 0,
                 rows: 0,
+                first_row: aether_protocol::coords::ElementRow::ZERO,
                 first_buffer_line: 0,
                 lines: Vec::new(),
             },
-            chrome_above: Default::default(),
-            trailing_chrome: Vec::new(),
             transient: false,
             tethered: false,
             mode: EditorMode::Normal,
             buffer_id: 1,
             viewport_id: 1,
             cursor: Default::default(),
-            scroll_line_index: 0,
-            scroll_skip_rows: 0,
+            paint_top: VisualRow::ZERO,
             focused_element: 0,
-            lines: Vec::new(),
-            line_count: 0,
             git_status: None,
-            max_scroll_view_line: ViewLine::ZERO,
-            total_visual_rows: 0,
+            total_rows: 0,
             top_visual_row: VisualRow::ZERO,
             wrap: aether_protocol::viewport::WrapMode::None,
             diff_view: false,

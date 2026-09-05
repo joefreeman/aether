@@ -3,7 +3,7 @@
 //! doc.
 
 use aether_protocol::buffer::{BufferOpen, BufferOpenParams, BufferOpenResult};
-use aether_protocol::coords::{ViewLine, VisualRow};
+use aether_protocol::coords::ElementRow;
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
     CursorSetParams, CursorState, Direction, Granularity, Motion, SelectionEdge, WordBoundary,
@@ -47,8 +47,7 @@ use aether_protocol::ui::{Element, RailJoin};
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
     BaselineRow, BufferStatusSnapshot, ChromeKind, DiagnosticSeverity, DiagnosticSpan, DiffMarker,
-    DiffStage, EmphasisRange, LineChange, LogicalLineRange, LogicalLineRender,
-    ViewportLinesChangedParams,
+    DiffStage, EmphasisRange, LineChange, LogicalLineRender, ViewportLinesChangedParams,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceList, WorkspaceOpenPath,
@@ -1787,7 +1786,8 @@ fn buffer_open_result_restored_scroll() {
         scratch_number: None,
         cursor: Default::default(),
         scroll: Some(ScrollPosition {
-            logical_line: ViewLine(7),
+            element: 2,
+            line: 7,
             sub_row: 0.5,
         }),
         lsp_server: None,
@@ -1796,7 +1796,10 @@ fn buffer_open_result_restored_scroll() {
         is_patch: false,
     })
     .unwrap();
-    assert_eq!(v["scroll"]["logical_line"], 7);
+    // Content, not a row: the element the viewport's top was in, the line of that element's
+    // buffer, and how far into the line's rows it sat.
+    assert_eq!(v["scroll"]["element"], 2);
+    assert_eq!(v["scroll"]["line"], 7);
     assert_eq!(v["scroll"]["sub_row"], 0.5);
     // `scratch_number: None` skips serialisation, like a file buffer.
     assert!(v.get("scratch_number").is_none());
@@ -1919,26 +1922,9 @@ fn directory_list_result_skips_none_parent() {
 fn viewport_lines_changed_params_cursor_shape() {
     let base = ViewportLinesChangedParams {
         buffer: 7,
-        other_elements_dirty: false,
         viewport_id: 7,
         revision: 42,
-        range: LogicalLineRange {
-            start_view_line: ViewLine(10),
-            end_view_line_exclusive: ViewLine(20),
-        },
-        root: Element::Editor {
-            element: 0,
-            buffer: 0,
-            rows: 0,
-            first_buffer_line: 0,
-            lines: Vec::new(),
-        },
-        view_line_count: 100,
-        max_scroll_view_line: ViewLine(90),
-        total_visual_rows: 100,
-        first_visual_row: VisualRow(10),
-        max_line_width: 0,
-        git_status: None,
+        window: sample_window(),
         cursor: None,
     };
     // Without a cursor the field is absent on the wire, and absent deserializes to `None` —
@@ -1980,7 +1966,7 @@ fn notification_roundtrip() {
     let n = Notification {
         jsonrpc: JsonRpc,
         method: ViewportLinesChanged::NAME.into(),
-        params: json!({"viewport_id": 1, "revision": 5, "range": {}, "root": {"node": "editor", "element": 0, "buffer": 3, "rows": 0, "first_buffer_line": 0, "lines": []}}),
+        params: json!({"viewport_id": 1, "buffer": 3, "revision": 5, "window": {"root": {"node": "editor", "element": 0, "buffer": 3, "rows": 0, "first_row": 0, "first_buffer_line": 0, "lines": []}, "max_line_width": 0}}),
     };
     let s = serde_json::to_string(&n).unwrap();
     let v: serde_json::Value = from_str(&s).unwrap();
@@ -2117,9 +2103,11 @@ fn viewport_subscribe_params_carry_sticky_diff_view() {
         rows: 24,
         overscan_rows: 0,
         scroll: ScrollPosition {
-            logical_line: ViewLine(0),
+            element: 0,
+            line: 0,
             sub_row: 0.0,
         },
+        focus: None,
         wrap: WrapMode::None,
         continuation_marker_width: 0,
         tab_width: 4,
@@ -2127,14 +2115,26 @@ fn viewport_subscribe_params_carry_sticky_diff_view() {
     };
     let v = to_value(&p).unwrap();
     assert_eq!(v["diff_view"], true);
+    // A fresh open names no focus: the server takes it from the scroll's element.
+    assert!(v.get("focus").is_none(), "focus: None stays off the wire");
     // Absent on the wire → defaults off (older clients that don't send the sticky toggle).
     let back: ViewportSubscribeParams = from_value(json!({
         "buffer_id": 1, "cols": 80, "rows": 24, "overscan_rows": 0,
-        "scroll": { "logical_line": 0, "sub_row": 0.0 },
+        "scroll": { "element": 0, "line": 0, "sub_row": 0.0 },
         "wrap": "none", "continuation_marker_width": 0, "tab_width": 4,
     }))
     .unwrap();
     assert!(!back.diff_view);
+    assert!(back.focus.is_none());
+    // A re-subscribe says which element already holds the cursor.
+    let back: ViewportSubscribeParams = from_value(json!({
+        "buffer_id": 1, "cols": 80, "rows": 24, "overscan_rows": 0,
+        "scroll": { "element": 2, "line": 9, "sub_row": 0.0 }, "focus": 2,
+        "wrap": "none", "continuation_marker_width": 0, "tab_width": 4,
+    }))
+    .unwrap();
+    assert_eq!(back.focus, Some(2));
+    assert_eq!((back.scroll.element, back.scroll.line), (2, 9));
 }
 
 #[test]
@@ -3778,7 +3778,7 @@ fn keybinding_entry_haystack_composes_in_display_order() {
 fn picker_view_params_keybindings_serialized_and_skipped_when_none() {
     use aether_protocol::picker::{KeybindingEntry, PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
-            view_id: None,
+        view_id: None,
         from_selection: false,
         kind: PickerKind::Keybindings,
         reset: PickerReset::All,
@@ -3806,7 +3806,7 @@ fn picker_view_params_keybindings_serialized_and_skipped_when_none() {
 
     // Absent on the wire when None (resume/scroll re-views), and deserializes back to None.
     let p = PickerViewParams {
-            view_id: None,
+        view_id: None,
         keybindings: None,
         ..p
     };
@@ -4068,7 +4068,7 @@ fn collapsible_kinds_are_pinned() {
 fn picker_view_params_omit_center_on_when_none() {
     use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
-            view_id: None,
+        view_id: None,
         from_selection: false,
         kind: PickerKind::Files,
         reset: PickerReset::All,
@@ -4206,7 +4206,7 @@ fn picker_view_params_from_selection_serialized() {
     use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     // `Space Alt-/`: grep-for-selection rides `from_selection` + the active buffer id.
     let p = PickerViewParams {
-            view_id: None,
+        view_id: None,
         from_selection: true,
         kind: PickerKind::Grep,
         reset: PickerReset::Keep,
@@ -4232,7 +4232,7 @@ fn picker_view_params_from_selection_serialized() {
 fn picker_view_params_center_on_serialized() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
-            view_id: None,
+        view_id: None,
         from_selection: false,
         kind: PickerKind::Files,
         reset: PickerReset::Keep,
@@ -4519,7 +4519,10 @@ fn view_save_wire_shape() {
         view_id: aether_protocol::ViewId(7),
         overwrite: false,
     };
-    assert_eq!(to_value(&p).unwrap(), json!({ "view_id": 7, "overwrite": false }));
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({ "view_id": 7, "overwrite": false })
+    );
 
     // Nothing dirty: no `focused` on the wire at all.
     let r = ViewSaveResult {
@@ -4667,7 +4670,7 @@ fn picker_item_dir_entry_carries_git_status() {
 fn picker_view_params_directory_path_skipped_when_none() {
     use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
-            view_id: None,
+        view_id: None,
         from_selection: false,
         kind: PickerKind::Explorer,
         reset: PickerReset::Keep,
@@ -4692,7 +4695,7 @@ fn picker_view_params_directory_path_skipped_when_none() {
 fn picker_view_params_directory_path_serialized() {
     use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
-            view_id: None,
+        view_id: None,
         from_selection: false,
         kind: PickerKind::Explorer,
         reset: PickerReset::All,
@@ -5493,6 +5496,7 @@ fn jumplist_wire_shapes() {
         total: 17,
         opened: None,
         seat: None,
+        skipped: 0,
     };
     let v = to_value(JumplistStepResult::Moved(Box::new(t))).unwrap();
     assert_eq!(
@@ -5522,6 +5526,7 @@ fn jumplist_wire_shapes() {
             element: 3,
             buffer_id: 9,
         }),
+        skipped: 0,
     };
     assert_eq!(
         to_value(JumplistStepResult::Moved(Box::new(seated))).unwrap(),
@@ -5546,6 +5551,7 @@ fn jumplist_wire_shapes() {
         total: 4,
         opened: None,
         seat: None,
+        skipped: 0,
     };
     assert_eq!(
         to_value(JumplistStepResult::Moved(Box::new(whole_file))).unwrap(),
@@ -5565,6 +5571,7 @@ fn jumplist_wire_shapes() {
         total: 4,
         opened: None,
         seat: None,
+        skipped: 0,
     };
     assert_eq!(
         to_value(JumplistStepResult::Moved(Box::new(scratch))).unwrap(),
@@ -5934,19 +5941,14 @@ fn round_trips<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) {
 fn sample_window() -> aether_protocol::viewport::Window {
     use aether_protocol::viewport::{Highlight, Segment, Window, WrappedRow};
     Window {
-            other_elements_dirty: false,
-        first_view_line: ViewLine(4),
-        last_view_line_exclusive: ViewLine(6),
-        view_line_count: 120,
-        max_scroll_view_line: ViewLine(110),
-        total_visual_rows: 130,
-        first_visual_row: VisualRow(5),
+        other_elements_dirty: false,
         max_line_width: 88,
         git_status: None,
         root: Element::Editor {
             element: 0,
             buffer: 7,
             rows: 130,
+            first_row: ElementRow(5),
             first_buffer_line: 4,
             lines: vec![LogicalLineRender {
                 logical_line: 4,
@@ -5981,13 +5983,25 @@ fn viewport_window_result_wire_shape() {
         window: sample_window(),
     };
     let v = to_value(&r).unwrap();
-    assert_eq!(v["window"]["first_view_line"], 4);
-    assert_eq!(v["window"]["last_view_line_exclusive"], 6);
-    assert_eq!(v["window"]["view_line_count"], 120);
-    assert_eq!(v["window"]["max_scroll_view_line"], 110);
-    assert_eq!(v["window"]["total_visual_rows"], 130);
-    assert_eq!(v["window"]["first_visual_row"], 5);
+    // No view-space geometry on the window itself: the client lays the view out from the tree,
+    // where each editor says how tall it is and where its loaded slice starts within it.
+    for gone in [
+        "first_view_line",
+        "last_view_line_exclusive",
+        "view_line_count",
+        "max_scroll_view_line",
+        "total_visual_rows",
+        "first_visual_row",
+    ] {
+        assert!(
+            v["window"].get(gone).is_none(),
+            "{gone} is not a wire field"
+        );
+    }
     assert_eq!(v["window"]["max_line_width"], 88);
+    assert_eq!(v["window"]["root"]["rows"], 130);
+    assert_eq!(v["window"]["root"]["first_row"], 5);
+    assert_eq!(v["window"]["root"]["first_buffer_line"], 4);
     assert!(
         v["window"].get("git_status").is_none(),
         "absent outside a repo rather than null"
@@ -6018,12 +6032,12 @@ fn viewport_window_result_wire_shape() {
     round_trips(&r);
 }
 
-/// The four viewport methods' params.
+/// The viewport methods' params.
 #[test]
 fn viewport_params_round_trip() {
     use aether_protocol::viewport::{
-        ViewportResizeParams, ViewportScrollParams, ViewportScrollToRowParams,
-        ViewportSetWrapParams,
+        ScrollPosition, SliceRequest, ViewportResizeParams, ViewportSetWrapParams, ViewportWindow,
+        ViewportWindowParams,
     };
     wire_keys(
         &ViewportResizeParams {
@@ -6033,23 +6047,33 @@ fn viewport_params_round_trip() {
         },
         &["viewport_id", "cols", "rows"],
     );
-    wire_keys(
-        &ViewportScrollParams {
-            viewport_id: 3,
-            scroll: aether_protocol::viewport::ScrollPosition {
-                logical_line: ViewLine(12),
-                sub_row: 0.5,
-            },
-        },
-        &["viewport_id", "scroll"],
+    // The one scroll request: the slices the client's viewport reaches, each by row within its
+    // element, plus where the top is as content so a reopen can restore it.
+    assert_eq!(ViewportWindow::NAME, "view/window");
+    let anchor = ScrollPosition {
+        element: 1,
+        line: 12,
+        sub_row: 0.5,
+    };
+    let slice = SliceRequest {
+        element: 1,
+        from_row: ElementRow(40),
+        rows: 60,
+    };
+    wire_keys(&anchor, &["element", "line", "sub_row"]);
+    wire_keys(&slice, &["element", "from_row", "rows"]);
+    let p = ViewportWindowParams {
+        viewport_id: 3,
+        anchor,
+        slices: vec![slice],
+    };
+    wire_keys(&p, &["viewport_id", "anchor", "slices"]);
+    let v = to_value(&p).unwrap();
+    assert_eq!(
+        v["slices"][0]["from_row"], 40,
+        "an element row is a bare number"
     );
-    wire_keys(
-        &ViewportScrollToRowParams {
-            viewport_id: 3,
-            top_visual_row: VisualRow(42),
-        },
-        &["viewport_id", "top_visual_row"],
-    );
+    round_trips(&p);
     wire_keys(
         &ViewportSetWrapParams {
             viewport_id: 3,
@@ -6057,6 +6081,77 @@ fn viewport_params_round_trip() {
         },
         &["viewport_id", "wrap"],
     );
+}
+
+/// A step's `Gone` outcome and the count of entries a landing stepped over — both new, both
+/// mirrored nowhere but here.
+#[test]
+fn jumplist_step_reports_gone_entries() {
+    use aether_protocol::jumplist::JumplistStepResult;
+    let v = to_value(JumplistStepResult::Gone {
+        index: 2,
+        total: 4,
+        skipped: 1,
+        opened: None,
+    })
+    .unwrap();
+    assert_eq!(v["status"], "gone");
+    assert_eq!(v["skipped"], 1);
+    assert!(v.get("opened").is_none());
+    let back: JumplistStepResult = from_value(v).unwrap();
+    assert!(back.moved().is_none(), "gone is not a move");
+    // An ordinary step passed over nothing, and says nothing about it.
+    let plain = to_value(JumplistStepResult::Moved(Box::new(
+        aether_protocol::jumplist::JumplistStepTarget {
+            path: None,
+            buffer_id: Some(3),
+            position: None,
+            anchor: None,
+            index: 1,
+            total: 1,
+            opened: None,
+            seat: None,
+            skipped: 0,
+        },
+    )))
+    .unwrap();
+    assert!(plain.get("skipped").is_none(), "zero stays off the wire");
+    let gone_row =
+        to_value(aether_protocol::picker::PickerSelectResult::Gone { open: None }).unwrap();
+    assert_eq!(gone_row["kind"], "gone");
+}
+
+/// `view/navigate_change` is what both `c` and `o` send, whatever the view: its grain and extend
+/// flag stay off the wire at their defaults, and an older server reads a plain `c`.
+#[test]
+fn navigate_change_params_keep_their_defaults_off_the_wire() {
+    use aether_protocol::viewport::{
+        FocusStep, NavigateGrain, ViewportNavigateChange, ViewportNavigateChangeParams,
+    };
+    assert_eq!(ViewportNavigateChange::NAME, "view/navigate_change");
+    let plain = ViewportNavigateChangeParams {
+        viewport_id: 3,
+        direction: FocusStep::Next,
+        count: None,
+        grain: NavigateGrain::Change,
+        extend: false,
+    };
+    wire_keys(&plain, &["viewport_id", "direction"]);
+    let shifted = ViewportNavigateChangeParams {
+        viewport_id: 3,
+        direction: FocusStep::Previous,
+        count: Some(2),
+        grain: NavigateGrain::Outline,
+        extend: true,
+    };
+    wire_keys(
+        &shifted,
+        &["viewport_id", "direction", "count", "grain", "extend"],
+    );
+    let v = to_value(&shifted).unwrap();
+    assert_eq!(v["grain"], "outline");
+    assert_eq!(v["direction"], "previous");
+    round_trips(&shifted);
 }
 
 /// The remaining methods that had no wire coverage at all.
@@ -6173,18 +6268,11 @@ fn previously_unpinned_params_round_trip() {
 /// client-only shapes too), but every key Rust actually *serialises* must appear in it.
 #[test]
 fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
-    use aether_protocol::coords::{ViewLine, VisualRow};
     use aether_protocol::viewport::{Element, Window};
 
     let ts = include_str!("../../../web/src/protocol.ts");
     let window = Window {
-            other_elements_dirty: false,
-        first_view_line: ViewLine(0),
-        last_view_line_exclusive: ViewLine(1),
-        view_line_count: 1,
-        max_scroll_view_line: ViewLine(0),
-        total_visual_rows: 1,
-        first_visual_row: VisualRow(0),
+        other_elements_dirty: false,
         max_line_width: 0,
         // `None` would be skipped, and a field that never serialises cannot be checked.
         git_status: Some(Default::default()),
@@ -6192,6 +6280,7 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
             element: 0,
             buffer: 1,
             rows: 1,
+            first_row: ElementRow(0),
             first_buffer_line: 0,
             lines: Vec::new(),
         },
@@ -6224,80 +6313,77 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
     );
 }
 
-/// A composed view's subscribe carries the focus; an ordinary one omits it entirely.
+/// Every subscribe carries the focus the server resolved — element 0 for an ordinary view, the
+/// element under the scroll for a composed one.
 ///
-/// The field is what stops a client holding two line spaces at once — its cursor in the view's own
-/// document while every rendered line belongs to a file — so its absence has to mean "nothing to
-/// reconcile" rather than "unknown". Pinned here because the browser shell hand-mirrors these types
-/// and `tsc` cannot see a Rust rename.
+/// Unconditional, because the client mirrors the focused element and has to start from the server's
+/// value whichever it is; an answer omitted "when there is nothing to reconcile" left a subscribe
+/// that landed in a patch's own text with the two sides on different elements. For a composed view
+/// it is also what stops a client holding two line spaces at once — its cursor in the view's own
+/// document while every rendered line belongs to a file. Pinned here because the browser shell
+/// hand-mirrors these types and `tsc` cannot see a Rust rename.
 #[test]
-fn a_composed_views_subscribe_carries_the_focus_it_resolved() {
+fn every_subscribe_carries_the_focus_it_resolved() {
     use aether_protocol::viewport::{ViewportFocusElementResult, ViewportSubscribeResult, Window};
     let window = || Window {
-            other_elements_dirty: false,
-        first_view_line: ViewLine(0),
-        last_view_line_exclusive: ViewLine(1),
-        view_line_count: 1,
-        max_scroll_view_line: ViewLine(0),
-        total_visual_rows: 1,
-        first_visual_row: aether_protocol::coords::VisualRow(0),
+        other_elements_dirty: false,
         max_line_width: 0,
         git_status: None,
         root: aether_protocol::viewport::Element::Editor {
             element: 0,
             buffer: 9,
             rows: 1,
+            first_row: ElementRow(0),
             first_buffer_line: 17,
             lines: vec![],
         },
+    };
+
+    let focus_on = |element: u32| ViewportFocusElementResult {
+        element,
+        buffer: aether_protocol::buffer::BufferOpenResult {
+            buffer_id: 9,
+            language: None,
+            line_count: 40,
+            byte_count: 400,
+            revision: 1,
+            saved_revision: 1,
+            path: Some("/repo/a.rs".into()),
+            scratch_number: None,
+            cursor: Default::default(),
+            scroll: None,
+            lsp_server: None,
+            transient: false,
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
+        buffer_status: Default::default(),
     };
 
     let ordinary = ViewportSubscribeResult {
         viewport_id: 1,
         window: window(),
         buffer_status: Default::default(),
-        focus: None,
+        focus: focus_on(0),
     };
     let v = to_value(&ordinary).unwrap();
-    assert!(
-        v.get("focus").is_none(),
-        "an ordinary view says nothing about focus: {v}"
+    assert_eq!(
+        v["focus"]["element"], 0,
+        "an ordinary view still names its one element: {v}"
     );
 
     let composed = ViewportSubscribeResult {
         viewport_id: 1,
         window: window(),
         buffer_status: Default::default(),
-        focus: Some(ViewportFocusElementResult {
-            element: 2,
-            buffer: aether_protocol::buffer::BufferOpenResult {
-                buffer_id: 9,
-                language: None,
-                line_count: 40,
-                byte_count: 400,
-                revision: 1,
-                saved_revision: 1,
-                path: Some("/repo/a.rs".into()),
-                scratch_number: None,
-                cursor: Default::default(),
-                scroll: None,
-                lsp_server: None,
-                transient: false,
-                title: None,
-                read_only: false,
-                is_patch: false,
-            },
-            buffer_status: Default::default(),
-        }),
+        focus: focus_on(2),
     };
     let v = to_value(&composed).unwrap();
     assert_eq!(v["focus"]["element"], 2);
     assert_eq!(v["focus"]["buffer"]["buffer_id"], 9);
     let back: ViewportSubscribeResult = from_value(v).unwrap();
-    assert_eq!(
-        back.focus.expect("focus survives the round trip").element,
-        2
-    );
+    assert_eq!(back.focus.element, 2);
 }
 
 /// `view/window_at_cursor` takes nothing but the viewport: both halves of the question — where the

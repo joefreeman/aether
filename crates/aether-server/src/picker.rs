@@ -183,6 +183,12 @@ pub struct PatchRowTarget {
     /// lands wherever that line happens to fall in whichever element — which is why every jumplist
     /// entry captured from a patch took you to the same place.
     pub file: Option<(aether_protocol::viewport::FieldId, BufferId, u32)>,
+    /// The same place named **durably**: the file it is in and the line of that file, however the
+    /// element happens to window it right now. What a jumplist entry stores — an element index or
+    /// a buffer id is dead as soon as the patch is rebuilt, and a patch line moves with every
+    /// regeneration, but a file and a line in it survive both. `None` for a row over generated
+    /// text with no file behind it.
+    pub durable: Option<(crate::jumplist::JumplistTarget, u32)>,
     /// Buffer line of each entry in [`GitChangeCandidate::lines`], parallel to it. Explicit rather
     /// than `line + i` because in a patch both sides are ordinary buffer lines with context
     /// sitting between them — so a query matching a *removed* line still lands on it, where in a

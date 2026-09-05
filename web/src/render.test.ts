@@ -32,17 +32,12 @@ const editor = (element: number, first: number, lines: LogicalLineRender[]): Vie
   element,
   buffer: element + 1,
   rows: lines.length,
+  first_row: 0,
   first_buffer_line: first,
   lines,
 });
 
-const windowOf = (root: ViewNode, viewLines: number): BufferWindow => ({
-  first_view_line: 0,
-  last_view_line_exclusive: viewLines,
-  view_line_count: viewLines,
-  max_scroll_view_line: 0,
-  total_visual_rows: viewLines,
-  first_visual_row: 0,
+const windowOf = (root: ViewNode): BufferWindow => ({
   max_line_width: 0,
   root,
 });
@@ -63,6 +58,7 @@ function painted(window: BufferWindow, opts: { cursor?: CursorState; focused?: n
     contentWidthPx: 0,
     spacerHeightPx: 0,
     contentTopPx: 0,
+    rowHeightPx: 0,
     blame: null,
     diffView: false,
     focusedElement: opts.focused ?? 0,
@@ -87,7 +83,6 @@ describe("the buffer painter", () => {
         node: "stack",
         children: [chrome("a.rs"), editor(0, 16, [line(16, "fn f17"), line(17, "fn f18")])],
       },
-      2,
     );
     expect(painted(w)).toEqual(["chrome a.rs", "text fn f17", "text fn f18"]);
   });
@@ -105,7 +100,6 @@ describe("the buffer painter", () => {
           editor(1, 10, [line(10, "b10"), line(11, "b11")]),
         ],
       },
-      4,
     );
     expect(painted(w)).toEqual([
       "chrome a.rs",
@@ -117,6 +111,47 @@ describe("the buffer painter", () => {
     ]);
   });
 
+  /// A slice loaded partway into its element sits at its row, and the rows above it — loaded by
+  /// nobody — are a gap of the same height, so everything below keeps its place in the scroller.
+  /// Mirrors `a_slice_sits_at_its_row_within_its_element` on the Rust side.
+  it("leaves a gap for the rows of an element nothing is loaded at", () => {
+    const w = windowOf({
+      node: "stack",
+      children: [
+        chrome("a.rs"),
+        {
+          node: "editor",
+          element: 0,
+          buffer: 1,
+          rows: 5,
+          first_row: 3,
+          first_buffer_line: 19,
+          lines: [line(19, "f20"), line(20, "f21")],
+        },
+      ],
+    });
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window: w,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 10,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+    });
+    const content = container.querySelector(".buffer-content")!;
+    const kinds = [...content.children].map((el) =>
+      el.classList.contains("row-gap") ? `gap ${(el as HTMLElement).style.height}` : el.textContent?.trim(),
+    );
+    // The heading on row 0; rows 1..3 are the element's first three, unloaded; the slice from row 4.
+    expect(kinds).toEqual(["a.rs", "gap 30px", "f20", "f21"]);
+  });
+
   /// The closing rule hangs off the *last rendered row*, not off a line number. Asking
   /// `logical_line + 1 === view_line_count` compares a buffer line to a view line: here the last
   /// line is numbered 11 in a 4-line view, so that test never fires and the rule vanishes.
@@ -126,7 +161,6 @@ describe("the buffer painter", () => {
         node: "stack",
         children: [editor(0, 10, [line(10, "x"), line(11, "y")]), chrome("closing")],
       },
-      2,
     );
     expect(painted(w)).toEqual(["text x", "text y", "chrome closing"]);
   });
@@ -136,7 +170,7 @@ describe("the buffer painter", () => {
   it("draws phantom baseline rows above their line", () => {
     const l = line(4, "after");
     l.baseline_above = [{ text: "before", stage: "unstaged", emphasis: [] }];
-    const w = windowOf(editor(0, 4, [l]), 1);
+    const w = windowOf(editor(0, 4, [l]));
     expect(painted(w)).toEqual(["phantom before", "text after"]);
   });
 
@@ -152,7 +186,6 @@ describe("the buffer painter", () => {
           editor(1, 10, [line(10, "beta ten")]),
         ],
       },
-      2,
     );
     const at10: CursorState = {
       position: { line: 10, col: 0 },
@@ -167,6 +200,7 @@ describe("the buffer painter", () => {
       contentWidthPx: 0,
       spacerHeightPx: 0,
       contentTopPx: 0,
+      rowHeightPx: 0,
       blame: null,
       diffView: false,
       focusedElement: 1,
@@ -197,7 +231,6 @@ describe("the buffer painter", () => {
           editor(1, 16, [line(16, "from b")]),
         ],
       },
-      2,
     );
     const container = document.createElement("div");
     renderBuffer(container, {
@@ -208,6 +241,7 @@ describe("the buffer painter", () => {
       contentWidthPx: 0,
       spacerHeightPx: 0,
       contentTopPx: 0,
+      rowHeightPx: 0,
       blame: null,
       diffView: false,
       focusedElement: 0,
@@ -222,7 +256,7 @@ describe("the buffer painter", () => {
   });
 
   it("paints a plain buffer as plain rows", () => {
-    const w = windowOf(editor(0, 0, [line(0, "one"), line(1, "two")]), 2);
+    const w = windowOf(editor(0, 0, [line(0, "one"), line(1, "two")]));
     expect(painted(w)).toEqual(["text one", "text two"]);
   });
 });

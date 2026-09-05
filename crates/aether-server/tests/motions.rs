@@ -2,7 +2,6 @@
 
 mod common;
 
-use aether_protocol::coords::ViewLine;
 use common::*;
 
 // ---- cursor + input ----------------------------------------------------------------------------
@@ -1514,9 +1513,11 @@ async fn input_text_inserts_and_pushes_notification() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -1559,7 +1560,7 @@ async fn input_text_inserts_and_pushes_notification() {
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(notif.viewport_id, sub.viewport_id);
     assert_eq!(notif.revision, 1);
-    let first_line = &notif.root.lines()[0];
+    let first_line = &notif.window.root.lines()[0];
     assert_eq!(first_line.visual_rows[0].segments[0].text, "aXYbc");
 
     drop(server);
@@ -1588,9 +1589,11 @@ async fn input_delete_backspace_removes_char_before_cursor() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -1608,7 +1611,7 @@ async fn input_delete_backspace_removes_char_before_cursor() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "hell"
     );
 
@@ -1951,9 +1954,11 @@ async fn viewport_includes_treesitter_highlights_for_rust() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
 
             continuation_marker_width: 0,
@@ -2036,9 +2041,11 @@ async fn setup_deferred_parse_buffer() -> (
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
 
             continuation_marker_width: 0,
@@ -2075,7 +2082,8 @@ async fn expect_lines_changed_where(
 /// restyle.
 async fn expect_highlighted_lines_changed(ws: &mut Ws) -> ViewportLinesChangedParams {
     expect_lines_changed_where(ws, "line 0 is highlighted", |push| {
-        push.root
+        push.window
+            .root
             .lines()
             .first()
             .and_then(|l| l.visual_rows.first())
@@ -2102,7 +2110,7 @@ async fn deferred_parse_restyles_the_viewport_when_it_lands() {
         push.revision, 0,
         "content didn't change — revision rides through"
     );
-    let highlights = &push.root.lines()[0].visual_rows[0].segments[0].highlights;
+    let highlights = &push.window.root.lines()[0].visual_rows[0].segments[0].highlights;
     let fn_kw = highlights.iter().find(|h| h.start == 0 && h.end == 2);
     assert!(
         fn_kw.is_some_and(|h| h.kind.contains("keyword")),
@@ -2140,7 +2148,7 @@ async fn deferred_parse_tracks_edits_landed_mid_parse() {
     );
     // Line 0 is now `struct Zz; fn f() ...` — the parse the highlights came from must have seen
     // the edited text, so `struct` (bytes 0..6) is tagged keyword.
-    let highlights = &push.root.lines()[0].visual_rows[0].segments[0].highlights;
+    let highlights = &push.window.root.lines()[0].visual_rows[0].segments[0].highlights;
     let struct_kw = highlights.iter().find(|h| h.start == 0 && h.end == 6);
     assert!(
         struct_kw.is_some_and(|h| h.kind.contains("keyword")),
@@ -2210,9 +2218,11 @@ async fn setup_deferred_git_buffer(
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
 
             continuation_marker_width: 0,
@@ -2248,15 +2258,15 @@ async fn deferred_git_baseline_pushes_hunks_when_it_lands() {
 
     // The background load lands and re-pushes the window with hunks and branch status.
     let push = expect_lines_changed_where(&mut ws, "git decorations arrived", |p| {
-        p.root.lines()[0].change.marker().is_some()
+        p.window.root.lines()[0].change.marker().is_some()
     })
     .await;
     assert_eq!(
-        push.root.lines()[0].change.marker(),
+        push.window.root.lines()[0].change.marker(),
         Some(DiffMarker::Modified)
     );
     assert!(
-        push.git_status.is_some(),
+        push.window.git_status.is_some(),
         "branch status rides the same push"
     );
 
@@ -2288,11 +2298,11 @@ async fn deferred_git_baseline_diffs_against_edits_landed_mid_load() {
     .await;
 
     let push = expect_lines_changed_where(&mut ws, "the live edit's hunk arrived", |p| {
-        p.root.lines()[0].change.marker().is_some()
+        p.window.root.lines()[0].change.marker().is_some()
     })
     .await;
     assert_eq!(
-        push.root.lines()[0].change.marker(),
+        push.window.root.lines()[0].change.marker(),
         Some(DiffMarker::Added),
         "line 0 is the inserted line — an Added hunk against the loaded baseline"
     );
@@ -2733,9 +2743,11 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -2802,9 +2814,11 @@ async fn save_in_place_writes_file_and_clears_dirty() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -3135,9 +3149,11 @@ async fn cut_selection_deletes_and_returns_text() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -3183,7 +3199,7 @@ async fn cut_selection_deletes_and_returns_text() {
     let notif =
         expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "alpha  gamma"
     );
     drop(server);
@@ -3210,9 +3226,11 @@ async fn input_text_with_select_pasted_makes_selection() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -3261,9 +3279,11 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -3302,7 +3322,10 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     assert_eq!(undo.revision, 0, "undo back to saved revision");
     let notif =
         expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "abc");
+    assert_eq!(
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
+        "abc"
+    );
 
     // Redo: re-applies "XY", revision advances past saved.
     let redo: UndoResult = send_request::<EditRedo>(
@@ -3319,7 +3342,7 @@ async fn undo_reverts_recent_edit_and_redo_reapplies() {
     let notif =
         expect_notification::<aether_protocol::viewport::ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "abcXY"
     );
 
@@ -3436,9 +3459,11 @@ async fn dirty_clears_when_undoing_back_past_save() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -3628,9 +3653,11 @@ async fn join_lines_deletes_break_and_indent() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -3653,7 +3680,7 @@ async fn join_lines_deletes_break_and_indent() {
     // After join: "hello world\n" — the newline and line 1's leading whitespace are deleted,
     // nothing is inserted; line 0's own trailing space is kept and is the separator here.
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "hello world"
     );
     drop(server);
@@ -3801,9 +3828,11 @@ async fn unjoin_parked_cursor_agrees_across_push_and_response() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -3892,9 +3921,11 @@ async fn input_text_with_selection_replaces_it() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -3921,7 +3952,7 @@ async fn input_text_with_selection_replaces_it() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "alpha DELTA gamma"
     );
 
@@ -5018,9 +5049,11 @@ async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -5061,9 +5094,11 @@ async fn visual_line_preserves_visual_column() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -5131,9 +5166,11 @@ async fn visual_line_crosses_logical_line_boundary() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -5188,9 +5225,11 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
@@ -5239,9 +5278,11 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
 
             continuation_marker_width: 0,
@@ -5294,9 +5335,11 @@ async fn viewport_set_wrap_changes_visible_rows() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
 
             continuation_marker_width: 0,
@@ -5343,9 +5386,11 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
@@ -5417,9 +5462,11 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
@@ -5486,9 +5533,11 @@ async fn virtual_col_cleared_by_horizontal_motion() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
@@ -5567,9 +5616,11 @@ async fn virtual_col_cleared_by_mutation() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
@@ -5650,9 +5701,11 @@ async fn continuation_marker_width_reduces_continuation_row_width() {
             rows: 5,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
@@ -5916,9 +5969,11 @@ async fn hunk_view(
             rows: 60,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -6245,9 +6300,11 @@ async fn moving_focus_rescopes_the_active_search() {
             rows: 80,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -6255,9 +6312,10 @@ async fn moving_focus_rescopes_the_active_search() {
         },
     )
     .await;
-    // Line extents, so from the lines — `rows` is a height in visual rows (phantoms included).
-    let extents: Vec<std::ops::Range<u32>> = sub
-        .window
+    // Line extents, so from the lines — `rows` is a height in visual rows (phantoms included) —
+    // of the whole view, since a subscribe loads only the element it opens on.
+    let whole = whole_view(&mut ws, sub.viewport_id, sub.window).await;
+    let extents: Vec<std::ops::Range<u32>> = whole
         .root
         .editors()
         .iter()
@@ -6441,9 +6499,11 @@ async fn subscribing_to_a_patch_reports_the_element_the_cursor_is_in() {
             rows: 60,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -6452,9 +6512,7 @@ async fn subscribing_to_a_patch_reports_the_element_the_cursor_is_in() {
     )
     .await;
 
-    let focus = sub
-        .focus
-        .expect("a composed view says which element holds the cursor");
+    let focus = sub.focus;
     assert_ne!(
         focus.buffer.buffer_id, opened.buffer_id,
         "the element windows the file, not the patch document the view was opened as"
@@ -6510,6 +6568,13 @@ async fn a_patch_opened_on_a_file_focuses_that_files_element() {
     )
     .await;
     // The client opens at the position the show reported — that is the whole point of `focus_path`.
+    let scroll = opened
+        .scroll
+        .expect("a patch opened on a file says which element that file is");
+    assert!(
+        scroll.element > 0,
+        "d.rs is not the first element: {scroll:?}"
+    );
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
@@ -6517,10 +6582,8 @@ async fn a_patch_opened_on_a_file_focuses_that_files_element() {
             cols: 120,
             rows: 60,
             overscan_rows: 0,
-            scroll: ScrollPosition {
-                logical_line: ViewLine(opened.cursor.position.line),
-                sub_row: 0.0,
-            },
+            scroll,
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -6528,7 +6591,7 @@ async fn a_patch_opened_on_a_file_focuses_that_files_element() {
         },
     )
     .await;
-    let focus = sub.focus.expect("a composed view reports its focus");
+    let focus = sub.focus;
     assert!(
         focus
             .buffer
@@ -6537,6 +6600,15 @@ async fn a_patch_opened_on_a_file_focuses_that_files_element() {
             .is_some_and(|p| p.ends_with("d.rs")),
         "the element focused must window the file asked for, not {:?}",
         focus.buffer.path
+    );
+    // And the scroll names a line of **that file**: the hunk's top, three context lines above the
+    // change at 20. Read before the view's layout was installed it was a patch line — the open
+    // still worked, because the element was right and the server clamps, but a view opened this
+    // way framed the wrong place.
+    assert_eq!(scroll.line, 17, "the file line of the hunk's top");
+    assert_eq!(
+        focus.buffer.cursor.position.line, 17,
+        "and the cursor is seated there in the file"
     );
     drop(server);
 }
@@ -6591,9 +6663,11 @@ async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -6601,11 +6675,7 @@ async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
         },
     )
     .await;
-    let buffer_id = sub
-        .focus
-        .expect("a composed view reports its focus")
-        .buffer
-        .buffer_id;
+    let buffer_id = sub.focus.buffer.buffer_id;
 
     // Put the cursor deep inside the hunk — far past the screenful the element's start would carry.
     let deep: CursorState = send_request::<CursorMove>(
@@ -6645,8 +6715,8 @@ async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
 
 /// **A view's reported height is the number of rows it actually has.**
 ///
-/// `total_visual_rows` is what a client scrolls against and what its scrollbar is drawn from, while
-/// every row it paints comes from the window: lines with their wrapped rows and their phantom
+/// The tree's height (`grid::total_rows`) is what a client scrolls against and what its scrollbar
+/// is drawn from, while every row it paints comes from the window: lines with their wrapped rows and their phantom
 /// "deleted" rows, and chrome. If the count is short, the last rows are unreachable — the scroll
 /// bound stops before the content does — and worse, the fetch that keeps the viewport full compares
 /// what it has loaded against the same number, decides it has already reached the end, and stops:
@@ -6695,9 +6765,11 @@ async fn a_views_reported_height_is_the_rows_it_ships() {
             rows: 400,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -6722,9 +6794,14 @@ async fn a_views_reported_height_is_the_rows_it_ships() {
         phantoms(&all.window) > 0,
         "the fixture must have phantom rows for this to prove anything"
     );
+    // Load the whole view — a subscribe loads one element's screen — then every row the tree
+    // says the view has must be a row it ships.
+    let total = total_rows(&all.window);
+    let viewport_id = all.viewport_id;
+    let all = window_at(&mut ws, viewport_id, &all.window, 0, total, 0).await;
     assert_eq!(
-        client_row_items(&all.window),
-        all.window.total_visual_rows,
+        painted_rows(&all.window),
+        total,
         "the view ships more rows than the height it reports, so its end is out of reach"
     );
 
@@ -6734,19 +6811,19 @@ async fn a_views_reported_height_is_the_rows_it_ships() {
     let off: ViewportWindowResult = send_request::<GitSetDiffView>(
         &mut ws,
         &GitSetDiffViewParams {
-            viewport_id: all.viewport_id,
+            viewport_id,
             enabled: false,
         },
     )
     .await;
     assert_eq!(phantoms(&off.window), 0, "the removed lines collapsed");
     assert!(
-        off.window.total_visual_rows < all.window.total_visual_rows,
+        total_rows(&off.window) < total,
         "and the view got shorter for it"
     );
     assert_eq!(
-        client_row_items(&off.window),
-        off.window.total_visual_rows,
+        painted_rows(&off.window),
+        total_rows(&off.window),
         "the collapsed view's height is the rows it ships, too"
     );
 
@@ -6755,7 +6832,7 @@ async fn a_views_reported_height_is_the_rows_it_ships() {
 
 /// **Every row you can scroll to comes back in the window you asked for.**
 ///
-/// `view/scroll_to_row` is how a client fetches while scrolling, and what it does with the answer is
+/// `view/window` is how a client fetches while scrolling, and what it does with the answer is
 /// resolve its own top row against the window's rows. A window that doesn't contain that row leaves
 /// it with nothing to draw from: the terminal falls back to the last line it has, paints that one
 /// row, and the rest of the screen is blank. Which is what it did — the row→line resolution counted
@@ -6801,9 +6878,11 @@ async fn every_scrollable_row_comes_back_in_its_window() {
             // What the real client sends: a screenful of overscan either side.
             overscan_rows: rows,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -6811,52 +6890,23 @@ async fn every_scrollable_row_comes_back_in_its_window() {
         },
     )
     .await;
-    let total = sub.window.total_visual_rows;
+    let total = total_rows(&sub.window);
     assert!(total > rows, "the view must be taller than the viewport");
 
     // Every row a client may put at the top of its viewport — which is exactly `0..=max_scroll`.
+    let mut window = sub.window;
     for top in 0..=total.saturating_sub(rows) {
-        let res: ViewportWindowResult = send_request::<ViewportScrollToRow>(
-            &mut ws,
-            &ViewportScrollToRowParams {
-                viewport_id: sub.viewport_id,
-                top_visual_row: VisualRow(top),
-            },
-        )
-        .await;
-        let first = res.window.first_visual_row.get();
-        let painted = client_row_items(&res.window);
-        assert!(
-            top >= first && top < first + painted,
-            "asked for row {top}; got a window covering {first}..{}",
-            first + painted
-        );
-        // …and enough of it to fill the screen, or the bottom goes blank.
-        assert!(
-            first + painted >= (top + rows).min(total),
-            "row {top}: the window ends at {} but the viewport reaches {}",
-            first + painted,
-            top + rows
-        );
+        let res = window_at(&mut ws, sub.viewport_id, &window, top, rows, rows).await;
+        let painted = aether_client::grid::painted_rows(&res.window);
+        for r in top..(top + rows).min(total) {
+            assert!(
+                painted.iter().any(|(at, _)| at.get() == r),
+                "asked for a screen from row {top}; row {r} has nothing to paint"
+            );
+        }
+        window = res.window;
     }
     drop(server);
-}
-
-/// The rows a client counts in a window: chrome is one, a line is its wrapped rows plus phantoms.
-fn client_row_items(w: &aether_protocol::viewport::Window) -> u32 {
-    fn walk(n: &aether_protocol::viewport::Element) -> u32 {
-        match n {
-            aether_protocol::viewport::Element::Stack { children } => {
-                children.iter().map(walk).sum()
-            }
-            aether_protocol::viewport::Element::Editor { lines, .. } => lines
-                .iter()
-                .map(|l| (l.visual_rows.len() + l.baseline_above.len()) as u32)
-                .sum(),
-            _ => 1,
-        }
-    }
-    walk(&w.root)
 }
 
 /// The client's own scroll loop reaches the bottom: scrolling a row at a time, fetching only when
@@ -6906,9 +6956,11 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
             rows,
             overscan_rows: rows,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 2,
             tab_width: 4,
@@ -6917,7 +6969,7 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
     )
     .await;
     let mut window = sub.window;
-    let total = window.total_visual_rows;
+    let total = total_rows(&window);
     let max_top = total.saturating_sub(rows);
     assert!(max_top > 0, "the view must be taller than the viewport");
     let mut top = 0u32;
@@ -6925,28 +6977,20 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
     let mut stuck = None;
     while top < max_top {
         top += 1;
-        // `maybe_fetch`: chase the scroll when it nears the loaded edge.
-        let first = window.first_visual_row.get();
-        let loaded_end = first + client_row_items(&window);
-        let margin = rows;
-        let need_above = first > 0 && top < first + margin;
-        let need_below = loaded_end < total && top + rows > loaded_end.saturating_sub(margin);
-        if need_above || need_below {
+        // `maybe_fetch`, the client's own rule: fetch when the slices the viewport reaches (with
+        // its overscan) are not all loaded.
+        let wanted = aether_client::grid::slices_for(&window.root, VisualRow(top), rows, rows);
+        if !aether_client::grid::loaded_covers(&window.root, &wanted) {
             fetches += 1;
-            let res: ViewportWindowResult = send_request::<ViewportScrollToRow>(
-                &mut ws,
-                &ViewportScrollToRowParams {
-                    viewport_id: sub.viewport_id,
-                    top_visual_row: VisualRow(top),
-                },
-            )
-            .await;
-            window = res.window;
+            window = window_at(&mut ws, sub.viewport_id, &window, top, rows, rows)
+                .await
+                .window;
         }
-        let first = window.first_visual_row.get();
-        let loaded_end = first + client_row_items(&window);
-        if top < first || top >= loaded_end {
-            stuck = Some((top, first, loaded_end));
+        let painted = aether_client::grid::painted_rows(&window);
+        if let Some(r) =
+            (top..(top + rows).min(total)).find(|r| !painted.iter().any(|(at, _)| at.get() == *r))
+        {
+            stuck = Some((top, r));
             break;
         }
     }
@@ -6955,12 +6999,13 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
         "the scroll reached a row no window can answer for (after {fetches} fetches)"
     );
     assert_eq!(top, max_top, "the loop must reach the last scroll position");
-    // The last scroll position really is the view's last: the window it ends on runs out exactly
-    // where the view does, rather than a few rows short of it.
-    let first = window.first_visual_row.get();
+    // The last scroll position really is the view's last: the rows painted run out exactly where
+    // the view does, rather than a few rows short of it.
     assert_eq!(
-        first + client_row_items(&window),
-        total,
+        aether_client::grid::painted_rows(&window)
+            .last()
+            .map(|(at, _)| at.get()),
+        Some(total - 1),
         "the final window ends somewhere other than the view's last row"
     );
     drop(server);
@@ -7004,9 +7049,11 @@ async fn a_patch_ends_with_its_closing_rule() {
             rows: 400, // the whole view, so the last row is in this window
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -7037,15 +7084,18 @@ async fn a_patch_ends_with_its_closing_rule() {
     );
     // And it is a row like any other, so the height counts it — otherwise the view is a row taller
     // than it says and its last row is unreachable.
+    let total = total_rows(&sub.window);
+    let all = window_at(&mut ws, sub.viewport_id, &sub.window, 0, total, 0).await;
     assert_eq!(
-        client_row_items(&sub.window),
-        sub.window.total_visual_rows,
+        painted_rows(&all.window),
+        total,
         "the closing rule must be counted in the view's height"
     );
 
-    // A window that doesn't reach the view's end doesn't carry it: the rule closes the *view*, and
-    // a client draws it after the last line it was sent. Shipped with a window that stops halfway,
-    // it would be drawn halfway — the same rule an element's own chrome follows.
+    // A window that doesn't reach the view's end still describes it: the tree is the whole view,
+    // whatever is loaded, and the rule closing it sits on the view's last row — not after the last
+    // line the client happened to be sent. Drawn there, a window stopping halfway would show the
+    // rule halfway down; placed by the tree, the rows below the loaded lines are simply blank.
     let partial: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
@@ -7054,9 +7104,11 @@ async fn a_patch_ends_with_its_closing_rule() {
             rows: 4,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -7064,19 +7116,27 @@ async fn a_patch_ends_with_its_closing_rule() {
         },
     )
     .await;
-    let aether_protocol::viewport::Element::Stack { children } = &partial.window.root else {
-        panic!("a patch composes into a stack");
-    };
     assert!(
-        !matches!(
-            children.last(),
-            Some(aether_protocol::viewport::Element::Chrome {
+        painted_rows(&partial.window) < total,
+        "four rows of a taller view leave rows unloaded"
+    );
+    let painted = aether_client::grid::painted_rows(&partial.window);
+    let (at, last) = painted.last().expect("the rule is painted");
+    assert!(
+        matches!(
+            last,
+            aether_client::grid::PaintedRow::Chrome(aether_protocol::viewport::Element::Chrome {
                 kind: aether_protocol::viewport::ChromeKind::Rule,
                 rail: aether_protocol::ui::RailJoin::Closes,
                 ..
             })
         ),
-        "a window that stops short of the view's end must not carry the rule that closes it"
+        "the last thing painted is the rule closing the view"
+    );
+    assert_eq!(
+        at.get(),
+        total - 1,
+        "and it sits on the view's last row, not after the last loaded line"
     );
     drop(server);
 }
@@ -7536,9 +7596,11 @@ async fn extending_a_selection_cannot_anchor_outside_the_element() {
             rows: 60,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -7642,9 +7704,11 @@ async fn moving_a_paragraph_cannot_reach_outside_the_hunk() {
             rows: 60,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -7652,11 +7716,7 @@ async fn moving_a_paragraph_cannot_reach_outside_the_hunk() {
         },
     )
     .await;
-    let file = sub
-        .focus
-        .expect("the view windows the file")
-        .buffer
-        .buffer_id;
+    let file = sub.focus.buffer.buffer_id;
     // `buffer/content` rather than a helper that subscribes — a subscribe would supersede the
     // patch viewport and dissolve the very scope under test.
     async fn content(ws: &mut Ws, buffer_id: u64) -> String {
@@ -7712,8 +7772,10 @@ async fn moving_a_paragraph_cannot_reach_outside_the_hunk() {
 #[tokio::test]
 async fn motion_undo_refuses_a_position_in_another_hunk() {
     use aether_protocol::cursor::{CursorUndo, CursorUndoParams};
-    use aether_protocol::viewport::{FocusStep, FocusTarget, ViewportFocusElement,
-        ViewportFocusElementParams, ViewportFocusElementResult};
+    use aether_protocol::viewport::{
+        FocusStep, FocusTarget, ViewportFocusElement, ViewportFocusElementParams,
+        ViewportFocusElementResult,
+    };
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -7745,9 +7807,11 @@ async fn motion_undo_refuses_a_position_in_another_hunk() {
             rows: 60,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -7772,7 +7836,12 @@ async fn motion_undo_refuses_a_position_in_another_hunk() {
     }
 
     // Land in the first hunk and move about, so the history fills with its lines.
-    let first = focus(&mut ws, sub.viewport_id, FocusTarget::Element { element: 0 }).await;
+    let first = focus(
+        &mut ws,
+        sub.viewport_id,
+        FocusTarget::Element { element: 0 },
+    )
+    .await;
     let buffer_id = first.buffer.buffer_id;
     let mut in_first = first.buffer.cursor.position;
     for _ in 0..2 {

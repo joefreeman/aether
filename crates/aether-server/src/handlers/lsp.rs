@@ -462,7 +462,7 @@ pub fn collect_symbol_path_pushes(s: &mut ServerState, buffer_id: BufferId) -> P
     let mut clients: Vec<ClientId> = s
         .viewports
         .values()
-        .filter(|vp| vp.binds(buffer_id))
+        .filter(|vp| s.view_of(vp).binds(buffer_id))
         .map(|vp| vp.client_id)
         .collect();
     clients.sort_unstable();
@@ -850,8 +850,6 @@ pub fn set_diagnostics_and_refresh(
     if !s.buffers.contains_key(&buffer_id) {
         return Vec::new();
     }
-    let buf = s.doc_of(buffer_id);
-    let revision = buf.revision;
     let diags = buffer_diagnostics(s, buffer_id);
     let counts = diagnostic_counts(diags);
     let mut pushes = Vec::new();
@@ -859,7 +857,7 @@ pub fn set_diagnostics_and_refresh(
     // plus the per-viewport `viewport/lines_changed` re-render (squiggles + gutter).
     let mut counted_clients: std::collections::HashSet<ClientId> = std::collections::HashSet::new();
     for vp in s.viewports.values() {
-        if !vp.shows(buffer_id) {
+        if !vp.shows(s.view_of(vp), buffer_id) {
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
@@ -870,7 +868,7 @@ pub fn set_diagnostics_and_refresh(
         }
         pushes.push((
             sender,
-            build_lines_changed_notif(s, vp, revision, lines_changed_cursor(s, vp)),
+            build_lines_changed_notif(s, vp, lines_changed_cursor(s, vp), SneakLabels::Hidden),
         ));
     }
     pushes
@@ -1581,7 +1579,7 @@ pub async fn lsp_format(
     let old_len = buf.text.len_chars();
     let cursors_before = document_cursor_snapshot(&s, buffer_id);
     let mut buf_mut = s.editable_doc(buffer_id)?;
-    let revision = buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Format, cursors_before);
+    buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Format, cursors_before);
 
     // Clamp every cursor on the buffer into the reformatted rope.
     clamp_doc_cursors(&mut s, buffer_id);
@@ -1594,7 +1592,7 @@ pub async fn lsp_format(
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     notify_lsp_change(&mut s, buffer_id);
 
-    let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+    let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id);
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
     let result_cursor = s
@@ -2094,8 +2092,7 @@ pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -
                 // generated against.
                 status.baseline = s.git_baseline_choices.get(&workdir).cloned();
                 s.virtual_git_status.insert(buffer_id, status);
-                let revision = s.doc_of(buffer_id).revision;
-                return collect_doc_lines_changed_pushes(s, buffer_id, revision);
+                return collect_doc_lines_changed_pushes(s, buffer_id);
             }
         }
         return Vec::new();

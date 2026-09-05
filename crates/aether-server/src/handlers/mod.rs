@@ -15,7 +15,7 @@ use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
     BlameCache, Buffer, BufferRange, DeferredToken, Document, DocumentId, EditKindTag,
     ElementBinding, LineEnding, NavEntry, SearchEntry, ServerState, SharedState, SneakCandidate,
-    SneakEntry, ViewLayout, Viewport,
+    SneakEntry, Viewport,
 };
 use crate::surround;
 use crate::wrap;
@@ -100,10 +100,9 @@ use aether_protocol::sneak::{
 };
 use aether_protocol::viewport::{
     BaselineRow, BufferStatusSnapshot, ConflictLine, DiagnosticSpan, DiffMarker, DiffStage,
-    Element, EmphasisRange, LineChange, LogicalLineRange, LogicalLineRender, PatchLine,
-    ScrollPosition, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResizeParams,
-    ViewportScrollParams, ViewportSetWrapParams, ViewportSubscribeParams, ViewportSubscribeResult,
-    ViewportWindowResult, Window,
+    Element, EmphasisRange, LineChange, LogicalLineRender, PatchLine, ScrollPosition,
+    ViewportLinesChanged, ViewportLinesChangedParams, ViewportResizeParams, ViewportSetWrapParams,
+    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, Window,
 };
 use aether_protocol::workspace::{
     WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProjectParams,

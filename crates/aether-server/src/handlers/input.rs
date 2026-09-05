@@ -167,7 +167,7 @@ pub async fn input_tab(
 pub fn client_tab_width(s: &ServerState, client_id: ClientId, buffer_id: BufferId) -> u32 {
     s.viewports
         .values()
-        .find(|v| v.binds(buffer_id) && v.client_id == client_id)
+        .find(|v| s.view_of(v).binds(buffer_id) && v.client_id == client_id)
         .map(|v| v.tab_width)
         .unwrap_or(4)
 }
@@ -1030,8 +1030,7 @@ async fn apply_toggle_comment(
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
-    let pushes: PendingPushes =
-        collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
+    let pushes: PendingPushes = collect_doc_edit_pushes(&s, buffer_id, edit_first, edit_last_excl);
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
     // LSP: full-document sync.
@@ -1440,8 +1439,13 @@ pub async fn input_adjust_number(
             .get(&(client_id, params.buffer_id))
             .copied()
             .unwrap_or_default();
-        if resolve_number_edit(&s.motion_scope(client_id, params.buffer_id)?, &cursor, delta, scan)
-            .is_none()
+        if resolve_number_edit(
+            &s.motion_scope(client_id, params.buffer_id)?,
+            &cursor,
+            delta,
+            scan,
+        )
+        .is_none()
         {
             let revision = buf.revision;
             let cursor = wrap_for_response(&s, client_id, params.buffer_id, cursor);
@@ -1578,8 +1582,7 @@ async fn apply_indent_or_dedent(
     let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
     search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
-    let pushes: PendingPushes =
-        collect_doc_edit_pushes(&s, buffer_id, revision, edit_first, edit_last_excl);
+    let pushes: PendingPushes = collect_doc_edit_pushes(&s, buffer_id, edit_first, edit_last_excl);
 
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
     // LSP: full-document sync.

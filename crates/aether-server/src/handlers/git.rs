@@ -3458,62 +3458,14 @@ pub async fn git_set_diff_view(
 ) -> Result<ViewportWindowResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
-    let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
-    vp.diff_view = params.enabled;
-    let (cols, rows, overscan, wrap, marker_width, tab_width, buffer_id, scroll_line) = (
-        vp.focus().cols,
-        vp.rows,
-        vp.overscan_rows,
-        vp.wrap,
-        vp.focus().continuation_marker_width,
-        vp.tab_width,
-        vp.buffer_id(),
-        vp.scroll_view_line,
-    );
-    let elements = elements_of(&s, params.viewport_id);
-
+    require_viewport_mut(&mut s, params.viewport_id, client_id)?.diff_view = params.enabled;
+    let buffer_id = s.focused_buffer(&s.viewports[&params.viewport_id]);
     // Refresh hunks so the first diff frame is accurate; clearing the view leaves them as-is
     // (harmless — nothing renders them).
     if params.enabled {
         recompute_diff_hunks_if_viewed(&mut s, buffer_id);
     }
-
-    if s.try_doc_of(buffer_id).is_none() {
-        return Err(RpcError::buffer_not_found(buffer_id));
-    }
-    // Against the **view's** length, not the focused element's document. `scroll_line` is a view
-    // line, and `pushed_range` clamps it to the count it is given: measured against one file of a
-    // patch, a scroll position further down the view than that file is long clamped back to the
-    // file's end, and the window came back from the top of the view instead of from where the
-    // client was. The client then found its anchor line missing and fell back to the window's
-    // first row — a scroll that jumps on toggle, on exactly the views where the two spaces differ.
-    let line_count = ViewLayout::of(&elements, |id| s.doc_of(id).line_count()).line_count();
-    let (first, last_excl) = pushed_range(scroll_line, rows, overscan, line_count);
-    let window = render_window(
-        &s,
-        client_id,
-        crate::handlers::view_id_of(&s, params.viewport_id, buffer_id),
-        &elements,
-        crate::handlers::focused_of(&s, params.viewport_id),
-        first,
-        last_excl,
-        wrap::WrapGeometry {
-            wrap,
-            cols,
-            marker_width,
-            tab_width,
-        },
-        rows,
-        params.enabled,
-        SneakLabels::Shown,
-    );
-
-    let vp = s
-        .viewports
-        .get_mut(&params.viewport_id)
-        .expect("just checked");
-    vp.first_view_line = first;
-    vp.last_view_line_exclusive = last_excl;
+    let window = render_viewport(&s, params.viewport_id, SneakLabels::Shown);
     Ok(ViewportWindowResult { window })
 }
 
@@ -3532,17 +3484,36 @@ pub async fn git_navigate_hunk(
     params: GitNavigateHunkParams,
 ) -> Result<GitNavigateHunkResult, RpcError> {
     let client_id = ctx.client_id;
-    let mut s = state.lock().await;
+    let s = state.lock().await;
     if !s.buffers.contains_key(&params.buffer_id) {
         return Err(RpcError::buffer_not_found(params.buffer_id));
     }
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
+    let anchors = buffer_change_anchors(&s, params.buffer_id);
+    // The field's extent. `c` is a *target* motion, so a hunk outside the element the cursor is in
+    // is not a destination — the same rule `d` follows. In an ordinary editor view the field is the
+    // whole buffer and this filters nothing; it matters wherever a view windows part of a file.
+    let (field_first, field_last) = {
+        let scope = s.motion_scope(client_id, params.buffer_id)?;
+        (scope.first_line(), scope.last_line())
+    };
+    let anchors: Vec<u32> = anchors
+        .into_iter()
+        .filter(|&a| a >= field_first && a <= field_last)
+        .collect();
+    finish_hunk_navigation(s, client_id, params, current, anchors).await
+}
 
-    // Three sources for "the next thing worth stepping to", picked by what the buffer *is*. Same
-    // keys, same gesture, better answer — the pattern the conflict branch established.
-    let conflicts = buffer_conflicts(&s, params.buffer_id);
-    let anchors: Vec<u32> = if let Some(generated) = s.doc_of(params.buffer_id).generated.as_ref() {
+/// The lines a buffer's own changes start on — what `c`/`Alt-c` step between in it, and what a
+/// view whose element windows the buffer without a diff of its own steps through
+/// `view/navigate_change`.
+///
+/// Three sources for "the next thing worth stepping to", picked by what the buffer *is*. Same keys,
+/// same gesture, better answer — the pattern the conflict branch established.
+pub fn buffer_change_anchors(s: &ServerState, buffer_id: BufferId) -> Vec<u32> {
+    let conflicts = buffer_conflicts(s, buffer_id);
+    if let Some(generated) = s.doc_of(buffer_id).generated.as_ref() {
         // A generated patch: its own change blocks, already in buffer-line coordinates.
         // Deliberately the blocks and not the hunks — a hunk opens with the context lines that
         // make it readable, so stopping at its start would land several lines above anything that
@@ -3568,8 +3539,8 @@ pub async fn git_navigate_hunk(
         // reverted back to HEAD's content but staged differently (in the index diff only). Under a
         // pinned baseline there is no second layer to union in: a revision puts the same content in
         // both blobs, and the saved file has no HEAD side at all.
-        let buf = s.doc_of(params.buffer_id);
-        let baseline = s.git_baseline.get(&params.buffer_id);
+        let buf = s.doc_of(buffer_id);
+        let baseline = s.git_baseline.get(&buffer_id);
         // A pending baseline offers no anchors — the gutter they would step between hasn't been
         // drawn yet either, and the push that draws it arrives a moment later.
         let effective =
@@ -3591,20 +3562,18 @@ pub async fn git_navigate_hunk(
         anchors.sort_unstable();
         anchors.dedup();
         anchors
-    };
-    // The field's extent. `c` is a *target* motion, so a hunk outside the element the cursor is in
-    // is not a destination — the same rule `d` follows. In an ordinary editor view the field is the
-    // whole buffer and this filters nothing; it matters wherever a view windows part of a file.
-    // (A composed view's `c` is routed to `view/navigate_change` by the client instead, which steps
-    // between the view's elements — a different verb, and the reason this one stays element-local.)
-    let (field_first, field_last) = {
-        let scope = s.motion_scope(client_id, params.buffer_id)?;
-        (scope.first_line(), scope.last_line())
-    };
-    let anchors: Vec<u32> = anchors
-        .into_iter()
-        .filter(|&a| a >= field_first && a <= field_last)
-        .collect();
+    }
+}
+
+/// The step itself, over the anchors already scoped to the field.
+async fn finish_hunk_navigation(
+    mut s: tokio::sync::MutexGuard<'_, ServerState>,
+    client_id: ClientId,
+    params: GitNavigateHunkParams,
+    current: CursorState,
+    anchors: Vec<u32>,
+) -> Result<GitNavigateHunkResult, RpcError> {
+    let key = (client_id, params.buffer_id);
     // Walk `count` hunks in `direction`. An over-large count **refuses** rather than landing on the
     // last/first change: the count names which hunk, and there isn't one. At `count == 1` the two
     // readings coincide, so this changes nothing for a bare `c`.
@@ -4066,8 +4035,7 @@ async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
         // text.
         clamp_doc_cursors(&mut s, buffer_id);
         refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
-        let revision = s.doc_of(buffer_id).revision;
-        let mut pushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+        let mut pushes = collect_doc_lines_changed_pushes(&s, buffer_id);
         // The state push as well as the content one, exactly as a reload sends both. A client
         // takes its `revision` from `viewport/lines_changed` but its `saved_revision` only from
         // `buffer/state` — so content alone leaves the two apart, and the buffer reads as edited.
@@ -4442,8 +4410,7 @@ pub async fn git_apply_hunk(
             let old_len = buf.text.len_chars();
             let cursors_before = document_cursor_snapshot(&s, buffer_id);
             let mut buf_mut = s.editable_doc(buffer_id)?;
-            let revision =
-                buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Revert, cursors_before);
+            buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Revert, cursors_before);
 
             // Clamp every cursor on the buffer into the reverted rope.
             clamp_doc_cursors(&mut s, buffer_id);
@@ -4457,7 +4424,7 @@ pub async fn git_apply_hunk(
             refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
             notify_lsp_change(&mut s, buffer_id);
 
-            let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+            let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id);
             let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
             let result = outcome(&s, ApplyHunkStatus::Reverted);
@@ -4545,7 +4512,7 @@ pub async fn git_resolve_conflict(
     let old_len = doc.text.len_chars();
     let cursors_before = document_cursor_snapshot(&s, buffer_id);
     let mut buf_mut = s.editable_doc(buffer_id)?;
-    let revision = buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Resolve, cursors_before);
+    buf_mut.apply_edit(0, old_len, &new_text, EditKindTag::Resolve, cursors_before);
 
     clamp_doc_cursors(&mut s, buffer_id);
     s.clear_motion_history_for_buffer(buffer_id);
@@ -4578,7 +4545,7 @@ pub async fn git_resolve_conflict(
     recompute_conflicts(&mut s, buffer_id);
     notify_lsp_change(&mut s, buffer_id);
 
-    let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id, revision);
+    let pushes: PendingPushes = collect_doc_lines_changed_pushes(&s, buffer_id);
     let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
 
     let mut result = outcome(&s, ResolveConflictStatus::Resolved);

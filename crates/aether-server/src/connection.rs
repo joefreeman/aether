@@ -53,8 +53,8 @@ use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::syntax::SyntaxHighlightSnippet;
 use aether_protocol::viewport::{
-    ViewSave, ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportScroll,
-    ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe, ViewportWindowAtCursor,
+    ViewSave, ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportSetWrap,
+    ViewportSubscribe, ViewportWindow, ViewportWindowAtCursor,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceAddProject, WorkspaceAddRoot, WorkspaceBindWorktree,
@@ -304,7 +304,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
             .viewports
             .values()
             .filter(|v| v.client_id == client_id)
-            .flat_map(|v| v.shown_buffers())
+            .flat_map(|v| v.shown_buffers(s.view_of(v)))
             .collect();
         s.drop_viewports_for_client(client_id);
         let (closed, _stopped) = s.close_orphaned_transients(viewed);
@@ -506,8 +506,7 @@ async fn dispatch(
         BufferCut::NAME => run!(BufferCut, handlers::buffer_cut),
         ViewportSubscribe::NAME => run!(ViewportSubscribe, handlers::viewport_subscribe),
         ViewportResize::NAME => run!(ViewportResize, handlers::viewport_resize),
-        ViewportScroll::NAME => run!(ViewportScroll, handlers::viewport_scroll),
-        ViewportScrollToRow::NAME => run!(ViewportScrollToRow, handlers::viewport_scroll_to_row),
+        ViewportWindow::NAME => run!(ViewportWindow, handlers::viewport_window),
         ViewportWindowAtCursor::NAME => {
             run!(ViewportWindowAtCursor, handlers::viewport_window_at_cursor)
         }

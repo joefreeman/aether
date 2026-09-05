@@ -206,6 +206,17 @@ pub enum JumplistStepResult {
     NoneInFile,
     /// No list is captured (or it captured empty) — the client toasts how to capture.
     Empty,
+    /// The entry names a view that no longer holds it — the change was staged, committed or
+    /// reverted since the capture — and neither does any entry further on in this direction. No
+    /// move. `skipped` counts the entries passed over looking, `opened` is the view when it had to
+    /// be brought back to look: the client shows it, since that is where the entries live.
+    Gone {
+        index: u32,
+        total: u32,
+        skipped: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opened: Option<Box<BufferOpenResult>>,
+    },
 }
 
 impl JumplistStepResult {
@@ -214,6 +225,7 @@ impl JumplistStepResult {
         match self {
             JumplistStepResult::Moved(t) => Some(*t),
             JumplistStepResult::AtEnd
+            | JumplistStepResult::Gone { .. }
             | JumplistStepResult::NoneInFile
             | JumplistStepResult::Empty => None,
         }
@@ -257,4 +269,8 @@ pub struct JumplistStepTarget {
     /// showing, or the entry never came from one — and the fields above are then the whole answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat: Option<ViewSeat>,
+    /// Entries stepped over on the way here because the view they name no longer holds them.
+    /// Zero — and off the wire — for every ordinary step.
+    #[serde(default, skip_serializing_if = "crate::is_zero")]
+    pub skipped: u32,
 }

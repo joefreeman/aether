@@ -154,6 +154,10 @@ pub(crate) fn count_one() -> u32 {
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 pub(crate) fn count_is_one(n: &u32) -> bool {
     *n == 1
 }

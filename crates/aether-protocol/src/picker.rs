@@ -1461,6 +1461,15 @@ pub enum PickerSelectResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         open: Option<Box<crate::buffer::BufferOpenResult>>,
     },
+    /// A jumplist row whose view no longer holds it: the change was staged, committed or reverted
+    /// since the capture. Nowhere to land and nowhere else to go — the row is a place *in that
+    /// view* — so the client says so rather than opening the row's file in an editor, which is
+    /// where such a row used to take you. `open` is the view when it had to be brought back to
+    /// look, for the client to show.
+    Gone {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        open: Option<Box<crate::buffer::BufferOpenResult>>,
+    },
     /// Attach to an already-open buffer *and* land the cursor somewhere in it — [`Self::Buffer`]
     /// with a position, and the pathless counterpart of [`Self::FileAt`].
     ///

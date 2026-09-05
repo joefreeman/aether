@@ -70,6 +70,61 @@ pub async fn buffer_close(
     // Remember the owning workspace before teardown drops the association, so we can retire an
     // ephemeral workspace once it loses its last buffer.
     let owning_workspace = s.workspace_for_buffer(buffer_id).map(str::to_string);
+    // A file a composed view windows is not torn down out from under the view. Closing it means
+    // the buffer stops being something opened *by name* — it leaves the buffers picker, the MRU and
+    // the persisted session, and this client's presentation of it goes — while the content stays
+    // exactly where the view's element shows it, in whichever client that is. It is collected with
+    // the view, the way every element buffer is: a buffer lives while some view shows it, and this
+    // is that rule applied to a close rather than an exception to it.
+    //
+    // Tearing it down instead dropped the review's layout and viewport silently; the window simply
+    // stopped updating.
+    let windowed_by_a_view = s
+        .viewports
+        .values()
+        .any(|v| v.view_id.presenting_buffer() != buffer_id && s.view_of(v).binds(buffer_id));
+    if windowed_by_a_view {
+        if let Some(buffer) = s.buffers.get_mut(&buffer_id) {
+            buffer.transient = true;
+        }
+        s.drop_buffer_from_mru(buffer_id);
+        s.viewports.retain(|_, v| {
+            !(v.client_id == client_id && v.view_id.presenting_buffer() == buffer_id)
+        });
+        let next_buffer_id = next_buffer_for_client(&s, client_id);
+        let mut pushes = collect_buffer_state_pushes(&s, buffer_id);
+        pushes.extend(refresh_buffer_pickers(&mut s));
+        drop(s);
+        for (sender, notif) in pushes {
+            let _ = sender.send(notif).await;
+        }
+        tracing::debug!(
+            buffer_id = buffer_id,
+            "buffer closed by name; kept for the view windowing it"
+        );
+        let opened = if params.open_next {
+            Some(
+                buffer_open(
+                    state,
+                    ctx,
+                    BufferOpenParams {
+                        buffer_id: next_buffer_id,
+                        ..Default::default()
+                    },
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        if let Some(workspace) = &owning_workspace {
+            persist_workspace_session(state, workspace, false).await;
+        }
+        return Ok(aether_protocol::buffer::BufferCloseResult {
+            next_buffer_id,
+            opened,
+        });
+    }
     // Closing is an explicit discard: drop any unsaved backup now, so the content isn't resurrected
     // the next time this path is opened (recover-on-open). Done before teardown drops the buffer.
     if let (Some(ws), Some(buf), Some(doc)) = (
@@ -267,7 +322,7 @@ pub async fn buffer_cut(
 
     let mut pushes: PendingPushes = Vec::new();
     for vp in s.viewports.values() {
-        if !vp.binds(params.buffer_id) {
+        if !s.view_of(vp).binds(params.buffer_id) {
             continue;
         }
         if !vp.diff_view
@@ -281,7 +336,7 @@ pub async fn buffer_cut(
         {
             // Out-of-window edit: nothing to render for this viewport, but a whole-document
             // consumer still needs the change signal.
-            push_buffer_changed(&s, vp, params.buffer_id, revision, &mut pushes);
+            push_buffer_changed(&s, vp, &mut pushes);
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
@@ -289,7 +344,7 @@ pub async fn buffer_cut(
         };
         pushes.push((
             sender,
-            build_lines_changed_notif(&s, vp, revision, lines_changed_cursor(&s, vp)),
+            build_lines_changed_notif(&s, vp, lines_changed_cursor(&s, vp), SneakLabels::Hidden),
         ));
     }
 
@@ -696,7 +751,7 @@ pub(crate) fn reload_buffer_locked(
     notify_lsp_change(s, buffer_id);
 
     let revision = s.doc_of(buffer_id).revision;
-    let mut pushes: PendingPushes = collect_doc_lines_changed_pushes(s, buffer_id, revision);
+    let mut pushes: PendingPushes = collect_doc_lines_changed_pushes(s, buffer_id);
 
     let state_pushes = collect_buffer_state_pushes(s, buffer_id);
     let picker_pushes = maybe_refresh_dirty(s, buffer_id, was_dirty);
@@ -792,7 +847,7 @@ fn open_scroll(
     if jump_to.is_some() {
         return None;
     }
-    client_id.and_then(|c| s.last_scroll.get(&(c, buffer_id)).copied())
+    client_id.and_then(|c| s.last_scroll.get(&(c, ViewId(buffer_id))).copied())
 }
 
 /// Materialize a dormant *scratch* buffer (selected by id from the picker, or landed on at activate):
@@ -946,6 +1001,91 @@ async fn buffer_for_working_file(
     )
     .await?
     .buffer_id)
+}
+
+/// Bind a generated view being presented again to its files, in full.
+///
+/// Every rebuild between a view's first open and now binds only the files that have a buffer open
+/// — `rebuild_view_layout` runs on the save, stage and teardown refreshes, where nothing can open
+/// one — and hiding the view closes its transient element buffers. So a review brought back
+/// through the buffers picker, a nav-history step or a jump came back windowing generated text
+/// for every file but the one you happened to be in, and named those hunks in patch coordinates.
+/// Being navigated to is a client's request, which is what it takes to open the files, so a view
+/// presented again is bound exactly as a fresh one is. A no-op for anything but a patch view with
+/// a file-backed element still windowing generated text.
+async fn rebind_presented_view(state: &SharedState, ctx: &mut ConnectionCtx, buffer_id: BufferId) {
+    let (repo_id, rev, paths) = {
+        let s = state.lock().await;
+        let Some(doc) = s.try_doc_of(buffer_id) else {
+            return;
+        };
+        let (Some(generated), Some(source), Some(view)) = (
+            doc.generated.as_ref(),
+            doc.virtual_source.as_ref(),
+            s.try_view(ViewId(buffer_id)),
+        ) else {
+            return;
+        };
+        let rev = match &source.target.what {
+            aether_protocol::git::ShowTarget::WorkingChanges => None,
+            aether_protocol::git::ShowTarget::Commit { rev } => Some(rev.clone()),
+            aether_protocol::git::ShowTarget::File { .. } => return,
+        };
+        // The file each element's region belongs to, when it has one — the same reading of the
+        // index `layout_over_files` makes.
+        let file_of = |span: &crate::patch::ElementSpan| -> Option<&str> {
+            let info = generated
+                .index
+                .lines
+                .get(span.start_line as usize)
+                .copied()
+                .flatten()?;
+            let hunk = info.hunk?;
+            let file = generated.plan.files.get(info.file as usize)?;
+            file.regions.get(hunk as usize)?;
+            file.new_path.as_deref()
+        };
+        let unbound_with_file = generated
+            .decorations
+            .elements
+            .iter()
+            .zip(view.elements.iter())
+            .any(|(span, binding)| binding.buffer_id == buffer_id && file_of(span).is_some());
+        if !unbound_with_file {
+            return;
+        }
+        let mut paths: Vec<String> = generated
+            .decorations
+            .elements
+            .iter()
+            .filter_map(file_of)
+            .map(str::to_string)
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        (source.target.repo_id.clone(), rev, paths)
+    };
+    // Resolve every file first — opening one is asynchronous — then lay out under the lock.
+    let mut buffers: std::collections::HashMap<String, BufferId> = std::collections::HashMap::new();
+    for path in paths {
+        let resolved = match rev.as_deref() {
+            Some(rev) => buffer_for_file_at_rev(state, ctx, &repo_id, rev, &path).await,
+            None => {
+                buffer_for_working_file(state, ctx, &std::path::Path::new(&repo_id).join(&path))
+                    .await
+            }
+        };
+        if let Ok(id) = resolved {
+            buffers.insert(path, id);
+        }
+    }
+    let mut s = state.lock().await;
+    let Some(generated) = s.try_doc_of(buffer_id).and_then(|d| d.generated.as_ref()) else {
+        return;
+    };
+    let layout = crate::patch::layout_over_files(generated, |path| buffers.get(path).copied());
+    s.set_view_layout(buffer_id, layout);
+    s.rebind_viewports_of(buffer_id);
 }
 
 /// Build a patch view's elements over the **real files** it describes.
@@ -1235,7 +1375,7 @@ pub async fn git_show(
         _ => None,
     };
 
-    let open = open_generated_buffer(
+    let mut open = open_generated_buffer(
         state,
         ctx,
         target,
@@ -1247,6 +1387,45 @@ pub async fn git_show(
     .await?;
     if let Some(layout) = layout {
         state.lock().await.set_view_layout(open.buffer_id, layout);
+    }
+    // Where the file the caller came for begins **in the view**: the element windowing it and the
+    // line of that element's buffer. The client frames its subscribe on this, and a fresh subscribe
+    // takes its focused element from the scroll — so this is what makes a patch opened on a file
+    // open *in* that file. Read after the layout is installed, since the outline's lines are the
+    // elements' own: before it they would be patch lines. The patch-line cursor the open reported
+    // is the same place named in the patch document, for the callers that read the patch itself.
+    if let Some(want) = params.focus_path.as_deref() {
+        let mut s = state.lock().await;
+        let id = open.buffer_id;
+        let elements = s.view_elements(ViewId(id)).into_owned();
+        if let Some(entry) = view_outline_of(&s, id, &elements)
+            .into_iter()
+            .find(|e| e.file == want)
+        {
+            open.scroll = Some(ScrollPosition {
+                element: entry.element,
+                line: entry.line,
+                sub_row: 0.0,
+            });
+            if let Some(binding) = elements.get(entry.element as usize) {
+                if binding.buffer_id != id {
+                    let position = LogicalPosition {
+                        line: entry.line,
+                        col: 0,
+                    };
+                    set_cursor(
+                        &mut s,
+                        (ctx.client_id, binding.buffer_id),
+                        CursorState {
+                            position,
+                            anchor: position,
+                            match_bracket: None,
+                            jumplist_position: None,
+                        },
+                    );
+                }
+            }
+        }
     }
     Ok(opened(open))
 }
@@ -1639,6 +1818,10 @@ async fn buffer_open_inner(
                 };
             }
             None => {}
+        }
+        // A view navigated back to is bound to its files in full — see `rebind_presented_view`.
+        if intent == OpenIntent::Navigate {
+            Box::pin(rebind_presented_view(state, ctx, buffer_id)).await;
         }
 
         let mut s = state.lock().await;
@@ -2303,17 +2486,18 @@ async fn finish_pending_parse(
 /// buffer's current revision rides through unchanged.
 pub fn collect_buffer_refresh_pushes(s: &ServerState, buffer_id: BufferId) -> PendingPushes {
     let mut pushes: PendingPushes = Vec::new();
-    let Some(buf) = s.try_doc_of(buffer_id) else {
+    if s.try_doc_of(buffer_id).is_none() {
         return pushes;
-    };
+    }
     for vp in s.viewports.values() {
-        if !vp.shows(buffer_id) {
+        if !vp.shows(s.view_of(vp), buffer_id) {
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
             continue;
         };
-        let notif = build_lines_changed_notif(s, vp, buf.revision, lines_changed_cursor(s, vp));
+        let notif =
+            build_lines_changed_notif(s, vp, lines_changed_cursor(s, vp), SneakLabels::Hidden);
         pushes.push((sender, notif));
     }
     pushes

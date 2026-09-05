@@ -1,6 +1,6 @@
 //! Viewport messages.
 
-use crate::coords::{ViewLine, VisualRow};
+use crate::coords::ElementRow;
 use crate::cursor::CursorState;
 use crate::envelope::{NotificationMethod, RpcMethod};
 use crate::git::GitBufferStatus;
@@ -20,10 +20,20 @@ pub enum WrapMode {
     None,
 }
 
-/// Where a view is scrolled to: a line of the **view**, plus how far into that line's own rows.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// Where a view is scrolled to, as **content**: an element, a line of that element's buffer, and
+/// how far into that line's block of rows.
+///
+/// Names a place the way a bookmark does, so it survives a wrap toggle, a resize and a restore — a
+/// visual row would not. It used to be a *view line*, an index into the concatenation of the
+/// elements' extents: a coordinate no client could compute and no user ever saw, and the one every
+/// blank-viewport bug in this area was a confusion with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScrollPosition {
-    pub logical_line: ViewLine,
+    pub element: FieldId,
+    /// A line of the element's **buffer**.
+    pub line: u32,
+    /// Rows into the line's block — chrome above it, phantoms, then its own wrapped rows.
+    /// Fractional for a pixel-scrolling client.
     pub sub_row: f32,
 }
 
@@ -335,29 +345,19 @@ pub struct Highlight {
     pub kind: String,
 }
 
+/// What a viewport shows of its view: the whole tree, with the loaded slices inside it, and the
+/// view-level facts the status bar needs.
+///
+/// No scroll geometry. The tree carries every element's total height and every loaded slice's row
+/// within its element, and the client lays the view out from that — it is the only side that can,
+/// since a prose element's height is measured there. So the view's total height, where a slice
+/// sits on screen and how far the view may scroll are all the client's arithmetic over the tree,
+/// not numbers the server sends.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Window {
-    /// The slice of the **view** currently pushed. View lines, not buffer lines: for a view of
-    /// several elements these index the concatenation of their extents and match no single file.
-    pub first_view_line: ViewLine,
-    pub last_view_line_exclusive: ViewLine,
-    /// How many lines the **view** has: its elements' extents, summed. Lets the client clamp
-    /// scroll targets without round-tripping.
-    pub view_line_count: u32,
-    /// Highest legal value for `ScrollPosition.logical_line`: the view's last visual row sits
-    /// at the bottom of the viewport. Server-computed because under soft wrap each line can
-    /// occupy multiple visual rows.
-    pub max_scroll_view_line: ViewLine,
-    /// Total visual rows in the whole view for this viewport's wrap+cols (real wrapped rows plus
-    /// any diff phantom rows and chrome). Lets a client size a native scroll container to the full
-    /// view (`total_visual_rows × line_height`). Equals `view_line_count` under `WrapMode::None`
-    /// with no diff and no chrome.
-    pub total_visual_rows: u32,
-    /// Visual row at which `first_view_line` begins (cumulative rows of everything above it). Lets
-    /// a client absolutely-position this window inside the full-height scroller.
-    pub first_visual_row: VisualRow,
-    /// Display width (in cols) of the buffer's widest line, for sizing a native horizontal scroll
-    /// container under `WrapMode::None`. `0` under soft wrap (content always fits `cols`).
+    /// Display width (in cols) of the widest line among the view's buffers, for sizing a native
+    /// horizontal scroll container under `WrapMode::None`. `0` under soft wrap (content always
+    /// fits `cols`).
     pub max_line_width: u32,
     /// Buffer-level Git status (branch + staged/unstaged counts) for the status bar. `None` outside
     /// a repo. Rides the window so it updates live on edits.
@@ -383,13 +383,6 @@ pub struct Window {
     /// and hunks interleaved for a generated patch. Use [`Element::lines`] where the structure is
     /// irrelevant and every rendered line is what's wanted.
     pub root: Element,
-}
-
-/// A range of **view** lines — what a push says it has replaced.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LogicalLineRange {
-    pub start_view_line: ViewLine,
-    pub end_view_line_exclusive: ViewLine,
 }
 
 // ---- view/save ----------------------------------------------------------------------------------
@@ -454,7 +447,14 @@ pub struct ViewportSubscribeParams {
     pub cols: u32,
     pub rows: u32,
     pub overscan_rows: u32,
+    /// Where to open: the server loads a screen of the named element around this line, and the
+    /// client puts that line's block at the top of its viewport.
     pub scroll: ScrollPosition,
+    /// Which element holds the cursor, when the subscriber knows — a re-subscribe (a wrap toggle,
+    /// a reconnect) says where focus already is, so the server does not move it. Absent on a fresh
+    /// open, where the element the scroll names is the one being looked at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<FieldId>,
     pub wrap: WrapMode,
     /// Cols the client reserves at the start of each *continuation* row for a wrap indicator
     /// glyph (e.g. "↪ "). The server subtracts this from the available width on continuation
@@ -487,14 +487,18 @@ pub struct ViewportSubscribeResult {
     /// Which element of this view holds the cursor, and the buffer it windows — the same answer
     /// [`ViewportFocusElement`] gives, because it is the same question.
     ///
-    /// Present only when it says something the subscriber doesn't already know: a **composed** view
-    /// is a tree of elements windowing *other* buffers, so the buffer it was opened as (a patch's
-    /// generated document) is not the buffer its cursor is in. A client that holds both at once
-    /// holds two line spaces: its cursor is a position in the view's document while every rendered
-    /// line belongs to a file, so nothing draws the cursor and any reveal it owes can never be paid.
-    /// Absent for an ordinary editor view, whose one element windows the buffer it *is*.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub focus: Option<ViewportFocusElementResult>,
+    /// Always present. A client mirrors the focused element, and the server decides it (from the
+    /// scroll the subscribe named, today), so the mirror has to start from the server's value
+    /// whichever element that is — for an ordinary view, element 0 over the buffer it *is*. It was
+    /// once omitted when the focused element windowed the subscribed buffer itself, which left a
+    /// subscribe landing in a patch's own text (a deleted file's block) with the server on element
+    /// N and the client on element 0, and no cursor seated in either.
+    ///
+    /// For a composed view it is also what keeps the client out of two line spaces at once: the
+    /// buffer it opened (a patch's generated document) is not the buffer its cursor is in, and a
+    /// cursor held as a position in the view's document while every rendered line belongs to a file
+    /// is a cursor nothing draws.
+    pub focus: ViewportFocusElementResult,
 }
 
 /// The buffer-level state a client needs to start showing a buffer, beyond the rendered window —
@@ -543,19 +547,43 @@ pub struct ViewportWindowResult {
     pub window: Window,
 }
 
-// ---- viewport/scroll ----------------------------------------------------------------------------
+// ---- view/window --------------------------------------------------------------------------------
 
-pub struct ViewportScroll;
-impl RpcMethod for ViewportScroll {
-    const NAME: &'static str = "view/scroll";
-    type Params = ViewportScrollParams;
+/// Load the slices of the view a client's viewport reaches.
+///
+/// The client lays the view out from the tree — every element's height is in it, chrome is one row
+/// each, prose it measures itself — so it knows which elements its viewport intersects and at what
+/// row within each. What it cannot know is which *lines* those rows are, because that depends on
+/// how the lines above them wrapped; so each slice is asked for by element and row within it, and
+/// the server answers with the lines from there. One request loads every element a screen straddles.
+///
+/// Replaces the two scroll requests that addressed the view by a *view line* or an absolute row:
+/// both presumed the server could sum the heights of everything above a point, which stops being
+/// true the moment a view holds an element the client laid out.
+pub struct ViewportWindow;
+impl RpcMethod for ViewportWindow {
+    const NAME: &'static str = "view/window";
+    type Params = ViewportWindowParams;
     type Result = ViewportWindowResult;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ViewportScrollParams {
+pub struct ViewportWindowParams {
     pub viewport_id: ViewportId,
-    pub scroll: ScrollPosition,
+    /// Where the viewport's top is, as content — what a reopen of this view restores. Reported
+    /// here rather than through a request of its own, because every scroll that matters ends in a
+    /// window request.
+    pub anchor: ScrollPosition,
+    /// The slices to load, replacing whatever was loaded before. An element not named is unloaded.
+    pub slices: Vec<SliceRequest>,
+}
+
+/// One element's slice: `rows` rows starting `from_row` within the element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SliceRequest {
+    pub element: FieldId,
+    pub from_row: ElementRow,
+    pub rows: u32,
 }
 
 // ---- viewport/focus_element ---------------------------------------------------------------------
@@ -643,13 +671,18 @@ pub struct ViewportFocusElementResult {
 
 // ---- viewport/navigate_change -------------------------------------------------------------------
 
-/// Step to the next or previous **change** in a composed view — a patch's `c` / `Alt-c`.
+/// Step to the next or previous **change** in a view — `c` / `Alt-c`, whatever the view shows.
 ///
 /// View-scoped rather than buffer-scoped, and that is the whole point: a patch's changes are spread
 /// across its elements, each windowing a different file. Asking one of those files what changed in
 /// it answers a different question — for a commit it answers nothing at all, since a blob at a
 /// revision has no baseline to diff against. The view knows, because its elements carry the diff's
 /// own account of their lines.
+///
+/// **Total**: an ordinary view's changes are its one buffer's own hunks, and its outline is that
+/// buffer's document symbols, so the same two keys go here whatever kind of view they are pressed
+/// in. A client that routed them by view kind had to know what a view *was*; one that routes them
+/// here does not.
 ///
 /// Stepping past the last change stops rather than wrapping, as hunk navigation does in a file.
 pub struct ViewportNavigateChange;
@@ -672,6 +705,11 @@ pub struct ViewportNavigateChangeParams {
     /// whose result type would be identical.
     #[serde(default, skip_serializing_if = "NavigateGrain::is_default")]
     pub grain: NavigateGrain,
+    /// Grow the selection to the landing change (Shift) rather than collapsing to a point there:
+    /// the anchor is kept and the cursor jumps. Within one element only — a selection cannot span
+    /// buffers — so a step that crosses into another element lands as a point there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub extend: bool,
 }
 
 /// The unit `view/navigate_change` steps.
@@ -699,42 +737,22 @@ impl NavigateGrain {
     }
 }
 
-// ---- viewport/scroll_to_row ---------------------------------------------------------------------
-
-/// Scroll so the given absolute visual row is at the top of the viewport. Visual-row-addressed
-/// (rather than logical-line) so a client doing native pixel scrolling can map `scrollTop /
-/// line_height` straight to a request — the server resolves the visual row to the logical line it
-/// falls in and returns the window (with `first_visual_row` for absolute positioning).
-pub struct ViewportScrollToRow;
-impl RpcMethod for ViewportScrollToRow {
-    const NAME: &'static str = "view/scroll_to_row";
-    type Params = ViewportScrollToRowParams;
-    type Result = ViewportWindowResult;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ViewportScrollToRowParams {
-    pub viewport_id: ViewportId,
-    pub top_visual_row: VisualRow,
-}
-
 // ---- viewport/window_at_cursor ------------------------------------------------------------------
 
 /// Return (and scroll to) a window containing **this client's cursor** in the view's focused
 /// element.
 ///
-/// The one thing a client cannot ask for in coordinates of its own. A window is addressed by view
-/// line or by visual row, and when the cursor's line has scrolled out of the loaded window the
-/// client knows neither: a view line is an index into the concatenation of the elements' extents,
-/// and a visual row depends on how the lines above the cursor wrapped — both facts the server holds
-/// and the client can only guess at. Guessing is what it used to do, by fetching around the focused
-/// *element's* start instead, which answers a different question the moment the cursor is more than
-/// a screen into a large element: the window comes back without the cursor's line in it, the reveal
-/// or placement waiting on it still cannot be performed, and the view has been dragged to the top of
-/// the element for nothing. That is what "`;` has to be pressed twice" was.
+/// The one thing a client cannot ask for in coordinates of its own. A slice is addressed by row
+/// within its element, and when the cursor's line has scrolled out of the loaded slice the client
+/// does not know its row: that depends on how the lines above the cursor wrapped, which the server
+/// holds and the client can only guess at. Guessing is what it used to do, by fetching around the
+/// focused *element's* start instead, which answers a different question the moment the cursor is
+/// more than a screen into a large element: the window comes back without the cursor's line in it,
+/// the reveal or placement waiting on it still cannot be performed, and the view has been dragged to
+/// the top of the element for nothing. That is what "`;` has to be pressed twice" was.
 ///
-/// No coordinates cross the wire, because both halves — where the cursor is, and how the view is
-/// laid out — live here.
+/// No coordinates cross the wire, because both halves — where the cursor is, and how its element
+/// wraps — live here.
 pub struct ViewportWindowAtCursor;
 impl RpcMethod for ViewportWindowAtCursor {
     const NAME: &'static str = "view/window_at_cursor";
@@ -781,31 +799,10 @@ pub struct ViewportLinesChangedParams {
     /// redirecting a buffer id behind the client's back unworkable.
     pub buffer: crate::BufferId,
     pub revision: Revision,
-    pub range: LogicalLineRange,
-    /// The window's content after the change. A whole replacement rather than a splice: the client
-    /// rebuilds its window from this, and a patch regenerates wholesale anyway. Carries the tree
-    /// rather than a flat line list so a regenerated patch keeps its chrome.
-    pub root: Element,
-    /// The **view's** line count after the edit. Lets the client keep its `view_line_count` cache
-    /// fresh as edits add/remove lines, so scroll clamping stays accurate.
-    pub view_line_count: u32,
-    /// Recomputed maximum legal scroll line after the edit.
-    pub max_scroll_view_line: ViewLine,
-    /// Recomputed total visual rows after the edit — lets a native-scrolling client resize its
-    /// scroll container (the wrapped height can change when an edit lengthens/shortens a line).
-    pub total_visual_rows: u32,
-    /// Visual row of the changed range's first line, so the client can reposition the window.
-    pub first_visual_row: VisualRow,
-    /// Recomputed widest-line width (cols) after the edit, for native horizontal scroll sizing.
-    pub max_line_width: u32,
-    /// Recomputed buffer-level Git status (branch + staged/unstaged counts). `None` outside a repo.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_status: Option<GitBufferStatus>,
-    /// Recomputed [`Window::other_elements_dirty`] — an edit in one element can be the first thing
-    /// that makes a *neighbouring* element's file dirty from the next element's point of view, so
-    /// the flag has to move with edits the way `git_status` does.
-    #[serde(default)]
-    pub other_elements_dirty: bool,
+    /// The window after the change: the same shape a geometry request answers with, re-rendered
+    /// over the slices the viewport had loaded. A whole replacement rather than a splice — the
+    /// client rebuilds from it, and a patch regenerates wholesale anyway.
+    pub window: Window,
     /// The authoritative cursor for the receiving client after the change, decorated like an RPC
     /// response (`match_bracket`, `jumplist_position`). Lets the client adopt server-side cursor
     /// moves that have no request in flight — e.g. the clamp a watcher reload applies when the

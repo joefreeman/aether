@@ -937,10 +937,6 @@ pub struct ViewState {
     /// depending on which hunk you were in. Identical to `buffer.label` for an ordinary view, which
     /// is one element windowing the buffer it is.
     pub view_label: String,
-    /// Whether this *view* is a patch — which its focused buffer cannot answer, since focus rebinds
-    /// `buffer` to whichever file the cursor is in and a file is not a patch. Decides where a
-    /// change-step goes: through the view's elements, or through one file's own diff.
-    pub view_is_patch: bool,
     /// Whether this **view** is transient — a preview that closes itself once hidden.
     ///
     /// [`Self::buffer`] cannot answer it, for the same reason it cannot answer the label: focus
@@ -1015,7 +1011,6 @@ impl ViewState {
     /// only thing that changes one without the other, and it goes through the focus path.
     pub fn rebind(&mut self, buffer: BufferInfo) {
         self.view_id = ViewId(buffer.buffer_id);
-        self.view_is_patch = buffer.is_patch;
         self.view_transient = buffer.transient;
         self.view_label = buffer.label.clone();
         self.buffer = buffer;
@@ -1062,7 +1057,6 @@ impl ViewState {
         Self {
             // A view opens on its own buffer; focus moves it off only in a multi-buffer view.
             view_id: ViewId(buffer.buffer_id),
-            view_is_patch: buffer.is_patch,
             view_transient: buffer.transient,
             view_label: buffer.label.clone(),
             buffer,
@@ -1775,13 +1769,20 @@ impl Session {
         ))
     }
 
-    /// The logical line the pending relayout anchor references — a re-subscribe (the TUI's wrap
-    /// path) must load a window around it so [`resolve_scroll_anchor`] can place it. `None` when no
+    /// The place the pending relayout anchor references — a re-subscribe (the TUI's wrap path)
+    /// must load a window around it so [`resolve_scroll_anchor`] can place it. `None` when no
     /// anchor is pending.
-    pub fn relayout_anchor_line(&self) -> Option<u32> {
+    pub fn relayout_anchor_position(&self) -> Option<ScrollPosition> {
         self.view
             .relayout_anchor
-            .map(|a| a.reference_line(self.view.buffer.cursor.position))
+            .map(|a| a.reference(self.view.focused_element, self.view.buffer.cursor.position))
+    }
+
+    /// Which element a re-subscribe should say holds the cursor: the one it already does, when
+    /// the session is re-presenting a view it holds a window for (a wrap toggle, a reconnect).
+    /// `None` on a fresh open, where the server decides from the place the view opens at.
+    pub fn subscribe_focus(&self) -> Option<aether_protocol::viewport::FieldId> {
+        self.view.window.as_ref().map(|_| self.view.focused_element)
     }
 
     /// The boot chooser's session (no workspace picked yet): every shell raises the Workspaces

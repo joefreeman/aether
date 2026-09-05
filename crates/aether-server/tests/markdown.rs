@@ -2,7 +2,6 @@
 
 mod common;
 
-use aether_protocol::coords::ViewLine;
 use common::*;
 
 // -------- transient buffers -----------------------------------------------------------------
@@ -1495,9 +1494,11 @@ async fn symbol_path_seeds_the_subscribe_snapshot() {
             rows: 40,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,

@@ -62,17 +62,16 @@ use aether_protocol::git::{
     GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult, GitDeleteBranch,
     GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitFetch, GitFetchParams,
     GitFetchResult, GitFetchStatus, GitFollowPatchLine, GitFollowPatchLineParams,
-    GitFollowPatchLineResult, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult,
-    GitOperationChanged, GitOperationChangedParams, GitPrepareCommit, GitPrepareCommitParams,
-    GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult, GitPullStatus, GitPush,
-    GitPushParams, GitPushResult, GitPushStatus, GitRepoOperation, GitReset, GitResetParams,
-    GitResetResult, GitResolveConflict, GitResolveConflictParams, GitResolveConflictResult,
-    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams,
-    GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams, GitStashPush,
-    GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus, GitWorktreeAdd,
-    GitWorktreeAddParams, GitWorktreeAddResult, GitWorktreeAddStatus, GitWorktreeRemove,
-    GitWorktreeRemoveParams, GitWorktreeRemoveResult, GitWorktreeRemoveStatus, HunkAction,
-    HunkDirection, ResolveConflictStatus,
+    GitFollowPatchLineResult, GitOperationChanged, GitOperationChangedParams, GitPrepareCommit,
+    GitPrepareCommitParams, GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult,
+    GitPullStatus, GitPush, GitPushParams, GitPushResult, GitPushStatus, GitRepoOperation,
+    GitReset, GitResetParams, GitResetResult, GitResolveConflict, GitResolveConflictParams,
+    GitResolveConflictResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
+    GitSetDiffViewParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
+    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus,
+    GitWorktreeAdd, GitWorktreeAddParams, GitWorktreeAddResult, GitWorktreeAddStatus,
+    GitWorktreeRemove, GitWorktreeRemoveParams, GitWorktreeRemoveResult, GitWorktreeRemoveStatus,
+    HunkAction, ResolveConflictStatus,
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
@@ -131,11 +130,10 @@ use aether_protocol::sneak::{
 };
 use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
 use aether_protocol::viewport::{
-    DiagnosticSeverity, FocusStep, FocusTarget, NavigateGrain, ViewportFocusElement,
-    ViewportFocusElementParams,
-    ViewportFocusElementResult, ViewportLinesChanged, ViewportLinesChangedParams,
-    ViewportNavigateChange, ViewportNavigateChangeParams, ViewportSubscribeResult,
-    ViewportWindowResult, Window, WrapMode, ViewSave, ViewSaveParams,
+    DiagnosticSeverity, FocusStep, FocusTarget, NavigateGrain, ViewSave, ViewSaveParams,
+    ViewportFocusElement, ViewportFocusElementParams, ViewportFocusElementResult,
+    ViewportLinesChanged, ViewportLinesChangedParams, ViewportNavigateChange,
+    ViewportNavigateChangeParams, ViewportSubscribeResult, ViewportWindowResult, WrapMode,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProject,
@@ -250,7 +248,12 @@ pub enum Event {
     HoverInfo(Result<LspHoverResult, String>),
     FormatDone(Result<LspFormatResult, String>),
     CommitLookup(Result<CommitDetails, String>),
-    HunkNav(Result<GitNavigateHunkResult, String>),
+    /// `view/navigate_change` came back: `c`/`Alt-c` stepped a change, or `o`/`Alt-o` an outline
+    /// entry. The same focus-shaped reply either way; the grain names the toast when nothing moved.
+    ViewStepped {
+        grain: NavigateGrain,
+        result: Result<ViewportFocusElementResult, String>,
+    },
     /// `git/prepare_commit` came back: the message file is written and ready to open.
     CommitPrepared {
         amend: bool,
@@ -475,6 +478,24 @@ pub enum PathEditorOwner {
     AddRoot,
     /// The open-from-path prompt (`Space Alt-w`) — absolute, files included.
     OpenPath,
+}
+
+/// The toast for a step that passed over entries whose view no longer holds them — none when it
+/// passed over none, which is every ordinary step.
+fn skipped_toast(skipped: u32) -> Effects {
+    match skipped {
+        0 => Effects::none(),
+        1 => Effects::toast_grouped(
+            "Skipped an entry that is no longer in the review",
+            ToastKind::Info,
+            "jumplist",
+        ),
+        n => Effects::toast_grouped(
+            format!("Skipped {n} entries that are no longer in the review"),
+            ToastKind::Info,
+            "jumplist",
+        ),
+    }
 }
 
 impl Session {
@@ -920,26 +941,54 @@ impl Session {
             {
                 let t = *t;
                 let (seat, position) = (t.seat.unwrap(), t.position.unwrap());
-                self.seat_in_view_element(
+                let seated = self.seat_in_view_element(
                     t.opened,
                     seat.element,
                     seat.buffer_id,
                     position,
                     t.anchor,
-                )
+                );
+                skipped_toast(t.skipped).and(seated)
             }
-            Event::JumplistStepped(Ok(JumplistStepResult::Moved(t)), _, _) => match t.opened {
-                Some(open) => {
-                    // A step is jump-shaped exactly when its entry carries a position — the same
-                    // test `open_path_at` applies, so `]` and Enter on the same row present the
-                    // target identically. A positioned entry (a grep hit, a diagnostic) lands in
-                    // the editor, where its line:col means something; a whole-target entry is "open
-                    // this file", so a markdown one reads.
-                    self.open_route_jumped = t.position.is_some();
-                    self.adopt_navigation(open)
+            // Nothing further in this direction is still in its view. The view is shown when it
+            // had to be brought back to look — that is where the entries are — and the toast says
+            // why nothing moved.
+            Event::JumplistStepped(
+                Ok(JumplistStepResult::Gone {
+                    skipped, opened, ..
+                }),
+                _,
+                _,
+            ) => {
+                let shown = match opened {
+                    Some(open) => {
+                        self.open_route_jumped = false;
+                        self.adopt_navigation(*open)
+                    }
+                    None => Effects::none(),
+                };
+                let msg = if skipped > 1 {
+                    format!("{skipped} entries are no longer in the review")
+                } else {
+                    "This entry is no longer in the review".to_string()
+                };
+                shown.and(Effects::toast_grouped(msg, ToastKind::Info, "jumplist"))
+            }
+            Event::JumplistStepped(Ok(JumplistStepResult::Moved(t)), _, _) => {
+                let skipped = skipped_toast(t.skipped);
+                match t.opened {
+                    Some(open) => {
+                        // A step is jump-shaped exactly when its entry carries a position — the
+                        // same test `open_path_at` applies, so `]` and Enter on the same row present
+                        // the target identically. A positioned entry (a grep hit, a diagnostic)
+                        // lands in the editor, where its line:col means something; a whole-target
+                        // entry is "open this file", so a markdown one reads.
+                        self.open_route_jumped = t.position.is_some();
+                        skipped.and(self.adopt_navigation(open))
+                    }
+                    None => skipped, // open:true is always sent; defensive
                 }
-                None => Effects::none(), // open:true is always sent; defensive
-            },
+            }
             // At the boundary — no wrap. Name the end reached (and, when file-scoped, that the
             // list continues in other files); keyed so holding the key coalesces.
             Event::JumplistStepped(Ok(JumplistStepResult::AtEnd), direction, scope) => {
@@ -1158,8 +1207,40 @@ impl Session {
             }
             Event::CommitLookup(Err(e)) => Effects::error_detail("Commit info failed", e),
 
-            Event::HunkNav(Ok(r)) => self.step_to_cursor(r.cursor, r.moved, "No more changes"),
-            Event::HunkNav(Err(e)) => Effects::error_detail("Change navigation failed", e),
+            Event::ViewStepped {
+                grain,
+                result: Ok(r),
+            } => {
+                // Moved or not is read off the reply: the server answers with where the cursor is,
+                // and "nowhere further" is the same place it was — in the same element.
+                let before = (self.view.focused_element, self.view.buffer.cursor);
+                let crossed = self.adopt_focus(r);
+                let moved = crossed || self.view.buffer.cursor != before.1;
+                let mut fx = if moved {
+                    Effects::none()
+                } else {
+                    // Grouped so repeatedly stepping with nowhere left to go coalesces to one toast.
+                    let exhausted = match grain {
+                        NavigateGrain::Change => "No more changes",
+                        NavigateGrain::Outline => "No more symbols",
+                    };
+                    Effects::toast_grouped(exhausted, ToastKind::Info, "step-nav")
+                };
+                // A change is a jump, as it always was; a symbol step within one buffer follows
+                // like the motion it always was, and only jumps when it crosses into another
+                // element.
+                fx.push(Effect::RevealCursor(
+                    if grain == NavigateGrain::Change || crossed {
+                        RevealStyle::Jump
+                    } else {
+                        RevealStyle::Follow
+                    },
+                ));
+                fx
+            }
+            Event::ViewStepped { result: Err(e), .. } => {
+                Effects::error_detail("Navigation failed", e)
+            }
 
             Event::CommitPrepared { amend, result } => match result {
                 Ok(prepared) => {
@@ -2049,13 +2130,25 @@ impl Session {
                     buffer_id,
                     position,
                     open,
-                } => self.seat_in_view_element(
-                    open.map(|o| *o),
-                    element,
-                    buffer_id,
-                    position,
-                    None,
-                ),
+                } => {
+                    self.seat_in_view_element(open.map(|o| *o), element, buffer_id, position, None)
+                }
+                // The row's view no longer holds it. Shown when it had to be brought back, and
+                // said either way — never the row's file in an editor.
+                PickerSelectResult::Gone { open } => {
+                    let shown = match open {
+                        Some(open) => {
+                            self.open_route_jumped = false;
+                            self.adopt_navigation(*open)
+                        }
+                        None => Effects::none(),
+                    };
+                    shown.and(Effects::toast_grouped(
+                        "This entry is no longer in the review",
+                        ToastKind::Info,
+                        "jumplist",
+                    ))
+                }
                 PickerSelectResult::BufferAt {
                     buffer_id,
                     position,
@@ -2548,7 +2641,11 @@ impl Session {
                     // only thing that moves the flag.
                     self.view.view_transient = transient;
                     Effects::toast_grouped(
-                        if transient { "View released" } else { "View kept" },
+                        if transient {
+                            "View released"
+                        } else {
+                            "View kept"
+                        },
                         ToastKind::Success,
                         "transient",
                     )
@@ -2833,19 +2930,28 @@ impl Session {
                             Err(e) if e.code == ErrorCode::WOULD_OVERWRITE.code() => {
                                 Ok(SaveTry::NeedsConfirm {
                                     kind: ConfirmKind::Overwrite { path: None },
-                                    action: ConfirmAction::Save { target: None, after },
+                                    action: ConfirmAction::Save {
+                                        target: None,
+                                        after,
+                                    },
                                 })
                             }
                             Err(e) if e.code == ErrorCode::EXTERNALLY_MODIFIED.code() => {
                                 Ok(SaveTry::NeedsConfirm {
                                     kind: ConfirmKind::OverwriteModified,
-                                    action: ConfirmAction::Save { target: None, after },
+                                    action: ConfirmAction::Save {
+                                        target: None,
+                                        after,
+                                    },
                                 })
                             }
                             Err(e) if e.code == ErrorCode::EXTERNALLY_DELETED.code() => {
                                 Ok(SaveTry::NeedsConfirm {
                                     kind: ConfirmKind::RecreateDeleted,
-                                    action: ConfirmAction::Save { target: None, after },
+                                    action: ConfirmAction::Save {
+                                        target: None,
+                                        after,
+                                    },
                                 })
                             }
                             Err(e) => Err(e.message),
@@ -3389,6 +3495,34 @@ impl Session {
         )
     }
 
+    /// Step the view — to its next change, or its next outline entry. A no-op without a viewport,
+    /// as focus is: there is nothing to step through before the first window arrives.
+    fn step_view(
+        &mut self,
+        forward: bool,
+        count: u32,
+        extend: bool,
+        grain: NavigateGrain,
+    ) -> Effects {
+        let Some(viewport_id) = self.view.viewport_id else {
+            return Effects::none();
+        };
+        self.request_str::<ViewportNavigateChange>(
+            ViewportNavigateChangeParams {
+                viewport_id,
+                direction: if forward {
+                    FocusStep::Next
+                } else {
+                    FocusStep::Previous
+                },
+                count: Some(count),
+                grain,
+                extend,
+            },
+            move |result| Event::ViewStepped { grain, result },
+        )
+    }
+
     /// Adopt a focus reply: which element holds the cursor, and the buffer it windows. Reports
     /// whether focus actually *moved*, which is what decides whether the view is re-framed.
     ///
@@ -3541,22 +3675,28 @@ impl Session {
         self.view.viewport_id = Some(res.viewport_id);
         self.adopt_buffer_status(res.buffer_status);
         self.view.window = Some(res.window);
-        // A composed view acts on the buffer its focused element windows, not on the buffer it was
-        // opened as: a patch's elements window real files while the view's own document is the
-        // generated patch text. Holding the latter while looking at the former is two line spaces at
-        // once — the cursor is a position in a document nothing on screen belongs to, so nothing
-        // draws it, motions act where no one is looking, and a reveal is owed that no window can
-        // ever pay. The server says which element and which buffer, because the server is what
-        // decided (a `focus_path` open lands on the file you asked for), and it says nothing at all
-        // for an ordinary view whose one element windows the buffer it is.
-        if let Some(focus) = res.focus {
-            self.view.focused_element = focus.element;
+        // The server decides which element holds the cursor (from the scroll the subscribe named,
+        // today), so the mirror starts from its answer — whichever element that is, including
+        // element 0 of an ordinary view. Taking it only for a composed view left a subscribe that
+        // landed in a patch's own text with the server on element N and this on element 0.
+        //
+        // The buffer rebinds only across a boundary. A composed view acts on the buffer its focused
+        // element windows, not on the buffer it was opened as: a patch's elements window real files
+        // while the view's own document is the generated patch text, and holding the latter while
+        // looking at the former is two line spaces at once — the cursor is a position in a document
+        // nothing on screen belongs to, so nothing draws it and a reveal is owed that no window can
+        // ever pay. For an ordinary view the focused element windows the buffer already held, whose
+        // `BufferInfo` came from the open and carries the restored scroll this subscribe was framed
+        // from; describing it again would only lose that.
+        let focus = res.focus;
+        self.view.focused_element = focus.element;
+        if focus.buffer.buffer_id != self.view.buffer.buffer_id {
             self.view.buffer = buffer_info(focus.buffer, &self.workspace_paths);
         }
     }
 
-    /// Adopt the window from a geometry RPC the shell issued (`viewport/scroll`, `scroll_to_row`,
-    /// `resize`). Pure core state; the shell clamps its scroll and reveals the cursor around it.
+    /// Adopt the window from a geometry RPC the shell issued (`view/window`, `view/set_wrap`,
+    /// `view/resize`). Pure core state; the shell clamps its scroll and reveals the cursor around it.
     pub fn adopt_window(&mut self, res: ViewportWindowResult) {
         self.view.window = Some(res.window);
     }
@@ -4284,7 +4424,7 @@ impl Session {
         ));
         fx = fx.and(self.request::<PickerView>(
             PickerViewParams {
-                    view_id: None,
+                view_id: None,
                 kind: PickerKind::Explorer,
                 reset: PickerReset::Keep,
                 offset: 0,
@@ -4388,7 +4528,7 @@ impl Session {
 
         self.request::<PickerView>(
             PickerViewParams {
-                    view_id: None,
+                view_id: None,
                 kind,
                 reset: PickerReset::Keep,
                 offset,
@@ -4840,7 +4980,7 @@ impl Session {
 
                 Effects::one(Effect::PickerScrollReset).and(self.request::<PickerView>(
                     PickerViewParams {
-                            view_id: None,
+                        view_id: None,
                         kind: PickerKind::Explorer,
                         reset: PickerReset::Keep,
                         offset: 0,
@@ -6557,10 +6697,10 @@ impl Session {
                 // way, e.g. another client's), and keep the cursor in view under the new
                 // geometry (the shell clamps + reveals).
                 //
-                // The revision belongs to `p.buffer`, which is not always the view's: a view is
-                // several editors over several buffers, and only the one this push rendered has
-                // moved. Filing another buffer's revision here would make the *next* push for the
-                // view's own buffer look stale and be dropped.
+                // `p.buffer` is the focused element's buffer as the server saw it — the one buffer
+                // this client tracks a revision for. It can still differ from ours: a push rendered
+                // before a focus move landed names the element focus just left, and filing its
+                // revision against the new buffer would make the next push for it look stale.
                 if p.buffer == self.view.buffer.buffer_id {
                     self.view.buffer.revision = p.revision;
                 }
@@ -6570,20 +6710,9 @@ impl Session {
                 if let Some(cursor) = p.cursor {
                     self.view.buffer.cursor = cursor;
                 }
-                self.view.window = Some(Window {
-                    first_view_line: p.range.start_view_line,
-                    last_view_line_exclusive: p.range.end_view_line_exclusive,
-                    view_line_count: p.view_line_count,
-                    max_scroll_view_line: p.max_scroll_view_line,
-                    total_visual_rows: p.total_visual_rows,
-                    first_visual_row: p.first_visual_row,
-                    max_line_width: p.max_line_width,
-                    git_status: p.git_status,
-                    other_elements_dirty: p.other_elements_dirty,
-                    root: p.root,
-                });
+                self.view.window = Some(p.window);
                 // An in-window edit is also a change signal for the reading view.
-                let read_fx = self.maybe_refresh_read(self.view.buffer.buffer_id, p.revision);
+                let read_fx = self.maybe_refresh_read(p.buffer, p.revision);
                 Effects::one(Effect::WindowAdopted).and(read_fx)
             }
             GitBlameChanged::NAME => {
@@ -9343,9 +9472,8 @@ impl Session {
                 // exactly the views this work is about.
                 //
                 // Counted, they stay absolute jumps: `N g` is buffer line N, 1-based, matching the
-                // gutter. `N Alt-g` still counts back from the view's end and is still wrong in a
-                // composed view — it needs the server to resolve "N-th from the field's end", which
-                // the protocol cannot yet say.
+                // gutter, and `N Alt-g` is the N-th line from the field's end — resolved by the
+                // server, the only side that knows where the focused element ends.
                 if !counted {
                     let motion = if last {
                         Motion::BufferEnd
@@ -9354,21 +9482,17 @@ impl Session {
                     };
                     return self.move_jump(motion, extend);
                 }
-                let line = if last {
-                    self.view
-                        .window
-                        .as_ref()
-                        .map(|w| w.view_line_count.saturating_sub(count))
-                        .unwrap_or(0)
+                let motion = if last {
+                    Motion::LineFromEnd { count }
                 } else {
-                    count.saturating_sub(1)
-                };
-                self.move_jump(
                     Motion::Goto {
-                        position: LogicalPosition { line, col: 0 },
-                    },
-                    extend,
-                )
+                        position: LogicalPosition {
+                            line: count.saturating_sub(1),
+                            col: 0,
+                        },
+                    }
+                };
+                self.move_jump(motion, extend)
             }
             A::MatchBracket { inner } => self.move_motion(Motion::MatchBracket { inner }, extend),
             A::PageMotion { dir, half } => {
@@ -9388,33 +9512,15 @@ impl Session {
             }
             // `o`/`Alt-o` step the **outline**, and which outline that is depends on the view: an
             // ordinary buffer's is its document symbols, a composed view's is its files. The same
-            // split `Space o` makes, and deliberately the same source — `view/navigate_change` at
-            // file grain reads the index the outline picker lists, so the key and the picker cannot
-            // disagree about what the stops are.
-            A::NavUnit(dir) if self.view.view_is_patch => {
-                let Some(viewport_id) = self.view.viewport_id else {
-                    return Effects::none();
-                };
-                self.request_str::<ViewportNavigateChange>(
-                    ViewportNavigateChangeParams {
-                        viewport_id,
-                        direction: if dir == Direction::Forward {
-                            FocusStep::Next
-                        } else {
-                            FocusStep::Previous
-                        },
-                        count: Some(count),
-                        grain: NavigateGrain::Outline,
-                    },
-                    Event::ElementFocused,
-                )
-            }
-            A::NavUnit(Direction::Forward) => {
-                self.move_motion(Motion::NextNavigationUnit { count }, extend)
-            }
-            A::NavUnit(Direction::Backward) => {
-                self.move_motion(Motion::PrevNavigationUnit { count }, extend)
-            }
+            // split `Space o` makes, and deliberately the same source — the view answers, so the
+            // key and the picker cannot disagree about what the stops are, and the client need not
+            // know what kind of view it is looking at.
+            A::NavUnit(dir) => self.step_view(
+                dir == Direction::Forward,
+                count,
+                extend,
+                NavigateGrain::Outline,
+            ),
             A::BeginFind { dir, till } => {
                 self.view.pending = Pending::Find {
                     dir,
@@ -9889,45 +9995,15 @@ impl Session {
                 ));
                 fx
             }
-            A::NextHunk | A::PrevHunk => {
-                let forward = matches!(action, A::NextHunk);
-                // A patch's changes live across its elements, each a window onto a different file.
-                // Asking one of those files what changed in it answers a different question — and
-                // for a commit, none at all: a blob at a revision has no baseline. The view knows.
-                if self.view.view_is_patch {
-                    let Some(viewport_id) = self.view.viewport_id else {
-                        return Effects::none();
-                    };
-                    return self.request_str::<ViewportNavigateChange>(
-                        ViewportNavigateChangeParams {
-                            viewport_id,
-                            direction: if forward {
-                                FocusStep::Next
-                            } else {
-                                FocusStep::Previous
-                            },
-                            count: Some(count),
-                            grain: NavigateGrain::Change,
-                        },
-                        Event::ElementFocused,
-                    );
-                }
-                let direction = if forward {
-                    HunkDirection::Next
-                } else {
-                    HunkDirection::Prev
-                };
-                self.request_str::<GitNavigateHunk>(
-                    GitNavigateHunkParams {
-                        buffer_id,
-                        from_line: self.view.buffer.cursor.position.line,
-                        direction,
-                        count,
-                        extend,
-                    },
-                    Event::HunkNav,
-                )
-            }
+            // A patch's changes live across its elements, each a window onto a different file;
+            // an ordinary buffer's are its own hunks. The view knows which, so the client asks it
+            // either way.
+            A::NextHunk | A::PrevHunk => self.step_view(
+                matches!(action, A::NextHunk),
+                count,
+                extend,
+                NavigateGrain::Change,
+            ),
             A::StageChange { scope } | A::UnstageChange { scope } | A::RevertChange { scope } => {
                 let hunk_action = match action {
                     A::StageChange { .. } => HunkAction::Stage,
@@ -10146,11 +10222,10 @@ impl Session {
             // alternative costs a round trip on every ordinary `Enter`: `git/follow_patch_line`
             // already answers "not a patch" server-side, but asking it first would make every
             // go-to-definition wait for that answer.
-            A::Activate if self.view.buffer.is_patch => self
-                .request_str::<GitFollowPatchLine>(
-                    GitFollowPatchLineParams { buffer_id },
-                    Event::PatchLineFollowed,
-                ),
+            A::Activate if self.view.buffer.is_patch => self.request_str::<GitFollowPatchLine>(
+                GitFollowPatchLineParams { buffer_id },
+                Event::PatchLineFollowed,
+            ),
             A::Activate => self
                 .request_str::<LspGotoDefinition>(LspBufferParams { buffer_id }, Event::Definition),
             // One verb, "tell me about the thing under the cursor", resolved against the mode:

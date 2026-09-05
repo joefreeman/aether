@@ -491,47 +491,45 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
                 // label — the file for the changes picker, the *directory* for the outline. Captured
                 // as a `File` target it produced entries naming directories, which a jump then tried
                 // to open as files.
-                let target = match &c.patch {
-                    // The **file** the change is in, at its own line. A jumplist entry is a place in
-                    // a file — that is what stepping it means — and addressing the patch document
-                    // instead gave every entry the same buffer and a patch line, so they all landed
-                    // in whichever element that line fell in.
-                    Some(p) => match p.file {
-                        Some((_, buffer_id, _)) => JumplistTarget::Buffer { buffer_id },
+                let (target, line) = match &c.patch {
+                    // The **file** the change is in, at its own line — however the view windows
+                    // it just now. A jumplist entry is a place in a file: that is what stepping it
+                    // means, and what survives the patch being rebuilt. Addressing the patch
+                    // document instead gave every entry the same buffer and a patch line, so they
+                    // all landed in whichever element that line fell in.
+                    Some(p) => match &p.durable {
+                        Some((target, line)) => (target.clone(), *line),
                         // Generated text with no file behind it: the patch itself is the only thing
-                        // that can address it.
-                        None => JumplistTarget::Buffer {
-                            buffer_id: p.buffer,
-                        },
+                        // that can address it, at the patch line.
+                        None => (
+                            JumplistTarget::Buffer {
+                                buffer_id: p.buffer,
+                            },
+                            c.select_line(re.as_ref()),
+                        ),
                     },
                     None => {
                         let (path_index, relative_path) =
                             relative_parts(c.path_index, &c.relative_path);
-                        JumplistTarget::File {
-                            path_index,
-                            relative_path,
-                            abs_path: c.abs_path.clone(),
-                        }
+                        (
+                            JumplistTarget::File {
+                                path_index,
+                                relative_path,
+                                abs_path: c.abs_path.clone(),
+                            },
+                            // Query-aware, like select: land on the matched line, not the anchor.
+                            c.select_line(re.as_ref()),
+                        )
                     }
                 };
                 JumplistEntry {
                     target,
                     // The key needs the view's source document, which only the capture *handler*
-                    // can reach; it fills this in for the rows that have a file behind them.
+                    // can reach; it fills this in for every row of a patch picker.
                     view: None,
-                    // In the same space as the target above: a file line for a bound row, a patch
-                    // line for one that has no file.
-                    position: Some(LogicalPosition {
-                        line: match &c.patch {
-                            Some(p) => p.file.map_or_else(
-                                || c.select_line(re.as_ref()),
-                                |(_, _, line)| line,
-                            ),
-                            // Query-aware, like select: land on the matched line, not the anchor.
-                            None => c.select_line(re.as_ref()),
-                        },
-                        col: 0,
-                    }),
+                    // In the same space as the target above: a file line for a row with a file, a
+                    // patch line for one that has none.
+                    position: Some(LogicalPosition { line, col: 0 }),
                     anchor: None,
                     // Both the workspace-wide and buffer-locked pickers group by file in the
                     // jumplist (`assign_file_groups`) — see the module note on grouping.
@@ -1198,17 +1196,35 @@ mod tests {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0), entry("/b", 2, 0)];
         // From /a:1 (on the first entry) → the next in-file entry.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/a", 0), pos(1, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(1, 0),
+                1
+            ),
             Some(1)
         );
         // Past /a's entries → the next file's first.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/a", 0), pos(5, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(5, 0),
+                1
+            ),
             Some(2)
         );
         // Past /b's entries → no wrap; stepping stops at the end.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/b", 0), pos(2, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/b", 0),
+                pos(2, 0),
+                1
+            ),
             None
         );
     }
@@ -1217,16 +1233,34 @@ mod tests {
     fn step_backward_mirrors_and_stops() {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0), entry("/b", 2, 0)];
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::file("/a", 0), pos(5, 0), 1),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::file("/a", 0),
+                pos(5, 0),
+                1
+            ),
             Some(0)
         );
         // Before /a's entries → no wrap; stepping stops at the start.
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::file("/a", 0), pos(1, 0), 1),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::file("/a", 0),
+                pos(1, 0),
+                1
+            ),
             None
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::file("/b", 0), pos(2, 0), 1),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::file("/b", 0),
+                pos(2, 0),
+                1
+            ),
             Some(1)
         );
     }
@@ -1236,20 +1270,44 @@ mod tests {
         let e = vec![entry("/a", 1, 0), entry("/c", 2, 0)];
         // /b sits between /a and /c.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/b", 0), pos(0, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/b", 0),
+                pos(0, 0),
+                1
+            ),
             Some(1)
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::file("/b", 0), pos(0, 0), 1),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::file("/b", 0),
+                pos(0, 0),
+                1
+            ),
             Some(0)
         );
         // Past either end (a file that sorts after / before every entry): no wrap, stop.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/z", 0), pos(0, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/z", 0),
+                pos(0, 0),
+                1
+            ),
             None
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::file("/A", 0), pos(0, 0), 1),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::file("/A", 0),
+                pos(0, 0),
+                1
+            ),
             None
         );
     }
@@ -1295,25 +1353,55 @@ mod tests {
 
         // From the top of buffer 7: its first hunk, then its second — progress, not entry 0 twice.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/one.rs", 7), pos(0, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/one.rs", 7),
+                pos(0, 0),
+                1
+            ),
             Some(0)
         );
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/one.rs", 7), pos(2, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/one.rs", 7),
+                pos(2, 0),
+                1
+            ),
             Some(1)
         );
         // Past buffer 7's last hunk, the walk crosses into the next buffer's entries.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/one.rs", 7), pos(42, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/one.rs", 7),
+                pos(42, 0),
+                1
+            ),
             Some(2)
         );
         // And backwards the same way, rather than snapping to an end.
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::file("/two.rs", 8), pos(42, 0), 1),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::file("/two.rs", 8),
+                pos(42, 0),
+                1
+            ),
             Some(2)
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::file("/two.rs", 8), pos(2, 0), 1),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::file("/two.rs", 8),
+                pos(2, 0),
+                1
+            ),
             Some(1)
         );
     }
@@ -1342,15 +1430,33 @@ mod tests {
         // The buffer id differs from anything captured — the view was reopened — and there is no
         // path. Only the key can match, and stepping still makes progress.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::view(key, 999), pos(0, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::view(key, 999),
+                pos(0, 0),
+                1
+            ),
             Some(0)
         );
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::view(key, 999), pos(2, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::view(key, 999),
+                pos(2, 0),
+                1
+            ),
             Some(1)
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::view(key, 999), pos(42, 0), 1),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::view(key, 999),
+                pos(42, 0),
+                1
+            ),
             Some(0)
         );
         // A different view's entries are not this view's.
@@ -1374,25 +1480,55 @@ mod tests {
         let e = vec![whole_file("/a"), whole_file("/b"), whole_file("/c")];
         // Deep inside /b — the cursor position is irrelevant to a whole-target entry.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/b", 0), pos(40, 3), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/b", 0),
+                pos(40, 3),
+                1
+            ),
             Some(2)
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::file("/b", 0), pos(40, 3), 1),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::file("/b", 0),
+                pos(40, 3),
+                1
+            ),
             Some(0)
         );
         // Still stops at the ends rather than cycling.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/c", 0), pos(0, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/c", 0),
+                pos(0, 0),
+                1
+            ),
             None
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::file("/a", 0), pos(0, 0), 1),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::file("/a", 0),
+                pos(0, 0),
+                1
+            ),
             None
         );
         // And a count still advances, but one the list cannot honour refuses.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/a", 0), pos(0, 0), 9),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(0, 0),
+                9
+            ),
             None
         );
     }
@@ -1403,7 +1539,13 @@ mod tests {
     fn step_walks_into_and_out_of_a_captured_scratch_buffer() {
         let e = vec![whole_file("/a"), scratch(9), scratch(12)];
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/a", 0), pos(0, 0), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(0, 0),
+                1
+            ),
             Some(1)
         );
         // Sitting in scratch 9: forward to the next scratch, backward to the file.
@@ -1428,11 +1570,23 @@ mod tests {
     fn step_in_file_finds_nothing_to_walk_in_a_whole_file_list() {
         let e = vec![whole_file("/a"), whole_file("/b")];
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Location::file("/a", 0), pos(0, 0), 1),
+            step_in_file(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(0, 0),
+                1
+            ),
             InFileStep::NoneInFile
         );
         assert_eq!(
-            step_in_file(&e, Direction::Backward, Location::file("/a", 0), pos(9, 0), 1),
+            step_in_file(
+                &e,
+                Direction::Backward,
+                Location::file("/a", 0),
+                pos(9, 0),
+                1
+            ),
             InFileStep::NoneInFile
         );
     }
@@ -1453,18 +1607,36 @@ mod tests {
     fn step_count_advances_or_refuses() {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0), entry("/b", 2, 0)];
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/a", 0), pos(0, 0), 2),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(0, 0),
+                2
+            ),
             Some(1)
         );
         // A count past the end **refuses**. It used to clamp to the last entry and call that a
         // move, which is precisely how `5]` followed by `5[` lost your place: the first landed at
         // the end, and the second counted five back from there instead of returning.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/a", 0), pos(0, 0), 4),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(0, 0),
+                4
+            ),
             None
         );
         assert_eq!(
-            step_index(&e, Direction::Backward, Location::file("/b", 0), pos(2, 0), 2),
+            step_index(
+                &e,
+                Direction::Backward,
+                Location::file("/b", 0),
+                pos(2, 0),
+                2
+            ),
             Some(0)
         );
     }
@@ -1476,7 +1648,13 @@ mod tests {
         let e = vec![entry("/a", 3, 2), spanned.clone(), entry("/a", 3, 12)];
         // Cursor edge at the span's start (col 4): the entry counts as current, step past it.
         assert_eq!(
-            step_index(&e, Direction::Forward, Location::file("/a", 0), pos(3, 4), 1),
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(3, 4),
+                1
+            ),
             Some(2)
         );
         assert_eq!(spanned.start(), Some(pos(3, 4)));
@@ -1488,26 +1666,56 @@ mod tests {
         let e = vec![entry("/a", 1, 0), entry("/b", 2, 0), entry("/a", 5, 0)];
         // Forward from the top of /a → its first entry, skipping /b entirely.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Location::file("/a", 0), pos(0, 0), 1),
+            step_in_file(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(0, 0),
+                1
+            ),
             InFileStep::Moved(0)
         );
         // From /a:1 → /a's next entry (index 2), still not /b.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Location::file("/a", 0), pos(1, 0), 1),
+            step_in_file(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(1, 0),
+                1
+            ),
             InFileStep::Moved(2)
         );
         // On /a's last entry → no fall-through to /b; stops at the file's end.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Location::file("/a", 0), pos(5, 0), 1),
+            step_in_file(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(5, 0),
+                1
+            ),
             InFileStep::AtEnd
         );
         // Backward from /a's last → its first; before the first → stop.
         assert_eq!(
-            step_in_file(&e, Direction::Backward, Location::file("/a", 0), pos(5, 0), 1),
+            step_in_file(
+                &e,
+                Direction::Backward,
+                Location::file("/a", 0),
+                pos(5, 0),
+                1
+            ),
             InFileStep::Moved(0)
         );
         assert_eq!(
-            step_in_file(&e, Direction::Backward, Location::file("/a", 0), pos(1, 0), 1),
+            step_in_file(
+                &e,
+                Direction::Backward,
+                Location::file("/a", 0),
+                pos(1, 0),
+                1
+            ),
             InFileStep::AtEnd
         );
     }
@@ -1517,7 +1725,13 @@ mod tests {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0)];
         // /b has no captured entries.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Location::file("/b", 0), pos(0, 0), 1),
+            step_in_file(
+                &e,
+                Direction::Forward,
+                Location::file("/b", 0),
+                pos(0, 0),
+                1
+            ),
             InFileStep::NoneInFile
         );
         // A scratch buffer (no path) likewise has nothing in "its" file.
@@ -1533,15 +1747,33 @@ mod tests {
         // Forward 2 from the top → the second entry (first-past-edge, then one more); a count
         // the file cannot honour refuses, as the cross-file step does.
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Location::file("/a", 0), pos(0, 0), 2),
+            step_in_file(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(0, 0),
+                2
+            ),
             InFileStep::Moved(1)
         );
         assert_eq!(
-            step_in_file(&e, Direction::Forward, Location::file("/a", 0), pos(0, 0), 9),
+            step_in_file(
+                &e,
+                Direction::Forward,
+                Location::file("/a", 0),
+                pos(0, 0),
+                9
+            ),
             InFileStep::AtEnd
         );
         assert_eq!(
-            step_in_file(&e, Direction::Backward, Location::file("/a", 0), pos(9, 0), 9),
+            step_in_file(
+                &e,
+                Direction::Backward,
+                Location::file("/a", 0),
+                pos(9, 0),
+                9
+            ),
             InFileStep::AtEnd
         );
     }

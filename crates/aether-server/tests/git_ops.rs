@@ -2,7 +2,6 @@
 
 mod common;
 
-use aether_protocol::coords::ViewLine;
 use common::*;
 
 // ---- git branch picker ---------------------------------------------------------------------------
@@ -125,7 +124,7 @@ async fn the_branch_you_are_on_is_the_initial_selection() {
     let again = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             reset: PickerReset::Keep,
             ..view_params_on(PickerKind::GitBranches, buffer)
         },
@@ -381,7 +380,7 @@ async fn branch_picker_scroll_review_keeps_the_listing() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             reset: PickerReset::Keep,
             offset: 0,
             buffer_id: None,
@@ -686,7 +685,7 @@ async fn deleting_a_branch_refreshes_the_open_picker() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             buffer_id: Some(buf),
             ..view_params(PickerKind::GitBranches)
         },
@@ -1293,7 +1292,7 @@ async fn git_log_file_picker_is_locked_to_the_buffers_path() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             buffer_id: Some(buffer_id),
             ..view_params(PickerKind::GitLogFile)
         },
@@ -1498,7 +1497,7 @@ async fn git_log_centres_on_the_commit_the_active_buffer_shows() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             center_on_cursor: Some(shown.buffer_id),
             buffer_id: Some(shown.buffer_id),
             ..view_params(PickerKind::GitLog)
@@ -2101,7 +2100,7 @@ async fn stash_picker_centres_on_the_entry_being_viewed() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             buffer_id: Some(file_buffer),
             ..view_params(PickerKind::GitStash)
         },
@@ -2134,7 +2133,7 @@ async fn stash_picker_centres_on_the_entry_being_viewed() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             center_on_cursor: Some(shown.buffer_id),
             buffer_id: Some(shown.buffer_id),
             ..view_params(PickerKind::GitStash)
@@ -2305,9 +2304,11 @@ async fn git_status_of(ws: &mut Ws, rel: &str) -> aether_protocol::git::GitBuffe
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -3842,7 +3843,7 @@ async fn a_half_resolved_file_shows_conflicts_and_changes_side_by_side() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             limit: 30,
             // The file-scoped picker is built from the buffer it names.
             buffer_id: Some(buffer_id),
@@ -3874,7 +3875,7 @@ async fn git_changes_picker_lists_conflict_blocks() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
-                view_id: None,
+            view_id: None,
             limit: 30,
             ..view_params(PickerKind::GitChanges)
         },

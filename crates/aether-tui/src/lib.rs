@@ -18,7 +18,6 @@ mod stderr_capture;
 mod text_input;
 mod ui;
 
-use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -31,6 +30,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{stdout, Stdout};
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 /// Run the terminal client to completion. `workspace`/`file` are the (optional) CLI positionals,
 /// `tether` marks the quick-edit invocation (file positional, no explicit `--workspace` — the

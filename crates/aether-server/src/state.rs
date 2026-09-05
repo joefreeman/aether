@@ -5,7 +5,6 @@ use crate::indent::{self, IndentStyle};
 use crate::picker::{self as picker_state, PickerState};
 use crate::syntax::{self, InjectionLayer, LanguageConfig};
 use crate::workspace_index::WorkspaceIndex;
-use aether_protocol::coords::ViewLine;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
 use aether_protocol::lsp::SymbolCrumb;
@@ -153,11 +152,12 @@ pub struct ServerState {
     /// Outstanding deferred work, so a caller can wait for the server to go quiet rather than
     /// guess at how long its debounces take. See [`Deferred`].
     pub deferred: Arc<Deferred>,
-    /// Per-`(client, buffer)` last-known scroll position. Written whenever the client subscribes
-    /// or scrolls a viewport on the buffer, and surfaced on `buffer/open` so the client can
-    /// restore the view when it reopens the buffer (e.g. navigating away and back via the file
-    /// browser). Cleared on disconnect.
-    pub last_scroll: HashMap<(ClientId, BufferId), ScrollPosition>,
+    /// Per-`(client, view)` last-known scroll position, as content. Written whenever the client
+    /// subscribes to or loads a window of the view, and surfaced on `buffer/open` so the client can
+    /// restore the view where it left it. Keyed by the **view**: keying by the focused element's
+    /// buffer recorded a patch's position against one of its files, which a plain open of that file
+    /// then restored as if it were the file's own. Cleared on disconnect.
+    pub last_scroll: HashMap<(ClientId, ViewId), ScrollPosition>,
     /// Per-`(client, kind)` picker state. Survives `picker/hide` (so resume restores query +
     /// ranking); cleared on disconnect.
     pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
@@ -192,10 +192,15 @@ pub struct ServerState {
     /// Resolved once, when the buffer is minted or regenerated, rather than per viewport window:
     /// these reads open the repo, and the window is built on the keystroke path.
     pub virtual_git_status: HashMap<BufferId, aether_protocol::git::GitBufferStatus>,
-    /// Driver-built element layouts, keyed by the **view's** buffer. Present for a patch, whose
-    /// elements window the real files it describes; absent for every view that is simply its own
-    /// document. Dropped with the view.
-    pub view_layouts: HashMap<BufferId, Vec<ElementLayout>>,
+    /// Every view a client can be showing, keyed by the buffer presenting it — the **one owner** of
+    /// what a view is composed of. A viewport references its view here rather than carrying a copy
+    /// of the elements: a copy was a second thing to shift on edit, to rebuild after a stage, and
+    /// to drop on close, and each of those was forgotten at least once.
+    ///
+    /// An ordinary buffer's view is one whole-buffer element; a patch's is what its driver built.
+    /// Created when a view is first presented (`ensure_view`) or built by a driver
+    /// (`set_view_layout`), dropped with its buffer.
+    pub views: HashMap<ViewId, View>,
     /// Per-buffer conflict blocks, for the files a stopped merge or rebase left conflicted.
     /// Rescanned from the buffer's markers on the same triggers as the hunk caches, and **only
     /// while the baseline says the file is conflicted** — so an ordinary buffer never pays for the
@@ -658,7 +663,7 @@ impl ServerState {
             git_both_hunks: HashMap::new(),
             git_baseline: HashMap::new(),
             virtual_git_status: HashMap::new(),
-            view_layouts: HashMap::new(),
+            views: HashMap::new(),
             git_conflicts: HashMap::new(),
             git_blame: HashMap::new(),
             matcher: picker_state::make_matcher(),
@@ -704,58 +709,74 @@ impl ServerState {
             .expect("buffer references a live document")
     }
 
-    /// A driver-built layout for this view, if one exists — elements bound to real buffers rather
-    /// than to slices of the view's own document. Set when a patch is generated; consulted first by
-    /// [`Self::element_layout_of`].
+    /// Install the layout a driver built for a view: elements bound to real buffers rather than to
+    /// slices of the view's own document. Set when a patch is generated.
     pub fn set_view_layout(&mut self, buffer_id: BufferId, layout: Vec<ElementLayout>) {
-        self.view_layouts.insert(buffer_id, layout);
+        self.views
+            .insert(ViewId(buffer_id), View::from_layout(buffer_id, layout));
     }
 
-    /// The regions a document divides into, with the chrome that introduces each.
+    /// The view presented by `id`. Panics like [`Self::doc_of`] on a view nothing has presented:
+    /// every viewport's view exists (subscribing ensures it) and dies with its buffer, so a miss is
+    /// a broken invariant rather than a case.
+    pub fn view(&self, id: ViewId) -> &View {
+        self.views
+            .get(&id)
+            .unwrap_or_else(|| panic!("view {id} has not been presented"))
+    }
+
+    /// Non-panicking [`Self::view`].
+    pub fn try_view(&self, id: ViewId) -> Option<&View> {
+        self.views.get(&id)
+    }
+
+    /// The view a viewport presents.
+    pub fn view_of(&self, vp: &Viewport) -> &View {
+        self.view(vp.view_id)
+    }
+
+    /// The buffer a viewport is acting on: its focused element's.
+    pub fn focused_buffer(&self, vp: &Viewport) -> BufferId {
+        vp.buffer_id(self.view_of(vp))
+    }
+
+    /// The elements of `id`, whether or not it has been presented yet — the view's own if it has,
+    /// otherwise what presenting it *would* build: the regions a generated patch divides into, or
+    /// one element over the whole buffer.
     ///
-    /// A generated patch carries its own table — the chrome between files and hunks is what splits
-    /// it — and every other document is one region spanning the whole buffer with no chrome. One
-    /// function for both, so callers never branch on "is this a patch", and one place where a
-    /// region's chrome is paired with its extent so the two cannot drift.
-    pub fn element_layout_of(&self, buffer_id: BufferId) -> Vec<ElementLayout> {
-        if let Some(layout) = self.view_layouts.get(&buffer_id) {
-            return layout
-                .iter()
-                .map(|l| ElementLayout {
-                    extent: l.extent.clone(),
-                    chrome_above: l.chrome_above.clone(),
-                    decorations: l.decorations.clone(),
-                })
-                .collect();
+    /// For the callers that resolve a place in a view nobody is subscribed to: a jumplist entry
+    /// reopening the view it was captured from lands before the client's subscribe arrives.
+    pub fn view_elements(&self, id: ViewId) -> std::borrow::Cow<'_, [ElementBinding]> {
+        match self.views.get(&id) {
+            Some(view) => std::borrow::Cow::Borrowed(&view.elements),
+            None => std::borrow::Cow::Owned(self.default_view(id).elements),
         }
-        let doc = self.doc_of(buffer_id);
-        match doc.generated.as_ref() {
-            Some(g) if !g.decorations.elements.is_empty() => g
-                .decorations
-                .elements
-                .iter()
-                .map(|e| ElementLayout {
-                    extent: ElementExtent::OwnDocument {
-                        lines: e.start_line..e.end_line,
-                    },
-                    decorations: None,
-                    chrome_above: std::sync::Arc::new(
-                        g.decorations
-                            .chrome
-                            .get(e.start_line as usize)
-                            .cloned()
-                            .unwrap_or_default(),
-                    ),
-                })
-                .collect(),
-            _ => vec![ElementLayout {
-                extent: ElementExtent::OwnDocument {
-                    lines: 0..doc.text.len_lines() as u32,
-                },
-                decorations: None,
-                chrome_above: std::sync::Arc::new(Vec::new()),
-            }],
+    }
+
+    /// Make sure `id`'s view exists — what presenting a buffer that no driver built a view for
+    /// does. A driver's view is never replaced here.
+    pub fn ensure_view(&mut self, id: ViewId) {
+        if !self.views.contains_key(&id) {
+            let view = self.default_view(id);
+            self.views.insert(id, view);
         }
+    }
+
+    /// The view a buffer presents when no driver built one: a generated patch's own regions
+    /// (chrome between files and hunks is what splits it), else one region over the whole buffer.
+    fn default_view(&self, id: ViewId) -> View {
+        let buffer_id = id.presenting_buffer();
+        match self.doc_of(buffer_id).generated.as_ref() {
+            Some(g) if !g.decorations.elements.is_empty() => View::over_generated(buffer_id, g),
+            _ => View::whole(buffer_id),
+        }
+    }
+
+    /// Lay `elements` out in view order against their buffers' **live** line counts — the one way
+    /// to get a [`ViewLayout`], so no site can build one against a stale or a wrong count. Cheap:
+    /// one map lookup per element.
+    pub fn layout_of(&self, elements: &[ElementBinding]) -> ViewLayout {
+        ViewLayout::of(elements, |id| self.doc_of(id).line_count())
     }
 
     /// Move every element windowing `buffer_id` to account for an edit that changed its line count.
@@ -776,27 +797,28 @@ impl ServerState {
     /// the rebuild a save/stage/commit performs.
     pub fn shift_element_extents(&mut self, buffer_id: BufferId, shift: LineShift) {
         let siblings = self.doc_siblings(buffer_id);
-        for layout in self.view_layouts.values_mut() {
-            for element in layout {
-                // `bound_to`, not "whichever buffer this resolves to": an `OwnDocument` extent
-                // indexes the view's *generated* document, which no edit reaches — a patch is
-                // read-only — so its lines never move even when the file it was rendered from does.
-                // Asking the extent rather than a nullable id is what says so out loud.
-                if element.extent.bound_to().is_some_and(|id| siblings.contains(&id)) {
-                    element.extent.shift(shift.at, shift.delta);
+        // One place, because the views are the one owner. An element windowing the view's own
+        // generated text is never among `siblings` — a patch is read-only, so no edit reaches it —
+        // and a whole-buffer element has no extent to move.
+        for view in self.views.values_mut() {
+            for element in &mut view.elements {
+                if siblings.contains(&element.buffer_id) {
+                    element.lines.shift(shift.at, shift.delta);
                 }
             }
         }
+        // The slices each viewport has loaded are lines of the same buffers, and follow the text
+        // the same way: type a line into a loaded slice and the slice holds one more line, so the
+        // push that follows re-renders it rather than a slice one line short.
+        let views = &self.views;
         for vp in self.viewports.values_mut() {
-            for element in &mut vp.elements {
-                if siblings.contains(&element.buffer_id) {
-                    if shift.at < element.start_line {
-                        element.start_line = element.start_line.saturating_add_signed(shift.delta);
-                        element.end_line_exclusive =
-                            element.end_line_exclusive.saturating_add_signed(shift.delta);
-                    } else if shift.at < element.end_line_exclusive {
-                        element.end_line_exclusive =
-                            element.end_line_exclusive.saturating_add_signed(shift.delta);
+            let Some(view) = views.get(&vp.view_id) else {
+                continue;
+            };
+            for (element, slice) in view.elements.iter().zip(vp.loaded.iter_mut()) {
+                if let Some(range) = slice {
+                    if siblings.contains(&element.buffer_id) {
+                        shift_range(range, shift.at, shift.delta);
                     }
                 }
             }
@@ -818,38 +840,61 @@ impl ServerState {
             .replace_generated(text, generated);
         // A rebuilt patch has different regions *and* different stages — staging is the only thing
         // this view shows changing — so a driver-built layout is rebuilt from the new data, or the
-        // view keeps rendering the stages it was opened with. Resolution is by path against buffers
-        // already open: this runs on the save/stage/commit refresh, where opening files would be
-        // both surprising and asynchronous.
-        let rebuilt = self.view_layouts.contains_key(&buffer_id).then(|| {
-            let workspace = self.buffer_workspaces.get(&buffer_id).cloned();
-            let doc = self.doc_of(buffer_id);
-            let repo_id = doc
-                .virtual_source
-                .as_ref()
-                .map(|v| v.target.repo_id.clone())
-                .unwrap_or_default();
-            doc.generated.as_ref().map(|generated| {
-                crate::patch::layout_over_files(generated, |path| {
-                    let workspace = workspace.as_deref()?;
-                    let canonical = std::path::Path::new(&repo_id).join(path);
-                    self.buffer_for_path_in_workspace(workspace, &canonical)
-                })
-            })
-        });
-        if let Some(Some(rebuilt)) = rebuilt {
-            self.view_layouts.insert(buffer_id, rebuilt);
+        // view keeps rendering the stages it was opened with.
+        self.rebuild_view_layout(buffer_id);
+        self.rebind_viewports_of(buffer_id);
+    }
+
+    /// Re-derive a view's driver-built layout from its generated document, resolving each file
+    /// against the buffers already open.
+    ///
+    /// By path, not by the ids the old layout held: this runs on the save/stage/commit refresh and
+    /// on a buffer's teardown, where opening files would be both surprising and asynchronous, and
+    /// where an id may name nothing any more. A file with no open buffer keeps its generated text,
+    /// exactly as the open path leaves it (see [`crate::patch::layout_over_files`]).
+    ///
+    /// `false` when the view has no driver layout to rebuild — an ordinary buffer, or a patch no
+    /// driver built — in which case nothing changes.
+    pub fn rebuild_view_layout(&mut self, view_buffer: BufferId) -> bool {
+        if !self.views.contains_key(&ViewId(view_buffer)) {
+            return false;
         }
-        let layout = self.element_layout_of(buffer_id);
+        let workspace = self.buffer_workspaces.get(&view_buffer).cloned();
+        let Some(doc) = self.try_doc_of(view_buffer) else {
+            return false;
+        };
+        let repo_id = doc
+            .virtual_source
+            .as_ref()
+            .map(|v| v.target.repo_id.clone())
+            .unwrap_or_default();
+        let Some(generated) = doc.generated.as_ref() else {
+            return false;
+        };
+        let rebuilt = crate::patch::layout_over_files(generated, |path| {
+            let workspace = workspace.as_deref()?;
+            let canonical = std::path::Path::new(&repo_id).join(path);
+            self.buffer_for_path_in_workspace(workspace, &canonical)
+        });
+        self.views
+            .insert(ViewId(view_buffer), View::from_layout(view_buffer, rebuilt));
+        true
+    }
+
+    /// After a view's elements were rebuilt: a rebuild can have fewer elements than the one a
+    /// viewport's focus was in, and a focus index past the end would fall back to element 0
+    /// silently. The viewports reference the view, so this is all a rebuild has to tell them.
+    pub fn rebind_viewports_of(&mut self, view_buffer: BufferId) {
+        let view_id = ViewId(view_buffer);
+        let last = self
+            .views
+            .get(&view_id)
+            .map_or(0, |v| v.elements.len().saturating_sub(1))
+            as aether_protocol::viewport::FieldId;
         for vp in self.viewports.values_mut() {
-            if !vp.binds(buffer_id) {
-                continue;
+            if vp.view_id == view_id {
+                vp.focused = vp.focused.min(last);
             }
-            let (cols, marker) = (vp.focus().cols, vp.focus().continuation_marker_width);
-            vp.elements = layout
-                .iter()
-                .map(|l| l.bind(buffer_id, cols, marker))
-                .collect();
         }
     }
 
@@ -886,11 +931,14 @@ impl ServerState {
         let element = self
             .viewports
             .values()
-            .find(|v| v.client_id == client_id && v.binds(buffer_id))
-            .map(|v| v.focus())
+            .find(|v| v.client_id == client_id && self.view_of(v).binds(buffer_id))
+            .map(|v| v.focus(self.view_of(v)))
             .filter(|e| e.buffer_id == buffer_id);
         Ok(match element {
-            Some(e) => crate::cursor::Scope::windowed(doc, e.start_line, e.end_line_exclusive),
+            Some(e) => {
+                let lines = e.lines_in(doc.line_count());
+                crate::cursor::Scope::windowed(doc, lines.start, lines.end)
+            }
             None => crate::cursor::Scope::whole(doc),
         })
     }
@@ -1232,7 +1280,7 @@ impl ServerState {
             .filter(|w| {
                 self.buffers_in_workspace(&w.id).into_iter().all(|id| {
                     !self.try_doc_of(id).is_some_and(|d| d.dirty)
-                        && !self.viewports.values().any(|v| v.binds(id))
+                        && !self.viewports.values().any(|v| self.view_of(v).binds(id))
                 })
             })
             .map(|w| w.id.clone())
@@ -1488,24 +1536,37 @@ impl ServerState {
             }
         }
         self.buffer_workspaces.remove(&id);
-        // A view's layout dies with the view, and no *surviving* layout may keep naming this
-        // buffer: `element_bindings` feeds every element's id to `ViewLayout::of`, which resolves
-        // it through `doc_of` — documented to panic on an unknown buffer. Closing a file a patch
-        // view windows also drops that view's viewport (just below), so re-subscribing is the very
-        // next thing that happens.
+        // A view's own layout dies with the view. A *surviving* layout that windowed this buffer
+        // is re-derived without it — the element falls back to the view's generated text, exactly
+        // as it would have opened had the file been unavailable — because no layout may keep naming
+        // a buffer that is gone: `element_bindings` feeds every element's id to `ViewLayout::of`,
+        // which resolves it through `doc_of`, documented to panic on an unknown buffer.
         //
-        // The whole layout goes, not the one dead element. An element's extent is in *file* lines
-        // while it is bound and in the generated patch's lines once it is not
-        // (`patch::layout_over_files`), so unbinding in place would reinterpret one space as the
-        // other — a silently wrong window in place of a panic, which is the worse trade. Without a
-        // layout the view falls back to one region over its own document, and the next
-        // `git/show` rebuilds the bindings.
-        self.view_layouts.remove(&id);
-        self.view_layouts
-            .retain(|_, layout| !layout.iter().any(|e| e.extent.bound_to() == Some(id)));
-        // `shows`: a viewport *presenting* a patch binds no element of it, so a `binds` test left
-        // it alive with a `view_id` pointing at a buffer that no longer exists.
-        self.viewports.retain(|_, v| !v.shows(id));
+        // Re-derived rather than unbound in place: an element's extent is in *file* lines while it
+        // is bound and in the generated patch's lines once it is not, so editing the one element
+        // would reinterpret one space as the other — a silently wrong window in place of a panic.
+        // And re-derived rather than dropped: dropping the layout dropped the review's viewports
+        // with it, and the client whose review it was simply stopped receiving updates.
+        self.views.remove(&ViewId(id));
+        let windowed_by: Vec<BufferId> = self
+            .views
+            .iter()
+            .filter(|(_, view)| view.binds(id))
+            .map(|(view, _)| view.presenting_buffer())
+            .collect();
+        for view in windowed_by {
+            if self.rebuild_view_layout(view) {
+                self.rebind_viewports_of(view);
+            } else {
+                self.views.remove(&ViewId(view));
+            }
+        }
+        // Only the viewports *presenting* this buffer go with it; one that merely windowed it has
+        // just been rebound. `presenting_buffer`, not `binds`: a viewport presenting a patch binds
+        // no element of it, so a `binds` test left it alive with a `view_id` pointing at a buffer
+        // that no longer existed.
+        self.viewports
+            .retain(|_, v| v.view_id.presenting_buffer() != id);
         self.cursors.retain(|(_, b), _| *b != id);
         self.motion_history.retain(|(_, b), _| *b != id);
         self.virtual_col.retain(|(_, b), _| *b != id);
@@ -1519,7 +1580,8 @@ impl ServerState {
         self.blame_follow_gen.retain(|(_, b), _| *b != id);
         self.blame_last_pushed.retain(|(_, b), _| *b != id);
         self.symbol_path_sent.retain(|(_, b), _| *b != id);
-        self.last_scroll.retain(|(_, b), _| *b != id);
+        self.last_scroll
+            .retain(|(_, v), _| v.presenting_buffer() != id);
         self.git_unstaged_hunks.remove(&id);
         self.git_both_hunks.remove(&id);
         self.git_baseline.remove(&id);
@@ -1579,7 +1641,7 @@ impl ServerState {
                 // windows it, so asking only about bindings said "nothing is showing this" about
                 // the document on screen. The GC and the push fan-out now ask the same question —
                 // a buffer that is live enough to receive notifications is live enough to keep.
-                && !self.viewports.values().any(|v| v.shows(id));
+                && !self.viewports.values().any(|v| v.shows(self.view_of(v), id));
             if !eligible {
                 continue;
             }
@@ -1976,12 +2038,16 @@ impl ServerState {
         let viewed: Vec<BufferId> = self
             .viewports
             .values()
-            .filter(|v| v.client_id == client_id && workspace_buffers.contains(&v.buffer_id()))
-            .flat_map(|v| v.shown_buffers())
+            .filter(|v| {
+                v.client_id == client_id && workspace_buffers.contains(&self.focused_buffer(v))
+            })
+            .flat_map(|v| v.shown_buffers(self.view_of(v)))
             .filter(|b| workspace_buffers.contains(b))
             .collect();
+        let views = &self.views;
         self.viewports.retain(|_, v| {
-            !(v.client_id == client_id && workspace_buffers.contains(&v.buffer_id()))
+            !(v.client_id == client_id
+                && workspace_buffers.contains(&v.buffer_id(&views[&v.view_id])))
         });
         // A transient buffer the client was previewing doesn't survive leaving the workspace —
         // it's hidden now, same as switching buffers. (Permanent buffers stay alive for
@@ -2165,6 +2231,11 @@ pub struct Document {
     /// is not a meaningful description of what happened — those rely on the layout's clamp against
     /// the live buffer and on the rebuild that a save/stage/commit performs.
     pub last_shift: Option<LineShift>,
+    /// Per-line layout facts derived from the text — see [`LayoutCache`]. Interior mutability
+    /// because a render holds the state immutably and the cache fills on first read. A `Mutex`
+    /// rather than a `RefCell` only so the state stays `Sync` — handlers hold `&ServerState` across
+    /// awaits — and it is never contended: the state is behind one lock already.
+    layout: std::sync::Mutex<LayoutCache>,
     /// Decorations and structure computed once when the content was *generated*, for documents no
     /// grammar spans — the commit patch behind `git/show`. See [`crate::patch::GeneratedPatch`].
     pub generated: Option<crate::patch::GeneratedPatch>,
@@ -2270,6 +2341,108 @@ pub struct LineShift {
     pub delta: i32,
 }
 
+/// Lines an edit replaced: `removed` lines starting at `at` became `inserted` lines. What a
+/// per-line cache needs to splice itself rather than start over. Several edits merge into one:
+/// `at..at+removed` is then a range of the text *before* any of them and `at..at+inserted` the
+/// same region of the text after all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineSplice {
+    pub at: u32,
+    pub removed: u32,
+    pub inserted: u32,
+}
+
+impl LineSplice {
+    /// Fold a later edit — given in the coordinates of the text as it was when that edit ran —
+    /// into this one, so the pair describes one region of the original text replaced by one
+    /// region of the current text.
+    fn merge(self, next: LineSplice) -> LineSplice {
+        let lo = self.at.min(next.at);
+        // The union's end in current coordinates, and the same line in the original text: lines
+        // below the region so far replaced sit `inserted - removed` further along now.
+        let cur_hi = (self.at + self.inserted).max(next.at + next.removed);
+        let old_hi = cur_hi - self.inserted + self.removed;
+        LineSplice {
+            at: lo,
+            removed: old_hi - lo,
+            inserted: (cur_hi - lo) + next.inserted - next.removed,
+        }
+    }
+}
+
+/// Per-line layout facts about a document's text, kept with the text so a render reads them
+/// instead of re-deriving them: how many rows each line wraps to at a given width, and the widest
+/// line. Both used to be recomputed over the whole document on every scroll step — every line of
+/// a view wrapped again each time, which on a working-changes view of this repository is thirty
+/// thousand lines per keystroke.
+///
+/// Maintained across edits by splicing the lines an edit touched ([`LineSplice`]) and thrown away
+/// on a wholesale replacement (undo, reload), where no single splice describes what moved. Filled
+/// lazily, on the first read after a change, so a document nobody wraps costs nothing.
+#[derive(Default)]
+pub struct LayoutCache {
+    /// Wrapped-row count per line, for the last two wrap geometries asked about. Two, not one: one
+    /// document can be on screen in two clients at different widths, and a single slot would
+    /// recompute the whole document on every alternating render.
+    wrapped: Vec<(WrapKey, std::sync::Arc<Vec<u32>>)>,
+    /// `(tab_width, widest line in cols)`, for the no-wrap horizontal scroller.
+    max_width: Option<(u32, u32)>,
+    /// The edits applied to the text since the wrapped counts last matched it, merged into one.
+    pending: Option<LineSplice>,
+}
+
+/// The inputs a line's wrapped row count depends on — [`crate::wrap::WrapGeometry`] without the
+/// mode, which only says whether to ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WrapKey {
+    cols: u32,
+    marker_width: u32,
+    tab_width: u32,
+}
+
+impl LayoutCache {
+    fn record(&mut self, splice: LineSplice) {
+        self.pending = Some(match self.pending {
+            Some(so_far) => so_far.merge(splice),
+            None => splice,
+        });
+        self.max_width = None;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Bring every cached count up to date with `text` by re-deriving the region the edits since
+    /// replaced.
+    fn settle(&mut self, text: &ropey::Rope) {
+        let Some(splice) = self.pending.take() else {
+            return;
+        };
+        for (key, rows) in &mut self.wrapped {
+            let rows = std::sync::Arc::make_mut(rows);
+            let at = (splice.at as usize).min(rows.len());
+            let end = (at + splice.removed as usize).min(rows.len());
+            let fresh: Vec<u32> = (splice.at..splice.at + splice.inserted)
+                .map(|line| wrapped_row_count(text, line, *key))
+                .collect();
+            rows.splice(at..end, fresh);
+        }
+    }
+}
+
+/// How many rows line `line` of `text` wraps to at `key`.
+fn wrapped_row_count(text: &ropey::Rope, line: u32, key: WrapKey) -> u32 {
+    if line as usize >= text.len_lines() {
+        return 1;
+    }
+    let mut s: String = text.line(line as usize).chunks().collect();
+    if s.ends_with('\n') {
+        s.pop();
+    }
+    crate::wrap::compute_rows(&s, key.cols, key.marker_width, key.tab_width).len() as u32
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineEnding {
     Lf,
@@ -2337,6 +2510,7 @@ impl Document {
             backed_up_revision: None,
             disk_blob: None,
             last_shift: None,
+            layout: Default::default(),
             virtual_source: None,
         })
     }
@@ -2363,6 +2537,7 @@ impl Document {
             syntax,
             syntax_pending: false,
             last_shift: None,
+            layout: Default::default(),
             generated: None,
             indent_style,
             saved_revision: Some(0),
@@ -2435,6 +2610,7 @@ impl Document {
             backed_up_revision: None,
             disk_blob: None,
             last_shift: None,
+            layout: Default::default(),
         }
     }
 
@@ -2463,6 +2639,7 @@ impl Document {
             syntax,
             syntax_pending: false,
             last_shift: None,
+            layout: Default::default(),
             generated: None,
             indent_style,
             // Treat empty scratch as "clean"; first edit makes it dirty.
@@ -2477,6 +2654,66 @@ impl Document {
             disk_blob: None,
             virtual_source: None,
         }
+    }
+
+    fn layout_cache(&self) -> std::sync::MutexGuard<'_, LayoutCache> {
+        self.layout.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn layout_cache_mut(&mut self) -> &mut LayoutCache {
+        self.layout.get_mut().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many rows each line wraps to at `geom`, one count per line of the document, shared
+    /// (an `Arc`) with the cache so a render can hold it while it walks. See [`LayoutCache`].
+    ///
+    /// Asked under soft wrap only — under no wrap every line is one row and nobody needs a table
+    /// to say so.
+    pub fn wrapped_rows(&self, geom: crate::wrap::WrapGeometry) -> std::sync::Arc<Vec<u32>> {
+        let key = WrapKey {
+            cols: geom.cols,
+            marker_width: geom.marker_width,
+            tab_width: geom.tab_width,
+        };
+        let mut cache = self.layout_cache();
+        cache.settle(&self.text);
+        if let Some((_, rows)) = cache.wrapped.iter().find(|(k, _)| *k == key) {
+            return rows.clone();
+        }
+        let rows = std::sync::Arc::new(
+            (0..self.line_count())
+                .map(|line| wrapped_row_count(&self.text, line, key))
+                .collect::<Vec<u32>>(),
+        );
+        if cache.wrapped.len() >= 2 {
+            cache.wrapped.remove(0);
+        }
+        cache.wrapped.push((key, rows.clone()));
+        rows
+    }
+
+    /// Display width (cols) of the widest line — sizes a client's native horizontal scroller under
+    /// no wrap. Cached until the next edit.
+    pub fn max_line_width(&self, tab_width: u32) -> u32 {
+        let mut cache = self.layout_cache();
+        if let Some((tab, width)) = cache.max_width {
+            if tab == tab_width {
+                return width;
+            }
+        }
+        let mut max = 0u32;
+        for line in self.text.lines() {
+            let mut col = 0u32;
+            for c in line.chars() {
+                if c == '\n' {
+                    break;
+                }
+                col += crate::wrap::char_display_width(c, col, tab_width);
+            }
+            max = max.max(col);
+        }
+        cache.max_width = Some((tab_width, max));
+        max
     }
 
     pub fn line_count(&self) -> u32 {
@@ -2544,15 +2781,13 @@ impl Document {
 
         // Where this edit lands, in lines, before the rope moves under us. Removing a range that
         // spans N line breaks and inserting text containing M of them is a delta of M − N.
-        let shift = {
-            let at = self.text.char_to_line(start_char) as u32;
-            let removed =
-                (self.text.char_to_line(end_char) - self.text.char_to_line(start_char)) as i32;
-            let added = insert_text.matches('\n').count() as i32;
-            LineShift {
-                at,
-                delta: added - removed,
-            }
+        let at = self.text.char_to_line(start_char) as u32;
+        let removed_breaks =
+            (self.text.char_to_line(end_char) - self.text.char_to_line(start_char)) as u32;
+        let added_breaks = insert_text.matches('\n').count() as u32;
+        let shift = LineShift {
+            at,
+            delta: added_breaks as i32 - removed_breaks as i32,
         };
         if start_char < end_char {
             self.text.remove(start_char..end_char);
@@ -2561,6 +2796,13 @@ impl Document {
             self.text.insert(start_char, insert_text);
         }
         self.last_shift = (shift.delta != 0).then_some(shift);
+        // The lines the edit touched: one more than the breaks on each side, since a break's two
+        // neighbours are both affected.
+        self.layout_cache_mut().record(LineSplice {
+            at,
+            removed: removed_breaks + 1,
+            inserted: added_breaks + 1,
+        });
         self.revision = self.next_revision_id;
         self.next_revision_id += 1;
         self.active_group = Some(ActiveGroup {
@@ -2712,6 +2954,7 @@ impl Document {
             .unwrap_or(0);
 
         self.text = ropey::Rope::from_str(&normalized);
+        self.layout_cache_mut().clear();
         self.line_ending = line_ending;
         self.revision = self.next_revision_id;
         self.next_revision_id += 1;
@@ -2744,6 +2987,7 @@ impl Document {
         // about to diverge from — exactly what the saved-file baseline wants.
         self.snapshot_disk_text();
         self.text = ropey::Rope::from_str(content);
+        self.layout_cache_mut().clear();
         self.revision = self.next_revision_id;
         self.next_revision_id += 1;
         self.active_group = None;
@@ -2766,6 +3010,7 @@ impl Document {
             cursors: current_cursors,
         });
         self.text = entry.rope;
+        self.layout_cache_mut().clear();
         self.revision = entry.revision;
         self.active_group = None;
         self.recompute_dirty();
@@ -2790,6 +3035,7 @@ impl Document {
             cursors: current_cursors,
         });
         self.text = entry.rope;
+        self.layout_cache_mut().clear();
         self.revision = entry.revision;
         self.active_group = None;
         self.recompute_dirty();
@@ -2845,6 +3091,7 @@ impl Document {
         generated: Option<crate::patch::GeneratedPatch>,
     ) {
         self.text = ropey::Rope::from_str(text);
+        self.layout_cache_mut().clear();
         self.generated = generated;
         self.revision += 1;
         self.saved_revision = Some(self.revision);
@@ -3000,18 +3247,14 @@ pub struct ClientSession {
     pub active_workspace: Option<String>,
 }
 
-/// One client's presentation of one view.
+/// One client's presentation of one view: its geometry, its scroll, and which element holds the
+/// cursor. What the view is *composed of* lives on the [`View`] it references — a viewport used to
+/// carry a copy of the elements, and the copy was a second thing to shift on every edit, to rebuild
+/// after every stage and to drop on every close.
 ///
-/// The fields split two ways, and the split is the point of the struct rather than an accident:
-/// **per-view** state (scroll, wrap, the pane's height) belongs to the presentation as a whole,
-/// while **per-element** state (which buffer, at what width, showing which lines) belongs to each
-/// editor the view is composed of. A view holds its editors inside one scroller, so there is one
-/// scroll position and N windows into N buffers — not N viewports.
-///
-/// A patch view already holds several elements — one per region its chrome divides it into — and
-/// the renderer draws each from its own binding. What no *produced* view does yet is bind those
-/// elements to **different buffers**; that arrives with the patch driver, and the machinery for it
-/// is already exercised by `handlers::viewport::tests::elements_render_from_their_own_buffers`.
+/// A view holds its editors inside one scroller, so there is one scroll position and N windows into
+/// N buffers — not N viewports.
+#[derive(Clone)]
 pub struct Viewport {
     pub id: ViewportId,
     pub client_id: ClientId,
@@ -3023,37 +3266,103 @@ pub struct Viewport {
     /// dirty state, its rebuild — would reach nobody.
     pub view_id: ViewId,
 
-    // ---- per-view ----
+    /// Width every element is wrapped to. One width for the whole view today; a side-by-side diff
+    /// is where that stops being true, and it would become per element then.
+    pub cols: u32,
+    /// Cols the client reserves at the start of each continuation row for its wrap marker.
+    pub continuation_marker_width: u32,
     pub rows: u32,
     pub overscan_rows: u32,
-    pub scroll_view_line: ViewLine,
-    pub scroll_sub_row: f32,
     pub wrap: WrapMode,
     pub tab_width: u32,
     /// Inline diff view: when on, rendered windows interleave phantom baseline rows from the
     /// buffer's Git hunks and the hunks are recomputed on every edit. Per-viewport so two views of
     /// the same buffer can differ. Toggled by `git/set_diff_view`.
     pub diff_view: bool,
-    /// First logical line currently pushed to the client (inclusive).
+    /// The slice of each element's buffer this client has loaded, by element index — `None` for
+    /// an element with nothing loaded. What a push re-renders, and what an edit shifts.
     ///
-    /// Per-**view**, not per-element: a view scrolls as one, so there is a single visible range
-    /// across the whole tree. It lived on the element binding until multi-element views needed the
-    /// binding to mean something stable, and a field rewritten on every scroll can't also be an
-    /// identity — see [`ElementBinding`].
-    pub first_view_line: ViewLine,
-    /// Last logical line currently pushed to the client (exclusive).
-    pub last_view_line_exclusive: ViewLine,
+    /// The client decides these: it lays the view out from the tree and asks for the elements its
+    /// viewport reaches, by row within each (`view/window`). The server used to own a scroll
+    /// position in *view lines* and derive one contiguous range from it, which presumed it could
+    /// sum the heights of everything above a point — true only while every element was monospace
+    /// text it had wrapped itself.
+    pub loaded: Vec<Option<std::ops::Range<u32>>>,
+    /// Where the client last said its viewport's top was, as content — what a reopen restores.
+    pub anchor: ScrollPosition,
 
     /// Which element holds the live cursor.
     ///
     /// Per-view, because a view has one cursor and it is in exactly one element. It stays 0 while
     /// every element of a view windows the same buffer — which is why storing it earlier would have
     /// been inert — and becomes load-bearing the moment they don't: it is what decides which
-    /// *buffer* an edit, a search, a motion or an undo acts on.
+    /// *buffer* an edit, a search, a motion or an undo acts on. An index into the view's elements.
     pub focused: aether_protocol::viewport::FieldId,
+}
 
-    // ---- per-element ----
+/// What a view is composed of: its elements, in order, each windowing some buffer.
+///
+/// The entity a client opens, switches between and closes. It is presented by one buffer — the
+/// key it sits under — and for an ordinary file that buffer is all it is: one element over the
+/// whole of it. A patch is a tree of elements over the files it describes, built by its driver.
+#[derive(Debug, Clone)]
+pub struct View {
     pub elements: Vec<ElementBinding>,
+}
+
+impl View {
+    /// The view an ordinary buffer presents: one element over the whole of it, following the
+    /// buffer's length as it changes.
+    pub fn whole(buffer_id: BufferId) -> Self {
+        View {
+            elements: vec![ElementBinding {
+                buffer_id,
+                lines: ElementLines::Whole,
+                decorations: None,
+                chrome_above: std::sync::Arc::new(Vec::new()),
+            }],
+        }
+    }
+
+    /// The view a driver built, bound against the buffer presenting it — the point at which an
+    /// `OwnDocument` extent is told which buffer it is a slice of.
+    pub fn from_layout(view_buffer: BufferId, layout: Vec<ElementLayout>) -> Self {
+        View {
+            elements: layout.iter().map(|l| l.bind(view_buffer)).collect(),
+        }
+    }
+
+    /// The regions a generated patch divides into on its own — one per run of lines with no chrome
+    /// between them — for a generated document no driver built a view over.
+    pub fn over_generated(view_buffer: BufferId, g: &crate::patch::GeneratedPatch) -> Self {
+        View {
+            elements: g
+                .decorations
+                .elements
+                .iter()
+                .map(|e| ElementBinding {
+                    buffer_id: view_buffer,
+                    lines: ElementLines::Range {
+                        start: e.start_line,
+                        end_exclusive: e.end_line,
+                    },
+                    decorations: None,
+                    chrome_above: std::sync::Arc::new(
+                        g.decorations
+                            .chrome
+                            .get(e.start_line as usize)
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether any element windows `buffer_id` — "is this buffer on screen in this view?".
+    pub fn binds(&self, buffer_id: BufferId) -> bool {
+        self.elements.iter().any(|e| e.buffer_id == buffer_id)
+    }
 }
 
 /// What a *view* says about the lines of one of its elements, overriding what the element's own
@@ -3141,20 +3450,6 @@ impl ElementExtent {
             Self::OwnDocument { .. } => None,
         }
     }
-
-    /// Slide or stretch the extent for an edit that changed a line count. See
-    /// [`ServerState::shift_element_extents`] for the three cases.
-    fn shift(&mut self, at: u32, delta: i32) {
-        let lines = match self {
-            Self::Bound { lines, .. } | Self::OwnDocument { lines } => lines,
-        };
-        if at < lines.start {
-            lines.start = lines.start.saturating_add_signed(delta);
-            lines.end = lines.end.saturating_add_signed(delta);
-        } else if at < lines.end {
-            lines.end = lines.end.saturating_add_signed(delta);
-        }
-    }
 }
 
 /// How a view divides into elements: each one's extent, the chrome introducing it, and — once a
@@ -3168,42 +3463,75 @@ pub struct ElementLayout {
 impl ElementLayout {
     /// Bind this element against the view it belongs to — the point at which an `OwnDocument`
     /// extent is told which buffer it is a slice of.
-    pub fn bind(
-        &self,
-        view_buffer: BufferId,
-        cols: u32,
-        continuation_marker_width: u32,
-    ) -> ElementBinding {
+    pub fn bind(&self, view_buffer: BufferId) -> ElementBinding {
         let lines = self.extent.lines();
         ElementBinding {
             buffer_id: self.extent.buffer(view_buffer),
-            cols,
-            continuation_marker_width,
-            start_line: lines.start,
-            end_line_exclusive: lines.end,
+            lines: ElementLines::Range {
+                start: lines.start,
+                end_exclusive: lines.end,
+            },
             decorations: self.decorations.clone(),
             chrome_above: self.chrome_above.clone(),
         }
     }
 }
 
-/// One editor element of a view: a window onto a buffer, at its own width.
+/// Which lines of its buffer an element windows.
+///
+/// `Whole` rather than `0..line_count` frozen at some moment: an ordinary buffer's one element has
+/// to follow the buffer through every edit, undo and reload, and a stored range would have to be
+/// told about each of them. A *range* is what a driver hands over — a hunk's lines — and follows
+/// edits through [`ServerState::shift_element_extents`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementLines {
+    /// The whole buffer, however long it is now.
+    Whole,
+    /// `start..end_exclusive` of the buffer.
+    Range { start: u32, end_exclusive: u32 },
+}
+
+impl ElementLines {
+    /// Slide or stretch a range for an edit that changed a line count; the whole buffer needs no
+    /// telling. See [`ServerState::shift_element_extents`] for the three cases.
+    fn shift(&mut self, at: u32, delta: i32) {
+        if let ElementLines::Range {
+            start,
+            end_exclusive,
+        } = self
+        {
+            let mut range = *start..*end_exclusive;
+            shift_range(&mut range, at, delta);
+            *start = range.start;
+            *end_exclusive = range.end;
+        }
+    }
+}
+
+/// The three cases an edit that changed a line count has for a range of lines: inside it, the
+/// range grows or shrinks; above it, the whole range slides; below it, nothing moves.
+fn shift_range(range: &mut std::ops::Range<u32>, at: u32, delta: i32) {
+    if at < range.start {
+        range.start = range.start.saturating_add_signed(delta);
+        range.end = range.end.saturating_add_signed(delta);
+    } else if at < range.end {
+        range.end = range.end.saturating_add_signed(delta);
+    }
+}
+
+/// One editor element of a view: a window onto a buffer.
 ///
 /// **Identity, not geometry.** Everything here is stable while the view is open — which buffer the
 /// element shows and which slice of it — so an [`aether_protocol::viewport::FieldId`] indexing
-/// into `elements` keeps naming the same region across a scroll. Where the *viewport* is currently
-/// scrolled to is [`Viewport::first_view_line`], one level up.
+/// into a view's elements keeps naming the same region across a scroll. Where a *viewport* is
+/// scrolled to, and how wide it is, live on the [`Viewport`].
 #[derive(Debug, Clone)]
 pub struct ElementBinding {
     pub buffer_id: BufferId,
-    pub cols: u32,
-    pub continuation_marker_width: u32,
-    /// The element's extent in its buffer: `start_line..end_line_exclusive`. A whole-buffer element
-    /// — every view but a patch, today — spans `0..line_count`.
-    pub start_line: u32,
-    pub end_line_exclusive: u32,
-    /// What the view says about these lines, if it has an opinion. `Arc` because bindings are
-    /// cloned per render and this is the one field with any size to it.
+    /// The element's extent in its buffer.
+    pub lines: ElementLines,
+    /// What the view says about these lines, if it has an opinion. `Arc` because a rebuild clones
+    /// what it keeps and this is the one field with any size to it.
     pub decorations: Option<std::sync::Arc<ElementDecorations>>,
     /// Chrome drawn above this element — a file separator, a hunk heading — as sibling nodes.
     ///
@@ -3213,29 +3541,42 @@ pub struct ElementBinding {
     pub chrome_above: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
 }
 
-/// Where each of a view's elements sits in the view's own line space — **the one place the two
-/// spaces meet.**
-///
-/// A view line is an index into the concatenation of its elements' extents; a buffer line is a line
-/// of some file. They coincide exactly when a view is a single whole-buffer element, which is every
-/// view but a patch — which is why passing one where the other was meant stayed invisible for so
-/// long, and then produced blank viewports, unreachable last lines and two `index past end of Rope`
-/// panics. Crossing between them now means calling something here. See [`aether_protocol::coords`].
+impl ElementBinding {
+    /// The element's lines, given how many the buffer has **now** — a whole-buffer element is as
+    /// long as its buffer, a range is what it was told. Not yet clamped: that is
+    /// [`ViewLayout::of`]'s job, and the one place it happens.
+    pub fn lines_in(&self, doc_lines: u32) -> std::ops::Range<u32> {
+        match self.lines {
+            ElementLines::Whole => 0..doc_lines,
+            ElementLines::Range {
+                start,
+                end_exclusive,
+            } => start..end_exclusive,
+        }
+    }
+
+    /// The first line the element windows.
+    pub fn start_line(&self) -> u32 {
+        match self.lines {
+            ElementLines::Whole => 0,
+            ElementLines::Range { start, .. } => start,
+        }
+    }
+}
+
+/// Each of a view's elements as a range of its buffer's lines that **exists right now**.
 ///
 /// Built against the buffers' **live** line counts, so an extent that has gone stale (the diff said
 /// a hunk was seven lines; the file has since been edited) is clamped at construction rather than
 /// indexing past the end of a rope somewhere downstream. A short window is a far better answer than
-/// a crash, and doing it once here beats doing it at each use.
+/// a crash, and doing it once here beats doing it at each use — which is why [`BufferRange`] can
+/// only be made here.
+///
+/// This used to also hold each element's place in a *view line* space, the concatenation of the
+/// extents, and to convert between the two. That space is gone: content is addressed per element,
+/// by row within it. See [`aether_protocol::coords`].
 pub struct ViewLayout {
-    spans: Vec<ElementSpan>,
-}
-
-/// One element's place in a view: where it starts in each space, and how many lines it contributes.
-#[derive(Debug, Clone, Copy)]
-struct ElementSpan {
-    view_start: ViewLine,
-    buffer_start: u32,
-    lines: u32,
+    ranges: Vec<BufferRange>,
 }
 
 /// A range of **buffer** lines that is already bounded by its buffer's live length.
@@ -3272,131 +3613,74 @@ impl BufferRange {
     pub fn lines(&self) -> std::ops::Range<u32> {
         self.start..self.end_exclusive
     }
-}
 
-impl ViewLayout {
-    /// Lay out `elements` in view order. `doc_lines` gives a buffer's current line count — the
-    /// clamp that keeps a stale extent from outliving the lines it described.
-    pub fn of(elements: &[ElementBinding], mut doc_lines: impl FnMut(BufferId) -> u32) -> Self {
-        let mut spans = Vec::with_capacity(elements.len());
-        let mut view_start = ViewLine::ZERO;
-        for binding in elements {
-            let available = doc_lines(binding.buffer_id);
-            let buffer_start = binding.start_line.min(available);
-            let lines = binding
-                .end_line_exclusive
-                .saturating_sub(binding.start_line)
-                .min(available.saturating_sub(buffer_start));
-            spans.push(ElementSpan {
-                view_start,
-                buffer_start,
-                lines,
-            });
-            view_start = view_start.saturating_add(lines);
-        }
-        Self { spans }
-    }
-
-    /// How many lines the **view** has: its elements' extents, summed.
-    ///
-    /// Not any document's line count. A bound patch's generated text is far longer than the view
-    /// built over it — only new-side lines are windowed, removals became phantoms — so ranging
-    /// against the document lets the scroll run past the view's real end, where every element clips
-    /// to nothing and the screen goes blank.
-    pub fn line_count(&self) -> u32 {
-        self.spans
-            .iter()
-            .map(|s| s.lines)
-            .fold(0u32, u32::saturating_add)
-    }
-
-    /// The view-line extent of one element: `start..end_exclusive`.
-    pub fn span_of(
-        &self,
-        element: aether_protocol::viewport::FieldId,
-    ) -> Option<(ViewLine, ViewLine)> {
-        let s = self.spans.get(element as usize)?;
-        Some((s.view_start, s.view_start.saturating_add(s.lines)))
-    }
-
-    /// The buffer-line range of the part of `element` lying inside the view-line window
-    /// `first..last_excl`, or `None` when the element is entirely outside it.
-    ///
-    /// This is what a renderer wants: intersect in *view* coordinates, then offset into the
-    /// element's own buffer. For a single whole-buffer element the two coincide, which is exactly
-    /// why doing it by hand went unnoticed.
-    pub fn intersect(
-        &self,
-        element: aether_protocol::viewport::FieldId,
-        first: ViewLine,
-        last_excl: ViewLine,
-    ) -> Option<BufferRange> {
-        let s = self.spans.get(element as usize)?;
-        let view_end = s.view_start.saturating_add(s.lines);
-        let lo = first.max(s.view_start);
-        let hi = last_excl.min(view_end);
-        if lo >= hi {
-            return None;
-        }
-        Some(BufferRange {
-            start: s.buffer_start + s.view_start.distance_to(lo),
-            end_exclusive: s.buffer_start + s.view_start.distance_to(hi),
+    /// The part of `lines` inside this range, or `None` when nothing is — how a slice a client
+    /// asked for, or one an edit shifted, is brought inside what the element has now.
+    pub fn intersect(&self, lines: std::ops::Range<u32>) -> Option<BufferRange> {
+        let start = lines.start.max(self.start);
+        let end_exclusive = lines.end.min(self.end_exclusive);
+        (start < end_exclusive).then_some(BufferRange {
+            start,
+            end_exclusive,
         })
     }
 
-    /// The whole of `element`'s window into its buffer, in view order or not — what its *height* is
-    /// measured over, as distinct from [`Self::intersect`]'s "the part currently on screen".
-    ///
-    /// Empty for an element that has fallen off the end of a buffer that shrank under it.
-    pub fn element_range(&self, element: aether_protocol::viewport::FieldId) -> BufferRange {
-        self.spans
-            .get(element as usize)
-            .map(|s| BufferRange {
-                start: s.buffer_start,
-                end_exclusive: s.buffer_start.saturating_add(s.lines),
+    /// The lines of this range before `line` — what sits above it in the element.
+    pub fn before(&self, line: u32) -> BufferRange {
+        BufferRange {
+            start: self.start,
+            end_exclusive: line.clamp(self.start, self.end_exclusive),
+        }
+    }
+}
+
+impl ViewLayout {
+    /// Lay out `elements`. `doc_lines` gives a buffer's current line count — the clamp that keeps
+    /// a stale extent from outliving the lines it described.
+    pub fn of(elements: &[ElementBinding], mut doc_lines: impl FnMut(BufferId) -> u32) -> Self {
+        let ranges = elements
+            .iter()
+            .map(|binding| {
+                let available = doc_lines(binding.buffer_id);
+                let extent = binding.lines_in(available);
+                let start = extent.start.min(available);
+                let end_exclusive = extent.end.clamp(start, available);
+                BufferRange {
+                    start,
+                    end_exclusive,
+                }
             })
+            .collect();
+        Self { ranges }
+    }
+
+    /// The whole of `element`'s window into its buffer — what its *height* is measured over.
+    ///
+    /// Empty for an element that has fallen off the end of a buffer that shrank under it, or for
+    /// an element the view does not have.
+    pub fn element_range(&self, element: aether_protocol::viewport::FieldId) -> BufferRange {
+        self.ranges
+            .get(element as usize)
+            .copied()
             .unwrap_or(BufferRange {
                 start: 0,
                 end_exclusive: 0,
             })
     }
 
-    /// The view line at which `element`'s buffer line `line` sits — the inverse of
-    /// [`Self::intersect`]. `None` when the line is outside the element's extent.
-    pub fn to_view(
+    /// The part of `lines` that `element` has: a loaded slice brought inside the element as it is
+    /// now, or `None` when none of it is.
+    pub fn clip(
         &self,
         element: aether_protocol::viewport::FieldId,
-        line: u32,
-    ) -> Option<ViewLine> {
-        let s = self.spans.get(element as usize)?;
-        let offset = line.checked_sub(s.buffer_start)?;
-        (offset < s.lines).then(|| s.view_start.saturating_add(offset))
-    }
-
-    /// Which element a **view** line falls in — the inverse of [`Self::span_of`].
-    ///
-    /// What "you are looking at this line" means in element terms, and so how a subscribe decides
-    /// which element holds the cursor: a view is scrolled somewhere on purpose, and the element
-    /// covering that line is the one being read. `None` when the line is past the view's end.
-    pub fn element_at(&self, line: ViewLine) -> Option<aether_protocol::viewport::FieldId> {
-        self.spans
-            .iter()
-            .position(|s| line >= s.view_start && line < s.view_start.saturating_add(s.lines))
-            .map(|i| i as aether_protocol::viewport::FieldId)
-    }
-
-    /// The buffer line an element's window starts at, whether or not any of it is in view — what a
-    /// rendered node reports as its `first_buffer_line`.
-    pub fn buffer_start(&self, element: aether_protocol::viewport::FieldId) -> u32 {
-        self.spans
-            .get(element as usize)
-            .map(|s| s.buffer_start)
-            .unwrap_or(0)
+        lines: std::ops::Range<u32>,
+    ) -> Option<BufferRange> {
+        self.ranges.get(element as usize)?.intersect(lines)
     }
 }
 
 impl Viewport {
-    /// The element holding the live cursor.
+    /// The element holding the live cursor, in `view` — the one this viewport presents.
     ///
     /// This replaced a `sole()` accessor that returned element 0 and was named for the assumption
     /// it encoded, so that the audit would be a grep rather than a guess. Working through those
@@ -3404,28 +3688,22 @@ impl Viewport {
     /// edited and searched — rather than the first element's, and those two only diverge once
     /// focus exists. Falls back to the first element if `focused` is somehow out of range, since a
     /// view always has at least one and a panic here would be a strange way to report a stale id.
-    pub fn focus(&self) -> &ElementBinding {
-        self.elements
+    pub fn focus<'v>(&self, view: &'v View) -> &'v ElementBinding {
+        view.elements
             .get(self.focused as usize)
-            .unwrap_or(&self.elements[0])
+            .unwrap_or(&view.elements[0])
     }
 
-    /// The buffer this view is currently acting on: the focused element's.
-    pub fn buffer_id(&self) -> BufferId {
-        self.focus().buffer_id
-    }
-
-    /// Whether any of this viewport's elements windows `buffer_id` — "is this buffer on screen?".
-    /// The one question about a viewport that stays meaningful once views bind several buffers.
-    pub fn binds(&self, buffer_id: BufferId) -> bool {
-        self.elements.iter().any(|e| e.buffer_id == buffer_id)
+    /// The buffer this viewport is currently acting on: the focused element's.
+    pub fn buffer_id(&self, view: &View) -> BufferId {
+        self.focus(view).buffer_id
     }
 
     /// Whether this viewport is showing `id` at all — as the view it presents, or as one of the
     /// buffers its elements window. The right question for anything fanning out *to viewers*,
     /// because a patch's viewers are watching the view even though no element windows it.
-    pub fn shows(&self, id: BufferId) -> bool {
-        self.view_id.presenting_buffer() == id || self.binds(id)
+    pub fn shows(&self, view: &View, id: BufferId) -> bool {
+        self.view_id.presenting_buffer() == id || view.binds(id)
     }
 
     /// Every buffer this viewport shows, each named once — [`Self::shows`] enumerated rather than
@@ -3436,9 +3714,9 @@ impl Viewport {
     /// element's* buffer — which for a composed view is one of the files and never the patch, so
     /// navigating away from working changes left the patch document and every unfocused element's
     /// buffer behind with nothing showing them and nothing looking for them.
-    pub fn shown_buffers(&self) -> Vec<BufferId> {
+    pub fn shown_buffers(&self, view: &View) -> Vec<BufferId> {
         let mut out = vec![self.view_id.presenting_buffer()];
-        for e in &self.elements {
+        for e in &view.elements {
             if !out.contains(&e.buffer_id) {
                 out.push(e.buffer_id);
             }
@@ -3446,13 +3724,12 @@ impl Viewport {
         out
     }
 
-    /// This viewport's wrap-layout inputs for its focused element, bundled for the motion/render
-    /// paths.
+    /// This viewport's wrap-layout inputs, bundled for the motion/render paths.
     pub fn wrap_geometry(&self) -> crate::wrap::WrapGeometry {
         crate::wrap::WrapGeometry {
             wrap: self.wrap,
-            cols: self.focus().cols,
-            marker_width: self.focus().continuation_marker_width,
+            cols: self.cols,
+            marker_width: self.continuation_marker_width,
             tab_width: self.tab_width,
         }
     }
@@ -3468,10 +3745,10 @@ mod view_layout_tests {
     fn two_hunks() -> Vec<ElementBinding> {
         let binding = |buffer_id| ElementBinding {
             buffer_id,
-            cols: 80,
-            continuation_marker_width: 0,
-            start_line: 10,
-            end_line_exclusive: 13,
+            lines: ElementLines::Range {
+                start: 10,
+                end_exclusive: 13,
+            },
             decorations: None,
             chrome_above: Default::default(),
         };
@@ -3479,28 +3756,27 @@ mod view_layout_tests {
     }
 
     #[test]
-    fn a_view_is_as_long_as_its_elements_together() {
+    fn each_element_is_its_own_range_of_its_own_buffer() {
         let layout = ViewLayout::of(&two_hunks(), |_| 100);
-        assert_eq!(layout.line_count(), 6);
-        assert_eq!(layout.span_of(0), Some((ViewLine(0), ViewLine(3))));
-        assert_eq!(layout.span_of(1), Some((ViewLine(3), ViewLine(6))));
-    }
-
-    /// The crossing, both ways. View line 4 is the second element's *second* line, which that
-    /// element's own file calls line 11 — and both files have a line 11, which is exactly why the
-    /// element has to be part of the question.
-    #[test]
-    fn a_view_line_resolves_into_the_element_that_owns_it() {
-        let layout = ViewLayout::of(&two_hunks(), |_| 100);
+        let range = |e| {
+            let r = layout.element_range(e);
+            (r.start(), r.end_exclusive())
+        };
+        assert_eq!(range(0), (10, 13));
+        assert_eq!(range(1), (10, 13));
+        assert_eq!(
+            range(7),
+            (0, 0),
+            "an element the view does not have is empty"
+        );
+        // A slice is clipped to what the element has; nothing of it inside is nothing.
         assert_eq!(
             layout
-                .intersect(1, ViewLine(4), ViewLine(5))
+                .clip(1, 12..40)
                 .map(|r| (r.start(), r.end_exclusive())),
-            Some((11, 12))
+            Some((12, 13))
         );
-        assert_eq!(layout.to_view(1, 11), Some(ViewLine(4)));
-        // Element 0 has the same buffer line, and it is a different view line.
-        assert_eq!(layout.to_view(0, 11), Some(ViewLine(1)));
+        assert_eq!(layout.clip(1, 20..40), None);
     }
 
     /// An edit inside a hunk grows it; one above slides it; one below leaves it alone. The same
@@ -3510,7 +3786,10 @@ mod view_layout_tests {
         let extents = |elements: &[ElementBinding]| -> Vec<(u32, u32)> {
             elements
                 .iter()
-                .map(|e| (e.start_line, e.end_line_exclusive))
+                .map(|e| {
+                    let r = e.lines_in(u32::MAX);
+                    (r.start, r.end)
+                })
                 .collect()
         };
         let mut s = ServerState::new();
@@ -3528,15 +3807,6 @@ mod view_layout_tests {
             file(2, &"fn two() {}\n".repeat(40)),
         );
         // Two hunks of file `a` plus one of file `b` — the third must not move when `a` is edited.
-        let binding = |buffer_id, start, end| ElementBinding {
-            buffer_id,
-            cols: 80,
-            continuation_marker_width: 0,
-            start_line: start,
-            end_line_exclusive: end,
-            decorations: None,
-            chrome_above: Default::default(),
-        };
         let bound = |buffer, lines: std::ops::Range<u32>| ElementLayout {
             extent: ElementExtent::Bound { buffer, lines },
             chrome_above: Default::default(),
@@ -3545,11 +3815,7 @@ mod view_layout_tests {
         let view = file(3, "patch\n");
         s.set_view_layout(
             view,
-            vec![
-                bound(a, 10..14),
-                bound(a, 30..34),
-                bound(b, 10..14),
-            ],
+            vec![bound(a, 10..14), bound(a, 30..34), bound(b, 10..14)],
         );
         let vp = Viewport {
             id: 1,
@@ -3557,49 +3823,43 @@ mod view_layout_tests {
             view_id: ViewId(view),
             rows: 10,
             overscan_rows: 0,
-            scroll_view_line: ViewLine::ZERO,
-            scroll_sub_row: 0.0,
             wrap: WrapMode::None,
             tab_width: 4,
             diff_view: false,
-            first_view_line: ViewLine::ZERO,
-            last_view_line_exclusive: ViewLine(12),
+            cols: 80,
+            continuation_marker_width: 0,
+            // The client has the first hunk and the last one loaded.
+            loaded: vec![Some(10..14), None, Some(10..14)],
+            anchor: ScrollPosition::default(),
             focused: 0,
-            elements: vec![binding(a, 10, 14), binding(a, 30, 34), binding(b, 10, 14)],
         };
         s.viewports.insert(1, vp);
 
         // Two lines typed into the first hunk of `a`.
         s.shift_element_extents(a, LineShift { at: 12, delta: 2 });
         assert_eq!(
-            extents(&s.viewports[&1].elements),
+            extents(&s.view(ViewId(view)).elements),
             vec![(10, 16), (32, 36), (10, 14)],
             "the hunk grew, the one below it slid, the other file's did not move"
         );
-        // The stored layout moves with it, or a rebuild would resurrect the old extents.
-        let layout = s.element_layout_of(view);
+        // The viewport reads the same elements — there is no copy to have gone stale — and the
+        // slice it had loaded of the edited hunk grew with it.
         assert_eq!(
-            layout
-                .iter()
-                .map(|l| { let r = l.extent.lines(); (r.start, r.end) })
-                .collect::<Vec<_>>(),
+            extents(&s.view_of(&s.viewports[&1]).elements),
             vec![(10, 16), (32, 36), (10, 14)]
+        );
+        assert_eq!(
+            s.viewports[&1].loaded,
+            vec![Some(10..16), None, Some(10..14)],
+            "the loaded slice of the edited hunk holds the new lines; the other file's does not move"
         );
 
         // A deletion below every element of `a` changes nothing.
         s.shift_element_extents(a, LineShift { at: 38, delta: -1 });
         assert_eq!(
-            extents(&s.viewports[&1].elements),
+            extents(&s.view(ViewId(view)).elements),
             vec![(10, 16), (32, 36), (10, 14)]
         );
-    }
-
-    /// An element scrolled out of the window contributes nothing rather than a bogus range.
-    #[test]
-    fn an_element_outside_the_window_intersects_nothing() {
-        let layout = ViewLayout::of(&two_hunks(), |_| 100);
-        assert_eq!(layout.intersect(1, ViewLine(0), ViewLine(3)), None);
-        assert_eq!(layout.to_view(1, 99), None);
     }
 
     /// An extent comes from a diff; the buffer it indexes is live. Once the file shrinks under it,
@@ -3609,21 +3869,19 @@ mod view_layout_tests {
     fn a_stale_extent_is_clamped_to_the_buffer_that_is_actually_there() {
         // The second file has been cut down to 11 lines, so its 10..13 window holds only line 10.
         let layout = ViewLayout::of(&two_hunks(), |id| if id == 2 { 11 } else { 100 });
-        assert_eq!(
-            layout.line_count(),
-            4,
-            "3 from the first, 1 from the second"
-        );
+        let r = layout.element_range(1);
+        assert_eq!((r.start(), r.end_exclusive()), (10, 11));
         assert_eq!(
             layout
-                .intersect(1, ViewLine(3), ViewLine(6))
+                .clip(1, 10..13)
                 .map(|r| (r.start(), r.end_exclusive())),
-            Some((10, 11))
+            Some((10, 11)),
+            "a slice over the old extent is brought inside the new one"
         );
         // And a file gone entirely from under an element contributes no lines at all.
         let gone = ViewLayout::of(&two_hunks(), |id| if id == 2 { 0 } else { 100 });
-        assert_eq!(gone.line_count(), 3);
-        assert_eq!(gone.intersect(1, ViewLine(0), ViewLine(9)), None);
+        assert!(gone.element_range(1).is_empty());
+        assert_eq!(gone.clip(1, 10..13), None);
     }
 }
 
@@ -4485,24 +4743,16 @@ mod workspace_state_tests {
                 client_id: uuid::Uuid::new_v4(),
                 rows: 24,
                 overscan_rows: 0,
-                scroll_view_line: ViewLine::ZERO,
-                scroll_sub_row: 0.0,
                 wrap: WrapMode::None,
                 tab_width: 4,
                 diff_view: false,
-                first_view_line: ViewLine::ZERO,
-                last_view_line_exclusive: ViewLine(1),
-                elements: vec![ElementBinding {
-                    buffer_id: viewed_buffer,
-                    cols: 80,
-                    continuation_marker_width: 0,
-                    start_line: 0,
-                    end_line_exclusive: 1,
-                    decorations: None,
-                    chrome_above: Default::default(),
-                }],
+                cols: 80,
+                continuation_marker_width: 0,
+                loaded: vec![Some(0..1)],
+                anchor: ScrollPosition::default(),
             },
         );
+        s.ensure_view(ViewId(viewed_buffer));
 
         let (retired, closed, _stopped) = s.supersede_ephemeral_workspaces();
         assert_eq!(retired, vec![idle.clone()]);
@@ -4589,5 +4839,89 @@ impl Drop for TokenInner {
         {
             self.0.quiet.notify_waiters();
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_cache_tests {
+    use super::*;
+    use crate::wrap::WrapGeometry;
+    use aether_protocol::viewport::WrapMode;
+
+    fn geom(cols: u32) -> WrapGeometry {
+        WrapGeometry {
+            wrap: WrapMode::Soft,
+            cols,
+            marker_width: 0,
+            tab_width: 4,
+        }
+    }
+
+    fn doc(text: &str) -> Document {
+        let mut d = Document::scratch(DocumentId(1), None);
+        d.text = ropey::Rope::from_str(text);
+        d
+    }
+
+    /// The oracle: the same table derived from a document that has never been edited.
+    fn fresh(d: &Document, cols: u32) -> Vec<u32> {
+        doc(&d.text.to_string())
+            .wrapped_rows(geom(cols))
+            .as_ref()
+            .clone()
+    }
+
+    fn edit(d: &mut Document, start: usize, end: usize, text: &str) {
+        d.apply_edit(start, end, text, EditKindTag::Text, Default::default());
+    }
+
+    /// Edits splice the table rather than rebuilding it, and several edits before a read merge
+    /// into one splice — so the merged region has to be the right one, or the table quietly drifts
+    /// from the text it describes.
+    #[test]
+    fn wrapped_rows_follow_edits_by_splicing() {
+        let mut d = doc("aa\nbb\ncc\ndd\nee\n");
+        assert_eq!(d.wrapped_rows(geom(8)).as_ref(), &vec![1, 1, 1, 1, 1, 1]);
+
+        // A long line lands in the middle and wraps to three rows.
+        edit(&mut d, 6, 6, "0123456789012345678\n");
+        assert_eq!(d.wrapped_rows(geom(8)).as_ref(), &fresh(&d, 8));
+        assert_eq!(d.wrapped_rows(geom(8))[2], 3, "the inserted line wraps");
+
+        // Two edits before anyone looks: one above the long line, one that rejoins two lines below
+        // it — the merge has to cover both, in each other's shifted coordinates.
+        edit(&mut d, 0, 0, "x\n");
+        let text = d.text.to_string();
+        let join = text.find("dd\nee").unwrap() + 2;
+        edit(&mut d, join, join + 1, "");
+        assert_eq!(d.wrapped_rows(geom(8)).as_ref(), &fresh(&d, 8));
+
+        // A second geometry is its own table, kept beside the first.
+        assert_eq!(d.wrapped_rows(geom(5)).as_ref(), &fresh(&d, 5));
+        assert_eq!(d.wrapped_rows(geom(8)).as_ref(), &fresh(&d, 8));
+        edit(&mut d, 0, 2, "");
+        assert_eq!(d.wrapped_rows(geom(5)).as_ref(), &fresh(&d, 5));
+        assert_eq!(d.wrapped_rows(geom(8)).as_ref(), &fresh(&d, 8));
+    }
+
+    /// Undo swaps the rope wholesale, where no splice describes what moved: the table starts over.
+    #[test]
+    fn a_wholesale_replacement_starts_over() {
+        let mut d = doc("aa\nbb\n");
+        let _ = d.wrapped_rows(geom(8));
+        edit(&mut d, 3, 3, "0123456789012345678\n");
+        assert_eq!(d.wrapped_rows(geom(8))[1], 3);
+        d.undo(Default::default()).expect("one edit to undo");
+        assert_eq!(d.wrapped_rows(geom(8)).as_ref(), &fresh(&d, 8));
+    }
+
+    #[test]
+    fn the_widest_line_follows_edits() {
+        let mut d = doc("aa\nbbbb\n");
+        assert_eq!(d.max_line_width(4), 4);
+        edit(&mut d, 0, 0, "0123456789\n");
+        assert_eq!(d.max_line_width(4), 10);
+        edit(&mut d, 0, 11, "");
+        assert_eq!(d.max_line_width(4), 4);
     }
 }

@@ -17,7 +17,7 @@ use aether_client::session::{buffer_info, HoverText, PasteKind, Session};
 use aether_client::transport::RpcError;
 use aether_client::update::Event;
 use aether_protocol::buffer::BufferOpenResult;
-use aether_protocol::coords::{ViewLine, VisualRow};
+use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::Granularity;
 use aether_protocol::envelope::{JsonRpc, Notification};
 use aether_protocol::viewport::{ViewportSubscribeResult, ViewportWindowResult};
@@ -212,7 +212,7 @@ impl WasmSession {
         Ok(())
     }
 
-    /// Adopt a window from a geometry RPC (`viewport/scroll`/`scroll_to_row`/`resize`).
+    /// Adopt a window from a geometry RPC (`view/window`/`view/set_wrap`/`view/resize`).
     pub fn adopt_window(&mut self, res: JsValue) -> Result<(), JsValue> {
         let res: ViewportWindowResult = from_js(res)?;
         self.inner.adopt_window(res);
@@ -277,35 +277,81 @@ impl WasmSession {
         self.inner.resolve_scroll_anchor().map(VisualRow::get)
     }
 
-    /// A cursor's **buffer** line named as a **view** line, for the requests that scroll by one —
-    /// a subscribe's `scroll` position, which the server reads as a view line. Mirrors the helper
-    /// of the same name in both native shells, including its fallback: exact while the window has
-    /// the line loaded, carried across unchanged when it doesn't (the two spaces coincide for every
-    /// single-element view, and for a patch the server clamps into the view).
-    pub fn view_line_for(&self, line: u32) -> u32 {
-        self.inner
-            .view
-            .window
-            .as_ref()
-            .and_then(|w| {
-                aether_client::grid::view_line_of(w, self.inner.view.focused_element, line)
-            })
-            .map_or(line, ViewLine::get)
+    /// Which element a re-subscribe should say holds the cursor — the one it already does, when
+    /// the session is re-presenting a view it holds a window for (a wrap toggle, a reconnect) —
+    /// or `null` on a fresh open, where the server decides from the place the view opens at.
+    pub fn subscribe_focus(&self) -> Option<u32> {
+        self.inner.subscribe_focus()
     }
 
-    /// The absolute visual row a **view** line's block starts at — the chrome standing above it
-    /// included — or `null` when that line isn't in the loaded window. What "position the viewport
-    /// at this scroll line" means: seating the line's own text row at the top instead scrolls the
-    /// file heading that introduces it above the fold.
-    pub fn block_start_of_view_line(&self, view_line: u32) -> Option<u32> {
-        // The wasm boundary speaks plain numbers — JS has no newtypes — so the coordinate spaces
-        // are named here, once, on the way in and out.
+    /// The absolute row a fresh subscribe's scroll lands the viewport on, or `null` when the
+    /// window holds neither the line nor its element. The line's *block* — the chrome standing
+    /// above it included — so a patch opened at its first line shows the file heading that
+    /// introduces it rather than starting just below it; a scroll restored from inside the line's
+    /// own rows goes back to that row (`sub_row` may be fractional: the browser scrolls by pixel).
+    /// A line the server clamped away leaves the element it named as where the view opens.
+    ///
+    /// The wasm boundary speaks plain numbers — JS has no newtypes — so the coordinate spaces are
+    /// named here, once, on the way in and out.
+    pub fn subscribe_top_row(&self, element: u32, line: u32, sub_row: f32) -> Option<f32> {
+        use aether_client::grid;
+        let w = self.inner.view.window.as_ref()?;
+        let row = if sub_row > 0.0 {
+            grid::line_top_row(w, element, line).map(|r| r.get() as f32 + sub_row)
+        } else {
+            grid::line_block_start(w, element, line).map(|r| r.get() as f32)
+        };
+        row.or_else(|| grid::element_start_row(w, element).map(|r| r.get() as f32))
+    }
+
+    /// Rows the whole view occupies — chrome and every element's full height, loaded or not —
+    /// off the tree. What sizes the scroller; `0` with no window.
+    pub fn total_rows(&self) -> u32 {
         self.inner
             .view
             .window
             .as_ref()
-            .and_then(|w| aether_client::grid::block_start_of_view_line(w, ViewLine(view_line)))
-            .map(VisualRow::get)
+            .map_or(0, |w| aether_client::grid::total_rows(&w.root))
+    }
+
+    /// The absolute row of the cursor's cell, or `null` when its line isn't loaded — what a
+    /// reveal scrolls to. Off the shared layout, so it is the row the painter draws the cursor on.
+    pub fn cursor_row(&self) -> Option<u32> {
+        let w = self.inner.view.window.as_ref()?;
+        aether_client::grid::position_cell(
+            w,
+            self.inner.view.focused_element,
+            self.inner.view.buffer.cursor.position,
+            aether_client::session::TAB_WIDTH,
+        )
+        .map(|(row, _, _)| row.get())
+    }
+
+    /// What a viewport showing rows `top_row..top_row + visible` should ask `view/window` for —
+    /// `{ anchor, slices }`, the params less the viewport id the shell adds — or `null` when every
+    /// row within `margin` of the screen is already loaded. The slices are the ones the screen
+    /// reaches with `overscan` rows either side, each by row within its element, since the client
+    /// knows every element's height from the tree but not which lines a row range is; the anchor
+    /// is where the top is as content, for a reopen to restore.
+    pub fn window_request(
+        &self,
+        top_row: u32,
+        visible: u32,
+        margin: u32,
+        overscan: u32,
+    ) -> Result<JsValue, JsValue> {
+        use aether_client::grid;
+        let Some(w) = self.inner.view.window.as_ref() else {
+            return Ok(JsValue::NULL);
+        };
+        let top = VisualRow(top_row);
+        if grid::loaded_covers(&w.root, &grid::slices_for(&w.root, top, visible, margin)) {
+            return Ok(JsValue::NULL);
+        }
+        to_js(&json!({
+            "anchor": grid::anchor_at(w, top),
+            "slices": grid::slices_for(&w.root, top, visible, overscan),
+        }))
     }
 
     /// Mouse wheel over the picker results list: move the highlighted row (+down / -up), refetching

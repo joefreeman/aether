@@ -2,7 +2,6 @@
 
 mod common;
 
-use aether_protocol::coords::ViewLine;
 use common::*;
 
 // ---- input/move_lines --------------------------------------------------------------------------
@@ -2895,9 +2894,11 @@ async fn input_delete_line_removes_line_with_newline() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -2921,7 +2922,8 @@ async fn input_delete_line_removes_line_with_newline() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.view_line_count, 3,
+        total_rows(&notif.window),
+        3,
         "buffer drops from 4 lines (incl trailing empty) to 3"
     );
 
@@ -2941,9 +2943,11 @@ async fn input_change_line_blanks_content_keeps_newline() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -2969,7 +2973,7 @@ async fn input_change_line_blanks_content_keeps_newline() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     // Line count stays at 4 (alpha, empty, gamma, trailing empty).
-    assert_eq!(notif.view_line_count, 4);
+    assert_eq!(total_rows(&notif.window), 4);
 
     drop(server);
 }
@@ -2987,9 +2991,11 @@ async fn input_replace_line_swaps_content() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -3039,9 +3045,11 @@ async fn subscribe_full(ws: &mut Ws, buffer_id: u64) -> ViewportSubscribeResult 
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -3085,7 +3093,7 @@ async fn surround_wraps_selection_and_selects_inner() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "a(bc)"
     );
 
@@ -3121,7 +3129,7 @@ async fn surround_aliases_and_quotes() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "{hi}"
     );
 
@@ -3191,7 +3199,7 @@ async fn unsurround_strips_hugging_pair() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "abcd"
     );
 
@@ -3258,7 +3266,7 @@ async fn surround_then_unsurround_roundtrips() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "a[bc]"
     );
 
@@ -3273,7 +3281,10 @@ async fn surround_then_unsurround_roundtrips() {
     .await;
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "abc");
+    assert_eq!(
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
+        "abc"
+    );
 
     drop(server);
 }
@@ -3307,7 +3318,10 @@ async fn unsurround_peels_nested_layers_per_press() {
     assert_eq!(r1.revision, 1);
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "(x)");
+    assert_eq!(
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
+        "(x)"
+    );
 
     // Selection now sits on "x" again — a second press peels the next layer: "(x)" → "x".
     let r2: EditResult = send_request::<InputUnsurround>(
@@ -3321,7 +3335,10 @@ async fn unsurround_peels_nested_layers_per_press() {
     assert_eq!(r2.revision, 2);
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "x");
+    assert_eq!(
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
+        "x"
+    );
 
     // Nothing left to strip: third press is a no-op (revision unchanged).
     let r3: EditResult = send_request::<InputUnsurround>(
@@ -3361,7 +3378,7 @@ async fn surround_line_wraps_whole_line_content() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "(abc)"
     );
 
@@ -3401,12 +3418,18 @@ async fn surround_line_targets_cursor_line() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     // Only line 1 is wrapped; the neighbours are untouched.
-    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "x");
     assert_eq!(
-        notif.root.lines()[1].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
+        "x"
+    );
+    assert_eq!(
+        notif.window.root.lines()[1].visual_rows[0].segments[0].text,
         "\"abc\""
     );
-    assert_eq!(notif.root.lines()[2].visual_rows[0].segments[0].text, "y");
+    assert_eq!(
+        notif.window.root.lines()[2].visual_rows[0].segments[0].text,
+        "y"
+    );
 
     drop(server);
 }
@@ -3443,7 +3466,10 @@ async fn unsurround_line_strips_wrapping_pair() {
 
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    assert_eq!(notif.root.lines()[0].visual_rows[0].segments[0].text, "abc");
+    assert_eq!(
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
+        "abc"
+    );
 
     drop(server);
 }
@@ -3484,7 +3510,7 @@ async fn surround_line_then_unsurround_line_roundtrips() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "{hello}"
     );
 
@@ -3499,7 +3525,7 @@ async fn surround_line_then_unsurround_line_roundtrips() {
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
     assert_eq!(
-        notif.root.lines()[0].visual_rows[0].segments[0].text,
+        notif.window.root.lines()[0].visual_rows[0].segments[0].text,
         "hello"
     );
 
@@ -3643,9 +3669,11 @@ async fn git_set_diff_view_interleaves_deleted_rows() {
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -3858,9 +3886,11 @@ async fn diff_view_carries_intraline_emphasis_on_modified_pairs() {
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -3947,9 +3977,11 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -3976,9 +4008,11 @@ async fn subscribe_with_diff_view_renders_diffs_in_first_frame() {
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -4047,9 +4081,11 @@ async fn git_status_counts_ride_the_window() {
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -4144,9 +4180,11 @@ async fn git_status_splits_staged_and_unstaged() {
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -4223,9 +4261,11 @@ async fn combined_view_tags_staged_and_unstaged_markers() {
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -4280,9 +4320,11 @@ async fn setup_with_viewport(
             rows: 50,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -4371,7 +4413,7 @@ async fn sneak_targets_ride_the_render() {
     .await;
     let notif: ViewportLinesChangedParams =
         expect_notification::<ViewportLinesChanged>(&mut ws).await;
-    let targets = &notif.root.lines()[0].sneak_targets;
+    let targets = &notif.window.root.lines()[0].sneak_targets;
     assert_eq!(targets.len(), 1, "one matched word on line 0");
     assert_eq!(targets[0].start, 0);
     assert_eq!(targets[0].end, 5, "covers 'alpha'");

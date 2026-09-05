@@ -2,7 +2,6 @@
 
 mod common;
 
-use aether_protocol::coords::ViewLine;
 use common::*;
 
 // ---- search/* -----------------------------------------------------------------------------------
@@ -1026,9 +1025,11 @@ async fn nav_open_file(ws: &mut Ws, file: &str, record_from: Option<u64>) -> (u6
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,

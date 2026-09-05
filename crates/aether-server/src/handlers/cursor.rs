@@ -75,7 +75,7 @@ pub async fn cursor_move(
             let tab_width = s
                 .viewports
                 .values()
-                .find(|v| v.binds(params.buffer_id) && v.client_id == client_id)
+                .find(|v| s.view_of(v).binds(params.buffer_id) && v.client_id == client_id)
                 .map(|v| v.tab_width)
                 .unwrap_or(4);
             let (pos, target_vcol) = motion::resolve_logical_line(
@@ -177,10 +177,48 @@ pub async fn cursor_move(
         match_bracket: None,
         jumplist_position: None,
     };
-    set_cursor(&mut s, key, new_state);
-    s.record_motion(key, current, new_state);
-    s.clear_tree_selection_history(client_id, params.buffer_id);
-    match new_virtual_col {
+    let (response, search_update) = commit_move(
+        &mut s,
+        client_id,
+        params.buffer_id,
+        current,
+        new_state,
+        new_virtual_col,
+    );
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
+    Ok(response)
+}
+
+/// What landing a motion yields: the cursor as the client should see it, and the search update the
+/// move owes — sent by the caller once the state lock is dropped.
+pub type MoveOutcome = (
+    CursorState,
+    Option<(mpsc::Sender<Notification>, Notification)>,
+);
+
+/// Land a resolved motion: set the cursor, record the move for motion undo, drop the
+/// tree-selection history, keep the virtual column only when the motion says to, and collect the
+/// search update the move owes. Returns the cursor as the client should see it.
+///
+/// Every motion lands through here, whichever handler resolved it — `element/move`, and the
+/// view-level steps `view/navigate_change` makes — so what a move *records* cannot depend on
+/// which key made it.
+pub fn commit_move(
+    s: &mut ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    from: CursorState,
+    to: CursorState,
+    virtual_col: Option<u32>,
+) -> MoveOutcome {
+    let key = (client_id, buffer_id);
+    set_cursor(s, key, to);
+    s.record_motion(key, from, to);
+    s.clear_tree_selection_history(client_id, buffer_id);
+    match virtual_col {
         Some(col) => {
             s.virtual_col.insert(key, col);
         }
@@ -188,13 +226,57 @@ pub async fn cursor_move(
             s.virtual_col.remove(&key);
         }
     }
-    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let response = wrap_for_response(&s, client_id, params.buffer_id, new_state);
-    drop(s);
-    if let Some((sender, notif)) = search_update {
-        let _ = sender.send(notif).await;
-    }
-    Ok(response)
+    let search_update = collect_cursor_search_update(s, client_id, buffer_id);
+    (
+        wrap_for_response(s, client_id, buffer_id, to),
+        search_update,
+    )
+}
+
+/// `o`/`Alt-o` over one buffer: step its document-symbol outline — the target's identifier lands
+/// selected, Shift grows the selection to it, a count the outline cannot honour refuses — landed
+/// through [`commit_move`] like any motion. What `view/navigate_change` steps for a view with no
+/// outline of its own.
+pub fn step_navigation_unit(
+    s: &mut ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    forward: bool,
+    count: u32,
+    extend: bool,
+) -> Result<MoveOutcome, RpcError> {
+    let scope = s.motion_scope(client_id, buffer_id)?;
+    let current = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
+    let motion = if forward {
+        Motion::NextNavigationUnit { count }
+    } else {
+        Motion::PrevNavigationUnit { count }
+    };
+    let symbols = s
+        .document_symbols
+        .get(&buffer_id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let (position, anchor) = motion::resolve_navigation_motion(
+        &scope,
+        symbols,
+        current.position,
+        current.anchor,
+        &motion,
+        extend,
+    );
+    let anchor = scope.clamp(anchor.unwrap_or(if extend { current.anchor } else { position }));
+    let to = CursorState {
+        position,
+        anchor,
+        match_bracket: None,
+        jumplist_position: None,
+    };
+    Ok(commit_move(s, client_id, buffer_id, current, to, None))
 }
 
 /// `w` / `Alt-w` — select a word. Sets both anchor and cursor (so it can't go through

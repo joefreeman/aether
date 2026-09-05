@@ -1550,9 +1550,7 @@ mod readme_parity {
         let allowed: BTreeSet<&str> = KEYMAP_ONLY.iter().map(|(c, _)| *c).collect();
         let undocumented: Vec<String> = keymap_chords()
             .into_iter()
-            .filter(|c| {
-                !rows.contains(c) && !prose.contains(c) && !allowed.contains(c.as_str())
-            })
+            .filter(|c| !rows.contains(c) && !prose.contains(c) && !allowed.contains(c.as_str()))
             .collect();
         assert!(
             undocumented.is_empty(),

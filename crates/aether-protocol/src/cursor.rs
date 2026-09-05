@@ -71,6 +71,12 @@ pub enum Motion {
     Goto {
         position: LogicalPosition,
     },
+    /// The `count`-th line from the **field's** end, 1-based — `N Alt-g`. Resolved server-side
+    /// because only the server knows where the focused element ends; a client counting back from a
+    /// view's length was naming a line of the wrong space.
+    LineFromEnd {
+        count: u32,
+    },
     VisualLine {
         viewport_id: ViewportId,
         direction: VerticalDirection,

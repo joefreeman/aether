@@ -2,7 +2,6 @@
 
 mod common;
 
-use aether_protocol::coords::ViewLine;
 use common::*;
 
 // -------- transient reachability -----------------------------------------------------------------
@@ -44,9 +43,11 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -89,9 +90,11 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -109,7 +112,10 @@ async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
         },
     )
     .await;
-    assert_eq!(state.buffer_id, preview, "the edited preview was not collected");
+    assert_eq!(
+        state.buffer_id, preview,
+        "the edited preview was not collected"
+    );
     assert!(
         !state.transient,
         "because the edit promoted it out of preview — that is the mechanism, not a rescue by the \
@@ -226,9 +232,11 @@ async fn save_as_writes_scratch_to_disk_and_clears_dirty() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -711,9 +719,11 @@ async fn save_as_to_same_path_is_in_place_save() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -793,9 +803,11 @@ async fn save_as_rejects_existing_file_without_overwrite() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -897,9 +909,11 @@ async fn in_place_save_never_triggers_overwrite_check() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -985,9 +999,11 @@ async fn in_place_save_after_save_as_targets_new_path() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -1211,9 +1227,11 @@ async fn buffer_close_drops_viewports() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -1300,9 +1318,11 @@ async fn setup_watched_buffer(
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -1349,9 +1369,11 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
             rows: 10,
             overscan_rows: 5,
             scroll: ScrollPosition {
-                logical_line: ViewLine(150),
+                element: 0,
+                line: 150,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -1359,7 +1381,11 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
         },
     )
     .await;
-    assert_eq!(sub.window.first_view_line, ViewLine(145));
+    assert_eq!(
+        loaded_lines(&sub.window).0,
+        145,
+        "the subscribe loads from the overscan above line 150"
+    );
 
     // Park the cursor deep too, so the reload's clamp has something to do.
     let st: CursorState = send_request::<CursorMove>(
@@ -1384,24 +1410,23 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
     let push = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let p = expect_notification_within::<ViewportLinesChanged>(&mut ws, remaining).await;
-        if p.view_line_count == new_line_count {
+        // One row per line: the rewritten lines are short.
+        if total_rows(&p.window) == new_line_count {
             break p;
         }
     };
 
-    // Scroll clamps to the last line (5); with rows 10 + overscan 5 the range saturates to the
-    // whole file. The essential invariants: non-empty and inside the new bounds.
-    let (start, end) = (
-        push.range.start_view_line,
-        push.range.end_view_line_exclusive,
-    );
+    // The loaded slice had fallen off the end of the shrunken file, so it clamps to the file's
+    // tail — with rows 10 + overscan 5 that is the whole file. The essential invariants:
+    // non-empty and inside the new bounds.
+    let (start, end) = loaded_lines(&push.window);
     assert!(
         start < end,
         "pushed window must be non-empty, got {start:?}..{end:?}"
     );
-    assert!(end <= ViewLine(new_line_count));
-    assert_eq!((start, end), (ViewLine(0), ViewLine(new_line_count)));
-    assert_eq!(push.root.lines().len(), start.distance_to(end) as usize);
+    assert!(end <= new_line_count);
+    assert_eq!((start, end), (0, new_line_count));
+    assert_eq!(push.window.root.lines().len(), (end - start) as usize);
 
     // The clamped cursor rides the push — without it the client shows a stale position (and no
     // cursor block at all) until the next round-trip.
@@ -1415,21 +1440,8 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
     );
 
     // The healed scroll state also serves follow-up scrolls normally.
-    let scrolled: ViewportWindowResult = send_request::<ViewportScroll>(
-        &mut ws,
-        &ViewportScrollParams {
-            viewport_id: sub.viewport_id,
-            scroll: ScrollPosition {
-                logical_line: ViewLine(0),
-                sub_row: 0.0,
-            },
-        },
-    )
-    .await;
-    assert_eq!(
-        scrolled.window.first_view_line,
-        aether_protocol::coords::ViewLine(0)
-    );
+    let scrolled = window_from_row(&mut ws, sub.viewport_id, 0, 15).await;
+    assert_eq!(loaded_lines(&scrolled.window).0, 0);
     assert!(!scrolled.window.root.lines().is_empty());
 
     drop(server);
@@ -1449,9 +1461,11 @@ async fn subscribe_with_scroll_past_eof_returns_non_empty_window() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(1000),
+                element: 0,
+                line: 1000,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -1461,14 +1475,13 @@ async fn subscribe_with_scroll_past_eof_returns_non_empty_window() {
     .await;
 
     let w = &sub.window;
-    assert_eq!(w.view_line_count, 4);
+    assert_eq!(total_rows(w), 4);
+    let (first, last) = loaded_lines(w);
     assert!(
-        w.first_view_line < w.last_view_line_exclusive,
-        "window must be non-empty, got {}..{}",
-        w.first_view_line,
-        w.last_view_line_exclusive
+        first < last,
+        "window must be non-empty, got {first}..{last}"
     );
-    assert!(w.last_view_line_exclusive <= ViewLine(w.view_line_count));
+    assert!(last <= 4);
     assert!(!w.root.lines().is_empty());
 
     drop(server);
@@ -1629,9 +1642,11 @@ async fn watcher_covers_open_buffer_inside_gitignored_dir() {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -1688,9 +1703,11 @@ async fn connect_and_open_watched(ws_url: &str, workspace: &str) -> (Ws, u64) {
             rows: 10,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::Soft,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -1847,7 +1864,7 @@ async fn edit_in_one_workspace_streams_to_the_other_workspaces_viewport() {
     )
     .await;
     assert_eq!(
-        push.root.lines()[0].visual_rows[0].segments[0].text,
+        push.window.root.lines()[0].visual_rows[0].segments[0].text,
         "shared-hello"
     );
     assert_eq!(buffer_text(&mut ws_b, buf_b).await, "shared-hello\n");
@@ -3697,9 +3714,11 @@ async fn restore_flags_externally_modified_when_disk_changed() {
             rows: 24,
             overscan_rows: 0,
             scroll: ScrollPosition {
-                logical_line: ViewLine(0),
+                element: 0,
+                line: 0,
                 sub_row: 0.0,
             },
+            focus: None,
             wrap: WrapMode::None,
             continuation_marker_width: 0,
             tab_width: 4,
@@ -4454,5 +4473,24 @@ async fn path_delete_proceeds_once_the_dirty_buffer_is_saved() {
     .await;
     assert_eq!(res.closed_buffer_ids, vec![nested]);
     assert!(!root.join("sub").exists());
+    drop(server);
+}
+
+/// Every subscribe says which element holds the cursor — an ordinary view included, where it is
+/// element 0 over the very buffer subscribed to.
+///
+/// The client mirrors the focused element and has to start from the server's value whichever
+/// element that is. Saying it only for a composed view left a subscribe that landed in a patch's
+/// own text with the two sides on different elements.
+#[tokio::test]
+async fn subscribing_to_an_ordinary_view_names_its_one_element() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha\nbeta\n").await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(buffer_id)).await;
+    assert_eq!(sub.focus.element, 0);
+    assert_eq!(
+        sub.focus.buffer.buffer_id, buffer_id,
+        "the one element windows the buffer the view is"
+    );
     drop(server);
 }
