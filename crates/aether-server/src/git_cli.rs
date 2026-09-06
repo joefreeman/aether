@@ -20,32 +20,22 @@
 //! failure to run git at all is an `Err`. Structured error variants would mean tracking git's
 //! message wording across versions and locales, and would throw away the detail the user needs.
 
+use crate::process::{self, Stream};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
 
 /// Watches for a cancellation of the operation [`run_streaming`] is running.
 ///
-/// A `watch` channel rather than a bare notification: it carries *state*, so a cancel that lands
-/// before the runner gets around to waiting is still seen. A dropped sender means nothing can
-/// cancel this any more, which reads as "never", not "now".
-pub type CancelToken = tokio::sync::watch::Receiver<bool>;
+/// Re-exported from [`crate::process`], which owns the running of children: it is the same type a
+/// shell view's run is cancelled through, so `git/cancel` and `shell/cancel` cannot drift into two
+/// ideas of what a cancel is.
+pub type CancelToken = process::CancelToken;
 /// The other end of a [`CancelToken`] — held by whoever may cancel the operation.
-pub type CancelHandle = tokio::sync::watch::Sender<bool>;
+pub type CancelHandle = process::CancelHandle;
 
 pub fn cancel_channel() -> (CancelHandle, CancelToken) {
-    tokio::sync::watch::channel(false)
-}
-
-async fn cancelled(rx: &mut CancelToken) {
-    loop {
-        if *rx.borrow_and_update() {
-            return;
-        }
-        if rx.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
+    process::cancel_channel()
 }
 
 /// What one `git` invocation produced. `code` is `None` when the child was killed by a signal.
@@ -124,91 +114,49 @@ pub async fn run(cwd: &Path, args: &[&str]) -> std::io::Result<GitOutput> {
 pub async fn run_streaming(
     cwd: &Path,
     args: &[&str],
-    mut cancel: CancelToken,
+    cancel: CancelToken,
     mut on_progress: impl FnMut(String) + Send,
 ) -> std::io::Result<GitOutput> {
-    let mut cmd = Command::new("git");
-    cmd.args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let mut cmd = process::command("git");
+    cmd.args(args).current_dir(cwd);
     if let Some(env) = crate::lsp::shell_env::resolve(cwd).await {
         cmd.envs(&env);
     }
     // The daemon has no terminal, so a git that decides to open an editor would sit there forever
     // (and `$EDITOR` from the user's shell may well be an interactive one). Every command here
     // either needs no message or passes it with `-F`, so "the editor did nothing and succeeded" is
-    // exactly the right answer — `git rebase --continue` then reuses the stored message, and
-    // `git pull`'s merge commit takes its default. Set after the shell environment, deliberately,
-    // so it wins over an inherited `GIT_EDITOR`.
+    // exactly the right answer — a continued rebase reuses the stored message, and a merge takes
+    // its default. Set after the shell environment, deliberately, so it wins over an inherited
+    // `GIT_EDITOR`.
     cmd.env("GIT_EDITOR", "true");
     // Ask for progress explicitly: git suppresses it when stderr isn't a terminal, which ours
     // never is.
     cmd.env("GIT_PROGRESS_DELAY", "0");
-    let mut child = cmd.spawn()?;
 
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut pending = Vec::<u8>::new();
-    // One buffer per stream: the two read branches below are alive in the same `select!`, so they
-    // can't share.
-    let mut err_buf = [0u8; 4096];
-    let mut out_buf = [0u8; 4096];
-
-    let status = loop {
-        tokio::select! {
-            // Biased so a cancel is honoured even when git is producing output steadily.
-            biased;
-            _ = cancelled(&mut cancel) => {
-                let _ = child.kill().await;
-                break child.wait().await?;
-            }
-            read = read_some(stderr_pipe.as_mut(), &mut err_buf) => {
-                match read? {
-                    0 => stderr_pipe = None,
-                    n => {
-                        stderr.push_str(&String::from_utf8_lossy(&err_buf[..n]));
-                        pending.extend_from_slice(&err_buf[..n]);
-                        for line in take_progress_lines(&mut pending) {
-                            on_progress(line);
-                        }
-                    }
+    let exit = process::run_streaming(cmd, cancel, |stream, chunk| {
+        match stream {
+            Stream::Stdout => stdout.push_str(&String::from_utf8_lossy(chunk)),
+            Stream::Stderr => {
+                stderr.push_str(&String::from_utf8_lossy(chunk));
+                pending.extend_from_slice(chunk);
+                for line in take_progress_lines(&mut pending) {
+                    on_progress(line);
                 }
-            }
-            read = read_some(stdout_pipe.as_mut(), &mut out_buf) => {
-                match read? {
-                    0 => stdout_pipe = None,
-                    n => stdout.push_str(&String::from_utf8_lossy(&out_buf[..n])),
-                }
-            }
-            status = child.wait(), if stdout_pipe.is_none() && stderr_pipe.is_none() => {
-                break status?;
             }
         }
-    };
+        // git's output is never capped: the caller wants the whole of what it said.
+        true
+    })
+    .await?;
 
     Ok(GitOutput {
         stdout,
         stderr,
-        code: status.code(),
+        code: exit.code,
     })
-}
-
-/// Read from a pipe, or park forever when it's already closed — so the `select!` above can drop
-/// each stream as it ends without the closed branch spinning at 100% on a perpetual `Ok(0)`.
-async fn read_some<R: tokio::io::AsyncRead + Unpin>(
-    pipe: Option<&mut R>,
-    buf: &mut [u8],
-) -> std::io::Result<usize> {
-    use tokio::io::AsyncReadExt;
-    match pipe {
-        Some(r) => r.read(buf).await,
-        None => std::future::pending().await,
-    }
 }
 
 /// Split off every complete progress line in `pending`, leaving any partial tail behind.

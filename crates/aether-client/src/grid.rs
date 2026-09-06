@@ -317,6 +317,43 @@ pub fn total_rows(root: &Element, measured: &Measured) -> u32 {
     total
 }
 
+/// Keep the **end** of a growing view on screen: the shell view's scroll policy.
+///
+/// While a command is producing output the view gets taller under you, and the interesting end of
+/// it is the bottom — the line just written, and the input under that, which is where the caret
+/// is. An ordinary clamp does nothing here: the scroll limit grows with the content, so the top
+/// row stays put and the tail walks off the screen.
+///
+/// So: if the last row was on screen *before* the change, put it back on screen after. If it was
+/// not — you had scrolled up to read something — nothing moves, which is the half that matters
+/// most: a view that yanks you back to the bottom every fifty milliseconds cannot be read at all.
+///
+/// `top` and `viewport_rows` are where the shell is scrolled now and how much of the view it can
+/// show; `before` and `after` are the view's height either side of the change, at the shell's own
+/// resolution ([`Measured::units_per_row`]). Answers the new top row, or `None` to leave the
+/// scroll alone.
+///
+/// In the core rather than in each shell because it is a policy, not geometry: three
+/// implementations of "when does the view follow the output" would be three answers.
+pub fn sticky_tail(
+    top: VisualRow,
+    viewport_rows: u32,
+    before: u32,
+    after: u32,
+) -> Option<VisualRow> {
+    // Only *growth* follows. A view that shrank (a shell closing a run, a wrap widening) is a
+    // relayout, and the anchor machinery already has an opinion about those.
+    if after <= before {
+        return None;
+    }
+    // "On screen" counts the last row itself: a viewport showing rows `top..top + rows` has the
+    // final row when `top + rows` reaches the total.
+    if top.get().saturating_add(viewport_rows) < before {
+        return None;
+    }
+    Some(VisualRow(after.saturating_sub(viewport_rows)))
+}
+
 /// The absolute row an element's own content starts on — after its chrome.
 ///
 /// Computable for **every** element, loaded or not: the tree carries every editor's height whether
@@ -539,10 +576,13 @@ fn walk_rows<'a>(
     f: &mut impl FnMut(Visit<'a>, Frame, u32),
 ) {
     match node {
+        // A title is not a row: it rides the top border row the box is already spending, so the
+        // walk says nothing about it and each painter reads it off that row's owner.
         Element::Column {
             children,
             edges,
             band,
+            title: _,
         } => {
             let inner = frame.plus(*edges, *band);
             // The box's own rows, above and below its children. Border and padding are separate
@@ -775,85 +815,90 @@ pub fn painted_rows_of<'a>(
     let mut out: Vec<(Placement, PaintedRow<'a>)> = Vec::new();
     let mut at = 0u32;
     let mut seen = 0usize;
-    walk_rows(root, measured, Frame::default(), &mut |visit, frame, height| {
-        let place = |row: u32| Placement {
-            row: VisualRow(row),
-            inset: frame.inset,
-            rails: frame.rails,
-            band: frame.band,
-        };
-        let node = match visit {
-            Visit::Edge { owner, side } => {
-                // The join is resolved in a second pass, once every edge is known: what an edge
-                // meets depends on the edge after it, which this pass has not reached.
-                out.push((
-                    place(at),
-                    PaintedRow::Edge {
-                        owner,
-                        side,
-                        join: RailJoin::Detached,
-                    },
-                ));
-                at = at.saturating_add(height);
-                return;
-            }
-            Visit::Node(node) => node,
-        };
-        match node {
-            Element::Editor {
-                element,
-                first_row,
-                lines,
-                ..
-            } => {
-                let client_laid_out = measured.of(node).is_some()
-                    || matches!(
-                        node,
-                        Element::Editor {
-                            laid_out_by: LayoutOwner::Client,
-                            ..
-                        }
-                    );
-                let mut row = at.saturating_add(first_row.get().saturating_mul(unit));
-                for (i, line) in lines.iter().enumerate() {
-                    if client_laid_out {
-                        // Where the shell put the line — or, unmeasured, one row per line.
-                        row = at.saturating_add(
-                            measured.offset_of(node, first_row.saturating_add(i as u32)),
+    walk_rows(
+        root,
+        measured,
+        Frame::default(),
+        &mut |visit, frame, height| {
+            let place = |row: u32| Placement {
+                row: VisualRow(row),
+                inset: frame.inset,
+                rails: frame.rails,
+                band: frame.band,
+            };
+            let node = match visit {
+                Visit::Edge { owner, side } => {
+                    // The join is resolved in a second pass, once every edge is known: what an edge
+                    // meets depends on the edge after it, which this pass has not reached.
+                    out.push((
+                        place(at),
+                        PaintedRow::Edge {
+                            owner,
+                            side,
+                            join: RailJoin::Detached,
+                        },
+                    ));
+                    at = at.saturating_add(height);
+                    return;
+                }
+                Visit::Node(node) => node,
+            };
+            match node {
+                Element::Editor {
+                    element,
+                    first_row,
+                    lines,
+                    ..
+                } => {
+                    let client_laid_out = measured.of(node).is_some()
+                        || matches!(
+                            node,
+                            Element::Editor {
+                                laid_out_by: LayoutOwner::Client,
+                                ..
+                            }
                         );
-                    }
-                    for (index, baseline) in line.baseline_above.iter().enumerate() {
-                        out.push((
-                            place(row),
-                            PaintedRow::Baseline {
-                                element: *element,
-                                line,
-                                index,
-                                row: baseline,
-                            },
-                        ));
-                        row = row.saturating_add(unit);
-                    }
-                    seen += 1;
-                    for (row_index, wrapped) in line.visual_rows.iter().enumerate() {
-                        out.push((
-                            place(row),
-                            PaintedRow::Text {
-                                element: *element,
-                                line,
-                                row: wrapped,
-                                row_index,
-                                last_line: seen == total_lines,
-                            },
-                        ));
-                        row = row.saturating_add(unit);
+                    let mut row = at.saturating_add(first_row.get().saturating_mul(unit));
+                    for (i, line) in lines.iter().enumerate() {
+                        if client_laid_out {
+                            // Where the shell put the line — or, unmeasured, one row per line.
+                            row = at.saturating_add(
+                                measured.offset_of(node, first_row.saturating_add(i as u32)),
+                            );
+                        }
+                        for (index, baseline) in line.baseline_above.iter().enumerate() {
+                            out.push((
+                                place(row),
+                                PaintedRow::Baseline {
+                                    element: *element,
+                                    line,
+                                    index,
+                                    row: baseline,
+                                },
+                            ));
+                            row = row.saturating_add(unit);
+                        }
+                        seen += 1;
+                        for (row_index, wrapped) in line.visual_rows.iter().enumerate() {
+                            out.push((
+                                place(row),
+                                PaintedRow::Text {
+                                    element: *element,
+                                    line,
+                                    row: wrapped,
+                                    row_index,
+                                    last_line: seen == total_lines,
+                                },
+                            ));
+                            row = row.saturating_add(unit);
+                        }
                     }
                 }
+                _ => out.push((place(at), PaintedRow::Chrome(node))),
             }
-            _ => out.push((place(at), PaintedRow::Chrome(node))),
-        }
-        at = at.saturating_add(height);
-    });
+            at = at.saturating_add(height);
+        },
+    );
     resolve_joins(&mut out);
     out
 }
@@ -876,24 +921,36 @@ pub fn painted_rows_of<'a>(
 /// fix while removing the wire field. A join read off the tree cannot disagree with the tree.
 fn resolve_joins(rows: &mut [(Placement, PaintedRow<'_>)]) {
     let railed: Vec<bool> = rows.iter().map(|(p, _)| p.rails.left > 0).collect();
-    let is_edge: Vec<bool> = rows
+    // Which box each rule belongs to, by identity — `None` for a row that is not one.
+    let owner: Vec<Option<*const Element>> = rows
         .iter()
-        .map(|(_, r)| matches!(r, PaintedRow::Edge { .. }))
+        .map(|(_, r)| match r {
+            PaintedRow::Edge { owner, .. } => Some(*owner as *const Element),
+            _ => None,
+        })
         .collect();
-    // The nearest neighbour that is not itself a rule: a rule between two rules still asks about
-    // the content either side of the pair.
+    // The nearest neighbour that is not one of **this box's own** rules: a border and the padding
+    // beside it are several rows of one box, and the question is about what lies outside them.
+    //
+    // Another box's rule is not skipped over — it *is* the answer, and the answer is no rail. Two
+    // boxes that each draw their own edge are two boxes: the one above closes (`└`) and the one
+    // below opens (`┌`), rather than both tee-ing into a rail that runs through neither of them.
+    // Sharing an edge is what `collapse` is for, and a shared edge is one row, not two.
     let neighbour = |from: usize, step: isize| -> bool {
+        let mine = owner[from];
         let mut i = from as isize + step;
         while i >= 0 && (i as usize) < railed.len() {
-            if !is_edge[i as usize] {
-                return railed[i as usize];
+            match owner[i as usize] {
+                None => return railed[i as usize],
+                Some(o) if Some(o) != mine => return false,
+                Some(_) => {}
             }
             i += step;
         }
         false
     };
     for i in 0..rows.len() {
-        if !is_edge[i] {
+        if owner[i].is_none() {
             continue;
         }
         let join = match (neighbour(i, -1), neighbour(i, 1)) {
@@ -907,7 +964,6 @@ fn resolve_joins(rows: &mut [(Placement, PaintedRow<'_>)]) {
         }
     }
 }
-
 
 /// The first painted row of a line: its first phantom row if it has any, else its first text row.
 /// `None` when the line isn't loaded.
@@ -1426,6 +1482,7 @@ mod tests {
                 rows: first_row + loaded,
                 first_row: ElementRow(first_row),
                 laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Field,
                 first_buffer_line: first_logical,
                 lines,
             },
@@ -1440,6 +1497,7 @@ mod tests {
             rows,
             first_row: ElementRow(first_row),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line,
             lines,
         }
@@ -1746,6 +1804,80 @@ mod tests {
         );
     }
 
+    /// The shell's scroll policy: output that arrives while you are at the bottom keeps the
+    /// bottom in view, and output that arrives while you are reading further up does not move you.
+    #[test]
+    fn sticky_tail_follows_output_only_when_you_were_at_the_end() {
+        // Viewport of 10 rows showing a 10-row view: the last row is on screen, so growing to 25
+        // scrolls to keep it there.
+        assert_eq!(
+            sticky_tail(VisualRow(0), 10, 10, 25),
+            Some(VisualRow(15)),
+            "the tail stays on screen as the view grows"
+        );
+        // Still at the end after scrolling down with it.
+        assert_eq!(sticky_tail(VisualRow(15), 10, 25, 40), Some(VisualRow(30)));
+        // Scrolled up to read: the view grows underneath and nothing moves.
+        assert_eq!(
+            sticky_tail(VisualRow(0), 10, 40, 55),
+            None,
+            "a reader who scrolled up is not yanked back"
+        );
+        // Exactly one row short of the end still counts as away from it.
+        assert_eq!(sticky_tail(VisualRow(0), 10, 11, 20), None);
+        // A view shorter than the viewport has nowhere to scroll to.
+        assert_eq!(sticky_tail(VisualRow(0), 10, 2, 5), Some(VisualRow(0)));
+    }
+
+    /// Nothing to follow: a view that did not grow leaves the scroll alone, whichever way it went.
+    #[test]
+    fn sticky_tail_ignores_a_view_that_did_not_grow() {
+        assert_eq!(sticky_tail(VisualRow(0), 10, 25, 25), None, "unchanged");
+        assert_eq!(
+            sticky_tail(VisualRow(15), 10, 25, 12),
+            None,
+            "a shrink is a relayout, and the anchor machinery owns those"
+        );
+    }
+
+    /// The policy composes with the real row maths: a shell view's height is what `total_rows`
+    /// says it is, so the shells and this agree about what "the end" means.
+    #[test]
+    fn sticky_tail_reads_the_end_off_the_tree() {
+        let view = |runs: u32| {
+            Element::column(
+                (0..runs)
+                    .map(|i| Element::Column {
+                        edges: Default::default(),
+                        band: Default::default(),
+                        title: Vec::new(),
+                        children: vec![
+                            chrome(&format!("$ run {i}")),
+                            editor(i, 0, 1, vec![line(0, vec![row(0, 0, "out")])]),
+                        ],
+                    })
+                    .chain(std::iter::once(editor(
+                        runs,
+                        0,
+                        1,
+                        vec![line(0, vec![row(0, 0, "")])],
+                    )))
+                    .collect(),
+            )
+        };
+        let m = Measured::default();
+        // Two runs (a header and a line each) plus the input.
+        let before = total_rows(&view(2), &m);
+        assert_eq!(before, 5);
+        let after = total_rows(&view(3), &m);
+        assert_eq!(after, 7);
+        // A viewport of four rows scrolled to the end follows the third run in.
+        assert_eq!(
+            sticky_tail(VisualRow(1), 4, before, after),
+            Some(VisualRow(3))
+        );
+    }
+
     #[test]
     fn scroll_anchor_pins_cursor_when_visible_else_top_line() {
         let w = window(
@@ -1870,6 +2002,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("─"),
                 editor(0, 0, 1, vec![line(0, vec![row(0, 0, "x")])]),
@@ -1912,6 +2045,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 editor(
                     0,
@@ -1971,6 +2105,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.rs"),
                 chrome("@@ hunk"),
@@ -2227,7 +2362,7 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/painted_rows.json"))
                 .expect("the corpus parses");
         assert!(
-            corpus.cases.len() >= 14,
+            corpus.cases.len() >= 15,
             "the corpus should not quietly shrink: {} cases",
             corpus.cases.len()
         );
@@ -2271,6 +2406,61 @@ mod tests {
         }
     }
 
+    /// A title costs its box no rows: it rides the top border row the box was already spending.
+    ///
+    /// The whole reason a title is a *field* of the container rather than a child of it. A child
+    /// would be a row, every shell's arithmetic would have to agree about which one, and a view
+    /// would grow a row the moment a box learned its own name — which is the class of bug the
+    /// shared row walk exists to make impossible. So the walk says nothing about titles at all,
+    /// and this is what holds it to that.
+    #[test]
+    fn a_title_adds_no_rows_to_its_box() {
+        use aether_protocol::ui::{Band, Edges, Sides};
+        let edges = Edges {
+            border: Sides::all(1),
+            ..Edges::NONE
+        };
+        let kids = || {
+            vec![
+                chrome("echo one"),
+                editor(0, 0, 1, vec![line(0, vec![row(0, 0, "a")])]),
+            ]
+        };
+        let mut plain = window(0, 0, vec![]);
+        plain.root = Element::column(vec![Element::framed(edges, Band::Chrome, kids())]);
+        let mut named = window(0, 0, vec![]);
+        named.root = Element::column(vec![Element::titled(
+            edges,
+            Band::Chrome,
+            vec![Element::text("~/proj  ok  3.2s", Vec::new())],
+            kids(),
+        )]);
+
+        assert_eq!(
+            total_rows(&named.root, &Measured::default()),
+            total_rows(&plain.root, &Measured::default()),
+        );
+        assert_eq!(painted(&named), painted(&plain));
+        // And the title is reachable from the row that draws it — the top edge names its box.
+        let rows = painted_rows(&named, &Measured::default());
+        let (_, top) = rows.first().expect("the box's top border");
+        let PaintedRow::Edge { owner, side, .. } = top else {
+            panic!(
+                "the first row of a box is its top border: {:?}",
+                painted(&named)
+            );
+        };
+        assert!(matches!(side, Side::Top));
+        assert_eq!(
+            owner
+                .title()
+                .iter()
+                .map(Element::text_content)
+                .collect::<String>(),
+            "~/proj  ok  3.2s",
+        );
+    }
+
     /// An `Editor` nested in a `Row` is loud, not silently drawn as one chrome row.
     ///
     /// The shape nothing produces — and the one that would quietly lose an editor's lines if the
@@ -2304,6 +2494,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.rs"),
                 editor(
@@ -2359,6 +2550,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.rs"),
                 editor(0, 0, 3, vec![l16]),
@@ -2391,6 +2583,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.rs"),
                 // 10 rows tall, with lines 40..42 loaded 7 rows in.
@@ -2459,6 +2652,7 @@ mod tests {
         let root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.rs"),
                 editor(0, 0, 5, vec![]),
@@ -2517,6 +2711,7 @@ mod tests {
         let root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![editor(
                 0,
                 3,
@@ -2580,6 +2775,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.rs"),
                 editor(0, 0, 1, vec![line(10, vec![row(0, 0, "a")])]),
@@ -2610,6 +2806,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.rs"),
                 editor(
@@ -2710,6 +2907,7 @@ mod tests {
             rows: 0,
             first_row: ElementRow::ZERO,
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line: 7,
             lines: vec![],
         };
@@ -2730,6 +2928,7 @@ mod tests {
             rows: lines,
             first_row: ElementRow(first_row),
             laid_out_by: aether_protocol::ui::LayoutOwner::Client,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line: loaded.start,
             lines: loaded.map(|n| line(n, vec![row(0, 0, "prose")])).collect(),
         }
@@ -2762,6 +2961,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.md"),
                 prose(0, 2, 10, 2..5),
@@ -2794,6 +2994,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.md"),
                 prose(0, 2, 10, 2..5),
@@ -2830,6 +3031,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.md"),
                 prose(0, 2, 10, 2..5),
@@ -2900,6 +3102,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![chrome("a.md"), prose(0, 2, 10, 2..5)],
         };
         let m = measured(0, 2, &[1, 3, 2]);
@@ -2929,6 +3132,7 @@ mod tests {
         w.root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 chrome("a.md"),
                 prose(0, 2, 10, 2..5),

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/aether-protocol",
     "crates/aether-markdown",
+    "crates/aether-shell",
     "crates/aether-server",
     "crates/aether-tui",
     "crates/aether-client",
@@ -38,6 +39,7 @@ aether-protocol = { path = "crates/aether-protocol" }
 aether-markdown = { path = "crates/aether-markdown" }
 aether-client = { path = "crates/aether-client" }
 aether-connection = { path = "crates/aether-connection" }
+aether-shell = { path = "crates/aether-shell" }
 aether-server = { path = "crates/aether-server" }
 aether-tui = { path = "crates/aether-tui" }
 aether-iced = { path = "crates/aether-iced" }

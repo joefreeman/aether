@@ -419,6 +419,8 @@ pub async fn activate_context(
                         // A revision is read-only, so it can never hold unsaved content to rescue;
                         // it regenerates when first viewed, like a dormant file with no backup.
                         crate::state::DormantSource::Virtual { .. } => false,
+                        // A shell's snapshot is safe on disk until it is opened; nothing to rescue.
+                        crate::state::DormantSource::Shell { .. } => false,
                     })
                     .map(|d| d.view)
                     .collect();
@@ -673,6 +675,17 @@ fn restore_dormant_sources(
             SessionView::Virtual { key } => {
                 Some((DormantSource::Virtual { key: key.clone() }, None))
             }
+            // A shell comes back only from its snapshot, as a scratch does from its backup.
+            SessionView::Shell { number } => {
+                let has_snapshot = backups_root.is_some_and(|root| {
+                    crate::backup::exists(&crate::backup::shell_backup_path(
+                        root,
+                        workspace_name,
+                        *number,
+                    ))
+                });
+                has_snapshot.then_some((DormantSource::Shell { number: *number }, None))
+            }
         })
         .collect();
     if let Some(root) = backups_root {
@@ -680,7 +693,9 @@ fn restore_dormant_sources(
             .iter()
             .filter_map(|(src, _)| match src {
                 DormantSource::Scratch { number } => Some(*number),
-                DormantSource::File(_) | DormantSource::Virtual { .. } => None,
+                DormantSource::File(_)
+                | DormantSource::Virtual { .. }
+                | DormantSource::Shell { .. } => None,
             })
             .collect();
         if let Ok(dir) = std::fs::read_dir(root.join("scratch").join(workspace_name)) {
@@ -696,6 +711,25 @@ fn restore_dormant_sources(
                     .map(|number| (DormantSource::Scratch { number }, None)),
             );
         }
+        // Shell snapshots the session did not name — written by a server that never got to
+        // record its session — come back too, after everything the session did name.
+        let known_shells: std::collections::HashSet<u32> = sources
+            .iter()
+            .filter_map(|(src, _)| match src {
+                DormantSource::Shell { number } => Some(*number),
+                _ => None,
+            })
+            .collect();
+        let mut recovered: Vec<u32> = crate::backup::shell_keys(root, workspace_name)
+            .into_iter()
+            .filter(|n| !known_shells.contains(n))
+            .collect();
+        recovered.sort_unstable();
+        sources.extend(
+            recovered
+                .into_iter()
+                .map(|number| (DormantSource::Shell { number }, None)),
+        );
     }
     sources
 }
@@ -723,6 +757,11 @@ pub fn delete_buffer_backups(s: &ServerState, workspace: &str, buf: &Buffer, doc
     if let Some(n) = buf.scratch_number {
         crate::backup::delete(&crate::backup::scratch_backup_path(root, workspace, n));
     }
+    if let Some(crate::state::VirtualTarget::Shell { number, .. }) =
+        doc.virtual_source.as_ref().map(|v| &v.target)
+    {
+        crate::backup::delete(&crate::backup::shell_backup_path(root, workspace, *number));
+    }
 }
 
 /// Flush unsaved-document backups to disk: write a backup for every dirty document with at least
@@ -739,6 +778,8 @@ pub(crate) async fn flush_backups(state: &SharedState) {
     enum Action {
         Write(String, aether_protocol::Revision),
         Delete,
+        /// A shell's snapshot, stamped with the generation and input revision it captured.
+        Shell(String, (u64, aether_protocol::Revision)),
     }
     struct Job {
         doc: DocumentId,
@@ -752,6 +793,46 @@ pub(crate) async fn flush_backups(state: &SharedState) {
         };
         let mut jobs = Vec::new();
         for doc in s.documents.values() {
+            // A shell is written down whole — transcript, runs, directory, assignments, the
+            // input — under its own key, whenever anything about it has moved since last time.
+            // Most of that state is not in the text, so the transcript's generation and the
+            // input's revision are the stamp, not a document revision.
+            if let Some(t) = doc.transcript() {
+                let Some(crate::state::VirtualTarget::Shell { number, .. }) =
+                    doc.virtual_source.as_ref().map(|v| &v.target)
+                else {
+                    continue;
+                };
+                let workspace = s
+                    .buffers
+                    .values()
+                    .find(|b| b.document == doc.id)
+                    .and_then(|b| s.buffer_workspaces.get(&b.id));
+                let Some(workspace) = workspace else { continue };
+                if s.workspaces.get(workspace).is_none_or(|w| w.name.is_none()) {
+                    continue;
+                }
+                let Some(input) = s.try_doc_of(t.input) else {
+                    continue;
+                };
+                let stamp = (t.generation, input.revision);
+                if t.backed_up == Some(stamp) {
+                    continue;
+                }
+                let text: String = doc.text.chunks().collect();
+                let typed: String = input.text.chunks().collect();
+                let snap = t
+                    .snapshot(&text, &typed)
+                    .trimmed(crate::shell::SNAPSHOT_BUDGET);
+                if let Ok(json) = serde_json::to_string(&snap) {
+                    jobs.push(Job {
+                        doc: doc.id,
+                        path: crate::backup::shell_backup_path(&root, workspace, *number),
+                        action: Action::Shell(json, stamp),
+                    });
+                }
+                continue;
+            }
             // Every *file-backed* document is backup-worthy, whatever kind of workspace holds
             // it: the backup key is path-only (`files/<hash>`) and recover-on-open is
             // workspace-agnostic, so content edited through an ephemeral tether context is
@@ -799,6 +880,7 @@ pub(crate) async fn flush_backups(state: &SharedState) {
         return;
     }
     let mut stamps: Vec<(DocumentId, Option<aether_protocol::Revision>)> = Vec::new();
+    let mut shell_stamps: Vec<(DocumentId, (u64, aether_protocol::Revision))> = Vec::new();
     for job in jobs {
         match job.action {
             Action::Write(content, rev) => match crate::backup::write(&job.path, &content) {
@@ -811,9 +893,25 @@ pub(crate) async fn flush_backups(state: &SharedState) {
                 crate::backup::delete(&job.path);
                 stamps.push((job.doc, None));
             }
+            Action::Shell(json, stamp) => match crate::backup::write(&job.path, &json) {
+                Ok(()) => shell_stamps.push((job.doc, stamp)),
+                Err(e) => {
+                    tracing::warn!(document = job.doc.0, error = %e, "failed to write shell snapshot")
+                }
+            },
         }
     }
     let mut s = state.lock().await;
+    for (doc_id, stamp) in shell_stamps {
+        if let Some(t) = s
+            .documents
+            .get_mut(&doc_id)
+            .and_then(|d| d.generated.as_mut())
+            .and_then(crate::state::Generated::transcript_mut)
+        {
+            t.backed_up = Some(stamp);
+        }
+    }
     for (doc_id, stamp) in stamps {
         if let Some(doc) = s.documents.get_mut(&doc_id) {
             // Stamping a revision the document may have already moved past is fine: the next
@@ -2206,6 +2304,33 @@ mod restore_tests {
                 DormantSource::Scratch { number: 5 },
             ]
         );
+    }
+
+    /// A shell comes back only from its snapshot — a session entry with none is dropped, and a
+    /// snapshot the session never named is recovered after the named ones.
+    #[test]
+    fn restore_dormant_sources_shells_need_their_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        crate::backup::write(&crate::backup::shell_backup_path(&backups, "p", 1), "{}").unwrap();
+        crate::backup::write(&crate::backup::shell_backup_path(&backups, "p", 4), "{}").unwrap();
+        let entries = vec![
+            SessionView::Shell { number: 1 },
+            SessionView::Shell { number: 2 },
+        ];
+        let sources: Vec<DormantSource> = restore_dormant_sources(&entries, "p", Some(&backups))
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
+        assert_eq!(
+            sources,
+            vec![
+                DormantSource::Shell { number: 1 },
+                DormantSource::Shell { number: 4 },
+            ]
+        );
+        // With backups disabled, no shell is restorable.
+        assert!(restore_dormant_sources(&entries, "p", None).is_empty());
     }
 
     /// A kept revision comes back unconditionally: there is nothing on disk to probe for, because

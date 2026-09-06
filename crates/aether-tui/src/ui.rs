@@ -1489,7 +1489,7 @@ fn root_buffer_status(state: &AppState, root: &str) -> Option<BufferStatusKind> 
 /// the app (the shell sets `should_quit`), so this is only ever a momentary flash.
 fn draw_no_workspace_view(f: &mut Frame, _state: &AppState, area: Rect) {
     f.render_widget(
-        Paragraph::new("").style(Style::default().bg(c(th().bg))),
+        Paragraph::new("").style(Style::default().bg(c(th().bg_app))),
         area,
     );
 }
@@ -5294,16 +5294,25 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         }
     };
 
-    // A box's border row, *inside* its own rails: the horizontal fill and nothing else. The
-    // corners where this meets the rails are drawn by `enclose`, which owns the frame — two
-    // mechanisms each drawing part of one box is how the rail ended up painted twice.
-    let box_edge_row = |cols: u16| -> Line<'static> {
-        Line::from(vec![Span::styled(
-            "─".repeat(cols as usize),
-            Style::default()
-                .fg(c(th().fg_faint))
-                .bg(c(th().patch_chrome_bg)),
-        )])
+    // A box's border row, *inside* its own rails: the horizontal fill, and — on a top border whose
+    // box is named — one rule cell, a space, the title, a space, then the rule on to the far
+    // corner. The corners where this meets the rails are drawn by `enclose`, which owns the frame
+    // — two mechanisms each drawing part of one box is how the rail ended up painted twice.
+    //
+    // A title over-long for its box is cut where any chrome row is, by `fit`: the rule it was
+    // going to trail simply never starts.
+    let box_edge_row = |cols: u16, title: &[Element]| -> Line<'static> {
+        let bg = c(th().bg_app);
+        let ink = Style::default().fg(c(th().fg_faint)).bg(bg);
+        if title.is_empty() {
+            return Line::from(vec![Span::styled("─".repeat(cols as usize), ink)]);
+        }
+        let row = Element::row(title.to_vec());
+        let mut spans = vec![Span::styled("─ ".to_string(), ink)];
+        spans.extend(element_spans(&row, inline_cols(&row) as u16, bg));
+        spans.push(Span::styled(" ".to_string(), Style::default().bg(bg)));
+        spans.push(Span::styled("─".repeat(cols as usize), ink));
+        Line::from(fit(spans, cols, bg))
     };
 
     // Put a row inside its box: the frame's own cells on the left, the row, the frame's cells on
@@ -5329,10 +5338,11 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             return line;
         }
         let mut style = Style::default();
-        // The box's own shade behind its border and padding cells. A box that declares no band
-        // leaves them on the editor background rather than assuming the patch's.
+        // The box's own shade behind its border and padding cells: the ground, which is where a
+        // box's frame belongs — it encloses the wells rather than being one. A box that declares
+        // no band leaves the cells to the pane's own fill, which paints the same ground anyway.
         if matches!(place.band, Band::Chrome) {
-            style = style.bg(c(th().patch_chrome_bg));
+            style = style.bg(c(th().bg_app));
         }
         let ink = style.fg(c(th().fg_faint));
         // On a border row the corner says what the rule meets; elsewhere the rail runs straight.
@@ -5509,7 +5519,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     &mut spans,
                     show_blame.then_some(blame_text.as_deref()).flatten(),
                 );
-                apply_line_tint(&mut spans, line_tint, cols);
+                paint_row_bg(&mut spans, line_tint, cols);
                 return prepend_gutter(
                     gutter_mark,
                     render.change.stage(),
@@ -5667,7 +5677,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             &mut spans,
             show_blame.then_some(blame_text.as_deref()).flatten(),
         );
-        apply_line_tint(&mut spans, line_tint, cols);
+        paint_row_bg(&mut spans, line_tint, cols);
         prepend_gutter(
             gutter_mark,
             render.change.stage(),
@@ -5721,9 +5731,16 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 chrome_row_within(node, inner, place.band),
             ),
             // `side` says top or bottom; the join already says what the rule meets, which is all
-            // the glyph depends on — a top that closes a run looks like a bottom that does.
-            aether_client::grid::PaintedRow::Edge { join, .. } => {
-                enclose(place, inner, Some(*join), box_edge_row(inner))
+            // the glyph depends on — a top that closes a run looks like a bottom that does. What
+            // `side` decides is the title: a box is named on the border it opens with, and the
+            // name rides that row rather than costing one. A tee carries it the same way, for the
+            // collapsed titled box nothing builds yet.
+            aether_client::grid::PaintedRow::Edge { owner, side, join } => {
+                let title: &[Element] = match side {
+                    aether_client::grid::Side::Top => owner.title(),
+                    aether_client::grid::Side::Bottom => &[],
+                };
+                enclose(place, inner, Some(*join), box_edge_row(inner, title))
             }
             aether_client::grid::PaintedRow::Baseline { row, .. } => {
                 enclose(place, inner, None, baseline_row(row, inner_text))
@@ -5743,10 +5760,12 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         });
     }
 
-    // Paint the whole buffer area with the Nord base style: spans without explicit fg/bg
-    // inherit it, and any empty/short visual rows get the background filled too.
+    // Paint the whole buffer area with the app's ground: spans without an explicit background
+    // inherit it, so the rows past the end of the content and the gaps an unloaded element
+    // leaves come out as ground rather than as more editor. The rows that *are* editor paint
+    // their own well over it (`paint_row_bg`).
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(c(th().bg)).fg(c(th().fg))),
+        Paragraph::new(lines).style(Style::default().bg(c(th().bg_app)).fg(c(th().fg))),
         area,
     );
 
@@ -5793,10 +5812,11 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 /// `width` is the *content* width, as it is for every other row — the gutter column sits outside
 /// it, which is why chrome must not subtract one for it.
 fn chrome_virtual_row_spans(content: &[Element], width: u16, band: Band) -> Vec<Span<'static>> {
-    // A presentation row with no band paints none: it still draws, it just sits on the editor's
-    // own background. Nothing produces one today; the vocabulary allows it, so the painter does.
+    // A presentation row with no band paints none: it still draws, it just sits on whatever the
+    // pane filled behind it. Nothing produces one today; the vocabulary allows it, so the painter
+    // does.
     let bg = match band {
-        Band::Chrome => c(th().patch_chrome_bg),
+        Band::Chrome => c(th().bg_app),
         Band::None => Color::Reset,
     };
     let style = Style::default().fg(c(th().fg_faint)).bg(bg);
@@ -6003,9 +6023,13 @@ fn deleted_virtual_row_spans(
     spans
 }
 
-/// A solid change-bar cell in the given color (`GUTTER_WIDTH` cols).
+/// A solid change-bar cell in the given color (`GUTTER_WIDTH` cols), on the editor's own shade.
+///
+/// The gutter belongs to the rows the cursor can reach, so it is part of the well and says so:
+/// the pane behind it paints the app's ground, and a gutter that named no background would leave
+/// a strip of ground down the left of every editor row.
 fn gutter_bar(color: Color) -> Span<'static> {
-    Span::styled("▎".to_string(), Style::default().fg(color))
+    Span::styled("▎".to_string(), Style::default().fg(color).bg(c(th().bg)))
 }
 
 /// Colour for a change-bar / marker: hue follows the change kind (`bright` and `dim` are the
@@ -6058,14 +6082,17 @@ fn git_gutter_cell(
             // "removed above" top marker
             Span::styled(
                 "▔".to_string(),
-                Style::default().fg(stage_color(
-                    stage,
-                    c(th().git_deleted),
-                    c(th().git_staged_deleted),
-                )),
+                Style::default()
+                    .fg(stage_color(
+                        stage,
+                        c(th().git_deleted),
+                        c(th().git_staged_deleted),
+                    ))
+                    .bg(c(th().bg)),
             )
         }
-        None => Span::styled(" ".to_string(), Style::default().fg(c(th().bg))), // unchanged → blank
+        // Unchanged → blank, on the well like every other gutter cell.
+        None => Span::styled(" ".to_string(), Style::default().bg(c(th().bg))),
     }
 }
 
@@ -6141,16 +6168,20 @@ fn cursor_line_bg(diff_marker: Option<DiffMarker>, stage: DiffStage) -> Color {
     }
 }
 
-/// Tint a real line's row with its diff-marker background: set the tint behind every span that
+/// Paint a real line's row: `tint` where the line carries one (a diff marker, a conflict side, the
+/// cursorline), the editor's own shade where it doesn't. Either goes behind every span that
 /// doesn't already carry its own background (so syntax fg shows through, but selection/search
-/// highlights keep their backgrounds), then fill out to `width` so the tint spans the row.
-/// No-op when `tint` is `None`.
+/// highlights keep theirs), then fills out to `width` so it spans the row.
+///
+/// The untinted case is not a no-op: the pane behind these rows is the app's *ground*, so a row
+/// that painted nothing would come out as ground rather than as the editor well it is. Tints layer
+/// over the well exactly as they always did — they simply replace it rather than covering it.
 ///
 /// Pads **to** `width`, not **by** it. Overshooting used to be free — the `Paragraph` clipped it
 /// at the viewport's edge — but a row inside a box is closed by a right rail that has to land on a
 /// column, and a fill that runs past it pushes the rail off the screen.
-fn apply_line_tint(spans: &mut Vec<Span<'static>>, tint: Option<Color>, width: u16) {
-    let Some(bg) = tint else { return };
+fn paint_row_bg(spans: &mut Vec<Span<'static>>, tint: Option<Color>, width: u16) {
+    let bg = tint.unwrap_or_else(|| c(th().bg));
     for span in spans.iter_mut() {
         if span.style.bg.is_none() {
             span.style = span.style.bg(bg);
@@ -6843,7 +6874,11 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 
         // Left: the Git change counts sit next to the file label (they're about the file's VCS
         // state). Diagnostics moved to the right segment, by the position indicator.
-        let git_spans = git_status_spans(state);
+        let mut git_spans = git_status_spans(state);
+        // The shell's activity indicator sits beside git's, in the same slot and the same shade:
+        // both answer "something is happening that you are waiting on", and a second place for
+        // that would be a second place to look.
+        git_spans.extend(shell_status_spans(state));
 
         // Right segment, left→right: search/grep counters, diagnostic counts, the position /
         // selection indicator, then the LSP glyph pinned to the far edge. A double space precedes
@@ -7330,6 +7365,19 @@ fn buffer_status_color(kind: BufferStatusKind) -> Color {
 /// one unstaged + two staged additions, `+3` three unstaged, `+(3)` three staged). Empty classes
 /// are skipped; the whole cluster is empty for files outside a repo. Reads `git_status`
 /// (server-computed).
+/// The running-shell indicator: the focused shell's command, or a count of the shells running
+/// elsewhere. Empty when nothing is running.
+///
+/// Rendered from the core's one composition of the text, so the terminal, the GUI and the browser
+/// cannot drift into three phrasings of it.
+fn shell_status_spans(state: &AppState) -> Vec<Span<'static>> {
+    let Some(label) = state.shell_indicator.as_ref() else {
+        return Vec::new();
+    };
+    let style = Style::default().bg(c(th().bg_panel)).fg(c(th().accent_alt));
+    vec![Span::styled(format!("⟳ {label}"), style)]
+}
+
 fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
     let bg = Style::default().bg(c(th().bg_panel));
     let meta = bg.fg(c(th().accent_alt)); // branch / base: the secondary accent, distinct from the body-text path
@@ -7941,7 +7989,7 @@ pub fn screen_to_logical(
                             screen_col.saturating_sub(at.inset.left as u16),
                         ),
                     },
-                ))
+                ));
             }
         }
     }
@@ -8288,6 +8336,7 @@ mod tests {
             root_labels: vec![String::new()],
             tether: None,
             git_operation: None,
+            shell_indicator: None,
             viewport_cols: TEST_COLS as u32,
             viewport_rows: TEST_ROWS as u32,
             should_quit: false,
@@ -9574,6 +9623,24 @@ mod tests {
         spans.iter().map(|s| s.content.width()).sum()
     }
 
+    /// The running-shell indicator takes the same slot and shade the git operation does: one
+    /// place to look for "something you are waiting on".
+    #[test]
+    fn the_shell_indicator_sits_in_the_git_slot() {
+        let mut state = crate::app::test_state(crate::app::test_editor_state());
+        assert!(
+            shell_status_spans(&state).is_empty(),
+            "nothing running, nothing drawn"
+        );
+        state.shell_indicator = Some("cargo build".into());
+        let spans = shell_status_spans(&state);
+        assert_eq!(spans_text(&spans), "⟳ cargo build");
+        assert_eq!(spans[0].style.fg, Some(c(th().accent_alt)));
+
+        state.shell_indicator = Some("2 running".into());
+        assert_eq!(spans_text(&shell_status_spans(&state)), "⟳ 2 running");
+    }
+
     #[test]
     fn editor_status_spans_no_status_pads_to_right_edge() {
         let status = crate::app::StatusMessage::default();
@@ -10538,6 +10605,7 @@ mod painter_tests {
             root: Element::Column {
                 edges: aether_protocol::ui::Edges::NONE,
                 band: aether_protocol::ui::Band::None,
+                title: Vec::new(),
                 children: vec![
                     chrome("a.rs"),
                     chrome("@@ fn f17"),
@@ -10547,6 +10615,7 @@ mod painter_tests {
                         rows: lines.len() as u32,
                         first_row: ElementRow::ZERO,
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        role: aether_protocol::ui::ElementRole::Field,
                         first_buffer_line: 16,
                         lines: lines.clone(),
                     },
@@ -10601,6 +10670,7 @@ mod painter_tests {
             root: Element::Column {
                 edges: aether_protocol::ui::Edges::NONE,
                 band: aether_protocol::ui::Band::None,
+                title: Vec::new(),
                 children: vec![
                     chrome("alpha.rs"),
                     Element::Editor {
@@ -10609,6 +10679,7 @@ mod painter_tests {
                         rows: 1,
                         first_row: ElementRow::ZERO,
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        role: aether_protocol::ui::ElementRole::Field,
                         first_buffer_line: 10,
                         lines: vec![line(10, "from alpha")],
                     },
@@ -10619,6 +10690,7 @@ mod painter_tests {
                         rows: 1,
                         first_row: ElementRow::ZERO,
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        role: aether_protocol::ui::ElementRole::Field,
                         first_buffer_line: 10,
                         lines: vec![line(10, "from beta")],
                     },
@@ -10653,6 +10725,7 @@ mod painter_tests {
             root: Element::Column {
                 edges: aether_protocol::ui::Edges::NONE,
                 band: aether_protocol::ui::Band::None,
+                title: Vec::new(),
                 children: vec![
                     chrome("alpha.rs"),
                     Element::Editor {
@@ -10661,6 +10734,7 @@ mod painter_tests {
                         rows: 2,
                         first_row: ElementRow::ZERO,
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        role: aether_protocol::ui::ElementRole::Field,
                         first_buffer_line: 10,
                         lines: vec![line(10, "alpha ten"), line(11, "alpha eleven")],
                     },
@@ -10671,6 +10745,7 @@ mod painter_tests {
                         rows: 2,
                         first_row: ElementRow::ZERO,
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        role: aether_protocol::ui::ElementRole::Field,
                         first_buffer_line: 10,
                         lines: vec![line(10, "beta ten"), line(11, "beta eleven")],
                     },
@@ -10727,6 +10802,7 @@ mod painter_tests {
             root: Element::Column {
                 edges: aether_protocol::ui::Edges::NONE,
                 band: aether_protocol::ui::Band::None,
+                title: Vec::new(),
                 children: vec![
                     chrome("a.rs"),
                     chrome("@@ a"),
@@ -10736,6 +10812,7 @@ mod painter_tests {
                         rows: 4,
                         first_row: ElementRow::ZERO,
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        role: aether_protocol::ui::ElementRole::Field,
                         first_buffer_line: 16,
                         lines: a,
                     },
@@ -10747,6 +10824,7 @@ mod painter_tests {
                         rows: 3,
                         first_row: ElementRow::ZERO,
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        role: aether_protocol::ui::ElementRole::Field,
                         first_buffer_line: 0,
                         lines: b,
                     },
@@ -11006,6 +11084,7 @@ mod painter_tests {
                     rows: lines.len() as u32,
                     first_row: ElementRow::ZERO,
                     laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
                     first_buffer_line: 16,
                     lines,
                 },
@@ -11150,6 +11229,244 @@ mod painter_tests {
     ///
     /// Painting the slack after a row's text in the band drew a chrome stripe across every editor
     /// row from the end of its text to the box's edge, and a tint that filled to the *viewport's*
+    /// A shell view as the server builds one: a header over each run's output, and the input
+    /// element last.
+    fn shell_editor_state() -> crate::app::EditorState {
+        let chrome = |text: &str| {
+            UiElement::chrome(vec![UiElement::row(vec![UiElement::text(
+                text,
+                Vec::new(),
+            )])])
+        };
+        let editor =
+            |element: u32, buffer: u64, lines: Vec<LogicalLineRender>, role| Element::Editor {
+                element,
+                buffer,
+                rows: lines.len() as u32,
+                first_row: ElementRow::ZERO,
+                laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                role,
+                first_buffer_line: 0,
+                lines,
+            };
+        let boxed = |title: &str, children: Vec<Element>| {
+            use aether_protocol::ui::{Band, Edges, Sides};
+            UiElement::titled(
+                Edges {
+                    border: Sides::all(1),
+                    padding: Sides::ZERO,
+                    collapse: false,
+                },
+                Band::Chrome,
+                vec![UiElement::text(title, Vec::new())],
+                children,
+            )
+        };
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![
+                boxed(
+                    "~/proj  ok",
+                    vec![
+                        chrome("echo one"),
+                        editor(
+                            0,
+                            7,
+                            vec![line(0, "one")],
+                            aether_protocol::ui::ElementRole::Field,
+                        ),
+                    ],
+                ),
+                chrome(""),
+                boxed(
+                    "~/proj  ok",
+                    vec![
+                        chrome("echo two"),
+                        editor(
+                            1,
+                            7,
+                            vec![line(1, "two")],
+                            aether_protocol::ui::ElementRole::Field,
+                        ),
+                    ],
+                ),
+                chrome(""),
+                boxed(
+                    "~/proj",
+                    vec![editor(
+                        2,
+                        8,
+                        vec![line(0, "cargo build")],
+                        aether_protocol::ui::ElementRole::Input,
+                    )],
+                ),
+            ],
+        };
+        editor_over(root, 0)
+    }
+
+    /// The shape a shell paints: each run in a named box of its own — the directory and the
+    /// outcome on the box's top border, the command on the row under it — and the input last, in a
+    /// box of its own. The row order the whole view depends on.
+    #[test]
+    fn a_shell_paints_its_runs_then_its_input() {
+        let mut ed = shell_editor_state();
+        ed.focused_element = 2;
+        let state = crate::app::test_state(ed);
+        let rows = painted(&state);
+        // Matched on the whole row inside its box's rails: "one" is a substring of "echo one",
+        // and a `contains` here would find the command row and call it the output.
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|r| r.trim().trim_matches(|c: char| c == '│' || c == ' ') == needle)
+                .unwrap_or_else(|| panic!("no row reading {needle:?}:\n{}", rows.join("\n")))
+        };
+        let first_command = row_of("echo one");
+        let first_out = row_of("one");
+        let second_command = row_of("echo two");
+        let second_out = row_of("two");
+        let input = row_of("cargo build");
+        assert!(
+            first_command < first_out
+                && first_out < second_command
+                && second_command < second_out
+                && second_out < input,
+            "runs in order, then the input:\n{}",
+            rows.join("\n")
+        );
+        // The name is on the border row itself and costs the box no row: a run's box opens one
+        // row above its command, and that row carries the name between two stretches of rule.
+        let opening = &rows[first_command - 1];
+        assert!(
+            opening.starts_with("┌─ ~/proj  ok ─") && opening.trim_end().ends_with('┐'),
+            "the box's top border is named: {opening:?}"
+        );
+        // Between one run's last output row and the next run's command: the first box's own
+        // closing border, a blank row of ground, then the second's named opening one. Two boxes,
+        // apart, not one ruled list.
+        assert_eq!(
+            second_command - first_out,
+            4,
+            "close, gap, open, command:\n{}",
+            rows.join("\n")
+        );
+        assert_eq!(
+            rows[first_out + 2].trim(),
+            "",
+            "the row between the boxes is blank:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows[first_out + 1].starts_with('└'),
+            "the first box closes itself: {:?}",
+            rows[first_out + 1]
+        );
+        assert!(
+            rows[first_out + 3].starts_with("┌─ ~/proj"),
+            "and the second opens its own: {:?}",
+            rows[first_out + 3]
+        );
+        // The input's box is named too, and holds nothing above the line you type.
+        assert!(
+            rows[input - 1].starts_with("┌─ ~/proj ─"),
+            "the input's box says where you are: {:?}",
+            rows[input - 1]
+        );
+        assert!(
+            rows[input + 1].starts_with('└'),
+            "and closes under it: {:?}",
+            rows[input + 1]
+        );
+    }
+
+    /// A run that said nothing is a box with a title and its command and no output row: the
+    /// command row sits directly on the closing edge.
+    #[test]
+    fn a_silent_run_paints_as_a_box_with_no_output_row() {
+        use aether_protocol::ui::{Band, Edges, Sides};
+        let silent = UiElement::titled(
+            Edges {
+                border: Sides::all(1),
+                padding: Sides::ZERO,
+                collapse: false,
+            },
+            Band::Chrome,
+            vec![UiElement::text("~/proj  ok", Vec::new())],
+            vec![
+                UiElement::chrome(vec![UiElement::row(vec![UiElement::text(
+                    "true",
+                    Vec::new(),
+                )])]),
+                Element::Editor {
+                    element: 0,
+                    buffer: 7,
+                    rows: 0,
+                    first_row: ElementRow::ZERO,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
+                    first_buffer_line: 0,
+                    lines: Vec::new(),
+                },
+            ],
+        );
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![silent],
+        };
+        let state = crate::app::test_state(editor_over(root, 0));
+        let rows = painted(&state);
+        let command = rows
+            .iter()
+            .position(|r| r.trim().trim_matches(|c: char| c == '│' || c == ' ') == "true")
+            .unwrap_or_else(|| panic!("no command row:\n{}", rows.join("\n")));
+        assert!(
+            rows[command - 1].contains("~/proj  ok"),
+            "the title is on the edge above:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows[command + 1].trim_start().starts_with('└'),
+            "and the box closes right under the command:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// A shell with no runs yet is a real state: the view is the one line you type into, and
+    /// nothing else is drawn above it.
+    #[test]
+    fn a_new_shell_paints_only_its_input() {
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![Element::Editor {
+                element: 0,
+                buffer: 8,
+                rows: 1,
+                first_row: ElementRow::ZERO,
+                laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Input,
+                first_buffer_line: 0,
+                lines: vec![line(0, "ls -la")],
+            }],
+        };
+        let state = crate::app::test_state(editor_over(root, 0));
+        let rows = painted(&state);
+        let content: Vec<&String> = rows.iter().filter(|r| !r.trim().is_empty()).collect();
+        assert_eq!(
+            content.len(),
+            1,
+            "one row, and it is the input:\n{}",
+            rows.join("\n")
+        );
+        assert_eq!(content[0].trim(), "ls -la");
+        assert_eq!(rows[0].trim(), "ls -la", "and it is the first row");
+    }
+
     /// width instead of the box's ran clean over the right rail and off the screen.
     #[test]
     fn a_boxs_band_stops_at_its_own_cells() {
@@ -11158,7 +11475,7 @@ mod painter_tests {
             added(17, "fn f18() {}"),
         ]));
         let rows = painted_cells(&state);
-        let band = c(th().patch_chrome_bg);
+        let band = c(th().bg_app);
         let last = TEST_PAINT_COLS as usize - 1;
 
         let row_of = |needle: &str| -> &Vec<(String, Color)> {
@@ -11202,6 +11519,64 @@ mod painter_tests {
             tinted[last - 2].1,
             row_of("fn f17() {}")[last - 2].1,
             "…and it is a tint, not the plain background the untinted row has"
+        );
+    }
+
+    /// The editor's rows are the well; everything else is the app's ground.
+    ///
+    /// Read as cell *styles* rather than glyphs — the shade each row carries is the whole of this
+    /// change, and no layout test can see it. A row of buffer text is the editor shade across its
+    /// whole span, gutter included, because the gutter belongs to the rows the cursor can reach.
+    /// A chrome row and the rows past the end of the view are the ground: unreachable reads as
+    /// "not in a well" rather than as text the cursor mysteriously skips.
+    #[test]
+    fn buffer_rows_are_the_well_and_everything_else_is_the_ground() {
+        let state = crate::app::test_state(patch_editor_state());
+        let rows = painted_cells(&state);
+        let well = c(th().bg);
+        let ground = c(th().bg_app);
+        assert_ne!(well, ground, "the two shades are the point");
+
+        let text_of = |row: &Vec<(String, Color)>| -> String {
+            row.iter().map(|(s, _)| s.as_str()).collect()
+        };
+        let row_of = |needle: &str| -> usize {
+            rows.iter()
+                .position(|r| text_of(r).contains(needle))
+                .unwrap_or_else(|| panic!("`{needle}` should be on screen"))
+        };
+        let shades = |row: &Vec<(String, Color)>| -> Vec<Color> {
+            let mut seen: Vec<Color> = row.iter().map(|(_, bg)| *bg).collect();
+            seen.dedup();
+            seen
+        };
+
+        // A line of buffer text: one shade the whole way across, and it is the well.
+        let text = &rows[row_of("fn f17() {}")];
+        assert_eq!(
+            shades(text),
+            vec![well],
+            "an editor row is the well edge to edge, its gutter cell included: {:?}",
+            text_of(text)
+        );
+
+        // The file heading above it, and the hunk heading: the ground showing between the wells.
+        for needle in ["a.rs", "@@ fn f17"] {
+            let chrome = &rows[row_of(needle)];
+            assert_eq!(
+                shades(chrome),
+                vec![ground],
+                "a chrome row is the ground, gutter included: {:?}",
+                text_of(chrome)
+            );
+        }
+
+        // And past the last loaded row there is no editor left to paint — only ground.
+        let past = rows.last().expect("a row at the bottom of the terminal");
+        assert_eq!(
+            shades(past),
+            vec![ground],
+            "a row past the end of the view is ground, not more editor"
         );
     }
 

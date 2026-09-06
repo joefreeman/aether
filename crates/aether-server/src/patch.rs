@@ -774,11 +774,14 @@ pub fn layout_over_files(
             extent: crate::state::ElementExtent::OwnDocument {
                 lines: span.start_line..span.end_line,
             },
+            chrome_before: Default::default(),
             chrome_above: chrome_above.clone(),
             decorations: None,
             edges,
             box_group,
+            title: Default::default(),
             band,
+            role: aether_protocol::ui::ElementRole::Field,
         };
 
         // Which file and hunk this element's first line belongs to — read from the index that
@@ -873,6 +876,7 @@ pub fn layout_over_files(
         // guess.
         let first = region.new_start.saturating_sub(1);
         layout.push(crate::state::ElementLayout {
+            chrome_before: Default::default(),
             extent: crate::state::ElementExtent::Bound {
                 buffer: buffer_id,
                 lines: first..first + region.new_lines,
@@ -881,7 +885,9 @@ pub fn layout_over_files(
             decorations: Some(std::sync::Arc::new(decorations)),
             edges,
             box_group,
+            title: Default::default(),
             band,
+            role: aether_protocol::ui::ElementRole::Field,
         });
     }
     close_last_box(&mut layout);

@@ -86,7 +86,17 @@ pub struct Theme {
     pub mode: ThemeMode,
 
     // ---- Backgrounds ----
-    /// Editor / app background.
+    /// The application's ground: everything that is not a well of editable text — the editor
+    /// pane behind and between its elements, the rows past the end of the content, the gaps an
+    /// unloaded element leaves, a chrome row's band, the cells a box's border and padding
+    /// occupy, and the whole canvas when no view is open.
+    ///
+    /// It is the shade [`Self::bg`] sits *in*, which is what makes an unreachable row legible:
+    /// chrome is simply the ground showing through between wells, rather than text the cursor
+    /// mysteriously skips.
+    pub bg_app: Rgb,
+    /// The editor well: rows of buffer text, gutter included — and a client-laid-out prose
+    /// element (the Markdown reader), which is an editor element too.
     pub bg: Rgb,
     /// Status line, panels, picker surfaces.
     pub bg_panel: Rgb,
@@ -105,17 +115,9 @@ pub struct Theme {
     /// The paired-bracket highlight under the cursor. Shares dark's shade with
     /// [`Self::syn_macro`]; chrome, not syntax.
     pub match_bracket: Rgb,
-    /// Current-line tint — between `bg` and `bg_panel` (Nord has no shade in between).
+    /// Current-line tint — between [`Self::bg`] and [`Self::bg_app`], so the line you are on
+    /// lifts off the well without reading as the ground around it.
     pub cursor_line_bg: Rgb,
-    /// Backdrop for a generated patch's chrome rows — the file rules, path headers and section
-    /// headings the cursor cannot reach.
-    ///
-    /// Its job is to make *unreachable* legible: without it, chrome looks like ordinary text that
-    /// the cursor mysteriously skips. Deliberately a touch further from `bg` than
-    /// [`Self::cursor_line_bg`], so a chrome row reads as a band rather than as the line you are
-    /// on, and it runs edge to edge — gutter included — because the gutter belongs to the rows the
-    /// cursor *can* reach.
-    pub patch_chrome_bg: Rgb,
     /// Outline for floating overlays' frames and separators.
     pub overlay_border: Rgb,
     /// Hairline borders on chrome panels (inputs, dialogs, toasts, table frames) — a step
@@ -254,6 +256,7 @@ impl Theme {
     /// pixel-identical.
     pub const DARK: Theme = Theme {
         mode: ThemeMode::Dark,
+        bg_app: rgb(0x373e4d), // ~60% from NORD0 toward NORD1 — the ground the wells sit in
         bg: NORD0,
         bg_panel: NORD1,
         bg_selection: NORD2,
@@ -262,8 +265,7 @@ impl Theme {
         sneak_prefix_bg: NORD3_BRIGHT,
         match_highlight: NORD13,
         match_bracket: NORD12,
-        cursor_line_bg: rgb(0x343a48),  // ~40% from NORD0 toward NORD1
-        patch_chrome_bg: rgb(0x373e4d), // ~60% from NORD0 toward NORD1 — a band, not a cursorline
+        cursor_line_bg: rgb(0x343a48), // ~40% from NORD0 toward NORD1
         overlay_border: NORD3_BRIGHTER,
         border_subtle: NORD3,
         fg: NORD4,
@@ -346,6 +348,7 @@ impl Theme {
     /// dimmer than unstaged; stripe between bg and panel) keep their dark-theme ordering.
     pub const LIGHT: Theme = Theme {
         mode: ThemeMode::Light,
+        bg_app: rgb(0xe1e6ee), // ~60% from NORD6 toward NORD5, as the dark pair is
         bg: NORD6,
         bg_panel: NORD5,
         bg_selection: NORD4,
@@ -355,7 +358,6 @@ impl Theme {
         match_highlight: rgb(0x9a7522), // = warning today; free to diverge
         match_bracket: rgb(0xab5f38),   // = syn_macro today; free to diverge
         cursor_line_bg: rgb(0xe4e9f0),  // ~40% from NORD6 toward NORD5
-        patch_chrome_bg: rgb(0xe1e6ee), // ~60% toward NORD5, as the dark pair is
         overlay_border: rgb(0xaab4c4),
         border_subtle: rgb(0xd8dfe8), // = fill_dim today; borders can darken independently
         fg: NORD0,
@@ -643,6 +645,36 @@ mod tests {
         assert_ne!(l.warning, NORD13, "aurora yellow is unreadable on light");
         // The staged-dimmer-than-unstaged ladder holds in both directions.
         assert_ne!(l.git_added, l.git_staged_added);
+    }
+
+    /// The ground and the well are two roles, and the cursorline sits between them.
+    ///
+    /// `bg` is the editor's rows of text; `bg_app` is everything around them — the pane behind
+    /// and past them, chrome rows, a box's frame. The line you are on has to lift off the well
+    /// without reading as the ground, which is only true while it is the nearer of the two.
+    #[test]
+    fn the_ground_is_a_further_step_from_the_well_than_the_cursorline() {
+        for t in [Theme::DARK, Theme::LIGHT] {
+            assert_ne!(
+                t.bg, t.bg_app,
+                "{:?}: the well and the ground differ",
+                t.mode
+            );
+            // Nord's Polar Night and Snow Storm both run along lightness, so one channel orders
+            // them; taking the distance from the well makes the comparison mode-blind.
+            let step = |c: Rgb| (i16::from(c.r) - i16::from(t.bg.r)).abs();
+            assert!(
+                step(t.cursor_line_bg) < step(t.bg_app),
+                "{:?}: the cursorline ({}) must sit nearer the well ({}) than the ground ({})",
+                t.mode,
+                t.cursor_line_bg.css(),
+                t.bg.css(),
+                t.bg_app.css(),
+            );
+        }
+        // The shades the ground took over from the chrome band it replaced.
+        assert_eq!(Theme::DARK.bg_app.css(), "#373e4d");
+        assert_eq!(Theme::LIGHT.bg_app.css(), "#e1e6ee");
     }
 
     /// A commit row's decorations exist to be told apart at a glance, so the four ref roles must

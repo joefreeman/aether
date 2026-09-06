@@ -18,6 +18,7 @@ use super::tests::connecting_bootstrap;
 use super::*;
 use aether_protocol::coords::ElementRow;
 use aether_protocol::picker::{PickerItem, PickerUpdateParams};
+use aether_protocol::settings::ThemeMode;
 use aether_protocol::ui::{Element as ViewElement, LayoutOwner};
 use aether_protocol::viewport::{
     DiffMarker, DiffStage, LogicalLineRender, Segment, Window, WrappedRow,
@@ -252,6 +253,7 @@ fn editor(element: u32, buffer: u64, first: u32, lines: Vec<LogicalLineRender>) 
         rows: lines.len() as u32,
         first_row: ElementRow::ZERO,
         laid_out_by: LayoutOwner::Server,
+        role: aether_protocol::ui::ElementRole::Field,
         first_buffer_line: first,
         lines,
     }
@@ -286,6 +288,65 @@ fn app_with(session: Session) -> App {
 
 fn app_showing(window: Window) -> App {
     app_with(session_showing(window))
+}
+
+/// A shell's input element: an editor like any other, marked so the client can find it.
+fn input(element: u32, buffer: u64, lines: Vec<LogicalLineRender>) -> ViewElement {
+    ViewElement::Editor {
+        element,
+        buffer,
+        rows: lines.len() as u32,
+        first_row: ElementRow::ZERO,
+        laid_out_by: LayoutOwner::Server,
+        role: aether_protocol::ui::ElementRole::Input,
+        first_buffer_line: 0,
+        lines,
+    }
+}
+
+/// A shell as the server composes one: each run in a box of its own, named on its top border for
+/// where it ran and how it went, holding the command over its output; and the input last, in a box
+/// of its own named only for the directory. Every box closes itself.
+fn shell_view() -> Window {
+    use aether_protocol::ui::{Band, Edges, Sides};
+    let boxed = |title: &str, children: Vec<ViewElement>| {
+        ViewElement::titled(
+            Edges {
+                border: Sides::all(1),
+                padding: Sides::ZERO,
+                collapse: false,
+            },
+            Band::Chrome,
+            vec![ViewElement::text(title, Vec::new())],
+            children,
+        )
+    };
+    window_of(vec![
+        boxed(
+            "~/proj  ok",
+            vec![chrome("echo one"), editor(0, 7, 0, vec![line(0, "one")])],
+        ),
+        chrome(""),
+        boxed(
+            "~/proj  ok",
+            vec![chrome("echo two"), editor(1, 7, 1, vec![line(1, "two")])],
+        ),
+        chrome(""),
+        boxed("~/proj", vec![input(2, 8, vec![line(0, "cargo build")])]),
+    ])
+}
+
+/// A plain file: one editor element and no chrome at all, windowing lines partway down the file
+/// so nothing lands on the cursor's line 0 and every row paints the plain editor background.
+fn plain_file() -> Window {
+    window_of(vec![editor(
+        0,
+        7,
+        10,
+        (10..14)
+            .map(|n| line(n, &format!("fn f{n}() {{}}")))
+            .collect(),
+    )])
 }
 
 /// Two files whose hunks start at the same line number — what a patch of two hunks looks like.
@@ -482,6 +543,116 @@ fn a_boxs_fills_land_in_the_boxs_own_columns() {
         caret[0],
         px(row.bounds.x)
     );
+}
+
+/// The editor's rows are the well and the app's ground is around them — in both modes.
+///
+/// Two probes and no more: a pixel inside a row of buffer text is the editor shade, and a pixel
+/// in the empty pane below the last row is the ground. Everything else here is row layout, which
+/// `Operation::text` can see; a background is a `fill`, so only the frame's own pixels can say
+/// which shade landed where. Light runs the same probes because the two shades swap ends there,
+/// and it is the only headless test that paints the light table at all.
+#[test]
+fn editor_rows_are_the_well_and_the_pane_around_them_is_the_ground() {
+    for (mode, name) in [
+        (ThemeMode::Dark, "plain-file"),
+        (ThemeMode::Light, "plain-file-light"),
+    ] {
+        let mut app = app_showing(plain_file());
+        app.session.theme = mode;
+        let p = crate::theme::palette(mode);
+        let rgb = |c: iced::Color| {
+            let b = c.into_rgba8();
+            [b[0], b[1], b[2]]
+        };
+        assert_ne!(
+            rgb(p.bg),
+            rgb(p.bg_app),
+            "{mode:?}: the two shades are the point"
+        );
+
+        let mut sim = simulate(&app);
+        let texts = seen(&mut sim);
+        let row = texts
+            .iter()
+            .find(|s| s.visible && s.text == "fn f11() {}")
+            .expect("the row is on the frame")
+            .clone();
+        // The status bar's cursor readout — the floor of the editor pane, so the ground probe
+        // lands between the last row and it rather than on either.
+        let status = texts
+            .iter()
+            .find(|s| s.visible && s.text.contains("1:1"))
+            .expect("the status bar is on the frame")
+            .clone();
+        let frame = pixels(&mut sim, &app);
+        let scale = frame.0 as f32 / WIDTH;
+        let y_of = |y: f32| (y * scale) as usize;
+
+        let in_row = y_of(row.bounds.y + row.bounds.height / 2.0);
+        assert!(
+            !columns_painted(&frame, in_row, rgb(p.bg)).is_empty(),
+            "{mode:?}: a row of buffer text sits in the editor well"
+        );
+        assert!(
+            columns_painted(&frame, in_row, rgb(p.bg_app)).is_empty(),
+            "{mode:?}: and nothing on that row is ground"
+        );
+
+        let below = y_of((row.bounds.y + row.bounds.height + status.bounds.y) / 2.0);
+        assert!(
+            !columns_painted(&frame, below, rgb(p.bg_app)).is_empty(),
+            "{mode:?}: below the last row the app's ground shows"
+        );
+        assert!(
+            columns_painted(&frame, below, rgb(p.bg)).is_empty(),
+            "{mode:?}: and no editor shade reaches past the rows"
+        );
+
+        snapshot(&mut sim, &app, name);
+    }
+}
+
+/// The reading view is a well too, edge to edge.
+///
+/// Prose is an editor element, so the whole reading pane is the editor's shade: every row in it is
+/// document, with no chrome rows for the ground to show through between. The pane used to take
+/// that shade from the base iced theme by accident — nothing painted a background at all — which
+/// stopped being the editor's shade the moment the app's ground became a role of its own.
+#[test]
+fn the_reading_view_is_one_well_from_edge_to_edge() {
+    let mut read = aether_client::session::ReadView::loading(7);
+    read.adopt(
+        1,
+        "# Reading\n\nProse sits in the editor's own shade.\n".into(),
+    );
+    let mut session = session_showing(plain_file());
+    session.view.read = Some(read);
+    let app = app_with(session);
+
+    let p = crate::theme::palette(app.session.theme);
+    let rgb = |c: iced::Color| {
+        let b = c.into_rgba8();
+        [b[0], b[1], b[2]]
+    };
+    let mut sim = simulate(&app);
+    let status = seen(&mut sim)
+        .into_iter()
+        .find(|s| s.visible && s.text.contains("1:1"))
+        .expect("the status bar is on the frame");
+    let frame = pixels(&mut sim, &app);
+    let scale = frame.0 as f32 / WIDTH;
+    // Halfway down the empty part of the pane, below the document and above the status bar.
+    let y = ((status.bounds.y / 2.0) * scale) as usize;
+    assert!(
+        !columns_painted(&frame, y, rgb(p.bg)).is_empty(),
+        "the reading pane is the editor's well"
+    );
+    assert!(
+        columns_painted(&frame, y, rgb(p.bg_app)).is_empty(),
+        "…and no ground shows inside it"
+    );
+    snapshot(&mut sim, &app, "reading-view");
 }
 
 /// Where each text begins horizontally, paired with the text — the GUI's half of the column
@@ -689,4 +860,68 @@ fn the_files_picker_opens_over_the_editor() {
         rows.join("\n")
     );
     snapshot(&mut sim, &app, "files-picker");
+}
+
+/// A shell's rows: each run in a box named on its top border, and the input at the bottom in one
+/// of its own. The name is on the border row rather than in a row of its own, so it lands one row
+/// above the command it introduces and the box grows no taller for having a name.
+#[test]
+fn a_shell_paints_its_runs_then_its_input() {
+    let app = app_showing(shell_view());
+    let mut sim = simulate(&app);
+    let rows = rows(&mut sim);
+    // Matched whole: "one" is a substring of "echo one", and `row_of`'s `contains` would find
+    // the command row and call it the output.
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|r| r.trim() == needle)
+            .unwrap_or_else(|| panic!("no row reading {needle:?}:\n{}", rows.join("\n")))
+    };
+    let first_title = row_of("~/proj  ok");
+    let first_command = row_of("echo one");
+    let first_out = row_of("one");
+    let second_command = row_of("echo two");
+    let second_out = row_of("two");
+    let input = row_of("cargo build");
+    assert!(
+        first_title + 1 == first_command
+            && first_command < first_out
+            && first_out < second_command
+            && second_command < second_out
+            && second_out < input,
+        "each run named on the border above its command, then the input:\n{}",
+        rows.join("\n")
+    );
+    // The input's box is named too, on the row directly above the line you type — nothing else
+    // stands between them.
+    assert_eq!(
+        rows[input - 1].trim(),
+        "~/proj",
+        "the input's box says where you are:\n{}",
+        rows.join("\n")
+    );
+    snapshot(&mut sim, &app, "shell-runs");
+}
+
+/// The running-shell indicator reaches the status bar, in the git operation's slot.
+#[test]
+fn a_running_shell_shows_in_the_status_bar() {
+    let mut session = session_showing(shell_view());
+    session.shell_runs.insert(
+        session.view.view_id,
+        aether_protocol::shell::RunState {
+            run: 1,
+            command: "cargo build".into(),
+            status: aether_protocol::shell::RunStatus::Running,
+        },
+    );
+    let app = app_with(session);
+    let mut sim = simulate(&app);
+    let rows = rows(&mut sim);
+    assert!(
+        rows.iter().any(|r| r.contains("\u{27f3} cargo build")),
+        "the indicator names the command you are waiting on:\n{}",
+        rows.join("\n")
+    );
+    snapshot(&mut sim, &app, "shell-indicator");
 }

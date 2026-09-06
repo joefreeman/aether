@@ -46,9 +46,10 @@ use aether_protocol::path::PathDelete;
 use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerSetGroup, PickerView};
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
+use aether_protocol::shell::{ShellCancel, ShellOpen, ShellRun};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::syntax::SyntaxHighlightSnippet;
-use aether_protocol::view::{ViewClose, ViewOpen, ViewSetTransient};
+use aether_protocol::view::{ViewClose, ViewFollowLine, ViewOpen, ViewSetTransient};
 use aether_protocol::viewport::{
     ViewSave, ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportSetWrap,
     ViewportSubscribe, ViewportWindow, ViewportWindowAtCursor,
@@ -590,6 +591,10 @@ async fn dispatch(
         GitWorktreeRemove::NAME => run!(GitWorktreeRemove, handlers::git_worktree_remove),
         GitPull::NAME => run!(GitPull, handlers::git_pull),
         GitCancel::NAME => run!(GitCancel, handlers::git_cancel),
+        ViewFollowLine::NAME => run!(ViewFollowLine, handlers::view_follow_line),
+        ShellOpen::NAME => run!(ShellOpen, handlers::shell_open),
+        ShellRun::NAME => run!(ShellRun, handlers::shell_run),
+        ShellCancel::NAME => run!(ShellCancel, handlers::shell_cancel),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),
         LspGotoDefinition::NAME => run!(LspGotoDefinition, handlers::lsp_goto_definition),

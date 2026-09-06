@@ -909,6 +909,90 @@ fn a_container_carries_its_box_only_when_it_has_one() {
     );
 }
 
+/// A box's title: off the wire entirely when it has none, and inline nodes when it has one.
+///
+/// The title is drawn *on* the top border row rather than in a row of its own, which is why it is
+/// a field of the container and not a child of it — a child would cost the box a row, and every
+/// shell's row arithmetic would have to agree about which one.
+#[test]
+fn a_box_carries_a_title_only_when_it_has_one() {
+    use aether_protocol::ui::{Band, Edges, Element, Sides};
+    use aether_protocol::viewport::Highlight;
+
+    let border = Edges {
+        border: Sides::all(1),
+        ..Edges::NONE
+    };
+
+    // An untitled box is byte-for-byte what it was before titles existed.
+    let plain = Element::framed(border, Band::Chrome, vec![Element::text("x", vec![])]);
+    let v = to_value(&plain).unwrap();
+    assert!(
+        v.get("title").is_none(),
+        "an untitled box spends no wire on saying so: {v}"
+    );
+    assert_eq!(from_value::<Element>(v).unwrap(), plain);
+
+    // A title: the same inline vocabulary a row holds, styled by the same highlight runs.
+    let titled = Element::titled(
+        border,
+        Band::Chrome,
+        vec![
+            Element::text(
+                "~/proj",
+                vec![Highlight {
+                    start: 0,
+                    end: 6,
+                    kind: "diff.meta".into(),
+                }],
+            ),
+            Element::space(2),
+            Element::text("ok", vec![]),
+        ],
+        vec![Element::text("echo one", vec![])],
+    );
+    let v = to_value(&titled).unwrap();
+    assert_eq!(v["node"], "column");
+    let title = v["title"].as_array().unwrap();
+    assert_eq!(title.len(), 3);
+    assert_eq!(title[0]["node"], "text");
+    assert_eq!(title[0]["text"], "~/proj");
+    assert_eq!(title[0]["highlights"][0]["kind"], "diff.meta");
+    assert_eq!(title[1]["node"], "space");
+    assert!(
+        v["children"].as_array().unwrap().len() == 1,
+        "the title is not a child: {v}"
+    );
+    assert_eq!(from_value::<Element>(v).unwrap(), titled);
+
+    // The browser hand-mirrors this; `tsc` cannot see a Rust rename.
+    let ts = include_str!("../../../web/src/protocol.ts");
+    assert!(
+        ts.contains("title?: ViewNode[]"),
+        "web/src/protocol.ts must declare the column node's `title`"
+    );
+}
+
+/// A title has to have a border row to sit on; a box with no top border would silently drop it.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "no top border")]
+fn a_title_needs_a_top_border_to_sit_on() {
+    use aether_protocol::ui::{Band, Edges, Element, Sides};
+    let _ = Element::titled(
+        Edges {
+            border: Sides {
+                left: 1,
+                ..Sides::ZERO
+            },
+            ..Edges::NONE
+        },
+        Band::Chrome,
+        vec![Element::text("~/proj", vec![])],
+        vec![],
+    );
+}
+
 #[test]
 fn buffer_status_snapshot_shape() {
     use aether_protocol::lsp::{DiagnosticCounts, LspServerStatus, LspStatus, SymbolCrumb};
@@ -6162,6 +6246,7 @@ fn sample_window() -> aether_protocol::viewport::Window {
             rows: 130,
             first_row: ElementRow(5),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line: 4,
             lines: vec![LogicalLineRender {
                 logical_line: 4,
@@ -6307,6 +6392,7 @@ fn an_editor_says_when_the_client_lays_it_out() {
         rows: 4,
         first_row: ElementRow(0),
         laid_out_by,
+        role: aether_protocol::ui::ElementRole::Field,
         first_buffer_line: 0,
         lines: Vec::new(),
     };
@@ -6531,6 +6617,7 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
             rows: 1,
             first_row: ElementRow(0),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line: 0,
             lines: Vec::new(),
         },
@@ -6585,6 +6672,7 @@ fn every_subscribe_carries_the_focus_it_resolved() {
             rows: 1,
             first_row: ElementRow(0),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line: 17,
             lines: vec![],
         },
@@ -6644,3 +6732,257 @@ fn window_at_cursor_names_no_coordinates() {
     let v = to_value(ViewportWindowAtCursorParams { viewport_id: 3 }).unwrap();
     assert_eq!(v, json!({ "viewport_id": 3 }));
 }
+
+// ---- shell views --------------------------------------------------------------------------------
+
+/// An editor element says what it is *for* only when that is not "content" — so every view that
+/// existed before shells serialises exactly as it did, and a shell's input is marked once.
+#[test]
+fn an_editor_says_when_it_is_a_shells_input() {
+    use aether_protocol::ui::{ElementRole, LayoutOwner};
+    let editor = |role| Element::Editor {
+        element: 2,
+        buffer: 9,
+        rows: 1,
+        first_row: ElementRow(0),
+        laid_out_by: LayoutOwner::Server,
+        role,
+        first_buffer_line: 0,
+        lines: Vec::new(),
+    };
+    let field = to_value(editor(ElementRole::Field)).unwrap();
+    assert!(
+        field.get("role").is_none(),
+        "content is the default and stays off the wire: {field}"
+    );
+    let input = to_value(editor(ElementRole::Input)).unwrap();
+    assert_eq!(input["role"], "input");
+    let back: Element = from_value(input).unwrap();
+    assert!(matches!(
+        back,
+        Element::Editor {
+            role: ElementRole::Input,
+            ..
+        }
+    ));
+
+    // Which is also how a client answers "is this a shell?", and which element takes its keys.
+    let shell = Element::column(vec![
+        Element::chrome(vec![Element::text("$ ls", Vec::new())]),
+        editor(ElementRole::Field),
+        editor(ElementRole::Input),
+    ]);
+    assert_eq!(shell.input_element(), Some(2));
+    assert_eq!(
+        Element::column(vec![editor(ElementRole::Field)]).input_element(),
+        None
+    );
+
+    // The browser hand-mirrors this; `tsc` cannot see a Rust rename.
+    let ts = include_str!("../../../web/src/protocol.ts");
+    assert!(
+        ts.contains("role?:"),
+        "web/src/protocol.ts must declare the editor node's `role`"
+    );
+    assert!(
+        ts.contains("\"field\" | \"input\""),
+        "…with both of the values it can take"
+    );
+}
+
+/// `shell/open` asks one question and answers with an open plus the element to type into.
+#[test]
+fn shell_open_shape() {
+    use aether_protocol::shell::{ShellOpen, ShellOpenParams, ShellOpenResult};
+    assert_eq!(ShellOpen::NAME, "shell/open");
+    // The ordinary press sends nothing: "a shell you can type into" is the default.
+    let v = to_value(ShellOpenParams { new: false }).unwrap();
+    assert_eq!(v, json!({ "new": false }));
+    assert!(!from_value::<ShellOpenParams>(json!({})).unwrap().new);
+    assert!(
+        from_value::<ShellOpenParams>(json!({"new": true}))
+            .unwrap()
+            .new
+    );
+
+    let result = ShellOpenResult {
+        opened: ViewOpenResult {
+            view_id: aether_protocol::ViewId(4),
+            scroll: None,
+            transient: false,
+            buffer: BufferDescription {
+                buffer_id: 3,
+                language: None,
+                line_count: 1,
+                byte_count: 0,
+                revision: 0,
+                saved_revision: 0,
+                path: None,
+                scratch_number: None,
+                cursor: CursorState::default(),
+                lsp_server: None,
+                title: Some("Shell 1".into()),
+                read_only: true,
+                is_patch: false,
+            },
+        },
+        input: 1,
+    };
+    let v = to_value(&result).unwrap();
+    // Flattened exactly as `git/show`'s is, so the client's adopt path is the same one.
+    assert_eq!(v["opened"]["buffer_id"], 3);
+    assert_eq!(v["opened"]["title"], "Shell 1");
+    assert_eq!(v["opened"]["read_only"], true);
+    assert_eq!(v["input"], 1);
+    let back: ShellOpenResult = from_value(v).unwrap();
+    assert_eq!(back.input, 1);
+}
+
+/// `shell/run` names the view and nothing else — the command is the input document's, server-side.
+#[test]
+fn shell_run_carries_no_command() {
+    use aether_protocol::shell::{ShellRun, ShellRunParams, ShellRunResult};
+    assert_eq!(ShellRun::NAME, "shell/run");
+    let v = to_value(ShellRunParams {
+        view_id: aether_protocol::ViewId(7),
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "view_id": 7 }));
+    assert_eq!(
+        to_value(ShellRunResult { run: Some(2) }).unwrap(),
+        json!({"run": 2})
+    );
+    // A line that only moved the shell's directory started nothing, and says so by omission.
+    assert_eq!(to_value(ShellRunResult { run: None }).unwrap(), json!({}));
+}
+
+#[test]
+fn shell_cancel_shape() {
+    use aether_protocol::shell::{ShellCancel, ShellCancelParams, ShellCancelResult};
+    assert_eq!(ShellCancel::NAME, "shell/cancel");
+    assert_eq!(
+        to_value(ShellCancelParams {
+            view_id: aether_protocol::ViewId(7)
+        })
+        .unwrap(),
+        json!({ "view_id": 7 })
+    );
+    assert_eq!(
+        from_value::<ShellCancelResult>(json!({"cancelled": false})).unwrap(),
+        ShellCancelResult { cancelled: false }
+    );
+}
+
+/// The push mirrors `git/operation_changed`: a start, a finish carrying its outcome, and an idle
+/// shell that says so by omitting the run.
+#[test]
+fn shell_run_changed_shape() {
+    use aether_protocol::shell::{RunState, RunStatus, ShellRunChanged, ShellRunChangedParams};
+    assert_eq!(ShellRunChanged::NAME, "shell/run_changed");
+    let params = |run| ShellRunChangedParams {
+        view_id: aether_protocol::ViewId(7),
+        run,
+    };
+    let idle = to_value(params(None)).unwrap();
+    assert_eq!(idle, json!({ "view_id": 7 }));
+    assert!(from_value::<ShellRunChangedParams>(idle)
+        .unwrap()
+        .run
+        .is_none());
+
+    let running = to_value(params(Some(RunState {
+        run: 1,
+        command: "cargo build".into(),
+        status: RunStatus::Running,
+    })))
+    .unwrap();
+    assert_eq!(running["run"]["command"], "cargo build");
+    assert_eq!(running["run"]["status"], json!({"kind": "running"}));
+
+    // Every outcome pins its tag, since three of the four carry no other field to tell them apart.
+    for (status, wire, label) in [
+        (RunStatus::Running, json!({"kind": "running"}), "running"),
+        (
+            RunStatus::Exited { code: 0 },
+            json!({"kind": "exited", "code": 0}),
+            "ok",
+        ),
+        (
+            RunStatus::Exited { code: 101 },
+            json!({"kind": "exited", "code": 101}),
+            "exit 101",
+        ),
+        (RunStatus::Killed, json!({"kind": "killed"}), "killed"),
+        (
+            RunStatus::Truncated,
+            json!({"kind": "truncated"}),
+            "truncated",
+        ),
+    ] {
+        assert_eq!(to_value(status).unwrap(), wire, "{status:?}");
+        assert_eq!(from_value::<RunStatus>(wire).unwrap(), status);
+        assert_eq!(status.label(), label);
+    }
+}
+
+/// A shell's commands recall from their own list — mixing them with the grep queries would make
+/// `Up` unpredictable, which is the whole reason the lists are per field.
+#[test]
+fn history_has_a_shell_list() {
+    use aether_protocol::history::{HistoryEntry, HistoryKind, HistoryLists, HistoryRecordParams};
+    assert_eq!(to_value(HistoryKind::Shell).unwrap(), json!("shell"));
+    let v = to_value(HistoryRecordParams {
+        kind: HistoryKind::Shell,
+        entry: HistoryEntry::bare("cargo test"),
+    })
+    .unwrap();
+    assert_eq!(v, json!({"kind": "shell", "value": "cargo test"}));
+
+    let mut lists = HistoryLists::default();
+    assert!(lists.record(HistoryKind::Shell, HistoryEntry::bare("ls")));
+    assert_eq!(lists.get(HistoryKind::Shell).len(), 1);
+    assert!(
+        lists.get(HistoryKind::Grep).is_empty(),
+        "a shell command is not a grep term"
+    );
+    // The field parses forward from a `history.json` written before shells existed.
+    let old: HistoryLists = from_value(json!({"search": [], "grep": []})).unwrap();
+    assert!(old.shell.is_empty());
+}
+
+/// A refused submit has a code of its own, so the client can tell "already running" from a shell
+/// that has gone away and keep the text the user typed.
+#[test]
+fn shell_busy_has_its_own_code() {
+    use aether_protocol::error::ErrorCode;
+    assert_eq!(ErrorCode::SHELL_BUSY.code(), -32050);
+    assert_ne!(ErrorCode::SHELL_BUSY, ErrorCode::READ_ONLY_BUFFER);
+}
+
+/// `Enter` in a composed view goes through one method, and it carries no position: the cursor is
+/// the server's, per `(client, buffer)`, in the focused element's buffer.
+#[test]
+fn view_follow_line_names_only_the_view() {
+    use aether_protocol::view::{ViewFollowLine, ViewFollowLineParams, ViewFollowLineResult};
+    assert_eq!(ViewFollowLine::NAME, "view/follow_line");
+    let v = to_value(ViewFollowLineParams {
+        view_id: aether_protocol::ViewId(6),
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "view_id": 6 }));
+
+    // Nowhere to go is an absent field, not an error — the shape every quiet follow answers with.
+    let nowhere = to_value(ViewFollowLineResult { opened: None }).unwrap();
+    assert_eq!(nowhere, json!({}));
+    assert!(from_value::<ViewFollowLineResult>(nowhere)
+        .unwrap()
+        .opened
+        .is_none());
+}
+
+/// Neither of the new methods mutates the buffer it *names* — `shell/run` edits the shell's input
+/// and `view/follow_line` edits nothing — so a client must not decline either locally against the
+/// read-only document they are addressed to. A `const` assertion because the answer is one:
+/// getting this wrong makes `Enter` in a shell do nothing at all, with no error to explain it.
+const _: () = assert!(!aether_protocol::shell::ShellRun::MUTATES_TEXT);
+const _: () = assert!(!aether_protocol::view::ViewFollowLine::MUTATES_TEXT);

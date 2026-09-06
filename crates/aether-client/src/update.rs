@@ -61,17 +61,16 @@ use aether_protocol::git::{
     GitCancelParams, GitCancelResult, GitCheckout, GitCheckoutParams, GitCheckoutResult,
     GitCheckoutStatus, GitCommit, GitCommitParams, GitCommitResult, GitDeleteBranch,
     GitDeleteBranchParams, GitDeleteBranchResult, GitDeleteBranchStatus, GitFetch, GitFetchParams,
-    GitFetchResult, GitFetchStatus, GitFollowPatchLine, GitFollowPatchLineParams,
-    GitFollowPatchLineResult, GitOperationChanged, GitOperationChangedParams, GitPrepareCommit,
-    GitPrepareCommitParams, GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult,
-    GitPullStatus, GitPush, GitPushParams, GitPushResult, GitPushStatus, GitRepoOperation,
-    GitReset, GitResetParams, GitResetResult, GitResolveConflict, GitResolveConflictParams,
-    GitResolveConflictResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
-    GitSetDiffViewParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
-    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, GitUpstreamStatus,
-    GitWorktreeAdd, GitWorktreeAddParams, GitWorktreeAddResult, GitWorktreeAddStatus,
-    GitWorktreeRemove, GitWorktreeRemoveParams, GitWorktreeRemoveResult, GitWorktreeRemoveStatus,
-    HunkAction, ResolveConflictStatus,
+    GitFetchResult, GitFetchStatus, GitOperationChanged, GitOperationChangedParams,
+    GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitPull, GitPullParams,
+    GitPullResult, GitPullStatus, GitPush, GitPushParams, GitPushResult, GitPushStatus,
+    GitRepoOperation, GitReset, GitResetParams, GitResetResult, GitResolveConflict,
+    GitResolveConflictParams, GitResolveConflictResult, GitSetBlameFollow, GitSetBlameFollowParams,
+    GitSetDiffView, GitSetDiffViewParams, GitStashApply, GitStashApplyParams, GitStashDrop,
+    GitStashDropParams, GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus,
+    GitUpstreamStatus, GitWorktreeAdd, GitWorktreeAddParams, GitWorktreeAddResult,
+    GitWorktreeAddStatus, GitWorktreeRemove, GitWorktreeRemoveParams, GitWorktreeRemoveResult,
+    GitWorktreeRemoveStatus, HunkAction, ResolveConflictStatus,
 };
 use aether_protocol::hints::{
     HintsRecord, HintsRecordParams, HintsState, HintsStateParams, HintsStateResult,
@@ -195,8 +194,16 @@ pub enum Event {
     /// working-changes view of a clean tree, the only target that can answer with nothing — a
     /// toast, since there is no buffer and never was one.
     Shown(Result<aether_protocol::git::GitShowResult, String>),
-    /// `Enter` in a patch resolved (or didn't) to a file at a revision.
-    PatchLineFollowed(Result<GitFollowPatchLineResult, String>),
+    /// `Enter` in a composed view resolved (or didn't) to the file the line under the cursor
+    /// named — a patch line's blob, a shell line's `path:line:col`.
+    LineFollowed(Result<aether_protocol::view::ViewFollowLineResult, String>),
+    /// `Space b` answered with the shell to show and which of its elements to type into.
+    ShellOpened(Result<aether_protocol::shell::ShellOpenResult, RpcError>),
+    /// A submit landed, or was refused — the refusal is the interesting half, since it names the
+    /// command in the way and the typed text is deliberately still there.
+    ShellRan(Result<aether_protocol::shell::ShellRunResult, RpcError>),
+    /// `Space Alt-b` answered. Nothing to do either way: the finish arrives as a push.
+    ShellCancelled(Result<aether_protocol::shell::ShellCancelResult, String>),
     /// `view/open` for the current buffer's other view (`Space u`, an edit transition out of
     /// the reader) resolved: adopt the sibling, or report the failure.
     SiblingOpened(Result<ViewOpenResult, String>),
@@ -807,11 +814,56 @@ impl Session {
             // Same landing as any other switch. `opened: None` means the cursor was on the
             // metadata block or the message — nothing to follow, and deliberately silent: `Enter`
             // is a common key and a toast for pressing it on the subject line would be noise.
-            Event::PatchLineFollowed(Ok(r)) => match r.opened {
+            // The shell is now on screen; the caret goes into its input, in Insert, so
+            // `Space b`, type, `Enter` reads like a REPL. The focused element is set before the
+            // resubscribe so the server is told which element to focus rather than being asked to
+            // guess from a scroll the client may not have adopted yet.
+            Event::ShellOpened(Ok(r)) => {
+                let input = r.input;
+                let same_view = r.opened.view_id == self.view.view_id;
+                let fx = self.adopt_open(r.opened);
+                self.view.focused_element = input;
+                self.view.mode = Mode::Insert;
+                // A switch already resubscribes; landing on the shell you were already looking at
+                // does not, and the focus move is what that subscribe carries.
+                if same_view {
+                    return fx.and(Effects::one(Effect::Resubscribe));
+                }
+                fx
+            }
+            Event::ShellOpened(Err(e)) => Effects::error_detail("Couldn't open a shell", e.message),
+            Event::ShellRan(Ok(_)) => {
+                if let Some(line) = self.pending_shell_submit.take() {
+                    self.history
+                        .record(HistoryKind::Shell, HistoryEntry::bare(line));
+                }
+                Effects::none()
+            }
+            // Busy is not a failure: the run you asked for is queued in your head, not lost, and
+            // the text you typed is still in the input. A refusal is not one either: the line did
+            // not pass, the word at fault is already selected, and the message says why. Anything
+            // else is an error.
+            Event::ShellRan(Err(e)) if e.code == ErrorCode::SHELL_BUSY.code() => {
+                self.pending_shell_submit = None;
+                Effects::toast_detail("Already running", e.message, ToastKind::Info)
+            }
+            Event::ShellRan(Err(e)) if e.code == ErrorCode::SHELL_REJECTED.code() => {
+                self.pending_shell_submit = None;
+                Effects::toast_detail("Not accepted", e.message, ToastKind::Info)
+            }
+            Event::ShellRan(Err(e)) => {
+                self.pending_shell_submit = None;
+                Effects::error_detail("Couldn't run that", e.message)
+            }
+            Event::ShellCancelled(_) => Effects::none(),
+            // Same landing as any other switch, and the same silence when the line leads nowhere:
+            // `Enter` is a common key, and being told off for pressing it on a line of output
+            // would be noise.
+            Event::LineFollowed(Ok(r)) => match r.opened {
                 Some(open) => self.adopt_navigation(open),
                 None => Effects::none(),
             },
-            Event::PatchLineFollowed(Err(e)) => Effects::error_detail("Couldn't open the file", e),
+            Event::LineFollowed(Err(e)) => Effects::error_detail("Couldn't open the file", e),
 
             Event::Switched(Err(e)) => self.open_failed(e),
 
@@ -1942,7 +1994,7 @@ impl Session {
             Event::DiffViewSet { enabled, result } => match result {
                 Ok(r) => {
                     self.diff_view = enabled;
-                    self.view.window = Some(r.window);
+                    self.replace_window(r.window);
                     let mut fx = Effects::one(Effect::WindowAdopted);
                     // Grouped so repeated toggling updates one toast in place rather than stacking.
                     fx.push(Effect::Toast {
@@ -2630,7 +2682,7 @@ impl Session {
                 self.pending_rpcs.clear();
                 self.conn = ConnState::Reconnecting {
                     attempt: 0,
-                    had_unsaved: self.view.buffer.revision != self.view.buffer.saved_revision,
+                    had_unsaved: self.view.unsaved(),
                 };
                 // Drop out of Insert: edits can't reach the server while down, and a live insert
                 // cursor with vanishing keystrokes reads as a freeze. We don't restore it on
@@ -3708,8 +3760,25 @@ impl Session {
     /// `view/resize`). Pure core state; the shell clamps its scroll and reveals the cursor around it.
     /// The effects are the reading view's, as for [`Self::adopt_subscribe`].
     pub fn adopt_window(&mut self, res: ViewportWindowResult) -> Effects {
-        self.view.window = Some(res.window);
+        self.replace_window(res.window);
         self.sync_read_presentation()
+    }
+
+    /// Replace the window of the view on screen, keeping the caret in the shell's input if that
+    /// is where it was.
+    ///
+    /// Elements are numbered by position, and a shell appends every run *above* its input, so the
+    /// number that named the input before this window names the new run in it. The server moves
+    /// its own focus the same way when it rebuilds the view; doing it here too is what keeps the
+    /// two agreeing without a focus field on every push.
+    fn replace_window(&mut self, window: aether_protocol::viewport::Window) {
+        let on_input = self.shell_input_focused();
+        self.view.window = Some(window);
+        if on_input {
+            if let Some(input) = self.shell_input() {
+                self.view.focused_element = input;
+            }
+        }
     }
 
     /// Report the viewport's current scroll position so the core knows what's actually on screen
@@ -6742,7 +6811,7 @@ impl Session {
                 if let Some(cursor) = p.cursor {
                     self.view.buffer.cursor = cursor;
                 }
-                self.view.window = Some(p.window);
+                self.replace_window(p.window);
                 // A reader's lines are all in the window, so this is also its re-parse.
                 let read_fx = self.sync_read_presentation();
                 Effects::one(Effect::WindowAdopted).and(read_fx)
@@ -6758,6 +6827,39 @@ impl Session {
                     self.view.blame = p.blame.map(|b| (p.line, b));
                 }
                 Effects::none()
+            }
+            aether_protocol::shell::ShellRunChanged::NAME => {
+                use aether_protocol::shell::ShellRunChangedParams;
+                let Ok(p) = serde_json::from_value::<ShellRunChangedParams>(n.params) else {
+                    return Effects::none();
+                };
+                let finished = p.run.clone().filter(|r| !r.is_running());
+                match p.run.filter(|r| r.is_running()) {
+                    Some(run) => {
+                        self.shell_runs.insert(p.view_id, run);
+                    }
+                    None => {
+                        self.shell_runs.remove(&p.view_id);
+                    }
+                }
+                // Say how it went only when you are looking somewhere else: a shell on screen has
+                // the outcome in the run's own header, and a toast repeating it is noise. Grouped
+                // by view so a shell you keep re-running replaces its own notice rather than
+                // stacking a column of them.
+                match finished.filter(|_| p.view_id != self.view.view_id) {
+                    Some(run) => Effects::toast_grouped_detail(
+                        run.command.clone(),
+                        run.status.label(),
+                        match run.status {
+                            aether_protocol::shell::RunStatus::Exited { code: 0 } => {
+                                ToastKind::Success
+                            }
+                            _ => ToastKind::Warning,
+                        },
+                        format!("shell-{}", p.view_id.get()),
+                    ),
+                    None => Effects::none(),
+                }
             }
             GitOperationChanged::NAME => {
                 // A long-running git operation started, advanced, or finished. Repo-scoped and
@@ -9400,6 +9502,87 @@ impl Session {
         hint_fx.and(task)
     }
 
+    /// Which element of the view on screen is a shell's **input** — and so, whether this view is
+    /// a shell at all.
+    ///
+    /// Derived from the window rather than from a kind flag on the view, which is what keeps every
+    /// shell kind-blind: they already paint an editor element, and this only says which of them
+    /// carries the caret's special meanings.
+    pub fn shell_input(&self) -> Option<aether_protocol::ui::FieldId> {
+        self.view.window.as_ref()?.root.input_element()
+    }
+
+    /// Whether this view is **composed** — its content generated by the server rather than loaded
+    /// from a file — which is the condition `Enter` follows a line under rather than asking a
+    /// language server.
+    ///
+    /// Two facts, and neither is a kind check on the view: `is_patch` is the flag an open already
+    /// carries, and an input element is a thing the window itself says it has.
+    fn composed_view(&self) -> bool {
+        self.view.buffer.is_patch || self.shell_input().is_some()
+    }
+
+    /// Whether the caret is in that input right now — the condition `Enter` submits under.
+    pub fn shell_input_focused(&self) -> bool {
+        self.view.focused_is_input()
+    }
+
+    /// What the shell's input holds, when it is a single line — read off the window, which is the
+    /// only copy of the text the client has. `None` when the focused element is not an input, or
+    /// when it holds more than one line.
+    fn shell_input_text(&self) -> Option<String> {
+        let element = self.shell_input()?;
+        let window = self.view.window.as_ref()?;
+        let node = window
+            .root
+            .editors()
+            .into_iter()
+            .find(|n| matches!(n, Element::Editor { element: e, .. } if *e == element))?;
+        let Element::Editor { rows, lines, .. } = node else {
+            return None;
+        };
+        if *rows > 1 || lines.len() > 1 {
+            return None;
+        }
+        Some(
+            lines
+                .first()
+                .map(|l| {
+                    l.visual_rows
+                        .iter()
+                        .flat_map(|r| r.segments.iter())
+                        .map(|s| s.text.as_str())
+                        .collect::<String>()
+                })
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Whether `Up`/`Down` should recall rather than move: the caret is in a shell's input, that
+    /// input is one line, and the caret is on it.
+    fn shell_recall_applies(&self) -> bool {
+        self.shell_input_focused()
+            && self.shell_input_text().is_some()
+            && self.view.buffer.cursor.position.line == 0
+    }
+
+    /// Walk the shell's command history and install the entry, replacing the input's one line.
+    ///
+    /// Through `input/replace_line` rather than by sending the text as a value: the input is a
+    /// document the server owns, and this is the ordinary edit for "this line now reads that" —
+    /// which is what keeps undo, the pushes and every other viewer coherent.
+    fn shell_history_step(&mut self, dir: VerticalDirection) -> Effects {
+        let buffer_id = self.view.buffer.buffer_id;
+        let current = HistoryEntry::bare(self.shell_input_text().unwrap_or_default());
+        match self.history_step(HistoryKind::Shell, dir, current) {
+            Some(entry) => self.edit::<InputReplaceLine>(InputReplaceLineParams {
+                buffer_id,
+                text: entry.value,
+            }),
+            None => Effects::none(),
+        }
+    }
+
     fn dispatch_action(
         &mut self,
         action: Action,
@@ -9456,6 +9639,13 @@ impl Session {
                 },
                 extend,
             ),
+            // `Up`/`Down` in a shell's input recall commands, as in any shell — but only while the
+            // input is one line and the caret is on it. A multi-line command (`Alt-Enter`) is text
+            // you are editing, and replacing it wholesale to walk a list would be a keystroke that
+            // destroys work.
+            A::MoveVisualLine(direction) if self.shell_recall_applies() => {
+                self.shell_history_step(direction)
+            }
             A::MoveVisualLine(direction) => {
                 let Some(viewport_id) = self.view.viewport_id else {
                     return Effects::none();
@@ -9918,7 +10108,7 @@ impl Session {
                 // keep. Atomic with the demotion, so it inherits the dirty guard — but audibly,
                 // since the user asked for a release.
                 if self.tethered() {
-                    if self.view.buffer.revision != self.view.buffer.saved_revision {
+                    if self.view.focused_unsaved() {
                         return Effects::toast_detail(
                             "Unsaved changes",
                             "Save before releasing the tether",
@@ -9943,13 +10133,7 @@ impl Session {
                 // discard them) once hidden. View-wide: *any* of its documents being dirty counts,
                 // since closing the view drops them all. Silent no-op; pinning permanent, or
                 // toggling a clean view, is fine.
-                let dirty = self.view.buffer.revision != self.view.buffer.saved_revision
-                    || self
-                        .view
-                        .window
-                        .as_ref()
-                        .is_some_and(|w| w.other_elements_dirty);
-                if target && dirty {
+                if target && self.view.unsaved() {
                     return Effects::none();
                 }
                 self.request_str::<ViewSetTransient>(
@@ -9982,13 +10166,7 @@ impl Session {
                 // stay open — but "close without asking" is not what the prompt is for.) The
                 // second term is the flag the status dot uses, so the prompt and the dot cannot
                 // disagree about whether the view is dirty.
-                let dirty = self.view.buffer.revision != self.view.buffer.saved_revision
-                    || self
-                        .view
-                        .window
-                        .as_ref()
-                        .is_some_and(|w| w.other_elements_dirty);
-                if dirty {
+                if self.view.unsaved() {
                     self.prompt = Some(Prompt::Confirm {
                         kind: ConfirmKind::DiscardOnClose {
                             // The view's name: in a composed view the dirty document may not be
@@ -10157,6 +10335,46 @@ impl Session {
                 None => Effects::none(),
             },
 
+            // The shell you can type into. Which one that is, is the server's to decide — it
+            // holds the shells and knows which are busy; the client only says whether the view in
+            // front of it is already a shell, since a `Space b` there means "another one".
+            A::ShellOpen => self.request::<aether_protocol::shell::ShellOpen>(
+                aether_protocol::shell::ShellOpenParams {
+                    new: self.shell_input().is_some(),
+                },
+                Event::ShellOpened,
+            ),
+            // Cancelling names the *view*, exactly as `Space g x` names the repo: the shell in
+            // front of you is the one you meant, and a shell you are not looking at is not
+            // something `Space Alt-b` should reach into.
+            A::ShellCancel if self.shell_input().is_none() => {
+                Effects::toast("Not a shell", ToastKind::Info)
+            }
+            A::ShellCancel if !self.shell_runs.contains_key(&self.view.view_id) => {
+                Effects::toast("Nothing is running here", ToastKind::Info)
+            }
+            A::ShellCancel => self.request_str::<aether_protocol::shell::ShellCancel>(
+                aether_protocol::shell::ShellCancelParams {
+                    view_id: self.view.view_id,
+                },
+                Event::ShellCancelled,
+            ),
+            // Reached from Normal-mode `Enter` (`Activate`) with the input focused. The guard is
+            // kept so that nothing can submit from anywhere else, whatever dispatches it.
+            A::ShellSubmit if self.shell_input_focused() => {
+                // Kept until the server answers: the line enters the recall list only if it was
+                // accepted, which is the same rule the server records by, so the two cannot
+                // disagree — and the input is cleared by the time the answer comes.
+                self.pending_shell_submit = self.shell_input_text().map(|t| t.trim().to_string());
+                self.request::<aether_protocol::shell::ShellRun>(
+                    aether_protocol::shell::ShellRunParams {
+                        view_id: self.view.view_id,
+                    },
+                    Event::ShellRan,
+                )
+            }
+            A::ShellSubmit => Effects::none(),
+
             A::GitUncommit => self.request_str::<GitReset>(
                 GitResetParams {
                     // Resolved server-side from the buffer we're on, the same rule
@@ -10233,6 +10451,13 @@ impl Session {
             // language server), which is what makes the trade affordable — `Enter` twice gets you
             // there, and `Ctrl-Enter` is not available as a shortcut because it already means
             // "activate in a new window" in the reading view.
+            // `Enter` in a shell's input means the same thing in Normal mode as in Insert: run it.
+            // Declared before the composed-view arm below, which would otherwise fire first — the
+            // input windows a different buffer than the view's own, so it looks like a hunk over a
+            // file and `Enter` would promote it to a view of its own.
+            A::Activate if self.shell_input_focused() => {
+                self.dispatch_action(A::ShellSubmit, count, counted, extend)
+            }
             A::Activate if self.view.buffer.buffer_id != self.view.view_buffer => {
                 // Not transient: you asked for this file, so it stays. `record_nav_from` is the
                 // view, so `Backspace` returns to the review rather than to the file you were
@@ -10248,18 +10473,22 @@ impl Session {
                     Event::Switched,
                 )
             }
-            // **Generated text** — a deletion, a binary swap, the metadata block: there is no
-            // element to promote because there is no file to window, so the patch's own line index
-            // is the only thing that can say where the line came from.
+            // **Generated text** — a patch's metadata block or a deletion, a shell's output:
+            // there is no element to promote because there is no file to window, so the only thing
+            // that can say where the line leads is the document's own account of itself, which is
+            // server-side. `view/follow_line` is total over the kinds of it, so this dispatch does
+            // not branch on which.
             //
-            // `is_patch` is the one kind-flag left in this dispatch, and it is here because the
-            // alternative costs a round trip on every ordinary `Enter`: `git/follow_patch_line`
-            // already answers "not a patch" server-side, but asking it first would make every
+            // The condition, not the destination, is the client's: `view/follow_line` would answer
+            // "nowhere" for an ordinary buffer, but asking it first would make every
             // go-to-definition wait for that answer.
-            A::Activate if self.view.buffer.is_patch => self.request_str::<GitFollowPatchLine>(
-                GitFollowPatchLineParams { buffer_id },
-                Event::PatchLineFollowed,
-            ),
+            A::Activate if self.composed_view() => self
+                .request_str::<aether_protocol::view::ViewFollowLine>(
+                    aether_protocol::view::ViewFollowLineParams {
+                        view_id: self.view.view_id,
+                    },
+                    Event::LineFollowed,
+                ),
             A::Activate => self
                 .request_str::<LspGotoDefinition>(LspBufferParams { buffer_id }, Event::Definition),
             // One verb, "tell me about the thing under the cursor", resolved against the mode:
@@ -11702,6 +11931,7 @@ mod tests {
                 rows: lines.len() as u32,
                 first_row: aether_protocol::coords::ElementRow::ZERO,
                 laid_out_by: aether_protocol::ui::LayoutOwner::Client,
+                role: aether_protocol::ui::ElementRole::Field,
                 first_buffer_line: 0,
                 lines,
             },

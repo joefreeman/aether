@@ -33,6 +33,10 @@ pub enum HistoryKind {
     /// recalled path resolves under whichever root the editor currently has, exactly as if it had
     /// been typed there.
     Path,
+    /// A shell view's input, recorded when a command is submitted. Its own list for the same
+    /// reason the others are separate: a shell command is not a search term, and `Up` in a shell
+    /// that walked grep queries would be unusable.
+    Shell,
 }
 
 /// One recalled value together with the configuration it ran under. Recall restores both: a regex
@@ -81,6 +85,8 @@ pub struct HistoryLists {
     pub glob: Vec<HistoryEntry>,
     #[serde(default)]
     pub path: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub shell: Vec<HistoryEntry>,
 }
 
 impl HistoryLists {
@@ -90,6 +96,7 @@ impl HistoryLists {
             HistoryKind::Grep => &self.grep,
             HistoryKind::Glob => &self.glob,
             HistoryKind::Path => &self.path,
+            HistoryKind::Shell => &self.shell,
         }
     }
 
@@ -99,6 +106,7 @@ impl HistoryLists {
             HistoryKind::Grep => &mut self.grep,
             HistoryKind::Glob => &mut self.glob,
             HistoryKind::Path => &mut self.path,
+            HistoryKind::Shell => &mut self.shell,
         }
     }
 

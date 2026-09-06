@@ -188,7 +188,19 @@ export interface BaselineRow {
  *  top-to-bottom list of rows, which cannot express two editors sharing rows. Side-by-side diff
  *  needs a different row model. Until then an editor is expected to be a child of a `stack`. */
 export type ViewNode =
-  | { node: "column"; edges?: Edges; band?: Band; children: ViewNode[] }
+  | {
+      node: "column";
+      edges?: Edges;
+      band?: Band;
+      /** What the box's **top border** says, drawn on the border row itself: a rule cell after the
+       *  corner, a space, these nodes, a space, then the rule on to the far corner. Inline nodes,
+       *  the kinds a row holds. Absent for an untitled box, which is every box a patch draws.
+       *
+       *  It costs the box no rows — `paintedRows` says nothing about it, and the painter reads it
+       *  off the top edge row's `owner`. Mirrors `Element::Column`'s `title`. */
+      title?: ViewNode[];
+      children: ViewNode[];
+    }
   | { node: "row"; edges?: Edges; band?: Band; children: ViewNode[] }
   | { node: "text"; text: string; highlights?: Highlight[] }
   | { node: "space"; cols: number }
@@ -210,6 +222,10 @@ export type ViewNode =
        *  editor. `client`: the lines come unwrapped, one row per line, and the true height is
        *  whatever the shell measured (`Measured`). */
       laid_out_by?: "server" | "client";
+      /** What the element is *for* — mirrors `ElementRole`. Absent for content, which is every
+       *  element of an ordinary or composed view. `input`: the line a shell's next command is
+       *  typed into, which is also how a client knows the view it is showing is a shell. */
+      role?: "field" | "input";
     };
 
 /** What the shell measured of an element it laid out itself — mirrors `grid::MeasuredElement`:
@@ -404,10 +420,16 @@ function walkRows(
  *  above the rule and the row below it. Mirrors `grid::resolve_joins`; see it for why a join is
  *  about the rail rather than about which edges happen to be adjacent. */
 function resolveJoins(rows: PaintedRow[]): void {
-  const isEdge = rows.map((r) => r.kind === "edge");
+  // Which box each rule belongs to, by identity — `undefined` for a row that is not one.
+  const owner = rows.map((r) => (r.kind === "edge" ? r.owner : undefined));
+  // The nearest neighbour that is not one of *this box's own* rules. Another box's rule is not
+  // skipped over — it is the answer, and the answer is no rail: two boxes that each draw their own
+  // edge close and open rather than both tee-ing. Sharing an edge is one row, not two.
   const neighbour = (from: number, step: number): boolean => {
+    const mine = owner[from];
     for (let i = from + step; i >= 0 && i < rows.length; i += step) {
-      if (!isEdge[i]) return (rows[i].rails.left ?? 0) > 0;
+      if (owner[i] === undefined) return (rows[i].rails.left ?? 0) > 0;
+      if (owner[i] !== mine) return false;
     }
     return false;
   };

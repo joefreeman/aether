@@ -590,6 +590,8 @@ pub enum DormantSource {
     /// Nothing is stored: the content regenerates from the repo when the buffer is first viewed,
     /// which is also why a revision that has since been rewritten away simply doesn't come back.
     Virtual { key: String },
+    /// A shell, restored from its snapshot in the backups directory by its per-workspace number.
+    Shell { number: u32 },
 }
 
 impl DormantView {
@@ -597,7 +599,9 @@ impl DormantView {
     pub fn path(&self) -> Option<&Path> {
         match &self.source {
             DormantSource::File(p) => Some(p.as_path()),
-            DormantSource::Scratch { .. } | DormantSource::Virtual { .. } => None,
+            DormantSource::Scratch { .. }
+            | DormantSource::Virtual { .. }
+            | DormantSource::Shell { .. } => None,
         }
     }
 }
@@ -983,12 +987,17 @@ impl ServerState {
         promoted
     }
 
-    /// The view a buffer presents when no driver built one: a generated patch's own regions
-    /// (chrome between files and hunks is what splits it), else one region over the whole buffer.
+    /// The view a buffer presents when no driver built one — matched per kind of generated
+    /// content, so a shell cannot fall through to the patch's region-splitting and come out as one
+    /// undivided block with no input.
     fn default_view(&self, buffer_id: BufferId) -> View {
         match self.doc_of(buffer_id).generated.as_ref() {
-            Some(g) if !g.decorations.elements.is_empty() => View::over_generated(buffer_id, g),
-            _ => View::whole(buffer_id),
+            // A generated patch's own regions: chrome between files and hunks is what splits it.
+            Some(Generated::Patch(g)) if !g.decorations.elements.is_empty() => {
+                View::over_generated(buffer_id, g)
+            }
+            Some(Generated::Shell(t)) => View::over_transcript(buffer_id, t),
+            Some(Generated::Patch(_)) | None => View::whole(buffer_id),
         }
     }
 
@@ -1054,7 +1063,7 @@ impl ServerState {
         &mut self,
         buffer_id: BufferId,
         text: &str,
-        generated: Option<crate::patch::GeneratedPatch>,
+        generated: Option<Generated>,
     ) {
         self.doc_of_mut(buffer_id)
             .replace_generated(text, generated);
@@ -1086,28 +1095,122 @@ impl ServerState {
         let repo_id = doc
             .virtual_source
             .as_ref()
-            .map(|v| v.target.repo_id.clone())
-            .unwrap_or_default();
-        let Some(generated) = doc.generated.as_ref() else {
-            return false;
+            .and_then(|v| v.target.repo_id())
+            .unwrap_or_default()
+            .to_string();
+        // Per kind, exhaustively: a shell's elements come from its runs and its input, and there
+        // is no path resolution to do — treating one as a patch would rebuild it as a single
+        // fileless region and lose the input element with it.
+        let rebuilt = match doc.generated.as_ref() {
+            None => return false,
+            Some(Generated::Shell(t)) => {
+                let view = View::over_transcript(view_buffer, t);
+                self.reinstate(view_id, view);
+                return true;
+            }
+            Some(Generated::Patch(generated)) => {
+                crate::patch::layout_over_files(generated, |path| {
+                    let workspace = workspace.as_deref()?;
+                    let canonical = std::path::Path::new(&repo_id).join(path);
+                    self.buffer_for_path_in_workspace(workspace, &canonical)
+                })
+            }
         };
-        let rebuilt = crate::patch::layout_over_files(generated, |path| {
-            let workspace = workspace.as_deref()?;
-            let canonical = std::path::Path::new(&repo_id).join(path);
-            self.buffer_for_path_in_workspace(workspace, &canonical)
-        });
-        let (last_used, transient) = self
-            .views
-            .get(&view_id)
-            .map_or((0, false), |v| (v.last_used, v.transient));
+        let view = View::from_layout(view_buffer, rebuilt);
+        self.reinstate(view_id, view);
+        true
+    }
+
+    /// Replace a view's composition while keeping what makes it *the same view* — its place in the
+    /// recency order and whether it is a preview. Both would otherwise reset on every rebuild, and
+    /// a shell rebuilds on every flush of output.
+    fn reinstate(&mut self, view_id: ViewId, view: View) {
+        let (last_used, transient, old_input) =
+            self.views.get(&view_id).map_or((0, false, None), |v| {
+                (v.last_used, v.transient, v.input_element())
+            });
+        let new_input = view.input_element();
+        let last = view.elements.len().saturating_sub(1) as aether_protocol::viewport::FieldId;
         self.views.insert(
             view_id,
             View {
                 last_used,
                 transient,
-                ..View::from_layout(view_buffer, rebuilt)
+                ..view
             },
         );
+        // A viewport's focus is an index into the elements, and a rebuild renumbers them: a shell
+        // appends every run *above* its input, so the number that named the input a moment ago
+        // names the new run now. Focus follows the element, not the number — a caret in the input
+        // stays in the input — and any other focus is clamped as before, since a rebuild can also
+        // have fewer elements than the one the focus was in.
+        for vp in self
+            .viewports
+            .values_mut()
+            .filter(|vp| vp.view_id == view_id)
+        {
+            vp.focused = match (old_input, new_input) {
+                (Some(old), Some(new)) if vp.focused == old => new,
+                _ => vp.focused.min(last),
+            };
+        }
+    }
+
+    /// Change a shell's transcript and rebuild its view from the result — **the pair**, because a
+    /// transcript that has grown a run while the view still lists the old ones is a view with an
+    /// element missing, and a status that changed with no rebuild is a header still saying
+    /// "running".
+    ///
+    /// `None` when the buffer is not a shell (or has gone), which is how the handlers treat
+    /// `shell/*` addressed at something else.
+    pub fn with_transcript<R>(
+        &mut self,
+        view_buffer: BufferId,
+        f: impl FnOnce(&mut crate::shell::Transcript) -> R,
+    ) -> Option<R> {
+        let doc = self.try_doc_of_mut(view_buffer)?;
+        let t = doc.generated.as_mut()?.transcript_mut()?;
+        let out = f(t);
+        t.generation += 1;
+        self.rebuild_view_layout(view_buffer);
+        self.rebind_viewports_of(view_buffer);
+        Some(out)
+    }
+
+    /// Append to a shell's transcript: replace the document from char `from` to its end with
+    /// `text`, carry the active run's extent to the new length, and rebuild the view.
+    ///
+    /// The one way to write output into a transcript. [`Document::write_tail`] is module-private
+    /// precisely so it cannot be called without this: a tail write that skipped the extent update
+    /// would leave the last run's element as long as it was before the output arrived, and the
+    /// lines you are watching arrive would render nowhere.
+    ///
+    /// `from` must be at or after the start of the active run's last line — see
+    /// [`crate::process::OutputText::line_start_at`], which is what computes it.
+    pub fn extend_transcript(&mut self, view_buffer: BufferId, from: usize, text: &str) -> bool {
+        let Some(doc) = self.try_doc_of_mut(view_buffer) else {
+            return false;
+        };
+        if doc
+            .generated
+            .as_ref()
+            .and_then(Generated::transcript)
+            .is_none()
+        {
+            return false;
+        }
+        doc.write_tail(from, text);
+        let end = doc.content_lines();
+        // The active run is the last one, and it is the only one whose extent can move: every
+        // earlier run's output is final, which is what makes a run's element stable for good.
+        if let Some(t) = doc.generated.as_mut().and_then(Generated::transcript_mut) {
+            if let Some(run) = t.runs.last_mut() {
+                run.end_line_exclusive = end.max(run.start_line);
+            }
+            t.generation += 1;
+        }
+        self.rebuild_view_layout(view_buffer);
+        self.rebind_viewports_of(view_buffer);
         true
     }
 
@@ -1682,6 +1785,9 @@ impl ServerState {
     /// so an auto-started server never reaps unsaved work it can't restore.
     pub fn has_unprotected_unsaved_buffers(&self) -> bool {
         let backups_enabled = self.backups_path.is_some();
+        // An internal document is never dirty (see `Document::internal`), so it cannot pin the
+        // reaper — a half-typed shell command is not work to rescue. What *does* pin it is a
+        // running command; that lives with the reaper, beside this.
         self.documents.values().any(|d| {
             d.dirty
                 && !(backups_enabled
@@ -1722,6 +1828,104 @@ impl ServerState {
             .expect("u32 range is non-empty")
     }
 
+    /// Whether any shell is running a command right now.
+    ///
+    /// Pins the idle reaper open beside the unsaved-work check: an auto-started server that reaped
+    /// itself mid-`cargo build` would kill the build and lose its output, which is the same class
+    /// of harm as dropping unsaved text. The shell's *input* deliberately does not pin it — a
+    /// half-typed command is not work in progress (see `Document::internal`).
+    pub fn has_running_shell(&self) -> bool {
+        self.documents
+            .values()
+            .filter_map(|d| d.transcript())
+            .any(|t| t.active().is_some())
+    }
+
+    /// Stop every shell's running command — the server is going away, and a process group that
+    /// outlives the editor that started it is an orphan nobody can see or stop.
+    pub fn cancel_all_shell_runs(&mut self) {
+        for doc in self.documents.values_mut() {
+            if let Some(t) = doc.generated.as_mut().and_then(Generated::transcript_mut) {
+                t.cancel_all();
+            }
+        }
+    }
+
+    /// The display number to give a new shell in `workspace`: the lowest positive integer no live
+    /// shell there is using. Same rule as [`Self::next_scratch_number`], and for the same reasons —
+    /// small numbers, stable for the shell's life, reused once it closes.
+    ///
+    /// Dormant shells — restored from the session but not yet opened — hold their numbers too, so
+    /// a fresh shell cannot take one out from under a pending restore.
+    pub fn next_shell_number(&self, workspace: &str) -> u32 {
+        let mut used: std::collections::HashSet<u32> = self
+            .buffer_workspaces
+            .iter()
+            .filter(|(_, p)| p.as_str() == workspace)
+            .filter_map(|(id, _)| self.try_doc_of(*id))
+            .filter_map(|d| match d.virtual_source.as_ref().map(|v| &v.target) {
+                Some(VirtualTarget::Shell { number, .. }) => Some(*number),
+                _ => None,
+            })
+            .collect();
+        if let Some(w) = self.workspaces.get(workspace) {
+            for d in &w.dormant_views {
+                if let DormantSource::Shell { number } = d.source {
+                    used.insert(number);
+                }
+            }
+        }
+        (1..)
+            .find(|n| !used.contains(n))
+            .expect("u32 range is non-empty")
+    }
+
+    /// Write `id`'s shell to its snapshot file now, if backups are on and the shell belongs to a
+    /// named workspace. What the flush does on its interval, done at once — for a teardown that
+    /// is about to drop the shell, so the last moments of its state are not lost with it.
+    pub fn snapshot_shell(&self, id: BufferId) {
+        let Some(root) = self.backups_path.as_deref() else {
+            return;
+        };
+        let Some(workspace) = self.buffer_workspaces.get(&id) else {
+            return;
+        };
+        if self
+            .workspaces
+            .get(workspace)
+            .is_none_or(|w| w.name.is_none())
+        {
+            return;
+        }
+        let Some(doc) = self.try_doc_of(id) else {
+            return;
+        };
+        let Some(t) = doc.transcript() else {
+            return;
+        };
+        let Some(VirtualTarget::Shell { number, .. }) =
+            doc.virtual_source.as_ref().map(|v| &v.target)
+        else {
+            return;
+        };
+        let text: String = doc.text.chunks().collect();
+        let input: String = self
+            .try_doc_of(t.input)
+            .map(|d| d.text.chunks().collect())
+            .unwrap_or_default();
+        let snap = t
+            .snapshot(&text, &input)
+            .trimmed(crate::shell::SNAPSHOT_BUDGET);
+        if let Ok(json) = serde_json::to_string(&snap) {
+            if let Err(e) = crate::backup::write(
+                &crate::backup::shell_backup_path(root, workspace, *number),
+                &json,
+            ) {
+                tracing::warn!(error = %e, "failed to write shell snapshot");
+            }
+        }
+    }
+
     /// Buffer ids in `workspace` whose backing file is at or under `canonical` — an exact match for
     /// a file, or a path-prefix match for a directory. Used by `path/delete` to find the buffers a
     /// deletion would close (and to screen them for unsaved changes first).
@@ -1746,6 +1950,29 @@ impl ServerState {
     /// Returns the key of a language server that was torn down because this was its last buffer
     /// (so the caller can refresh open status views), or `None`.
     pub fn close_buffer(&mut self, id: BufferId) -> Option<crate::lsp::manager::LspServerKey> {
+        // A shell owns two documents and a process group. Stopping the runs here — rather than in
+        // the `shell/*` handlers — is what makes it unconditional: a view closed by a workspace
+        // switch, a root removal or a disconnect kills its `cargo build` exactly as `Space x`
+        // does. The input goes with it: nothing else can reach it, so leaving it behind would be a
+        // buffer nobody can open and nobody can close.
+        // Written down before it goes: a workspace switch or a disconnect tears the shell down,
+        // and what it held since the last flush must not go with it. An explicit close deletes
+        // the file again afterwards, which is what makes closing a discard.
+        self.snapshot_shell(id);
+        let input = match self
+            .try_doc_of_mut(id)
+            .and_then(|d| d.generated.as_mut())
+            .and_then(Generated::transcript_mut)
+        {
+            Some(t) => {
+                t.cancel_all();
+                Some(t.input)
+            }
+            None => None,
+        };
+        if let Some(input) = input.filter(|input| *input != id) {
+            self.close_buffer(input);
+        }
         // Notify any language server before we drop the buffer (needs its path).
         let lsp_uri = self
             .try_doc_of(id)
@@ -1881,6 +2108,13 @@ impl ServerState {
         let mut closed_views = Vec::new();
         for id in candidates {
             if !self.buffers.contains_key(&id) {
+                continue;
+            }
+            // A field of a view is not a buffer anyone opened, so it is not one the GC may close:
+            // it has no view of its own to be "hidden", and closing it would take a shell's input
+            // line away the moment you looked at something else. It dies with the view that owns
+            // it — see `ServerState::close_buffer`.
+            if self.try_doc_of(id).is_some_and(|d| d.internal) {
                 continue;
             }
             // Hidden previews of a buffer that has other views close alone.
@@ -2131,6 +2365,8 @@ impl ServerState {
         let mut seen_files: std::collections::HashSet<(PathBuf, ViewKind)> =
             std::collections::HashSet::new();
         let mut seen_scratch: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+        let mut seen_shell: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut seen_virtual: std::collections::HashSet<String> = std::collections::HashSet::new();
         for view_id in &workspace.mru_views {
             let Some(view) = self.views.get(view_id) else {
@@ -2154,6 +2390,15 @@ impl ServerState {
                     out.push(SessionView::file(path.to_path_buf(), kind));
                 }
             } else if let Some(source) = doc.virtual_source.as_ref() {
+                // A shell is recorded by its number; its content survives as a snapshot in the
+                // backups directory, keyed the same way, and an entry with no snapshot is dropped
+                // at activation exactly as a scratch's is.
+                if let VirtualTarget::Shell { number, .. } = source.target {
+                    if seen_shell.insert(number) {
+                        out.push(SessionView::Shell { number });
+                    }
+                    continue;
+                }
                 let key = source.target.key();
                 if seen_virtual.insert(key.clone()) {
                     out.push(SessionView::Virtual { key });
@@ -2185,6 +2430,11 @@ impl ServerState {
                 DormantSource::Virtual { key } => {
                     if seen_virtual.insert(key.clone()) {
                         out.push(SessionView::Virtual { key: key.clone() });
+                    }
+                }
+                DormantSource::Shell { number } => {
+                    if seen_shell.insert(*number) {
+                        out.push(SessionView::Shell { number: *number });
                     }
                 }
             }
@@ -2488,7 +2738,7 @@ pub struct VirtualSource {
     pub title: String,
 }
 
-/// What a virtual document was generated from: a repo, plus which of its states.
+/// What a virtual document was generated from — content the server produced rather than loaded.
 ///
 /// **Structured, not a string.** It was a string once, and every consumer that wanted one field out
 /// of it — the repo, the rev, the path — re-split it by hand, each slightly differently
@@ -2496,47 +2746,95 @@ pub struct VirtualSource {
 /// splits, which is the failure mode this exists to remove: ask for the field you want and a shape
 /// that hasn't got one answers `None`.
 ///
+/// A **shell** is the second producer, and it is not a repo at all: it has no revision, no path
+/// and no repo id, which is exactly why the repo fields moved inside a variant instead of staying
+/// at the top with a shell obliged to invent values for them.
+///
 /// The string form survives only as an *encoding*, for the one place that needs to write a target
-/// down and read it back: the session file. See [`Self::key`] and [`Self::parse_key`].
+/// down and read it back: the session file. See [`Self::key`] and [`Self::parse_key`]. A shell is
+/// never written there — its content does not survive a restart — but the encoding still round
+/// trips, because a key that only half works is a key that fails somewhere else later.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VirtualTarget {
-    /// Canonical workdir of the repo — which is what makes a key stable across restarts.
-    pub repo_id: String,
-    pub what: aether_protocol::git::ShowTarget,
+pub enum VirtualTarget {
+    /// A repo, plus which of its states: a commit's diff, a file at a revision, the working tree.
+    Git {
+        /// Canonical workdir of the repo — which is what makes a key stable across restarts.
+        repo_id: String,
+        what: aether_protocol::git::ShowTarget,
+    },
+    /// One shell view's transcript, numbered per workspace like a scratch buffer.
+    Shell { workspace: String, number: u32 },
 }
 
 impl VirtualTarget {
     pub fn new(repo_id: impl Into<String>, what: aether_protocol::git::ShowTarget) -> Self {
-        Self {
+        Self::Git {
             repo_id: repo_id.into(),
             what,
         }
     }
 
+    pub fn shell(workspace: impl Into<String>, number: u32) -> Self {
+        Self::Shell {
+            workspace: workspace.into(),
+            number,
+        }
+    }
+
+    /// The repo this is of, for the git-shaped targets. `None` for a shell, which has none —
+    /// which is the whole point of asking rather than reading a field.
+    pub fn repo_id(&self) -> Option<&str> {
+        match self {
+            Self::Git { repo_id, .. } => Some(repo_id),
+            Self::Shell { .. } => None,
+        }
+    }
+
+    /// Which state of the repo this shows. `None` for a shell.
+    pub fn what(&self) -> Option<&aether_protocol::git::ShowTarget> {
+        match self {
+            Self::Git { what, .. } => Some(what),
+            Self::Shell { .. } => None,
+        }
+    }
+
     pub fn rev(&self) -> Option<&str> {
-        self.what.rev()
+        self.what()?.rev()
     }
 
     pub fn path(&self) -> Option<&str> {
-        self.what.path()
+        self.what()?.path()
     }
 
     /// Whether re-showing this can attach to a buffer already holding it. A revision can't change
-    /// under us; the working tree can, and has to be rebuilt.
+    /// under us; the working tree can, and has to be rebuilt. A shell is neither: it is addressed
+    /// by its own view, never re-materialised from a target.
     pub fn is_immutable(&self) -> bool {
         self.rev().is_some()
+    }
+
+    /// The buffer's display name — what the picker rows and the status bar show.
+    pub fn title(&self) -> Option<String> {
+        match self {
+            Self::Git { .. } => None, // generated with the content; see `VirtualSource::title`
+            Self::Shell { number, .. } => Some(format!("Shell {number}")),
+        }
     }
 
     /// Stable string encoding, for writing a target into the session file.
     ///
     /// `#` separates the working tree rather than `@`, so a round-trip can never mistake it for a
-    /// revision named `worktree`.
+    /// revision named `worktree`. A shell leads with `shell:`, which no canonical workdir can:
+    /// a repo id is an absolute path.
     pub fn key(&self) -> String {
         use aether_protocol::git::ShowTarget;
-        match &self.what {
-            ShowTarget::Commit { rev } => format!("{}@{rev}", self.repo_id),
-            ShowTarget::File { rev, path } => format!("{}@{rev}:{path}", self.repo_id),
-            ShowTarget::WorkingChanges => format!("{}#worktree", self.repo_id),
+        match self {
+            Self::Git { repo_id, what } => match what {
+                ShowTarget::Commit { rev } => format!("{repo_id}@{rev}"),
+                ShowTarget::File { rev, path } => format!("{repo_id}@{rev}:{path}"),
+                ShowTarget::WorkingChanges => format!("{repo_id}#worktree"),
+            },
+            Self::Shell { workspace, number } => format!("shell:{number}:{workspace}"),
         }
     }
 
@@ -2544,6 +2842,10 @@ impl VirtualTarget {
     /// itself contain `@`; the remainder can't, so the `:` split after it is unambiguous.
     pub fn parse_key(key: &str) -> Option<Self> {
         use aether_protocol::git::ShowTarget;
+        if let Some(rest) = key.strip_prefix("shell:") {
+            let (number, workspace) = rest.split_once(':')?;
+            return Some(Self::shell(workspace, number.parse().ok()?));
+        }
         if let Some(repo_id) = key.strip_suffix("#worktree") {
             return Some(Self::new(repo_id, ShowTarget::WorkingChanges));
         }
@@ -2560,6 +2862,46 @@ impl VirtualTarget {
                 },
             },
         ))
+    }
+}
+
+/// Decorations and structure computed once when a document's content was **generated** — for the
+/// documents no grammar spans and no file backs.
+///
+/// A closed enum rather than one nullable patch, because there are two kinds now and the
+/// difference matters everywhere the content is read: a patch divides into files and hunks, a
+/// shell into runs. Every reader that cares matches exhaustively (`ServerState::default_view`,
+/// `rebuild_view_layout`, `view_outline_of`, `change_anchors`), so a third kind cannot be silently
+/// rendered as a patch — which is exactly what a bare `Option<GeneratedPatch>` would have allowed.
+/// Readers that genuinely only want a patch ask for one ([`Document::patch`]) and get `None`.
+#[derive(Debug)]
+pub enum Generated {
+    /// `git/show`: a commit's diff, or the working tree's.
+    Patch(crate::patch::GeneratedPatch),
+    /// A shell view's transcript — its runs, its input, and where it runs.
+    Shell(crate::shell::Transcript),
+}
+
+impl Generated {
+    pub fn patch(&self) -> Option<&crate::patch::GeneratedPatch> {
+        match self {
+            Generated::Patch(p) => Some(p),
+            Generated::Shell(_) => None,
+        }
+    }
+
+    pub fn transcript(&self) -> Option<&crate::shell::Transcript> {
+        match self {
+            Generated::Shell(t) => Some(t),
+            Generated::Patch(_) => None,
+        }
+    }
+
+    pub fn transcript_mut(&mut self) -> Option<&mut crate::shell::Transcript> {
+        match self {
+            Generated::Shell(t) => Some(t),
+            Generated::Patch(_) => None,
+        }
     }
 }
 
@@ -2600,8 +2942,17 @@ pub struct Document {
     /// awaits — and it is never contended: the state is behind one lock already.
     layout: std::sync::Mutex<LayoutCache>,
     /// Decorations and structure computed once when the content was *generated*, for documents no
-    /// grammar spans — the commit patch behind `git/show`. See [`crate::patch::GeneratedPatch`].
-    pub generated: Option<crate::patch::GeneratedPatch>,
+    /// grammar spans — the commit patch behind `git/show`, a shell's transcript. See [`Generated`].
+    pub generated: Option<Generated>,
+    /// This document is a **field of a view** rather than a document of the user's: a shell's
+    /// input line. It is never listed in a picker, never written to the session file, never backed
+    /// up, never attached to a language server, and — see [`Self::saved_revision`] — never dirty.
+    ///
+    /// One flag consulted by the places that enumerate the user's work, rather than an exclusion
+    /// remembered at each of them: an internal document that leaked into the buffers picker would
+    /// be a row nobody can open, and one that leaked into the dirty aggregate would put a modified
+    /// marker on a shell for the crime of having a half-typed command in it.
+    pub internal: bool,
     /// Detected (or defaulted) once on load; stable for the buffer's lifetime so further edits
     /// don't make the unit drift.
     pub indent_style: IndentStyle,
@@ -2874,6 +3225,7 @@ impl Document {
             disk_blob: None,
             last_shift: None,
             layout: Default::default(),
+            internal: false,
             virtual_source: None,
         })
     }
@@ -2901,6 +3253,7 @@ impl Document {
             syntax_pending: false,
             last_shift: None,
             layout: Default::default(),
+            internal: false,
             generated: None,
             indent_style,
             saved_revision: Some(0),
@@ -2933,7 +3286,7 @@ impl Document {
         source: VirtualSource,
         text: String,
         language: Option<String>,
-        generated: Option<crate::patch::GeneratedPatch>,
+        generated: Option<Generated>,
         force_defer: bool,
     ) -> Self {
         let text = ropey::Rope::from_str(&text);
@@ -2974,12 +3327,39 @@ impl Document {
             disk_blob: None,
             last_shift: None,
             layout: Default::default(),
+            internal: false,
         }
     }
 
     /// Whether this document refuses edits, saves and reloads — true exactly for the virtual ones.
     pub fn read_only(&self) -> bool {
         self.virtual_source.is_some()
+    }
+
+    /// The generated patch this document holds, or `None` for one generated some other way.
+    ///
+    /// For the readers whose question genuinely *is* "is this a patch?" — the `is_patch` flag, the
+    /// patch index, the follow-the-line lookup. Everything that has to behave differently per kind
+    /// matches [`Generated`] exhaustively instead, which is what stops a shell being treated as a
+    /// patch with an empty index.
+    pub fn patch(&self) -> Option<&crate::patch::GeneratedPatch> {
+        self.generated.as_ref()?.patch()
+    }
+
+    /// The shell transcript this document holds, if it is one.
+    pub fn transcript(&self) -> Option<&crate::shell::Transcript> {
+        self.generated.as_ref()?.transcript()
+    }
+
+    /// An **internal** document: a field of a view rather than a document of the user's — a
+    /// shell's input line, and nothing else so far. Editable and ordinary in every other respect,
+    /// so the whole edit surface works in it unchanged; see [`Self::internal`] for what it is
+    /// excluded from.
+    pub fn field(id: DocumentId, language: Option<String>) -> Self {
+        Document {
+            internal: true,
+            ..Document::scratch(id, language)
+        }
     }
 
     /// Content for a scratch buffer: empty, pathless. The scratch's per-workspace display number
@@ -3003,6 +3383,7 @@ impl Document {
             syntax_pending: false,
             last_shift: None,
             layout: Default::default(),
+            internal: false,
             generated: None,
             indent_style,
             // Treat empty scratch as "clean"; first edit makes it dirty.
@@ -3079,6 +3460,24 @@ impl Document {
         max
     }
 
+    /// Lines that hold content — the line count without the phantom empty line ropey reports
+    /// after a final newline.
+    ///
+    /// What a shell's runs partition, and so where the next run starts. The phantom is deliberately
+    /// outside every run's element: giving it to the last run would make that element shrink by one
+    /// the moment the next run began, and "a finished run's extent never moves" is the property the
+    /// whole transcript rests on.
+    pub fn content_lines(&self) -> u32 {
+        let chars = self.text.len_chars();
+        if chars == 0 {
+            0
+        } else if self.text.char(chars - 1) == '\n' {
+            self.line_count().saturating_sub(1)
+        } else {
+            self.line_count()
+        }
+    }
+
     pub fn line_count(&self) -> u32 {
         // ropey counts lines as separated by \n; a trailing empty "line" after a final \n is
         // included. For protocol purposes we report ropey's count directly — clients see what
@@ -3088,7 +3487,15 @@ impl Document {
 
     /// Revision at the last successful save (or `0` for a fresh scratch buffer that's never been
     /// saved). The client uses this together with `revision` to derive `dirty`.
+    ///
+    /// An **internal** document answers with its current revision, so it reads as clean however
+    /// much has been typed into it. Here rather than at each of the places that ask, because the
+    /// question is asked in four of them — the status bar's dot, the dirty aggregate, the session
+    /// file, the backup flush — and "the shell input is not unsaved work" has to be one answer.
     pub fn saved_revision(&self) -> Revision {
+        if self.internal {
+            return self.revision;
+        }
         self.saved_revision.unwrap_or(0)
     }
 
@@ -3410,7 +3817,9 @@ impl Document {
     }
 
     fn recompute_dirty(&mut self) {
-        self.dirty = self.saved_revision != Some(self.revision);
+        // An internal document has nowhere to save to and nothing worth rescuing: a half-typed
+        // shell command is not unsaved work. See [`Self::internal`].
+        self.dirty = !self.internal && self.saved_revision != Some(self.revision);
         if !self.dirty {
             // Back in step with disk, so the snapshot has nothing left to describe. Dropping it
             // here rather than only on save is what makes undoing back to the saved point clear
@@ -3448,14 +3857,52 @@ impl Document {
     /// every viewport showing it needs its element bindings re-derived. Going through
     /// [`ServerState::replace_generated`] is what makes the pair unskippable rather than something
     /// a third rebuild path has to remember.
-    pub(in crate::state) fn replace_generated(
-        &mut self,
-        text: &str,
-        generated: Option<crate::patch::GeneratedPatch>,
-    ) {
+    pub(in crate::state) fn replace_generated(&mut self, text: &str, generated: Option<Generated>) {
         self.text = ropey::Rope::from_str(text);
         self.layout_cache_mut().clear();
         self.generated = generated;
+        self.revision += 1;
+        self.saved_revision = Some(self.revision);
+        self.recompute_dirty();
+    }
+
+    /// Rewrite a generated document's **tail**: replace everything from char `from` to the end
+    /// with `text`.
+    ///
+    /// The mutation a stream of output needs, and the reason it is not
+    /// [`Self::replace_generated`]: a command producing a hundred thousand lines would otherwise
+    /// re-rope and re-wrap the whole document twenty times a second, and a carriage-return progress
+    /// bar would do it for every frame it draws. `from` is the start of the line being appended to
+    /// — the earliest point a `\r` can have changed — so the work is proportional to what actually
+    /// moved.
+    ///
+    /// Four properties, each of which is a bug if it is missing:
+    /// - it **splices** the wrap cache rather than clearing it, so the lines above the tail keep
+    ///   their measured heights and a long transcript doesn't re-wrap per flush;
+    /// - it bumps `revision`, because viewport pushes are revision-guarded and would otherwise be
+    ///   dropped as stale;
+    /// - it moves `saved_revision` with it, because a transcript is read-only and has nothing to
+    ///   save — leaving the two apart would show a modified marker for output the user never typed;
+    /// - it **never touches undo**. There is nothing to undo: the text is a record of what
+    ///   happened, and an undo stack over it would grow without bound while a build runs.
+    ///
+    /// Restricted to this module, and reachable only through [`ServerState::extend_transcript`],
+    /// which rebuilds the view's layout from the same transcript in the same breath — a tail write
+    /// that lands without one leaves the last run's element the length it was before the output
+    /// arrived. It is deliberately *not* on [`Editable`]: this is generation, not editing, and a
+    /// read-only document must keep refusing every edit there is.
+    pub(in crate::state) fn write_tail(&mut self, from: usize, text: &str) {
+        let from = from.min(self.text.len_chars());
+        let first_line = self.text.char_to_line(from) as u32;
+        let removed = self.line_count() - first_line;
+        self.text.remove(from..self.text.len_chars());
+        self.text.insert(from, text);
+        let inserted = self.line_count() - first_line;
+        self.layout_cache_mut().record(LineSplice {
+            at: first_line,
+            removed,
+            inserted,
+        });
         self.revision += 1;
         self.saved_revision = Some(self.revision);
         self.recompute_dirty();
@@ -3700,10 +4147,13 @@ impl View {
                 buffer_id,
                 lines: ElementLines::Whole,
                 decorations: None,
+                chrome_before: Default::default(),
                 chrome_above: std::sync::Arc::new(Vec::new()),
                 laid_out_by: LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Field,
                 edges: aether_protocol::ui::Edges::NONE,
                 box_group: None,
+                title: Default::default(),
                 band: aether_protocol::ui::Band::None,
             }],
         }
@@ -3721,10 +4171,13 @@ impl View {
                 buffer_id,
                 lines: ElementLines::Whole,
                 decorations: None,
+                chrome_before: Default::default(),
                 chrome_above: std::sync::Arc::new(Vec::new()),
                 laid_out_by: LayoutOwner::Client,
+                role: aether_protocol::ui::ElementRole::Field,
                 edges: aether_protocol::ui::Edges::NONE,
                 box_group: None,
+                title: Default::default(),
                 band: aether_protocol::ui::Band::None,
             }],
         }
@@ -3740,9 +4193,19 @@ impl View {
 
     /// Which of the two client-choosable kinds this view is — `None` for a view a driver built,
     /// which is neither and cannot be re-presented as either.
+    ///
+    /// "One element over the whole of its buffer, with nothing drawn around it" is the test, and
+    /// every clause of it counts: a fresh shell is also a single whole-buffer element, and what
+    /// makes it not a file's editor is that the element is an *input* standing in a box of its own.
     pub fn kind(&self) -> Option<ViewKind> {
         match &self.elements[..] {
-            [only] if only.lines == ElementLines::Whole && only.chrome_above.is_empty() => {
+            [only]
+                if only.lines == ElementLines::Whole
+                    && only.chrome_above.is_empty()
+                    && only.title.is_empty()
+                    && only.box_group.is_none()
+                    && only.role.is_field() =>
+            {
                 Some(match only.laid_out_by {
                     LayoutOwner::Server => ViewKind::Editor,
                     LayoutOwner::Client => ViewKind::Reader,
@@ -3760,6 +4223,89 @@ impl View {
             last_used: 0,
             transient: false,
             elements: layout.iter().map(|l| l.bind(view_buffer)).collect(),
+        }
+    }
+
+    /// A shell: one element per run, each introduced by its header, and the **input** last.
+    ///
+    /// The input is an element like any other — it windows an ordinary editable document, which is
+    /// what makes typing into it work with no new edit path — and is marked
+    /// [`aether_protocol::ui::ElementRole::Input`] so the client can find it without being told
+    /// what kind of view it is looking at.
+    ///
+    /// A shell with no runs is a real state: the view is then just the input, which is what
+    /// `Space b` on a fresh shell shows.
+    /// Which element is a shell's input, if this view has one. By role, never by position: the
+    /// input is the last element, and "last" is a different number after every run.
+    pub fn input_element(&self) -> Option<aether_protocol::ui::FieldId> {
+        self.elements
+            .iter()
+            .position(|e| e.role.is_input())
+            .map(|i| i as aether_protocol::ui::FieldId)
+    }
+
+    pub fn over_transcript(view_buffer: BufferId, t: &crate::shell::Transcript) -> Self {
+        use aether_protocol::ui::{Band, Edges, Sides};
+        // Every run is a box of its own, closed on all four sides, and so is the input: a separate
+        // box per run rather than one ruled list, because each one is *named* — its directory, and
+        // once it is over its outcome and how long it took — and a name belongs to one box. Runs
+        // are read one at a time; a shared rail invited them to be read as one document.
+        let boxed = Edges {
+            border: Sides::all(1),
+            padding: Sides::ZERO,
+            collapse: false,
+        };
+        // One blank row of ground between boxes: a chrome row with nothing on it, standing before
+        // the box rather than inside it.
+        let gap =
+            || std::sync::Arc::new(vec![aether_protocol::viewport::Element::chrome(Vec::new())]);
+        let mut elements: Vec<ElementBinding> = t
+            .runs
+            .iter()
+            .enumerate()
+            .map(|(i, run)| ElementBinding {
+                buffer_id: view_buffer,
+                lines: ElementLines::Range {
+                    start: run.start_line,
+                    end_exclusive: run.end_line_exclusive,
+                },
+                decorations: None,
+                // A blank row of ground before every box but the first.
+                chrome_before: if i == 0 { Default::default() } else { gap() },
+                // Inside the box, the command alone; the directory and the outcome are the box's
+                // own name, on the border above it.
+                chrome_above: std::sync::Arc::new(crate::shell::command_row(run)),
+                laid_out_by: LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Field,
+                edges: boxed,
+                box_group: Some(i as u32),
+                title: std::sync::Arc::new(crate::shell::run_title(run)),
+                band: Band::Chrome,
+            })
+            .collect();
+        elements.push(ElementBinding {
+            buffer_id: t.input,
+            lines: ElementLines::Whole,
+            decorations: None,
+            chrome_before: if t.runs.is_empty() {
+                Default::default()
+            } else {
+                gap()
+            },
+            // Nothing above the line you type: the box says where you are, and the box is enough.
+            chrome_above: std::sync::Arc::new(Vec::new()),
+            laid_out_by: LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Input,
+            edges: boxed,
+            box_group: Some(t.runs.len() as u32),
+            title: std::sync::Arc::new(crate::shell::input_title(&t.cwd)),
+            band: Band::Chrome,
+        });
+        View {
+            presenting: view_buffer,
+            last_used: 0,
+            transient: false,
+            elements,
         }
     }
 
@@ -3781,6 +4327,7 @@ impl View {
                         end_exclusive: e.end_line,
                     },
                     decorations: None,
+                    chrome_before: Default::default(),
                     chrome_above: std::sync::Arc::new(
                         g.decorations
                             .chrome
@@ -3789,8 +4336,10 @@ impl View {
                             .unwrap_or_default(),
                     ),
                     laid_out_by: LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
                     edges: aether_protocol::ui::Edges::NONE,
                     box_group: None,
+                    title: Default::default(),
                     band: aether_protocol::ui::Band::None,
                 })
                 .collect(),
@@ -3895,12 +4444,19 @@ impl ElementExtent {
 pub struct ElementLayout {
     pub extent: ElementExtent,
     pub chrome_above: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
+    /// Chrome standing **before** the element's box, outside it — the gap between one box and
+    /// the next. `chrome_above` goes inside a box the element opens; this never does.
+    pub chrome_before: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
     pub decorations: Option<std::sync::Arc<ElementDecorations>>,
     /// The accumulated inset of the box this element sits in — see [`ElementBinding::edges`].
     pub edges: aether_protocol::ui::Edges,
     /// Which box this element belongs to — see [`ElementBinding::box_group`].
     pub box_group: Option<u32>,
+    /// What the box this element opens says on its top border — see [`ElementBinding::title`].
+    pub title: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
     pub band: aether_protocol::ui::Band,
+    /// See [`ElementBinding::role`].
+    pub role: aether_protocol::ui::ElementRole,
 }
 
 impl ElementLayout {
@@ -3916,9 +4472,12 @@ impl ElementLayout {
             },
             decorations: self.decorations.clone(),
             chrome_above: self.chrome_above.clone(),
+            chrome_before: self.chrome_before.clone(),
             laid_out_by: LayoutOwner::Server,
+            role: self.role,
             edges: self.edges,
             box_group: self.box_group,
+            title: self.title.clone(),
             band: self.band,
         }
     }
@@ -3986,11 +4545,19 @@ pub struct ElementBinding {
     /// lookup was the last thing tying a view's structure to a document's line space. An element
     /// whose content comes from a real file has no line in the patch to anchor its heading to.
     pub chrome_above: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
+    /// Chrome standing **before** the element's box, outside it — the gap between one box and
+    /// the next. `chrome_above` goes inside a box the element opens; this never does.
+    pub chrome_before: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
     /// Whose arithmetic the element's height is. A server-laid-out element is wrapped to the
     /// viewport and shipped a screen at a time; a client-laid-out one is sent unwrapped and whole,
     /// and the client measures it. Decided by the view's kind, never per viewport: two clients
     /// presenting one view see the same elements.
     pub laid_out_by: LayoutOwner,
+    /// What the element is *for* — see [`aether_protocol::ui::ElementRole`]. `Field` for every
+    /// element of an ordinary or composed view; `Input` for the line a shell's next command is
+    /// typed into. Rides to the client on the window, so no shell has to re-derive it from the
+    /// shape of the tree.
+    pub role: aether_protocol::ui::ElementRole,
     /// The cells the box around this element spends on its own border and padding — accumulated
     /// over every container enclosing it, so it is the whole inset rather than one frame's share.
     ///
@@ -4008,11 +4575,32 @@ pub struct ElementBinding {
     /// the whole view addresses them that way. Consecutiveness is the driver's guarantee: a patch's
     /// file blocks are contiguous by construction, and nothing else builds boxes yet.
     pub box_group: Option<u32>,
+    /// What the box this element **opens** says on its top border: the run's directory and
+    /// outcome, for a shell. Empty for every element that opens no box and for every box with
+    /// nothing to say.
+    ///
+    /// Read from the element that opens a box and ignored on the rest of the run, exactly as
+    /// `edges` and `band` are: only the opening element's is composed onto the box. A title costs
+    /// the box no rows, so unlike `chrome_above` it changes nothing about the element's height.
+    pub title: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
     /// What the box paints behind its own border and padding cells.
     pub band: aether_protocol::ui::Band,
 }
 
 impl ElementBinding {
+    /// Whether the element windows no lines at all — a shell run that said nothing. Such an
+    /// element is drawn (its box, its title, its chrome) but never focused or stepped to: there
+    /// is no line in it for a cursor to sit on.
+    pub fn is_empty(&self) -> bool {
+        match self.lines {
+            ElementLines::Whole => false,
+            ElementLines::Range {
+                start,
+                end_exclusive,
+            } => end_exclusive <= start,
+        }
+    }
+
     /// The element's lines, given how many the buffer has **now** — a whole-buffer element is as
     /// long as its buffer, a range is what it was told. Not yet clamped: that is
     /// [`ViewLayout::of`]'s job, and the one place it happens.
@@ -4221,10 +4809,13 @@ mod view_layout_tests {
                 end_exclusive: 13,
             },
             decorations: None,
+            chrome_before: Default::default(),
             chrome_above: Default::default(),
             laid_out_by: LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             edges: aether_protocol::ui::Edges::NONE,
             box_group: None,
+            title: Default::default(),
             band: aether_protocol::ui::Band::None,
         };
         vec![binding(1), binding(2)]
@@ -4284,11 +4875,14 @@ mod view_layout_tests {
         // Two hunks of file `a` plus one of file `b` — the third must not move when `a` is edited.
         let bound = |buffer, lines: std::ops::Range<u32>| ElementLayout {
             extent: ElementExtent::Bound { buffer, lines },
+            chrome_before: Default::default(),
             chrome_above: Default::default(),
             decorations: None,
             edges: aether_protocol::ui::Edges::NONE,
             box_group: None,
+            title: Default::default(),
             band: aether_protocol::ui::Band::None,
+            role: aether_protocol::ui::ElementRole::Field,
         };
         let patch = file(3, "patch\n");
         s.set_view_layout(
@@ -4398,6 +4992,10 @@ mod virtual_target_tests {
                     path: "src/a.rs".into(),
                 },
             ),
+            // A shell is not a repo at all. Its key leads with a token no canonical workdir can
+            // start with, so the two namespaces can't collide.
+            VirtualTarget::shell("my-project", 1),
+            VirtualTarget::shell("weird:name@here", 42),
         ];
         for target in cases {
             let key = target.key();
@@ -4418,7 +5016,7 @@ mod virtual_target_tests {
     #[test]
     fn a_shape_without_a_field_answers_none() {
         let working = VirtualTarget::new("/proj", ShowTarget::WorkingChanges);
-        assert_eq!(working.repo_id, "/proj");
+        assert_eq!(working.repo_id(), Some("/proj"));
         assert_eq!(working.rev(), None, "never hand this to rev-parse");
         assert_eq!(working.path(), None);
         assert!(!working.is_immutable(), "the worktree moves; rebuild it");
@@ -4437,6 +5035,369 @@ mod virtual_target_tests {
         );
         assert_eq!(file.path(), Some("a.rs"));
         assert!(file.is_immutable());
+
+        // A shell has no repo, no revision and no path — asking gets `None` rather than an
+        // invented empty string that would then be handed to git.
+        let shell = VirtualTarget::shell("proj", 2);
+        assert_eq!(shell.repo_id(), None);
+        assert_eq!(shell.what(), None);
+        assert_eq!(shell.rev(), None);
+        assert_eq!(shell.path(), None);
+        assert!(!shell.is_immutable());
+        assert_eq!(shell.title().as_deref(), Some("Shell 2"));
+    }
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+    use crate::shell::Transcript;
+
+    /// A shell whose transcript holds `text` and whose runs are `(start, end_exclusive)`.
+    fn shell_state(text: &str, runs: &[(u32, u32)]) -> (ServerState, BufferId, BufferId) {
+        let mut s = ServerState::new();
+        let transcript = s.allocate_buffer_id();
+        let input = s.allocate_buffer_id();
+        s.insert_buffer_with_document(input, None, false, |id| Document::field(id, None));
+        let mut t = Transcript::new(input, PathBuf::from("/tmp"), "Shell 1".into());
+        for (start, end) in runs {
+            let (handle, _token) = crate::process::cancel_channel();
+            let id = t.push_run(format!("cmd{start}"), *start, handle);
+            t.run_mut(id).unwrap().end_line_exclusive = *end;
+            t.run_mut(id).unwrap().status = aether_protocol::shell::RunStatus::Exited { code: 0 };
+        }
+        let doc_id = s.allocate_document_id();
+        s.documents.insert(
+            doc_id,
+            Document::virtual_content(
+                doc_id,
+                VirtualSource {
+                    target: VirtualTarget::shell("proj", 1),
+                    title: "Shell 1".into(),
+                },
+                text.to_string(),
+                None,
+                Some(Generated::Shell(t)),
+                false,
+            ),
+        );
+        s.buffers.insert(
+            transcript,
+            Buffer {
+                id: transcript,
+                document: doc_id,
+                scratch_number: None,
+            },
+        );
+        s.buffer_workspaces.insert(transcript, "proj".into());
+        s.buffer_workspaces.insert(input, "proj".into());
+        s.open_view(transcript);
+        (s, transcript, input)
+    }
+
+    /// The view a shell presents: one element per run, over the transcript's own lines, and the
+    /// **input last** — which is what makes a client able to find it without knowing what kind of
+    /// view it is looking at.
+    #[test]
+    fn a_shell_view_is_its_runs_then_its_input() {
+        let (s, transcript, input) = shell_state("one\ntwo\n", &[(0, 1), (1, 2)]);
+        let view = s.view(s.view_presenting(transcript).unwrap());
+        assert_eq!(view.elements.len(), 3, "two runs and the input");
+        // A blank row of ground stands before every box but the first.
+        assert!(view.elements[0].chrome_before.is_empty());
+        assert!(!view.elements[1].chrome_before.is_empty());
+        assert!(!view.elements[2].chrome_before.is_empty());
+        assert_eq!(view.elements[0].buffer_id, transcript);
+        assert_eq!(
+            view.elements[0].lines,
+            ElementLines::Range {
+                start: 0,
+                end_exclusive: 1
+            }
+        );
+        assert_eq!(
+            view.elements[0].chrome_above.len(),
+            1,
+            "a run's box holds the command it ran, and nothing else above its output"
+        );
+        assert!(
+            view.elements[0]
+                .title
+                .iter()
+                .map(aether_protocol::viewport::Element::text_content)
+                .collect::<String>()
+                .starts_with('/'),
+            "and its box is named for the directory it ran in"
+        );
+        let last = view.elements.last().unwrap();
+        assert_eq!(last.buffer_id, input, "the input is the last element");
+        assert_eq!(last.lines, ElementLines::Whole);
+        assert!(last.role.is_input());
+        assert!(
+            view.elements[..2].iter().all(|e| !e.role.is_input()),
+            "and nothing else claims to be one"
+        );
+        // A driver-built view has no client-choosable kind, and a shell is one of those.
+        assert_eq!(view.kind(), None);
+
+        // Each run is a box of its own, and so is the input: closed on all four sides, with
+        // nothing shared between them — a run is read on its own, and it is named on its own.
+        let groups: Vec<_> = view.elements.iter().map(|e| e.box_group).collect();
+        assert_eq!(groups, vec![Some(0), Some(1), Some(2)]);
+        for e in &view.elements {
+            assert_eq!(
+                (
+                    e.edges.border.top,
+                    e.edges.border.right,
+                    e.edges.border.bottom,
+                    e.edges.border.left
+                ),
+                (1, 1, 1, 1),
+                "every box closes itself"
+            );
+            assert!(!e.edges.collapse, "and shares no edge with the next");
+            assert_eq!(e.band, aether_protocol::ui::Band::Chrome);
+            assert!(!e.title.is_empty(), "every box is named");
+        }
+        // The input's box says only where it is: there is no outcome yet, and nothing above the
+        // line you type.
+        assert!(last.chrome_above.is_empty());
+        assert_eq!(
+            last.title
+                .iter()
+                .map(aether_protocol::viewport::Element::text_content)
+                .collect::<String>(),
+            view.elements[0]
+                .title
+                .iter()
+                .map(aether_protocol::viewport::Element::text_content)
+                .collect::<String>()
+                .split("  ")
+                .next()
+                .unwrap(),
+            "the same directory a run's title opens with"
+        );
+    }
+
+    /// An empty shell is a real state: the view is just the input, and it still has one.
+    #[test]
+    fn a_new_shell_is_just_its_input() {
+        let (s, transcript, input) = shell_state("", &[]);
+        let view = s.view(s.view_presenting(transcript).unwrap());
+        assert_eq!(view.elements.len(), 1);
+        assert_eq!(view.elements[0].buffer_id, input);
+        assert!(view.elements[0].role.is_input());
+        // And it is still not a file's editor. A fresh shell is one whole-buffer element with no
+        // chrome above it, which is the shape `kind()` reads — what tells the two apart is the
+        // role, the box and the name on it, and dropping any of those from the test hands a shell
+        // a client-choosable kind and offers to re-present it as a reader.
+        assert_eq!(view.kind(), None);
+    }
+
+    /// The tail write is what output arrives through: it extends the document, carries the active
+    /// run's extent with it, and leaves the buffer clean — a transcript is not unsaved work.
+    #[test]
+    fn extending_a_transcript_moves_the_active_runs_extent_and_stays_clean() {
+        let (mut s, transcript, _) = shell_state("", &[]);
+        let (handle, _token) = crate::process::cancel_channel();
+        s.with_transcript(transcript, |t| t.push_run("ls".into(), 0, handle));
+        let before = s.doc_of(transcript).revision;
+
+        assert!(s.extend_transcript(transcript, 0, "one\ntwo"));
+        let doc = s.doc_of(transcript);
+        assert_eq!(doc.text.to_string(), "one\ntwo");
+        assert!(doc.revision > before, "pushes are revision-guarded");
+        assert!(!doc.dirty, "generated content is never unsaved work");
+        assert_eq!(doc.saved_revision(), doc.revision);
+        let run = &doc.transcript().unwrap().runs[0];
+        assert_eq!((run.start_line, run.end_line_exclusive), (0, 2));
+
+        // A carriage-return redraw rewrites the last line: the tail write starts at that line, so
+        // the document ends up with what the reader would see, not with both versions.
+        assert!(s.extend_transcript(transcript, 4, "three\n"));
+        assert_eq!(s.doc_of(transcript).text.to_string(), "one\nthree\n");
+        let run = &s.doc_of(transcript).transcript().unwrap().runs[0];
+        assert_eq!(
+            (run.start_line, run.end_line_exclusive),
+            (0, 2),
+            "the phantom line after a final newline belongs to no run"
+        );
+    }
+
+    /// A run is appended *above* the input, so the input's element number goes up by one with
+    /// every command — and a viewport's focus is that number. The caret follows the input, not
+    /// the number; a caret parked on a run's output is left where it is.
+    #[test]
+    fn focus_follows_the_input_when_a_run_is_appended_above_it() {
+        let (mut s, transcript, _) = shell_state("", &[]);
+        let view = s.view_presenting(transcript).unwrap();
+        assert_eq!(
+            s.view(view).input_element(),
+            Some(0),
+            "a fresh shell is only its input"
+        );
+        let viewport = |id, focused| Viewport {
+            id,
+            client_id: uuid::Uuid::new_v4(),
+            view_id: view,
+            rows: 10,
+            overscan_rows: 0,
+            wrap: WrapMode::None,
+            tab_width: 4,
+            diff_view: false,
+            cols: 80,
+            continuation_marker_width: 0,
+            loaded: vec![None],
+            anchor: ScrollPosition::default(),
+            focused,
+        };
+        s.viewports.insert(1, viewport(1, 0));
+
+        let (handle, _token) = crate::process::cancel_channel();
+        s.with_transcript(transcript, |t| t.push_run("one".into(), 0, handle));
+        s.extend_transcript(transcript, 0, "first\n");
+        assert_eq!(s.view(view).input_element(), Some(1));
+        assert_eq!(
+            s.viewports[&1].focused, 1,
+            "the caret is still in the input"
+        );
+
+        // A second viewport is reading the first run's output.
+        s.viewports.insert(2, viewport(2, 0));
+        let start = s.doc_of(transcript).line_count() - 1;
+        let from = s.doc_of(transcript).text.len_chars();
+        let (handle, _token) = crate::process::cancel_channel();
+        s.with_transcript(transcript, |t| t.push_run("two".into(), start, handle));
+        s.extend_transcript(transcript, from, "second\n");
+        assert_eq!(s.view(view).input_element(), Some(2));
+        assert_eq!(s.viewports[&1].focused, 2, "still in the input");
+        assert_eq!(s.viewports[&2].focused, 0, "still reading the first run");
+    }
+
+    /// A second run appends an element and leaves the first one exactly where it was — the
+    /// property the whole transcript rests on, since a run's output is final once it is over.
+    #[test]
+    fn a_second_run_leaves_the_first_alone() {
+        let (mut s, transcript, _) = shell_state("", &[]);
+        let (handle, _token) = crate::process::cancel_channel();
+        s.with_transcript(transcript, |t| t.push_run("one".into(), 0, handle));
+        s.extend_transcript(transcript, 0, "first\n");
+        s.with_transcript(transcript, |t| {
+            t.runs[0].status = aether_protocol::shell::RunStatus::Exited { code: 0 };
+        });
+        let first = s.view(s.view_presenting(transcript).unwrap()).elements[0].lines;
+
+        let start = s.doc_of(transcript).line_count() - 1;
+        let (handle, _token) = crate::process::cancel_channel();
+        s.with_transcript(transcript, |t| t.push_run("two".into(), start, handle));
+        s.extend_transcript(
+            transcript,
+            s.doc_of(transcript).text.len_chars(),
+            "second\n",
+        );
+
+        let view = s.view(s.view_presenting(transcript).unwrap());
+        assert_eq!(view.elements.len(), 3, "two runs and the input");
+        assert_eq!(view.elements[0].lines, first, "the first run has not moved");
+        assert_eq!(
+            view.elements[1].lines,
+            ElementLines::Range {
+                start: 1,
+                end_exclusive: 2
+            }
+        );
+        assert_eq!(s.doc_of(transcript).text.to_string(), "first\nsecond\n");
+    }
+
+    /// The tail write splices the wrap cache rather than clearing it — the reason a hundred
+    /// thousand lines of output don't re-wrap twenty times a second.
+    #[test]
+    fn a_tail_write_splices_the_wrap_cache() {
+        let (mut s, transcript, _) = shell_state("", &[]);
+        let (handle, _token) = crate::process::cancel_channel();
+        s.with_transcript(transcript, |t| t.push_run("ls".into(), 0, handle));
+        s.extend_transcript(transcript, 0, "aaaa\nbb\n");
+        let geom = crate::wrap::WrapGeometry {
+            wrap: aether_protocol::viewport::WrapMode::Soft,
+            cols: 3,
+            marker_width: 0,
+            tab_width: 4,
+        };
+        // Populate the cache, then extend and read it back: the counts for the untouched lines
+        // must survive, and the new ones must be present.
+        assert_eq!(&s.doc_of(transcript).wrapped_rows(geom)[..2], &[2, 1]);
+        s.extend_transcript(
+            transcript,
+            s.doc_of(transcript).text.len_chars(),
+            "cccccc\n",
+        );
+        assert_eq!(&s.doc_of(transcript).wrapped_rows(geom)[..3], &[2, 1, 2]);
+    }
+
+    /// A transcript is generated content, not something the user typed: appending to it must not
+    /// give them an undo step, or a long build would fill the stack with rope snapshots.
+    #[test]
+    fn appending_output_is_not_undoable() {
+        let (mut s, transcript, _) = shell_state("", &[]);
+        let (handle, _token) = crate::process::cancel_channel();
+        s.with_transcript(transcript, |t| t.push_run("ls".into(), 0, handle));
+        s.extend_transcript(transcript, 0, "line\n");
+        // The only door to a mutation with undo is `Editable`, and a virtual document is refused
+        // at it — which is what makes "output is not undoable" structural rather than a
+        // convention the streaming task has to remember.
+        assert!(s.editable_doc(transcript).is_err());
+    }
+
+    /// The input is a document of the view's, not of the user's: it never counts as unsaved work,
+    /// never appears in the session file, and never pins the idle reaper.
+    #[test]
+    fn the_input_is_internal_and_never_dirty() {
+        let (mut s, transcript, input) = shell_state("", &[]);
+        {
+            let doc = s.doc_of_mut(input);
+            assert!(doc.internal);
+        }
+        // Type into it through the ordinary edit path.
+        let mut editable = s.editable_doc(input).expect("the input is editable");
+        editable.apply_edit(0, 0, "cargo build", EditKindTag::Text, HashMap::new());
+        let doc = s.doc_of(input);
+        assert_eq!(doc.text.to_string(), "cargo build");
+        assert!(!doc.dirty, "a half-typed command is not unsaved work");
+        assert_eq!(
+            doc.saved_revision(),
+            doc.revision,
+            "so the client's dirty dot stays out"
+        );
+        assert!(!s.has_unprotected_unsaved_buffers());
+        assert!(
+            s.session_views("proj").is_empty(),
+            "and nothing is recorded"
+        );
+        let _ = transcript;
+    }
+
+    /// Closing a shell takes its input and its runs with it. Nothing else can reach either.
+    #[test]
+    fn closing_a_shell_drops_its_input_and_stops_its_runs() {
+        let (mut s, transcript, input) = shell_state("", &[]);
+        let (handle, mut token) = crate::process::cancel_channel();
+        s.with_transcript(transcript, |t| t.push_run("sleep 100".into(), 0, handle));
+        assert!(!*token.borrow_and_update());
+
+        s.close_buffer(transcript);
+        assert!(*token.borrow_and_update(), "the run was told to stop");
+        assert!(!s.buffers.contains_key(&input), "the input went with it");
+        assert!(!s.buffers.contains_key(&transcript));
+    }
+
+    /// Shell numbers behave like scratch numbers: lowest free, per workspace, reused on close.
+    #[test]
+    fn shell_numbers_are_the_lowest_free_per_workspace() {
+        let (mut s, transcript, _) = shell_state("", &[]);
+        assert_eq!(s.next_shell_number("proj"), 2, "1 is taken");
+        assert_eq!(s.next_shell_number("other"), 1, "a different workspace");
+        s.close_buffer(transcript);
+        assert_eq!(s.next_shell_number("proj"), 1, "and 1 is free again");
     }
 }
 

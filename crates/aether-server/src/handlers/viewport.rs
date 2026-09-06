@@ -274,7 +274,14 @@ fn other_elements_dirty(
         .iter()
         .enumerate()
         .filter(|(i, e)| *i != focused as usize && Some(e.buffer_id) != focused_buffer)
-        .any(|(_, e)| s.try_doc_of(e.buffer_id).is_some_and(|d| d.dirty))
+        // An internal element never counts: a shell's input is where the next command is being
+        // typed, and a modified marker on a shell for that would be a dot that never goes out.
+        // It answers `false` on its own too (`Document::internal` keeps it clean), so this is
+        // documentation of the intent rather than the enforcement.
+        .any(|(_, e)| {
+            s.try_doc_of(e.buffer_id)
+                .is_some_and(|d| d.dirty && !d.internal)
+        })
 }
 
 /// The buffer-level status for `buffer_id`: everything the status bar shows that the window itself
@@ -354,13 +361,22 @@ pub async fn viewport_focus_element(
     let view = s.view_of(vp);
 
     let last = view.elements.len().saturating_sub(1) as u32;
+    // A step lands on the nearest element in that direction that has a line to land on — one
+    // with no lines (a shell run that said nothing) is drawn but skipped — and stays put when
+    // there is none.
+    let has_lines = |i: u32| view.elements.get(i as usize).is_some_and(|e| !e.is_empty());
     let focused = match params.target {
         FocusTarget::Step {
             direction: FocusStep::Next,
-        } => vp.focused.saturating_add(1).min(last),
+        } => (vp.focused + 1..=last)
+            .find(|&i| has_lines(i))
+            .unwrap_or(vp.focused),
         FocusTarget::Step {
             direction: FocusStep::Previous,
-        } => vp.focused.saturating_sub(1),
+        } => (0..vp.focused)
+            .rev()
+            .find(|&i| has_lines(i))
+            .unwrap_or(vp.focused),
         // Clamped rather than refused: an id names an element the client just saw, and a view that
         // rebuilt underneath it is a stale id, not a protocol error.
         FocusTarget::Element { element } => element.min(last),
@@ -412,7 +428,22 @@ fn change_anchors(
     let mut out = Vec::new();
     let view = s.view_of(vp);
     let view_buffer = view.presenting;
-    let generated = s.try_doc_of(view_buffer).and_then(|d| d.generated.as_ref());
+    // A shell's changes are its **runs** — `c` steps from one command's output to the next, which
+    // is the grain a transcript actually has. Answered up front rather than by falling through the
+    // diff walk below: a shell's elements carry no decorations and window the view's own document,
+    // so that walk answers "no changes at all" and `c` does nothing. The input is not a change: it
+    // is where you are going to type, not something that happened.
+    if let Some(t) = s.try_doc_of(view_buffer).and_then(|d| d.transcript()) {
+        return t
+            .runs
+            .iter()
+            .enumerate()
+            // A run that said nothing has no line to stop on.
+            .filter(|(_, run)| run.end_line_exclusive > run.start_line)
+            .map(|(idx, run)| (idx as aether_protocol::viewport::FieldId, run.start_line))
+            .collect();
+    }
+    let generated = s.try_doc_of(view_buffer).and_then(|d| d.patch());
     let layout = s.layout_of(&view.elements);
     for (idx, binding) in view.elements.iter().enumerate() {
         let Some(decorations) = binding.decorations.as_deref() else {
@@ -622,7 +653,7 @@ pub fn seat_in(
         LogicalPosition { line, col: 0 }
     } else {
         // The element windows the generated text: the same file line, as the patch numbers it.
-        let index = &s.doc_of(view_buffer).generated.as_ref()?.index;
+        let index = &s.doc_of(view_buffer).patch()?.index;
         let row = hit
             .patch_lines
             .clone()
@@ -705,8 +736,13 @@ pub fn view_outline_of(
     elements: &[crate::state::ElementBinding],
 ) -> Vec<OutlineEntry> {
     let doc = s.doc_of(view_buffer);
-    let Some(generated) = doc.generated.as_ref() else {
-        return Vec::new();
+    // Per kind, exhaustively. A shell's structure is its runs, labelled by the command that
+    // produced them, which is what makes `o`, `Space o` and the breadcrumb work in one without a
+    // single client-side check of what sort of view this is.
+    let generated = match doc.generated.as_ref() {
+        None => return Vec::new(),
+        Some(crate::state::Generated::Shell(t)) => return transcript_outline(t),
+        Some(crate::state::Generated::Patch(g)) => g,
     };
     // How a file the view shows is named when nothing windows it: the same name the buffer a bound
     // element windows would have, derived from the view's own target rather than read off a buffer
@@ -716,13 +752,13 @@ pub fn view_outline_of(
     let derived_identity = |path: &str| -> Option<String> {
         use aether_protocol::git::ShowTarget;
         let target = &source?.target;
-        Some(match &target.what {
-            ShowTarget::WorkingChanges => std::path::Path::new(&target.repo_id)
+        Some(match target.what()? {
+            ShowTarget::WorkingChanges => std::path::Path::new(target.repo_id()?)
                 .join(path)
                 .to_string_lossy()
                 .into_owned(),
             ShowTarget::Commit { rev } => crate::state::VirtualTarget::new(
-                target.repo_id.clone(),
+                target.repo_id()?.to_string(),
                 ShowTarget::File {
                     rev: rev.clone(),
                     path: path.to_string(),
@@ -817,6 +853,34 @@ pub fn view_outline_of(
         }
     }
     out
+}
+
+/// A shell's outline: one entry per run, named by the command that produced it.
+///
+/// The input is deliberately absent. An outline lists what a view *contains*, and the input
+/// contains nothing yet — including it would put a nameless row at the end of every shell's
+/// `Space o` and make `o` stop there on the way past.
+fn transcript_outline(t: &crate::shell::Transcript) -> Vec<OutlineEntry> {
+    t.runs
+        .iter()
+        .enumerate()
+        // A run that said nothing has no line to jump to.
+        .filter(|(_, run)| run.end_line_exclusive > run.start_line)
+        .map(|(idx, run)| OutlineEntry {
+            element: idx as aether_protocol::viewport::FieldId,
+            line: run.start_line,
+            // The "file" is the group a listing puts the entry under, and every run of one shell
+            // belongs to that shell. Its title is the only name it has.
+            file: t.title.clone(),
+            label: run.command.replace('\n', " \u{23ce} "),
+            patch_line: run.start_line,
+            patch_lines: run.start_line..run.end_line_exclusive.max(run.start_line + 1),
+            // Nothing durable to name: a transcript does not survive a restart, so an entry
+            // captured from one can never be found again in another.
+            identity: None,
+            file_lines: run.start_line..run.end_line_exclusive,
+        })
+        .collect()
 }
 
 /// The breadcrumb for a **composed** view: the path through its outline to the cursor.
@@ -1928,7 +1992,7 @@ fn render_element_lines(
     // they stay. Removals collapse wherever there is a line left to collapse onto.
     let baseline_rows = match supplied {
         Some(d) if diff_view => d.baseline_above.clone(),
-        None if diff_view && buf.generated.is_none() => {
+        None if diff_view && buf.patch().is_none() => {
             deleted_rows_by_anchor(hunks, buf.line_count(), Some(&intraline))
         }
         _ => HashMap::new(),
@@ -1942,7 +2006,7 @@ fn render_element_lines(
         .map(|_| buf.text.chunks().collect::<String>());
     // Generated read-only content (a commit's patch) instead of a parse tree — see
     // [`crate::patch::GeneratedPatch`]. Both are never present at once.
-    let generated = buf.generated.as_ref().map(|g| &g.decorations);
+    let generated = buf.patch().map(|g| &g.decorations);
 
     let mut lines: Vec<LogicalLineRender> =
         Vec::with_capacity(last_excl.saturating_sub(first) as usize);
@@ -2042,14 +2106,18 @@ struct RenderedElement {
     /// Where the loaded slice starts within the element.
     first_row: ElementRow,
     laid_out_by: aether_protocol::ui::LayoutOwner,
+    role: aether_protocol::ui::ElementRole,
     chrome_above: std::sync::Arc<Vec<Element>>,
+    chrome_before: std::sync::Arc<Vec<Element>>,
     first_buffer_line: u32,
     lines: Vec<LogicalLineRender>,
     /// The box this element belongs to, and what that box draws — carried from the binding so
-    /// `compose_tree` can group a run without going back to the state.
+    /// `compose_tree` can group a run without going back to the state. `title` is read off the
+    /// element that *opens* a box, exactly as `edges` and `band` are.
     box_group: Option<u32>,
     edges: aether_protocol::ui::Edges,
     band: aether_protocol::ui::Band,
+    title: std::sync::Arc<Vec<Element>>,
 }
 
 /// Render the window a viewport shows of its view: the whole tree, every element carrying its
@@ -2080,7 +2148,7 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
     // moment the elements stopped being that document, and the rule silently stopped rendering.
     let trailing_chrome: &[Element] = s
         .try_doc_of(s.view_of(vp).presenting)
-        .and_then(|d| d.generated.as_ref())
+        .and_then(|d| d.patch())
         .map(|g| &g.decorations.trailing_chrome[..])
         .unwrap_or(&[]);
     // Per **element**, because that is how the rows themselves are decided: `render_element_lines`
@@ -2137,12 +2205,15 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
             rows: element_visual_rows(doc, range, geom, phantom_rows),
             first_row,
             laid_out_by: binding.laid_out_by,
+            role: binding.role,
             chrome_above: binding.chrome_above.clone(),
+            chrome_before: binding.chrome_before.clone(),
             first_buffer_line,
             lines,
             box_group: binding.box_group,
             edges: binding.edges,
             band: binding.band,
+            title: binding.title.clone(),
         });
     }
 
@@ -2261,7 +2332,7 @@ fn element_phantom_rows(
             .collect();
     }
     let buf = s.doc_of(binding.buffer_id);
-    if buf.generated.is_some() {
+    if buf.patch().is_some() {
         return HashMap::new();
     }
     // Counts only: the emphasis a phantom row carries does not change how many there are.
@@ -2296,6 +2367,7 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
         rows: r.rows,
         first_row: r.first_row,
         laid_out_by: r.laid_out_by,
+        role: r.role,
         first_buffer_line: r.first_buffer_line,
         lines: r.lines,
     };
@@ -2305,6 +2377,7 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
     // builds elements without generating a document gets the same answer.
     if rendered.len() == 1
         && rendered[0].chrome_above.is_empty()
+        && rendered[0].chrome_before.is_empty()
         && rendered[0].box_group.is_none()
         && trailing_chrome.is_empty()
     {
@@ -2316,20 +2389,19 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
     // that element opens one, which is what puts a file's heading under its own rule rather than
     // above it.
     let mut children: Vec<Element> = Vec::new();
+    // A box being filled: its group key, what it draws, what its top border says, and the
+    // children gathered into it so far.
     type OpenBox = (
         u32,
         aether_protocol::ui::Edges,
         aether_protocol::ui::Band,
+        std::sync::Arc<Vec<Element>>,
         Vec<Element>,
     );
     let mut open: Option<OpenBox> = None;
     let close = |children: &mut Vec<Element>, b: OpenBox| {
-        let (_, edges, band, kids) = b;
-        children.push(Element::Column {
-            edges,
-            band,
-            children: kids,
-        });
+        let (_, edges, band, title, kids) = b;
+        children.push(Element::titled(edges, band, title.as_ref().clone(), kids));
     };
     for r in rendered {
         let group = r.box_group;
@@ -2341,13 +2413,16 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
                 close(&mut children, b);
             }
         }
+        // Chrome standing before the element's box — the gap between boxes — is a sibling of
+        // the box, never a child of it, and never inside a box already open.
         if open.is_none() {
+            children.extend(r.chrome_before.iter().cloned());
             if let Some(g) = group {
-                open = Some((g, r.edges, r.band, Vec::new()));
+                open = Some((g, r.edges, r.band, r.title.clone(), Vec::new()));
             }
         }
         let into = match &mut open {
-            Some((_, _, _, kids)) => kids,
+            Some((_, _, _, _, kids)) => kids,
             None => &mut children,
         };
         into.extend(r.chrome_above.iter().cloned());
@@ -2972,10 +3047,13 @@ mod slice_tests {
             buffer_id: 1,
             lines: ElementLines::Whole,
             decorations: None,
+            chrome_before: Default::default(),
             chrome_above: Default::default(),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             edges: aether_protocol::ui::Edges::NONE,
             box_group: None,
+            title: Default::default(),
             band: aether_protocol::ui::Band::None,
         };
         ViewLayout::of(std::slice::from_ref(&binding), |_| doc.line_count()).element_range(0)
@@ -3087,10 +3165,13 @@ mod tests {
                             end_exclusive: 1,
                         },
                         decorations: None,
+                        chrome_before: Default::default(),
                         chrome_above: Default::default(),
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        role: aether_protocol::ui::ElementRole::Field,
                         edges: aether_protocol::ui::Edges::NONE,
                         box_group: None,
+                        title: Default::default(),
                         band: aether_protocol::ui::Band::None,
                     })
                     .collect(),
@@ -3333,10 +3414,13 @@ mod tests {
                 end_exclusive: 3,
             },
             decorations: None,
+            chrome_before: Default::default(),
             chrome_above: Default::default(),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             edges: aether_protocol::ui::Edges::NONE,
             box_group: None,
+            title: Default::default(),
             band: aether_protocol::ui::Band::None,
         };
         let vp = viewport_over(&mut s, vec![a, b]); // no generated view behind these plain buffers

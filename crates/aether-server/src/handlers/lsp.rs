@@ -2084,7 +2084,7 @@ pub(crate) fn refresh_git_for_buffer(s: &mut ServerState, buffer_id: BufferId) -
         if let Some(workdir) = buf
             .virtual_source
             .as_ref()
-            .map(|v| std::path::PathBuf::from(&v.target.repo_id))
+            .and_then(|v| v.target.repo_id().map(std::path::PathBuf::from))
         {
             if let Some(mut status) = crate::git::repo_status(&workdir) {
                 // A pathless buffer has no `GitBaseline` to carry the baseline token, so it is

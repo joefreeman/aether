@@ -430,6 +430,22 @@ pub enum Action {
     /// Copy the active buffer's absolute (canonical) path to the system clipboard.
     CopyAbsolutePath,
     NewScratch,
+    /// `Space b` — a shell you can type into. When the view in front of you is already a shell,
+    /// a **new** one; otherwise the idle shell the server picks, or a fresh one when every shell
+    /// is busy. The client only reports which of the two it is asking for; the choosing is the
+    /// server's, which is where the shells and their states live.
+    ShellOpen,
+    /// `Space Alt-b` — stop the focused shell's run, killing its whole process group. Toasts when
+    /// the view is not a shell, or when nothing is running. Same shape as `Space g x`.
+    ShellCancel,
+    /// Submit what is typed in a shell's **input** element.
+    ///
+    /// Not bound to a key of its own: Normal-mode `Enter` is [`Action::Activate`], and the
+    /// dispatch routes it here when the focused element is a shell's input — a keymap row cannot
+    /// see which element holds the cursor, so the choice is made where that is known. Insert-mode
+    /// `Enter` stays the newline it is everywhere, so a multi-line command is typed like any other
+    /// text and run from Normal mode.
+    ShellSubmit,
     CloseView,
     /// `Space z` — open another window onto the same workspace: the GUI spawns a fresh detached `ae
     /// --gui` process dialling the same daemon; the web shell opens a new browser tab on the same
@@ -1388,6 +1404,10 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('i'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitBaseline), "Git", "Diff against…"),
     bind!(L, ch('h'), Exact(Mods::NONE), A::DismissHint, "App", "Dismiss the current hint"),
     bind!(L, ch('h'), Exact(Mods::ALT), A::ToggleHints, "App", "Toggle hints on/off"),
+    // The plain/Alt pair names one verb twice, as everywhere else: `b` gives you a shell, `Alt-b`
+    // stops what it is running. `b` was the only free letter under the leader.
+    bind!(L, ch('b'), Exact(Mods::NONE), A::ShellOpen, "App", "Shell (run a command)"),
+    bind!(L, ch('b'), Exact(Mods::ALT), A::ShellCancel, "App", "Stop the shell's running command"),
 ];
 
 /// The `Space g` sub-leader: git operations on the repo. Same plain/Alt sibling convention as the

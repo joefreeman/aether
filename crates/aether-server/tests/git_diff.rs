@@ -32,7 +32,9 @@ async fn select_lines(ws: &mut Ws, buffer_id: u64, anchor_line: u32, line: u32) 
 fn box_edge_rows(node: &aether_protocol::viewport::Element) -> u32 {
     use aether_protocol::viewport::Element as E;
     match node {
-        E::Column { edges, children, .. } => {
+        E::Column {
+            edges, children, ..
+        } => {
             u32::from(edges.top() + edges.bottom())
                 + children.iter().map(box_edge_rows).sum::<u32>()
         }
@@ -40,7 +42,6 @@ fn box_edge_rows(node: &aether_protocol::viewport::Element) -> u32 {
         _ => 0,
     }
 }
-
 
 #[tokio::test]
 async fn apply_hunk_stages_then_unstages_a_modification() {
@@ -4195,6 +4196,7 @@ async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
     let added: GitFollowPatchLineResult =
         send_request::<GitFollowPatchLine>(&mut ws, &follow).await;
     let opened = added.opened.expect("a `+` line follows somewhere");
+    let added_buffer = opened.buffer_id;
     assert!(!opened.is_patch, "it opened a file, not another patch");
     assert_eq!(
         opened.title.as_deref().map(|t| t.ends_with(":a.rs")),
@@ -4239,6 +4241,23 @@ async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
         "the parent's blob, not the commit's"
     );
     assert_eq!(old.cursor.position.line, 4);
+
+    // `view/follow_line` is the method `Enter` actually routes through, and for a patch it is
+    // this same logic: one question the client can ask of any composed view, answered by what the
+    // document is. Same cursor, same landing.
+    let _: CursorState = send_request::<CursorMove>(&mut ws, &goto(line_of("fn after() {}"))).await;
+    let via_view: ViewFollowLineResult = send_request::<ViewFollowLine>(
+        &mut ws,
+        &ViewFollowLineParams {
+            view_id: view_of(patch_buffer),
+        },
+    )
+    .await;
+    let opened = via_view
+        .opened
+        .expect("the same `+` line follows the same way");
+    assert_eq!(opened.buffer_id, added_buffer);
+    assert_eq!(opened.cursor.position.line, 4);
 
     drop(server);
 }

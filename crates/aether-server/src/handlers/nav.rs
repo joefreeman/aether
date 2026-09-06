@@ -117,10 +117,14 @@ pub async fn materialise_virtual_key(
     key: &str,
 ) -> Option<Result<ViewOpenResult, RpcError>> {
     let target = crate::state::VirtualTarget::parse_key(key)?;
+    // Only the git-shaped targets can be re-materialised from a key: a shell's transcript is
+    // this process's memory of what commands printed, and there is nothing to regenerate it from.
+    // `None` is exactly right here — the callers read it as "this key names nothing restorable".
+    let (repo_id, what) = (target.repo_id()?.to_string(), target.what()?.clone());
     let params = aether_protocol::git::GitShowParams {
-        repo_id: Some(target.repo_id),
+        repo_id: Some(repo_id),
         buffer_id: None,
-        target: target.what,
+        target: what,
         // A reopen restores its own cursor; focusing a file would fight that.
         focus_path: None,
     };

@@ -28,6 +28,10 @@ use iced::{Color, Element, Event, Font, Length, Point, Rectangle, Size};
 pub const PAD: f32 = 8.0;
 /// Change-bar gutter width, in cells (TUI's `GUTTER_WIDTH`).
 pub const GUTTER_COLS: u32 = 1;
+/// Where a box's name starts on its top border, as a column offset from where the rows inside the
+/// box start their content: one cell of rule after the corner, then a space. The terminal's
+/// `┌─ name ─…┐` spelled in cells, so the two shells put it in the same column.
+const TITLE_COL: u32 = 1;
 
 /// Scrollbar rail/thumb width in px — the shared buffer/chrome tier, so the editor bar matches
 /// the picker/popover bars (and stays a step heavier than the read view's inline panel bars).
@@ -242,10 +246,15 @@ where
             if text.is_empty() {
                 continue;
             }
-            // The same left edge `draw` uses, inset included. Two computations of one number, and
+            // The same left edge `draw` uses, inset included — and, on a border row, the same
+            // rule cell and space a box's name sits after. Two computations of one number, and
             // they must not drift: this is what a test harness reads, so a disagreement shows up
             // as a passing test measuring a place nothing is painted.
-            let x = bounds.x + (GUTTER_COLS + abs_row.inset.left) as f32 * cell.width
+            let lead = match item {
+                grid::PaintedRow::Edge { .. } => TITLE_COL,
+                _ => 0,
+            };
+            let x = bounds.x + (GUTTER_COLS + abs_row.inset.left + lead) as f32 * cell.width
                 - self.content.scroll_x_px;
             let width = text.chars().count() as f32 * cell.width;
             let rect = Rectangle {
@@ -429,7 +438,10 @@ where
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
         let p = self.content.palette;
-        fill(renderer, bounds, p.bg);
+        // The pane's own fill is the app's *ground*: what shows past the last row, in the gap an
+        // unloaded element leaves, and behind a box's frame. The rows that are editor paint their
+        // own well over it below — the darker shade is the text, not the canvas it sits on.
+        fill(renderer, bounds, p.bg_app);
 
         let (Some(cell), Some(window)) = (state.cell, self.content.window) else {
             return;
@@ -457,8 +469,9 @@ where
         // `left` is the cells the boxes around a row have claimed — 0 for every row outside one.
         // Threaded rather than captured because it varies per row: two files in one view can sit
         // in boxes of different depths.
-        let text_x_in =
-            |left: u32, dcol: u32| bounds.x + (GUTTER_COLS + left + dcol) as f32 * cell.width - scroll_x;
+        let text_x_in = |left: u32, dcol: u32| {
+            bounds.x + (GUTTER_COLS + left + dcol) as f32 * cell.width - scroll_x
+        };
         // Where a rail's hairline sits in the cell it is given: down the middle, which is where the
         // terminal's `│` puts its ink and where the browser's gradient sits. Both sides of a box
         // read it, so they cannot end up different distances in from their own edge. `x` is the
@@ -473,6 +486,51 @@ where
             y: bounds.y,
             width: (bounds.width - (left + GUTTER_COLS) as f32 * cell.width).max(0.0),
             height: bounds.height,
+        };
+
+        // One inline text node's highlight runs, painted a cell apart from `col`, with `x_of`
+        // saying where a column is. Shared by a chrome row and a box's title: the same runs in the
+        // same roles, only starting somewhere else. Runs split at the server's span boundaries;
+        // the gaps between spans fall back to the muted foreground, since chrome is never plain
+        // body text.
+        let draw_runs = |renderer: &mut Renderer,
+                         text: &str,
+                         highlights: &[aether_protocol::viewport::Highlight],
+                         x_of: &dyn Fn(u32) -> f32,
+                         col: u32,
+                         y: f32,
+                         clip: Rectangle| {
+            let mut runs: Vec<(usize, usize, Option<&str>)> = Vec::new();
+            let mut pos = 0usize;
+            for h in highlights {
+                let a = (h.start as usize).min(text.len());
+                let b = (h.end as usize).min(text.len());
+                if a > pos {
+                    runs.push((pos, a, None));
+                }
+                if b > a {
+                    runs.push((a, b, Some(h.kind.as_str())));
+                }
+                pos = pos.max(b);
+            }
+            if pos < text.len() {
+                runs.push((pos, text.len(), None));
+            }
+            for (a, b, kind) in runs {
+                let color = kind
+                    .and_then(|k| theme::highlight_color(p.mode, k))
+                    .unwrap_or(p.fg_muted);
+                draw_text_run(
+                    renderer,
+                    text[a..b].to_string(),
+                    Point::new(x_of(col + text[..a].chars().count() as u32), y),
+                    cell,
+                    color,
+                    highlight_font(kind),
+                    clip,
+                    text_shaping,
+                );
+            }
         };
 
         let cursor_at = grid::ElementLine::new(self.content.focused_element, cursor_pos.line);
@@ -539,7 +597,7 @@ where
                     },
                 ] {
                     if strip.width > 0.0 {
-                        fill(renderer, strip, p.patch_chrome_bg);
+                        fill(renderer, strip, p.bg_app);
                     }
                 }
             }
@@ -567,14 +625,15 @@ where
             // Chrome and phantom rows first — both draw a full-width band and hold no cursor
             // position — then a line's own text rows.
             let (element, line, row, row_idx) = match item {
-                // A box's own border or padding row. No node stands for one, so there is nothing
-                // to read text from: what it draws is the rule and where that rule meets the rail.
+                // A box's own border or padding row: the rule, where that rule meets the rail, and
+                // — on the border a named box opens with — the box's own name, drawn *on* the rule
+                // rather than in a row of its own.
                 //
                 // The frame owns the whole figure — the rule, the corners and the rail stubs they
                 // run into — because they are one drawing. Two mechanisms each drawing part of it
                 // is how the terminal ended up with a rail beside its own rail.
-                grid::PaintedRow::Edge { join, .. } => {
-                    fill(renderer, row_rect, p.patch_chrome_bg);
+                grid::PaintedRow::Edge { owner, side, join } => {
+                    fill(renderer, row_rect, p.bg_app);
                     let rule_y = y + (cell.height * 0.5).floor();
                     // The rails' own share of the join: down from the rule where it opens, up to
                     // it where it closes, through it where it tees. Detached draws no rail.
@@ -617,16 +676,56 @@ where
                     } else {
                         bounds.x + bounds.width
                     };
-                    fill(
-                        renderer,
-                        Rectangle {
-                            x: from,
-                            y: rule_y,
-                            width: (to - from).max(0.0),
-                            height: 1.0,
-                        },
-                        p.fg_faint,
-                    );
+                    // A box is named on the border it opens with. The name lands a rule cell and a
+                    // space in from the corner, and the rule is drawn as the two segments either
+                    // side of it rather than as one run masked afterwards — a mask is a second
+                    // opinion about what colour is behind the row, and the band is not always the
+                    // same shade.
+                    let title = match side {
+                        grid::Side::Top => owner.title(),
+                        grid::Side::Bottom => &[],
+                    };
+                    let cols = title_cols(title);
+                    // Untitled: rail to rail, leaving the very cell the vertical line is in, which
+                    // is what closes the corner. Named: the same rule in two pieces, one cell of
+                    // it after the corner and the rest from a space past the name's last column.
+                    let segments = if cols == 0 {
+                        [(from, to), (to, to)]
+                    } else {
+                        [
+                            (from, text_x(0)),
+                            (text_x(TITLE_COL + cols + 1).clamp(from, to), to),
+                        ]
+                    };
+                    for (a, b) in segments {
+                        fill(
+                            renderer,
+                            Rectangle {
+                                x: a,
+                                y: rule_y,
+                                width: (b - a).max(0.0),
+                                height: 1.0,
+                            },
+                            p.fg_faint,
+                        );
+                    }
+                    // The name's own clip stops at the closing rail, so an over-long one is cut
+                    // where the box ends rather than running out over its own border.
+                    let title_clip = Rectangle {
+                        width: (to - content_left).max(0.0),
+                        ..content_clip
+                    };
+                    let mut col = TITLE_COL;
+                    for leaf in title.iter().flat_map(ViewElement::inline) {
+                        match leaf {
+                            ViewElement::Space { cols } => col += u32::from(*cols),
+                            ViewElement::Text { text, highlights } => {
+                                draw_runs(renderer, text, highlights, &text_x, col, y, title_clip);
+                                col += text.chars().count() as u32;
+                            }
+                            _ => {}
+                        }
+                    }
                     continue;
                 }
                 // A row of generated presentation. Its band starts in the gutter, since the
@@ -637,7 +736,7 @@ where
                     // on the editor's own background. Nothing produces one today; the vocabulary
                     // allows it, so the painter does.
                     if matches!(abs_row.band, Band::Chrome) {
-                        fill(renderer, row_rect, p.patch_chrome_bg);
+                        fill(renderer, row_rect, p.bg_app);
                     }
                     let rule_y = y + (cell.height * 0.5).floor();
                     let mut col = 0u32;
@@ -663,43 +762,15 @@ where
                             }
                             // `inline()` yields only leaves, so nothing else can appear here.
                             ViewElement::Text { text, highlights } => {
-                                // Runs split at the server's span boundaries; the gaps between
-                                // spans fall back to the muted foreground, since chrome is
-                                // never plain body text.
-                                let mut runs: Vec<(usize, usize, Option<&str>)> = Vec::new();
-                                let mut pos = 0usize;
-                                for h in highlights {
-                                    let a = (h.start as usize).min(text.len());
-                                    let b = (h.end as usize).min(text.len());
-                                    if a > pos {
-                                        runs.push((pos, a, None));
-                                    }
-                                    if b > a {
-                                        runs.push((a, b, Some(h.kind.as_str())));
-                                    }
-                                    pos = pos.max(b);
-                                }
-                                if pos < text.len() {
-                                    runs.push((pos, text.len(), None));
-                                }
-                                for (a, b, kind) in runs {
-                                    let color = kind
-                                        .and_then(|k| theme::highlight_color(p.mode, k))
-                                        .unwrap_or(p.fg_muted);
-                                    draw_text_run(
-                                        renderer,
-                                        text[a..b].to_string(),
-                                        Point::new(
-                                            text_x(col + text[..a].chars().count() as u32),
-                                            y,
-                                        ),
-                                        cell,
-                                        color,
-                                        highlight_font(kind),
-                                        content_clip,
-                                        text_shaping,
-                                    );
-                                }
+                                draw_runs(
+                                    renderer,
+                                    text,
+                                    highlights,
+                                    &text_x,
+                                    col,
+                                    y,
+                                    content_clip,
+                                );
                                 col += text.chars().count() as u32;
                             }
                             _ => {}
@@ -896,9 +967,10 @@ where
                     (true, Some(_), ..) => Some(p.cursor_line_bg),
                 },
             );
-            if let Some(bg) = row_bg {
-                fill(renderer, row_bounds, bg);
-            }
+            // Always painted, tint or none: the pane behind this row is the app's ground, so an
+            // editor row has to lay its own well down. A tint simply replaces the well, layering
+            // over it exactly as it did when the well was the canvas.
+            fill(renderer, row_bounds, row_bg.unwrap_or(p.bg));
 
             // Intra-line diff emphasis: the stronger change fill over the line tint, under
             // the search/selection/cursor fills below (same stacking as the terminal). The
@@ -1628,21 +1700,41 @@ fn measure_cell<Renderer: text::Renderer<Font = Font>>(
     paragraph.min_bounds()
 }
 
+/// Inline leaves as the text they draw, left to right — a space contributing its own width.
+fn inline_text(leaves: Vec<&ViewElement>) -> String {
+    let mut out = String::new();
+    for leaf in leaves {
+        match leaf {
+            ViewElement::Text { text, .. } => out.push_str(text),
+            ViewElement::Space { cols } => out.push_str(&" ".repeat(*cols as usize)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Cells a box's name occupies on its border row: its text and the spaces between, left to right.
+fn title_cols(title: &[ViewElement]) -> u32 {
+    inline_text(title.iter().flat_map(ViewElement::inline).collect())
+        .chars()
+        .count() as u32
+}
+
 /// A painted row as the one string a reader sees — continuation marker, indent and tab stops
 /// spelled out — which is what the widget reports for it under an operation.
 fn row_text(item: &grid::PaintedRow<'_>, tab_width: u32) -> String {
     let mut out = String::new();
     match item {
-        grid::PaintedRow::Chrome(chrome) => {
-            for leaf in chrome.inline() {
-                match leaf {
-                    ViewElement::Text { text, .. } => out.push_str(text),
-                    ViewElement::Space { cols } => out.push_str(&" ".repeat(*cols as usize)),
-                    _ => {}
-                }
-            }
-        }
-        // A box edge is a rule, not words — nothing for a reader to read.
+        grid::PaintedRow::Chrome(chrome) => out.push_str(&inline_text(chrome.inline())),
+        // A box edge is a rule, not words — except the border a named box opens with, which
+        // carries the name, and that is the only text on it.
+        grid::PaintedRow::Edge {
+            owner,
+            side: grid::Side::Top,
+            ..
+        } => out.push_str(&inline_text(
+            owner.title().iter().flat_map(ViewElement::inline).collect(),
+        )),
         grid::PaintedRow::Edge { .. } => {}
         grid::PaintedRow::Baseline { row, .. } => out.push_str(&row.text),
         grid::PaintedRow::Text { row, .. } => {

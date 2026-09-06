@@ -54,6 +54,17 @@ pub enum Element {
         edges: Edges,
         #[serde(default, skip_serializing_if = "Band::is_none")]
         band: Band,
+        /// What the box's **top border** says, drawn on the border row itself: a rule cell after
+        /// the corner, a space, these nodes, a space, then the rule on to the far corner.
+        ///
+        /// Inline nodes — the kinds a [`Element::Row`] holds — so a title is styled by the same
+        /// [`Highlight`] runs everything else is, through the theme table a shell already has.
+        /// It costs the box **no rows**: it rides the border row the box was already spending, and
+        /// [`crate::ui`]'s row walk therefore says nothing about it — each painter reads it off
+        /// the top edge row's owner. A title needs somewhere to sit, so `edges.border.top` must be
+        /// at least 1; see [`Element::titled`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        title: Vec<Element>,
         children: Vec<Element>,
     },
     /// Children left to right, sharing one row. At most one [`Element::Fill`] child, which takes
@@ -85,6 +96,9 @@ pub enum Element {
         /// Whose arithmetic `rows` is — see [`LayoutOwner`]. Off the wire for the ordinary case.
         #[serde(default, skip_serializing_if = "LayoutOwner::is_server")]
         laid_out_by: LayoutOwner,
+        /// What this element is *for* — see [`ElementRole`]. Off the wire for the ordinary case.
+        #[serde(default, skip_serializing_if = "ElementRole::is_field")]
+        role: ElementRole,
     },
     /// Literal text with role-styled runs over it. `highlights` are byte offsets into `text` and
     /// carry the same capture names buffer text does, so they resolve through the theme table a
@@ -131,6 +145,39 @@ impl LayoutOwner {
     }
 }
 
+/// What an editor element is *for*, where a view has more than one kind of them.
+///
+/// Every element of every view so far has been a field of content: a file, a hunk, a slice of a
+/// generated document. A shell view has one that is not — the line you type the next command into
+/// — and a handful of keys mean something different there (`Enter` submits; `Alt-Enter` is the
+/// newline; `Up`/`Down` recall history on a single line). The client has to know *which* element
+/// that is, and this is how the window says so.
+///
+/// **A role, not a view kind.** The client derives "this view is a shell" from the presence of an
+/// input element rather than from a tag on the view, which keeps the shells kind-blind: they
+/// already paint an editor element, and this only says which of them holds the caret's special
+/// meanings. A view that later grows a second kind of field says so here too, in one place, rather
+/// than by each client re-deriving it from the shape of the tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementRole {
+    /// Content. Every element of an ordinary or composed view.
+    #[default]
+    Field,
+    /// The line a shell's next command is typed into — the view's last element.
+    Input,
+}
+
+impl ElementRole {
+    pub fn is_field(&self) -> bool {
+        matches!(self, ElementRole::Field)
+    }
+
+    pub fn is_input(&self) -> bool {
+        matches!(self, ElementRole::Input)
+    }
+}
+
 /// The two views a client can ask for over one file: its source in the editor, or the document
 /// its source describes, laid out by the client and read at block grain.
 ///
@@ -151,6 +198,7 @@ impl Element {
         Element::Column {
             edges: Edges::NONE,
             band: Band::None,
+            title: Vec::new(),
             children,
         }
     }
@@ -169,6 +217,29 @@ impl Element {
         Element::Column {
             edges,
             band,
+            title: Vec::new(),
+            children,
+        }
+    }
+
+    /// [`Element::framed`] with a name on its top border — see the `title` field.
+    ///
+    /// The title is drawn *on* the top border row, so there has to be one: a box with no top
+    /// border has nowhere to put it and would silently drop it.
+    pub fn titled(
+        edges: Edges,
+        band: Band,
+        title: Vec<Element>,
+        children: Vec<Element>,
+    ) -> Element {
+        debug_assert!(
+            title.is_empty() || edges.border.top >= 1,
+            "a title is drawn on the top border row; this box has no top border"
+        );
+        Element::Column {
+            edges,
+            band,
+            title,
             children,
         }
     }
@@ -226,6 +297,19 @@ impl Element {
         out
     }
 
+    /// What this container's top border says, if anything — empty for every node that is not a
+    /// titled [`Element::Column`].
+    ///
+    /// Deliberately **not** part of [`Element::walk`]: a title is not a row and stands for none, so
+    /// nothing that counts rows, lines or editors should find it. The painters read it here, off
+    /// the owner an edge row already names.
+    pub fn title(&self) -> &[Element] {
+        match self {
+            Element::Column { title, .. } => title,
+            _ => &[],
+        }
+    }
+
     /// The leaves of one row, flattened left to right — text, spaces and fills, in painting order.
     /// A shell laying out a single row can walk this and never see the nesting.
     pub fn inline(&self) -> Vec<&Element> {
@@ -251,6 +335,19 @@ impl Element {
             }
         });
         out
+    }
+
+    /// The [`ElementRole::Input`] element of this tree, if it has one — which is also the answer
+    /// to "is this view a shell?".
+    ///
+    /// Derived from the tree rather than carried as a view kind, so a client never branches on
+    /// what a view *is*: it asks whether the thing in front of it has an input, and the keys that
+    /// belong to one follow from that.
+    pub fn input_element(&self) -> Option<FieldId> {
+        self.editors().into_iter().find_map(|e| match e {
+            Element::Editor { element, role, .. } if role.is_input() => Some(*element),
+            _ => None,
+        })
     }
 
     /// The view's rendered lines in order, flattened across its editors — for the paths that

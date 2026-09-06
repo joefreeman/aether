@@ -514,7 +514,8 @@ async fn handle_event(state: &SharedState, event: Event) {
                 .chain(s.virtual_git_status.keys().copied().filter(|id| {
                     s.try_doc_of(*id)
                         .and_then(|d| d.virtual_source.as_ref())
-                        .is_some_and(|v| git_workdirs.contains(&PathBuf::from(&v.target.repo_id)))
+                        .and_then(|v| v.target.repo_id())
+                        .is_some_and(|repo| git_workdirs.contains(&PathBuf::from(repo)))
                 }))
                 .collect();
             for id in affected {

@@ -14,8 +14,8 @@ use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
     BlameCache, Buffer, BufferRange, DeferredToken, Document, DocumentId, EditKindTag,
-    ElementBinding, LineEnding, NavEntry, SearchEntry, ServerState, SharedState, SneakCandidate,
-    SneakEntry, Viewport,
+    ElementBinding, Generated, LineEnding, NavEntry, SearchEntry, ServerState, SharedState,
+    SneakCandidate, SneakEntry, Viewport,
 };
 use crate::surround;
 use crate::wrap;
@@ -148,6 +148,7 @@ mod lsp;
 mod nav;
 mod picker;
 mod search;
+mod shell;
 mod sneak;
 mod viewport;
 mod workspace;
@@ -163,6 +164,7 @@ pub use lsp::*;
 pub use nav::*;
 pub use picker::*;
 pub use search::*;
+pub use shell::*;
 pub use sneak::*;
 pub use viewport::*;
 pub use workspace::*;

@@ -360,6 +360,15 @@ impl WasmSession {
             .map(VisualRow::get)
     }
 
+    /// Where to scroll after a push that made a shell's view taller — the core's "follow the
+    /// output" policy. `null` leaves the scroll alone, which is every ordinary view and every
+    /// reader who has scrolled up to look at something.
+    pub fn sticky_tail_row(&mut self, top_row: u32, viewport_rows: u32) -> Option<u32> {
+        self.inner
+            .sticky_tail_row(VisualRow(top_row), viewport_rows, &self.measured)
+            .map(VisualRow::get)
+    }
+
     /// Which element a re-subscribe should say holds the cursor — the one it already does, when
     /// the session is re-presenting a view it holds a window for (a wrap toggle, a reconnect) —
     /// or `null` on a fresh open, where the server decides from the place the view opens at.

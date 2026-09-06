@@ -98,6 +98,11 @@ pub async fn view_close(
                         // A revision is read-only, so it never had a backup to discard. Dropping
                         // the dormant entry (above) is the whole of closing one.
                         crate::state::DormantSource::Virtual { .. } => {}
+                        // Closing a dormant shell discards the snapshot it would have come
+                        // back from.
+                        crate::state::DormantSource::Shell { number } => crate::backup::delete(
+                            &crate::backup::shell_backup_path(root, &workspace, *number),
+                        ),
                     }
                 }
                 let pushes = refresh_view_pickers(&mut s);
@@ -188,9 +193,24 @@ pub async fn view_close(
     ) {
         delete_buffer_backups(&s, ws, buf, doc);
     }
+    let shell_number =
+        s.try_doc_of(buffer_id)
+            .and_then(|d| match d.virtual_source.as_ref().map(|v| &v.target) {
+                Some(crate::state::VirtualTarget::Shell { number, .. }) => Some(*number),
+                _ => None,
+            });
     // Canonical teardown (drops the buffer + all its per-client slices, sends LSP `didClose`,
     // clears diagnostics, and tears down the language server if this was its last buffer).
     let stopped_server = s.close_buffer(buffer_id);
+    // A shell writes itself down as it is torn down, so a workspace switch cannot lose it. This
+    // is an explicit close — a discard — so the snapshot goes again.
+    if let (Some(ws), Some(number), Some(root)) = (
+        owning_workspace.as_deref(),
+        shell_number,
+        s.backups_path.as_deref(),
+    ) {
+        crate::backup::delete(&crate::backup::shell_backup_path(root, ws, number));
+    }
     // The previews it was keeping alive — a review's element buffers — go with it.
     let collected = collect_after_close(&mut s, &left_behind);
     // If that was the last buffer of an ephemeral context, retire it — and evict any *other*
@@ -1070,7 +1090,7 @@ pub fn describe_buffer(
         lsp_server: buffer_lsp_server_ref(s, buffer_id),
         title: doc.virtual_source.as_ref().map(|v| v.title.clone()),
         read_only: doc.read_only(),
-        is_patch: doc.generated.is_some(),
+        is_patch: doc.patch().is_some(),
     })
 }
 
@@ -1125,16 +1145,17 @@ async fn rebind_presented_view(state: &SharedState, ctx: &mut ConnectionCtx, buf
             return;
         };
         let (Some(generated), Some(source), Some(view)) = (
-            doc.generated.as_ref(),
+            doc.patch(),
             doc.virtual_source.as_ref(),
             s.view_presenting(buffer_id).and_then(|v| s.try_view(v)),
         ) else {
             return;
         };
-        let rev = match &source.target.what {
-            aether_protocol::git::ShowTarget::WorkingChanges => None,
-            aether_protocol::git::ShowTarget::Commit { rev } => Some(rev.clone()),
-            aether_protocol::git::ShowTarget::File { .. } => return,
+        let rev = match source.target.what() {
+            Some(aether_protocol::git::ShowTarget::WorkingChanges) => None,
+            Some(aether_protocol::git::ShowTarget::Commit { rev }) => Some(rev.clone()),
+            // A file at a revision has no regions to rebind; a shell has no files at all.
+            Some(aether_protocol::git::ShowTarget::File { .. }) | None => return,
         };
         // The file each element's region belongs to, when it has one — the same reading of the
         // index `layout_over_files` makes.
@@ -1168,7 +1189,11 @@ async fn rebind_presented_view(state: &SharedState, ctx: &mut ConnectionCtx, buf
             .collect();
         paths.sort_unstable();
         paths.dedup();
-        (source.target.repo_id.clone(), rev, paths)
+        (
+            source.target.repo_id().unwrap_or_default().to_string(),
+            rev,
+            paths,
+        )
     };
     // Resolve every file first — opening one is asynchronous — then lay out under the lock.
     let mut buffers: std::collections::HashMap<String, BufferId> = std::collections::HashMap::new();
@@ -1185,7 +1210,7 @@ async fn rebind_presented_view(state: &SharedState, ctx: &mut ConnectionCtx, buf
         }
     }
     let mut s = state.lock().await;
-    let Some(generated) = s.try_doc_of(buffer_id).and_then(|d| d.generated.as_ref()) else {
+    let Some(generated) = s.try_doc_of(buffer_id).and_then(|d| d.patch()) else {
         return;
     };
     let layout = crate::patch::layout_over_files(generated, |path| buffers.get(path).copied());
@@ -1352,8 +1377,11 @@ pub async fn git_show(
             .map(opened);
     }
 
-    let workdir = std::path::PathBuf::from(&target.repo_id);
-    let what = target.what.clone();
+    let workdir = std::path::PathBuf::from(target.repo_id().unwrap_or_default());
+    let what = target
+        .what()
+        .cloned()
+        .unwrap_or(aether_protocol::git::ShowTarget::WorkingChanges);
     // The working-tree diff is measured against whatever `git/set_baseline` last set for this repo,
     // so the view and the gutters of the files in it can't disagree. Read before the spawn, since
     // the generation runs off the lock.
@@ -1389,7 +1417,7 @@ pub async fn git_show(
     let mut content = content.map_err(RpcError::git_show_failed)?;
     // Two repos in one workspace would otherwise both list as "Working changes", naming neither.
     if sibling_repos > 1 {
-        if let Some(name) = std::path::Path::new(&target.repo_id)
+        if let Some(name) = std::path::Path::new(target.repo_id().unwrap_or_default())
             .file_name()
             .and_then(|n| n.to_str())
         {
@@ -1419,7 +1447,11 @@ pub async fn git_show(
     if let Some(buffer_id) = existing {
         {
             let mut s = state.lock().await;
-            s.replace_generated(buffer_id, &content.text, content.generated);
+            s.replace_generated(
+                buffer_id,
+                &content.text,
+                content.generated.map(Generated::Patch),
+            );
             // Re-showing is a refresh point for the branch too: it may have moved (a checkout in a
             // terminal) since this buffer was minted.
             if let Some(status) = repo_status.clone() {
@@ -1452,13 +1484,16 @@ pub async fn git_show(
     //
     // Regions the diff gave no hunks keep windowing the generated document either way; see
     // `patch::layout_over_files`.
-    let layout = match (&target.what, content.generated.as_ref()) {
-        (aether_protocol::git::ShowTarget::Commit { rev }, Some(generated)) => {
-            let (repo_id, rev) = (target.repo_id.clone(), rev.clone());
+    let layout = match (target.what(), content.generated.as_ref()) {
+        (Some(aether_protocol::git::ShowTarget::Commit { rev }), Some(generated)) => {
+            let (repo_id, rev) = (
+                target.repo_id().unwrap_or_default().to_string(),
+                rev.clone(),
+            );
             Some(patch_elements_over_files(state, ctx, &repo_id, Some(&rev), generated).await)
         }
-        (aether_protocol::git::ShowTarget::WorkingChanges, Some(generated)) => {
-            let repo_id = target.repo_id.clone();
+        (Some(aether_protocol::git::ShowTarget::WorkingChanges), Some(generated)) => {
+            let repo_id = target.repo_id().unwrap_or_default().to_string();
             Some(patch_elements_over_files(state, ctx, &repo_id, None, generated).await)
         }
         _ => None,
@@ -1551,7 +1586,7 @@ pub async fn git_follow_patch_line(
         match s
             .try_doc_of(params.buffer_id)
             .and_then(|d| d.virtual_source.as_ref())
-            .map(|v| (v.target.repo_id.clone(), &v.target.what))
+            .and_then(|v| Some((v.target.repo_id()?.to_string(), v.target.what()?)))
         {
             Some((repo_id, aether_protocol::git::ShowTarget::File { path, .. })) => {
                 let cursor_line = s
@@ -1582,10 +1617,10 @@ pub async fn git_follow_patch_line(
                 return Ok(none());
             };
 
-            let Some(generated) = doc.generated.as_ref() else {
+            let Some(generated) = doc.patch() else {
                 return Ok(none());
             };
-            let repo_id = source.target.repo_id.as_str();
+            let repo_id = source.target.repo_id().unwrap_or_default();
             let cursor_line = s
                 .cursors
                 .get(&(client_id, params.buffer_id))
@@ -1768,7 +1803,7 @@ async fn open_generated_buffer(
         },
         content.text,
         content.language,
-        content.generated,
+        content.generated.map(Generated::Patch),
         // A view's buffer must not stall the view: see `OpenIntent`.
         intent == OpenIntent::Bind,
     );
@@ -1785,7 +1820,7 @@ async fn open_generated_buffer(
     // question nobody asked. Its first *change*, not its header: the header is a virtual row and
     // has no cursor position, and the changes are what you came to read.
     let focused = focus_path
-        .zip(doc.generated.as_ref())
+        .zip(doc.patch())
         .and_then(|(want, generated)| {
             let file = generated.index.files.iter().find(|f| f.path() == want)?;
             let line = file
@@ -1819,7 +1854,7 @@ async fn open_generated_buffer(
             read_only: true,
             // A commit's diff, not a file at a revision — both are read-only, only the first has a
             // patch index for `Enter` to follow through.
-            is_patch: doc.generated.is_some(),
+            is_patch: doc.patch().is_some(),
         },
     };
     s.documents.insert(doc_id, doc);
@@ -1856,7 +1891,7 @@ async fn open_generated_buffer(
 /// Present a live buffer the server already holds — a revision found materialised, a scratch
 /// rebuilt — through its most recently used view. The wire has no open by buffer: a client names
 /// a view, and only the server ever arrives at an open holding a buffer and nothing else.
-async fn present_buffer(
+pub(crate) async fn present_buffer(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     buffer_id: BufferId,
@@ -1995,6 +2030,14 @@ async fn view_open_inner(
                 opened.transient = false;
                 return Ok(opened);
             }
+            // A shell comes back from its snapshot: the transcript and its runs, where it was,
+            // what it had assigned, and what was being typed.
+            Some(crate::state::DormantSource::Shell { number }) => {
+                return Box::pin(crate::handlers::shell::open_restored_shell(
+                    state, ctx, number,
+                ))
+                .await;
+            }
             None => {}
         }
         // A view navigated back to is bound to its files in full — see `rebind_presented_view`.
@@ -2019,7 +2062,7 @@ async fn view_open_inner(
         // view picker, which opens by id because there's no path to dispatch on.
         let virtual_title = doc.virtual_source.as_ref().map(|v| v.title.clone());
         let read_only = doc.read_only();
-        let is_patch = doc.generated.is_some();
+        let is_patch = doc.patch().is_some();
         let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(doc, jt));
         let clamped_anchor = params
             .jump_to_anchor

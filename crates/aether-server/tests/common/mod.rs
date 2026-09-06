@@ -91,14 +91,20 @@ pub use aether_protocol::search::{
 pub use aether_protocol::settings::{
     AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
 };
+pub use aether_protocol::shell::{
+    RunState, RunStatus, ShellCancel, ShellCancelParams, ShellCancelResult, ShellOpen,
+    ShellOpenParams, ShellOpenResult, ShellRun, ShellRunChanged, ShellRunChangedParams,
+    ShellRunParams, ShellRunResult,
+};
 pub use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
 };
 pub use aether_protocol::view::{
     BufferDescription, ViewClose, ViewCloseParams, ViewCloseResult, ViewClosed, ViewClosedParams,
-    ViewOpen, ViewOpenParams, ViewOpenResult, ViewSetTransient, ViewSetTransientParams,
-    ViewSetTransientResult, ViewState, ViewStateParams,
+    ViewFollowLine, ViewFollowLineParams, ViewFollowLineResult, ViewOpen, ViewOpenParams,
+    ViewOpenResult, ViewSetTransient, ViewSetTransientParams, ViewSetTransientResult, ViewState,
+    ViewStateParams,
 };
 pub use aether_protocol::viewport::Element;
 pub use aether_protocol::viewport::{
@@ -1577,6 +1583,28 @@ pub fn chrome_nodes(window: &aether_protocol::viewport::Window) -> Vec<&Element>
             Element::Column { children, .. } => children.iter().for_each(|c| walk(c, out)),
             Element::Row { band, .. } if !band.is_none() => out.push(n),
             _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(&window.root, &mut out);
+    out
+}
+
+/// The name on every box of a window's tree that has one, in tree order.
+///
+/// A title is a *field* of its container rather than a child of it — it rides the top border row
+/// the box was already spending and costs no row — so [`chrome_nodes`] cannot find one. This walks
+/// the same tree and reads the other field.
+pub fn box_titles(window: &aether_protocol::viewport::Window) -> Vec<String> {
+    fn walk(n: &Element, out: &mut Vec<String>) {
+        if let Element::Column {
+            title, children, ..
+        } = n
+        {
+            if !title.is_empty() {
+                out.push(title.iter().map(Element::text_content).collect());
+            }
+            children.iter().for_each(|c| walk(c, out));
         }
     }
     let mut out = Vec::new();

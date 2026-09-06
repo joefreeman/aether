@@ -89,6 +89,18 @@ impl ErrorCode {
     /// a revision's content (`git/show`), which has no file behind it and nothing an edit could
     /// mean. Clients decline these locally too; this is the authoritative refusal.
     pub const READ_ONLY_BUFFER: Self = Self(-32045);
+    /// `shell/run` was asked to start a command in a shell that is already running one. One run
+    /// at a time per shell, so the client says which command is in the way and offers the key
+    /// that stops it — and deliberately keeps the text the user typed, since typing ahead of a
+    /// build is a reasonable thing to do. Its own code (rather than a generic refusal) exactly so
+    /// the client can tell this apart from a shell that has gone away.
+    pub const SHELL_BUSY: Self = Self(-32050);
+    /// `shell/run` refused the line before running anything: it did not parse, or it named a
+    /// command, directory, file or variable that does not exist. The message says which, the
+    /// server has already selected the offending word in the input, and the text is left as
+    /// typed so it can be corrected rather than retyped. Its own code so the client can say
+    /// "not accepted" rather than "failed".
+    pub const SHELL_REJECTED: Self = Self(-32051);
 
     pub fn code(self) -> i32 {
         self.0

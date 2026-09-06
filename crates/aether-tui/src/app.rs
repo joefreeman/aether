@@ -180,6 +180,11 @@ pub struct AppState {
     /// The long-running git operation in flight, mirrored from the session each sync. Session-level
     /// rather than per-editor: it belongs to a repo, not to the buffer that happens to be open.
     pub git_operation: Option<aether_protocol::git::GitOperation>,
+    /// What the status bar says about shells — the focused shell's running command, or a count of
+    /// the ones running elsewhere. Composed by the core
+    /// ([`aether_client::session::Session::shell_indicator`]) so all three shells say the same
+    /// thing; mirrored here each sync like the git operation beside it.
+    pub shell_indicator: Option<String>,
     pub viewport_cols: u32,
     pub viewport_rows: u32,
     pub should_quit: bool,
@@ -575,14 +580,10 @@ pub struct EditorState {
     pub last_click: Option<(Instant, u16, u16)>,
     /// Length of the current same-cell click chain (1 = single, 2 = double, 3+ = triple).
     pub click_streak: u32,
-    pub revision: u64,
-    /// Revision at the most recent successful save. `dirty` is derived as
-    /// `revision != saved_revision`.
-    pub saved_revision: u64,
-    /// Any *other* element of this view has unsaved changes — the view-wide half of the dirty dot,
-    /// which the focused buffer's own revisions cannot answer. Mirrors
-    /// `Window::other_elements_dirty`; always false for an ordinary view.
-    pub other_elements_dirty: bool,
+    /// The view has unsaved edits — the core's one answer (`ViewState::unsaved`): the focused
+    /// buffer's own revisions, or any other element of the view. Mirrored here per frame rather
+    /// than derived again, so this shell cannot hold a second opinion about what "unsaved" means.
+    pub unsaved: bool,
     /// Set when the server's file-watcher detected a disk change while this buffer was dirty
     /// (clean buffers reload silently). The user must `Ctrl-s` (and confirm overwrite) or
     /// `buffer/reload` to clear it. Updated from `BufferState` notifications.
@@ -649,7 +650,7 @@ pub const BUFFER_STATUS_DOT: &str = "●";
 /// Rendered as a colour-coded dot in the status bar; the colours match the web client's favicon.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BufferStatusKind {
-    /// Unsaved local edits (`revision != saved_revision`).
+    /// Unsaved local edits (`ViewState::unsaved`).
     Unsaved,
     /// The file changed on disk underneath us.
     ExternallyModified,
@@ -662,13 +663,14 @@ pub enum BufferStatusKind {
 #[cfg(test)]
 pub(crate) fn test_editor_state() -> EditorState {
     EditorState {
-        other_elements_dirty: false,
+        unsaved: false,
         root: aether_protocol::viewport::Element::Editor {
             element: 0,
             buffer: 0,
             rows: 0,
             first_row: aether_protocol::coords::ElementRow::ZERO,
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line: 0,
             lines: Vec::new(),
         },
@@ -692,8 +694,6 @@ pub(crate) fn test_editor_state() -> EditorState {
         drag_granularity: Granularity::Char,
         last_click: None,
         click_streak: 0,
-        revision: 0,
-        saved_revision: 0,
         externally_modified: false,
         externally_deleted: false,
         pending_count: 0,
@@ -720,6 +720,7 @@ pub(crate) fn test_state(editor: EditorState) -> AppState {
             root_labels: Vec::new(),
             tether: None,
             git_operation: None,
+            shell_indicator: None,
             viewport_cols: 80,
             viewport_rows: 24,
             should_quit: false,
@@ -778,11 +779,7 @@ impl AppState {
             Some(BufferStatusKind::ExternallyDeleted)
         } else if ed.externally_modified {
             Some(BufferStatusKind::ExternallyModified)
-        } else if ed.revision != ed.saved_revision || ed.other_elements_dirty {
-            // The focused buffer's own compare *or* the view's other elements: unsaved edits in a
-            // hunk scrolled past used to be invisible, because the dot only ever asked the buffer
-            // under the cursor. The local compare comes first so typing and saving show instantly,
-            // without waiting for a re-render — see `Window::other_elements_dirty`.
+        } else if ed.unsaved {
             Some(BufferStatusKind::Unsaved)
         } else {
             None
@@ -1157,6 +1154,7 @@ mod tests {
             root_labels: Vec::new(),
             tether: None,
             git_operation: None,
+            shell_indicator: None,
             viewport_cols: 80,
             viewport_rows: 24,
             should_quit: false,
@@ -1192,6 +1190,7 @@ mod tests {
             root_labels: vec![String::new()],
             tether: None,
             git_operation: None,
+            shell_indicator: None,
             viewport_cols: 80,
             viewport_rows: 24,
             should_quit: false,
@@ -1230,6 +1229,7 @@ mod tests {
             root_labels: vec![String::new()],
             tether: None,
             git_operation: None,
+            shell_indicator: None,
             viewport_cols: 80,
             viewport_rows: 24,
             should_quit: false,
@@ -1258,7 +1258,7 @@ mod tests {
         assert_eq!(terminal_title(&state), "[demo] src/main.rs");
         // Local edits → leading dot.
         if let Some(ed) = state.editor.as_mut() {
-            ed.revision = 5;
+            ed.unsaved = true;
         }
         assert_eq!(terminal_title(&state), "● [demo] src/main.rs");
         // External delete is still a (single, plain) leading dot — the title can't colour-code it.
@@ -1269,17 +1269,18 @@ mod tests {
     }
 
     /// Minimal `EditorState` for title tests — only the fields the title code reads matter
-    /// (`file_label`, `revision`, `saved_revision`, `externally_modified`, `externally_deleted`).
-    /// The rest is filled with sensible defaults.
+    /// (`file_label`, `unsaved`, `externally_modified`, `externally_deleted`). The rest is filled
+    /// with sensible defaults.
     fn stub_editor_state(label: &str) -> EditorState {
         EditorState {
-            other_elements_dirty: false,
+            unsaved: false,
             root: aether_protocol::viewport::Element::Editor {
                 element: 0,
                 buffer: 0,
                 rows: 0,
                 first_row: aether_protocol::coords::ElementRow::ZERO,
                 laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Field,
                 first_buffer_line: 0,
                 lines: Vec::new(),
             },
@@ -1303,8 +1304,6 @@ mod tests {
             drag_granularity: Granularity::Char,
             last_click: None,
             click_streak: 0,
-            revision: 0,
-            saved_revision: 0,
             externally_modified: false,
             externally_deleted: false,
             pending_count: 0,

@@ -121,6 +121,7 @@ dependencies = [
  "aether-client",
  "aether-markdown",
  "aether-protocol",
+ "aether-shell",
  "anyhow",
  "clap",
  "directories",
@@ -171,6 +172,10 @@ dependencies = [
  "unicode-width",
  "uuid",
 ]
+
+[[package]]
+name = "aether-shell"
+version = "0.4.0"
 
 [[package]]
 name = "aether-tui"

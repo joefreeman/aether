@@ -966,6 +966,11 @@ pub struct ViewState {
     /// which is the authority; the client keeps it to know where `Tab` starts from and, later,
     /// which of a view's buffers it is editing.
     pub focused_element: aether_protocol::viewport::FieldId,
+    /// How tall this view was the last time a shell asked about the tail, at that shell's
+    /// resolution — see [`Session::sticky_tail_row`]. Zero for a view nothing has measured yet,
+    /// which is also what a switch resets it to: landing in a shell with output already in it puts
+    /// you at its end, where the input is.
+    pub(crate) tail_total: u32,
     pub window: Option<Window>,
     /// The markdown reading view of the current buffer, when active.
     pub read: Option<ReadView>,
@@ -1036,6 +1041,36 @@ impl ViewState {
         self.focused_element = 0;
     }
 
+    /// Whether the cursor is in the view's **input** element — the one a shell's transcript
+    /// ends in. Derived from the window (see `Element::input_element`), so no shell has to be
+    /// told what kind of view it is showing.
+    pub fn focused_is_input(&self) -> bool {
+        self.window.as_ref().and_then(|w| w.root.input_element()) == Some(self.focused_element)
+    }
+
+    /// Whether the focused element's buffer has edits that are not on disk.
+    ///
+    /// The local compare, `revision != saved_revision`, is what makes typing show and saving
+    /// clear without waiting on a round trip. Two buffers have no saved point for it to compare
+    /// against, and each is a fact the client already holds rather than a kind it would have to
+    /// be told: a **read-only** buffer is regenerated whole by the server, its saved point moving
+    /// with every regeneration, so its revision is a change counter and never a debt; and a view's
+    /// **input** is where the next command is being typed, not a document of the user's — the
+    /// server keeps it clean however much is in it, and a dot for it would never go out.
+    pub fn focused_unsaved(&self) -> bool {
+        !self.buffer.read_only
+            && !self.focused_is_input()
+            && self.buffer.revision != self.buffer.saved_revision
+    }
+
+    /// Whether the view has unsaved edits anywhere: the focused buffer first-hand, or any other
+    /// element as the server last reported it (`Window::other_elements_dirty`). The one answer
+    /// the status dot, the close prompt and the transience guard all read, so they cannot
+    /// disagree about whether a view is dirty.
+    pub fn unsaved(&self) -> bool {
+        self.focused_unsaved() || self.window.as_ref().is_some_and(|w| w.other_elements_dirty)
+    }
+
     /// The status bar's breadcrumb: the path from the view's root down to the cursor.
     ///
     /// Server-composed, whole. For an ordinary view it is the document-symbol chain; for a composed
@@ -1087,6 +1122,7 @@ impl ViewState {
         Self {
             // A view opens on its own buffer; focus moves it off only in a multi-buffer view.
             view_id,
+            tail_total: 0,
             view_buffer: buffer.buffer_id,
             view_transient: transient,
             view_label: buffer.label.clone(),
@@ -1198,6 +1234,18 @@ pub struct Session {
     ///
     /// Only user-initiated operations ever appear here: the periodic fetcher runs unannounced.
     pub git_operation: Option<(String, GitOperation)>,
+    /// The shells with a command in flight, keyed by view — pushed by the server
+    /// (`shell/run_changed`) and rendered as the status bar's shell indicator.
+    ///
+    /// A map rather than one slot, because a workspace can have several shells and several of them
+    /// can be building at once: the indicator names the *focused* shell's command when it is
+    /// running and counts the others when they are not, which is a question only the whole set can
+    /// answer. Keyed by view id, so `Space Alt-b` knows which one it is stopping.
+    pub shell_runs: std::collections::HashMap<ViewId, aether_protocol::shell::RunState>,
+    /// The line a `shell/run` in flight was sent with. Recorded into the shell history only once
+    /// the server accepts it, so a refused line is not recalled by `Up` — and held here because
+    /// by the time the answer arrives the input has been cleared.
+    pub pending_shell_submit: Option<String>,
     /// Inline diff view toggle — sticky across buffer switches (re-enabled after each
     /// subscribe), like the TUI's `ViewSettings`.
     pub diff_view: bool,
@@ -1650,6 +1698,8 @@ impl Session {
             git_auto_fetch: false,
             worktree_store: String::new(),
             git_operation: None,
+            shell_runs: std::collections::HashMap::new(),
+            pending_shell_submit: None,
             diff_view: false,
             markdown_read_default: true,
             markdown_width: aether_protocol::settings::default_markdown_width(),
@@ -1805,6 +1855,56 @@ impl Session {
 
     /// Which element a re-subscribe should say holds the cursor: the one it already does, when
     /// the session is re-presenting a view it holds a window for (a wrap toggle, a reconnect).
+    /// Where to scroll after a push that made this view taller — the shell view's "follow the
+    /// output" policy, applied for the shells and only for them.
+    ///
+    /// `top` and `viewport_rows` are where the client is scrolled now and how much it can show;
+    /// how tall the view was *before* is remembered here, from the last time a shell asked — which
+    /// is what keeps the three of them from each carrying their own copy of it. `None` leaves the
+    /// scroll alone, which is every ordinary view and every reader who has scrolled up to look at
+    /// something.
+    ///
+    /// Gated here rather than in each shell so the three cannot disagree about *when* a view
+    /// follows its own output; [`crate::grid::sticky_tail`] owns the arithmetic of *where* it
+    /// lands.
+    pub fn sticky_tail_row(
+        &mut self,
+        top: VisualRow,
+        viewport_rows: u32,
+        measured: &crate::grid::Measured,
+    ) -> Option<VisualRow> {
+        let after = match self.view.window.as_ref() {
+            Some(w) => crate::grid::total_rows(&w.root, measured),
+            None => return None,
+        };
+        // Recorded whatever the answer is: this is "how tall was it last time anyone asked", and a
+        // shell that skips a comparison must not leave a stale height behind for the next one.
+        let before = std::mem::replace(&mut self.view.tail_total, after);
+        // Only a view with an input follows: its last element is the line you are typing into, so
+        // keeping the end on screen keeps the caret on screen. An ordinary file has no such end.
+        self.shell_input()?;
+        crate::grid::sticky_tail(top, viewport_rows, before, after)
+    }
+
+    /// What the status bar says about shells, or `None` when none is running.
+    ///
+    /// The shell you are looking at is named by its **command**, because that is the thing you are
+    /// waiting on; shells you are not looking at are counted, because their commands are not what
+    /// the row is for and three of them would not fit anyway. One definition, in the core, so the
+    /// terminal, the GUI and the browser cannot disagree about what the indicator says.
+    ///
+    /// Presentation stays with the shells: no glyph, no colour — the same division the git
+    /// operation's label draws.
+    pub fn shell_indicator(&self) -> Option<String> {
+        if let Some(run) = self.shell_runs.get(&self.view.view_id) {
+            return Some(run.command.clone());
+        }
+        match self.shell_runs.len() {
+            0 => None,
+            n => Some(format!("{n} running")),
+        }
+    }
+
     /// `None` on a fresh open, where the server decides from the place the view opens at.
     pub fn subscribe_focus(&self) -> Option<aether_protocol::viewport::FieldId> {
         self.view.window.as_ref().map(|_| self.view.focused_element)
@@ -1985,6 +2085,75 @@ mod tests {
 
     fn roots(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A shell-shaped view: a transcript element and, last, the input. `focused` is where the
+    /// cursor is; the revisions are the focused buffer's as the client holds them.
+    fn shell_view(focused: u32, revision: u64, saved_revision: u64) -> Session {
+        use aether_protocol::coords::ElementRow;
+        use aether_protocol::ui::{Element, ElementRole, LayoutOwner};
+        let editor = |element: u32, role: ElementRole| Element::Editor {
+            element,
+            buffer: u64::from(element) + 1,
+            rows: 1,
+            first_row: ElementRow(0),
+            laid_out_by: LayoutOwner::Server,
+            role,
+            first_buffer_line: 0,
+            lines: Vec::new(),
+        };
+        let mut s = Session::placeholder();
+        s.view.window = Some(aether_protocol::viewport::Window {
+            other_elements_dirty: false,
+            max_line_width: 0,
+            git_status: None,
+            root: Element::column(vec![
+                editor(0, ElementRole::Field),
+                editor(1, ElementRole::Input),
+            ]),
+        });
+        s.view.focused_element = focused;
+        s.view.buffer.revision = revision;
+        s.view.buffer.saved_revision = saved_revision;
+        s
+    }
+
+    /// Typing a command bumps the input's revision past the saved point the client learned when
+    /// it focused the input — and that is not unsaved work. The same numbers on the transcript
+    /// element would be: it is which buffer, not the numbers, that decides.
+    #[test]
+    fn typing_into_a_shell_input_is_not_unsaved() {
+        let s = shell_view(1, 5, 3);
+        assert!(s.view.focused_is_input());
+        assert!(!s.view.focused_unsaved());
+        assert!(
+            !s.view.unsaved(),
+            "the input is where the next command is typed"
+        );
+
+        let s = shell_view(0, 5, 3);
+        assert!(!s.view.focused_is_input());
+        assert!(s.view.unsaved());
+    }
+
+    /// A read-only buffer is regenerated whole by the server, its saved point moving with every
+    /// regeneration: a revision that ran ahead of the saved point the client holds is a change
+    /// counter, not a debt.
+    #[test]
+    fn a_read_only_buffer_is_never_unsaved() {
+        let mut s = shell_view(0, 5, 3);
+        s.view.buffer.read_only = true;
+        assert!(!s.view.unsaved());
+    }
+
+    /// The view-wide half: another element being dirty counts whatever is focused, and is not
+    /// the focused buffer's own answer.
+    #[test]
+    fn another_element_being_dirty_counts_whatever_is_focused() {
+        let mut s = shell_view(1, 3, 3);
+        s.view.window.as_mut().unwrap().other_elements_dirty = true;
+        assert!(!s.view.focused_unsaved());
+        assert!(s.view.unsaved());
     }
 
     #[test]

@@ -186,6 +186,44 @@ impl std::ops::DerefMut for ViewOpenResult {
     }
 }
 
+// ---- view/follow_line -------------------------------------------------------------------------
+
+/// Follow the line under the cursor to whatever it points at — `Enter` in a **composed** view.
+///
+/// One method, **total** over the kinds of generated content a view can be built from, so a client
+/// never has to know which it is looking at: a patch line leads to the file it came from at the
+/// revision that side of the diff belongs to (the logic [`crate::git::GitFollowPatchLine`] owns,
+/// which stays a method of its own), a shell's transcript line leads to a `path:line:col` printed
+/// in it, and anything else answers `None`.
+///
+/// No position rides here. The cursor is the server's — per `(client, buffer)`, in the focused
+/// element's buffer — and it is the same convention every other position-bearing method follows:
+/// a client that sent coordinates could disagree with the document they index.
+pub struct ViewFollowLine;
+impl RpcMethod for ViewFollowLine {
+    const NAME: &'static str = "view/follow_line";
+    type Params = ViewFollowLineParams;
+    type Result = ViewFollowLineResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewFollowLineParams {
+    /// The view being read. A view with no generated content answers `opened: None`.
+    pub view_id: crate::ViewId,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewFollowLineResult {
+    /// The file opened, in the same shape every other open returns, with the cursor already on the
+    /// place the line named.
+    ///
+    /// `None` when the line leads nowhere — a patch's metadata block, a line of shell output with
+    /// no path in it, a path that doesn't exist. A quiet no-op rather than an error: `Enter` is a
+    /// common key and being told off for pressing it on ordinary output would be noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened: Option<ViewOpenResult>,
+}
+
 // ---- view/close -------------------------------------------------------------------------------
 
 pub struct ViewClose;

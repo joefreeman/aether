@@ -1,0 +1,8 @@
+[package]
+name = "aether-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Aether's own command language — the parser and the validator, with nothing that touches a process"
+
+[dependencies]

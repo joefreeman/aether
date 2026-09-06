@@ -7,6 +7,7 @@ description = "Aether editor server daemon."
 
 [dependencies]
 aether-protocol.workspace = true
+aether-shell.workspace = true
 
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

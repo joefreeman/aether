@@ -487,8 +487,6 @@ interface CoreView {
     language: string | null;
     cursor: CursorState;
     scroll: ScrollPosition | null;
-    revision: number;
-    saved_revision: number;
   };
   /** Raw blame for the followed cursor line (server `git/blame_changed` push); formatted here. */
   blame: { line: number; author: string; timestamp: number; is_uncommitted: boolean } | null;
@@ -501,8 +499,14 @@ interface CoreView {
   workspace_worktrees: { repo_id: string; worktree: string; branch?: string }[];
   externally_modified: boolean;
   externally_deleted: boolean;
+  /** The view has unsaved edits — the core's one answer (`ViewState::unsaved`). */
+  unsaved: boolean;
   /** The long-running git operation in flight, or null. Only user-initiated ones appear. */
   git_operation: GitOperation | null;
+  /** What to say about shells running commands — the focused shell's command, or "N running"
+   *  for the ones elsewhere. Composed by the core (`Session::shell_indicator`), so this is the
+   *  whole string bar its glyph. Null when nothing is running. */
+  shell_indicator: string | null;
   diagnostics: DiagnosticCounts;
   lsp: LspServerStatus | null;
   search: SearchView;
@@ -626,13 +630,7 @@ function bufferStateColor(v: CoreView): string | null {
   const light = v.theme === "light";
   if (v.externally_deleted) return "#bf616a"; // state-deleted (NORD11 in both themes)
   if (v.externally_modified) return light ? "#ab5f38" : "#d08770"; // state-changed
-  // Focused buffer's own compare, or any other element of the view — unsaved edits in a hunk
-  // scrolled past were invisible while this only asked the buffer under the cursor.
-  if (
-    v.buffer.revision !== v.buffer.saved_revision ||
-    v.window?.other_elements_dirty === true
-  )
-    return light ? "#5e81ac" : "#81a1c1"; // state-unsaved
+  if (v.unsaved) return light ? "#5e81ac" : "#81a1c1"; // state-unsaved
   return null;
 }
 
@@ -2333,7 +2331,17 @@ export class Shell {
           // Diff toggle re-layout: restore the view to the pending content anchor (same content on
           // screen) if there is one; otherwise reveal the cursor as before.
           const row = this.session.resolve_scroll_anchor();
-          if (row != null) this.scrollTopTo(this.pxOfUnits(row), false);
+          if (row != null) {
+            this.scrollTopTo(this.pxOfUnits(row), false);
+            break;
+          }
+          // A shell whose output is arriving while you were at the end: follow it. The caret is in
+          // the input, which is that end, so there is nothing left to reveal.
+          const tail = this.session.sticky_tail_row(
+            this.unitsOfPx(this.bufferEl.scrollTop),
+            this.visibleUnits(),
+          );
+          if (tail != null) this.scrollTopTo(this.pxOfUnits(tail), false);
           else this.revealCursor();
           break;
         }
@@ -5157,6 +5165,15 @@ export class Shell {
     used += [...name.textContent].length;
     fileGroup.append(name);
     left.append(fileGroup);
+    // The running-shell indicator sits beside git's, in the same slot and the same shade: both
+    // answer "something is happening that you are waiting on".
+    if (v.shell_indicator) {
+      const el = document.createElement("span");
+      el.className = "status-git git-branch";
+      el.textContent = `⟳ ${v.shell_indicator}`;
+      used += [...el.textContent].length + DIVIDER_COLS;
+      left.append(sectionDivider(), el);
+    }
     // An operation in flight replaces the whole git group: while a push runs, its progress is the
     // only thing about git worth the width, and the branch hasn't moved.
     const op = v.git_operation;

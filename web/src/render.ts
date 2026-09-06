@@ -521,50 +521,16 @@ function gutter(
   return g;
 }
 
-/** A generated patch's file or hunk separator, the patch's summary caption, or the blank space
- *  between them.
+/** The spans a row's inline nodes draw, appended to `into` left to right.
  *
- *  Chrome, not content: it holds no cursor position (that's the whole reason it's a virtual row
- *  rather than a buffer line) and carries no gutter change-bar, since it belongs to no line of
- *  either side. The file separator's trailing rule is drawn in CSS, so it fills whatever width is
- *  left. */
-/** One row of a box's own border or padding.
- *
- *  No tree node stands for it, so unlike `chromeRow` there is nothing to read text out of: what it
- *  draws is the rule, and where the rule meets the rail. `join` is the same alphabet the terminal
- *  spells with `┌`/`├`/`└`; here it is a CSS class, as the file rail already was. */
-function edgeRow(side: "top" | "bottom", join: RailJoin, band: Band): HTMLElement {
-  const rowEl = document.createElement("div");
-  rowEl.className = `row box-edge ${side} ${join}`;
-  // A box's own cells take its band, the same as any other row of it.
-  if (band === "chrome") rowEl.classList.add("patch-chrome");
-  const g = document.createElement("span");
-  g.className = "gutter";
-  rowEl.appendChild(g);
-  const content = document.createElement("span");
-  content.className = "content";
-  rowEl.appendChild(content);
-  return rowEl;
-}
-
-function chromeRow(v: ViewNode, band: Band): HTMLElement {
-  const rowEl = document.createElement("div");
-  rowEl.className = "row";
-  // A row of presentation with no band paints none — since one vocabulary covers both axes, an
-  // inline element may stand on its own. It still draws; it just sits on the editor's background.
-  // The band was a `chrome` variant carrying a `ChromeKind` no shell branched on and a `RailJoin`
-  // that is derived from the tree now; what it delivered was this shade, so this is what says it.
-  if (band === "chrome") rowEl.classList.add("patch-chrome");
-  const g = document.createElement("span");
-  g.className = "gutter";
-  rowEl.appendChild(g);
-  const content = document.createElement("span");
-  content.className = "content";
-  for (const w of inlineOf(v)) {
+ *  Shared by a chrome row and a box's title: the same vocabulary, in the same roles, drawn in two
+ *  different places on the row. */
+function appendInline(into: HTMLElement, nodes: ViewNode[]): void {
+  for (const w of nodes) {
     if (w.node === "space") {
       const span = document.createElement("span");
       span.textContent = " ".repeat(w.cols);
-      content.appendChild(span);
+      into.appendChild(span);
     } else if (w.node === "fill") {
       // Nothing to append: a rule is a flex-grown `::after` border keyed off the row's `.rule`
       // class (see theme.css), not a repeated glyph. The element says "absorb the slack"; the DOM
@@ -586,11 +552,62 @@ function chromeRow(v: ViewNode, band: Band): HTMLElement {
         const span = document.createElement("span");
         if (cls[i]) span.className = cls[i] as string;
         span.textContent = cps.slice(i, j).join("");
-        content.appendChild(span);
+        into.appendChild(span);
         i = j;
       }
     }
   }
+}
+
+/** One row of a box's own border or padding.
+ *
+ *  No tree node stands for it, so unlike `chromeRow` there is nothing to read text out of — except
+ *  on the border a *named* box opens with, which carries the name on the rule itself. `join` is
+ *  the same alphabet the terminal spells with `┌`/`├`/`└`; here it is a CSS class, as the file
+ *  rail already was, and the name is a span that masks the rule where it sits (`.box-edge .title`)
+ *  — the rule being one gradient across the row, splitting it in two would mean teaching the
+ *  `--rule-from`/`--rule-to` rails to count characters. */
+function edgeRow(side: "top" | "bottom", join: RailJoin, band: Band, title: ViewNode[]): HTMLElement {
+  const rowEl = document.createElement("div");
+  rowEl.className = `row box-edge ${side} ${join}`;
+  // A box's own cells take its band, the same as any other row of it.
+  if (band === "chrome") rowEl.classList.add("patch-chrome");
+  const g = document.createElement("span");
+  g.className = "gutter";
+  rowEl.appendChild(g);
+  const content = document.createElement("span");
+  content.className = "content";
+  if (title.length) {
+    const named = document.createElement("span");
+    named.className = "title";
+    appendInline(named, title.flatMap(inlineOf));
+    content.appendChild(named);
+  }
+  rowEl.appendChild(content);
+  return rowEl;
+}
+
+/** A generated patch's file or hunk separator, the patch's summary caption, or the blank space
+ *  between them.
+ *
+ *  Chrome, not content: it holds no cursor position (that's the whole reason it's a virtual row
+ *  rather than a buffer line) and carries no gutter change-bar, since it belongs to no line of
+ *  either side. The file separator's trailing rule is drawn in CSS, so it fills whatever width is
+ *  left. */
+function chromeRow(v: ViewNode, band: Band): HTMLElement {
+  const rowEl = document.createElement("div");
+  rowEl.className = "row";
+  // A row of presentation with no band paints none — since one vocabulary covers both axes, an
+  // inline element may stand on its own. It still draws; it just sits on the editor's background.
+  // The band was a `chrome` variant carrying a `ChromeKind` no shell branched on and a `RailJoin`
+  // that is derived from the tree now; what it delivered was this shade, so this is what says it.
+  if (band === "chrome") rowEl.classList.add("patch-chrome");
+  const g = document.createElement("span");
+  g.className = "gutter";
+  rowEl.appendChild(g);
+  const content = document.createElement("span");
+  content.className = "content";
+  appendInline(content, inlineOf(v));
   rowEl.appendChild(content);
   return rowEl;
 }
@@ -734,7 +751,10 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
       continue;
     }
     if (item.kind === "edge") {
-      frag.appendChild(inset(edgeRow(item.side, item.join, item.band)));
+      // A box is named on the border it opens with; the closing one carries nothing.
+      const title =
+        item.side === "top" && item.owner.node === "column" ? (item.owner.title ?? []) : [];
+      frag.appendChild(inset(edgeRow(item.side, item.join, item.band, title)));
       continue;
     }
     const { line, row, rowIndex, element } = item;

@@ -7269,8 +7269,8 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
                 .window;
         }
         let painted = aether_client::grid::painted_rows(&window, &Measured::default());
-        if let Some(r) =
-            (top..(top + rows).min(total)).find(|r| !painted.iter().any(|(at, _)| at.row.get() == *r))
+        if let Some(r) = (top..(top + rows).min(total))
+            .find(|r| !painted.iter().any(|(at, _)| at.row.get() == *r))
         {
             stuck = Some((top, r));
             break;

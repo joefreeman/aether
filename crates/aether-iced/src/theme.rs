@@ -24,6 +24,7 @@ pub struct Palette {
     pub mode: ThemeMode,
 
     // ---- Backgrounds ----
+    pub bg_app: Color,
     pub bg: Color,
     pub bg_panel: Color,
     pub bg_selection: Color,
@@ -33,7 +34,6 @@ pub struct Palette {
     pub match_highlight: Color,
     pub match_bracket: Color,
     pub cursor_line_bg: Color,
-    pub patch_chrome_bg: Color,
     pub overlay_border: Color,
     pub border_subtle: Color,
 
@@ -105,6 +105,7 @@ impl Palette {
     fn from_theme(t: &Theme) -> Palette {
         Palette {
             mode: t.mode,
+            bg_app: color(t.bg_app),
             bg: color(t.bg),
             bg_panel: color(t.bg_panel),
             bg_selection: color(t.bg_selection),
@@ -114,7 +115,6 @@ impl Palette {
             match_highlight: color(t.match_highlight),
             match_bracket: color(t.match_bracket),
             cursor_line_bg: color(t.cursor_line_bg),
-            patch_chrome_bg: color(t.patch_chrome_bg),
             overlay_border: color(t.overlay_border),
             border_subtle: color(t.border_subtle),
             fg: color(t.fg),

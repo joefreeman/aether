@@ -1637,6 +1637,12 @@ impl App {
                     } else if let Some(px) = self.resolve_anchor_px() {
                         self.scroll_px = px;
                         self.clamp_scroll();
+                    } else if let Some(px) = self.sticky_tail_px() {
+                        // A shell whose output is arriving while you were at the end: follow it,
+                        // and let an owed reveal go — the caret is in the input, at that end.
+                        self.scroll_px = px;
+                        self.clamp_scroll();
+                        self.pending_reveal.abandon();
                     } else {
                         self.clamp_scroll();
                         // A pushed window can be the one that finally holds the cursor's line, so
@@ -2520,6 +2526,15 @@ impl App {
         self.scroll_px = self.scroll_px.clamp(0.0, self.max_scroll_px());
     }
 
+    /// Where to scroll to when a shell's output has just made its view taller — the core's policy,
+    /// asked in units and answered in pixels.
+    fn sticky_tail_px(&mut self) -> Option<f32> {
+        let top = VisualRow(self.units_of_px(self.scroll_px).max(0.0) as u32);
+        let rows = self.visible_rows() * self.measured.units_per_row;
+        let row = self.session.sticky_tail_row(top, rows, &self.measured)?;
+        Some(self.px_of_units(row.get() as f32))
+    }
+
     /// Scroll to `target` px — animated when the move is short enough to look good (the web
     /// client's `scrollTopTo`): smooth within ~1.5 viewports, snap beyond (a long glide would
     /// sail over not-yet-loaded rows and storm the server with window fetches).
@@ -3097,14 +3112,24 @@ impl App {
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .style(move |_| container::Style {
-                        background: Some(p.bg.into()),
+                        // No view, so no well: the whole canvas is the app's ground.
+                        background: Some(p.bg_app.into()),
                         ..container::Style::default()
                     })
                     .into()
             } else if self.session.view.read.is_some() {
                 // The markdown reading view replaces the editor wholesale while active — the same
-                // status bar and overlays around it.
-                column![self.read_view(), self.status_bar()].into()
+                // status bar and overlays around it. A client-laid-out prose element is an editor
+                // element too, so the whole reading pane is the editor's well: every row in it is
+                // document, with no chrome rows for the ground to show through between.
+                let page = container(self.read_view())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(p.bg.into()),
+                        ..container::Style::default()
+                    });
+                column![page, self.status_bar()].into()
             } else {
                 let editor = editor::editor(
                     editor::Content {
@@ -4732,6 +4757,15 @@ impl App {
             // see the view picker's tether star.
             left = left.push(t(" *".into(), p.fg_muted));
             used += 2;
+        }
+        // The running-shell indicator sits beside git's, in the same slot and the same shade: both
+        // answer "something is happening that you are waiting on". The text is the core's, so the
+        // three shells cannot phrase it three ways.
+        if let Some(label) = self.session.shell_indicator() {
+            let seg = format!("⟳ {label}");
+            left = left.push(section_divider(&self.ui(), p));
+            used += DIVIDER_COLS + seg.chars().count();
+            left = left.push(t(seg, p.accent_alt));
         }
         // An operation in flight replaces the whole git cluster: while a push runs, its progress
         // is the only thing about git worth the width, and the branch hasn't moved.
@@ -6998,15 +7032,7 @@ fn session_state_color(s: &Session) -> Option<iced::Color> {
     if s.view.externally_modified {
         return Some(p.state_changed);
     }
-    // The focused buffer's own compare *or* the view's other elements — unsaved edits in a hunk
-    // scrolled past were invisible while the dot only asked the buffer under the cursor. Local
-    // first, so typing and saving register without waiting for a re-render.
-    if s.view.buffer.revision != s.view.buffer.saved_revision
-        || s.view
-            .window
-            .as_ref()
-            .is_some_and(|w| w.other_elements_dirty)
-    {
+    if s.view.unsaved() {
         return Some(p.state_unsaved);
     }
     None

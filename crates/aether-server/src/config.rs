@@ -898,6 +898,12 @@ pub enum SessionView {
     Virtual {
         key: String,
     },
+    /// A shell, by its per-workspace number. Its transcript, runs, directory and assignments
+    /// survive as a snapshot in the backups directory, keyed the same way; an entry with no
+    /// snapshot to restore from is dropped at activation, as a scratch's is.
+    Shell {
+        number: u32,
+    },
     /// A session written before the tag was the view's kind: a file with an optional `view`. Read
     /// as the editor or reader it named ([`WorkspaceSessions::normalise`]); never written.
     #[doc(hidden)]
@@ -925,7 +931,9 @@ impl SessionView {
             SessionView::Editor { path } => Some((path, ViewKind::Editor)),
             SessionView::Reader { path } => Some((path, ViewKind::Reader)),
             SessionView::File { path, view } => Some((path, view.unwrap_or(ViewKind::Editor))),
-            SessionView::Scratch { .. } | SessionView::Virtual { .. } => None,
+            SessionView::Scratch { .. }
+            | SessionView::Virtual { .. }
+            | SessionView::Shell { .. } => None,
         }
     }
 

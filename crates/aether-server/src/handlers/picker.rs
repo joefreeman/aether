@@ -32,6 +32,11 @@ fn build_view_candidates(s: &ServerState, client_id: ClientId) -> Vec<picker_sta
         let (Some(buf), Some(doc)) = (s.buffers.get(&id), s.try_doc_of(id)) else {
             continue;
         };
+        // A field of a view is not a view: a shell's input has no row of its own, and a row that
+        // opened one would present half a shell. See `Document::internal`.
+        if doc.internal {
+            continue;
+        }
         out.push(buffer_candidate(buf, doc, view_id, view, &roots));
         seen.insert(view_id);
     }
@@ -42,6 +47,7 @@ fn build_view_candidates(s: &ServerState, client_id: ClientId) -> Vec<picker_sta
         .views
         .iter()
         .filter(|(view_id, view)| belongs(&view.presenting) && !seen.contains(view_id))
+        .filter(|(_, view)| !s.try_doc_of(view.presenting).is_some_and(|d| d.internal))
         .filter(|(_, view)| !view.transient)
         .map(|(view_id, _)| *view_id)
         .collect();
@@ -89,12 +95,13 @@ fn dormant_candidate(
             crate::workspace_index::workspace_relative_parts(p, roots),
         ),
         crate::state::DormantSource::Scratch { number } => (format!("(scratch {number})"), None),
+        crate::state::DormantSource::Shell { number } => (format!("Shell {number}"), None),
         // Named as the live view names itself, as far as the key allows: the working changes are
         // `Working changes`, a revision its short hash (`abc1234`, `abc1234:src/a.rs`) — the
         // subject is generated with the content, which a dormant entry hasn't paid for yet. A key
         // that doesn't parse is shown as it is.
         crate::state::DormantSource::Virtual { key } => (
-            match crate::state::VirtualTarget::parse_key(key).map(|t| t.what) {
+            match crate::state::VirtualTarget::parse_key(key).and_then(|t| t.what().cloned()) {
                 Some(aether_protocol::git::ShowTarget::WorkingChanges) => "Working changes".into(),
                 Some(aether_protocol::git::ShowTarget::Commit { rev }) => {
                     rev.chars().take(7).collect()
@@ -114,9 +121,10 @@ fn dormant_candidate(
     let status = match &d.source {
         // A revision is Clean for the same reason a file is, and more so: it is read-only, so
         // there was never anything to save.
-        crate::state::DormantSource::File(_) | crate::state::DormantSource::Virtual { .. } => {
-            BufferDirtyState::Clean
-        }
+        // A shell's snapshot is safe on disk, and a shell is never unsaved work.
+        crate::state::DormantSource::File(_)
+        | crate::state::DormantSource::Virtual { .. }
+        | crate::state::DormantSource::Shell { .. } => BufferDirtyState::Clean,
         crate::state::DormantSource::Scratch { .. } => BufferDirtyState::Unsaved,
     };
     picker_state::ViewCandidate {
@@ -131,7 +139,8 @@ fn dormant_candidate(
             // No file to open behind either: a revision is regenerated, and a scratch is content
             // with nowhere on disk to live.
             crate::state::DormantSource::Scratch { .. }
-            | crate::state::DormantSource::Virtual { .. } => None,
+            | crate::state::DormantSource::Virtual { .. }
+            | crate::state::DormantSource::Shell { .. } => None,
         },
         transient: false,
     }
@@ -1660,6 +1669,10 @@ pub async fn picker_view(
                         .find(|v| v.client_id == client_id && v.view_id == view_id);
                     vp.and_then(|v| {
                         let doc = s.try_doc_of(s.view_of(v).presenting)?;
+                        // Any *generated* view has an outline of its own — a patch's hunks, a
+                        // shell's runs — and `view_outline` is the one place that says which.
+                        // Asking "is it a patch?" here is what made `Space o` in a shell fall
+                        // through to a language server that has nothing to say about it.
                         doc.generated.as_ref()?;
                         Some(build_outline_candidates(&s, v, &doc.text))
                     })
@@ -1755,7 +1768,7 @@ pub async fn picker_view(
                 Some(buffer_id) => {
                     let s = state.lock().await;
                     s.try_doc_of(buffer_id).and_then(|d| {
-                        let generated = d.generated.as_ref()?;
+                        let generated = d.patch()?;
                         let view = s.view_presenting(buffer_id)?;
                         Some(build_patch_change_candidates(view, generated, &d.text))
                     })
@@ -3421,7 +3434,7 @@ pub fn step_location(
         cursor,
         translated: false,
     };
-    let Some(generated) = doc.generated.as_ref() else {
+    let Some(generated) = doc.patch() else {
         return Some(plain);
     };
     // The patch document itself: the client's focused element windows generated text. Its place

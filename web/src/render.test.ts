@@ -68,11 +68,14 @@ function painted(window: BufferWindow, opts: { cursor?: CursorState; focused?: n
     focusedElement: opts.focused ?? 0,
   });
   return [...container.querySelectorAll(".row")].map((el) => {
-    const kind = el.classList.contains("patch-chrome")
-      ? "chrome"
-      : el.classList.contains("deleted-phantom")
-        ? "phantom"
-        : "text";
+    // An edge row sits on the chrome band too, so it is asked about first.
+    const kind = el.classList.contains("box-edge")
+      ? "edge"
+      : el.classList.contains("patch-chrome")
+        ? "chrome"
+        : el.classList.contains("deleted-phantom")
+          ? "phantom"
+          : "text";
     return `${kind} ${el.textContent?.trim()}`;
   });
 }
@@ -308,6 +311,72 @@ describe("boxes", () => {
   });
 });
 
+describe("the well and the ground", () => {
+  /** The class each painted row carries, in order.
+   *
+   *  The well/ground split is drawn entirely in CSS, off these classes: an editor row is `.row`
+   *  and paints `--bg`; a chrome row adds `.patch-chrome` and paints `--bg-app`, which is also
+   *  what `#buffer` behind them shows. Nothing in the DOM can be asked what colour it came out —
+   *  happy-dom has no layout — so what a painter test can pin is that the classes the rules key
+   *  off are the ones the rows actually get. */
+  function classesOf(window: BufferWindow): string[][] {
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+    });
+    return [...container.querySelectorAll(".row")].map((el) => [...el.classList]);
+  }
+
+  const patch = windowOf({
+    node: "column",
+    children: [chrome("a.rs"), editor(0, 16, [line(16, "fn f17"), line(17, "fn f18")])],
+  });
+
+  it("marks chrome rows and leaves buffer rows plain", () => {
+    const [heading, ...text] = classesOf(patch);
+    expect(heading, "a chrome row carries the class the ground rule keys off").toContain(
+      "patch-chrome",
+    );
+    for (const row of text) {
+      expect(row, "a buffer row is a plain `.row` — the well is its own default").toEqual(["row"]);
+    }
+  });
+
+  it("leaves the gaps between elements to the pane", () => {
+    // A row nothing is loaded at is a bare spacer with no `.row` class, so it paints neither the
+    // well nor a tint — it is `#buffer` showing through, which is the ground.
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window: patch,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+    });
+    for (const gap of container.querySelectorAll(".row-gap")) {
+      expect([...gap.classList]).toEqual(["row-gap"]);
+    }
+  });
+});
+
 /** The stylesheet, read as text.
  *
  *  Not a rendering test — happy-dom has no layout — but the one thing about these rules that can
@@ -342,6 +411,34 @@ describe("the box stylesheet", () => {
     }
   });
 
+  /** The app's ground is the canvas and the editor's well is the rows on it.
+   *
+   *  Hand-mirrored from `Theme` in `crates/aether-client/src/theme.rs`, so which var each surface
+   *  names is exactly the thing that can drift here and nowhere else. `.row` must set the well
+   *  itself: `#buffer` behind it is the ground, so a row that named no background would come out
+   *  as ground. And it has to come first, or the tints after it would never win. */
+  it("puts the ground on the app and the well on the rows", () => {
+    // The declaration block, not the `html, body, #app` sizing rule that precedes it.
+    expect(
+      rule("#app {\n  display: flex;"),
+      "the application's background is the chrome shade",
+    ).toContain("background: var(--bg-app)");
+    expect(rule(".row {"), "an editor row paints the well").toContain("background: var(--bg)");
+    expect(rule(".row.patch-chrome {"), "a chrome row is the ground showing through").toContain(
+      "background: var(--bg-app)",
+    );
+    expect(
+      css.indexOf(".row.patch-chrome {"),
+      "the chrome rule must follow the plain `.row` one it overrides",
+    ).toBeGreaterThan(css.indexOf(".row {"));
+    // Prose is an editor element too, so the whole reading pane is a well.
+    expect(rule("#buffer.md-read-host {")).toContain("background: var(--bg)");
+    // The retired role must not linger in either theme block or any rule.
+    expect(css, "--patch-chrome-bg is retired; the ground is one role").not.toContain(
+      "--patch-chrome-bg",
+    );
+  });
+
   /** Both rails read one offset, each measured from its own edge.
    *
    *  A percentage in `background-position` resolves against the positioning area **minus the
@@ -368,6 +465,24 @@ describe("the box stylesheet", () => {
       "and after the rule that makes an ordinary chrome gutter opaque",
     ).toBeGreaterThan(css.indexOf(".row.patch-chrome .gutter {"));
   });
+
+  /** A box's name lies *on* the rule, so it has to hide the stretch of rule it covers — and hide
+   *  it in the shade the row itself paints, or the name reads as a differently-coloured patch cut
+   *  out of the border. The space either side of it is the padding, which the same background
+   *  covers: the terminal's `┌─ name ────┐` has a blank cell there, not a rule. */
+  it("masks the rule under a box's name, in the row's own shade", () => {
+    const title = rule(".row.box-edge .title {");
+    expect(title, "a blank cell either side of the name").toContain("padding: 0 1ch");
+    expect(title, "the plain row's shade").toContain("background-color: var(--bg)");
+    expect(
+      rule(".row.box-edge.patch-chrome .title {"),
+      "and the chrome band's, on a box that declares one",
+    ).toContain("background-color: var(--bg-app)");
+    expect(
+      css.indexOf(".row.box-edge .title {"),
+      "the mask must follow the rule it masks, or the gradient paints over it",
+    ).toBeGreaterThan(css.indexOf(".row.box-edge {"));
+  });
 });
 
 describe("the buffer painter", () => {
@@ -382,6 +497,64 @@ describe("the buffer painter", () => {
       },
     );
     expect(painted(w)).toEqual(["chrome a.rs", "text fn f17", "text fn f18"]);
+  });
+
+  /// A shell: each run in a box named on its top border, and the input element last in a box of
+  /// its own. The input is an editor like any other — that is the whole point of the role riding
+  /// on the node rather than the view having a kind — so the painter needs no branch for it, and
+  /// this is what proves it.
+  ///
+  /// The name rides the border row, so it adds no row: a run's box is exactly as tall named as it
+  /// would be nameless, and the row the name lands on is the one the box was already spending.
+  it("paints a shell's runs above its input", () => {
+    const input: ViewNode = {
+      ...(editor(2, 0, [line(0, "cargo build")]) as ViewNode & { node: "editor" }),
+      role: "input",
+    };
+    // Each run in a box of its own, closed on all four sides and named on its top border.
+    const boxed = (name: string, children: ViewNode[]): ViewNode => ({
+      node: "column",
+      edges: { border: { top: 1, right: 1, bottom: 1, left: 1 } },
+      band: "chrome",
+      title: [{ node: "text", text: name }],
+      children,
+    });
+    const w = windowOf({
+      node: "column",
+      children: [
+        boxed("~/proj  ok", [chrome("echo one"), editor(0, 0, [line(0, "one")])]),
+        chrome(""),
+        boxed("~/proj  ok", [chrome("echo two"), editor(1, 1, [line(1, "two")])]),
+        chrome(""),
+        boxed("~/proj", [input]),
+      ],
+    });
+    expect(painted(w)).toEqual([
+      "edge ~/proj  ok",
+      "chrome echo one",
+      "text one",
+      "edge ",
+      "chrome ",
+      "edge ~/proj  ok",
+      "chrome echo two",
+      "text two",
+      "edge ",
+      "chrome ",
+      "edge ~/proj",
+      "text cargo build",
+      "edge ",
+    ]);
+  });
+
+  /// A new shell is a real state: just the line you type into.
+  it("paints a shell with no runs as its input alone", () => {
+    const input: ViewNode = {
+      ...(editor(0, 0, [line(0, "ls -la")]) as ViewNode & { node: "editor" }),
+      role: "input",
+    };
+    expect(painted(windowOf({ node: "column", children: [input] }))).toEqual([
+      "text ls -la",
+    ]);
   });
 
   /// Two files in one view. The second's lines are numbered *below* the first's, so any lookup by

@@ -177,7 +177,7 @@ fn buffer_repo_id(s: &ServerState, buffer_id: BufferId) -> Option<RepoId> {
     from_baseline.or_else(|| {
         s.try_doc_of(buffer_id)
             .and_then(|d| d.virtual_source.as_ref())
-            .map(|v| v.target.repo_id.clone())
+            .and_then(|v| v.target.repo_id().map(str::to_string))
     })
 }
 
@@ -3263,7 +3263,7 @@ pub async fn git_blame_line(
 fn revision_file_of(doc: &Document) -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
     let target = &doc.virtual_source.as_ref()?.target;
     Some((
-        std::path::PathBuf::from(&target.repo_id),
+        std::path::PathBuf::from(target.repo_id()?),
         std::path::PathBuf::from(target.path()?),
         target.rev()?.to_string(),
     ))
@@ -3479,7 +3479,7 @@ pub async fn git_set_diff_view(
 /// same gesture, better answer — the pattern the conflict branch established.
 pub fn buffer_change_anchors(s: &ServerState, buffer_id: BufferId) -> Vec<u32> {
     let conflicts = buffer_conflicts(s, buffer_id);
-    if let Some(generated) = s.doc_of(buffer_id).generated.as_ref() {
+    if let Some(generated) = s.doc_of(buffer_id).patch() {
         // A generated patch: its own change blocks, already in buffer-line coordinates.
         // Deliberately the blocks and not the hunks — a hunk opens with the context lines that
         // make it readable, so stopping at its start would land several lines above anything that
@@ -3584,14 +3584,13 @@ async fn resolve_patch_apply_target(
     let Some(doc) = s.try_doc_of(buffer_id) else {
         return Ok(PatchApply::NotAPatch);
     };
-    let (Some(generated), Some(source)) = (doc.generated.as_ref(), doc.virtual_source.as_ref())
-    else {
+    let (Some(generated), Some(source)) = (doc.patch(), doc.virtual_source.as_ref()) else {
         return Ok(PatchApply::NotAPatch);
     };
-    if source.target.what != aether_protocol::git::ShowTarget::WorkingChanges {
+    if source.target.what() != Some(&aether_protocol::git::ShowTarget::WorkingChanges) {
         return Ok(PatchApply::History);
     }
-    let workdir = std::path::PathBuf::from(&source.target.repo_id);
+    let workdir = std::path::PathBuf::from(source.target.repo_id().unwrap_or_default());
     let line = s
         .cursors
         .get(&(client_id, buffer_id))
@@ -3845,7 +3844,9 @@ async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
         else {
             return;
         };
-        let workdir = std::path::PathBuf::from(&source.target.repo_id);
+        let Some(workdir) = source.target.repo_id().map(std::path::PathBuf::from) else {
+            return;
+        };
         let baseline = s.git_baseline_choices.get(&workdir).cloned();
         (workdir, baseline)
     };
@@ -3868,7 +3869,7 @@ async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
             return;
         };
         let unchanged = doc.text == content.text
-            && doc.generated.as_ref().map(|g| &g.decorations.stage)
+            && doc.patch().map(|g| &g.decorations.stage)
                 == content.generated.as_ref().map(|g| &g.decorations.stage);
         // The baseline is the third thing that can move. It usually moves the text with it, but not
         // always — re-baselining onto `HEAD` with nothing staged produces the identical patch — and
@@ -3892,17 +3893,20 @@ async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
             .iter()
             .filter(|((_, b), cur)| *b == buffer_id && cur.is_point())
             .filter_map(|((c, _), cur)| {
-                let anchor = doc.generated.as_ref().and_then(|g| patch_anchor(g, *cur))?;
+                let anchor = doc.patch().and_then(|g| patch_anchor(g, *cur))?;
                 Some((*c, anchor))
             })
             .collect();
 
-        s.replace_generated(buffer_id, &content.text, content.generated);
+        s.replace_generated(
+            buffer_id,
+            &content.text,
+            content.generated.map(Generated::Patch),
+        );
         for (client, anchor) in anchors {
             let Some(line) = s
                 .doc_of(buffer_id)
-                .generated
-                .as_ref()
+                .patch()
                 .and_then(|g| reseat_patch_anchor(g, &anchor))
             else {
                 continue; // the file has no changes left; the clamp below decides
@@ -3952,8 +3956,8 @@ pub(crate) fn working_changes_repos(
     s.buffers
         .keys()
         .filter_map(|id| s.try_doc_of(*id).and_then(|d| d.virtual_source.as_ref()))
-        .filter(|v| v.target.what == aether_protocol::git::ShowTarget::WorkingChanges)
-        .map(|v| std::path::PathBuf::from(&v.target.repo_id))
+        .filter(|v| v.target.what() == Some(&aether_protocol::git::ShowTarget::WorkingChanges))
+        .filter_map(|v| v.target.repo_id().map(std::path::PathBuf::from))
         .collect()
 }
 
@@ -3982,8 +3986,11 @@ pub(crate) async fn refresh_working_changes_views(
                     && s.try_doc_of(**id)
                         .and_then(|d| d.virtual_source.as_ref())
                         .is_some_and(|v| {
-                            v.target.what == aether_protocol::git::ShowTarget::WorkingChanges
-                                && workdirs.contains(&std::path::PathBuf::from(&v.target.repo_id))
+                            v.target.what()
+                                == Some(&aether_protocol::git::ShowTarget::WorkingChanges)
+                                && v.target.repo_id().is_some_and(|repo| {
+                                    workdirs.contains(&std::path::PathBuf::from(repo))
+                                })
                         })
             })
             .map(|(id, _)| *id)

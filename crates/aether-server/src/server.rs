@@ -201,6 +201,9 @@ pub async fn run_with_listener(
     // Final synchronous flush so a graceful exit (SIGINT/SIGTERM/idle-reap) captures the latest
     // unsaved content; the periodic loop covers SIGKILL/crash to within one interval. No-op when
     // backups are disabled.
+    // Everything this server started goes with it: a `cargo build` whose editor has exited has
+    // nobody to report to and nobody who can stop it.
+    state.lock().await.cancel_all_shell_runs();
     if backups_enabled {
         crate::handlers::flush_backups(&state).await;
     }
@@ -374,7 +377,8 @@ async fn git_fetch_loop(state: SharedState) {
 /// for `timeout`, notify `shutdown` so the accept loop exits. A reconnecting client resets the clock.
 ///
 /// "Idle" means no clients connected. A dirty buffer whose content wouldn't survive the process
-/// additionally pins the server open — reaping it would silently drop unsaved work. That covers
+/// additionally pins the server open — reaping it would silently drop unsaved work — and so does a
+/// shell with a command still running ([`ServerState::has_running_shell`]). That covers
 /// backups being *disabled* (in-process tests/embeddings) and dirty buffers in an *ephemeral*
 /// workspace, which is never backed up. Everything else is safe on disk (and re-flushed on
 /// shutdown), so it no longer blocks the reap: that interim guard is what backup persistence retires.
@@ -388,7 +392,10 @@ async fn idle_reaper(state: SharedState, timeout: Duration, shutdown: Arc<Notify
         let idle = {
             let s = state.lock().await;
             let unsaved_pins = s.has_unprotected_unsaved_buffers();
-            s.clients.is_empty() && !unsaved_pins
+            // A command still running pins the server open for the same reason unsaved work does:
+            // reaping would kill it, and the output nobody has read yet would go with it.
+            let shell_pins = s.has_running_shell();
+            s.clients.is_empty() && !unsaved_pins && !shell_pins
         };
         if idle {
             let since = *idle_since.get_or_insert_with(Instant::now);

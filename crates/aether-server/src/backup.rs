@@ -31,6 +31,26 @@ pub fn scratch_backup_path(root: &Path, workspace: &str, number: u32) -> PathBuf
         .join(number.to_string())
 }
 
+/// Backup path for a shell: `<root>/shell/<workspace>/<number>`. What it holds is not a document
+/// but a snapshot of the whole shell — transcript, runs, directory, assignments, the input — as
+/// JSON, keyed the way a scratch is: by the per-workspace number that is the shell's identity.
+pub fn shell_backup_path(root: &Path, workspace: &str, number: u32) -> PathBuf {
+    root.join("shell").join(workspace).join(number.to_string())
+}
+
+/// The shell numbers `workspace` holds snapshots for on disk — the shells that can come back.
+pub fn shell_keys(root: &Path, workspace: &str) -> std::collections::HashSet<u32> {
+    std::fs::read_dir(root.join("shell").join(workspace))
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|name| !name.starts_with(".tmp-"))
+                .filter_map(|n| n.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The scratch numbers `workspace` currently holds backups for on disk. Each one is a scratch with
 /// unsaved content, whether or not it's loaded — which is what lets the switcher flag unsaved work
 /// in a workspace nobody has activated yet (`ServerState::unsaved_buffer_count`; file backups are
@@ -121,6 +141,8 @@ mod tests {
     fn file_and_scratch_paths_live_in_distinct_subdirs() {
         let root = Path::new("/state/backups");
         let f = file_backup_path(root, Path::new("/work/a.rs"));
+        let sh = shell_backup_path(root, "work", 2);
+        assert_eq!(sh, root.join("shell").join("work").join("2"));
         let s = scratch_backup_path(root, "work", 3);
         assert!(f.starts_with(root.join("files")));
         assert_eq!(s, root.join("scratch").join("work").join("3"));

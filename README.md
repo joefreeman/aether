@@ -205,6 +205,7 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space x`/`Space Alt-x` | Close view / save and close it |
 | `Space z`/`Space Alt-z` | Open another window / copy this view's web URL |
 | `Space ,`/`Space .` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
+| `Space b`/`Space Alt-b` | A shell you can type into (a new one when you are in one already) / stop what it is running |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save and quit |
 | `Space y`/`Space ?` | Show keyboard shortcuts / about this build |
@@ -242,7 +243,7 @@ scopes — plain takes the change under the cursor (or the selected lines), Alt 
 | Chord | Action |
 | --- | --- |
 | `Space t` | Hover (type & docs, or a link's target) |
-| `Enter` | Follow what's under the cursor: the definition — or, in a patch, the file that line came from |
+| `Enter` | Follow what's under the cursor: the definition — or, in a patch or a shell's output, the file that line names. In a shell's input, run the command |
 | `Space r` | Go to references |
 | `d`/`Alt-d` | Next/previous diagnostic |
 | `Space n` | Diagnostic at cursor |

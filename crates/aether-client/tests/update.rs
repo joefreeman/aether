@@ -246,6 +246,7 @@ fn goto_line_from_end_counts_up_from_the_bottom() {
             rows: 0,
             first_row: aether_protocol::coords::ElementRow(0),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line: 0,
             lines: vec![],
         },
@@ -3015,6 +3016,7 @@ fn diff_toggle_toast_is_grouped() {
             rows: 0,
             first_row: aether_protocol::coords::ElementRow(0),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line: 0,
             lines: vec![],
         },
@@ -6597,6 +6599,7 @@ fn abandoning_a_stopped_operation_confirms_and_names_it() {
             rows: 0,
             first_row: aether_protocol::coords::ElementRow(0),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line: 0,
             lines: vec![],
         },
@@ -7364,6 +7367,7 @@ fn space_k_refuses_a_view_with_another_element_dirty() {
             rows: 0,
             first_row: aether_protocol::coords::ElementRow(0),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
             first_buffer_line: 0,
             lines: vec![],
         },
@@ -10888,6 +10892,7 @@ fn reader_subscribe(
                 rows: lines.len() as u32,
                 first_row: aether_protocol::coords::ElementRow::ZERO,
                 laid_out_by: aether_protocol::ui::LayoutOwner::Client,
+                role: aether_protocol::ui::ElementRole::Field,
                 first_buffer_line: 0,
                 lines,
             },
@@ -13210,6 +13215,7 @@ fn subscribe_over(
                 // A hunk, so the element's lines are nowhere near the view's own line 0.
                 first_row: aether_protocol::coords::ElementRow(0),
                 laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Field,
                 first_buffer_line: 17,
                 lines: vec![],
             },
@@ -13400,6 +13406,7 @@ fn a_press_in_another_element_focuses_it_before_setting_the_cursor() {
         w.root = aether_protocol::viewport::Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
             children: vec![
                 w.root.clone(),
                 aether_protocol::viewport::Element::Editor {
@@ -13408,6 +13415,7 @@ fn a_press_in_another_element_focuses_it_before_setting_the_cursor() {
                     rows: 3,
                     first_row: aether_protocol::coords::ElementRow(0),
                     laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
                     first_buffer_line: 40,
                     lines: vec![],
                 },
@@ -13640,4 +13648,463 @@ fn selecting_a_view_row_focuses_its_element_then_sets_the_cursor() {
     let set = find_request(&fx, "element/set").expect("the cursor is set");
     assert_eq!(set["buffer_id"], json!(11), "on the element's own buffer");
     assert_eq!(set["position"]["line"], json!(42));
+}
+
+// ---- shell views ---------------------------------------------------------------------------------
+
+/// Put the session on a shell view: a run above, the input below, and the caret wherever
+/// `focused` says. The window is what the server would push, since that is the only thing that
+/// tells the client this view is a shell at all.
+fn shell_session(focused: u32) -> Session {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::viewport::ViewportLinesChanged;
+
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    s.view.view_id = ViewId(10);
+    s.view.view_buffer = 10;
+    s.view.buffer.buffer_id = 10;
+    let _ = s.on_event(Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: ViewportLinesChanged::NAME.into(),
+        params: json!({
+            "viewport_id": 7,
+            "buffer": 10,
+            "revision": 1,
+            "window": {
+                "max_line_width": 0,
+                "root": {"node": "column", "children": [
+                    {"node": "row", "band": "chrome", "children": [
+                        {"node": "text", "text": "$ echo hi"}]},
+                    {"node": "editor", "element": 0, "buffer": 10, "rows": 1, "first_row": 0,
+                     "first_buffer_line": 0, "lines": [{"logical_line": 0, "visual_rows": [
+                        {"byte_offset": 0, "continuation_indent": 0,
+                         "segments": [{"text": "hi", "highlights": []}]}]}]},
+                    {"node": "editor", "element": 1, "buffer": 11, "rows": 1, "first_row": 0,
+                     "role": "input", "first_buffer_line": 0, "lines": [{"logical_line": 0,
+                       "visual_rows": [{"byte_offset": 0, "continuation_indent": 0,
+                         "segments": [{"text": "ls -la", "highlights": []}]}]}]},
+                ]},
+            },
+        }),
+    }));
+    s.view.focused_element = focused;
+    // The focused element's buffer is what every text op addresses.
+    s.view.buffer.buffer_id = if focused == 1 { 11 } else { 10 };
+    s
+}
+
+fn shell_run_push(
+    view_id: u64,
+    command: &str,
+    status: serde_json::Value,
+) -> aether_client::update::Event {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: aether_protocol::shell::ShellRunChanged::NAME.into(),
+        params: json!({
+            "view_id": view_id,
+            "run": {"run": 1, "command": command, "status": status},
+        }),
+    })
+}
+
+/// `Space b` asks for a *new* shell only when the view in front of you is already one — which the
+/// client reads off the window's input element, not off any kind flag.
+#[test]
+fn space_b_asks_for_a_new_shell_only_from_inside_one() {
+    let mut s = session();
+    let fx = {
+        let _ = key(&mut s, ' ');
+        key(&mut s, 'b')
+    };
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "shell/open");
+    assert_eq!(params["new"], false, "an ordinary view: give me a shell");
+
+    let mut s = shell_session(1);
+    let fx = {
+        let _ = key(&mut s, ' ');
+        key(&mut s, 'b')
+    };
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "shell/open");
+    assert_eq!(params["new"], true, "already in one: give me another");
+}
+
+/// Opening a shell lands the caret in its input, in Insert.
+#[test]
+fn opening_a_shell_focuses_the_input_and_enters_insert() {
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let fx = key(&mut s, 'b');
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(method, "shell/open");
+
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "input": 3,
+            "opened": {
+                "view_id": 12,
+                "buffer_id": 10,
+                "line_count": 1,
+                "byte_count": 0,
+                "revision": 0,
+                "saved_revision": 0,
+                "path": null,
+                "title": "Shell 1",
+                "read_only": true,
+                "transient": false,
+                "cursor": {"position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0}},
+                "scroll": {"element": 3, "line": 0, "sub_row": 0.0},
+            },
+        })),
+    );
+    assert_eq!(s.view.view_id, ViewId(12));
+    assert_eq!(s.view.focused_element, 3, "the caret goes into the input");
+    assert_eq!(s.view.mode, aether_client::session::Mode::Insert);
+}
+
+/// Insert-mode `Enter` is a newline in a shell's input exactly as it is everywhere else: a
+/// multi-line command is typed like any other text, and running it is a Normal-mode act.
+#[test]
+fn insert_mode_enter_in_the_input_is_a_newline() {
+    for focused in [1, 0] {
+        let mut s = shell_session(focused);
+        s.view.mode = aether_client::session::Mode::Insert;
+        let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+        let (_, method, _) = the_request(&fx);
+        assert_eq!(
+            method, "element/newline_and_indent",
+            "focused element {focused}"
+        );
+    }
+
+    // And in a view with no input at all.
+    let mut s = session();
+    s.view.mode = aether_client::session::Mode::Insert;
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (_, method, _) = the_request(&fx);
+    assert_eq!(method, "element/newline_and_indent");
+}
+
+/// Normal-mode `Enter` on the input runs the command — the one way to run one. Without the guard
+/// it would take the composed-view path and open the input as a view of its own.
+#[test]
+fn normal_mode_enter_on_the_input_submits() {
+    let mut s = shell_session(1);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (_, method, _) = the_request(&fx);
+    assert_eq!(method, "shell/run");
+
+    // On the transcript it is `Enter`'s composed-view meaning: follow what the line names.
+    let mut s = shell_session(0);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "view/follow_line");
+    assert_eq!(params["view_id"], 10);
+}
+
+/// `Enter` follows the line in every composed view, through one method — the client never asks
+/// which sort of generated content it is looking at, and an ordinary buffer still goes to the
+/// language server without paying a round trip to be told so.
+#[test]
+fn enter_follows_the_line_in_any_composed_view() {
+    // A patch: the flag the open carried.
+    let mut s = session();
+    s.view.view_id = ViewId(4);
+    s.view.buffer.is_patch = true;
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "view/follow_line");
+    assert_eq!(params["view_id"], 4);
+    assert_eq!(
+        params.as_object().map(|o| o.len()),
+        Some(1),
+        "no position rides: the cursor is the server's"
+    );
+
+    // An ordinary buffer.
+    let mut s = session();
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    assert_eq!(the_request(&fx).1, "lsp/goto_definition");
+}
+
+/// A line that leads nowhere is silence, not an error — `Enter` is a common key and most lines of
+/// output are not paths.
+#[test]
+fn following_a_line_that_leads_nowhere_says_nothing() {
+    let mut s = shell_session(0);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(token, Ok(json!({})));
+    assert!(no_request(&fx));
+    assert!(toast_messages(&fx).is_empty());
+}
+
+/// A busy shell refuses the submit, and the refusal is information rather than an error — the
+/// text you typed is still in the input, waiting.
+#[test]
+fn a_refused_submit_says_what_is_in_the_way() {
+    let mut s = shell_session(1);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(
+        token,
+        Err(aether_client::transport::RpcError {
+            method: "shell/run",
+            code: aether_protocol::error::ErrorCode::SHELL_BUSY.code(),
+            message: "Shell 1 is running sleep 100 — Space Alt-b stops it".into(),
+        }),
+    );
+    let toasts = toast_messages(&fx);
+    assert_eq!(
+        toasts,
+        vec!["Already running — Shell 1 is running sleep 100 — Space Alt-b stops it".to_string()]
+    );
+    assert!(!has_error_toast(&fx), "busy is not a failure");
+}
+
+/// `Space Alt-b` stops the shell you are looking at, and says so plainly when there is nothing to
+/// stop — silence there reads as a dropped keystroke.
+#[test]
+fn space_alt_b_stops_the_focused_shells_run() {
+    let mut s = shell_session(1);
+    let _ = s.on_event(shell_run_push(10, "sleep 100", json!({"kind": "running"})));
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "shell/cancel");
+    assert_eq!(params["view_id"], 10);
+
+    // Nothing running.
+    let mut s = shell_session(1);
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
+    assert!(no_request(&fx));
+    assert_eq!(
+        toast_messages(&fx),
+        vec!["Nothing is running here".to_string()]
+    );
+
+    // Not a shell at all.
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
+    assert!(no_request(&fx));
+    assert_eq!(toast_messages(&fx), vec!["Not a shell".to_string()]);
+}
+
+/// A run is appended above the input, so the input's element number goes up by one with every
+/// command. The caret follows the input, not the number — otherwise `Enter` would start putting
+/// newlines into the output of the command it had just run.
+#[test]
+fn the_caret_follows_the_input_when_a_run_is_appended_above_it() {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::viewport::ViewportLinesChanged;
+
+    let line = |text: &str| {
+        json!([{"logical_line": 0, "visual_rows": [
+            {"byte_offset": 0, "continuation_indent": 0,
+             "segments": [{"text": text, "highlights": []}]}]}])
+    };
+    let two_runs = || {
+        Event::ServerPush(Notification {
+            jsonrpc: JsonRpc,
+            method: ViewportLinesChanged::NAME.into(),
+            params: json!({
+                "viewport_id": 7,
+                "buffer": 11,
+                "revision": 2,
+                "window": {
+                    "max_line_width": 0,
+                    "root": {"node": "column", "children": [
+                        {"node": "editor", "element": 0, "buffer": 10, "rows": 1, "first_row": 0,
+                         "first_buffer_line": 0, "lines": line("hi")},
+                        {"node": "editor", "element": 1, "buffer": 10, "rows": 1, "first_row": 1,
+                         "first_buffer_line": 1, "lines": line("there")},
+                        {"node": "editor", "element": 2, "buffer": 11, "rows": 1, "first_row": 0,
+                         "role": "input", "first_buffer_line": 0, "lines": line("")},
+                    ]},
+                },
+            }),
+        })
+    };
+
+    // The caret was in the input, element 1; the input is element 2 now.
+    let mut s = shell_session(1);
+    assert!(s.shell_input_focused());
+    let _ = s.on_event(two_runs());
+    assert_eq!(s.view.focused_element, 2);
+    assert!(s.shell_input_focused(), "`Enter` still submits");
+
+    // A caret parked on a run's output stays on that run.
+    let mut s = shell_session(0);
+    let _ = s.on_event(two_runs());
+    assert_eq!(s.view.focused_element, 0);
+    assert!(!s.shell_input_focused());
+}
+
+/// A run's start and finish are tracked per view, and a finish elsewhere is announced — while a
+/// finish in the shell you are watching is not, because its header already says so.
+#[test]
+fn a_finished_run_is_announced_only_when_you_are_looking_elsewhere() {
+    let mut s = shell_session(1);
+    let fx = s.on_event(shell_run_push(
+        10,
+        "cargo build",
+        json!({"kind": "running"}),
+    ));
+    assert!(toast_messages(&fx).is_empty(), "starting is not news");
+
+    let fx = s.on_event(shell_run_push(
+        10,
+        "cargo build",
+        json!({"kind": "exited", "code": 1}),
+    ));
+    assert!(
+        toast_messages(&fx).is_empty(),
+        "the run's own header says how it went"
+    );
+
+    // The same finish in a shell you are not looking at.
+    let mut s = shell_session(1);
+    let _ = s.on_event(shell_run_push(
+        99,
+        "cargo build",
+        json!({"kind": "running"}),
+    ));
+    let fx = s.on_event(shell_run_push(
+        99,
+        "cargo build",
+        json!({"kind": "exited", "code": 1}),
+    ));
+    assert_eq!(
+        toast_messages(&fx),
+        vec!["cargo build — exit 1".to_string()]
+    );
+}
+
+/// `Up`/`Down` in the input recall commands; on the transcript they stay ordinary motions.
+#[test]
+fn up_and_down_recall_commands_in_the_input() {
+    use aether_protocol::history::{HistoryEntry, HistoryKind};
+
+    let mut s = shell_session(1);
+    s.view.mode = aether_client::session::Mode::Insert;
+    s.history
+        .record(HistoryKind::Shell, HistoryEntry::bare("cargo test"));
+    s.history
+        .record(HistoryKind::Shell, HistoryEntry::bare("cargo build"));
+
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "element/replace_line");
+    assert_eq!(params["text"], "cargo build", "the newest entry first");
+
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None);
+    assert_eq!(the_request(&fx).2["text"], "cargo test");
+
+    let fx = s.on_key(KeyCode::Down, Mods::NONE, None);
+    assert_eq!(the_request(&fx).2["text"], "cargo build", "and back down");
+
+    // On the transcript element `Up` is the motion it always was.
+    let mut s = shell_session(0);
+    s.view.mode = aether_client::session::Mode::Insert;
+    s.history
+        .record(HistoryKind::Shell, HistoryEntry::bare("cargo build"));
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None);
+    assert_eq!(the_request(&fx).1, "element/move");
+}
+
+/// Submitting records the command locally, so `Up` recalls it without waiting for the server's
+/// copy to come back.
+#[test]
+fn submitting_records_the_command_for_recall() {
+    use aether_protocol::history::HistoryKind;
+
+    let mut s = shell_session(1);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (token, _, _) = the_request(&fx);
+    assert!(
+        s.history.list(HistoryKind::Shell).is_empty(),
+        "not until the server has accepted it"
+    );
+    let _ = s.on_rpc_result(token, Ok(json!({"run": 1})));
+    let values: Vec<&str> = s
+        .history
+        .list(HistoryKind::Shell)
+        .iter()
+        .map(|e| e.value.as_str())
+        .collect();
+    assert_eq!(
+        values,
+        vec!["ls -la"],
+        "what the input held when it was sent"
+    );
+}
+
+/// A line the shell would not accept is said so, mildly — the word at fault is already selected
+/// in the input — and is not recalled by `Up`.
+#[test]
+fn a_rejected_line_is_not_accepted_and_not_recalled() {
+    use aether_protocol::history::HistoryKind;
+
+    let mut s = shell_session(1);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(
+        token,
+        Err(aether_client::transport::RpcError {
+            method: "shell/run",
+            code: aether_protocol::error::ErrorCode::SHELL_REJECTED.code(),
+            message: "unknown command `lss`".into(),
+        }),
+    );
+    assert_eq!(
+        toast_messages(&fx),
+        vec!["Not accepted — unknown command `lss`".to_string()]
+    );
+    assert!(!has_error_toast(&fx), "a refusal is not a failure");
+    assert!(s.history.list(HistoryKind::Shell).is_empty());
+}
+
+/// The status indicator names the command you are waiting on, and counts the ones you are not.
+#[test]
+fn the_shell_indicator_names_the_focused_run_and_counts_the_rest() {
+    let mut s = shell_session(1);
+    assert_eq!(s.shell_indicator(), None, "nothing running");
+
+    let _ = s.on_event(shell_run_push(
+        10,
+        "cargo build",
+        json!({"kind": "running"}),
+    ));
+    assert_eq!(
+        s.shell_indicator().as_deref(),
+        Some("cargo build"),
+        "the shell in front of you is named by its command"
+    );
+
+    let _ = s.on_event(shell_run_push(99, "npm test", json!({"kind": "running"})));
+    assert_eq!(
+        s.shell_indicator().as_deref(),
+        Some("cargo build"),
+        "the focused one still wins"
+    );
+
+    // Focused shell finishes; the other is counted rather than named.
+    let _ = s.on_event(shell_run_push(
+        10,
+        "cargo build",
+        json!({"kind": "exited", "code": 0}),
+    ));
+    assert_eq!(s.shell_indicator().as_deref(), Some("1 running"));
+    let _ = s.on_event(shell_run_push(99, "npm test", json!({"kind": "killed"})));
+    assert_eq!(s.shell_indicator(), None);
 }

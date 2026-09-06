@@ -22,6 +22,7 @@ pub mod path;
 pub mod picker;
 pub mod search;
 pub mod settings;
+pub mod shell;
 pub mod sneak;
 pub mod syntax;
 pub mod ui;

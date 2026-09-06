@@ -601,6 +601,16 @@ impl Shell {
                         // The anchor positions the view itself; an owed reveal would only fight it
                         // on the next window, so it's superseded rather than deferred (as in iced).
                         self.pending_reveal.abandon();
+                    } else if let Some(row) = self.session.sticky_tail_row(
+                        self.top_visual_row,
+                        self.visible_rows(),
+                        &self.measured,
+                    ) {
+                        // A shell whose output is arriving while you were at the end: follow it,
+                        // and let a reveal go — the caret is in the input, which is the end.
+                        self.top_visual_row = row;
+                        self.clamp_scroll();
+                        self.pending_reveal.abandon();
                     } else {
                         self.clamp_scroll();
                         // A pushed window can be the one that finally holds the cursor's line, so
@@ -2042,6 +2052,7 @@ impl Shell {
         st.workspace_name = s.workspace.clone();
         st.tether = s.tether;
         st.git_operation = s.git_operation.as_ref().map(|(_, op)| op.clone());
+        st.shell_indicator = s.shell_indicator();
         if st.workspace_paths != s.workspace_paths {
             st.workspace_paths = s.workspace_paths.clone();
             st.root_labels = labels::root_labels(&st.workspace_paths);
@@ -2609,6 +2620,7 @@ impl Shell {
                     rows: 0,
                     first_row: aether_protocol::coords::ElementRow::ZERO,
                     laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
                     first_buffer_line: 0,
                     lines: Vec::new(),
                 }),
@@ -2633,13 +2645,7 @@ impl Shell {
             drag_granularity: aether_protocol::cursor::Granularity::Char,
             last_click: None,
             click_streak: 0,
-            revision: s.view.buffer.revision,
-            saved_revision: s.view.buffer.saved_revision,
-            other_elements_dirty: s
-                .view
-                .window
-                .as_ref()
-                .is_some_and(|w| w.other_elements_dirty),
+            unsaved: s.view.unsaved(),
             externally_modified: s.view.externally_modified,
             externally_deleted: s.view.externally_deleted,
             pending_count: s.view.count.unwrap_or(0),
@@ -3443,6 +3449,7 @@ fn make_state(
         root_labels,
         tether: None,
         git_operation: None,
+        shell_indicator: None,
         viewport_cols: cols as u32,
         viewport_rows: (rows as u32).saturating_sub(1),
         should_quit: false,
@@ -3517,6 +3524,7 @@ mod scroll_tests {
                 rows: *height,
                 first_row: aether_protocol::coords::ElementRow::ZERO,
                 laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Field,
                 first_buffer_line: *first,
                 lines: if loaded.contains(&i) {
                     (*first..*first + *height).map(line).collect()
@@ -3870,7 +3878,9 @@ mod scroll_tests {
         let first_row = ed.paint_top.get();
         let painted_from_there = aether_client::grid::painted_rows_of(&ed.root, &sh.measured)
             .iter()
-            .filter(|(at, _)| at.row.get() >= first_row && at.row.get() < first_row + sh.visible_rows())
+            .filter(|(at, _)| {
+                at.row.get() >= first_row && at.row.get() < first_row + sh.visible_rows()
+            })
             .count() as u32;
         // A screenful, or everything the window holds when it holds less than a screen.
         assert_eq!(

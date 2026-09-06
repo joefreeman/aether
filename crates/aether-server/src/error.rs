@@ -140,6 +140,32 @@ impl RpcError {
         self.code == nothing.code && self.message == nothing.message
     }
 
+    /// `shell/*` addressed at a view that is not a shell — a stale view id, or a client that has
+    /// lost track of what it is looking at. Its own message rather than "buffer not found", which
+    /// would blame the wrong thing.
+    pub fn not_a_shell(view_id: aether_protocol::ViewId) -> Self {
+        Self::new(
+            ErrorCode::BUFFER_NOT_FOUND,
+            format!("view {} is not a shell", view_id.get()),
+        )
+    }
+
+    /// A submit into a shell that is already running something. The message is what the client
+    /// toasts, so it names both the shell and the command in the way, and the key that stops it.
+    pub fn shell_busy(title: &str, command: &str) -> Self {
+        Self::new(
+            ErrorCode::SHELL_BUSY,
+            format!("{title} is running {command} — Space Alt-b stops it"),
+        )
+    }
+
+    /// A line the shell would not accept: a syntax error, or a command, directory, file or
+    /// variable that is not there. The message is the refusal's own wording, which the client
+    /// toasts; the offending word is already selected in the input by the time this is sent.
+    pub fn shell_rejected(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::SHELL_REJECTED, message.into())
+    }
+
     pub fn read_only_buffer(buffer_id: aether_protocol::BufferId) -> Self {
         Self::new(
             ErrorCode::READ_ONLY_BUFFER,

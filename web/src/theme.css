@@ -35,7 +35,8 @@
   /* ---- Roles: the DARK table (theme.rs Theme::DARK) ---- */
   color-scheme: dark; /* native scrollbars/checkboxes follow the app theme */
   /* Backgrounds */
-  --bg: var(--nord0); /* editor / app background */
+  --bg-app: #373e4d; /* the app's ground: the pane behind the rows, chrome bands, a box's frame */
+  --bg: var(--nord0); /* the editor well: rows of buffer text, gutter included */
   --bg-panel: var(--nord1); /* status line, panels, picker surfaces */
   --bg-selection: var(--nord2); /* chrome selection: picker active row, chips */
   --bg-visual: var(--nord10); /* editor visual-mode selection */
@@ -43,8 +44,7 @@
   --sneak-prefix-bg: var(--nord3-bright); /* sneak typed-prefix band */
   --match-highlight: var(--nord13); /* fuzzy-match/sneak emphasis: picker match chars, the sneak label */
   --match-bracket: var(--nord12); /* paired-bracket highlight under the cursor — chrome, not syntax */
-  --cursor-line-bg: #343a48;
-  --patch-chrome-bg: #373e4d; /* current-line tint, ~40% from NORD0 toward NORD1 */
+  --cursor-line-bg: #343a48; /* current-line tint, ~40% from NORD0 toward NORD1 */
   --overlay-border: var(--nord3-brighter); /* outline for floating overlays' frames */
   --border-subtle: var(--nord3); /* hairline chrome borders — a step quieter than overlay-border */
   /* Foregrounds */
@@ -158,6 +158,7 @@
    keep their dark-theme ordering. */
 :root[data-theme="light"] {
   color-scheme: light;
+  --bg-app: #e1e6ee; /* ~60% from NORD6 toward NORD5, as the dark pair is */
   --bg: var(--nord6);
   --bg-panel: var(--nord5);
   --bg-selection: var(--nord4);
@@ -166,8 +167,7 @@
   --sneak-prefix-bg: #c4cedb; /* darker than fill-dim: prominence inverts on light */
   --match-highlight: #9a7522; /* = warning today; free to diverge */
   --match-bracket: #ab5f38; /* = syn-macro today; free to diverge */
-  --cursor-line-bg: #e4e9f0;
-  --patch-chrome-bg: #e1e6ee; /* ~40% from NORD6 toward NORD5 */
+  --cursor-line-bg: #e4e9f0; /* ~40% from NORD6 toward NORD5 */
   --overlay-border: #aab4c4;
   --border-subtle: #d8dfe8; /* = fill-dim today; borders can darken independently */
   --fg: var(--nord0);
@@ -244,7 +244,9 @@ html, body, #app {
 #app {
   display: flex;
   flex-direction: column;
-  background: var(--bg);
+  /* The app's ground. `#buffer` and the gaps between elements inherit it, so what shows past the
+     last row is ground; the rows that are editor paint their own well over it (`.row` below). */
+  background: var(--bg-app);
   color: var(--fg);
   font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
@@ -674,7 +676,10 @@ html, body, #app {
   font: var(--ui-font-size)/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
-.row { display: flex; min-height: 1.4em; } /* keep blank lines from collapsing to zero height */
+/* An editor row is the well, gutter included — `#buffer` behind it is the app's ground, so a row
+   that named no background would come out as ground rather than as editor. Every tint below
+   replaces it, layering exactly as it did when the well was the pane. */
+.row { display: flex; min-height: 1.4em; background: var(--bg); } /* min-height: keep blank lines from collapsing */
 .row.added-bg { background: var(--git-added-bg); }
 .row.modified-bg { background: var(--git-modified-bg); }
 .row.added-bg.staged { background: var(--git-staged-added-bg); }
@@ -682,16 +687,17 @@ html, body, #app {
 /* A generated patch's separators. No background fill and no gutter bar — chrome belongs to no line
    of either side, which is the same reason it holds no cursor position. The file separator's rule
    is a flex filler, so it runs out to whatever width is left after the path and its counts. */
-/* The band runs edge to edge, gutter included: the gutter belongs to the rows the cursor can
-   reach, and chrome is not one of them. Making "unreachable" legible is its whole job. */
-.row.patch-chrome { color: var(--fg-muted); background: var(--patch-chrome-bg); }
-/* The gutter takes the *band's* colour rather than the editor background it paints on every other
-   row: it is opaque either way (it has to be — it is sticky, so text scrolls under it), and
-   painting the editor background here left a strip of it down the left of every chrome row.
+/* Chrome is the app's ground showing through between the wells — edge to edge, gutter included,
+   because the gutter belongs to the rows the cursor *can* reach and chrome is not one of them.
+   That is what makes "unreachable" legible: the row is simply not in a well. */
+.row.patch-chrome { color: var(--fg-muted); background: var(--bg-app); }
+/* The gutter takes the *ground's* colour rather than the well it paints on every other row: it is
+   opaque either way (it has to be — it is sticky, so text scrolls under it), and painting the
+   editor shade here left a strip of well down the left of every chrome row.
    It drew a rail here too, tying a file's chrome rows together and joining the rule that opened
    the block — `┌`/`├`/`└` in the terminal's alphabet, gradients in this one. That line is the file
    block's own border now, a cell further out, so a rail here would be a second one beside it. */
-.row.patch-chrome .gutter { background-color: var(--patch-chrome-bg); }
+.row.patch-chrome .gutter { background-color: var(--bg-app); }
 .row.patch-chrome .content { display: flex; align-items: center; }
 /* A section heading is its name and nothing else. It used to trail a rule to the right edge, which
    read as heavily as the file rule above it and flattened the file/hunk hierarchy. */
@@ -779,7 +785,7 @@ html, body, #app {
   --rail-inset: calc(0.5ch - 0.5px);
 }
 .row.boxed {
-  --band: linear-gradient(var(--patch-chrome-bg), var(--patch-chrome-bg));
+  --band: linear-gradient(var(--bg-app), var(--bg-app));
   --rail: linear-gradient(var(--fg-faint), var(--fg-faint));
   background-image: var(--rail-l, none), var(--rail-r, none), var(--band), var(--band);
   background-size:
@@ -836,6 +842,18 @@ html, body, #app {
    rule. There is nothing under the gutter here to protect (a border row has no text and no change
    bar), so it steps out of the way and the rule runs unbroken. */
 .row.box-edge .gutter { background-color: transparent; }
+/* A box's name, on the border it opens with: `┌─ name ────┐` in the terminal, and here the rule
+   with the name laid over it. The gutter is the one rule cell after the corner; the padding is
+   the space either side of the name, and the opaque background is what stops the rule running
+   under it — the rule is one gradient across the whole row, and splitting a gradient in two would
+   mean teaching the `--rule-from`/`--rule-to` rails to count characters.
+
+   The shade is the row's own, so the mask cannot be a different colour from what it masks. */
+.row.box-edge .title {
+  padding: 0 1ch;
+  background-color: var(--bg);
+}
+.row.box-edge.patch-chrome .title { background-color: var(--bg-app); }
 /* The rail's own share of the join: down from the rule where it opens, up to it where it closes,
    straight through where it tees. Detached draws no rail — a plain rule with nothing to meet. */
 .row.box-edge.opens {
@@ -1643,6 +1661,10 @@ a.picker-row:not(.selected):hover .picker-main {
    grid's `white-space: pre` must not leak in (it would kill paragraph wrapping), and native text
    selection is deliberately re-enabled — reading is where select-to-copy belongs. */
 #buffer.md-read-host {
+  /* Prose is an editor element too, so the reading pane is the editor's well rather than the
+     app's ground: every row in it is document, with no chrome rows for the ground to show
+     through between. */
+  background: var(--bg);
   font-family: "Source Serif 4", Charter, "Bitstream Charter", Georgia, serif;
   /* One step above the editor text size (the buffer font-size set on #app): reading wants
      larger type than code. Em-relative, so the buffer-font-size setting still governs reading,

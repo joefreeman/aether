@@ -66,9 +66,16 @@ pub fn build_view(s: &Session) -> Value {
         "lsp": s.view.lsp.as_ref().map(jv),
         "externally_modified": s.view.externally_modified,
         "externally_deleted": s.view.externally_deleted,
+        // The view has unsaved edits — the core's one answer (`ViewState::unsaved`), so the
+        // favicon cannot hold a second opinion about what "unsaved" means.
+        "unsaved": s.view.unsaved(),
         // The long-running git operation in flight, if any. The repo id it also carries stays in
         // the core — the shell only paints the indicator; `Space g x` is dispatched core-side.
         "git_operation": s.git_operation.as_ref().map(|(_, op)| jv(op)),
+        // What the status bar says about shells — the focused shell's running command, or a count
+        // of the ones running elsewhere. Composed in the core so all three shells say the same
+        // thing; the browser only paints it.
+        "shell_indicator": s.shell_indicator(),
         // Raw blame fields (from the server's `git/blame_changed` push): the TS shell formats
         // the label — "3w ago" needs a clock, and the shell already has one for its own chrome.
         "blame": s.view.blame.as_ref().map(|(line, b)| json!({
@@ -463,8 +470,6 @@ fn buffer(s: &Session) -> Value {
         "path": b.path,
         "label": b.label,
         "language": b.language,
-        "revision": b.revision,
-        "saved_revision": b.saved_revision,
         "cursor": jv(&b.cursor),
         // The buffer's restored scroll (server-provided; positions a fresh subscribe). The shell
         // reads this each subscribe so a jump always loads the window around its target.
@@ -570,6 +575,7 @@ mod tests {
             root: Element::Column {
                 edges: aether_protocol::ui::Edges::NONE,
                 band: aether_protocol::ui::Band::None,
+                title: Vec::new(),
                 children: vec![
                     chrome.clone(),
                     Element::Editor {
@@ -578,6 +584,7 @@ mod tests {
                         rows: 2,
                         first_row: ElementRow(0),
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        role: aether_protocol::ui::ElementRole::Field,
                         first_buffer_line: 16,
                         lines: vec![line(16), line(17)],
                     },
@@ -588,6 +595,7 @@ mod tests {
                         rows: 2,
                         first_row: ElementRow(0),
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        role: aether_protocol::ui::ElementRole::Field,
                         first_buffer_line: 40,
                         lines: vec![line(40), line(41)],
                     },

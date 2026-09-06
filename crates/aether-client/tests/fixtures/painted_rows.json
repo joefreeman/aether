@@ -1213,6 +1213,167 @@
       ]
     },
     {
+      "name": "two-closed-boxes-each-keep-their-own-corners",
+      "why": "Two boxes that each draw their own top and bottom border, with nothing between them \u2014 a shell's runs. The first box's bottom rule closes its own rail and the second's top rule opens its own; neither tees, because the rail above one and the rail below the other belong to different boxes. Tee-ing is what `collapse` produces, and a collapsed edge is one row rather than two. The first box also carries a title, which costs it no rows: the title rides the border row the box was already spending, so both walks must place every row exactly as they would without it.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 6,
+      "root": {
+        "node": "column",
+        "children": [
+          {
+            "node": "column",
+            "edges": {
+              "border": {
+                "top": 1,
+                "bottom": 1,
+                "left": 1
+              }
+            },
+            "title": [
+              {
+                "node": "text",
+                "text": "~/proj",
+                "highlights": []
+              }
+            ],
+            "children": [
+              {
+                "node": "editor",
+                "element": 0,
+                "buffer": 1,
+                "rows": 1,
+                "first_row": 0,
+                "first_buffer_line": 0,
+                "lines": [
+                  {
+                    "logical_line": 0,
+                    "visual_rows": [
+                      {
+                        "byte_offset": 0,
+                        "continuation_indent": 0,
+                        "segments": [
+                          {
+                            "text": "one",
+                            "highlights": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "node": "column",
+            "edges": {
+              "border": {
+                "top": 1,
+                "bottom": 1,
+                "left": 1
+              }
+            },
+            "children": [
+              {
+                "node": "editor",
+                "element": 1,
+                "buffer": 2,
+                "rows": 1,
+                "first_row": 0,
+                "first_buffer_line": 0,
+                "lines": [
+                  {
+                    "logical_line": 0,
+                    "visual_rows": [
+                      {
+                        "byte_offset": 0,
+                        "continuation_indent": 0,
+                        "segments": [
+                          {
+                            "text": "two",
+                            "highlights": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "edge",
+          "side": "top",
+          "join": "opens",
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "text",
+          "element": 0,
+          "line": 0,
+          "row_index": 0,
+          "last_line": false,
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 2,
+          "kind": "edge",
+          "side": "bottom",
+          "join": "closes",
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 3,
+          "kind": "edge",
+          "side": "top",
+          "join": "opens",
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 4,
+          "kind": "text",
+          "element": 1,
+          "line": 0,
+          "row_index": 0,
+          "last_line": true,
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 5,
+          "kind": "edge",
+          "side": "bottom",
+          "join": "closes",
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
       "name": "nested-boxes-accumulate-their-insets",
       "why": "An inset is the sum of every box enclosing a row, not one frame's share \u2014 which is what lets the server compute one wrap width per element from the tree it built.",
       "measured": {
