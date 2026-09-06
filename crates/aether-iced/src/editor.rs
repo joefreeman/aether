@@ -209,6 +209,51 @@ where
         layout::Node::new(limits.max())
     }
 
+    /// What the widget shows, for tooling that walks the tree rather than the pixels: iced's
+    /// selectors (a headless test finds a row by its text and clicks it) and anything else that
+    /// reads widgets through [`Operation::text`](iced::advanced::widget::Operation::text). One
+    /// report per loaded row inside the widget's bounds — the row's text on the rectangle it is
+    /// painted in — so a selector's hit lands where a pointer would.
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        let state = tree.state.downcast_mut::<State>();
+        // An operation can run before any event has measured the cell (a tree built and queried
+        // headlessly): measure here, exactly as `update` would.
+        if state.measured_font_size != Some(self.content.font_size) {
+            state.cell = Some(measure_cell(renderer, self.content.font_size));
+            state.measured_font_size = Some(self.content.font_size);
+        }
+        let (Some(cell), Some(window)) = (state.cell, self.content.window) else {
+            return;
+        };
+        let bounds = layout.bounds();
+        let unit_px = self.unit_px(cell);
+        for (abs_row, item) in grid::painted_rows(window, self.content.measured) {
+            let y = bounds.y + PAD + abs_row.get() as f32 * unit_px - self.content.scroll_px;
+            if y + cell.height < bounds.y || y > bounds.y + bounds.height {
+                continue;
+            }
+            let text = row_text(&item, self.content.tab_width);
+            if text.is_empty() {
+                continue;
+            }
+            let x = bounds.x + GUTTER_COLS as f32 * cell.width - self.content.scroll_x_px;
+            let width = text.chars().count() as f32 * cell.width;
+            let rect = Rectangle {
+                x,
+                y,
+                width,
+                height: cell.height,
+            };
+            operation.text(None, rect, &text);
+        }
+    }
+
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -1477,6 +1522,38 @@ fn measure_cell<Renderer: text::Renderer<Font = Font>>(
         wrapping: text::Wrapping::None,
     });
     paragraph.min_bounds()
+}
+
+/// A painted row as the one string a reader sees — continuation marker, indent and tab stops
+/// spelled out — which is what the widget reports for it under an operation.
+fn row_text(item: &grid::PaintedRow<'_>, tab_width: u32) -> String {
+    let mut out = String::new();
+    match item {
+        grid::PaintedRow::Chrome(chrome) => {
+            for leaf in chrome.inline() {
+                match leaf {
+                    ViewElement::Text { text, .. } => out.push_str(text),
+                    ViewElement::Space { cols } => out.push_str(&" ".repeat(*cols as usize)),
+                    _ => {}
+                }
+            }
+        }
+        grid::PaintedRow::Baseline { row, .. } => out.push_str(&row.text),
+        grid::PaintedRow::Text { row, .. } => {
+            if row.byte_offset != 0 {
+                out.push_str(CONTINUATION_MARKER);
+                out.push_str(&" ".repeat(row.continuation_indent as usize));
+            }
+            for cell in grid::row_cells(row, tab_width) {
+                if cell.ch == '\t' {
+                    out.push_str(&" ".repeat(cell.width as usize));
+                } else {
+                    out.push(cell.ch);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Clamp a rect's left edge to `left`, shrinking its width; `None` when fully clipped.

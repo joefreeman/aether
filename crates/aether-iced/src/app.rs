@@ -7574,7 +7574,15 @@ pub fn run(bootstrap: Bootstrap) -> iced::Result {
     // defaulting to iced's Light theme.
     .theme(Shell::theme)
     // The buffer's font + size (chrome sets explicit fonts/sizes): web's 14px monospace.
-    .settings(iced::Settings {
+    .settings(settings())
+    .run()
+}
+
+/// The renderer settings every window runs under: the bundled fonts, and the buffer's default
+/// face and size. One definition, so a frame painted headlessly is shaped by exactly what a
+/// window is.
+pub(crate) fn settings() -> iced::Settings {
+    iced::Settings {
         // Bundle JetBrains Mono for the editor (chrome stays on the default monospace). Registered
         // here so `Font::with_name("JetBrains Mono")` resolves; the editor toggles its ligatures
         // via shaping mode (see `editor::EDITOR_FONT`). All four faces (Regular/Bold/Italic/
@@ -7614,8 +7622,7 @@ pub fn run(bootstrap: Bootstrap) -> iced::Result {
         default_text_size: iced::Pixels(14.0),
         antialiasing: true,
         ..iced::Settings::default()
-    })
-    .run()
+    }
 }
 
 /// Initial window settings: size, and on Linux the application id ("uk.joef.Aether") that becomes
@@ -7729,6 +7736,9 @@ fn crumb_separator<'a>(ui: &theme::Ui, p: &theme::Palette) -> Element<'a, Messag
         p,
     )
 }
+
+#[cfg(test)]
+mod headless;
 
 #[cfg(test)]
 mod tests {
@@ -8324,7 +8334,7 @@ mod tests {
         );
     }
 
-    fn connecting_bootstrap() -> Bootstrap {
+    pub(super) fn connecting_bootstrap() -> Bootstrap {
         Bootstrap::Connecting(ConnectingBootstrap {
             worktrees: Vec::new(),
             workspace: None,
