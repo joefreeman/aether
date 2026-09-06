@@ -37,7 +37,7 @@
 //! Styling therefore travels as [`Highlight`] runs, exactly as it does for buffer text, and
 //! resolves through each shell's existing theme table. No new palette, no new vocabulary.
 
-use crate::viewport::{ChromeKind, Highlight, LogicalLineRender};
+use crate::viewport::{Highlight, LogicalLineRender};
 use serde::{Deserialize, Serialize};
 
 /// Identifies one editor element within a view, for the messages that address a single one of them.
@@ -47,17 +47,22 @@ pub type FieldId = u32;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "node", rename_all = "snake_case")]
 pub enum Element {
-    /// Children top to bottom.
-    Stack { children: Vec<Element> },
+    /// Children top to bottom. Was `Stack`, which named the same thing without pairing with
+    /// [`Element::Row`] — there is no third arrangement for it to have meant.
+    Column {
+        #[serde(default, skip_serializing_if = "Edges::is_zero")]
+        edges: Edges,
+        #[serde(default, skip_serializing_if = "Band::is_none")]
+        band: Band,
+        children: Vec<Element>,
+    },
     /// Children left to right, sharing one row. At most one [`Element::Fill`] child, which takes
     /// whatever width the others leave.
-    Row { children: Vec<Element> },
-    /// Generated presentation — a file heading, a rule, a spacer. Occupies a row and holds no
-    /// cursor position. `kind` says what it *means*, which is what a shell keys its band and
-    /// spacing off; `children` say what to draw, laid out left to right as a [`Element::Row`] does.
-    Chrome {
-        kind: ChromeKind,
-        rail: RailJoin,
+    Row {
+        #[serde(default, skip_serializing_if = "Edges::is_zero")]
+        edges: Edges,
+        #[serde(default, skip_serializing_if = "Band::is_none")]
+        band: Band,
         children: Vec<Element>,
     },
     /// A window onto a buffer. `lines` are its rendered lines, starting at `first_buffer_line`.
@@ -142,12 +147,30 @@ pub enum ViewKind {
 }
 
 impl Element {
-    pub fn stack(children: Vec<Element>) -> Element {
-        Element::Stack { children }
+    pub fn column(children: Vec<Element>) -> Element {
+        Element::Column {
+            edges: Edges::NONE,
+            band: Band::None,
+            children,
+        }
     }
 
     pub fn row(children: Vec<Element>) -> Element {
-        Element::Row { children }
+        Element::Row {
+            edges: Edges::NONE,
+            band: Band::None,
+            children,
+        }
+    }
+
+    /// A column that draws a box: `edges` around `children`, with `band` behind the cells the
+    /// border and padding occupy.
+    pub fn framed(edges: Edges, band: Band, children: Vec<Element>) -> Element {
+        Element::Column {
+            edges,
+            band,
+            children,
+        }
     }
 
     pub fn text(text: impl Into<String>, highlights: Vec<Highlight>) -> Element {
@@ -165,10 +188,16 @@ impl Element {
         Element::Fill { glyph }
     }
 
-    pub fn chrome(kind: ChromeKind, rail: RailJoin, children: Vec<Element>) -> Element {
-        Element::Chrome {
-            kind,
-            rail,
+    /// A row of generated presentation — a file heading, a spacer — on the chrome band.
+    ///
+    /// Was `Element::Chrome`, a variant of its own carrying a `kind` no shell branched on.
+    /// What it actually delivered was the band, so that is what it says now; "holds no cursor
+    /// position" needs no tag, because a row is cursor-bearing iff it came from an
+    /// [`Element::Editor`]'s lines.
+    pub fn chrome(children: Vec<Element>) -> Element {
+        Element::Row {
+            edges: Edges::NONE,
+            band: Band::Chrome,
             children,
         }
     }
@@ -239,9 +268,7 @@ impl Element {
     fn walk<'a>(&'a self, f: &mut impl FnMut(&'a Element)) {
         f(self);
         match self {
-            Element::Stack { children }
-            | Element::Row { children }
-            | Element::Chrome { children, .. } => {
+            Element::Column { children, .. } | Element::Row { children, .. } => {
                 for child in children {
                     child.walk(f);
                 }
@@ -251,13 +278,147 @@ impl Element {
     }
 }
 
-/// Where a chrome row sits on the **file rail** — the vertical line tying one file's chrome
-/// together so its headings read as belonging to the file rather than floating in the diff.
+/// The cells a container spends on itself: a border, and padding inside it.
+///
+/// **Structure, not geometry.** How many cells the box costs changes how many its content gets, and
+/// the server must wrap to that — so it belongs here, exactly as [`Element::Space`]'s `cols` does.
+/// What a border *looks like* is the shell's: the terminal draws box-drawing glyphs, the GUI a
+/// hairline, the web a CSS border.
+///
+/// Counted in **cells**, not pixels or fractions. A terminal border is one column or one row; a
+/// pixel shell draws its hairline inside the cell it is given, which is what `aether-iced` already
+/// does for the file rail. Prose the client lays out is measured in ems rather than cells, so a
+/// reader that grows frames will need the horizontal analogue of `grid::Measured::units_per_row` —
+/// a widening of how a shell *reads* these, not a change to what is sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edges {
+    #[serde(default, skip_serializing_if = "Sides::is_zero")]
+    pub border: Sides,
+    #[serde(default, skip_serializing_if = "Sides::is_zero")]
+    pub padding: Sides,
+    /// Whether adjacent bordered children of this container **share** an edge rather than each
+    /// drawing its own — `border-collapse`, and the reason a run of file blocks reads as one
+    /// ruled list rather than as a stack of separate boxes.
+    ///
+    /// On the container, not the children: it is a fact about how two siblings meet, and only
+    /// their parent can see both. What the shared edge is *drawn* as follows from it — a join with
+    /// something above and below is a tee, one with nothing above is a corner — which is the
+    /// question [`RailJoin`] answers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapse: bool,
+}
+
+impl Edges {
+    pub const NONE: Edges = Edges {
+        border: Sides::ZERO,
+        padding: Sides::ZERO,
+        collapse: false,
+    };
+
+    /// Nothing on any side, and nothing to collapse — the ordinary case, kept off the wire.
+    ///
+    /// Deliberately includes `collapse`: a value that serialises to nothing must deserialise back
+    /// to itself, and `collapse: true` with no borders would not.
+    pub fn is_zero(&self) -> bool {
+        *self == Edges::NONE
+    }
+
+    /// Cells lost to the left and right — what an element's wrap width is reduced by.
+    pub fn horizontal(&self) -> u16 {
+        self.border.left + self.border.right + self.padding.left + self.padding.right
+    }
+
+    /// Cells the left side spends, which is where the content starts.
+    pub fn left(&self) -> u16 {
+        self.border.left + self.padding.left
+    }
+
+    /// Rows the top spends, and the bottom — border and padding alike occupy whole rows.
+    pub fn top(&self) -> u16 {
+        self.border.top + self.padding.top
+    }
+
+    pub fn bottom(&self) -> u16 {
+        self.border.bottom + self.padding.bottom
+    }
+}
+
+/// Cells per side, in the order a stylesheet names them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sides {
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub top: u16,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub right: u16,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub bottom: u16,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub left: u16,
+}
+
+fn is_zero_u16(n: &u16) -> bool {
+    *n == 0
+}
+
+impl Sides {
+    pub const ZERO: Sides = Sides {
+        top: 0,
+        right: 0,
+        bottom: 0,
+        left: 0,
+    };
+
+    pub fn is_zero(&self) -> bool {
+        *self == Sides::ZERO
+    }
+
+    /// The same count on every side.
+    pub fn all(n: u16) -> Sides {
+        Sides {
+            top: n,
+            right: n,
+            bottom: n,
+            left: n,
+        }
+    }
+}
+
+/// The fill a container paints behind itself — behind its border and padding cells, with children
+/// painting over their own content area, as a box model has it.
+///
+/// A **closed** enum rather than a colour or an open role name, for the reason the whole vocabulary
+/// is closed (see this module's header): every shell matches exhaustively, so a new band cannot
+/// render as nothing on one client. A colour would be palette, which does not travel here; an open
+/// role string would land in the syntax vocabulary, the one part of the palette with no cross-shell
+/// parity test — the same reason [`Element::Fill`] declines to carry a role.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Band {
+    /// Paints nothing of its own; whatever is behind it shows through.
+    #[default]
+    None,
+    /// Generated presentation — the shade a patch's separators and the space around its hunks sit
+    /// on. Rows on it hold no cursor position, which is what the band exists to make legible.
+    Chrome,
+}
+
+impl Band {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Band::None)
+    }
+}
+
+/// How a box's horizontal border meets the rails down its sides — `┌`, `├`, `└`, or a bare rule
+/// with no rail to meet.
 ///
 /// Structure, not presentation. All three shells ask this same question and answer it differently
-/// — the terminal with box-drawing glyphs, the GUI with a pixel rule, the web with a border — and
-/// until this existed all three re-derived it from a flat row list, in three different places, with
-/// three chances to disagree. The server builds the file blocks, so the server knows.
+/// — the terminal with box-drawing glyphs, the GUI with a pixel rule, the web with a background
+/// gradient — and before this existed all three re-derived it from a flat row list, in three
+/// different places, with three chances to disagree.
+///
+/// **Not on the wire.** It rode on `Chrome` while a file block's boundary was a chrome row; it is a
+/// box's own border now, so `grid::resolve_joins` reads it off the tree — one derivation, in the
+/// shared core, that cannot disagree with the structure it describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RailJoin {

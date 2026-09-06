@@ -426,6 +426,18 @@ pub struct NavEntry {
     /// not loaded, so without this a virtual buffer would die with its id and stepping back to a
     /// diff you followed a line out of would find nothing to return to.
     pub virtual_key: Option<String>,
+    /// The element the cursor was in, for a **composed** view — one whose elements window buffers
+    /// other than the view's own. `None` for an ordinary view, where the view's buffer *is* the
+    /// element's and there is nothing to disambiguate.
+    ///
+    /// A composed view's location is not a position in the buffer it was opened as. A
+    /// working-changes patch's elements window the real files, so the cursor lives in one of
+    /// *those*, and the patch's own document holds a cursor nothing ever moves. Recorded without
+    /// this, every step back into such a view restored that one — line 0 — and landed at the top
+    /// of the patch however far down you had been.
+    pub element: Option<aether_protocol::viewport::FieldId>,
+    /// The cursor to restore, in [`Self::element`]'s buffer when there is one and in
+    /// [`Self::buffer_id`] otherwise.
     pub cursor: CursorState,
 }
 
@@ -3690,6 +3702,9 @@ impl View {
                 decorations: None,
                 chrome_above: std::sync::Arc::new(Vec::new()),
                 laid_out_by: LayoutOwner::Server,
+                edges: aether_protocol::ui::Edges::NONE,
+                box_group: None,
+                band: aether_protocol::ui::Band::None,
             }],
         }
     }
@@ -3708,6 +3723,9 @@ impl View {
                 decorations: None,
                 chrome_above: std::sync::Arc::new(Vec::new()),
                 laid_out_by: LayoutOwner::Client,
+                edges: aether_protocol::ui::Edges::NONE,
+                box_group: None,
+                band: aether_protocol::ui::Band::None,
             }],
         }
     }
@@ -3771,6 +3789,9 @@ impl View {
                             .unwrap_or_default(),
                     ),
                     laid_out_by: LayoutOwner::Server,
+                    edges: aether_protocol::ui::Edges::NONE,
+                    box_group: None,
+                    band: aether_protocol::ui::Band::None,
                 })
                 .collect(),
         }
@@ -3875,6 +3896,11 @@ pub struct ElementLayout {
     pub extent: ElementExtent,
     pub chrome_above: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
     pub decorations: Option<std::sync::Arc<ElementDecorations>>,
+    /// The accumulated inset of the box this element sits in — see [`ElementBinding::edges`].
+    pub edges: aether_protocol::ui::Edges,
+    /// Which box this element belongs to — see [`ElementBinding::box_group`].
+    pub box_group: Option<u32>,
+    pub band: aether_protocol::ui::Band,
 }
 
 impl ElementLayout {
@@ -3891,6 +3917,9 @@ impl ElementLayout {
             decorations: self.decorations.clone(),
             chrome_above: self.chrome_above.clone(),
             laid_out_by: LayoutOwner::Server,
+            edges: self.edges,
+            box_group: self.box_group,
+            band: self.band,
         }
     }
 }
@@ -3962,6 +3991,25 @@ pub struct ElementBinding {
     /// and the client measures it. Decided by the view's kind, never per viewport: two clients
     /// presenting one view see the same elements.
     pub laid_out_by: LayoutOwner,
+    /// The cells the box around this element spends on its own border and padding — accumulated
+    /// over every container enclosing it, so it is the whole inset rather than one frame's share.
+    ///
+    /// Here rather than read back off the composed tree because the **wrap happens first**: an
+    /// element inset by four columns must be wrapped to `cols - 4`, and `compose_tree` runs after
+    /// every line has already been wrapped. The driver knows the boxes it is building, so the
+    /// driver is what says this.
+    ///
+    /// `Edges::NONE` for every element outside a box.
+    pub edges: aether_protocol::ui::Edges,
+    /// Which box this element belongs to, if any — elements sharing a key, and consecutive, are
+    /// wrapped in one container by `compose_tree`.
+    ///
+    /// A key rather than a nested layout because `FieldId` indexes a **flat** list of elements and
+    /// the whole view addresses them that way. Consecutiveness is the driver's guarantee: a patch's
+    /// file blocks are contiguous by construction, and nothing else builds boxes yet.
+    pub box_group: Option<u32>,
+    /// What the box paints behind its own border and padding cells.
+    pub band: aether_protocol::ui::Band,
 }
 
 impl ElementBinding {
@@ -4175,6 +4223,9 @@ mod view_layout_tests {
             decorations: None,
             chrome_above: Default::default(),
             laid_out_by: LayoutOwner::Server,
+            edges: aether_protocol::ui::Edges::NONE,
+            box_group: None,
+            band: aether_protocol::ui::Band::None,
         };
         vec![binding(1), binding(2)]
     }
@@ -4235,6 +4286,9 @@ mod view_layout_tests {
             extent: ElementExtent::Bound { buffer, lines },
             chrome_above: Default::default(),
             decorations: None,
+            edges: aether_protocol::ui::Edges::NONE,
+            box_group: None,
+            band: aether_protocol::ui::Band::None,
         };
         let patch = file(3, "patch\n");
         s.set_view_layout(

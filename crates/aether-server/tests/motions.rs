@@ -7176,7 +7176,7 @@ async fn every_scrollable_row_comes_back_in_its_window() {
         let painted = aether_client::grid::painted_rows(&res.window, &Measured::default());
         for r in top..(top + rows).min(total) {
             assert!(
-                painted.iter().any(|(at, _)| at.get() == r),
+                painted.iter().any(|(at, _)| at.row.get() == r),
                 "asked for a screen from row {top}; row {r} has nothing to paint"
             );
         }
@@ -7270,7 +7270,7 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
         }
         let painted = aether_client::grid::painted_rows(&window, &Measured::default());
         if let Some(r) =
-            (top..(top + rows).min(total)).find(|r| !painted.iter().any(|(at, _)| at.get() == *r))
+            (top..(top + rows).min(total)).find(|r| !painted.iter().any(|(at, _)| at.row.get() == *r))
         {
             stuck = Some((top, r));
             break;
@@ -7286,7 +7286,7 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
     assert_eq!(
         aether_client::grid::painted_rows(&window, &Measured::default())
             .last()
-            .map(|(at, _)| at.get()),
+            .map(|(at, _)| at.row.get()),
         Some(total - 1),
         "the final window ends somewhere other than the view's last row"
     );
@@ -7344,23 +7344,24 @@ async fn a_patch_ends_with_its_closing_rule() {
     )
     .await;
 
-    let aether_protocol::viewport::Element::Stack { children } = &sub.window.root else {
+    let aether_protocol::viewport::Element::Column { children, .. } = &sub.window.root else {
         panic!("a patch composes into a stack");
     };
+    // The last thing in the view is the file block itself, closed by its own bottom border. It
+    // used to be a `Rule` chrome node standing in for the edge the box was missing.
     let last = children.last().expect("the view has children");
     assert!(
         matches!(
             last,
-            aether_protocol::viewport::Element::Chrome {
-                kind: aether_protocol::viewport::ChromeKind::Rule,
-                ..
-            }
+            aether_protocol::viewport::Element::Column { edges, .. }
+                if edges.border.bottom == 1
         ),
-        "the last thing in the view should be the rule that closes it, not {}",
+        "the view should end with a box that closes itself, not {}",
         match last {
             aether_protocol::viewport::Element::Editor { element, .. } =>
                 format!("editor {element}"),
-            aether_protocol::viewport::Element::Chrome { kind, .. } => format!("chrome {kind:?}"),
+            aether_protocol::viewport::Element::Column { edges, .. } =>
+                format!("a box with edges {edges:?}"),
             _ => "something else".into(),
         }
     );
@@ -7371,7 +7372,7 @@ async fn a_patch_ends_with_its_closing_rule() {
     assert_eq!(
         painted_rows(&all.window),
         total,
-        "the closing rule must be counted in the view's height"
+        "the closing border must be counted in the view's height"
     );
 
     // A window that doesn't reach the view's end still describes it: the tree is the whole view,
@@ -7403,20 +7404,21 @@ async fn a_patch_ends_with_its_closing_rule() {
         "four rows of a taller view leave rows unloaded"
     );
     let painted = aether_client::grid::painted_rows(&partial.window, &Measured::default());
-    let (at, last) = painted.last().expect("the rule is painted");
+    let (at, last) = painted.last().expect("the closing border is painted");
     assert!(
         matches!(
             last,
-            aether_client::grid::PaintedRow::Chrome(aether_protocol::viewport::Element::Chrome {
-                kind: aether_protocol::viewport::ChromeKind::Rule,
-                rail: aether_protocol::ui::RailJoin::Closes,
+            aether_client::grid::PaintedRow::Edge {
+                side: aether_client::grid::Side::Bottom,
+                join: aether_protocol::ui::RailJoin::Closes,
                 ..
-            })
+            }
         ),
-        "the last thing painted is the rule closing the view"
+        "the last thing painted is the border closing the view — and `Closes` is derived from \
+         the rails around it, not sent"
     );
     assert_eq!(
-        at.get(),
+        at.row.get(),
         total - 1,
         "and it sits on the view's last row, not after the last loaded line"
     );

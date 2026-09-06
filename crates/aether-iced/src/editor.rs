@@ -14,7 +14,7 @@ use aether_protocol::cursor::CursorState;
 // `Widget` is aliased: iced's own `Widget` trait is implemented in this file.
 // `Element` is iced's too, so the protocol's — a node of the view tree — is aliased, as the
 // other clashing protocol names in this file already are.
-use aether_protocol::ui::{Element as ViewElement, RailJoin};
+use aether_protocol::ui::{Band, Element as ViewElement, RailJoin};
 use aether_protocol::viewport::{
     ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, LogicalLineRender, PatchLine, Window,
 };
@@ -234,7 +234,7 @@ where
         let bounds = layout.bounds();
         let unit_px = self.unit_px(cell);
         for (abs_row, item) in grid::painted_rows(window, self.content.measured) {
-            let y = bounds.y + PAD + abs_row.get() as f32 * unit_px - self.content.scroll_px;
+            let y = bounds.y + PAD + abs_row.row.get() as f32 * unit_px - self.content.scroll_px;
             if y + cell.height < bounds.y || y > bounds.y + bounds.height {
                 continue;
             }
@@ -242,7 +242,11 @@ where
             if text.is_empty() {
                 continue;
             }
-            let x = bounds.x + GUTTER_COLS as f32 * cell.width - self.content.scroll_x_px;
+            // The same left edge `draw` uses, inset included. Two computations of one number, and
+            // they must not drift: this is what a test harness reads, so a disagreement shows up
+            // as a passing test measuring a place nothing is painted.
+            let x = bounds.x + (GUTTER_COLS + abs_row.inset.left) as f32 * cell.width
+                - self.content.scroll_x_px;
             let width = text.chars().count() as f32 * cell.width;
             let rect = Rectangle {
                 x,
@@ -450,27 +454,25 @@ where
         } else {
             text::Shaping::Basic
         };
-        let text_x = |dcol: u32| bounds.x + (GUTTER_COLS + dcol) as f32 * cell.width - scroll_x;
-        // Under horizontal scroll, content quads/text must not bleed over the gutter column.
-        let content_left = bounds.x + GUTTER_COLS as f32 * cell.width;
-        let content_clip = Rectangle {
-            x: content_left,
+        // `left` is the cells the boxes around a row have claimed — 0 for every row outside one.
+        // Threaded rather than captured because it varies per row: two files in one view can sit
+        // in boxes of different depths.
+        let text_x_in =
+            |left: u32, dcol: u32| bounds.x + (GUTTER_COLS + left + dcol) as f32 * cell.width - scroll_x;
+        // Where a rail's hairline sits in the cell it is given: down the middle, which is where the
+        // terminal's `│` puts its ink and where the browser's gradient sits. Both sides of a box
+        // read it, so they cannot end up different distances in from their own edge. `x` is the
+        // cell's left edge; the hairline is 1px, so centring it means half a pixel back.
+        let rail_in = |x: f32| x + (cell.width - 1.0) * 0.5;
+        // Under horizontal scroll, content quads/text must not bleed over the gutter column — nor
+        // over the box that holds a row in, which is why this is a function of the row's inset
+        // rather than one number for the pane.
+        let content_left_of = |left: u32| bounds.x + (left + GUTTER_COLS) as f32 * cell.width;
+        let content_clip_of = |left: u32| Rectangle {
+            x: content_left_of(left),
             y: bounds.y,
-            width: (bounds.width - GUTTER_COLS as f32 * cell.width).max(0.0),
+            width: (bounds.width - (left + GUTTER_COLS) as f32 * cell.width).max(0.0),
             height: bounds.height,
-        };
-        let fill_content = |renderer: &mut Renderer, r: Rectangle, c: Color| {
-            if let Some(r) = clamp_left(r, content_left) {
-                fill(renderer, r, c);
-            }
-        };
-        // Rounded variant for the intra-line diff-emphasis band (the only rounded fill in the
-        // buffer). A left-clamped band loses its rounding on the clipped edge; acceptable — it
-        // only happens mid-glyph under horizontal scroll.
-        let fill_content_rounded = |renderer: &mut Renderer, r: Rectangle, c: Color, rad: f32| {
-            if let Some(r) = clamp_left(r, content_left) {
-                fill_rounded(renderer, r, c, rad);
-            }
         };
 
         let cursor_at = grid::ElementLine::new(self.content.focused_element, cursor_pos.line);
@@ -479,81 +481,181 @@ where
         // rows above their line. The widget draws whatever is at each row, and nothing where
         // nothing is loaded. It no longer walks the lines counting chrome and phantoms as it goes
         // — the count the terminal, this shell and the browser each did differently.
-        for (abs_row, item) in grid::painted_rows(window, self.content.measured) {
-            let y = bounds.y + PAD + abs_row.get() as f32 * unit_px - scroll;
+        let painted = grid::painted_rows(window, self.content.measured);
+        for (abs_row, item) in &painted {
+            let (abs_row, item) = (*abs_row, item);
+            let y = bounds.y + PAD + abs_row.row.get() as f32 * unit_px - scroll;
+            let inset = abs_row.inset.left;
+            let text_x = |dcol: u32| text_x_in(inset, dcol);
+            // Per row, because two files in one view can sit in boxes of different depths: what
+            // the row's own paint may touch, and what the box has claimed either side of it.
+            let content_left = content_left_of(inset);
+            let content_clip = content_clip_of(inset);
+            let fill_content = |renderer: &mut Renderer, r: Rectangle, c: Color| {
+                if let Some(r) = clamp_left(r, content_left) {
+                    fill(renderer, r, c);
+                }
+            };
+            // Rounded variant for the intra-line diff-emphasis band (the only rounded fill in the
+            // buffer). A left-clamped band loses its rounding on the clipped edge; acceptable — it
+            // only happens mid-glyph under horizontal scroll.
+            let fill_content_rounded =
+                |renderer: &mut Renderer, r: Rectangle, c: Color, rad: f32| {
+                    if let Some(r) = clamp_left(r, content_left) {
+                        fill_rounded(renderer, r, c, rad);
+                    }
+                };
+            // The row's own span: everything between the boxes around it. A row's background — the
+            // chrome band, a phantom's red, an editor row's nothing — belongs here and stops here;
+            // what lies outside is the box's, and painting a row edge to edge is what buried the
+            // rails under the chrome band.
+            let row_left = bounds.x + inset as f32 * cell.width;
+            let row_right = bounds.x + bounds.width - abs_row.inset.right as f32 * cell.width;
+            let row_rect = Rectangle {
+                x: row_left,
+                y,
+                width: (row_right - row_left).max(0.0),
+                height: cell.height,
+            };
             if y + cell.height < bounds.y || y > bounds.y + bounds.height {
                 continue;
+            }
+            // The box's own cells, painted before the row: its band behind border and padding,
+            // then a rail down each side it draws. A quarter-cell into the border cell — the
+            // offset the file rail has always used, so the two read as one line.
+            if matches!(abs_row.band, Band::Chrome) {
+                for strip in [
+                    Rectangle {
+                        x: bounds.x,
+                        y,
+                        width: inset as f32 * cell.width,
+                        height: cell.height,
+                    },
+                    Rectangle {
+                        x: row_right,
+                        y,
+                        width: abs_row.inset.right as f32 * cell.width,
+                        height: cell.height,
+                    },
+                ] {
+                    if strip.width > 0.0 {
+                        fill(renderer, strip, p.patch_chrome_bg);
+                    }
+                }
+            }
+            // A border row draws its own rails, since how far each runs is the join.
+            if !matches!(item, grid::PaintedRow::Edge { .. }) {
+                for (cells, x) in [
+                    (abs_row.rails.left, bounds.x),
+                    (abs_row.rails.right, bounds.x + bounds.width - cell.width),
+                ] {
+                    if cells == 0 {
+                        continue;
+                    }
+                    fill(
+                        renderer,
+                        Rectangle {
+                            x: rail_in(x),
+                            y,
+                            width: 1.0,
+                            height: cell.height,
+                        },
+                        p.fg_faint,
+                    );
+                }
             }
             // Chrome and phantom rows first — both draw a full-width band and hold no cursor
             // position — then a line's own text rows.
             let (element, line, row, row_idx) = match item {
-                // A generated patch's chrome. It carries a band — starting in the gutter, since
-                // the gutter belongs to the rows the cursor can reach — so that "unreachable"
-                // reads as a band rather than as text the cursor mysteriously skips.
-                grid::PaintedRow::Chrome(ViewElement::Chrome { rail, children, .. }) => {
-                    fill(
-                        renderer,
-                        Rectangle {
-                            x: bounds.x,
-                            y,
-                            width: bounds.width,
-                            height: cell.height,
-                        },
-                        p.patch_chrome_bg,
-                    );
-                    // A left rail down the file's chrome, in the gutter column, so the heading
-                    // rows read as belonging to the file above them rather than floating in the
-                    // diff. *Which* join to draw is the server's call now (`RailJoin`); this is
-                    // only the GUI's alphabet for it — the terminal spells the same thing with
-                    // box-drawing glyphs.
-                    let rail_x = bounds.x + cell.width * 0.25;
+                // A box's own border or padding row. No node stands for one, so there is nothing
+                // to read text from: what it draws is the rule and where that rule meets the rail.
+                //
+                // The frame owns the whole figure — the rule, the corners and the rail stubs they
+                // run into — because they are one drawing. Two mechanisms each drawing part of it
+                // is how the terminal ended up with a rail beside its own rail.
+                grid::PaintedRow::Edge { join, .. } => {
+                    fill(renderer, row_rect, p.patch_chrome_bg);
                     let rule_y = y + (cell.height * 0.5).floor();
-                    let (rail_y, rail_h) = match rail {
+                    // The rails' own share of the join: down from the rule where it opens, up to
+                    // it where it closes, through it where it tees. Detached draws no rail.
+                    let (rail_y, rail_h) = match join {
                         RailJoin::Detached => (y, 0.0),
-                        // Corner into the rule: a stub above it would read as a line to nowhere.
                         RailJoin::Opens => (rule_y, cell.height - (rule_y - y)),
-                        // The mirror: the rail arrives from above and stops at the rule.
                         RailJoin::Closes => (y, rule_y - y),
                         RailJoin::Tees => (y, cell.height),
                     };
+                    let rail_l = rail_in(bounds.x);
+                    let rail_r = rail_in(bounds.x + bounds.width - cell.width);
                     if rail_h > 0.0 {
-                        fill(
-                            renderer,
-                            Rectangle {
-                                x: rail_x,
-                                y: rail_y,
-                                width: 1.0,
-                                height: rail_h,
-                            },
-                            p.fg_faint,
-                        );
+                        for (cells, x) in
+                            [(abs_row.rails.left, rail_l), (abs_row.rails.right, rail_r)]
+                        {
+                            if cells > 0 {
+                                fill(
+                                    renderer,
+                                    Rectangle {
+                                        x,
+                                        y: rail_y,
+                                        width: 1.0,
+                                        height: rail_h,
+                                    },
+                                    p.fg_faint,
+                                );
+                            }
+                        }
                     }
+                    // From rail to rail: the rule leaves the very cell the vertical line is in,
+                    // which is what closes the corner. With no rail either side it is a plain
+                    // rule across the row.
+                    let from = if abs_row.rails.left > 0 {
+                        rail_l
+                    } else {
+                        bounds.x
+                    };
+                    let to = if abs_row.rails.right > 0 {
+                        rail_r
+                    } else {
+                        bounds.x + bounds.width
+                    };
+                    fill(
+                        renderer,
+                        Rectangle {
+                            x: from,
+                            y: rule_y,
+                            width: (to - from).max(0.0),
+                            height: 1.0,
+                        },
+                        p.fg_faint,
+                    );
+                    continue;
+                }
+                // A row of generated presentation. Its band starts in the gutter, since the
+                // gutter belongs to the rows the cursor can reach — so that "unreachable" reads as
+                // a band rather than as text the cursor mysteriously skips.
+                grid::PaintedRow::Chrome(ViewElement::Row { children, .. }) => {
+                    // A presentation row with no band paints none: it still draws, it just sits
+                    // on the editor's own background. Nothing produces one today; the vocabulary
+                    // allows it, so the painter does.
+                    if matches!(abs_row.band, Band::Chrome) {
+                        fill(renderer, row_rect, p.patch_chrome_bg);
+                    }
+                    let rule_y = y + (cell.height * 0.5).floor();
                     let mut col = 0u32;
                     for widget in children.iter().flat_map(ViewElement::inline) {
                         match widget {
                             ViewElement::Space { cols } => col += *cols as u32,
-                            // A rule is a hairline to the right edge, not a repeated glyph:
-                            // the element says "absorb the slack", and pixels spell that
-                            // differently from cells.
+                            // A rule is a hairline to the row's edge, not a repeated glyph: the
+                            // element says "absorb the slack", and pixels spell that differently
+                            // from cells. It runs from where the text left off, so it never
+                            // strikes through it.
                             ViewElement::Fill { .. } => {
-                                // A fill that *starts* the row is the rule opening or closing a
-                                // block ("a rule is the fill and nothing else — the rail sits
-                                // outside the content width"), so it is drawn from the rail
-                                // rather than from the first content column: the two have to
-                                // meet, which is what the terminal's `┌`/`├`/`└` spells with a
-                                // glyph whose horizontal arm leaves the cell the vertical line
-                                // is in. Starting it at the content edge left the corner open,
-                                // with the rule floating a gutter away from the rail.
-                                //
-                                // A fill that follows text still starts where the text left off
-                                // — otherwise the rule would strike through it.
-                                let x = if col == 0 { rail_x } else { text_x(col) };
+                                let x = text_x(col);
                                 fill(
                                     renderer,
                                     Rectangle {
                                         x,
                                         y: rule_y,
-                                        width: bounds.x + bounds.width - x,
+                                        width: (row_right - x).max(0.0),
                                         height: 1.0,
                                     },
                                     p.fg_faint,
@@ -623,20 +725,11 @@ where
                     } else {
                         (p.git_deleted_bg, p.git_deleted, p.git_deleted)
                     };
+                    fill(renderer, row_rect, bg);
                     fill(
                         renderer,
                         Rectangle {
-                            x: bounds.x,
-                            y,
-                            width: bounds.width,
-                            height: cell.height,
-                        },
-                        bg,
-                    );
-                    fill(
-                        renderer,
-                        Rectangle {
-                            x: bounds.x,
+                            x: row_left,
                             y,
                             width: cell.width * 0.5,
                             height: cell.height,
@@ -730,16 +823,13 @@ where
                 } => (element, line, row, row_index),
             };
             // The pair, never the number: `at == cursor_at` asks about *this* element's line.
-            let at = grid::ElementLine::new(element, line.logical_line);
+            let at = grid::ElementLine::new(*element, line.logical_line);
             let on_cursor_line = at == cursor_at;
-            let draw_sel = draw_selection && element == self.content.focused_element;
+            let draw_sel = draw_selection && *element == self.content.focused_element;
             let n_rows = line.visual_rows.len();
-            let row_bounds = Rectangle {
-                x: bounds.x,
-                y,
-                width: bounds.width,
-                height: cell.height,
-            };
+            // The row's own span — its gutter and its text — and no more: a line tint that ran
+            // edge to edge painted over the box holding the row and buried its rails.
+            let row_bounds = row_rect;
 
             let cells = grid::row_cells(row, self.content.tab_width);
 
@@ -932,7 +1022,7 @@ where
                 fill(
                     renderer,
                     Rectangle {
-                        x: bounds.x,
+                        x: row_left,
                         y,
                         width: cell.width * 0.5,
                         height: cell.height,
@@ -953,7 +1043,7 @@ where
                 fill(
                     renderer,
                     Rectangle {
-                        x: bounds.x,
+                        x: row_left,
                         y,
                         width: cell.width * 0.5,
                         height: cell.height,
@@ -967,12 +1057,12 @@ where
                     // so mark it with a small triangle straddling this line's top boundary
                     // rather than a full-height bar — a bar reads as "this line changed",
                     // which it didn't. Mirrors the web's `.gutter.deleted::before`.
-                    fill_triangle_right(renderer, bounds.x, y, color);
+                    fill_triangle_right(renderer, row_left, y, color);
                 } else {
                     fill(
                         renderer,
                         Rectangle {
-                            x: bounds.x,
+                            x: row_left,
                             y,
                             width: cell.width * 0.5,
                             height: cell.height,
@@ -1017,7 +1107,7 @@ where
                             self.content.tab_width,
                             self.content.measured,
                         ) {
-                            if r == abs_row {
+                            if r == abs_row.row {
                                 fill_content(
                                     renderer,
                                     Rectangle {
@@ -1254,8 +1344,22 @@ where
             self.content.measured,
         ) {
             let y = bounds.y + PAD + row.get() as f32 * unit_px - scroll;
+            // The box holding the cursor's row, read off the same list the row was painted from.
+            // Drawn without it, the block landed at the pane's edge while the row it belongs to
+            // sat two columns in — a second cursor, in a place nothing else was.
+            let inset = painted
+                .iter()
+                .find(|(place, _)| place.row == row)
+                .map_or(0, |(place, _)| place.inset.left);
+            let content_left = content_left_of(inset);
+            let content_clip = content_clip_of(inset);
+            let fill_content = |renderer: &mut Renderer, r: Rectangle, c: Color| {
+                if let Some(r) = clamp_left(r, content_left) {
+                    fill(renderer, r, c);
+                }
+            };
             if y + cell.height >= bounds.y && y <= bounds.y + bounds.height {
-                let x = text_x(dcol);
+                let x = text_x_in(inset, dcol);
                 // Underscore while a capture is armed takes precedence over insert/normal.
                 if self.content.awaiting_key {
                     fill_content(
@@ -1538,6 +1642,8 @@ fn row_text(item: &grid::PaintedRow<'_>, tab_width: u32) -> String {
                 }
             }
         }
+        // A box edge is a rule, not words — nothing for a reader to read.
+        grid::PaintedRow::Edge { .. } => {}
         grid::PaintedRow::Baseline { row, .. } => out.push_str(&row.text),
         grid::PaintedRow::Text { row, .. } => {
             if row.byte_offset != 0 {

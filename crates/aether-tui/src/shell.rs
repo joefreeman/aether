@@ -2545,7 +2545,7 @@ impl Shell {
         // half-empty beats painting the wrong one whole: pulling back to the last full screen here
         // would drag the view backwards on every scroll and snap forward when the window landed.
         let on_screen = |i: &usize| {
-            let at = rows[*i].0.get();
+            let at = rows[*i].0.row.get();
             at >= top && at < top.saturating_add(visible)
         };
         if content.iter().any(on_screen) {
@@ -2558,13 +2558,13 @@ impl Shell {
             return VisualRow(top);
         };
         let (mut fi, mut li) = (fi, li);
-        while fi > 0 && rows[fi - 1].0.get() + 1 == rows[fi].0.get() {
+        while fi > 0 && rows[fi - 1].0.row.get() + 1 == rows[fi].0.row.get() {
             fi -= 1;
         }
-        while li + 1 < rows.len() && rows[li + 1].0.get() == rows[li].0.get() + 1 {
+        while li + 1 < rows.len() && rows[li + 1].0.row.get() == rows[li].0.row.get() + 1 {
             li += 1;
         }
-        let (first, last) = (rows[fi].0.get(), rows[li].0.get());
+        let (first, last) = (rows[fi].0.row.get(), rows[li].0.row.get());
         VisualRow(if top < first {
             first
         } else {
@@ -3507,11 +3507,10 @@ mod scroll_tests {
     fn window_of(elements: &[(u64, u32, u32)], loaded: &[usize]) -> Window {
         let mut children = Vec::new();
         for (i, (buffer, first, height)) in elements.iter().enumerate() {
-            children.push(Element::Chrome {
-                kind: aether_protocol::viewport::ChromeKind::FileHeader,
-                rail: aether_protocol::ui::RailJoin::Opens,
-                children: vec![aether_protocol::ui::Element::text("a file", Vec::new())],
-            });
+            children.push(Element::chrome(vec![aether_protocol::ui::Element::text(
+                "a file",
+                Vec::new(),
+            )]));
             children.push(Element::Editor {
                 element: i as u32,
                 buffer: *buffer,
@@ -3530,7 +3529,7 @@ mod scroll_tests {
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
-            root: Element::Stack { children },
+            root: Element::column(children),
         }
     }
 
@@ -3871,7 +3870,7 @@ mod scroll_tests {
         let first_row = ed.paint_top.get();
         let painted_from_there = aether_client::grid::painted_rows_of(&ed.root, &sh.measured)
             .iter()
-            .filter(|(at, _)| at.get() >= first_row && at.get() < first_row + sh.visible_rows())
+            .filter(|(at, _)| at.row.get() >= first_row && at.row.get() < first_row + sh.visible_rows())
             .count() as u32;
         // A screenful, or everything the window holds when it holds less than a screen.
         assert_eq!(

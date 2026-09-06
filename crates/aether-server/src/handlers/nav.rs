@@ -41,11 +41,6 @@ pub fn nav_entry_for(
     if !s.buffers.contains_key(&buffer_id) {
         return None;
     }
-    let cursor = s
-        .cursors
-        .get(&(client_id, buffer_id))
-        .copied()
-        .unwrap_or_default();
     let (path_index, relative_path) = buffer_path_ref(s, client_id, buffer_id);
     let virtual_key = s
         .try_doc_of(buffer_id)
@@ -55,14 +50,60 @@ pub fn nav_entry_for(
     // path — a view id is never `0`, so the entry cannot mistake a later view for its own.
     let view_id =
         crate::handlers::viewport::client_view_of(s, client_id, buffer_id).unwrap_or_default();
+    // Where the cursor *is*, which in a composed view is not this buffer. The viewport already
+    // tracks which element holds it — the same field an edit, a search and an undo act through —
+    // so the location is that element and the cursor of the buffer it windows.
+    let element = focused_element(s, client_id, view_id)
+        .filter(|(_, in_buffer)| *in_buffer != buffer_id)
+        .map(|(element, _)| element);
+    let cursor_in = match element {
+        Some(e) => element_buffer(s, view_id, e).unwrap_or(buffer_id),
+        None => buffer_id,
+    };
+    let cursor = s
+        .cursors
+        .get(&(client_id, cursor_in))
+        .copied()
+        .unwrap_or_default();
     Some(NavEntry {
         view_id,
         buffer_id,
         path_index,
         relative_path,
         virtual_key,
+        element,
         cursor,
     })
+}
+
+/// The element holding `view`'s cursor for this client, and the buffer it windows. `None` when the
+/// client has no viewport on the view, or the view has no such element.
+fn focused_element(
+    s: &ServerState,
+    client_id: ClientId,
+    view: ViewId,
+) -> Option<(aether_protocol::viewport::FieldId, BufferId)> {
+    let focused = s
+        .viewports
+        .values()
+        .find(|vp| vp.client_id == client_id && vp.view_id == view)?
+        .focused;
+    Some((focused, element_buffer(s, view, focused)?))
+}
+
+/// The buffer `element` of `view` windows.
+fn element_buffer(
+    s: &ServerState,
+    view: ViewId,
+    element: aether_protocol::viewport::FieldId,
+) -> Option<BufferId> {
+    Some(
+        s.views
+            .get(&view)?
+            .elements
+            .get(element as usize)?
+            .buffer_id,
+    )
 }
 
 /// Re-materialise whatever a virtual key names. Shared by nav-history restore and the dormant
@@ -110,6 +151,11 @@ async fn navigate_to(
             let mut result = opened?;
             let mut s = state.lock().await;
             result.cursor = restore_cursor(&mut s, ctx.client_id, result.buffer_id, entry.cursor);
+            if let Some((scroll, cursor)) = restore_element(&mut s, ctx.client_id, &result, &entry)
+            {
+                result.scroll = Some(scroll);
+                result.cursor = cursor;
+            }
             return Ok(result);
         }
     }
@@ -140,7 +186,42 @@ async fn navigate_to(
 
     let mut s = state.lock().await;
     result.cursor = restore_cursor(&mut s, ctx.client_id, result.buffer_id, entry.cursor);
+    if let Some((scroll, cursor)) = restore_element(&mut s, ctx.client_id, &result, &entry) {
+        result.scroll = Some(scroll);
+        result.cursor = cursor;
+    }
     Ok(result)
+}
+
+/// Put a composed view's location back: the cursor into the buffer its element windows, and a
+/// scroll naming that element so the view reopens framed on it.
+///
+/// Ordinary views need neither. Their open answers `scroll: None` on purpose — the client then
+/// centres on the restored cursor with a single subscribe, and with one element there is nowhere
+/// else for the cursor to be. A composed view has an element per hunk and a fresh subscribe takes
+/// its focused element *from the scroll it names*, so `None` means element 0: the cursor is
+/// restored into a buffer nothing on screen is showing and the view opens at the top of the patch.
+///
+/// Answers `None` when the entry named no element, or when the view no longer has it — a patch
+/// regenerated against a tree that has moved on may be shorter than the one you left.
+fn restore_element(
+    s: &mut ServerState,
+    client_id: ClientId,
+    result: &ViewOpenResult,
+    entry: &NavEntry,
+) -> Option<(ScrollPosition, CursorState)> {
+    let element = entry.element?;
+    let view = crate::handlers::viewport::client_view_of(s, client_id, result.buffer_id)?;
+    let buffer = element_buffer(s, view, element)?;
+    let cursor = restore_cursor(s, client_id, buffer, entry.cursor);
+    Some((
+        ScrollPosition {
+            element,
+            line: cursor.position.line,
+            sub_row: 0.0,
+        },
+        cursor,
+    ))
 }
 
 /// Seat a remembered cursor in `buffer_id`, clamped to what the buffer holds now.
@@ -244,6 +325,9 @@ pub async fn nav_goto(
         path_index: params.path_index,
         relative_path: params.relative_path,
         virtual_key: params.virtual_key,
+        // The web owns its own stacks and hands back what it was given; a composed view's element
+        // is not in that payload, so this restores the cursor and lets the client frame itself.
+        element: None,
         cursor: params.cursor,
     };
     Ok(NavStepResult {

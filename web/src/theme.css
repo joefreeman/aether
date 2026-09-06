@@ -685,72 +685,16 @@ html, body, #app {
 /* The band runs edge to edge, gutter included: the gutter belongs to the rows the cursor can
    reach, and chrome is not one of them. Making "unreachable" legible is its whole job. */
 .row.patch-chrome { color: var(--fg-muted); background: var(--patch-chrome-bg); }
-/* A left rail down the file's chrome, in the gutter column, meeting the rule that opens the block —
-   so the heading rows read as belonging to the file above rather than floating in the diff.
-   The gutter takes the *band's* colour rather than the editor background it paints on every other
-   row: it is opaque either way (it has to be — it is sticky, so text scrolls under it), and painting
-   the editor background here left a strip of it down the left of every chrome row. The band stopped
-   a column short of the edge and the rail read as living in the gutter rather than in the block. */
-.row.patch-chrome .gutter {
-  /* A quarter-cell in from the row's left edge, not hard against it. The terminal draws the rail as
-     `│`, whose ink sits centred in its cell, and the GUI insets its hairline by a quarter cell; a
-     rail on the gutter's own border edge had no such gap and read as pinned to the window. Drawn as
-     a background layer for the same reason — a border can only ever be at the edge — measured from
-     the border box so the offset is from the row's edge rather than from inside the (transparent)
-     change-bar border. A hairline, not the change-bar's 3px: this is a rail joining chrome rows
-     together, and at the gutter's weight it read as a git marker on rows that have no line to mark.
-     The column keeps its 1ch width (`border-box`), so chrome text stays aligned with code text. */
-  --rail-x: 0.25ch;
-  background-color: var(--patch-chrome-bg);
-  background-image: linear-gradient(var(--fg-faint), var(--fg-faint));
-  background-size: 1px 100%;
-  background-position: var(--rail-x) 0;
-  background-origin: border-box;
-  background-repeat: no-repeat;
-}
-/* A rule *joins* the rail: the terminal spells the join as one glyph (`┌`/`├`/`└`) whose horizontal
-   arm leaves the very cell the vertical line is in, and this is the same figure in two halves — an
-   arm across the gutter, drawn here, and the filler across the content, drawn below. Two halves
-   because the gutter is `position: sticky` (so the change-bar survives horizontal scrolling) and
-   therefore paints over anything the row draws underneath it: a single line spanning the row would
-   be hidden for exactly the width that has to reach the rail.
-   Layers, in paint order: the arm, then the rail itself — the arm leaves *from* the rail, so it
-   starts at the same quarter-cell offset and runs to the gutter's edge (sized a full cell and
-   clipped there), where the content's filler picks it up. */
-.row.patch-chrome.rule .gutter {
-  background-image:
-    linear-gradient(var(--fg-faint), var(--fg-faint)),
-    linear-gradient(var(--fg-faint), var(--fg-faint));
-  background-size: 100% 1px, 1px 100%;
-  background-position: var(--rail-x) 50%, var(--rail-x) 0;
-  background-repeat: no-repeat;
-}
-.row.patch-chrome.rule.closes .gutter {
-  background-image:
-    linear-gradient(var(--fg-faint), var(--fg-faint)),
-    linear-gradient(to bottom, var(--fg-faint) 50%, transparent 50%);
-}
-/* The first file has no rail running into it, so its rule corners rather than teeing: the rail
-   starts halfway down, where the horizontal line meets it. */
-.row.patch-chrome.rule.corners .gutter {
-  background-image:
-    linear-gradient(var(--fg-faint), var(--fg-faint)),
-    linear-gradient(to bottom, transparent 50%, var(--fg-faint) 50%);
-}
+/* The gutter takes the *band's* colour rather than the editor background it paints on every other
+   row: it is opaque either way (it has to be — it is sticky, so text scrolls under it), and
+   painting the editor background here left a strip of it down the left of every chrome row.
+   It drew a rail here too, tying a file's chrome rows together and joining the rule that opened
+   the block — `┌`/`├`/`└` in the terminal's alphabet, gradients in this one. That line is the file
+   block's own border now, a cell further out, so a rail here would be a second one beside it. */
+.row.patch-chrome .gutter { background-color: var(--patch-chrome-bg); }
 .row.patch-chrome .content { display: flex; align-items: center; }
-/* A file block opens with a rule drawn edge to edge; its path and counts sit on the row below. The
-   filler is the right-hand half of the join above — it starts where the gutter's arm stops. */
-.row.patch-chrome.rule .content::after {
-  content: "";
-  flex: 1;
-  height: 1px;
-  background: var(--fg-faint);
-}
 /* A section heading is its name and nothing else. It used to trail a rule to the right edge, which
    read as heavily as the file rule above it and flattened the file/hunk hierarchy. */
-/* The patch's summary caption sits above the first file's rule and belongs to no file, so the rail
-   doesn't run through it (see `.detached`). */
-.row.patch-chrome.detached .gutter { background-image: none; }
 .hl-diff-file { color: var(--fg); font-weight: 600; }
 .hl-diff-added { color: var(--git-added); }
 .hl-diff-removed { color: var(--git-deleted); }
@@ -808,6 +752,103 @@ html, body, #app {
 .row.staged.patch-removed { background: var(--git-staged-deleted-bg); }
 .row.cursor-line.staged.patch-added { background: var(--cursor-line-staged-added-bg); }
 .row.cursor-line.staged.patch-removed { background: var(--cursor-line-staged-deleted-bg); }
+
+/* ---- boxes -----------------------------------------------------------------------------------
+   Deliberately after every row-background rule above. Those use the `background` *shorthand*, which
+   resets `background-image` to `none`; a box drawn earlier in the file would be wiped off the
+   cursor's line and every diff-tinted row, which is exactly the row a missing rail is noticed on. */
+/* A row inside a box: the cells its border and padding claimed, and the band behind them.
+   The gutter rides along, so a boxed file's change bar sits inside its border rather than pinned
+   to the window.
+
+   The band is drawn as two background *images* — one strip per side, sized to the inset — rather
+   than as the row's background colour, because the row's colour is already spoken for: it is the
+   cursor-line tint, the diff tint, the chrome band. An image paints above the colour, so the
+   strips cover whatever the tint spilled into the box's own cells. That spill is what made the
+   cursor's line read a box wider than every other line. */
+.row {
+  padding-left: var(--inset-left, 0);
+  padding-right: var(--inset-right, 0);
+  /* How far a rail's hairline sits in from the edge of the cell it is drawn in: down the middle,
+     which is where the terminal's `│` puts its ink. Half a pixel back from the half-cell mark,
+     since the line is 1px wide and a position places its edge.
+     Used as `left var(--rail-inset)` / `right var(--rail-inset)` — the four-value form, measured
+     from the named edge. Not `calc(100% - …)`: a percentage in `background-position` resolves
+     against the positioning area *minus the layer's own width*, so the two sides came out a pixel
+     apart, which is exactly the lopsidedness one offset for both is meant to rule out. */
+  --rail-inset: calc(0.5ch - 0.5px);
+}
+.row.boxed {
+  --band: linear-gradient(var(--patch-chrome-bg), var(--patch-chrome-bg));
+  --rail: linear-gradient(var(--fg-faint), var(--fg-faint));
+  background-image: var(--rail-l, none), var(--rail-r, none), var(--band), var(--band);
+  background-size:
+    var(--rail-l-size, 0 0), var(--rail-r-size, 0 0),
+    var(--inset-left, 0) 100%, var(--inset-right, 0) 100%;
+  background-position:
+    left var(--rail-inset) top 0, right var(--rail-inset) top 0,
+    left 0 top 0, right 0 top 0;
+  background-repeat: no-repeat;
+}
+/* The box's rails, one per side it draws — the rails first in the list, so they sit on the band
+   rather than under it. Drawn as a layer rather than a border, since a border can only ever be at
+   the very edge. */
+.row.boxed.rail-left {
+  --rail-l: var(--rail);
+  --rail-l-size: 1px 100%;
+}
+.row.boxed.rail-right {
+  --rail-r: var(--rail);
+  --rail-r-size: 1px 100%;
+}
+/* A box's own border/padding row. Unlike chrome there is no text in it: what it draws is the rule
+   and the rails it meets — one figure, drawn in one place, which is why the row's `.content` no
+   longer trails a rule of its own. `join` is the same alphabet the terminal spells with
+   `┌`/`├`/`└`; here it is a stub of rail above the rule, below it, or both.
+
+   The rule runs rail to rail: it has to leave the very cell the vertical line is in, which is what
+   closes the corner. With no rail on a side it simply runs to that edge. */
+.row.box-edge {
+  --rule-from: 0px;
+  --rule-to: 0px;
+  --edge-rail-size: 0 0;
+  --edge-rail-y: top 0;
+  background-image:
+    var(--rail-l, none), var(--rail-r, none),
+    linear-gradient(var(--fg-faint), var(--fg-faint)),
+    var(--band, none), var(--band, none);
+  background-size:
+    var(--edge-rail-size), var(--edge-rail-size),
+    calc(100% - var(--rule-from) - var(--rule-to)) 1px,
+    var(--inset-left, 0) 100%, var(--inset-right, 0) 100%;
+  background-position:
+    left var(--rail-inset) var(--edge-rail-y), right var(--rail-inset) var(--edge-rail-y),
+    left var(--rule-from) top 50%,
+    left 0 top 0, right 0 top 0;
+  background-repeat: no-repeat;
+}
+/* The rule stops at each rail's *centre*, which is what closes the corner: its horizontal arm has
+   to leave the very cell the vertical line is in. */
+.row.box-edge.rail-left { --rule-from: 0.5ch; }
+.row.box-edge.rail-right { --rule-to: 0.5ch; }
+/* The gutter is `position: sticky` and opaque — it has to be, since text scrolls under it — so it
+   paints over anything the row draws beneath. On a border row that punched a cell-wide gap in the
+   rule. There is nothing under the gutter here to protect (a border row has no text and no change
+   bar), so it steps out of the way and the rule runs unbroken. */
+.row.box-edge .gutter { background-color: transparent; }
+/* The rail's own share of the join: down from the rule where it opens, up to it where it closes,
+   straight through where it tees. Detached draws no rail — a plain rule with nothing to meet. */
+.row.box-edge.opens {
+  --edge-rail-size: 1px 50%;
+  --edge-rail-y: bottom 0;
+}
+.row.box-edge.closes { --edge-rail-size: 1px 50%; }
+.row.box-edge.tees { --edge-rail-size: 1px 100%; }
+.row.box-edge.detached {
+  --edge-rail-size: 0 0;
+  --rule-from: 0px;
+  --rule-to: 0px;
+}
 
 /* Native change-bar: a colored left border in the gutter column (no text glyph). The transparent
    border on every gutter keeps the text start aligned whether or not a line is changed. */

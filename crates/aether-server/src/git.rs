@@ -25,7 +25,7 @@ use aether_protocol::git::{
     GitBaselineChoice, GitBaselineSource, GitBufferStatus, GitHead, GitRepoOperation, GitStatus,
     GitUpstreamStatus, HunkAction,
 };
-use aether_protocol::viewport::{ChromeKind, DiffStage};
+use aether_protocol::viewport::DiffStage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -2749,7 +2749,7 @@ fn emit_summary(b: &mut PatchBuilder, diff: &git2::Diff<'_>, baseline_label: Opt
         text.push_str(&since);
     }
 
-    b.chrome(ChromeKind::Summary, text, &spans);
+    b.heading(text, &spans);
 }
 
 /// The first parent of `rev`, as a full hash — the revision a patch's `-` lines belong to.
@@ -4674,7 +4674,7 @@ mod tests {
     // ---- show_commit: a generated patch document ------------------------------------------------
 
     use crate::patch::{GeneratedPatch, PatchFileStatus, HUNK};
-    use aether_protocol::viewport::{ChromeKind, Element, PatchLine};
+    use aether_protocol::viewport::{Element, PatchLine};
 
     /// The text a highlight span covers, so assertions read as "this word is a keyword" rather
     /// than as byte arithmetic.
@@ -4727,17 +4727,36 @@ mod tests {
     }
 
     /// The contents of every chrome row of `kind`, in order.
-    fn chrome(g: &GeneratedPatch, want: ChromeKind) -> Vec<&[aether_protocol::ui::Element]> {
+    /// Every chrome row the patch carries, as the children each draws.
+    ///
+    /// Filtered by `ChromeKind` until the tag went: no shell ever branched on it, and what these
+    /// assertions are really about is what a row *says*. A heading has text; a blank has none.
+    fn chrome(g: &GeneratedPatch) -> Vec<&[aether_protocol::ui::Element]> {
         g.decorations
             .chrome
             .iter()
             .flatten()
+            .chain(g.decorations.trailing_chrome.iter())
             .filter_map(|r| match r {
-                Element::Chrome { kind, children, .. } if *kind == want => {
-                    Some(children.as_slice())
-                }
+                Element::Row { children, .. } => Some(children.as_slice()),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// The same rows as the text each draws, `""` for a blank — the sequence a reader sees.
+    fn chrome_text(g: &GeneratedPatch) -> Vec<String> {
+        chrome(g)
+            .into_iter()
+            .map(|row| row.iter().map(Element::text_content).collect())
+            .collect()
+    }
+
+    /// The chrome rows that say something, blanks dropped.
+    fn headings(g: &GeneratedPatch) -> Vec<String> {
+        chrome_text(g)
+            .into_iter()
+            .filter(|t| !t.is_empty())
             .collect()
     }
 
@@ -4756,16 +4775,14 @@ mod tests {
         assert_eq!(g.decorations.emphasis.len(), n);
         assert_eq!(g.index.lines.len(), n);
         // Strictly equal again: the patch ends without a trailing newline, so there is no empty
-        // last line, and the chrome that would have anchored there is `trailing_rows` instead.
+        // last line for chrome to anchor to. Anything queued after the last content line goes to
+        // `trailing_chrome` instead — nothing here, since the boundary that used to trail as a
+        // closing rule is the last file block's own bottom border now.
         assert_eq!(g.decorations.chrome.len(), n);
         assert!(
             !text.ends_with('\n'),
             "no trailing newline — the empty last line it makes is one the cursor can land on, \
              below everything the patch has to show"
-        );
-        assert!(
-            !g.decorations.trailing_chrome.is_empty(),
-            "the closing rule lives here, having no line to sit above"
         );
     }
 
@@ -4790,11 +4807,24 @@ mod tests {
     /// Chrome lives in virtual rows and never in the text. That is what makes it unreachable by
     /// the cursor for free — the alternative, buffer lines the cursor refuses to land on, would
     /// need a skip rule in every motion, in search landing, in sneak and in nav restore.
+    ///
+    /// The fixture changes a line deep inside a function on purpose: a hunk git can name is the
+    /// only one that renders a heading at all, and a heading is half of what this is checking got
+    /// lifted out of the text.
     #[test]
     fn chrome_is_never_buffer_text() {
         let dir = tempfile::tempdir().unwrap();
-        repo_with_committed_file(dir.path(), "src.rs", "one\ntwo\nthree\n");
-        commit_change(dir.path(), "src.rs", "one\nTWO\nthree\n", "shout");
+        repo_with_committed_file(
+            dir.path(),
+            "src.rs",
+            "fn wrapper() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n}\n",
+        );
+        commit_change(
+            dir.path(),
+            "src.rs",
+            "fn wrapper() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 44;\n}\n",
+            "tweak",
+        );
         let (text, g) = head_patch(dir.path());
 
         for line in text.lines() {
@@ -4805,8 +4835,63 @@ mod tests {
                 );
             }
         }
-        assert_eq!(chrome(&g, ChromeKind::FileHeader).len(), 1);
-        assert_eq!(chrome(&g, ChromeKind::HunkHeader).len(), 1);
+        assert_eq!(
+            headings(&g),
+            ["1 file changed  +1  −1", "src.rs  +1  −1", "fn wrapper() {"],
+            "the caption, the path and the signature are chrome rows, not lines of the document"
+        );
+    }
+
+    /// Every hunk gets a blank above it. A heading only when it has something new to say.
+    ///
+    /// Three blank rows per hunk was the pre-frame way of setting a run of code apart from its
+    /// chrome (`ChromeKind::Spacer`'s own doc: *"one sits above and below every run of code, so a
+    /// section reads as boxed in by its chrome"*). The box does most of that now, with a border and
+    /// a band; what the box cannot say is where one hunk ends and the next begins, since its border
+    /// marks the *file* and two hunks share one box. So one blank is left, above — the boundary —
+    /// and the heading is what that boundary is *called*, drawn only when there is a name for it.
+    ///
+    /// Pinned as a *sequence*, because taking the spacers out broke nothing any test could see:
+    /// 2607 passed on a patch with three fewer rows per hunk. A count would not have caught it
+    /// either — what changes is the shape.
+    #[test]
+    fn a_hunk_gets_a_blank_above_it_and_a_heading_only_when_it_says_something_new() {
+        // Three hunks: the first at the top of the file (git names no signature for it), then two
+        // inside `fn tail`, whose signature the second of them would only repeat.
+        let file = |a: &str, b: &str, c: &str| {
+            let mut out = format!("let top = {a};\n");
+            for i in 0..12 {
+                out.push_str(&format!("let filler{i} = 0;\n"));
+            }
+            out.push_str("fn tail() {\n");
+            for i in 0..4 {
+                out.push_str(&format!("    let pad{i} = 0;\n"));
+            }
+            out.push_str(&format!("    let b = {b};\n"));
+            for i in 4..12 {
+                out.push_str(&format!("    let pad{i} = 0;\n"));
+            }
+            out.push_str(&format!("    let c = {c};\n"));
+            out.push_str("}\n");
+            out
+        };
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", &file("1", "2", "3"));
+        commit_change(dir.path(), "src.rs", &file("11", "22", "33"), "three hunks");
+        let (_, g) = head_patch(dir.path());
+
+        assert_eq!(
+            chrome_text(&g),
+            [
+                "1 file changed  +3  −3", // the caption
+                "src.rs  +3  −3",         // the path
+                "",                       // hunk 1: at the top of the file, git names nothing
+                "",                       // hunk 2's blank…
+                "fn tail() {",            // …and its heading, said for the first time
+                "",                       // hunk 3: `fn tail` again, so the blank alone
+            ],
+            "a blank per hunk, and a heading only where it names somewhere new"
+        );
     }
 
     /// A section heading is the enclosing signature alone.
@@ -4830,11 +4915,18 @@ mod tests {
         );
         let (_, g) = head_patch(dir.path());
 
-        let rows = chrome(&g, ChromeKind::HunkHeader);
-        let row = rows.first().expect("a section heading");
-        let text: String = row.iter().map(Element::text_content).collect();
-        assert_eq!(text, "fn wrapper() {", "the signature, nothing else");
-        assert!(!text.contains("@@"), "the ranges are gone: {text:?}");
+        let text = headings(&g);
+        assert_eq!(
+            text.last().map(String::as_str),
+            Some("fn wrapper() {"),
+            "the signature, nothing else: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|t| t.contains("@@")),
+            "the ranges are gone: {text:?}"
+        );
+        let rows = chrome(&g);
+        let row = rows.last().expect("a section heading");
         let kinds: Vec<&str> = row
             .iter()
             .flat_map(Element::highlight_runs)
@@ -4842,8 +4934,16 @@ mod tests {
             .collect();
         assert_eq!(kinds, [HUNK]);
 
-        // The file block opens with a full-width rule, and its path sits on the row below.
-        assert_eq!(chrome(&g, ChromeKind::Rule).len(), 1);
+        // No rule row at all: a file block's boundaries are its box's own borders, top and bottom,
+        // so the patch draws no separator of its own. One as well would draw it twice — and, with
+        // `collapse`, the join between two files would be a rule under a rule rather than a tee.
+        assert!(
+            chrome(&g)
+                .iter()
+                .all(|row| !row.iter().any(|e| matches!(e, Element::Fill { .. })
+                    || e.inline().iter().any(|i| matches!(i, Element::Fill { .. })))),
+            "the boundary is the box's border now, not a chrome rule"
+        );
     }
 
     /// The file separator is the file-scope handle — for `Space g Alt-s` and for the eye — so it
@@ -4855,10 +4955,11 @@ mod tests {
         commit_change(dir.path(), "src.rs", "one\nTWO\nthree\n", "shout");
         let (_, g) = head_patch(dir.path());
 
-        let rows = chrome(&g, ChromeKind::FileHeader);
-        let row = rows.first().expect("a file separator");
-        let text: String = row.iter().map(Element::text_content).collect();
-        assert!(text.starts_with("src.rs"), "{text:?}");
+        let all = headings(&g);
+        let text = all
+            .iter()
+            .find(|t| t.starts_with("src.rs"))
+            .unwrap_or_else(|| panic!("a file separator: {all:?}"));
         assert!(text.contains("+1"), "{text:?}");
         assert!(text.contains("−1"), "{text:?}");
     }

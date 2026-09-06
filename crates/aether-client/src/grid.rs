@@ -9,7 +9,7 @@
 //! continuation indent, same as the web client.
 
 use aether_protocol::coords::{ElementRow, VisualRow};
-use aether_protocol::ui::LayoutOwner;
+use aether_protocol::ui::{Band, LayoutOwner, RailJoin};
 use aether_protocol::viewport::{
     BaselineRow, Element, FieldId, LogicalLineRender, ScrollPosition, SliceRequest, Window,
     WrappedRow,
@@ -260,15 +260,25 @@ impl Measured {
         }
     }
 
-    /// Units `node` occupies: the tree's row count at this resolution, or the measured height for
-    /// an element the client laid out.
+    /// Units `node` occupies **on its own** — not counting children.
+    ///
+    /// A container contributes only the rows its own box spends: a `Column` with no edges is still
+    /// weightless, and one with a top and bottom border is two rows tall before anything is inside
+    /// it. A `Row`'s children share its one row, so a bare `Row` is one row plus its box.
     pub fn height(&self, node: &Element) -> u32 {
         match (node, self.of(node)) {
             (Element::Editor { rows, .. }, Some(m)) => m.height(*rows, self.units_per_row),
             (Element::Editor { rows, .. }, None) => rows * self.units_per_row,
-            (Element::Stack { .. }, _) => 0,
+            (Element::Column { edges, .. }, _) => self.box_rows(*edges),
+            (Element::Row { edges, .. }, _) => self.units_per_row + self.box_rows(*edges),
             _ => self.units_per_row,
         }
+    }
+
+    /// Units a box spends above and below its content — border and padding alike occupy whole
+    /// rows.
+    pub fn box_rows(&self, edges: aether_protocol::ui::Edges) -> u32 {
+        u32::from(edges.top() + edges.bottom()) * self.units_per_row
     }
 
     /// Which wire row of `node` sits `offset` units into it — the row the server numbers, which is
@@ -301,7 +311,7 @@ impl Measured {
 /// tree says it, where the shell does not.
 pub fn total_rows(root: &Element, measured: &Measured) -> u32 {
     let mut total = 0u32;
-    walk_rows(root, measured, &mut |_, rows| {
+    walk_rows(root, measured, Frame::default(), &mut |_, _, rows| {
         total = total.saturating_add(rows)
     });
     total
@@ -329,9 +339,9 @@ pub fn element_start_row_of(
 ) -> Option<VisualRow> {
     let mut at = 0u32;
     let mut found = None;
-    walk_rows(root, measured, &mut |node, rows| {
+    walk_rows(root, measured, Frame::default(), &mut |visit, _, rows| {
         if found.is_none() {
-            if let Element::Editor { element: id, .. } = node {
+            if let Visit::Node(Element::Editor { element: id, .. }) = visit {
                 if *id == element {
                     found = Some(VisualRow(at));
                 }
@@ -363,13 +373,13 @@ pub fn slices_for(
     let unit = measured.row();
     let mut out = Vec::new();
     let mut at = 0u32;
-    walk_rows(root, measured, &mut |node, height| {
-        if let Element::Editor {
+    walk_rows(root, measured, Frame::default(), &mut |visit, _, height| {
+        if let Visit::Node(Element::Editor {
             element,
             rows: lines,
             laid_out_by,
             ..
-        } = node
+        }) = visit
         {
             let (start, end) = (at, at.saturating_add(height));
             let (a, b) = (lo.max(start), hi.min(end));
@@ -451,30 +461,153 @@ pub fn loaded_covers(root: &Element, wanted: &[SliceRequest]) -> bool {
     })
 }
 
-/// One pass over the tree in painting order, telling `f` each node's row count: 1 for chrome and
-/// for any inline element standing on its own, an editor's height, nothing for a container.
+/// How far in from the view's own edges a row sits, in cells — the boxes enclosing it, summed.
+///
+/// Not a width: [`painted_rows`] is a pure function of the tree and never learns the viewport's
+/// size, so it reports what the boxes *take* and each shell subtracts that from the width it has.
+/// A shell's content therefore runs from `left` to `total - right`, its gutter included or not by
+/// its own convention.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Inset {
+    pub left: u32,
+    pub right: u32,
+}
+
+/// What the walk carries down the tree: how far in the boxes hold a row, and whether any of them
+/// runs a rail down its left side.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Frame {
+    inset: Inset,
+    rails: aether_protocol::ui::Sides,
+    band: Band,
+}
+
+impl Frame {
+    /// This frame with `edges`' own sides added — one box deeper. The band is the innermost one
+    /// that declares one, so a plain box inside a banded one does not silently repaint it.
+    fn plus(self, edges: aether_protocol::ui::Edges, band: Band) -> Frame {
+        Frame {
+            inset: Inset {
+                left: self.inset.left + u32::from(edges.left()),
+                right: self.inset.right + u32::from(edges.border.right + edges.padding.right),
+            },
+            // Rails accumulate: a box inside a box is railed on any side either of them draws.
+            rails: aether_protocol::ui::Sides {
+                left: self.rails.left.max(edges.border.left),
+                right: self.rails.right.max(edges.border.right),
+                ..aether_protocol::ui::Sides::ZERO
+            },
+            band: if band.is_none() { self.band } else { band },
+        }
+    }
+}
+
+/// Which side of its box an [`PaintedRow::Edge`] row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Top,
+    Bottom,
+}
+
+/// What one pass over the tree reports: a node that occupies rows, or a row a **box** occupies
+/// that no node stands for.
+///
+/// A border is not a tree node — that is exactly why [`PaintedRow::Chrome`] cannot carry one — so
+/// the walk synthesises it and names the container it belongs to. An edge that knows its own box
+/// is what makes its join derivable from sibling order.
+enum Visit<'a> {
+    Node(&'a Element),
+    Edge { owner: &'a Element, side: Side },
+}
+
+/// One pass over the tree in painting order, telling `f` each visit's row count and where it sits
+/// horizontally: 1 row for chrome and for any inline element standing on its own, an editor's
+/// height, a box's own rows for a container.
 ///
 /// A horizontal group is **one** screen row: its children share it. An `Editor` nested inside one
 /// is representable and not renderable — this row model is a flat top-to-bottom list with no way to
-/// say "these two editors share these rows", so side-by-side diff needs a different row model, not
-/// a deeper walk here. Worth asserting rather than dropping silently, because [`Element::walk`]
-/// *does* descend into rows: `lines()` and `editors()` would count such an editor while this drew
-/// it as one chrome row, and two traversals of one tree disagreeing is the kind of thing that shows
-/// up as a cursor in the wrong place three layers away.
-fn walk_rows<'a>(node: &'a Element, measured: &Measured, f: &mut impl FnMut(&'a Element, u32)) {
+/// say "these two editors share these rows". Frames do not change that: they inset a row, they do
+/// not split one. See §3.7 of the plan for what is actually left before splits work — less than it
+/// looks, now that a row has a horizontal coordinate — but until then this stays loud, because
+/// [`Element::walk`] *does* descend into rows: `lines()` and `editors()` would count such an editor
+/// while this drew it as one chrome row, and two traversals of one tree disagreeing is the kind of
+/// thing that shows up as a cursor in the wrong place three layers away.
+fn walk_rows<'a>(
+    node: &'a Element,
+    measured: &Measured,
+    frame: Frame,
+    f: &mut impl FnMut(Visit<'a>, Frame, u32),
+) {
     match node {
-        Element::Stack { children } => children.iter().for_each(|c| walk_rows(c, measured, f)),
-        Element::Editor { .. } => f(node, measured.height(node)),
-        Element::Row { children } | Element::Chrome { children, .. } => {
+        Element::Column {
+            children,
+            edges,
+            band,
+        } => {
+            let inner = frame.plus(*edges, *band);
+            // The box's own rows, above and below its children. Border and padding are separate
+            // cells but the same kind of row to a painter — what differs is what it draws there,
+            // which is the shell's business.
+            for _ in 0..u32::from(edges.top()) {
+                f(
+                    Visit::Edge {
+                        owner: node,
+                        side: Side::Top,
+                    },
+                    inner,
+                    measured.row(),
+                );
+            }
+            children
+                .iter()
+                .for_each(|c| walk_rows(c, measured, inner, f));
+            for _ in 0..u32::from(edges.bottom()) {
+                f(
+                    Visit::Edge {
+                        owner: node,
+                        side: Side::Bottom,
+                    },
+                    inner,
+                    measured.row(),
+                );
+            }
+        }
+        Element::Editor { .. } => f(Visit::Node(node), frame, measured.height(node)),
+        Element::Row {
+            children,
+            edges,
+            band,
+        } => {
             debug_assert!(
                 !children.iter().any(|c| !c.editors().is_empty()),
-                "an Editor inside a Row/Chrome: representable, but the row model cannot give \
+                "an Editor inside a Row: representable, but the row model cannot give \
                  it rows of its own — see the module docs on `ui::Element`"
             );
-            f(node, measured.row())
+            let inner = frame.plus(*edges, *band);
+            for _ in 0..u32::from(edges.top()) {
+                f(
+                    Visit::Edge {
+                        owner: node,
+                        side: Side::Top,
+                    },
+                    inner,
+                    measured.row(),
+                );
+            }
+            f(Visit::Node(node), inner, measured.row());
+            for _ in 0..u32::from(edges.bottom()) {
+                f(
+                    Visit::Edge {
+                        owner: node,
+                        side: Side::Bottom,
+                    },
+                    inner,
+                    measured.row(),
+                );
+            }
         }
         Element::Text { .. } | Element::Space { .. } | Element::Fill { .. } => {
-            f(node, measured.row())
+            f(Visit::Node(node), frame, measured.row())
         }
     }
 }
@@ -547,6 +680,17 @@ pub fn line_is_loaded(window: &Window, element: FieldId, logical_line: u32) -> b
 pub enum PaintedRow<'a> {
     /// Generated presentation — a file heading, a rule, a spacer. Holds no cursor position.
     Chrome(&'a Element),
+    /// A row a **box** occupies: its border or its padding, above or below what it encloses.
+    ///
+    /// Not a tree node — which is why it cannot be a [`Self::Chrome`] — so it names the container
+    /// it belongs to instead. `join` says what the edge meets: a box whose neighbour's edge
+    /// collapses into this one tees, one with nothing above it corners. Derived here from sibling
+    /// order rather than sent, so it cannot disagree with the tree it describes.
+    Edge {
+        owner: &'a Element,
+        side: Side,
+        join: RailJoin,
+    },
     /// A phantom baseline row: text the working buffer removed, drawn above the line that replaced
     /// it. Holds no cursor position either, but it belongs to a line — which is what a click on one
     /// snaps to.
@@ -575,6 +719,38 @@ pub enum PaintedRow<'a> {
     },
 }
 
+/// Where a painted row sits: which absolute row, and how far its box holds it in from the view's
+/// own edges.
+///
+/// The horizontal half is an *inset*, not a width — see [`Inset`]. A shell knows its own width;
+/// what it cannot know without walking the tree is how much of it the boxes have claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    pub row: VisualRow,
+    pub inset: Inset,
+    /// The border cells the enclosing boxes run down each side of this row — the rails, as
+    /// distinct from the padding beside them, so a shell knows where to draw a line rather than
+    /// only how far to indent.
+    ///
+    /// `left`/`right` are what a shell paints; `top`/`bottom` are always zero here, since a
+    /// horizontal border is a row of its own rather than something a row carries. A row inside a
+    /// left-railed box is what [`resolve_joins`] reads to decide whether a rule meets anything.
+    pub rails: aether_protocol::ui::Sides,
+    /// What the innermost enclosing box paints behind its own cells — the shade a shell fills the
+    /// border and padding columns with. [`Band::None`] outside a box, and for a box that declares
+    /// no band.
+    pub band: Band,
+}
+
+impl Placement {
+    /// The columns left for content in a viewport `total` wide.
+    pub fn width(&self, total: u32) -> u32 {
+        total
+            .saturating_sub(self.inset.left)
+            .saturating_sub(self.inset.right)
+    }
+}
+
 /// Every loaded visual row of the view, top to bottom, paired with its **absolute** row.
 ///
 /// The single source of truth for a view's vertical layout, shared by every shell so they cannot
@@ -585,7 +761,7 @@ pub enum PaintedRow<'a> {
 pub fn painted_rows<'a>(
     window: &'a Window,
     measured: &Measured,
-) -> Vec<(VisualRow, PaintedRow<'a>)> {
+) -> Vec<(Placement, PaintedRow<'a>)> {
     painted_rows_of(&window.root, measured)
 }
 
@@ -593,13 +769,36 @@ pub fn painted_rows<'a>(
 pub fn painted_rows_of<'a>(
     root: &'a Element,
     measured: &Measured,
-) -> Vec<(VisualRow, PaintedRow<'a>)> {
+) -> Vec<(Placement, PaintedRow<'a>)> {
     let total_lines: usize = root.lines().len();
     let unit = measured.row();
-    let mut out = Vec::new();
+    let mut out: Vec<(Placement, PaintedRow<'a>)> = Vec::new();
     let mut at = 0u32;
     let mut seen = 0usize;
-    walk_rows(root, measured, &mut |node, height| {
+    walk_rows(root, measured, Frame::default(), &mut |visit, frame, height| {
+        let place = |row: u32| Placement {
+            row: VisualRow(row),
+            inset: frame.inset,
+            rails: frame.rails,
+            band: frame.band,
+        };
+        let node = match visit {
+            Visit::Edge { owner, side } => {
+                // The join is resolved in a second pass, once every edge is known: what an edge
+                // meets depends on the edge after it, which this pass has not reached.
+                out.push((
+                    place(at),
+                    PaintedRow::Edge {
+                        owner,
+                        side,
+                        join: RailJoin::Detached,
+                    },
+                ));
+                at = at.saturating_add(height);
+                return;
+            }
+            Visit::Node(node) => node,
+        };
         match node {
             Element::Editor {
                 element,
@@ -625,7 +824,7 @@ pub fn painted_rows_of<'a>(
                     }
                     for (index, baseline) in line.baseline_above.iter().enumerate() {
                         out.push((
-                            VisualRow(row),
+                            place(row),
                             PaintedRow::Baseline {
                                 element: *element,
                                 line,
@@ -638,7 +837,7 @@ pub fn painted_rows_of<'a>(
                     seen += 1;
                     for (row_index, wrapped) in line.visual_rows.iter().enumerate() {
                         out.push((
-                            VisualRow(row),
+                            place(row),
                             PaintedRow::Text {
                                 element: *element,
                                 line,
@@ -651,12 +850,64 @@ pub fn painted_rows_of<'a>(
                     }
                 }
             }
-            _ => out.push((VisualRow(at), PaintedRow::Chrome(node))),
+            _ => out.push((place(at), PaintedRow::Chrome(node))),
         }
         at = at.saturating_add(height);
     });
+    resolve_joins(&mut out);
     out
 }
+
+/// Fill in each [`PaintedRow::Edge`]'s [`RailJoin`], now that the whole sequence is known.
+///
+/// A join says **how a box's horizontal rule meets the vertical rail** — which is what the four
+/// values have always meant, and why they are drawn as `┌`, `├`, `└` and a bare rule. So it is
+/// resolved from *rail continuity*, not from edge adjacency: what matters is whether a railed box
+/// encloses the row above this rule and the row below it.
+///
+/// - a rule with rail only below it **opens** a run (`┌`)
+/// - with rail above and below, it **tees** (`├`) — one file's block ending where the next begins,
+///   which is what `collapse` produces
+/// - with rail only above, it **closes** (`└`)
+/// - with neither, it is **detached**: a plain rule, no rail to meet
+///
+/// Derived here rather than sent, and derived **once** in the shared core rather than three times
+/// in three shells — that was the original sin `RailJoin` was invented to fix, and this keeps the
+/// fix while removing the wire field. A join read off the tree cannot disagree with the tree.
+fn resolve_joins(rows: &mut [(Placement, PaintedRow<'_>)]) {
+    let railed: Vec<bool> = rows.iter().map(|(p, _)| p.rails.left > 0).collect();
+    let is_edge: Vec<bool> = rows
+        .iter()
+        .map(|(_, r)| matches!(r, PaintedRow::Edge { .. }))
+        .collect();
+    // The nearest neighbour that is not itself a rule: a rule between two rules still asks about
+    // the content either side of the pair.
+    let neighbour = |from: usize, step: isize| -> bool {
+        let mut i = from as isize + step;
+        while i >= 0 && (i as usize) < railed.len() {
+            if !is_edge[i as usize] {
+                return railed[i as usize];
+            }
+            i += step;
+        }
+        false
+    };
+    for i in 0..rows.len() {
+        if !is_edge[i] {
+            continue;
+        }
+        let join = match (neighbour(i, -1), neighbour(i, 1)) {
+            (true, true) => RailJoin::Tees,
+            (false, true) => RailJoin::Opens,
+            (true, false) => RailJoin::Closes,
+            (false, false) => RailJoin::Detached,
+        };
+        if let PaintedRow::Edge { join: j, .. } = &mut rows[i].1 {
+            *j = join;
+        }
+    }
+}
+
 
 /// The first painted row of a line: its first phantom row if it has any, else its first text row.
 /// `None` when the line isn't loaded.
@@ -674,7 +925,7 @@ pub fn line_top_row(
             }
             | PaintedRow::Text {
                 element: e, line, ..
-            } if e == element && line.logical_line == logical_line => Some(at),
+            } if e == element && line.logical_line == logical_line => Some(at.row),
             _ => None,
         })
 }
@@ -701,21 +952,23 @@ pub fn line_block_start(
         | PaintedRow::Text {
             element: e, line, ..
         } => *e == element && line.logical_line == logical_line,
+        // A box's own row belongs to no line, exactly as chrome does.
+        PaintedRow::Edge { .. } => false,
         PaintedRow::Chrome(_) => false,
     })?;
     // Walk back over chrome immediately above, but only if the line is the first row of its element
     // — chrome above an element belongs to the element, not to a line in its middle.
-    let starts_element = element_start_row(window, element, measured) == Some(rows[idx].0);
+    let starts_element = element_start_row(window, element, measured) == Some(rows[idx].0.row);
     let mut start = idx;
     if starts_element {
         while start > 0
             && matches!(rows[start - 1].1, PaintedRow::Chrome(_))
-            && rows[start - 1].0.saturating_add(1) == rows[start].0
+            && rows[start - 1].0.row.saturating_add(1) == rows[start].0.row
         {
             start -= 1;
         }
     }
-    Some(rows[start].0)
+    Some(rows[start].0.row)
 }
 
 /// The line owning absolute offset `abs_row`, and how many of that line's rows sit above it (the
@@ -747,7 +1000,8 @@ fn line_at_offset(
     let unit = measured.row();
     let content = |item: &PaintedRow<'_>| -> Option<LineRow> {
         match item {
-            PaintedRow::Chrome(_) => None,
+            // Neither chrome nor a box's border holds a line — or a cursor position.
+            PaintedRow::Chrome(_) | PaintedRow::Edge { .. } => None,
             PaintedRow::Baseline {
                 element,
                 line,
@@ -774,6 +1028,7 @@ fn line_at_offset(
     let mut on: Option<(Option<LineRow>, VisualRow)> = None;
     let mut after: Option<(LineRow, VisualRow)> = None;
     for (at, item) in &rows {
+        let at = &at.row;
         if *at <= abs_row {
             let here = content(item);
             on = (abs_row < at.saturating_add(unit)).then_some((here, *at));
@@ -942,8 +1197,8 @@ fn first_loaded_row(window: &Window, measured: &Measured) -> VisualRow {
     painted_rows(window, measured)
         .into_iter()
         .find_map(|(at, item)| match item {
-            PaintedRow::Chrome(_) => None,
-            _ => Some(at),
+            PaintedRow::Chrome(_) | PaintedRow::Edge { .. } => None,
+            _ => Some(at.row),
         })
         .unwrap_or(VisualRow::ZERO)
 }
@@ -967,7 +1222,7 @@ pub fn position_cell(
                 line,
                 row,
                 ..
-            } if e == element && line.logical_line == pos.line => Some((at, row)),
+            } if e == element && line.logical_line == pos.line => Some((at.row, row)),
             _ => None,
         })
         .collect();
@@ -1612,7 +1867,9 @@ mod tests {
     #[test]
     fn chrome_rows_count_toward_row_positions() {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("─"),
                 editor(0, 0, 1, vec![line(0, vec![row(0, 0, "x")])]),
@@ -1652,7 +1909,9 @@ mod tests {
     /// numbered lines of another, so "line 11" names two different rows.
     fn colliding_elements() -> Window {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 editor(
                     0,
@@ -1709,7 +1968,9 @@ mod tests {
     #[test]
     fn a_lines_block_starts_at_its_elements_chrome() {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.rs"),
                 chrome("@@ hunk"),
@@ -1787,8 +2048,11 @@ mod tests {
         painted_rows(w, &Measured::default())
             .into_iter()
             .map(|(at, item)| match item {
-                PaintedRow::Chrome(n) => format!("{at} chrome {}", chrome_text(n)),
-                PaintedRow::Baseline { row, .. } => format!("{at} baseline {}", row.text),
+                PaintedRow::Chrome(n) => format!("{} chrome {}", at.row, chrome_text(n)),
+                PaintedRow::Edge { side, join, .. } => {
+                    format!("{} edge {side:?} {join:?}", at.row)
+                }
+                PaintedRow::Baseline { row, .. } => format!("{} baseline {}", at.row, row.text),
                 PaintedRow::Text {
                     element,
                     line,
@@ -1796,7 +2060,8 @@ mod tests {
                     last_line,
                     ..
                 } => format!(
-                    "{at} text e{element} L{}#{row_index}{}",
+                    "{} text e{element} L{}#{row_index}{}",
+                    at.row,
                     line.logical_line,
                     if last_line { " last" } else { "" }
                 ),
@@ -1806,20 +2071,203 @@ mod tests {
 
     fn chrome_text(n: &Element) -> String {
         match n {
-            Element::Chrome { children, .. } => {
-                children.iter().map(Element::text_content).collect()
-            }
+            Element::Row { children, .. } => children.iter().map(Element::text_content).collect(),
             _ => String::new(),
         }
     }
 
     fn chrome(text: &str) -> Element {
-        use aether_protocol::ui::{Element, RailJoin};
-        use aether_protocol::viewport::ChromeKind;
-        Element::Chrome {
-            kind: ChromeKind::FileHeader,
-            rail: RailJoin::Opens,
-            children: vec![Element::text(text, Vec::new())],
+        Element::chrome(vec![Element::text(text, Vec::new())])
+    }
+
+    // ---- the shared corpus ------------------------------------------------------------------
+
+    /// One painted row, reduced to what **both** walks can produce — the common denominator the
+    /// corpus is written in.
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum CorpusRow {
+        Chrome {
+            at: u32,
+            left: u32,
+            right: u32,
+            rails_left: u16,
+            rails_right: u16,
+            text: String,
+        },
+        /// A box's own border/padding row — no tree node stands for it.
+        Edge {
+            at: u32,
+            left: u32,
+            right: u32,
+            rails_left: u16,
+            rails_right: u16,
+            side: String,
+            join: String,
+        },
+        Baseline {
+            at: u32,
+            left: u32,
+            right: u32,
+            rails_left: u16,
+            rails_right: u16,
+            element: FieldId,
+            line: u32,
+            index: usize,
+            text: String,
+        },
+        Text {
+            at: u32,
+            left: u32,
+            right: u32,
+            rails_left: u16,
+            rails_right: u16,
+            element: FieldId,
+            line: u32,
+            row_index: usize,
+            last_line: bool,
+        },
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CorpusCase {
+        name: String,
+        #[allow(dead_code)] // read by a human, and by the TS side's failure messages
+        why: String,
+        measured: Measured,
+        total_rows: u32,
+        root: Element,
+        rows: Vec<CorpusRow>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Corpus {
+        cases: Vec<CorpusCase>,
+    }
+
+    fn reduce(rows: Vec<(Placement, PaintedRow<'_>)>) -> Vec<CorpusRow> {
+        rows.into_iter()
+            .map(|(p, item)| {
+                let (at, left, right) = (p.row.get(), p.inset.left, p.inset.right);
+                let (rails_left, rails_right) = (p.rails.left, p.rails.right);
+                match item {
+                    PaintedRow::Chrome(node) => CorpusRow::Chrome {
+                        at,
+                        left,
+                        right,
+                        rails_left,
+                        rails_right,
+                        text: node.text_content(),
+                    },
+                    PaintedRow::Edge { side, join, .. } => CorpusRow::Edge {
+                        at,
+                        left,
+                        right,
+                        rails_left,
+                        rails_right,
+                        side: match side {
+                            Side::Top => "top".into(),
+                            Side::Bottom => "bottom".into(),
+                        },
+                        join: match join {
+                            RailJoin::Opens => "opens".into(),
+                            RailJoin::Tees => "tees".into(),
+                            RailJoin::Closes => "closes".into(),
+                            RailJoin::Detached => "detached".into(),
+                        },
+                    },
+                    PaintedRow::Baseline {
+                        element,
+                        line,
+                        index,
+                        row,
+                    } => CorpusRow::Baseline {
+                        at,
+                        left,
+                        right,
+                        rails_left,
+                        rails_right,
+                        element,
+                        line: line.logical_line,
+                        index,
+                        text: row.text.clone(),
+                    },
+                    PaintedRow::Text {
+                        element,
+                        line,
+                        row_index,
+                        last_line,
+                        ..
+                    } => CorpusRow::Text {
+                        at,
+                        left,
+                        right,
+                        rails_left,
+                        rails_right,
+                        element,
+                        line: line.logical_line,
+                        row_index,
+                        last_line,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// The row layout matches the shared corpus, case for case.
+    ///
+    /// This walk is the **specification**; `web/src/protocol.ts` hand-mirrors it and `render.ts`
+    /// paints from that mirror rather than from the wasm core, so the two are separate
+    /// implementations of one algorithm. Both were tested before this, and each against fixtures
+    /// written in its own language — which is coverage of each and no coverage at all of their
+    /// *agreement*. `web/src/render.test.ts` reads this same file.
+    #[test]
+    fn the_row_layout_matches_the_shared_corpus() {
+        let corpus: Corpus =
+            serde_json::from_str(include_str!("../tests/fixtures/painted_rows.json"))
+                .expect("the corpus parses");
+        assert!(
+            corpus.cases.len() >= 14,
+            "the corpus should not quietly shrink: {} cases",
+            corpus.cases.len()
+        );
+        for case in &corpus.cases {
+            assert_eq!(
+                reduce(painted_rows_of(&case.root, &case.measured)),
+                case.rows,
+                "case `{}` — {}",
+                case.name,
+                case.why
+            );
+            assert_eq!(
+                total_rows(&case.root, &case.measured),
+                case.total_rows,
+                "case `{}`: total height",
+                case.name
+            );
+        }
+    }
+
+    /// Every corpus case is reachable from the tree walk too — the invariant
+    /// `the_row_layout_accounts_for_every_line_the_tree_walk_finds` pins for one hand-built tree,
+    /// applied to all of them. A case that drops an element's lines would otherwise pass by
+    /// agreeing with an expectation that is itself wrong.
+    #[test]
+    fn every_corpus_case_paints_every_line_its_tree_holds() {
+        let corpus: Corpus =
+            serde_json::from_str(include_str!("../tests/fixtures/painted_rows.json"))
+                .expect("the corpus parses");
+        for case in &corpus.cases {
+            let in_tree: usize = case.root.lines().iter().map(|l| l.visual_rows.len()).sum();
+            let painted = painted_rows_of(&case.root, &case.measured)
+                .iter()
+                .filter(|(_, r)| matches!(r, PaintedRow::Text { .. }))
+                .count();
+            assert_eq!(
+                in_tree, painted,
+                "case `{}`: the tree walk finds {in_tree} visual rows, the layout paints {painted}",
+                case.name
+            );
         }
     }
 
@@ -1835,6 +2283,8 @@ mod tests {
     fn an_editor_nested_in_a_row_is_refused_rather_than_dropped() {
         let mut w = window(0, 0, vec![]);
         w.root = Element::Row {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![editor(0, 0, 1, vec![line(0, vec![row(0, 0, "a")])])],
         };
         let _ = painted_rows(&w, &Measured::default());
@@ -1851,7 +2301,9 @@ mod tests {
     #[test]
     fn the_row_layout_accounts_for_every_line_the_tree_walk_finds() {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.rs"),
                 editor(
@@ -1862,6 +2314,8 @@ mod tests {
                 ),
                 // A row of pure chrome: one screen row, no lines — the shape that exists today.
                 Element::Row {
+                    edges: aether_protocol::ui::Edges::NONE,
+                    band: aether_protocol::ui::Band::None,
                     children: vec![
                         Element::text("left", Vec::new()),
                         Element::Fill { glyph: '─' },
@@ -1902,7 +2356,9 @@ mod tests {
             emphasis: vec![],
         }];
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.rs"),
                 editor(0, 0, 3, vec![l16]),
@@ -1932,7 +2388,9 @@ mod tests {
     #[test]
     fn a_slice_sits_at_its_row_within_its_element() {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.rs"),
                 // 10 rows tall, with lines 40..42 loaded 7 rows in.
@@ -1998,7 +2456,9 @@ mod tests {
     /// within that editor, with the overscan either side.
     #[test]
     fn slices_name_each_editor_the_span_reaches_by_row_within_it() {
-        let root = Element::Stack {
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.rs"),
                 editor(0, 0, 5, vec![]),
@@ -2054,7 +2514,9 @@ mod tests {
     /// already has loaded.
     #[test]
     fn loaded_covers_reads_each_editors_loaded_rows() {
-        let root = Element::Stack {
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![editor(
                 0,
                 3,
@@ -2115,7 +2577,9 @@ mod tests {
     #[test]
     fn two_files_starting_at_the_same_line_each_keep_their_own_heading() {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.rs"),
                 editor(0, 0, 1, vec![line(10, vec![row(0, 0, "a")])]),
@@ -2143,7 +2607,9 @@ mod tests {
     #[test]
     fn a_screen_row_resolves_to_the_line_painted_on_it_across_chrome() {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.rs"),
                 editor(
@@ -2171,7 +2637,7 @@ mod tests {
         let painted_at = |r: u32| {
             painted_rows(&w, &Measured::default())
                 .into_iter()
-                .find(|(at, _)| *at == VisualRow(r))
+                .find(|(at, _)| at.row == VisualRow(r))
                 .map(|(_, item)| match item {
                     PaintedRow::Text { line, .. } => format!("line {}", line.logical_line),
                     _ => "chrome".into(),
@@ -2207,7 +2673,7 @@ mod tests {
             .filter_map(|(at, item)| match item {
                 PaintedRow::Text {
                     line, last_line, ..
-                } => last_line.then_some((at, line.logical_line)),
+                } => last_line.then_some((at.row, line.logical_line)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2293,7 +2759,9 @@ mod tests {
     #[test]
     fn an_unmeasured_client_element_is_one_row_per_line() {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.md"),
                 prose(0, 2, 10, 2..5),
@@ -2323,7 +2791,9 @@ mod tests {
     fn a_measured_client_element_is_as_tall_as_the_shell_says() {
         let mut w = window(0, 0, vec![]);
         // Ten lines, lines 2..5 loaded two rows in; the shell laid them out 1, 3 and 2 rows tall.
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.md"),
                 prose(0, 2, 10, 2..5),
@@ -2338,9 +2808,9 @@ mod tests {
         let rows: Vec<String> = painted_rows(&w, &m)
             .into_iter()
             .map(|(at, item)| match item {
-                PaintedRow::Chrome(n) => format!("{at} chrome {}", chrome_text(n)),
-                PaintedRow::Text { line, .. } => format!("{at} L{}", line.logical_line),
-                PaintedRow::Baseline { .. } => unreachable!(),
+                PaintedRow::Chrome(n) => format!("{} chrome {}", at.row, chrome_text(n)),
+                PaintedRow::Text { line, .. } => format!("{} L{}", at.row, line.logical_line),
+                PaintedRow::Baseline { .. } | PaintedRow::Edge { .. } => unreachable!(),
             })
             .collect();
         assert_eq!(
@@ -2357,7 +2827,9 @@ mod tests {
     #[test]
     fn a_pixel_resolution_counts_thousandths_of_a_row() {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.md"),
                 prose(0, 2, 10, 2..5),
@@ -2386,9 +2858,9 @@ mod tests {
         let rows: Vec<String> = painted_rows(&w, &m)
             .into_iter()
             .map(|(at, item)| match item {
-                PaintedRow::Chrome(n) => format!("{at} chrome {}", chrome_text(n)),
-                PaintedRow::Text { line, .. } => format!("{at} L{}", line.logical_line),
-                PaintedRow::Baseline { .. } => unreachable!(),
+                PaintedRow::Chrome(n) => format!("{} chrome {}", at.row, chrome_text(n)),
+                PaintedRow::Text { line, .. } => format!("{} L{}", at.row, line.logical_line),
+                PaintedRow::Baseline { .. } | PaintedRow::Edge { .. } => unreachable!(),
             })
             .collect();
         assert_eq!(
@@ -2425,7 +2897,9 @@ mod tests {
     #[test]
     fn rows_inside_a_measured_line_resolve_to_it() {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![chrome("a.md"), prose(0, 2, 10, 2..5)],
         };
         let m = measured(0, 2, &[1, 3, 2]);
@@ -2452,7 +2926,9 @@ mod tests {
     #[test]
     fn slices_through_a_measured_element_name_its_lines() {
         let mut w = window(0, 0, vec![]);
-        w.root = Element::Stack {
+        w.root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 chrome("a.md"),
                 prose(0, 2, 10, 2..5),

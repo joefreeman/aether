@@ -562,16 +562,14 @@ mod tests {
             diagnostics: vec![],
             sneak_targets: vec![],
         };
-        let chrome = Element::Chrome {
-            kind: aether_protocol::viewport::ChromeKind::FileHeader,
-            rail: aether_protocol::ui::RailJoin::Opens,
-            children: vec![aether_protocol::ui::Element::text("a.rs", vec![])],
-        };
+        let chrome = Element::chrome(vec![aether_protocol::ui::Element::text("a.rs", vec![])]);
         let w = Window {
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
-            root: Element::Stack {
+            root: Element::Column {
+                edges: aether_protocol::ui::Edges::NONE,
+                band: aether_protocol::ui::Band::None,
                 children: vec![
                     chrome.clone(),
                     Element::Editor {

@@ -87,15 +87,33 @@ export interface SneakTarget {
   label?: string | null;
 }
 
-/** "deleted" is the inline diff view's phantom baseline row; the rest are a generated patch's
- *  chrome, which is deliberately not buffer text so the cursor can never land on it. */
-/** Which piece of a generated patch's chrome a row is. */
-export type ChromeKind =
-  | "rule"
-  | "file_header"
-  | "hunk_header"
-  | "spacer"
-  | "summary";
+/** Cells per side, in the order a stylesheet names them. Mirrors `ui::Sides`; absent sides are 0. */
+export interface Sides {
+  top?: number;
+  right?: number;
+  bottom?: number;
+  left?: number;
+}
+
+/** The cells a container spends on itself — a border, and padding inside it. Mirrors `ui::Edges`.
+ *
+ *  Structure, not geometry: how many cells the box costs changes how many its content gets, and the
+ *  server wraps to that. What a border *looks like* is this shell's business (a CSS border), as the
+ *  terminal's is a box-drawing glyph. Counted in cells; absent means zero, and the whole object is
+ *  omitted when nothing is set.
+ *
+ *  `collapse` asks whether adjacent bordered children share an edge rather than each drawing its
+ *  own — `border-collapse`, on the container because only a parent can see two siblings meet. */
+export interface Edges {
+  border?: Sides;
+  padding?: Sides;
+  collapse?: boolean;
+}
+
+/** The fill a container paints behind its border and padding cells, with children painting over
+ *  their own content area. Mirrors `ui::Band` — a closed set, not a colour: every shell matches it
+ *  exhaustively, so a new band cannot render as nothing here. */
+export type Band = "none" | "chrome";
 
 /** Where a chrome row sits on the file rail. Structure, not presentation: the server answers it
  *  once and each client spells it its own way (here, CSS classes). */
@@ -170,9 +188,8 @@ export interface BaselineRow {
  *  top-to-bottom list of rows, which cannot express two editors sharing rows. Side-by-side diff
  *  needs a different row model. Until then an editor is expected to be a child of a `stack`. */
 export type ViewNode =
-  | { node: "stack"; children: ViewNode[] }
-  | { node: "row"; children: ViewNode[] }
-  | { node: "chrome"; kind: ChromeKind; rail: RailJoin; children: ViewNode[] }
+  | { node: "column"; edges?: Edges; band?: Band; children: ViewNode[] }
+  | { node: "row"; edges?: Edges; band?: Band; children: ViewNode[] }
   | { node: "text"; text: string; highlights?: Highlight[] }
   | { node: "space"; cols: number }
   | { node: "fill"; glyph: string }
@@ -249,11 +266,10 @@ export function offsetOf(n: ViewNode, row: number, measured: Measured): number {
 /** Every rendered line of a view, in order — for the paths that want lines and no structure. */
 export function nodeLines(n: ViewNode): LogicalLineRender[] {
   if (n.node === "editor") return n.lines;
-  // Descends into `row` and `chrome` as well as `stack`, matching `Element::lines`'s walk. It only
-  // matters for a shape nothing produces yet, but a mirror that stops one level shallower than the
-  // thing it mirrors is a difference waiting to be discovered the hard way.
-  if (n.node === "stack" || n.node === "row" || n.node === "chrome")
-    return n.children.flatMap(nodeLines);
+  // Descends into `row` as well as `column`, matching `Element::lines`'s walk. It only matters for
+  // a shape nothing produces yet, but a mirror that stops one level shallower than the thing it
+  // mirrors is a difference waiting to be discovered the hard way.
+  if (n.node === "column" || n.node === "row") return n.children.flatMap(nodeLines);
   return [];
 }
 
@@ -261,8 +277,7 @@ export function nodeLines(n: ViewNode): LogicalLineRender[] {
  *  Mirrors `Element::inline`. */
 export function inlineOf(n: ViewNode): ViewNode[] {
   if (n.node === "text" || n.node === "space" || n.node === "fill") return [n];
-  if (n.node === "stack" || n.node === "row" || n.node === "chrome")
-    return n.children.flatMap(inlineOf);
+  if (n.node === "column" || n.node === "row") return n.children.flatMap(inlineOf);
   return [];
 }
 
@@ -271,8 +286,21 @@ export function inlineOf(n: ViewNode): ViewNode[] {
  *
  *  Every loaded row of a view is exactly one of these, in the order `paintedRows` produces; the
  *  rows between two entries that are not consecutive are loaded by nobody and painted blank. */
-export type PaintedRow = { at: number } & (
+export type PaintedRow = {
+  at: number;
+  /** Cells the enclosing boxes claim on each side — an inset, not a width: this walk never learns
+   *  the viewport's size, so the shell subtracts these from the width it has. */
+  left: number;
+  right: number;
+  /** Border cells the enclosing boxes run down each side — the rails, as distinct from the
+   *  padding beside them, so a shell knows where to draw a line and not only how far to indent. */
+  rails: Sides;
+  /** What the innermost enclosing box paints behind its own border and padding cells. */
+  band: Band;
+} & (
   | { kind: "chrome"; node: ViewNode }
+  /** A box's own border/padding row. No tree node stands for one, so it names its container. */
+  | { kind: "edge"; owner: ViewNode; side: "top" | "bottom"; join: RailJoin }
   | { kind: "baseline"; element: number; line: LogicalLineRender; index: number; row: BaselineRow }
   | {
       kind: "text";
@@ -291,21 +319,104 @@ export type PaintedRow = { at: number } & (
  *  Mirrors `grid::total_rows`. */
 export function totalRows(root: ViewNode, measured: Measured = WHOLE_ROWS): number {
   let total = 0;
-  walkRows(root, measured, (_, rows) => (total += rows));
+  walkRows(root, measured, NO_FRAME, (_v, _f, rows) => (total += rows));
   return total;
 }
 
 /** One pass over the tree in painting order, telling `f` each node's height in units: an editor's
  *  height, one row for chrome or any inline element standing on its own, nothing for a stack.
  *  Mirrors `grid::walk_rows`. */
-function walkRows(n: ViewNode, measured: Measured, f: (node: ViewNode, rows: number) => void): void {
-  if (n.node === "stack") n.children.forEach((c) => walkRows(c, measured, f));
-  else if (n.node === "editor") f(n, editorHeight(n, measured));
-  // A row/chrome group is one screen row — its children share it — as is any inline element
-  // standing on its own. An editor nested in one would be drawn as a single chrome row while
-  // `nodeLines` still counted its lines; the Rust builder asserts against that shape, and this
-  // mirror inherits the same expectation rather than re-deriving it.
-  else f(n, measured.units_per_row);
+/** How far in the boxes hold a row, and whether any runs a rail down its left side. Mirrors
+ *  `grid::Frame`. */
+interface Frame {
+  left: number;
+  right: number;
+  rails: Sides;
+  band: Band;
+}
+
+const NO_FRAME: Frame = { left: 0, right: 0, rails: {}, band: "none" };
+
+function sides(s?: Sides): { t: number; r: number; b: number; l: number } {
+  return { t: s?.top ?? 0, r: s?.right ?? 0, b: s?.bottom ?? 0, l: s?.left ?? 0 };
+}
+
+/** This frame with `edges`' own sides added — one box deeper. Mirrors `grid::Frame::plus`. */
+function deeper(f: Frame, edges?: Edges, band?: Band): Frame {
+  const b = sides(edges?.border);
+  const p = sides(edges?.padding);
+  return {
+    left: f.left + b.l + p.l,
+    right: f.right + b.r + p.r,
+    // Rails accumulate: a box inside a box is railed on any side either of them draws.
+    rails: {
+      left: Math.max(f.rails.left ?? 0, b.l),
+      right: Math.max(f.rails.right ?? 0, b.r),
+    },
+    // The innermost band that declares one, so a plain box inside a banded one does not repaint it.
+    band: !band || band === "none" ? f.band : band,
+  };
+}
+
+/** Rows a box spends above and below its content. Mirrors `grid::Measured::box_rows`. */
+function boxRows(edges: Edges | undefined, unit: number): number {
+  const b = sides(edges?.border);
+  const p = sides(edges?.padding);
+  return (b.t + p.t + b.b + p.b) * unit;
+}
+
+type Visit =
+  | { node: ViewNode; edge?: undefined }
+  | { node: ViewNode; edge: "top" | "bottom" };
+
+function walkRows(
+  n: ViewNode,
+  measured: Measured,
+  frame: Frame,
+  f: (v: Visit, frame: Frame, rows: number) => void,
+): void {
+  const unit = measured.units_per_row;
+  if (n.node === "column") {
+    const inner = deeper(frame, n.edges, n.band);
+    const b = sides(n.edges?.border);
+    const p = sides(n.edges?.padding);
+    for (let i = 0; i < b.t + p.t; i++) f({ node: n, edge: "top" }, inner, unit);
+    n.children.forEach((c) => walkRows(c, measured, inner, f));
+    for (let i = 0; i < b.b + p.b; i++) f({ node: n, edge: "bottom" }, inner, unit);
+  } else if (n.node === "editor") {
+    f({ node: n }, frame, editorHeight(n, measured));
+  } else if (n.node === "row") {
+    const inner = deeper(frame, n.edges, n.band);
+    const b = sides(n.edges?.border);
+    const p = sides(n.edges?.padding);
+    for (let i = 0; i < b.t + p.t; i++) f({ node: n, edge: "top" }, inner, unit);
+    f({ node: n }, inner, unit);
+    for (let i = 0; i < b.b + p.b; i++) f({ node: n, edge: "bottom" }, inner, unit);
+  }
+  // A chrome group is one screen row — its children share it — as is any inline element standing
+  // on its own. An editor nested in one would be drawn as a single chrome row while `nodeLines`
+  // still counted its lines; the Rust builder asserts against that shape, and this mirror inherits
+  // the same expectation rather than re-deriving it.
+  else f({ node: n }, frame, unit);
+}
+
+/** Fill in each edge row's join from **rail continuity** — whether a railed box encloses the row
+ *  above the rule and the row below it. Mirrors `grid::resolve_joins`; see it for why a join is
+ *  about the rail rather than about which edges happen to be adjacent. */
+function resolveJoins(rows: PaintedRow[]): void {
+  const isEdge = rows.map((r) => r.kind === "edge");
+  const neighbour = (from: number, step: number): boolean => {
+    for (let i = from + step; i >= 0 && i < rows.length; i += step) {
+      if (!isEdge[i]) return (rows[i].rails.left ?? 0) > 0;
+    }
+    return false;
+  };
+  rows.forEach((r, i) => {
+    if (r.kind !== "edge") return;
+    const above = neighbour(i, -1);
+    const below = neighbour(i, 1);
+    r.join = above && below ? "tees" : below ? "opens" : above ? "closes" : "detached";
+  });
 }
 
 /** Every loaded visual row of the view, top to bottom, each at its absolute row. Mirrors
@@ -319,7 +430,21 @@ export function paintedRows(root: ViewNode, measured: Measured = WHOLE_ROWS): Pa
   const total = nodeLines(root).length;
   let seen = 0;
   let at = 0;
-  walkRows(root, measured, (n, height) => {
+  walkRows(root, measured, NO_FRAME, (v, frame, height) => {
+    const place = (row: number) => ({
+      at: row,
+      left: frame.left,
+      right: frame.right,
+      rails: frame.rails,
+      band: frame.band,
+    });
+    if (v.edge) {
+      // The join needs the whole sequence, so it is filled in below.
+      out.push({ ...place(at), kind: "edge", owner: v.node, side: v.edge, join: "detached" });
+      at += height;
+      return;
+    }
+    const n = v.node;
     if (n.node === "editor") {
       const clientLaidOut = n.laid_out_by === "client";
       let row = at + n.first_row * unit;
@@ -327,13 +452,13 @@ export function paintedRows(root: ViewNode, measured: Measured = WHOLE_ROWS): Pa
         // Where the shell put the line — or, unmeasured, one row per line.
         if (clientLaidOut) row = at + offsetOf(n, n.first_row + i, measured);
         (line.baseline_above ?? []).forEach((brow, index) => {
-          out.push({ at: row, kind: "baseline", element: n.element, line, index, row: brow });
+          out.push({ ...place(row), kind: "baseline", element: n.element, line, index, row: brow });
           row += unit;
         });
         seen += 1;
         line.visual_rows.forEach((wrow, rowIndex) => {
           out.push({
-            at: row,
+            ...place(row),
             kind: "text",
             element: n.element,
             line,
@@ -344,9 +469,10 @@ export function paintedRows(root: ViewNode, measured: Measured = WHOLE_ROWS): Pa
           row += unit;
         });
       });
-    } else out.push({ at, kind: "chrome", node: n });
+    } else out.push({ ...place(at), kind: "chrome", node: n });
     at += height;
   });
+  resolveJoins(out);
   return out;
 }
 

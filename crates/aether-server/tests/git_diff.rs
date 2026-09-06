@@ -23,6 +23,25 @@ async fn select_lines(ws: &mut Ws, buffer_id: u64, anchor_line: u32, line: u32) 
     .await;
 }
 
+/// Rows the boxes in a tree spend on their own borders and padding — real rows of the view that no
+/// element and no chrome node accounts for.
+///
+/// A file block's opening rule used to be a chrome node; it is the box's top border
+/// now, so any sum of "editors plus chrome" has to add these back or it comes up short by one row
+/// per file.
+fn box_edge_rows(node: &aether_protocol::viewport::Element) -> u32 {
+    use aether_protocol::viewport::Element as E;
+    match node {
+        E::Column { edges, children, .. } => {
+            u32::from(edges.top() + edges.bottom())
+                + children.iter().map(box_edge_rows).sum::<u32>()
+        }
+        E::Row { edges, .. } => u32::from(edges.top() + edges.bottom()),
+        _ => 0,
+    }
+}
+
+
 #[tokio::test]
 async fn apply_hunk_stages_then_unstages_a_modification() {
     let dir = tempfile::tempdir().unwrap();
@@ -3529,22 +3548,11 @@ async fn git_show_decorates_the_patch_it_generates() {
     // (c) Chrome reaches the viewport as tree siblings, never as buffer lines — which is what
     // makes it unreachable by the cursor without a skip rule in every motion.
     let chrome: Vec<&Element> = chrome_nodes(&window);
+    let texts: Vec<String> = chrome.iter().map(|n| chrome_text(n)).collect();
     let file_header = chrome
         .iter()
-        .find(|n| {
-            matches!(
-                n,
-                Element::Chrome {
-                    kind: ChromeKind::FileHeader,
-                    ..
-                }
-            )
-        })
-        .expect("a file separator");
-    assert!(
-        chrome_text(file_header).starts_with("a.rs"),
-        "{file_header:?}"
-    );
+        .find(|n| chrome_text(n).starts_with("a.rs"))
+        .unwrap_or_else(|| panic!("a file separator: {texts:?}"));
     assert_eq!(
         chrome_content(file_header)
             .iter()
@@ -3553,34 +3561,14 @@ async fn git_show_decorates_the_patch_it_generates() {
             .map(|h| h.kind.as_str()),
         Some("diff.file")
     );
-    // The file block opens with a full-width rule; its path sits on the row below.
-    assert!(
-        chrome.iter().any(|n| matches!(
-            n,
-            Element::Chrome {
-                kind: ChromeKind::Rule,
-                ..
-            }
-        )),
-        "a file block opens with a rule"
-    );
-    // A section heading is the enclosing signature alone — git's `@@` ranges are dropped, and this
-    // fixture is small enough that git names no signature, so it is empty.
-    let hunk_header = chrome
-        .iter()
-        .find(|n| {
-            matches!(
-                n,
-                Element::Chrome {
-                    kind: ChromeKind::HunkHeader,
-                    ..
-                }
-            )
-        })
-        .expect("a section heading");
-    assert!(
-        !chrome_text(hunk_header).contains("@@"),
-        "no line ranges anywhere: {hunk_header:?}"
+    // A section heading names the hunk's enclosing signature, and this fixture's hunk reaches line
+    // 1, so git offers none: it gets the blank that marks the boundary and no heading at all. A
+    // heading with no text would be a blank row impersonating one. And no rule row anywhere: a
+    // file block's boundaries are its box's own borders, top and bottom.
+    assert_eq!(
+        texts,
+        ["1 file changed  +1  −1", "a.rs  +1  −1", ""],
+        "the caption, the path, and the blank above the one hunk"
     );
     for line in &window.root.lines() {
         let text: String = line
@@ -3651,8 +3639,8 @@ async fn patch_chrome_counts_toward_the_scroll_extent() {
     assert!(chrome > 0, "the fixture has separators to account for");
     assert_eq!(
         total_rows(&window),
-        editors + chrome,
-        "every chrome row is an occupied row"
+        editors + chrome + box_edge_rows(&window.root),
+        "every chrome row is an occupied row, and so is every row a box spends on its own border"
     );
 
     drop(server);
@@ -6591,18 +6579,8 @@ async fn a_rebuild_keeps_the_cursor_on_the_line_it_was_reading() {
 /// The summary caption's text, or `None` when the view has no diff to caption.
 async fn summary_caption(ws: &mut Ws, buffer_id: u64) -> Option<String> {
     let window = window_of(ws, buffer_id).await;
-    chrome_nodes(&window)
-        .into_iter()
-        .find(|n| {
-            matches!(
-                n,
-                Element::Chrome {
-                    kind: ChromeKind::Summary,
-                    ..
-                }
-            )
-        })
-        .map(chrome_text)
+    // The caption is the patch's first chrome row — the one thing above the first file's heading.
+    chrome_nodes(&window).into_iter().next().map(chrome_text)
 }
 
 /// The view follows `Space Alt-i`, so it and the gutters of the files in it can never disagree
@@ -6927,15 +6905,7 @@ async fn the_working_changes_view_shows_its_branch_and_opens_on_the_diff() {
     let window = window_of(&mut ws, opened.buffer_id).await;
     let summary = chrome_nodes(&window)
         .into_iter()
-        .find(|n| {
-            matches!(
-                n,
-                Element::Chrome {
-                    kind: ChromeKind::Summary,
-                    ..
-                }
-            )
-        })
+        .next()
         .expect("the summary caption");
     assert!(chrome_text(summary).starts_with("1 file changed"));
     let kinds: Vec<&str> = chrome_content(summary)
@@ -6944,18 +6914,15 @@ async fn the_working_changes_view_shows_its_branch_and_opens_on_the_diff() {
         .map(|h| h.kind.as_str())
         .collect();
     assert_eq!(kinds, vec!["diff.meta", "diff.added", "diff.removed"]);
-    // The first file's rule follows it immediately — a blank between the two left the caption
-    // floating rather than sitting on the diff.
-    // Chrome is a tree sibling now, so the caption and the rule are the first two chrome nodes
-    // rather than the first two virtual rows of line 0.
-    let kinds: Vec<ChromeKind> = chrome_nodes(&window)
-        .into_iter()
-        .filter_map(|n| match n {
-            Element::Chrome { kind, .. } => Some(*kind),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(&kinds[..2], &[ChromeKind::Summary, ChromeKind::Rule]);
+    // The first file's heading follows it immediately — a blank between the two left the caption
+    // floating rather than sitting on the diff. Chrome is a tree sibling now, so the two are the
+    // first two chrome rows rather than the first two virtual rows of line 0, and the rule that
+    // used to sit between them is the file box's top border: a row of the view, not a chrome node.
+    let texts: Vec<String> = chrome_nodes(&window).into_iter().map(chrome_text).collect();
+    assert!(
+        texts[0].starts_with("1 file changed") && texts[1].starts_with("a.rs"),
+        "the caption, then the first file's heading: {texts:?}"
+    );
 
     drop(server);
 }
@@ -7222,6 +7189,144 @@ async fn nav_back_onto_a_since_cleaned_working_changes_view_says_why() {
     assert!(
         err.contains("no working changes"),
         "names what happened rather than blaming a buffer id, got {err:?}"
+    );
+
+    drop(server);
+}
+
+/// Leaving the working-changes view and stepping back returns to the hunk you left, at the line
+/// you were on.
+///
+/// A composed view's location is not a position in the buffer it was opened as. Its elements
+/// window the real files, so the cursor lives in one of *those*, while the patch's own document
+/// holds a cursor nothing ever moves. The nav entry recorded that one — line 0 — so every step
+/// back landed at the top of the patch however far down you had been, and the cursor came back
+/// into a buffer nothing on screen was showing.
+///
+/// End to end because that is where it is visible: each piece was individually reasonable, and
+/// the reproduction had to go through a `Tab` and a real `view/open` before the wrong thing
+/// happened. Setting a cursor on the patch document directly — the shorter test — round-trips
+/// perfectly and proves nothing, since that is not where the cursor is.
+#[tokio::test]
+async fn stepping_back_into_the_working_changes_view_returns_to_the_hunk_you_left() {
+    use aether_protocol::viewport::{
+        FocusStep, FocusTarget, ViewportFocusElement, ViewportFocusElementParams,
+        ViewportFocusElementResult,
+    };
+
+    // Two hunks far enough apart that git keeps them apart, so there is a second element to be in.
+    let file = |a: &str, b: &str| {
+        let mut s = format!("const TOP: u32 = {a};\n");
+        for i in 0..10 {
+            s.push_str(&format!("const F{i}: u32 = 0;\n"));
+        }
+        s.push_str("impl Measured {\n");
+        for i in 0..4 {
+            s.push_str(&format!("    fn pad{i}() {{}}\n"));
+        }
+        s.push_str(&format!("    fn one() {{ {b} }}\n"));
+        for i in 4..8 {
+            s.push_str(&format!("    fn pad{i}() {{}}\n"));
+        }
+        s.push_str("}\n");
+        s
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "alpha.rs", &file("1", "2"));
+    std::fs::write(root.join("alpha.rs"), file("11", "22")).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: view_of(patch.buffer_id),
+            cols: 80,
+            rows: 20,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // `Tab` to the second hunk, then a motion inside it. Both act on the element's own buffer —
+    // the real file — which is the whole reason the patch's cursor is not the location.
+    let moved: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
+        &mut ws,
+        &ViewportFocusElementParams {
+            viewport_id: sub.viewport_id,
+            target: FocusTarget::Step {
+                direction: FocusStep::Next,
+            },
+        },
+    )
+    .await;
+    assert_eq!(moved.element, 1, "Tab reaches the second hunk");
+    let in_file = moved.buffer.buffer_id;
+    assert_ne!(
+        in_file, patch.buffer_id,
+        "a working-changes element windows the real file, not the patch"
+    );
+    set_cursor(&mut ws, in_file, 16, 7).await;
+
+    // `Enter`: promote the element to its own view, recording the *view* as the origin so
+    // `Backspace` returns to the review rather than to the file you were already in.
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(patch.view_id),
+            element: Some(moved.element),
+            record_nav_from: Some(patch.buffer_id),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // `Backspace`.
+    let back: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        &NavStepParams {
+            buffer_id: opened.buffer_id,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
+    let back = back.target.expect("a step back");
+    assert_eq!(back.buffer_id, patch.buffer_id, "back to the review");
+    assert_eq!(
+        back.cursor.position,
+        LogicalPosition { line: 16, col: 7 },
+        "at the line it was left on"
+    );
+    assert_eq!(
+        back.scroll,
+        Some(ScrollPosition {
+            element: 1,
+            line: 16,
+            sub_row: 0.0,
+        }),
+        "framed on the hunk it was left in — a fresh subscribe takes its focused element from \
+         this, so without it the view reopens on element 0"
     );
 
     drop(server);
@@ -7687,8 +7792,8 @@ async fn patch_editors_report_their_buffer_and_full_height() {
     // The elements tile the view: their heights sum to everything that isn't chrome.
     fn count_chrome(n: &aether_protocol::viewport::Element) -> u32 {
         match n {
-            aether_protocol::viewport::Element::Chrome { .. } => 1,
-            aether_protocol::viewport::Element::Stack { children } => {
+            aether_protocol::viewport::Element::Row { .. } => 1,
+            aether_protocol::viewport::Element::Column { children, .. } => {
                 children.iter().map(count_chrome).sum()
             }
             _ => 0,
@@ -7697,9 +7802,9 @@ async fn patch_editors_report_their_buffer_and_full_height() {
     let chrome_rows = count_chrome(&window.root);
     let summed: u32 = editors.iter().map(|(_, _, rows, _)| rows).sum();
     assert_eq!(
-        summed + chrome_rows,
+        summed + chrome_rows + box_edge_rows(&window.root),
         total_rows(&window),
-        "element heights plus chrome should account for the view's total rows: {editors:?}"
+        "element heights, chrome and box edges should account for the view's total rows: {editors:?}"
     );
 
     drop(server);
@@ -8940,7 +9045,7 @@ async fn scrolling_to_the_end_of_a_patch_still_shows_content() {
         let painted = aether_client::grid::painted_rows(&w.window, &Measured::default());
         for r in top..(top + 10).min(total) {
             assert!(
-                painted.iter().any(|(at, _)| at.get() == r),
+                painted.iter().any(|(at, _)| at.row.get() == r),
                 "scrolled to row {top} (view {total} rows) and row {r} had nothing to paint"
             );
         }
@@ -9021,12 +9126,12 @@ async fn the_scroll_limit_reaches_the_last_line_of_a_patch() {
     let painted = aether_client::grid::painted_rows(&end.window, &Measured::default());
     for r in total - ROWS..total {
         assert!(
-            painted.iter().any(|(at, _)| at.get() == r),
+            painted.iter().any(|(at, _)| at.row.get() == r),
             "at the scroll limit row {r} of {total} has nothing to paint"
         );
     }
     assert_eq!(
-        painted.last().map(|(at, _)| at.get()),
+        painted.last().map(|(at, _)| at.row.get()),
         Some(total - 1),
         "the last row painted is the view's last"
     );

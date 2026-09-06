@@ -105,10 +105,10 @@ pub use aether_protocol::viewport::{
     BaselineRow, ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, EmphasisRange, PatchLine,
 };
 pub use aether_protocol::viewport::{
-    ChromeKind, ScrollPosition, SliceRequest, ViewportLinesChanged, ViewportLinesChangedParams,
-    ViewportResize, ViewportResizeParams, ViewportSetWrap, ViewportSetWrapParams,
-    ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindow,
-    ViewportWindowParams, ViewportWindowResult, WrapMode,
+    ScrollPosition, SliceRequest, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
+    ViewportResizeParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
+    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindow, ViewportWindowParams,
+    ViewportWindowResult, WrapMode,
 };
 pub use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProject,
@@ -1550,11 +1550,11 @@ pub async fn resolve_conflict(
     send_request::<GitResolveConflict>(ws, &GitResolveConflictParams { buffer_id, side }).await
 }
 
-/// The content tree of a chrome row. Panics on a baseline row — the two are separate
-/// variants precisely so a test can't confuse them.
+/// The content tree of a chrome row. Panics on anything else, so a test cannot confuse a row of
+/// presentation with a row of buffer text.
 pub fn chrome_content(row: &Element) -> &[Element] {
     match row {
-        Element::Chrome { children, .. } => children,
+        Element::Row { children, .. } => children,
         _ => panic!("expected a chrome node"),
     }
 }
@@ -1567,12 +1567,15 @@ pub fn chrome_text(row: &Element) -> String {
         .collect()
 }
 
-/// Every chrome node of a window's tree, in order.
+/// Every chrome row of a window's tree, in order.
+///
+/// A row of generated presentation is a `Row` on the chrome band — it was a variant of its own,
+/// carrying a kind no shell branched on, until the band said the same thing without one.
 pub fn chrome_nodes(window: &aether_protocol::viewport::Window) -> Vec<&Element> {
     fn walk<'a>(n: &'a Element, out: &mut Vec<&'a Element>) {
         match n {
-            Element::Stack { children } => children.iter().for_each(|c| walk(c, out)),
-            Element::Chrome { .. } => out.push(n),
+            Element::Column { children, .. } => children.iter().for_each(|c| walk(c, out)),
+            Element::Row { band, .. } if !band.is_none() => out.push(n),
             _ => {}
         }
     }
@@ -1615,7 +1618,7 @@ pub fn first_loaded_row(window: &aether_protocol::viewport::Window) -> u32 {
         .into_iter()
         .find_map(|(at, item)| match item {
             aether_client::grid::PaintedRow::Chrome(_) => None,
-            _ => Some(at.get()),
+            _ => Some(at.row.get()),
         })
         .unwrap_or(0)
 }

@@ -15,10 +15,10 @@ use aether_protocol::search::SearchMatchRange;
 use aether_protocol::settings::{MarkdownWidth, ThemeMode};
 use aether_protocol::sneak::SneakTarget;
 // `Layout` is aliased: ratatui has one of its own, and this file uses both.
-use aether_protocol::ui::{Element, RailJoin};
+use aether_protocol::ui::{Band, Element, RailJoin};
 use aether_protocol::viewport::{
-    ChromeKind, ConflictLine, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage,
-    EmphasisRange, Highlight, PatchLine, WrapMode, WrappedRow,
+    ConflictLine, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage, EmphasisRange,
+    Highlight, PatchLine, WrapMode, WrappedRow,
 };
 use aether_protocol::LogicalPosition;
 use ratatui::buffer::Buffer;
@@ -5261,9 +5261,6 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         state.ed().cursor.position.line,
     );
     let viewport_rows = area.height as usize;
-    // The leftmost `GUTTER_WIDTH` cols are the change-bar gutter; content fills the rest. The
-    // server already wrapped to this reduced width (the client reports it as `cols`).
-    let viewport_cols = text_cols(area.width);
     let diff_view = state.ed().diff_view;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
     let scroll_col = if matches!(state.ed().wrap, WrapMode::None) {
@@ -5288,46 +5285,122 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     // blank between them — at the row the tree puts it on. Chrome is a sibling of the elements, so
     // it needs no line to hang off: the rule closing a patch is painted on the view's last row
     // whether or not the lines above it are loaded.
-    let chrome_row = |node: &Element| -> Line<'static> {
+    let chrome_row_within = |node: &Element, cols: u16, band: Band| -> Line<'static> {
         match node {
-            Element::Chrome {
-                kind,
-                rail,
-                children: content,
-            } => Line::from(chrome_virtual_row_spans(
-                *kind,
-                *rail,
-                content,
-                viewport_cols,
-            )),
+            Element::Row { children, .. } => {
+                Line::from(chrome_virtual_row_spans(children, cols, band))
+            }
             other => Line::raw(other.text_content()),
         }
+    };
+
+    // A box's border row, *inside* its own rails: the horizontal fill and nothing else. The
+    // corners where this meets the rails are drawn by `enclose`, which owns the frame — two
+    // mechanisms each drawing part of one box is how the rail ended up painted twice.
+    let box_edge_row = |cols: u16| -> Line<'static> {
+        Line::from(vec![Span::styled(
+            "─".repeat(cols as usize),
+            Style::default()
+                .fg(c(th().fg_faint))
+                .bg(c(th().patch_chrome_bg)),
+        )])
+    };
+
+    // Put a row inside its box: the frame's own cells on the left, the row, the frame's cells on
+    // the right. `edge` is the join when this row *is* a border — a border row's corners and the
+    // rails they meet are one figure, so one place draws all of it.
+    //
+    // `inner` is the whole row's width inside the box, **gutter included**: the gutter rides with
+    // the content, so a boxed file's change bar sits inside its border. Padding out to exactly
+    // that is what lines the right rail up down the block; without it the rail would follow the
+    // ragged right edge of the text.
+    //
+    // The band belongs to the box's *own* cells — its border and its padding — and stops there.
+    // What lies between them is the row's, so the pad that carries a short row out to the right
+    // rail keeps the row's own background: filling it with the band drew a chrome stripe across
+    // every editor row, from the end of its text to the box's edge.
+    let enclose = |place: &aether_client::grid::Placement,
+                   inner: u16,
+                   edge: Option<RailJoin>,
+                   line: Line<'static>|
+     -> Line<'static> {
+        let (left, right) = (place.inset.left as u16, place.inset.right as u16);
+        if left == 0 && right == 0 {
+            return line;
+        }
+        let mut style = Style::default();
+        // The box's own shade behind its border and padding cells. A box that declares no band
+        // leaves them on the editor background rather than assuming the patch's.
+        if matches!(place.band, Band::Chrome) {
+            style = style.bg(c(th().patch_chrome_bg));
+        }
+        let ink = style.fg(c(th().fg_faint));
+        // On a border row the corner says what the rule meets; elsewhere the rail runs straight.
+        let (glyph_l, glyph_r, filler) = match edge {
+            None => ("\u{2502}", "\u{2502}", " "),
+            Some(RailJoin::Opens) => ("\u{250c}", "\u{2510}", "\u{2500}"),
+            Some(RailJoin::Tees) => ("\u{251c}", "\u{2524}", "\u{2500}"),
+            Some(RailJoin::Closes) => ("\u{2514}", "\u{2518}", "\u{2500}"),
+            Some(RailJoin::Detached) => ("\u{2500}", "\u{2500}", "\u{2500}"),
+        };
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if left > 0 {
+            if place.rails.left > 0 {
+                spans.push(Span::styled(glyph_l.to_string(), ink));
+            }
+            let pad = left.saturating_sub(place.rails.left.min(left));
+            spans.push(Span::styled(filler.repeat(pad as usize), ink));
+        }
+        let width: usize = line.spans.iter().map(|sp| sp.content.width()).sum();
+        spans.extend(line.spans);
+        if right > 0 {
+            // A border row's own fill reaches the rails, so it is the frame's ink; every other
+            // row's slack is interior, and stays the row's.
+            let (slack_glyph, slack_style) = match edge {
+                Some(_) => (filler, ink),
+                None => (" ", Style::default()),
+            };
+            spans.push(Span::styled(
+                slack_glyph.repeat((inner as usize).saturating_sub(width)),
+                slack_style,
+            ));
+            let pad = right.saturating_sub(place.rails.right.min(right));
+            spans.push(Span::styled(filler.repeat(pad as usize), ink));
+            if place.rails.right > 0 {
+                spans.push(Span::styled(glyph_r.to_string(), ink));
+            }
+        }
+        Line::from(spans)
     };
 
     // Inline diff: a phantom "deleted" row renders above the line it belongs to. It occupies a
     // screen row but carries no cursor position. Each band is a visible change, so it gets a red
     // change-*bar* in the gutter (matching add/modify), rather than the compact `▔` top-marker
     // used when there's no band.
-    let baseline_row = |brow: &aether_protocol::viewport::BaselineRow| -> Line<'static> {
-        let mut spans =
-            deleted_virtual_row_spans(&brow.text, viewport_cols, brow.stage, &brow.emphasis);
-        // Deletion bar in the git gutter column: bright red unstaged, dimmed red staged.
-        spans.insert(
-            0,
-            gutter_bar(stage_color(
-                brow.stage,
-                c(th().git_deleted),
-                c(th().git_staged_deleted),
-            )),
-        );
-        Line::from(spans)
-    };
+    let baseline_row =
+        |brow: &aether_protocol::viewport::BaselineRow, cols: u16| -> Line<'static> {
+            let mut spans = deleted_virtual_row_spans(&brow.text, cols, brow.stage, &brow.emphasis);
+            // Deletion bar in the git gutter column: bright red unstaged, dimmed red staged.
+            spans.insert(
+                0,
+                gutter_bar(stage_color(
+                    brow.stage,
+                    c(th().git_deleted),
+                    c(th().git_staged_deleted),
+                )),
+            );
+            Line::from(spans)
+        };
 
     // One (possibly wrapped) row of a line's own text.
+    // `cols` is the text width this row actually has — the viewport's, less whatever the box
+    // around it claimed. Every width in here is that one: the server wrapped to it, so a tint or
+    // a fill measured against the viewport instead runs out past the box's right rail.
     let text_row = |element: aether_protocol::viewport::FieldId,
                     render: &aether_protocol::viewport::LogicalLineRender,
                     vrow: &WrappedRow,
-                    vrow_idx: usize|
+                    vrow_idx: usize,
+                    cols: u16|
      -> Line<'static> {
         // The line's identity comes from the line, not from a counter: logical lines are unique
         // only within an element, so a view spanning several files has no single ascending run.
@@ -5436,7 +5509,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     &mut spans,
                     show_blame.then_some(blame_text.as_deref()).flatten(),
                 );
-                apply_line_tint(&mut spans, line_tint, viewport_cols);
+                apply_line_tint(&mut spans, line_tint, cols);
                 return prepend_gutter(
                     gutter_mark,
                     render.change.stage(),
@@ -5529,10 +5602,8 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             0
         };
         let indent = vrow.continuation_indent;
-        let prefix_width = marker_width
-            .saturating_add(indent)
-            .min(viewport_cols as u32) as u16;
-        let body_width = viewport_cols.saturating_sub(prefix_width);
+        let prefix_width = marker_width.saturating_add(indent).min(cols as u32) as u16;
+        let body_width = cols.saturating_sub(prefix_width);
 
         let mut spans: Vec<Span<'static>> = Vec::new();
         if is_continuation {
@@ -5596,7 +5667,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             &mut spans,
             show_blame.then_some(blame_text.as_deref()).flatten(),
         );
-        apply_line_tint(&mut spans, line_tint, viewport_cols);
+        apply_line_tint(&mut spans, line_tint, cols);
         prepend_gutter(
             gutter_mark,
             render.change.stage(),
@@ -5615,31 +5686,60 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let painted = aether_client::grid::painted_rows_of(&state.ed().root, &state.ed().measured);
     let mut next = painted
         .iter()
-        .position(|(at, _)| at.get() >= top)
+        .position(|(at, _)| at.row.get() >= top)
         .unwrap_or(painted.len());
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_rows);
     for screen_row in 0..viewport_rows as u32 {
         let want = top.saturating_add(screen_row);
-        while next < painted.len() && painted[next].0.get() < want {
+        while next < painted.len() && painted[next].0.row.get() < want {
             next += 1;
         }
-        let item = match painted.get(next) {
-            Some((at, item)) if at.get() == want => item,
+        let (place, item) = match painted.get(next) {
+            Some((at, item)) if at.row.get() == want => (at, item),
             _ => {
                 lines.push(Line::default());
                 continue;
             }
         };
+        // Cells the boxes around this row have claimed. Content starts `left` in from where it
+        // otherwise would and stops `right` short — the gutter rides with it, so a boxed file's
+        // change bar sits inside its border rather than pinned to the window.
+        //
+        // Two widths, and mixing them is an off-by-a-gutter: `inner` is the whole row inside the
+        // box, which is what the frame pads out to, and `inner_text` is what is left after the
+        // leftmost `GUTTER_WIDTH` cols of change-bar gutter — the width the server wrapped this
+        // row to, and so the width every fill and tint on it has to stop at.
+        let inner = area
+            .width
+            .saturating_sub(place.inset.left as u16 + place.inset.right as u16);
+        let inner_text = text_cols(inner);
         lines.push(match item {
-            aether_client::grid::PaintedRow::Chrome(node) => chrome_row(node),
-            aether_client::grid::PaintedRow::Baseline { row, .. } => baseline_row(row),
+            aether_client::grid::PaintedRow::Chrome(node) => enclose(
+                place,
+                inner,
+                None,
+                chrome_row_within(node, inner, place.band),
+            ),
+            // `side` says top or bottom; the join already says what the rule meets, which is all
+            // the glyph depends on — a top that closes a run looks like a bottom that does.
+            aether_client::grid::PaintedRow::Edge { join, .. } => {
+                enclose(place, inner, Some(*join), box_edge_row(inner))
+            }
+            aether_client::grid::PaintedRow::Baseline { row, .. } => {
+                enclose(place, inner, None, baseline_row(row, inner_text))
+            }
             aether_client::grid::PaintedRow::Text {
                 element,
                 line,
                 row,
                 row_index,
                 ..
-            } => text_row(*element, line, row, *row_index),
+            } => enclose(
+                place,
+                inner,
+                None,
+                text_row(*element, line, row, *row_index, inner_text),
+            ),
         });
     }
 
@@ -5681,36 +5781,29 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 /// only styles them and draws the rule that makes a file boundary read as one. No change-bar in
 /// the gutter: chrome belongs to no line of either side, which is the same reason the cursor can't
 /// reach it.
-/// What the left rail does where a `Rule` crosses it. Named rather than passed as loose booleans
-/// Paint one chrome row: the rail glyph in the gutter column, then the row's element tree across
-/// the content width, on the chrome band.
+/// Paint one row of generated presentation: a blank gutter cell, then the row's element tree
+/// across the content width, on whatever shade its band names.
+///
+/// The gutter cell is blank and stays: it is what keeps a heading aligned with the code under it,
+/// since every text row spends the same cell on its change bar. It used to carry a rail glyph —
+/// `│`, or `┌`/`├`/`└` where a rule crossed it — which was the pre-frame way of tying a file's
+/// chrome together. A file block is a box now and its border draws that line, a cell further out,
+/// so a rail here was a second one beside it.
 ///
 /// `width` is the *content* width, as it is for every other row — the gutter column sits outside
 /// it, which is why chrome must not subtract one for it.
-fn chrome_virtual_row_spans(
-    kind: ChromeKind,
-    rail: RailJoin,
-    content: &[Element],
-    width: u16,
-) -> Vec<Span<'static>> {
-    let bg = c(th().patch_chrome_bg);
-    let style = Style::default().fg(c(th().fg_faint)).bg(bg);
-
-    // The gutter cell carries a left rail down the file's chrome, so the heading rows read as
-    // belonging to the file above them rather than floating in the diff. Which join to draw is the
-    // server's call now (`RailJoin`); this is only the terminal's alphabet for it.
-    let glyph = match (kind, rail) {
-        (_, RailJoin::Detached) => " ",
-        (ChromeKind::Rule, RailJoin::Closes) => "└",
-        (ChromeKind::Rule, RailJoin::Tees) => "├",
-        (ChromeKind::Rule, RailJoin::Opens) => "┌",
-        _ => "│",
+fn chrome_virtual_row_spans(content: &[Element], width: u16, band: Band) -> Vec<Span<'static>> {
+    // A presentation row with no band paints none: it still draws, it just sits on the editor's
+    // own background. Nothing produces one today; the vocabulary allows it, so the painter does.
+    let bg = match band {
+        Band::Chrome => c(th().patch_chrome_bg),
+        Band::None => Color::Reset,
     };
-    let mut spans = vec![Span::styled(glyph.to_string(), style)];
-    // Chrome's children lay out left to right, exactly as a `Row`'s do.
+    let style = Style::default().fg(c(th().fg_faint)).bg(bg);
+    let mut spans = vec![Span::styled(" ".repeat(GUTTER_WIDTH as usize), style)];
     spans.append(&mut element_spans(
         &Element::row(content.to_vec()),
-        width,
+        width.saturating_sub(GUTTER_WIDTH),
         bg,
     ));
     spans
@@ -5721,22 +5814,21 @@ fn chrome_virtual_row_spans(
 /// A `Row` lays its children out left to right and gives a `Fill` whatever the others leave; the
 /// band is carried to the edge either way, so a short heading still reads as a band rather than a
 /// stub. Chrome is one screen row, so this truncates rather than wrapping.
+///
+/// **Exactly `width`, never more.** It used to overshoot and let the `Paragraph` clip the excess —
+/// a nested row banded the slack and then its parent banded the same slack again, so a chrome row
+/// came out at twice the width it asked for. Harmless while the row ended at the screen's edge;
+/// inside a box the row ends at a right rail, and an over-long one pushes that rail off the screen.
 fn element_spans(element: &Element, width: u16, bg: Color) -> Vec<Span<'static>> {
     let banded = |n: usize| Span::styled(" ".repeat(n), Style::default().bg(bg));
-    let Element::Row { children } = element else {
+    let Element::Row { children, .. } = element else {
         // A bare leaf is laid out as if it were the only child of a row.
         return element_spans(&Element::row(vec![element.clone()]), width, bg);
     };
 
-    // Everything except the fill, measured first, so the fill knows what is left for it.
-    let fixed: usize = children
-        .iter()
-        .map(|child| match child {
-            Element::Space { cols } => *cols as usize,
-            Element::Text { text, .. } => text.chars().count(),
-            _ => 0,
-        })
-        .sum();
+    // Everything except the fill, measured first, so the fill knows what is left for it. Measured
+    // *through* nested rows: counting a container as zero is what made the slack be banded twice.
+    let fixed: usize = children.iter().map(inline_cols).sum();
     let mut remaining = (width as usize).saturating_sub(fixed);
 
     let mut out: Vec<Span<'static>> = Vec::new();
@@ -5771,15 +5863,67 @@ fn element_spans(element: &Element, width: u16, bg: Color) -> Vec<Span<'static>>
                 ));
                 remaining = 0;
             }
-            // A nested row, or anything else that found its way inline: laid out in place.
+            // A nested row, or anything else that found its way inline: laid out in place, into
+            // what its siblings have left it.
             _ => out.append(&mut element_spans(child, width, bg)),
         }
     }
-    // Carry the band to the edge. Section headings used to trail a muted rule from the end of the
-    // signature; it read as heavily as the file rule above it, so a file and a hunk inside it were
-    // hard to tell apart at a glance. The rule is now the file boundary's alone.
-    if remaining > 0 {
-        out.push(banded(remaining));
+    // Carry the band to the edge, once, off what was actually drawn. Section headings used to
+    // trail a muted rule from the end of the signature; it read as heavily as the file rule above
+    // it, so a file and a hunk inside it were hard to tell apart at a glance. The rule is now the
+    // file boundary's alone.
+    fit(out, width, bg)
+}
+
+/// Cells an inline node draws, a [`Element::Fill`] aside — that one takes whatever is left, which
+/// is the number this is measured to find.
+fn inline_cols(element: &Element) -> usize {
+    match element {
+        Element::Space { cols } => *cols as usize,
+        Element::Text { text, .. } => text.chars().count(),
+        Element::Row { children, .. } => children.iter().map(inline_cols).sum(),
+        _ => 0,
+    }
+}
+
+/// `spans` in exactly `width` cells: banded out if short, cut if long.
+fn fit(mut spans: Vec<Span<'static>>, width: u16, bg: Color) -> Vec<Span<'static>> {
+    let width = width as usize;
+    let drawn: usize = spans.iter().map(|s| s.content.width()).sum();
+    if drawn < width {
+        spans.push(Span::styled(
+            " ".repeat(width - drawn),
+            Style::default().bg(bg),
+        ));
+        return spans;
+    }
+    if drawn == width {
+        return spans;
+    }
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut room = width;
+    for span in spans {
+        let cells = span.content.width();
+        if cells <= room {
+            room -= cells;
+            out.push(span);
+            continue;
+        }
+        // Cut inside a span on a character boundary, taking whole characters only.
+        let mut kept = String::new();
+        let mut taken = 0usize;
+        for ch in span.content.chars() {
+            let w = ch.to_string().width();
+            if taken + w > room {
+                break;
+            }
+            taken += w;
+            kept.push(ch);
+        }
+        if !kept.is_empty() {
+            out.push(Span::styled(kept, span.style));
+        }
+        break;
     }
     out
 }
@@ -5999,8 +6143,12 @@ fn cursor_line_bg(diff_marker: Option<DiffMarker>, stage: DiffStage) -> Color {
 
 /// Tint a real line's row with its diff-marker background: set the tint behind every span that
 /// doesn't already carry its own background (so syntax fg shows through, but selection/search
-/// highlights keep their backgrounds), then fill to the right edge so the tint spans the row.
+/// highlights keep their backgrounds), then fill out to `width` so the tint spans the row.
 /// No-op when `tint` is `None`.
+///
+/// Pads **to** `width`, not **by** it. Overshooting used to be free — the `Paragraph` clipped it
+/// at the viewport's edge — but a row inside a box is closed by a right rail that has to land on a
+/// column, and a fill that runs past it pushes the rail off the screen.
 fn apply_line_tint(spans: &mut Vec<Span<'static>>, tint: Option<Color>, width: u16) {
     let Some(bg) = tint else { return };
     for span in spans.iter_mut() {
@@ -6008,9 +6156,9 @@ fn apply_line_tint(spans: &mut Vec<Span<'static>>, tint: Option<Color>, width: u
             span.style = span.style.bg(bg);
         }
     }
-    // Over-long fill is clipped by the Paragraph; this just guarantees we reach the right edge.
+    let drawn: usize = spans.iter().map(|sp| sp.content.width()).sum();
     spans.push(Span::styled(
-        " ".repeat(width as usize),
+        " ".repeat((width as usize).saturating_sub(drawn)),
         Style::default().bg(bg),
     ));
 }
@@ -7620,7 +7768,8 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
         return; // cursor off-screen
     };
     let row = buffer_area.y + visual_row;
-    // `visual_col` is content-relative; shift past the gutter to the real screen column.
+    // `visual_col` counts from the gutter's right edge, the box around the row included; shift past
+    // the gutter to the real screen column.
     let col = buffer_area
         .x
         .saturating_add(GUTTER_WIDTH)
@@ -7639,6 +7788,12 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
 /// Map the cursor's logical (line, col) to (visual_row_offset_from_top_of_viewport, visual_col).
 /// Returns `None` if the cursor is off-screen (above the top, below the bottom, off-screen left
 /// after horizontal scroll, or its logical line hasn't been pushed into the window yet).
+///
+/// `visual_col` counts from the **gutter's right edge**, the box around the row included — the same
+/// space [`screen_to_logical`] reads a click in, so the two are inverses. The terminal's caret is
+/// the one part of the cursor the painter does not draw: the block is a span the row carries, and
+/// the caret is the hardware cursor placed from this. Left out of here, the inset put the two in
+/// different columns — two cursors on screen, one of them where nothing else was.
 pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u16, u16)> {
     let ed = state.ed();
     let cursor = ed.cursor.position;
@@ -7657,7 +7812,7 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
     // The pair, not the number: a logical line names a line only within its own element, so two
     // files' hunks both have a line 10 and the cursor would be drawn on whichever came first.
     let rows = aether_client::grid::painted_rows_of(&ed.root, &ed.measured);
-    let (at, row) = rows.iter().find_map(|(at, item)| match item {
+    let (at, inset, row) = rows.iter().find_map(|(at, item)| match item {
         aether_client::grid::PaintedRow::Text {
             element,
             line,
@@ -7668,7 +7823,7 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
             && line.logical_line == cursor.line
             && *row_index == find_row_idx_for_col(&line.visual_rows, cursor.col) =>
         {
-            Some((at.get(), *row))
+            Some((at.row.get(), at.inset.left, *row))
         }
         _ => None,
     })?;
@@ -7704,9 +7859,10 @@ pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u
     if logical_visual_col < scroll_col {
         return None; // scrolled off the left
     }
+    // Horizontal scroll moves the text under the box, not the box: the inset is added after it.
     Some((
         visual_offset as u16,
-        (logical_visual_col - scroll_col) as u16,
+        (logical_visual_col - scroll_col + inset) as u16,
     ))
 }
 
@@ -7749,13 +7905,15 @@ pub fn screen_to_logical(
     let want = top_row + screen_row as u32;
     let rows = aether_client::grid::painted_rows_of(&ed.root, &ed.measured);
     for (at, item) in &rows {
-        if at.get() < want {
+        if at.row.get() < want {
             continue;
         }
         match item {
             // Chrome holds no addressable position: a click on it falls through to the first
-            // content row below it, exactly as a phantom row's does.
-            aether_client::grid::PaintedRow::Chrome(_) => continue,
+            // content row below it, exactly as a phantom row's does. A box's own border row is
+            // the same kind of thing — unreachable, by construction rather than by a rule.
+            aether_client::grid::PaintedRow::Chrome(_)
+            | aether_client::grid::PaintedRow::Edge { .. } => continue,
             // Phantom diff rows render above the line's content. A click on one maps to the start
             // of the real line it sits above (they have no addressable position of their own).
             aether_client::grid::PaintedRow::Baseline { element, line, .. } => {
@@ -7774,7 +7932,14 @@ pub fn screen_to_logical(
                     *element,
                     LogicalPosition {
                         line: line.logical_line,
-                        col: byte_at_screen_col(state, row, screen_col),
+                        // Inside a box the text starts further right, so the click has to lose
+                        // those cells too — the same subtraction the gutter already gets. Painting
+                        // and hit-testing read one list, so they cannot disagree about the inset.
+                        col: byte_at_screen_col(
+                            state,
+                            row,
+                            screen_col.saturating_sub(at.inset.left as u16),
+                        ),
                     },
                 ))
             }
@@ -7788,7 +7953,8 @@ pub fn screen_to_logical(
         | aether_client::grid::PaintedRow::Text { element, line, .. } => {
             Some((*element, line.logical_line))
         }
-        aether_client::grid::PaintedRow::Chrome(_) => None,
+        aether_client::grid::PaintedRow::Chrome(_)
+        | aether_client::grid::PaintedRow::Edge { .. } => None,
     });
     Some(match above {
         Some((element, line)) => (
@@ -10333,8 +10499,8 @@ mod painter_tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    use aether_protocol::ui::{Element as UiElement, RailJoin};
-    use aether_protocol::viewport::{ChromeKind, Element, LogicalLineRender, Segment, WrappedRow};
+    use aether_protocol::ui::Element as UiElement;
+    use aether_protocol::viewport::{Element, LogicalLineRender, Segment, WrappedRow};
 
     fn line(n: u32, text: &str) -> LogicalLineRender {
         LogicalLineRender {
@@ -10364,19 +10530,17 @@ mod painter_tests {
         let lines: Vec<LogicalLineRender> = (16..23)
             .map(|n| line(n, &format!("fn f{}() {{}}", n + 1)))
             .collect();
-        let chrome = |kind, text: &str| Element::Chrome {
-            kind,
-            rail: RailJoin::Opens,
-            children: vec![UiElement::text(text, Vec::new())],
-        };
+        let chrome = |text: &str| UiElement::chrome(vec![UiElement::text(text, Vec::new())]);
         let window = aether_protocol::viewport::Window {
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
-            root: Element::Stack {
+            root: Element::Column {
+                edges: aether_protocol::ui::Edges::NONE,
+                band: aether_protocol::ui::Band::None,
                 children: vec![
-                    chrome(ChromeKind::FileHeader, "a.rs"),
-                    chrome(ChromeKind::HunkHeader, "@@ fn f17"),
+                    chrome("a.rs"),
+                    chrome("@@ fn f17"),
                     Element::Editor {
                         element: 0,
                         buffer: 7,
@@ -10429,18 +10593,16 @@ mod painter_tests {
     /// shells shared the mistake; this pins the terminal's half.
     #[test]
     fn two_files_starting_at_the_same_line_each_keep_their_heading() {
-        let chrome = |kind, text: &str| Element::Chrome {
-            kind,
-            rail: RailJoin::Opens,
-            children: vec![UiElement::text(text, Vec::new())],
-        };
+        let chrome = |text: &str| UiElement::chrome(vec![UiElement::text(text, Vec::new())]);
         let window = aether_protocol::viewport::Window {
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
-            root: Element::Stack {
+            root: Element::Column {
+                edges: aether_protocol::ui::Edges::NONE,
+                band: aether_protocol::ui::Band::None,
                 children: vec![
-                    chrome(ChromeKind::FileHeader, "alpha.rs"),
+                    chrome("alpha.rs"),
                     Element::Editor {
                         element: 0,
                         buffer: 7,
@@ -10450,7 +10612,7 @@ mod painter_tests {
                         first_buffer_line: 10,
                         lines: vec![line(10, "from alpha")],
                     },
-                    chrome(ChromeKind::FileHeader, "beta.rs"),
+                    chrome("beta.rs"),
                     Element::Editor {
                         element: 1,
                         buffer: 8,
@@ -10482,19 +10644,17 @@ mod painter_tests {
     /// files both have a line 10 the decision painted on *both* of them.
     #[test]
     fn the_cursor_is_painted_in_the_focused_element_only() {
-        let chrome = |kind, text: &str| Element::Chrome {
-            kind,
-            rail: RailJoin::Opens,
-            children: vec![UiElement::text(text, Vec::new())],
-        };
+        let chrome = |text: &str| UiElement::chrome(vec![UiElement::text(text, Vec::new())]);
         // Both files show lines 10 and 11 — the collision that made one cursor into two.
         let window = aether_protocol::viewport::Window {
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
-            root: Element::Stack {
+            root: Element::Column {
+                edges: aether_protocol::ui::Edges::NONE,
+                band: aether_protocol::ui::Band::None,
                 children: vec![
-                    chrome(ChromeKind::FileHeader, "alpha.rs"),
+                    chrome("alpha.rs"),
                     Element::Editor {
                         element: 0,
                         buffer: 7,
@@ -10504,7 +10664,7 @@ mod painter_tests {
                         first_buffer_line: 10,
                         lines: vec![line(10, "alpha ten"), line(11, "alpha eleven")],
                     },
-                    chrome(ChromeKind::FileHeader, "beta.rs"),
+                    chrome("beta.rs"),
                     Element::Editor {
                         element: 1,
                         buffer: 8,
@@ -10557,21 +10717,19 @@ mod painter_tests {
     /// Two files in one view, scrolled — the shape `Space g w` actually produces.
     #[test]
     fn a_two_file_patch_paints_both_files_and_scrolls_through_them() {
-        let chrome = |kind, text: &str| Element::Chrome {
-            kind,
-            rail: RailJoin::Opens,
-            children: vec![UiElement::text(text, Vec::new())],
-        };
+        let chrome = |text: &str| UiElement::chrome(vec![UiElement::text(text, Vec::new())]);
         let a: Vec<LogicalLineRender> = (16..20).map(|n| line(n, &format!("a{n}"))).collect();
         let b: Vec<LogicalLineRender> = (0..3).map(|n| line(n, &format!("b{n}"))).collect();
         let window = aether_protocol::viewport::Window {
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
-            root: Element::Stack {
+            root: Element::Column {
+                edges: aether_protocol::ui::Edges::NONE,
+                band: aether_protocol::ui::Band::None,
                 children: vec![
-                    chrome(ChromeKind::FileHeader, "a.rs"),
-                    chrome(ChromeKind::HunkHeader, "@@ a"),
+                    chrome("a.rs"),
+                    chrome("@@ a"),
                     Element::Editor {
                         element: 0,
                         buffer: 7,
@@ -10581,8 +10739,8 @@ mod painter_tests {
                         first_buffer_line: 16,
                         lines: a,
                     },
-                    chrome(ChromeKind::FileHeader, "b.rs"),
-                    chrome(ChromeKind::HunkHeader, "@@ b"),
+                    chrome("b.rs"),
+                    chrome("@@ b"),
                     Element::Editor {
                         element: 1,
                         buffer: 8,
@@ -10736,14 +10894,10 @@ mod painter_tests {
     #[test]
     fn a_patchs_closing_rule_is_painted_after_its_last_line() {
         let mut ed = patch_editor_state();
-        let Element::Stack { children } = &mut ed.root else {
+        let Element::Column { children, .. } = &mut ed.root else {
             panic!("the fixture is a stack");
         };
-        children.push(Element::Chrome {
-            kind: ChromeKind::Rule,
-            rail: RailJoin::Closes,
-            children: vec![UiElement::fill('═')],
-        });
+        children.push(UiElement::chrome(vec![UiElement::fill('═')]));
         ed.total_rows = aether_client::grid::total_rows(&ed.root, &ed.measured);
         let state = crate::app::test_state(ed);
         let rows = painted(&state);
@@ -10759,9 +10913,336 @@ mod painter_tests {
         );
     }
 
+    // ---- column layout ------------------------------------------------------------------------
+
+    /// Where each row's content begins, horizontally.
+    ///
+    /// The vertical half of the layout is pinned by the shared corpus
+    /// (`aether-client/tests/fixtures/painted_rows.json`, walked by `grid::painted_rows` and by
+    /// `web/src/protocol.ts`). The horizontal half cannot be shared — a cell is not a pixel, and
+    /// each shell answers in its own units — so it is pinned per shell, here and in
+    /// `web/src/render.test.ts` and `aether-iced/src/app/headless.rs`.
+    ///
+    /// Nothing covered this before. Frames will move every one of these numbers, and without a
+    /// test saying what they are today, "the box is one column too far left in the terminal only"
+    /// is a thing a reader has to notice.
+    #[test]
+    fn every_row_leaves_the_gutter_column_to_the_gutter() {
+        let state = crate::app::test_state(patch_editor_state());
+        let rows = painted(&state);
+        let body = rows.join("\n");
+
+        // In display columns, not bytes. The rail glyph `│` is three bytes wide and one column
+        // wide, so a byte offset answers this question wrong for exactly the rows that matter.
+        let col_of = |row: &str, needle: &str| -> Option<usize> {
+            row.find(needle).map(|at| row[..at].width())
+        };
+
+        // Buffer text sits one cell in: column 0 is the change-bar gutter, blank on an unchanged
+        // line, and `GUTTER_WIDTH` is what the shell subtracts before telling the server `cols`.
+        for needle in ["fn f17() {}", "fn f23() {}"] {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("`{needle}` should be on screen:\n{body}"));
+            assert_eq!(
+                col_of(row, needle),
+                Some(GUTTER_WIDTH as usize),
+                "`{needle}` should start one gutter cell in, not at the edge: {row:?}"
+            );
+        }
+
+        // Chrome spends the same column on its gutter cell, so its text lines up with the code's.
+        // Blank, not a rail: the rail used to be drawn here and is the box's border now, a cell
+        // further out — a rail here would be a second one beside it.
+        let heading = rows
+            .iter()
+            .find(|r| r.contains("a.rs"))
+            .unwrap_or_else(|| panic!("the file heading should be on screen:\n{body}"));
+        assert_eq!(
+            col_of(heading, "a.rs"),
+            Some(GUTTER_WIDTH as usize),
+            "chrome text should align with code text: {heading:?}"
+        );
+        assert!(
+            heading.starts_with(' '),
+            "the gutter cell of a chrome row is blank: {heading:?}"
+        );
+    }
+
+    /// A box built the way `patch.rs` builds one: chrome nested in a row, as `PatchBuilder::chrome`
+    /// emits it, so the painter is exercised on the shape it actually receives.
+    fn boxed_file(lines: Vec<LogicalLineRender>) -> crate::app::EditorState {
+        use aether_protocol::ui::{Band, Edges, Sides};
+
+        let boxed = UiElement::framed(
+            Edges {
+                border: Sides {
+                    top: 1,
+                    left: 1,
+                    right: 1,
+                    bottom: 0,
+                },
+                padding: Sides {
+                    left: 1,
+                    right: 1,
+                    ..Sides::ZERO
+                },
+                collapse: true,
+            },
+            Band::Chrome,
+            vec![
+                // Nested, as the builder emits it: a banded row whose one child is a `Row`. The
+                // painter walked that shape by banding the row's slack and then banding it again
+                // in the parent, so a chrome row came out twice as wide as it asked for and
+                // pushed the box's right rail off the screen.
+                UiElement::chrome(vec![UiElement::row(vec![UiElement::text(
+                    "a.rs",
+                    Vec::new(),
+                )])]),
+                Element::Editor {
+                    element: 0,
+                    buffer: 7,
+                    rows: lines.len() as u32,
+                    first_row: ElementRow::ZERO,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    first_buffer_line: 16,
+                    lines,
+                },
+            ],
+        );
+        editor_over(UiElement::column(vec![boxed]), 0)
+    }
+
+    /// A line on the added side of a patch, which is what gives a row a background tint.
+    fn added(n: u32, text: &str) -> LogicalLineRender {
+        LogicalLineRender {
+            change: aether_protocol::viewport::LineChange::Patch {
+                side: PatchLine::Added,
+                stage: DiffStage::Unstaged,
+                emphasis: Vec::new(),
+            },
+            ..line(n, text)
+        }
+    }
+
+    /// A box indents everything inside it, and owns a rule row of its own.
+    ///
+    /// Nothing produces this tree yet — `patch.rs` switches over in the next stage — so it is built
+    /// by hand here. That is the point: the painter has to be right *before* a producer depends on
+    /// it, or the first thing a box reveals is a shell that never drew one.
+    #[test]
+    fn a_box_indents_its_rows_and_draws_its_own_rule() {
+        let state = crate::app::test_state(boxed_file(vec![line(16, "fn f17() {}")]));
+        let rows = painted(&state);
+        let body = rows.join("\n");
+
+        let col_of = |row: &str, needle: &str| -> Option<usize> {
+            row.find(needle).map(|at| row[..at].width())
+        };
+
+        // The box's own row comes first, and it corners: a rail opens here and runs down its left
+        // side. Nothing above it to tee into.
+        assert!(
+            rows[0].starts_with('┌') && rows[0].trim_end().ends_with('┐'),
+            "the box's top edge should corner at both ends:\n{body}"
+        );
+        assert!(
+            !rows[0].contains("│"),
+            "the frame draws the corners; chrome must not add a rail of its own:\n{body}"
+        );
+
+        // Both rails are drawn, one down each side of the block.
+        let text_row = rows
+            .iter()
+            .find(|r| r.contains("fn f17() {}"))
+            .expect("the hunk's line is on screen");
+        assert_eq!(
+            text_row.matches('│').count(),
+            2,
+            "a rail down each side of the block: {text_row:?}"
+        );
+
+        // Chrome and code start in the same column: one border cell, one padding cell, then the
+        // gutter. Chrome spends its gutter cell on nothing — it has no line to mark — which is what
+        // keeps a file's heading over the code it names rather than a column right of it.
+        for needle in ["a.rs", "fn f17() {}"] {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("`{needle}` should be on screen:\n{body}"));
+            assert_eq!(
+                col_of(row, needle),
+                Some(GUTTER_WIDTH as usize + 2),
+                "`{needle}` should sit inside the box, not at the window edge: {row:?}"
+            );
+        }
+    }
+
+    /// The terminal's caret lands on the same column the cursor's character is painted at.
+    ///
+    /// The one part of the cursor the painter does not draw: the block is a span the row carries,
+    /// so it moved with the box for free, while the caret is the hardware cursor placed from
+    /// `cursor_visual_position` — which counted from the pane and not from the box. The two ended
+    /// up in different columns, which reads as two cursors, one of them on nothing.
+    #[test]
+    fn the_caret_lands_on_the_column_its_character_is_painted_at() {
+        let mut ed = boxed_file(vec![line(16, "fn f17() {}")]);
+        ed.cursor.position = LogicalPosition { line: 16, col: 3 };
+        ed.cursor.anchor = ed.cursor.position;
+        let state = crate::app::test_state(ed);
+
+        let rows = painted(&state);
+        let text_row = rows
+            .iter()
+            .position(|r| r.contains("fn f17() {}"))
+            .expect("the hunk's line is on screen");
+        // In display columns, not bytes: the rail glyph `│` is three bytes wide and one column.
+        let f17 = rows[text_row]
+            .find("fn f17() {}")
+            .map(|at| rows[text_row][..at].width())
+            .expect("found above");
+        let (caret_row, caret_col) =
+            cursor_visual_position(&state, 24).expect("the cursor is on screen");
+
+        assert_eq!(
+            caret_row as usize, text_row,
+            "the caret is on the cursor's row"
+        );
+        assert_eq!(
+            GUTTER_WIDTH + caret_col,
+            (f17 + 3) as u16,
+            "the caret should sit on the 4th character of {:?}, box included",
+            rows[text_row]
+        );
+    }
+
+    /// Every row of a box is exactly as wide as the box, so the right rail lands on one column.
+    ///
+    /// Untrimmed, which is the whole point: the rail *was* drawn, one column short of the edge on
+    /// text rows and one column past it on chrome rows, and every assertion phrased as
+    /// `trim_end().ends_with('│')` was happy with both.
+    #[test]
+    fn every_row_of_a_box_closes_on_the_same_column() {
+        let state = crate::app::test_state(boxed_file(vec![
+            line(16, "fn f17() {}"),
+            added(17, "fn f18() {}"),
+        ]));
+        let rows = painted_cells(&state);
+        let last = TEST_PAINT_COLS as usize - 1;
+
+        for (n, row) in rows.iter().enumerate().take(4) {
+            let text: String = row.iter().map(|(sym, _)| sym.as_str()).collect();
+            assert_eq!(
+                row[0].0,
+                if n == 0 { "┌" } else { "│" },
+                "row {n} should open on the box's border column: {text:?}"
+            );
+            assert_eq!(
+                row[last].0,
+                if n == 0 { "┐" } else { "│" },
+                "row {n} should close on the box's last column: {text:?}"
+            );
+        }
+    }
+
+    /// The band is the box's own cells and stops there; what lies between them is the row's.
+    ///
+    /// Painting the slack after a row's text in the band drew a chrome stripe across every editor
+    /// row from the end of its text to the box's edge, and a tint that filled to the *viewport's*
+    /// width instead of the box's ran clean over the right rail and off the screen.
+    #[test]
+    fn a_boxs_band_stops_at_its_own_cells() {
+        let state = crate::app::test_state(boxed_file(vec![
+            line(16, "fn f17() {}"),
+            added(17, "fn f18() {}"),
+        ]));
+        let rows = painted_cells(&state);
+        let band = c(th().patch_chrome_bg);
+        let last = TEST_PAINT_COLS as usize - 1;
+
+        let row_of = |needle: &str| -> &Vec<(String, Color)> {
+            rows.iter()
+                .find(|r| {
+                    r.iter()
+                        .map(|(s, _)| s.as_str())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("`{needle}` should be on screen"))
+        };
+
+        for needle in ["fn f17() {}", "fn f18() {}"] {
+            let row = row_of(needle);
+            // The border and padding cells either side carry the band.
+            for col in [0, 1, last - 1, last] {
+                assert_eq!(
+                    row[col].1, band,
+                    "col {col} of {needle:?} is the box's own cell and should carry its band"
+                );
+            }
+            // Everything between them belongs to the row, tinted or not — never the band.
+            for (col, cell) in row.iter().enumerate().take(last - 1).skip(2) {
+                assert_ne!(
+                    cell.1, band,
+                    "col {col} of {needle:?} is inside the box, so it keeps the row's background"
+                );
+            }
+        }
+
+        // And the tinted row is tinted the whole way across its own span, not just behind its
+        // text: from the first column after the gutter to the last before the box's padding.
+        let tinted = row_of("fn f18() {}");
+        assert_eq!(
+            tinted[GUTTER_WIDTH as usize + 2].1,
+            tinted[last - 2].1,
+            "a line tint reaches the box's inner edge and stops there"
+        );
+        assert_ne!(
+            tinted[last - 2].1,
+            row_of("fn f17() {}")[last - 2].1,
+            "…and it is a tint, not the plain background the untinted row has"
+        );
+    }
+
+    /// The width handed to the server is the content width, gutter excluded — the arithmetic that
+    /// decides how the server wraps, and the one frames change.
+    #[test]
+    fn the_width_sent_to_the_server_excludes_the_gutter() {
+        assert_eq!(text_cols(100), 100 - GUTTER_WIDTH);
+        assert_eq!(
+            text_cols(0),
+            0,
+            "a degenerate width saturates rather than wrapping around"
+        );
+    }
+
+    /// The width the painter tests render at. Named because the column assertions are about the
+    /// row's *last* column, which is only a number if it is the same one every time.
+    const TEST_PAINT_COLS: u16 = 100;
+
+    /// Render `state` and return every cell — symbol and background — untrimmed.
+    ///
+    /// [`painted`] trims each row, which is fine for "is this text on screen" and useless for "does
+    /// the box close on the last column": a rail one column short and a rail one column past the
+    /// edge both survive a `trim_end`.
+    fn painted_cells(state: &AppState) -> Vec<Vec<(String, Color)>> {
+        let mut term = Terminal::new(TestBackend::new(TEST_PAINT_COLS, 24)).expect("test terminal");
+        term.draw(|f| draw_buffer(f, state, f.area()))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| (buf[(x, y)].symbol().to_string(), buf[(x, y)].bg))
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Render `state` into a 100x24 test terminal and return its rows as text.
     fn painted(state: &AppState) -> Vec<String> {
-        let mut term = Terminal::new(TestBackend::new(100, 24)).expect("test terminal");
+        let mut term = Terminal::new(TestBackend::new(TEST_PAINT_COLS, 24)).expect("test terminal");
         term.draw(|f| draw_buffer(f, state, f.area()))
             .expect("draw");
         let buf = term.backend().buffer().clone();

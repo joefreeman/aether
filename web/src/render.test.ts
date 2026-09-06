@@ -11,9 +11,11 @@
 //!
 //! Deliberately not pixels. Geometry, not rendering.
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { renderBuffer } from "./render";
-import { totalRows } from "./protocol";
+import { paintedRows, totalRows } from "./protocol";
 import { WHOLE_ROWS } from "./protocol";
 import type { BufferWindow, CursorState, LogicalLineRender, Measured, ViewNode } from "./protocol";
 
@@ -23,9 +25,8 @@ const line = (n: number, text: string): LogicalLineRender => ({
 });
 
 const chrome = (text: string): ViewNode => ({
-  node: "chrome",
-  kind: "file_header",
-  rail: "opens",
+  node: "row",
+  band: "chrome",
   children: [{ node: "text", text, highlights: [] }],
 });
 
@@ -76,6 +77,299 @@ function painted(window: BufferWindow, opts: { cursor?: CursorState; focused?: n
   });
 }
 
+
+// ---- the shared corpus -----------------------------------------------------------------------
+
+/** The row layout both walks must agree on, as data.
+ *
+ *  `grid::painted_rows` is the specification and `paintedRows` here is a hand-written mirror of
+ *  it — `render.ts` paints from this mirror, not from the wasm core. Each side was tested before
+ *  this, and each against fixtures written in its own language, which is coverage of both and
+ *  none at all of their *agreement*. `crates/aether-client/src/grid.rs` reads this same file. */
+// Resolved from the vitest root (`web/`), not from `import.meta.url`: under happy-dom the module
+// URL is an `http:` one and `fileURLToPath` refuses it.
+const corpus = JSON.parse(
+  readFileSync(
+    resolve(process.cwd(), "../crates/aether-client/tests/fixtures/painted_rows.json"),
+    "utf8",
+  ),
+) as {
+  cases: {
+    name: string;
+    why: string;
+    measured: Measured;
+    total_rows: number;
+    root: ViewNode;
+    rows: unknown[];
+  }[];
+};
+
+/** The literal text a node draws, left to right — `Element::text_content`'s mirror. */
+function textContent(n: ViewNode): string {
+  if (n.node === "text") return n.text;
+  if (n.node === "column" || n.node === "row") return n.children.map(textContent).join("");
+  return "";
+}
+
+/** One painted row reduced to what both walks can produce — the corpus's own shape.
+ *
+ *  `left`/`right` ride on every row, so a case that only exercises the vertical layout still pins
+ *  that the boxes claimed nothing. */
+function reduce(root: ViewNode, measured: Measured): unknown[] {
+  return paintedRows(root, measured).map((r) => {
+    const at = {
+      at: r.at,
+      left: r.left,
+      right: r.right,
+      rails_left: r.rails.left ?? 0,
+      rails_right: r.rails.right ?? 0,
+    };
+    if (r.kind === "chrome") return { kind: "chrome", ...at, text: textContent(r.node) };
+    if (r.kind === "edge") return { kind: "edge", ...at, side: r.side, join: r.join };
+    if (r.kind === "baseline")
+      return {
+        kind: "baseline",
+        ...at,
+        element: r.element,
+        line: r.line.logical_line,
+        index: r.index,
+        text: r.row.text,
+      };
+    return {
+      kind: "text",
+      ...at,
+      element: r.element,
+      line: r.line.logical_line,
+      row_index: r.rowIndex,
+      last_line: r.lastLine,
+    };
+  });
+}
+
+describe("the row layout", () => {
+  it("has a corpus that has not quietly shrunk", () => {
+    expect(corpus.cases.length).toBeGreaterThanOrEqual(14);
+  });
+
+  for (const c of corpus.cases) {
+    it(`matches the shared corpus: ${c.name}`, () => {
+      // `toEqual` ignores key order but not key *presence*, so a mirror that stopped emitting a
+      // field fails here rather than passing on a subset.
+      expect(reduce(c.root, c.measured), c.why).toEqual(c.rows);
+      expect(totalRows(c.root, c.measured), `${c.name}: total height`).toEqual(c.total_rows);
+    });
+  }
+});
+
+describe("column layout", () => {
+  /** Every row's horizontal structure: the gutter column, then the content.
+   *
+   *  The vertical half is pinned by the shared corpus above, which both walks read. The horizontal
+   *  half cannot be shared — a cell is not a pixel — so each shell pins its own, here and in
+   *  `aether-tui/src/ui.rs` and `aether-iced/src/app/headless.rs`. Nothing covered this before;
+   *  frames move all of it. */
+  function rowParts(window: BufferWindow): { gutters: number; contents: number; order: string }[] {
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+    });
+    return [...container.querySelectorAll(".row")].map((el) => ({
+      gutters: el.querySelectorAll(":scope > .gutter").length,
+      contents: el.querySelectorAll(":scope > .content").length,
+      order: [...el.children].map((c) => (c.classList.contains("gutter") ? "gutter" : c.classList.contains("content") ? "content" : "?")).join(","),
+    }));
+  }
+
+  const patch = windowOf({
+    node: "column",
+    children: [chrome("a.rs"), editor(0, 16, [line(16, "fn f17"), line(17, "fn f18")])],
+  });
+
+  it("gives every row exactly one gutter, before its content", () => {
+    const parts = rowParts(patch);
+    expect(parts.length).toBeGreaterThan(0);
+    for (const p of parts) {
+      expect(p.gutters, `one gutter per row (${p.order})`).toBe(1);
+      expect(p.contents, `one content per row (${p.order})`).toBe(1);
+      // The gutter is `position: sticky`, so it must lead — it paints over whatever precedes it.
+      expect(p.order, "the gutter leads the row").toBe("gutter,content");
+    }
+  });
+
+  it("puts a row's text inside its content, never in the gutter", () => {
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window: patch,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+    });
+    for (const el of container.querySelectorAll(".row")) {
+      const gutter = el.querySelector(":scope > .gutter");
+      const content = el.querySelector(":scope > .content");
+      expect(gutter?.textContent ?? "", "the gutter carries no text").toBe("");
+      // Chrome and code alike: the words live in `.content`, which is what an inset would move.
+      expect((content?.textContent ?? "").length + (gutter?.textContent ?? "").length).toBe(
+        (el.textContent ?? "").length,
+      );
+    }
+    const texts = [...container.querySelectorAll(".row > .content")].map((c) => c.textContent?.trim());
+    expect(texts).toEqual(["a.rs", "fn f17", "fn f18"]);
+  });
+});
+
+describe("boxes", () => {
+  /** A box holds its rows in and owns a rule row of its own.
+   *
+   *  Nothing produces this tree yet — `patch.rs` switches over in the next stage — so it is built
+   *  by hand. The painter has to be right before a producer depends on it. */
+  const boxed = windowOf({
+    node: "column",
+    children: [
+      {
+        node: "column",
+        edges: { border: { top: 1, left: 1 }, padding: { left: 1 }, collapse: true },
+        band: "chrome",
+        children: [chrome("a.rs"), editor(0, 16, [line(16, "fn f17")])],
+      },
+    ],
+  });
+
+  function rowsOf(window: BufferWindow): HTMLElement[] {
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+    });
+    return [...container.querySelectorAll(".row")] as HTMLElement[];
+  }
+
+  it("draws the box's own edge row, opening its rail", () => {
+    const rows = rowsOf(boxed);
+    expect(rows[0].classList.contains("box-edge"), rows[0].className).toBe(true);
+    expect(rows[0].classList.contains("opens"), rows[0].className).toBe(true);
+    // An edge is a rule, not words — there is no node to read text from.
+    expect(rows[0].textContent).toBe("");
+  });
+
+  it("insets every row inside it, chrome and code alike", () => {
+    for (const row of rowsOf(boxed)) {
+      expect(row.style.getPropertyValue("--inset-left"), row.className).toBe("2ch");
+    }
+  });
+
+  it("leaves rows outside a box uninset", () => {
+    const plain = windowOf({
+      node: "column",
+      children: [chrome("a.rs"), editor(0, 16, [line(16, "fn f17")])],
+    });
+    for (const row of rowsOf(plain)) {
+      expect(row.style.getPropertyValue("--inset-left"), row.className).toBe("");
+      expect(row.classList.contains("boxed"), row.className).toBe(false);
+    }
+  });
+
+  /** `boxed` is what the stylesheet keys the band and the rails off. Without it a boxed row is
+   *  inset with nothing drawn in the cells it gave up, and the line tint underneath simply runs
+   *  through them — which is how the cursor's line came to read a box wider than every other. */
+  it("marks every row inside a box as boxed", () => {
+    for (const row of rowsOf(boxed)) {
+      expect(row.classList.contains("boxed"), row.className).toBe(true);
+    }
+  });
+});
+
+/** The stylesheet, read as text.
+ *
+ *  Not a rendering test — happy-dom has no layout — but the one thing about these rules that can
+ *  break silently and cannot be seen in the DOM: their *order*. */
+describe("the box stylesheet", () => {
+  const css = readFileSync(resolve(process.cwd(), "src/theme.css"), "utf8");
+
+  /** One rule's declarations, by its selector. */
+  const rule = (selector: string): string => {
+    const at = css.indexOf(selector);
+    expect(at, `${selector} should be in theme.css`).toBeGreaterThan(0);
+    return css.slice(at, css.indexOf("}", at));
+  };
+
+  /** Every row-background rule uses the `background` **shorthand**, which resets
+   *  `background-image` to `none`. The box's band and rails are background images, so a box rule
+   *  placed before them is wiped off the cursor's line and every diff-tinted row — the rows a
+   *  missing rail is noticed on, and the only ones the bug ever showed up on. */
+  it("draws boxes after every rule that sets a row background", () => {
+    const lastShorthand = Math.max(
+      ...[...css.matchAll(/^\.row[^{\n]*\{[^}\n]*\bbackground:/gm)].map((m) => m.index ?? 0),
+    );
+    expect(lastShorthand).toBeGreaterThan(0);
+    for (const selector of [".row.boxed {", ".row.box-edge {"]) {
+      const at = css.indexOf(selector);
+      expect(at, `${selector} should be in theme.css`).toBeGreaterThan(0);
+      expect(
+        at,
+        `${selector} must come after the last \`background:\` shorthand on a row, which would ` +
+          `otherwise reset its background-image to none`,
+      ).toBeGreaterThan(lastShorthand);
+    }
+  });
+
+  /** Both rails read one offset, each measured from its own edge.
+   *
+   *  A percentage in `background-position` resolves against the positioning area **minus the
+   *  layer's own width**, so `calc(100% - …)` put the right rail a pixel further in than the left
+   *  — the lopsidedness a single shared offset exists to rule out. The four-value form
+   *  (`right <offset>`) measures from the named edge and has no such subtraction. */
+  it("draws both rails one shared offset in from their own edge", () => {
+    const boxed = rule(".row.boxed {");
+    expect(boxed).toContain("left var(--rail-inset)");
+    expect(boxed).toContain("right var(--rail-inset)");
+    expect(
+      /background-position:[^;]*calc\(\s*100%/.test(boxed),
+      "a rail positioned with calc(100% - …) lands a layer-width short of its own edge",
+    ).toBe(false);
+  });
+
+  /** The gutter is `position: sticky` and opaque, so it paints over whatever the row draws
+   *  beneath it — on a border row, a cell-wide gap in the rule. It has nothing to protect there
+   *  (no text, no change bar), so it has to get out of the way. */
+  it("clears the gutter's background on a border row", () => {
+    expect(rule(".row.box-edge .gutter {")).toContain("background-color: transparent");
+    expect(
+      css.indexOf(".row.box-edge .gutter {"),
+      "and after the rule that makes an ordinary chrome gutter opaque",
+    ).toBeGreaterThan(css.indexOf(".row.patch-chrome .gutter {"));
+  });
+});
+
 describe("the buffer painter", () => {
   /// The shape that blanked the terminal and the GUI: an element windowing a *file*, so its lines
   /// start at 16 while the view's own first line is 0. Anything that indexes by
@@ -83,7 +377,7 @@ describe("the buffer painter", () => {
   it("paints a hunk whose lines start partway down its file", () => {
     const w = windowOf(
       {
-        node: "stack",
+        node: "column",
         children: [chrome("a.rs"), editor(0, 16, [line(16, "fn f17"), line(17, "fn f18")])],
       },
     );
@@ -95,7 +389,7 @@ describe("the buffer painter", () => {
   it("paints both files when their line numbers collide", () => {
     const w = windowOf(
       {
-        node: "stack",
+        node: "column",
         children: [
           chrome("a.rs"),
           editor(0, 10, [line(10, "a10"), line(11, "a11")]),
@@ -119,7 +413,7 @@ describe("the buffer painter", () => {
   /// Mirrors `a_slice_sits_at_its_row_within_its_element` on the Rust side.
   it("leaves a gap for the rows of an element nothing is loaded at", () => {
     const w = windowOf({
-      node: "stack",
+      node: "column",
       children: [
         chrome("a.rs"),
         {
@@ -170,7 +464,7 @@ describe("the buffer painter", () => {
       lines: [line(2, "two"), line(3, "three"), line(4, "four")],
       laid_out_by: "client",
     };
-    const w = windowOf({ node: "stack", children: [chrome("a.md"), prose] });
+    const w = windowOf({ node: "column", children: [chrome("a.md"), prose] });
     const paint = (measured: Measured) => {
       const container = document.createElement("div");
       renderBuffer(container, {
@@ -216,7 +510,7 @@ describe("the buffer painter", () => {
   it("draws the closing chrome after the final row, whatever that row's line number is", () => {
     const w = windowOf(
       {
-        node: "stack",
+        node: "column",
         children: [editor(0, 10, [line(10, "x"), line(11, "y")]), chrome("closing")],
       },
     );
@@ -238,7 +532,7 @@ describe("the buffer painter", () => {
   it("marks the cursor line in the focused element only", () => {
     const w = windowOf(
       {
-        node: "stack",
+        node: "column",
         children: [
           editor(0, 10, [line(10, "alpha ten")]),
           editor(1, 10, [line(10, "beta ten")]),
@@ -282,7 +576,7 @@ describe("the buffer painter", () => {
   it("tags each row with the element it belongs to, for hit-testing", () => {
     const w = windowOf(
       {
-        node: "stack",
+        node: "column",
         children: [
           chrome("a.rs"),
           editor(0, 16, [line(16, "from a")]),

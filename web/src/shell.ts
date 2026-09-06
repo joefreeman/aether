@@ -591,7 +591,7 @@ interface AppSettingsView {
  *  and refetching around it fetches nothing. Mirrors `grid::line_is_loaded`. */
 function lineIsLoaded(w: BufferWindow, element: number, line: number): boolean {
   const editors = (function walk(n: ViewNode): ViewNode[] {
-    if (n.node === "stack") return n.children.flatMap(walk);
+    if (n.node === "column") return n.children.flatMap(walk);
     return n.node === "editor" ? [n] : [];
   })(w.root);
   return editors.some(

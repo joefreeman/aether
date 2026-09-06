@@ -29,3 +29,8 @@ objc2-foundation = { workspace = true }
 
 [dev-dependencies]
 iced_test = { workspace = true }
+# Reading a headless frame back as pixels. Every rail, band and cursor block this shell draws is a
+# fill, and a fill is invisible to `Operation::text` — the only thing the widget tree reports — so
+# without a decoder there is no assertion that can see one at all.
+png = "0.18"
+tempfile = "3"

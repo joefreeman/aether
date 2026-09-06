@@ -13397,7 +13397,9 @@ fn a_press_in_another_element_focuses_it_before_setting_the_cursor() {
         let aether_protocol::viewport::Element::Editor { .. } = &w.root else {
             panic!("fixture is a single editor");
         };
-        w.root = aether_protocol::viewport::Element::Stack {
+        w.root = aether_protocol::viewport::Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
             children: vec![
                 w.root.clone(),
                 aether_protocol::viewport::Element::Editor {

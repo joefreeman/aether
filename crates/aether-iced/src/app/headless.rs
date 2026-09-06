@@ -18,8 +18,10 @@ use super::tests::connecting_bootstrap;
 use super::*;
 use aether_protocol::coords::ElementRow;
 use aether_protocol::picker::{PickerItem, PickerUpdateParams};
-use aether_protocol::ui::{Element as ViewElement, LayoutOwner, RailJoin};
-use aether_protocol::viewport::{ChromeKind, LogicalLineRender, Segment, Window, WrappedRow};
+use aether_protocol::ui::{Element as ViewElement, LayoutOwner};
+use aether_protocol::viewport::{
+    DiffMarker, DiffStage, LogicalLineRender, Segment, Window, WrappedRow,
+};
 use iced::Rectangle;
 use iced_test::selector::Candidate;
 use iced_test::{Selector, Simulator};
@@ -159,6 +161,53 @@ fn snapshot(sim: &mut Simulator<'_, Message>, app: &App, name: &str) {
         .expect("write the snapshot"));
 }
 
+/// The frame as pixels: `(width, height, rgba)`.
+///
+/// Everything this shell draws that is not a glyph — the box's rails and band, a gutter change
+/// bar, the cursor's block — is a `fill`, and `Operation::text` (all a `Selector` ever sees)
+/// reports none of it. So a column assertion about any of them has to read the frame itself. Not a
+/// golden image: nothing here compares a whole frame, only where a known colour lands on a known
+/// row, which is layout in the one alphabet this shell has for it.
+fn pixels(sim: &mut Simulator<'_, Message>, app: &App) -> (usize, usize, Vec<u8>) {
+    let shot = sim
+        .snapshot(&base_theme(app))
+        .expect("the frame draws headlessly");
+    let dir = tempfile::tempdir().expect("scratch dir");
+    let path = dir.path().join("frame");
+    // Writes the PNG when the path is free, which is how the frame is got at: `Snapshot` keeps its
+    // buffer to itself.
+    assert!(shot.matches_image(&path).expect("write the frame"));
+    // Written as `<name>-<renderer>.png`, and which renderer is the backend's business.
+    let written = std::fs::read_dir(dir.path())
+        .expect("scratch dir")
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "png"))
+        .expect("the frame was written");
+    let png = std::fs::File::open(written).expect("the frame is readable");
+    let mut reader = png::Decoder::new(std::io::BufReader::new(png))
+        .read_info()
+        .expect("a readable frame");
+    let mut buf = vec![0; reader.output_buffer_size().expect("a frame that fits")];
+    let info = reader.next_frame(&mut buf).expect("the frame's pixels");
+    buf.truncate(info.buffer_size());
+    (info.width as usize, info.height as usize, buf)
+}
+
+/// The columns of `row` painted in `colour`, as a fraction of the frame's width.
+///
+/// Fractions rather than pixels because the snapshot is rasterised at whatever scale the backend
+/// picked; what the assertions are about is *which cell*, and a cell is a fixed share of the pane.
+fn columns_painted(frame: &(usize, usize, Vec<u8>), y: usize, colour: [u8; 3]) -> Vec<usize> {
+    let (w, _, rgba) = frame;
+    (0..*w)
+        .filter(|x| {
+            let i = (y * w + x) * 4;
+            rgba[i..i + 3] == colour
+        })
+        .collect()
+}
+
 // ---- fixtures ------------------------------------------------------------------------------
 
 fn line(n: u32, text: &str) -> LogicalLineRender {
@@ -180,12 +229,20 @@ fn line(n: u32, text: &str) -> LogicalLineRender {
     }
 }
 
-fn chrome(text: &str) -> ViewElement {
-    ViewElement::Chrome {
-        kind: ChromeKind::FileHeader,
-        rail: RailJoin::Opens,
-        children: vec![ViewElement::text(text, Vec::new())],
+/// A line with a change against its baseline, so the gutter draws a bar beside it.
+fn added(n: u32, text: &str) -> LogicalLineRender {
+    LogicalLineRender {
+        change: aether_protocol::viewport::LineChange::Changed {
+            marker: DiffMarker::Added,
+            stage: DiffStage::Unstaged,
+            emphasis: Vec::new(),
+        },
+        ..line(n, text)
     }
+}
+
+fn chrome(text: &str) -> ViewElement {
+    ViewElement::chrome(vec![ViewElement::text(text, Vec::new())])
 }
 
 fn editor(element: u32, buffer: u64, first: u32, lines: Vec<LogicalLineRender>) -> ViewElement {
@@ -205,7 +262,7 @@ fn window_of(children: Vec<ViewElement>) -> Window {
         other_elements_dirty: false,
         max_line_width: 0,
         git_status: None,
-        root: ViewElement::Stack { children },
+        root: ViewElement::column(children),
     }
 }
 
@@ -313,6 +370,237 @@ fn a_click_on_a_painted_row_reports_that_row() {
         kind: ClickKind::Single,
         shift: false,
     }));
+}
+
+// ---- column layout -------------------------------------------------------------------------
+
+/// A box's rails, its gutter change-bar and the cursor's block all land in the box's own columns.
+///
+/// Every one of these is a `fill`, so `columns()` cannot see any of them — which is how the GUI
+/// shipped a box whose rails were buried under the chrome band, a change bar pinned to the pane
+/// while its row sat two cells in, and a cursor block drawn at the pane's edge with the character
+/// it belongs to highlighted somewhere else entirely. Three of one bug: a painter that knew the
+/// inset in one place and not in the others.
+#[test]
+fn a_boxs_fills_land_in_the_boxs_own_columns() {
+    use aether_protocol::ui::{Band, Edges, Sides};
+
+    let mut app = app_showing(window_of(vec![ViewElement::framed(
+        Edges {
+            border: Sides::all(1),
+            padding: Sides {
+                left: 1,
+                right: 1,
+                ..Sides::ZERO
+            },
+            collapse: true,
+        },
+        Band::Chrome,
+        vec![
+            chrome("a.rs"),
+            editor(0, 7, 10, vec![added(10, "from alpha")]),
+        ],
+    )]));
+    app.session.view.buffer.cursor.position = LogicalPosition { line: 10, col: 0 };
+    app.session.view.buffer.cursor.anchor = app.session.view.buffer.cursor.position;
+    // Insert's bar, not normal's block: the block is the foreground colour, which is also every
+    // glyph on the row, so nothing could tell the two apart. The bar is the accent and nothing
+    // else on a text row is — and both are placed by the same arithmetic.
+    app.session.view.mode = Mode::Insert;
+
+    let mut sim = simulate(&app);
+    let row = seen(&mut sim)
+        .into_iter()
+        .find(|s| s.visible && s.text == "from alpha")
+        .expect("the row is on the frame");
+    let frame = pixels(&mut sim, &app);
+    // The snapshot is rasterised at the backend's own scale, so everything is measured in it.
+    let scale = frame.0 as f32 / WIDTH;
+    let y = ((row.bounds.y + row.bounds.height / 2.0) * scale) as usize;
+    let px = |x: f32| (x * scale) as usize;
+
+    let p = crate::theme::palette(app.session.theme);
+    let rgb = |c: iced::Color| {
+        let b = c.into_rgba8();
+        [b[0], b[1], b[2]]
+    };
+
+    // A rail down each side, in the box's border cells: the first column of the pane and the last.
+    let rails = columns_painted(&frame, y, rgb(p.fg_faint));
+    let cell = px(row.bounds.x) / 3; // border, padding, gutter — then the text
+    let left = *rails
+        .iter()
+        .find(|x| **x < cell)
+        .unwrap_or_else(|| panic!("a rail in the box's left border cell (0..{cell}): {rails:?}"));
+    let right = *rails
+        .iter()
+        .rev()
+        .find(|x| **x >= frame.0 - cell)
+        .unwrap_or_else(|| {
+            panic!(
+                "and one in its right border cell ({}..{}): {rails:?}",
+                frame.0 - cell,
+                frame.0
+            )
+        });
+
+    // Down the middle of the cell each is drawn in, and so the same distance in from its own edge.
+    // Against the cell's leading edge instead, the two sides read as different weights of line and
+    // neither lines up with the terminal's `│`, whose ink is centred in its cell.
+    let (in_from_left, in_from_right) = (left, frame.0 - 1 - right);
+    assert!(
+        in_from_left.abs_diff(in_from_right) <= 1,
+        "the rails should be the same distance in from their own edges ({in_from_left} and \
+         {in_from_right} of a {cell}px cell)"
+    );
+    assert!(
+        in_from_left.abs_diff(cell / 2) <= 1,
+        "…and that distance is half a cell, the middle of the border cell ({in_from_left} of \
+         {cell})"
+    );
+
+    // The change bar rides with the row, inside the border rather than pinned to the pane.
+    let bar = columns_painted(&frame, y, rgb(p.git_added));
+    assert!(
+        !bar.is_empty() && bar[0] >= cell && bar[0] < px(row.bounds.x),
+        "the change bar belongs in the box's gutter cell, got {bar:?} (cell {cell})"
+    );
+
+    // And the cursor sits on the character it marks, not at the pane's edge.
+    let caret = columns_painted(&frame, y, rgb(p.accent));
+    assert!(
+        !caret.is_empty(),
+        "the cursor draws a bar in insert mode — placed without the row's inset it lands left of \
+         the box's content and `fill_content` clips it away entirely"
+    );
+    // Within half a cell, since a rasterised fill and a reported bound round differently. The
+    // failure this guards against is two whole cells wide.
+    assert!(
+        caret[0].abs_diff(px(row.bounds.x)) * 2 < cell,
+        "the cursor starts where its row's text does ({} vs {}): drawn without the row's inset it \
+         lands at the pane's edge, leaving two cursors on screen",
+        caret[0],
+        px(row.bounds.x)
+    );
+}
+
+/// Where each text begins horizontally, paired with the text — the GUI's half of the column
+/// layout.
+///
+/// The vertical half is pinned by the shared corpus
+/// (`aether-client/tests/fixtures/painted_rows.json`, walked by `grid::painted_rows` and its
+/// TypeScript mirror). The horizontal half cannot be shared — a cell is not a pixel — so each
+/// shell pins its own: here, in `aether-tui/src/ui.rs`, and in `web/src/render.test.ts`.
+fn columns(sim: &mut Simulator<'_, Message>) -> Vec<(f32, String)> {
+    seen(sim)
+        .into_iter()
+        .filter(|s| s.visible)
+        .map(|s| (s.bounds.x, s.text))
+        .collect()
+}
+
+/// Buffer text and chrome text start at the same x — one gutter column in from the pane's edge —
+/// so a file heading lines up with the code under it.
+///
+/// Frames move this number. Without it, "the box is a column out in the GUI only" is something a
+/// reader has to notice.
+#[test]
+fn chrome_and_code_share_one_left_edge() {
+    let app = app_showing(two_files());
+    let mut sim = simulate(&app);
+    let cols = columns(&mut sim);
+
+    // Exact, not `contains`: the status bar shows a filename too, and "alpha.rs" ends with
+    // "a.rs" — a substring match would silently start measuring the wrong widget.
+    let x_of = |needle: &str| -> f32 {
+        cols.iter()
+            .find(|(_, t)| t == needle)
+            .unwrap_or_else(|| panic!("`{needle}` should be on the frame: {cols:?}"))
+            .0
+    };
+    let heading = x_of("alpha.rs");
+    for needle in ["from alpha", "beta.rs", "from beta"] {
+        assert!(
+            (x_of(needle) - heading).abs() < 0.5,
+            "`{needle}` starts at {} but the first heading starts at {heading}: {cols:?}",
+            x_of(needle)
+        );
+    }
+    // And that shared edge is inset from the pane, not flush with it: the gutter lives there.
+    assert!(
+        heading > 0.0,
+        "the gutter column should sit left of the text (heading x {heading})"
+    );
+}
+
+/// A box holds its rows in from the pane's edge.
+///
+/// The GUI's half of the same property the terminal pins in cells and the browser in `ch`: nothing
+/// produces this tree yet, so it is built by hand — the painter has to be right before a producer
+/// depends on it.
+#[test]
+fn a_box_insets_the_rows_inside_it() {
+    use aether_protocol::ui::{Band, Edges, Sides};
+
+    let plain = app_showing(window_of(vec![
+        chrome("a.rs"),
+        editor(0, 7, 10, vec![line(10, "from alpha")]),
+    ]));
+    let mut sim = simulate(&plain);
+    let flush = columns(&mut sim)
+        .into_iter()
+        .find(|(_, t)| t == "from alpha")
+        .expect("the row is on the frame")
+        .0;
+
+    let boxed_window = window_of(vec![ViewElement::framed(
+        Edges {
+            border: Sides {
+                top: 1,
+                left: 1,
+                ..Sides::ZERO
+            },
+            padding: Sides {
+                left: 1,
+                ..Sides::ZERO
+            },
+            collapse: true,
+        },
+        Band::Chrome,
+        vec![
+            chrome("a.rs"),
+            editor(0, 7, 10, vec![line(10, "from alpha")]),
+        ],
+    )]);
+    let boxed = app_showing(boxed_window);
+    let mut sim = simulate(&boxed);
+    let cols = columns(&mut sim);
+    let inset = cols
+        .iter()
+        .find(|(_, t)| t == "from alpha")
+        .unwrap_or_else(|| panic!("the row should still be on the frame: {cols:?}"))
+        .0;
+
+    // Two cells in — one border, one padding — from where the same row sat unboxed.
+    let cell = (inset - flush) / 2.0;
+    assert!(
+        inset > flush,
+        "a boxed row should start right of an unboxed one ({inset} vs {flush})"
+    );
+    assert!(
+        cell > 1.0,
+        "and by two whole cells, not a hairline ({cell}px per cell)"
+    );
+    // The heading moves with it: a box indents its whole contents, chrome included.
+    let heading = cols
+        .iter()
+        .find(|(_, t)| t == "a.rs")
+        .expect("the heading is on the frame")
+        .0;
+    assert!(
+        (heading - inset).abs() < 0.5,
+        "chrome and code share the box's left edge ({heading} vs {inset})"
+    );
 }
 
 // ---- the chrome ----------------------------------------------------------------------------

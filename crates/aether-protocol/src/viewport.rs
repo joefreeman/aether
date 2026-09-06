@@ -51,7 +51,7 @@ pub struct LogicalLineRender {
     /// making some *buffer* lines unaddressable would need a skip rule in every motion, in search
     /// landing, in sneak, and in jumplist and nav restore.
     ///
-    /// A generated patch's chrome used to share this field. It is an [`Element::Chrome`] sibling now:
+    /// A generated patch's chrome used to share this field. It is a banded [`ui::Element::Row`] now:
     /// a separator belongs between two hunks, not to the line beneath it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub baseline_above: Vec<BaselineRow>,
@@ -272,7 +272,7 @@ pub struct EmphasisRange {
 ///
 /// Anchored to a line rather than placed in the view's tree, which is the difference between this
 /// and a patch's chrome: a phantom deletion belongs *above line N* of a particular buffer, whereas
-/// a file separator belongs between two hunks. Chrome is an [`Element::Chrome`] sibling; this is
+/// a file separator belongs between two hunks. Chrome is a banded [`ui::Element::Row`]; this is
 /// not.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BaselineRow {
@@ -288,29 +288,6 @@ pub struct BaselineRow {
     /// changes and pure deletions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emphasis: Vec<EmphasisRange>,
-}
-
-/// Which piece of a generated patch's chrome an [`Element::Chrome`] is. Its `child` says what to
-/// draw; this says what it *means*, which is what a shell keys its band and spacing off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChromeKind {
-    /// A full-width horizontal line opening a file block — the heaviest boundary in the buffer,
-    /// and the only one drawn edge to edge.
-    Rule,
-    /// The file separator: the path (or `old → new` for a rename) and its change counts.
-    FileHeader,
-    /// Blank vertical space inside a chrome block. One sits above and below every run of code, so a
-    /// section reads as boxed in by its chrome rather than running straight into it — and as a row
-    /// rather than an empty buffer line, the breathing room costs no cursor positions.
-    Spacer,
-    /// A section heading: the enclosing signature git names for the hunk. Deliberately plain — it
-    /// once trailed a muted rule to the right edge, which made a hunk boundary look as heavy as a
-    /// file boundary and flattened the one hierarchy the view has.
-    HunkHeader,
-    /// The patch's opening caption: how many files it touches and its total `+N −M`. Belongs to no
-    /// file, so no rail runs into it.
-    Summary,
 }
 
 /// The **content** of one row a logical line wrapped into: where it starts in the line, how far it

@@ -1,0 +1,1362 @@
+{
+  "note": [
+    "The row layout every shell must agree on, as data rather than as code.",
+    "",
+    "`grid::painted_rows` is the specification; `web/src/protocol.ts` hand-mirrors it in TypeScript",
+    "and `render.ts` paints from that mirror rather than from the wasm core. Both walks are tested,",
+    "but until this file they were tested against fixtures hand-written in their own language, so",
+    "nothing would have caught them drifting apart. This is the table both are pinned to.",
+    "",
+    "`root` is wire-format `aether_protocol::ui::Element`; `measured` is wire-format",
+    "`grid::Measured`. `rows` is the flattened output: one entry per painted row, in order, with",
+    "only the fields both languages can produce. Rows need not be consecutive \u2014 an element with",
+    "nothing loaded leaves a gap, which is the point of case `a-gap-where-nothing-is-loaded`.",
+    "",
+    "Vertical only, deliberately. `PaintedRow` carries no horizontal coordinate today; when stage",
+    "3.4 gives it one, `x` and `width` are added here and the painters' own column tests (which are",
+    "per-shell, because a cell is not a pixel) keep covering what a cell is worth.",
+    "",
+    "Rows carry `left`/`right` \u2014 the cells the boxes around them claim, not a width: the walk is a",
+    "pure function of the tree and never learns the viewport's size, so each shell subtracts these",
+    "from the width it has. `edge` rows are a box's own border/padding rows, which are not tree",
+    "nodes; their `join` is derived from sibling order, never sent."
+  ],
+  "cases": [
+    {
+      "name": "a-plain-buffer",
+      "why": "The one-element case: an ordinary buffer is a bare Editor, not a Stack of one.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 3,
+      "root": {
+        "node": "editor",
+        "element": 0,
+        "buffer": 1,
+        "rows": 3,
+        "first_row": 0,
+        "first_buffer_line": 0,
+        "lines": [
+          {
+            "logical_line": 0,
+            "visual_rows": [
+              {
+                "byte_offset": 0,
+                "continuation_indent": 0,
+                "segments": [
+                  {
+                    "text": "one",
+                    "highlights": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "logical_line": 1,
+            "visual_rows": [
+              {
+                "byte_offset": 0,
+                "continuation_indent": 0,
+                "segments": [
+                  {
+                    "text": "two",
+                    "highlights": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "logical_line": 2,
+            "visual_rows": [
+              {
+                "byte_offset": 0,
+                "continuation_indent": 0,
+                "segments": [
+                  {
+                    "text": "three",
+                    "highlights": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "text",
+          "element": 0,
+          "line": 0,
+          "row_index": 0,
+          "last_line": false,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "text",
+          "element": 0,
+          "line": 1,
+          "row_index": 0,
+          "last_line": false,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 2,
+          "kind": "text",
+          "element": 0,
+          "line": 2,
+          "row_index": 0,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "a-hunk-starting-partway-down-its-file",
+      "why": "The scar that blanked the terminal and the GUI: an element windows a file, so its lines start at 16 while the view's own rows start at 0. Anything indexing by `logical_line - first_view_line` reads past the end and draws nothing.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 3,
+      "root": {
+        "node": "column",
+        "children": [
+          {
+            "node": "row",
+            "children": [
+              {
+                "node": "text",
+                "text": "a.rs",
+                "highlights": []
+              }
+            ],
+            "band": "chrome"
+          },
+          {
+            "node": "editor",
+            "element": 0,
+            "buffer": 1,
+            "rows": 2,
+            "first_row": 0,
+            "first_buffer_line": 16,
+            "lines": [
+              {
+                "logical_line": 16,
+                "visual_rows": [
+                  {
+                    "byte_offset": 0,
+                    "continuation_indent": 0,
+                    "segments": [
+                      {
+                        "text": "fn f17",
+                        "highlights": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "logical_line": 17,
+                "visual_rows": [
+                  {
+                    "byte_offset": 0,
+                    "continuation_indent": 0,
+                    "segments": [
+                      {
+                        "text": "fn f18",
+                        "highlights": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "chrome",
+          "text": "a.rs",
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "text",
+          "element": 0,
+          "line": 16,
+          "row_index": 0,
+          "last_line": false,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 2,
+          "kind": "text",
+          "element": 0,
+          "line": 17,
+          "row_index": 0,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "two-files-whose-line-numbers-collide",
+      "why": "Two elements over different files, both showing line 10. Any lookup by line number alone finds the wrong row \u2014 or, keying chrome by the line it stands above, loses one heading entirely.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 4,
+      "root": {
+        "node": "column",
+        "children": [
+          {
+            "node": "row",
+            "children": [
+              {
+                "node": "text",
+                "text": "alpha.rs",
+                "highlights": []
+              }
+            ],
+            "band": "chrome"
+          },
+          {
+            "node": "editor",
+            "element": 0,
+            "buffer": 1,
+            "rows": 1,
+            "first_row": 0,
+            "first_buffer_line": 10,
+            "lines": [
+              {
+                "logical_line": 10,
+                "visual_rows": [
+                  {
+                    "byte_offset": 0,
+                    "continuation_indent": 0,
+                    "segments": [
+                      {
+                        "text": "from alpha",
+                        "highlights": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "node": "row",
+            "children": [
+              {
+                "node": "text",
+                "text": "beta.rs",
+                "highlights": []
+              }
+            ],
+            "band": "chrome"
+          },
+          {
+            "node": "editor",
+            "element": 1,
+            "buffer": 2,
+            "rows": 1,
+            "first_row": 0,
+            "first_buffer_line": 10,
+            "lines": [
+              {
+                "logical_line": 10,
+                "visual_rows": [
+                  {
+                    "byte_offset": 0,
+                    "continuation_indent": 0,
+                    "segments": [
+                      {
+                        "text": "from beta",
+                        "highlights": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "chrome",
+          "text": "alpha.rs",
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "text",
+          "element": 0,
+          "line": 10,
+          "row_index": 0,
+          "last_line": false,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 2,
+          "kind": "chrome",
+          "text": "beta.rs",
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 3,
+          "kind": "text",
+          "element": 1,
+          "line": 10,
+          "row_index": 0,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "a-gap-where-nothing-is-loaded",
+      "why": "The tree carries every element's height whether or not its lines are in the window, so an element with nothing loaded still occupies its rows. Consecutive entries are therefore not consecutive rows, and a painter draws blank between them.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 8,
+      "root": {
+        "node": "column",
+        "children": [
+          {
+            "node": "editor",
+            "element": 0,
+            "buffer": 1,
+            "rows": 3,
+            "first_row": 0,
+            "first_buffer_line": 0,
+            "lines": [
+              {
+                "logical_line": 0,
+                "visual_rows": [
+                  {
+                    "byte_offset": 0,
+                    "continuation_indent": 0,
+                    "segments": [
+                      {
+                        "text": "top",
+                        "highlights": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "node": "editor",
+            "element": 1,
+            "buffer": 2,
+            "rows": 4,
+            "first_row": 0,
+            "first_buffer_line": 0,
+            "lines": []
+          },
+          {
+            "node": "editor",
+            "element": 2,
+            "buffer": 3,
+            "rows": 1,
+            "first_row": 0,
+            "first_buffer_line": 0,
+            "lines": [
+              {
+                "logical_line": 0,
+                "visual_rows": [
+                  {
+                    "byte_offset": 0,
+                    "continuation_indent": 0,
+                    "segments": [
+                      {
+                        "text": "bottom",
+                        "highlights": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "text",
+          "element": 0,
+          "line": 0,
+          "row_index": 0,
+          "last_line": false,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 7,
+          "kind": "text",
+          "element": 2,
+          "line": 0,
+          "row_index": 0,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "a-slice-sitting-partway-into-its-element",
+      "why": "`first_row` places the loaded slice inside the element; the rows above it are the element's, unloaded. Scrolling a long file lands here on every window.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 5,
+      "root": {
+        "node": "editor",
+        "element": 0,
+        "buffer": 1,
+        "rows": 5,
+        "first_row": 2,
+        "first_buffer_line": 2,
+        "lines": [
+          {
+            "logical_line": 2,
+            "visual_rows": [
+              {
+                "byte_offset": 0,
+                "continuation_indent": 0,
+                "segments": [
+                  {
+                    "text": "c",
+                    "highlights": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "logical_line": 3,
+            "visual_rows": [
+              {
+                "byte_offset": 0,
+                "continuation_indent": 0,
+                "segments": [
+                  {
+                    "text": "d",
+                    "highlights": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 2,
+          "kind": "text",
+          "element": 0,
+          "line": 2,
+          "row_index": 0,
+          "last_line": false,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 3,
+          "kind": "text",
+          "element": 0,
+          "line": 3,
+          "row_index": 0,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "phantom-rows-sit-above-their-line",
+      "why": "An inline-diff phantom occupies a screen row and holds no cursor position, but belongs to the line it sits above \u2014 which is what a click on one snaps to. The element's `rows` counts them.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 3,
+      "root": {
+        "node": "editor",
+        "element": 0,
+        "buffer": 1,
+        "rows": 3,
+        "first_row": 0,
+        "first_buffer_line": 0,
+        "lines": [
+          {
+            "logical_line": 0,
+            "baseline_above": [
+              {
+                "text": "was"
+              }
+            ],
+            "visual_rows": [
+              {
+                "byte_offset": 0,
+                "continuation_indent": 0,
+                "segments": [
+                  {
+                    "text": "is",
+                    "highlights": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "logical_line": 1,
+            "visual_rows": [
+              {
+                "byte_offset": 0,
+                "continuation_indent": 0,
+                "segments": [
+                  {
+                    "text": "after",
+                    "highlights": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "baseline",
+          "element": 0,
+          "line": 0,
+          "index": 0,
+          "text": "was",
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "text",
+          "element": 0,
+          "line": 0,
+          "row_index": 0,
+          "last_line": false,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 2,
+          "kind": "text",
+          "element": 0,
+          "line": 1,
+          "row_index": 0,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "a-wrapped-line-takes-a-row-per-visual-row",
+      "why": "Soft wrap makes one logical line several rows. Note `last_line` is a property of the *line*, not the row, so every row of the final line carries it \u2014 surprising enough to pin.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 3,
+      "root": {
+        "node": "editor",
+        "element": 0,
+        "buffer": 1,
+        "rows": 3,
+        "first_row": 0,
+        "first_buffer_line": 0,
+        "lines": [
+          {
+            "logical_line": 0,
+            "visual_rows": [
+              {
+                "byte_offset": 0,
+                "continuation_indent": 0,
+                "segments": [
+                  {
+                    "text": "aaa",
+                    "highlights": []
+                  }
+                ]
+              },
+              {
+                "byte_offset": 3,
+                "continuation_indent": 2,
+                "segments": [
+                  {
+                    "text": "bbb",
+                    "highlights": []
+                  }
+                ]
+              },
+              {
+                "byte_offset": 6,
+                "continuation_indent": 2,
+                "segments": [
+                  {
+                    "text": "ccc",
+                    "highlights": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "text",
+          "element": 0,
+          "line": 0,
+          "row_index": 0,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "text",
+          "element": 0,
+          "line": 0,
+          "row_index": 1,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 2,
+          "kind": "text",
+          "element": 0,
+          "line": 0,
+          "row_index": 2,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "trailing-chrome-after-the-last-row",
+      "why": "A patch's closing rule has no line to sit above \u2014 the generated text ends without a trailing newline \u2014 so it is a sibling that simply comes last.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 2,
+      "root": {
+        "node": "column",
+        "children": [
+          {
+            "node": "editor",
+            "element": 0,
+            "buffer": 1,
+            "rows": 1,
+            "first_row": 0,
+            "first_buffer_line": 40,
+            "lines": [
+              {
+                "logical_line": 40,
+                "visual_rows": [
+                  {
+                    "byte_offset": 0,
+                    "continuation_indent": 0,
+                    "segments": [
+                      {
+                        "text": "last",
+                        "highlights": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "node": "row",
+            "children": [
+              {
+                "node": "fill",
+                "glyph": "-"
+              }
+            ],
+            "band": "chrome"
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "text",
+          "element": 0,
+          "line": 40,
+          "row_index": 0,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "chrome",
+          "text": "",
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "a-client-laid-out-element-lands-where-the-shell-measured",
+      "why": "The reader's path: the server sends prose unwrapped, one wire row per line, and the shell measures the real heights. Rows come from `Measured`, not from the tree \u2014 and the element's height is the measured slice plus one row for each line outside it.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {
+          "0": {
+            "first_row": 1,
+            "starts": [
+              1,
+              3
+            ],
+            "end": 6
+          }
+        }
+      },
+      "total_rows": 8,
+      "root": {
+        "node": "column",
+        "children": [
+          {
+            "node": "row",
+            "children": [
+              {
+                "node": "text",
+                "text": "doc",
+                "highlights": []
+              }
+            ],
+            "band": "chrome"
+          },
+          {
+            "node": "editor",
+            "element": 0,
+            "buffer": 1,
+            "rows": 4,
+            "first_row": 1,
+            "first_buffer_line": 1,
+            "laid_out_by": "client",
+            "lines": [
+              {
+                "logical_line": 1,
+                "visual_rows": [
+                  {
+                    "byte_offset": 0,
+                    "continuation_indent": 0,
+                    "segments": [
+                      {
+                        "text": "a paragraph",
+                        "highlights": []
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "logical_line": 2,
+                "visual_rows": [
+                  {
+                    "byte_offset": 0,
+                    "continuation_indent": 0,
+                    "segments": [
+                      {
+                        "text": "another",
+                        "highlights": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "chrome",
+          "text": "doc",
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 2,
+          "kind": "text",
+          "element": 0,
+          "line": 1,
+          "row_index": 0,
+          "last_line": false,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 4,
+          "kind": "text",
+          "element": 0,
+          "line": 2,
+          "row_index": 0,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "a-box-insets-its-content-and-owns-its-edge-row",
+      "why": "The frame's whole point: the border row belongs to the box (it is no tree node), and every row inside is held in by border+padding. `left` is 2 \u2014 one border cell, one padding cell \u2014 and `right` is 1, since this box has padding but no right border.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 3,
+      "root": {
+        "node": "column",
+        "children": [
+          {
+            "node": "column",
+            "edges": {
+              "border": {
+                "top": 1,
+                "left": 1
+              },
+              "padding": {
+                "left": 1,
+                "right": 1
+              },
+              "collapse": true
+            },
+            "children": [
+              {
+                "node": "row",
+                "children": [
+                  {
+                    "node": "text",
+                    "text": "a.rs",
+                    "highlights": []
+                  }
+                ],
+                "band": "chrome"
+              },
+              {
+                "node": "editor",
+                "element": 0,
+                "buffer": 1,
+                "rows": 1,
+                "first_row": 0,
+                "first_buffer_line": 10,
+                "lines": [
+                  {
+                    "logical_line": 10,
+                    "visual_rows": [
+                      {
+                        "byte_offset": 0,
+                        "continuation_indent": 0,
+                        "segments": [
+                          {
+                            "text": "boxed",
+                            "highlights": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "edge",
+          "side": "top",
+          "join": "opens",
+          "left": 2,
+          "right": 1,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "chrome",
+          "text": "a.rs",
+          "left": 2,
+          "right": 1,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 2,
+          "kind": "text",
+          "element": 0,
+          "line": 10,
+          "row_index": 0,
+          "last_line": true,
+          "left": 2,
+          "right": 1,
+          "rails_left": 1,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "adjacent-boxes-collapse-their-shared-edge",
+      "why": "Two file blocks in a column, each with a left rail and a top rule. The first opens the run; the second's rule has rail above (the first block's) and below (its own), so it tees rather than drawing a second, separate line. This is what `RailJoin` used to be sent for, and the join follows rail continuity \u2014 not edge adjacency.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 4,
+      "root": {
+        "node": "column",
+        "children": [
+          {
+            "node": "column",
+            "edges": {
+              "border": {
+                "top": 1,
+                "left": 1
+              },
+              "collapse": true
+            },
+            "children": [
+              {
+                "node": "editor",
+                "element": 0,
+                "buffer": 1,
+                "rows": 1,
+                "first_row": 0,
+                "first_buffer_line": 10,
+                "lines": [
+                  {
+                    "logical_line": 10,
+                    "visual_rows": [
+                      {
+                        "byte_offset": 0,
+                        "continuation_indent": 0,
+                        "segments": [
+                          {
+                            "text": "alpha",
+                            "highlights": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "node": "column",
+            "edges": {
+              "border": {
+                "top": 1,
+                "left": 1
+              },
+              "collapse": true
+            },
+            "children": [
+              {
+                "node": "editor",
+                "element": 1,
+                "buffer": 2,
+                "rows": 1,
+                "first_row": 0,
+                "first_buffer_line": 10,
+                "lines": [
+                  {
+                    "logical_line": 10,
+                    "visual_rows": [
+                      {
+                        "byte_offset": 0,
+                        "continuation_indent": 0,
+                        "segments": [
+                          {
+                            "text": "beta",
+                            "highlights": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "edge",
+          "side": "top",
+          "join": "opens",
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "text",
+          "element": 0,
+          "line": 10,
+          "row_index": 0,
+          "last_line": false,
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 2,
+          "kind": "edge",
+          "side": "top",
+          "join": "tees",
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 3,
+          "kind": "text",
+          "element": 1,
+          "line": 10,
+          "row_index": 0,
+          "last_line": true,
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "a-lone-box-opens-and-closes-its-own-rail",
+      "why": "Nothing to collapse into, so its rules bracket its own rail: the top opens it and the bottom closes it. `detached` is reserved for a rule with no rail at all \u2014 a patch's opening caption, which belongs to no file.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 3,
+      "root": {
+        "node": "column",
+        "children": [
+          {
+            "node": "column",
+            "edges": {
+              "border": {
+                "top": 1,
+                "bottom": 1,
+                "left": 1
+              }
+            },
+            "children": [
+              {
+                "node": "editor",
+                "element": 0,
+                "buffer": 1,
+                "rows": 1,
+                "first_row": 0,
+                "first_buffer_line": 0,
+                "lines": [
+                  {
+                    "logical_line": 0,
+                    "visual_rows": [
+                      {
+                        "byte_offset": 0,
+                        "continuation_indent": 0,
+                        "segments": [
+                          {
+                            "text": "alone",
+                            "highlights": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "edge",
+          "side": "top",
+          "join": "opens",
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "text",
+          "element": 0,
+          "line": 0,
+          "row_index": 0,
+          "last_line": true,
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        },
+        {
+          "at": 2,
+          "kind": "edge",
+          "side": "bottom",
+          "join": "closes",
+          "left": 1,
+          "right": 0,
+          "rails_left": 1,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "nested-boxes-accumulate-their-insets",
+      "why": "An inset is the sum of every box enclosing a row, not one frame's share \u2014 which is what lets the server compute one wrap width per element from the tree it built.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 1,
+      "root": {
+        "node": "column",
+        "edges": {
+          "padding": {
+            "left": 2,
+            "right": 2
+          }
+        },
+        "children": [
+          {
+            "node": "column",
+            "edges": {
+              "border": {
+                "left": 1
+              },
+              "padding": {
+                "left": 1,
+                "right": 3
+              }
+            },
+            "children": [
+              {
+                "node": "editor",
+                "element": 0,
+                "buffer": 1,
+                "rows": 1,
+                "first_row": 0,
+                "first_buffer_line": 0,
+                "lines": [
+                  {
+                    "logical_line": 0,
+                    "visual_rows": [
+                      {
+                        "byte_offset": 0,
+                        "continuation_indent": 0,
+                        "segments": [
+                          {
+                            "text": "deep",
+                            "highlights": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "text",
+          "element": 0,
+          "line": 0,
+          "row_index": 0,
+          "last_line": true,
+          "left": 4,
+          "right": 5,
+          "rails_left": 1,
+          "rails_right": 0
+        }
+      ]
+    },
+    {
+      "name": "a-rule-with-no-rail-is-detached",
+      "why": "A box with a top border but no left border draws a plain rule: there is no vertical line for it to meet, so it joins nothing. The patch's opening summary is this shape \u2014 it belongs to no file.",
+      "measured": {
+        "units_per_row": 1,
+        "elements": {}
+      },
+      "total_rows": 2,
+      "root": {
+        "node": "column",
+        "children": [
+          {
+            "node": "column",
+            "edges": {
+              "border": {
+                "top": 1
+              }
+            },
+            "children": [
+              {
+                "node": "editor",
+                "element": 0,
+                "buffer": 1,
+                "rows": 1,
+                "first_row": 0,
+                "first_buffer_line": 0,
+                "lines": [
+                  {
+                    "logical_line": 0,
+                    "visual_rows": [
+                      {
+                        "byte_offset": 0,
+                        "continuation_indent": 0,
+                        "segments": [
+                          {
+                            "text": "summary",
+                            "highlights": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "rows": [
+        {
+          "at": 0,
+          "kind": "edge",
+          "side": "top",
+          "join": "detached",
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        },
+        {
+          "at": 1,
+          "kind": "text",
+          "element": 0,
+          "line": 0,
+          "row_index": 0,
+          "last_line": true,
+          "left": 0,
+          "right": 0,
+          "rails_left": 0,
+          "rails_right": 0
+        }
+      ]
+    }
+  ]
+}

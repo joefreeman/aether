@@ -43,12 +43,12 @@ use aether_protocol::sneak::{
     SneakCancel, SneakSelect, SneakSelectParams, SneakTarget, SneakUpdate, SneakUpdateParams,
     SneakUpdateResult,
 };
-use aether_protocol::ui::{Element, RailJoin};
+use aether_protocol::ui::Element;
 use aether_protocol::view::{BufferDescription, ViewOpen, ViewOpenParams, ViewOpenResult};
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
-    BaselineRow, BufferStatusSnapshot, ChromeKind, DiagnosticSeverity, DiagnosticSpan, DiffMarker,
-    DiffStage, EmphasisRange, LineChange, LogicalLineRender, ViewportLinesChangedParams,
+    BaselineRow, BufferStatusSnapshot, DiagnosticSeverity, DiagnosticSpan, DiffMarker, DiffStage,
+    EmphasisRange, LineChange, LogicalLineRender, ViewportLinesChangedParams,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceInfo, WorkspaceList, WorkspaceOpenPath,
@@ -727,6 +727,7 @@ fn logical_line_render_patch_shape() {
 
 #[test]
 fn patch_chrome_virtual_row_shape() {
+    use aether_protocol::ui::{Band, Edges};
     use aether_protocol::viewport::Highlight;
     // A generated patch's separators ride the same channel as the inline diff's phantom deleted
     // rows, so that chrome costs no buffer lines and therefore no cursor positions. Unlike a
@@ -734,53 +735,65 @@ fn patch_chrome_virtual_row_shape() {
     //
     // A section heading is the enclosing signature alone — git's `@@ -a,b +c,d @@` ranges are
     // dropped, so a patch shows no line numbers anywhere.
-    let row = Element::Chrome {
-        kind: ChromeKind::HunkHeader,
-        rail: RailJoin::Tees,
-        children: vec![
-            Element::space(1),
-            Element::text(
-                "fn render_window(",
-                vec![Highlight {
-                    start: 0,
-                    end: 17,
-                    kind: "diff.hunk".into(),
-                }],
-            ),
-        ],
-    };
+    let row = Element::chrome(vec![Element::text(
+        "fn render_window(",
+        vec![Highlight {
+            start: 0,
+            end: 17,
+            kind: "diff.hunk".into(),
+        }],
+    )]);
     let v = to_value(&row).unwrap();
-    assert_eq!(v["node"], "chrome", "the variant tag");
-    assert_eq!(v["kind"], "hunk_header");
-    assert_eq!(v["rail"], "tees");
+    // A row on the chrome band, not a variant of its own. `Chrome` carried a `ChromeKind` that no
+    // shell ever branched on and a `RailJoin` that is derived from the tree now; what it actually
+    // delivered was the band, so the band is what it says.
+    assert_eq!(v["node"], "row", "the variant tag");
+    assert_eq!(v["band"], "chrome");
+    assert!(
+        v.get("kind").is_none() && v.get("rail").is_none(),
+        "neither the tag nor the join rides along: {v}"
+    );
     assert!(
         v.get("stage").is_none(),
-        "stage is a deletion's business; chrome has no field for it to be meaningless in"
+        "stage is a deletion's business; a chrome row has no field for it to be meaningless in"
     );
-    // The content: chrome's children, laid out left to right, each self-describing under the one
-    // `node` tag the whole vocabulary shares. It used to nest a `layout`/`widget` pair inside a
-    // `content` object — two enums for one idea, and an editor could not appear among them.
+    // The content: children laid out left to right, each self-describing under the one `node` tag
+    // the whole vocabulary shares. It used to nest a `layout`/`widget` pair inside a `content`
+    // object — two enums for one idea, and an editor could not appear among them.
     let children = v["children"].as_array().unwrap();
-    assert_eq!(children[0]["node"], "space");
-    assert_eq!(children[0]["cols"], 1);
-    assert_eq!(children[1]["node"], "text");
-    assert_eq!(children[1]["highlights"][0]["kind"], "diff.hunk");
+    assert_eq!(children[0]["node"], "text");
+    assert_eq!(children[0]["highlights"][0]["kind"], "diff.hunk");
     assert!(
         v.get("content").is_none(),
-        "no wrapper object between chrome and what it draws"
+        "no wrapper object between a chrome row and what it draws"
     );
     let back: Element = from_value(v).unwrap();
-    assert!(matches!(
-        back,
-        Element::Chrome {
-            kind: ChromeKind::HunkHeader,
-            ..
-        }
-    ));
     assert_eq!(back, row);
 
-    // A baseline row is a different type entirely, not a sibling variant: chrome belongs to the
-    // view's tree, a phantom deletion belongs to the line it stands above.
+    // An ordinary row is the same shape with no band, and the band stays off the wire when it has
+    // none — the one thing that keeps a plain view's bytes unchanged by any of this.
+    let plain = to_value(Element::row(vec![Element::fill('─')])).unwrap();
+    assert_eq!(plain["node"], "row");
+    assert!(
+        plain.get("band").is_none(),
+        "`Band::None` is the default and is skipped: {plain}"
+    );
+
+    for (band, wire) in [(Band::None, None), (Band::Chrome, Some("chrome"))] {
+        let v = to_value(Element::Row {
+            edges: Edges::NONE,
+            band,
+            children: vec![Element::fill('─')],
+        })
+        .unwrap();
+        assert_eq!(v.get("band").and_then(|b| b.as_str()), wire);
+        assert_eq!(v["children"][0]["node"], "fill");
+        let back: Element = from_value(v).unwrap();
+        assert!(matches!(back, Element::Row { band: b, .. } if b == band));
+    }
+
+    // A baseline row is a different type entirely, not a sibling variant: a chrome row belongs to
+    // the view's tree, a phantom deletion belongs to the line it stands above.
     let del = BaselineRow {
         text: "gone".into(),
         stage: DiffStage::Unstaged,
@@ -790,40 +803,110 @@ fn patch_chrome_virtual_row_shape() {
     assert_eq!(v["text"], "gone");
     assert!(v.get("kind").is_none() && v.get("rail").is_none());
     assert_eq!(from_value::<BaselineRow>(v).unwrap(), del);
+}
 
-    for (kind, wire) in [
-        (ChromeKind::FileHeader, "file_header"),
-        (ChromeKind::HunkHeader, "hunk_header"),
-        (ChromeKind::Rule, "rule"),
-        (ChromeKind::Spacer, "spacer"),
-        (ChromeKind::Summary, "summary"),
-    ] {
-        let v = to_value(Element::Chrome {
-            kind,
-            rail: RailJoin::Opens,
-            children: vec![Element::fill('─')],
-        })
-        .unwrap();
-        assert_eq!(v["kind"], wire);
-        assert_eq!(v["children"][0]["node"], "fill");
-        let back: Element = from_value(v).unwrap();
-        assert!(matches!(back, Element::Chrome { kind: k, .. } if k == kind));
+/// A container's box: off the wire entirely when it has none, and exact when it has one.
+///
+/// `edges` and `band` are additive fields on `Column`/`Row`, so every ordinary view — which is
+/// every view that is not a patch — must serialise byte-for-byte as it did before they existed.
+/// That is what makes the vocabulary change a no-op until a producer opts in.
+#[test]
+fn a_container_carries_its_box_only_when_it_has_one() {
+    use aether_protocol::ui::{Band, Edges, Element, Sides};
+
+    // The ordinary case: nothing added to the wire.
+    let plain = Element::column(vec![Element::text("x", vec![])]);
+    let v = to_value(&plain).unwrap();
+    assert_eq!(v["node"], "column", "the variant tag — was `stack`");
+    assert!(
+        v.get("edges").is_none() && v.get("band").is_none(),
+        "a container with no box spends no wire on saying so: {v}"
+    );
+    assert_eq!(from_value::<Element>(v).unwrap(), plain);
+
+    // A box, spelled out. Cells per side, in stylesheet order.
+    let framed = Element::framed(
+        Edges {
+            border: Sides {
+                top: 1,
+                left: 1,
+                ..Sides::ZERO
+            },
+            padding: Sides::all(1),
+            collapse: true,
+        },
+        Band::Chrome,
+        vec![Element::text("hunk", vec![])],
+    );
+    let v = to_value(&framed).unwrap();
+    assert_eq!(v["node"], "column");
+    assert_eq!(v["band"], "chrome");
+    assert_eq!(v["edges"]["border"]["top"], 1);
+    assert_eq!(v["edges"]["border"]["left"], 1);
+    assert_eq!(v["edges"]["padding"]["right"], 1);
+    assert_eq!(v["edges"]["collapse"], true);
+    assert!(
+        v["edges"]["border"].get("right").is_none(),
+        "a zero side is absent, not 0: {v}"
+    );
+    assert_eq!(from_value::<Element>(v).unwrap(), framed);
+
+    // `collapse` counts as part of "has no box". A value that serialises to nothing has to
+    // deserialise back to itself, and `collapse: true` with no borders would not — so it is not
+    // zero, and it stays on the wire.
+    let collapse_only = Element::framed(
+        Edges {
+            collapse: true,
+            ..Edges::NONE
+        },
+        Band::None,
+        vec![],
+    );
+    let v = to_value(&collapse_only).unwrap();
+    assert_eq!(
+        v["edges"]["collapse"], true,
+        "collapse alone still rides: {v}"
+    );
+    assert_eq!(from_value::<Element>(v).unwrap(), collapse_only);
+
+    // A `Row` takes the same two fields — a box is a property of containers, not of columns.
+    let row = Element::Row {
+        edges: Edges {
+            border: Sides::all(1),
+            ..Edges::NONE
+        },
+        band: Band::Chrome,
+        children: vec![],
+    };
+    let v = to_value(&row).unwrap();
+    assert_eq!(v["node"], "row");
+    assert_eq!(v["edges"]["border"]["bottom"], 1);
+    assert_eq!(from_value::<Element>(v).unwrap(), row);
+
+    for (band, wire) in [(Band::None, "none"), (Band::Chrome, "chrome")] {
+        assert_eq!(to_value(band).unwrap(), wire);
+        assert_eq!(from_value::<Band>(to_value(band).unwrap()).unwrap(), band);
     }
 
-    for (rail, wire) in [
-        (RailJoin::Opens, "opens"),
-        (RailJoin::Tees, "tees"),
-        (RailJoin::Closes, "closes"),
-        (RailJoin::Detached, "detached"),
+    // The browser hand-mirrors this; `tsc` cannot see a Rust rename.
+    let ts = include_str!("../../../web/src/protocol.ts");
+    for needle in [
+        "node: \"column\"",
+        "edges?: Edges",
+        "band?: Band",
+        "export interface Edges",
+        "export interface Sides",
+        "export type Band",
     ] {
-        let v = to_value(Element::Chrome {
-            kind: ChromeKind::Rule,
-            rail,
-            children: vec![],
-        })
-        .unwrap();
-        assert_eq!(v["rail"], wire);
+        assert!(
+            ts.contains(needle),
+            "web/src/protocol.ts must declare `{needle}`"
+        );
     }
+    assert!(
+        !ts.contains("node: \"stack\""),
+        "the `stack` tag is gone; the mirror must not still declare it"
+    );
 }
 
 #[test]

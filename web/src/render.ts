@@ -6,6 +6,7 @@
 
 import { decodeRow, utf8ByteLen } from "./text";
 import type {
+  Band,
   BufferWindow,
   ConflictLine,
   Measured,
@@ -16,6 +17,7 @@ import type {
   LogicalLineRender,
   LogicalPosition,
   PatchLine,
+  RailJoin,
   UiElement,
   BaselineRow,
   ViewNode,
@@ -526,19 +528,33 @@ function gutter(
  *  rather than a buffer line) and carries no gutter change-bar, since it belongs to no line of
  *  either side. The file separator's trailing rule is drawn in CSS, so it fills whatever width is
  *  left. */
-function chromeRow(v: ViewNode): HTMLElement {
+/** One row of a box's own border or padding.
+ *
+ *  No tree node stands for it, so unlike `chromeRow` there is nothing to read text out of: what it
+ *  draws is the rule, and where the rule meets the rail. `join` is the same alphabet the terminal
+ *  spells with `┌`/`├`/`└`; here it is a CSS class, as the file rail already was. */
+function edgeRow(side: "top" | "bottom", join: RailJoin, band: Band): HTMLElement {
   const rowEl = document.createElement("div");
-  rowEl.className = "row patch-chrome";
-  // A row of presentation that isn't chrome carries no kind and no rail — since one vocabulary
-  // covers both axes, an inline element may stand on its own. It still draws; it just has no band.
-  if (v.node === "chrome") {
-    rowEl.classList.add(v.kind.replace("_", "-"));
-    // Which join to draw is the server's call (`RailJoin`) — this is only the web's alphabet for
-    // it. The terminal spells the same thing with box-drawing glyphs, the GUI with a hairline.
-    if (v.rail === "opens") rowEl.classList.add("corners");
-    if (v.rail === "detached") rowEl.classList.add("detached");
-    if (v.rail === "closes") rowEl.classList.add("closes");
-  }
+  rowEl.className = `row box-edge ${side} ${join}`;
+  // A box's own cells take its band, the same as any other row of it.
+  if (band === "chrome") rowEl.classList.add("patch-chrome");
+  const g = document.createElement("span");
+  g.className = "gutter";
+  rowEl.appendChild(g);
+  const content = document.createElement("span");
+  content.className = "content";
+  rowEl.appendChild(content);
+  return rowEl;
+}
+
+function chromeRow(v: ViewNode, band: Band): HTMLElement {
+  const rowEl = document.createElement("div");
+  rowEl.className = "row";
+  // A row of presentation with no band paints none — since one vocabulary covers both axes, an
+  // inline element may stand on its own. It still draws; it just sits on the editor's background.
+  // The band was a `chrome` variant carrying a `ChromeKind` no shell branched on and a `RailJoin`
+  // that is derived from the tree now; what it delivered was this shade, so this is what says it.
+  if (band === "chrome") rowEl.classList.add("patch-chrome");
   const g = document.createElement("span");
   g.className = "gutter";
   rowEl.appendChild(g);
@@ -695,13 +711,30 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
       frag.appendChild(gap);
     }
     next = item.at + unit;
+    // Cells the enclosing boxes claimed, applied to whatever the row turns out to be. `boxed`
+    // is what puts the band behind those cells and takes the pre-frame rail out of the gutter:
+    // inside a box the rail is the box's border, and drawing both is two lines down one file.
+    const inset = (el: HTMLElement): HTMLElement => {
+      if (!item.left && !item.right) return el;
+      el.classList.add("boxed");
+      el.style.setProperty("--inset-left", `${item.left}ch`);
+      el.style.setProperty("--inset-right", `${item.right}ch`);
+      // A rail per side the box actually draws — the padding beside it gets no line.
+      if (item.rails.left) el.classList.add("rail-left");
+      if (item.rails.right) el.classList.add("rail-right");
+      return el;
+    };
     if (item.kind === "chrome") {
-      frag.appendChild(chromeRow(item.node));
+      frag.appendChild(inset(chromeRow(item.node, item.band)));
       continue;
     }
     if (item.kind === "baseline") {
       const v = item.row;
-      frag.appendChild(phantomRow(v.text, v.stage ?? "unstaged", v.emphasis ?? []));
+      frag.appendChild(inset(phantomRow(v.text, v.stage ?? "unstaged", v.emphasis ?? [])));
+      continue;
+    }
+    if (item.kind === "edge") {
+      frag.appendChild(inset(edgeRow(item.side, item.join, item.band)));
       continue;
     }
     const { line, row, rowIndex, element } = item;
@@ -730,18 +763,20 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
     const isLast = rowIndex === line.visual_rows.length - 1;
     const blameLine = !insertMode && blame && onCursorElement && cursor.position.line === L;
     frag.appendChild(
-      renderVisualRow(
-        element,
-        line,
-        row,
-        rowIndex,
-        isLast,
-        cursorByte,
-        sel,
-        cursorClass,
-        bracketBytes,
-        blameLine && isLast ? blame : null,
-        diffView,
+      inset(
+        renderVisualRow(
+          element,
+          line,
+          row,
+          rowIndex,
+          isLast,
+          cursorByte,
+          sel,
+          cursorClass,
+          bracketBytes,
+          blameLine && isLast ? blame : null,
+          diffView,
+        ),
       ),
     );
   }

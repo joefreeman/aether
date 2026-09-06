@@ -23,10 +23,8 @@
 
 use std::collections::HashMap;
 
-use aether_protocol::ui::{Element, RailJoin};
-use aether_protocol::viewport::{
-    ChromeKind, DiffStage, EmphasisRange, FieldId, Highlight, PatchLine,
-};
+use aether_protocol::ui::Element;
+use aether_protocol::viewport::{DiffStage, EmphasisRange, FieldId, Highlight, PatchLine};
 
 use crate::syntax::{InjectionLayer, LanguageConfig};
 
@@ -283,7 +281,7 @@ pub struct PatchHunk {
     pub new_lines: u32,
     /// The enclosing signature git prints after the second `@@` — "where you are" in the file.
     ///
-    /// Already rendered as this hunk's [`ChromeKind::HunkHeader`]; kept here as well because it is
+    /// Already rendered as this hunk's heading row; kept here as well because it is
     /// the **outline's** label for every change in the hunk, and an outline that read it back out of
     /// the rendered chrome would be parsing its own output. Empty when git offers none (the top of
     /// a file, a non-code file), which the outline falls back from.
@@ -359,69 +357,20 @@ impl PatchBuilder {
         );
     }
 
-    /// Queue a chrome row to render above the next content line.
+    /// Queue a heading to render above the next content line — a file's path, a hunk's signature.
     ///
-    /// The [`RailJoin`] is filled in when the group is flushed ([`Self::flush_rails`]) rather than
-    /// here: whether a row opens the rail or tees off it depends on what else ends up in its group,
-    /// which isn't known until the group is closed by a content line.
-    pub fn chrome(&mut self, kind: ChromeKind, text: impl Into<String>, spans: &[Span]) {
-        let text = text.into();
-        let content = match kind {
-            // A rule is the fill and nothing else — the rail sits outside the content width.
-            ChromeKind::Rule => Element::row(vec![Element::fill('─')]),
-            // Blank: the band and the rail are all a spacer is.
-            ChromeKind::Spacer => Element::row(Vec::new()),
-            // Set in from the rail by a space: chrome is a heading, not code, so it reads better
-            // than it would aligned to the column content starts at.
-            _ => Element::row(vec![
-                Element::space(1),
-                Element::text(text, spans_to_highlights(spans)),
-            ]),
-        };
-        self.pending.push(Element::Chrome {
-            kind,
-            rail: RailJoin::Tees,
-            children: vec![content],
-        });
+    /// Flush with the code under it. The lead-in space this used to carry was clearance from the
+    /// rail drawn in the gutter cell; the file block's box holds that line now, so a second one
+    /// only reads as a heading indented out of step with the lines it names.
+    pub fn heading(&mut self, text: impl Into<String>, spans: &[Span]) {
+        let content = Element::row(vec![Element::text(text.into(), spans_to_highlights(spans))]);
+        self.pending.push(Element::chrome(vec![content]));
     }
 
-    /// Resolve the [`RailJoin`] of every row in the pending group, now that the group is complete.
-    ///
-    /// This was three client-side derivations — box glyphs in the terminal, a pixel rule in the
-    /// GUI, CSS classes on the web — each reconstructing the file structure from a flat row list.
-    /// The builder has the structure in hand, so it answers once.
-    fn flush_rails(rows: &mut [Element]) {
-        let opening = rows.iter().any(|r| {
-            matches!(
-                r,
-                Element::Chrome {
-                    kind: ChromeKind::Summary,
-                    ..
-                }
-            )
-        });
-        let mut above_rule = true;
-        for (idx, row) in rows.iter_mut().enumerate() {
-            let Element::Chrome { kind, rail, .. } = row else {
-                continue;
-            };
-            let is_rule = *kind == ChromeKind::Rule;
-            *rail = if !is_rule {
-                // The opening caption and its blank belong to no file, so nothing runs into them.
-                if opening && above_rule {
-                    RailJoin::Detached
-                } else {
-                    RailJoin::Tees
-                }
-            } else if above_rule && (opening || idx == 0) {
-                RailJoin::Opens
-            } else {
-                RailJoin::Tees
-            };
-            if is_rule {
-                above_rule = false;
-            }
-        }
+    /// Queue a blank row above the next content line. The band is all it is.
+    pub fn blank(&mut self) {
+        self.pending
+            .push(Element::chrome(vec![Element::row(Vec::new())]));
     }
 
     /// A line of file content, which also flushes any queued chrome above itself. `highlights` are
@@ -454,8 +403,7 @@ impl PatchBuilder {
         self.highlights.push(highlights);
         self.emphasis.push(emphasis);
         self.stage.push(stage);
-        let mut group = std::mem::take(&mut self.pending);
-        Self::flush_rails(&mut group);
+        let group = std::mem::take(&mut self.pending);
         self.chrome.push(group);
         self.lines.push(info);
     }
@@ -478,14 +426,10 @@ impl PatchBuilder {
     }
 
     pub fn finish(mut self) -> (String, GeneratedPatch) {
-        // A rule closing the patch, joining the rail up into the last section's blank. Whatever
-        // chrome is still pending has nowhere to sit *above* — the text ends at its last content
-        // line — so it becomes the trailing block instead.
-        self.pending.push(Element::Chrome {
-            kind: ChromeKind::Rule,
-            rail: RailJoin::Closes,
-            children: vec![Element::fill('─')],
-        });
+        // No rule closing the patch: the last file block's box draws its own bottom border now
+        // (`close_last_box`), so the figure is one frame rather than a frame plus a node standing
+        // in for its missing edge. Whatever chrome is still pending has nowhere to sit *above* —
+        // the text ends at its last content line — so it becomes the trailing block instead.
         // No trailing newline: the empty last line it would create is one the cursor can land on,
         // below everything the patch has to show. The closing chrome hangs off the final content
         // line instead, which is what `trailing_chrome` exists for.
@@ -780,12 +724,61 @@ pub fn layout_over_files(
                 .cloned()
                 .unwrap_or_default(),
         );
+        // The box around this element's file. One per file, so consecutive elements of the same
+        // file share it and the next file's opens a new one — which is what `collapse` then draws
+        // as a tee rather than as two rules.
+        //
+        // A left border and a top border: the rail down the file's side, and the rule that opens
+        // it. The rule the file header used to emit is this border now, which is why it is not
+        // drawn twice.
+        let file_of = |line: u32| -> Option<u32> {
+            generated
+                .index
+                .lines
+                .get(line as usize)
+                .copied()
+                .flatten()
+                .map(|i| i.file)
+        };
+        let (box_group, edges, band) = match file_of(span.start_line) {
+            Some(file) => (
+                Some(file),
+                aether_protocol::ui::Edges {
+                    // Rails down both sides and a rule across the top. No bottom border: with
+                    // `collapse` the next file's top rule *is* this file's closing one, so the run
+                    // reads as one ruled list rather than as a stack of separate boxes. The last
+                    // file's block is closed by the patch's trailing rule.
+                    border: aether_protocol::ui::Sides {
+                        top: 1,
+                        left: 1,
+                        right: 1,
+                        bottom: 0,
+                    },
+                    // No padding. The gutter cell already sits between the left rail and the
+                    // text — blank on an unchanged line — and the right rail stands off the ragged
+                    // end of the code, so a padding cell either side only widened the block
+                    // without separating anything that was touching.
+                    padding: aether_protocol::ui::Sides::ZERO,
+                    collapse: true,
+                },
+                aether_protocol::ui::Band::Chrome,
+            ),
+            // The patch's opening caption belongs to no file, so it sits in no box.
+            None => (
+                None,
+                aether_protocol::ui::Edges::NONE,
+                aether_protocol::ui::Band::None,
+            ),
+        };
         let generated_slice = || crate::state::ElementLayout {
             extent: crate::state::ElementExtent::OwnDocument {
                 lines: span.start_line..span.end_line,
             },
             chrome_above: chrome_above.clone(),
             decorations: None,
+            edges,
+            box_group,
+            band,
         };
 
         // Which file and hunk this element's first line belongs to — read from the index that
@@ -886,9 +879,33 @@ pub fn layout_over_files(
             },
             chrome_above,
             decorations: Some(std::sync::Arc::new(decorations)),
+            edges,
+            box_group,
+            band,
         });
     }
+    close_last_box(&mut layout);
     layout
+}
+
+/// Give the patch's last file block a bottom border, so the box closes itself.
+///
+/// `collapse` means a block draws no bottom edge — the next file's top rule *is* its closing one,
+/// which is what makes a run of files read as one ruled list rather than a stack of boxes. The last
+/// block has no next file, and a trailing rule node used to stand in for the edge it was
+/// missing. It is a border now, so the frame owns the figure from `┌` to `┘`, and the rule closes
+/// rail to rail rather than running the whole width of the pane.
+///
+/// Set on the run's **first** element, because that is the one `compose_tree` reads a box's edges
+/// from — the others in the run carry theirs only for their own wrap inset, which a bottom border
+/// does not change.
+fn close_last_box(layout: &mut [crate::state::ElementLayout]) {
+    let Some(last) = layout.iter().rev().find_map(|e| e.box_group) else {
+        return; // a patch with no file blocks at all — nothing to close
+    };
+    if let Some(first) = layout.iter_mut().find(|e| e.box_group == Some(last)) {
+        first.edges.border.bottom = 1;
+    }
 }
 
 /// The shape of a diff: which files it touches, and which line ranges of each.
@@ -1073,9 +1090,8 @@ fn emit_file_header(
     added: u32,
     removed: u32,
 ) {
-    // A full-width rule opens every file block, including the first: the heaviest boundary in the
-    // buffer, and the one thing drawn edge to edge.
-    b.chrome(ChromeKind::Rule, "", &[]);
+    // No rule here: the file block's box draws it as its top border, and `collapse` makes the
+    // boundary between two files one rule rather than two. Emitting one as well would double it.
 
     let old_path = path_of(&delta.old_file());
     let new_path = path_of(&delta.new_file());
@@ -1121,10 +1137,7 @@ fn emit_file_header(
         text.push_str(&s);
     }
 
-    b.chrome(ChromeKind::FileHeader, text, &spans);
-    // A blank between the path and its first section heading, so the file's name reads as a title
-    // rather than as the first of a run of headings.
-    b.chrome(ChromeKind::Spacer, "", &[]);
+    b.heading(text, &spans);
 }
 
 /// The one content line standing in for a delta git gave no hunks: a binary file, a bare mode
@@ -1178,7 +1191,7 @@ fn emit_placeholder(
         // Nothing textual to locate in the index, so it reads as the top layer.
         stage: DiffStage::Unstaged,
     });
-    b.chrome(ChromeKind::Spacer, "", &[]);
+    b.blank();
     b.content_line(
         &text,
         spans_to_highlights(&[(0, text.len(), META)]),
@@ -1192,7 +1205,7 @@ fn emit_placeholder(
             new_lineno: None,
         },
     );
-    b.chrome(ChromeKind::Spacer, "", &[]);
+    b.blank();
 }
 
 /// One content line of a hunk, gathered before anything is pushed.
@@ -1280,8 +1293,31 @@ fn emit_hunk(
     } else {
         vec![(0, signature.len(), HUNK)]
     };
-    b.chrome(ChromeKind::HunkHeader, signature, &spans);
-    b.chrome(ChromeKind::Spacer, "", &[]);
+    // A blank above the heading and none below, so the gap reads as belonging to the boundary
+    // rather than to the heading: the signature sits directly on the code it names, and what sets
+    // it apart from the hunk before is the space over it. Emitted here rather than at the end of
+    // the previous hunk so the first heading in a file gets one too, and so the last hunk leaves
+    // no trailing blank to flush into the next file's block.
+    //
+    // The blank is the boundary; the heading is what the boundary is *called*, and it is only
+    // drawn when it has something new to say. Git offers no signature for a hunk that starts at
+    // the top of its file, and a heading with no text is a blank row impersonating a heading;
+    // two hunks inside the same function repeat one signature, and the second is a label for
+    // somewhere the reader already is. Either way the blank alone says "new hunk", which is the
+    // part that was carrying the meaning.
+    //
+    // Against the previous *hunk's* signature rather than the last one shown: the two cases
+    // cannot overlap, since only a hunk containing line 1 lacks a signature and only the first
+    // hunk can contain line 1.
+    let repeats_previous = b
+        .file_mut(file_idx)
+        .hunks
+        .last()
+        .is_some_and(|h| h.signature == signature);
+    b.blank();
+    if !signature.is_empty() && !repeats_previous {
+        b.heading(signature, &spans);
+    }
 
     let start_line = b.next_line();
     let line_count = patch
@@ -1395,8 +1431,6 @@ fn emit_hunk(
             stage,
         });
     }
-
-    b.chrome(ChromeKind::Spacer, "", &[]);
 
     let end_line = b.next_line();
     b.file_mut(file_idx).hunks.push(PatchHunk {
@@ -1546,10 +1580,15 @@ mod tests {
         );
     }
 
-    /// The plan agrees with what the renderer actually emitted: one hunk heading per planned region.
+    /// The plan agrees with what the renderer actually emitted: one hunk per planned region.
     ///
     /// Cheap cross-check, and the thing that would catch the two walks drifting apart — the reason
     /// `render_diff` consumes the plan rather than recomputing the status refinement itself.
+    ///
+    /// Counted off the **index**, not off the hunk headings. The headings used to be one per hunk
+    /// and were the obvious proxy; they are a presentation choice now — one is dropped when git
+    /// gives no signature or when it would repeat the heading above it — so counting them would
+    /// make this test fail for a reason that has nothing to do with the two walks agreeing.
     #[test]
     fn the_plan_matches_what_the_renderer_emits() {
         let dir = tempfile::tempdir().unwrap();
@@ -1565,25 +1604,10 @@ mod tests {
         let planned_regions: usize = plan.files.iter().map(|f| f.regions.len()).sum();
         // Named, so a mutual zero can't pass as agreement.
         assert_eq!(planned_regions, 3, "two hunks in a.txt and one in b.txt");
-        let hunk_headings = generated
-            .decorations
-            .chrome
-            .iter()
-            .flatten()
-            .chain(generated.decorations.trailing_chrome.iter())
-            .filter(|n| {
-                matches!(
-                    n,
-                    Element::Chrome {
-                        kind: ChromeKind::HunkHeader,
-                        ..
-                    }
-                )
-            })
-            .count();
+        let rendered_hunks: usize = generated.index.files.iter().map(|f| f.hunks.len()).sum();
         assert_eq!(
-            planned_regions, hunk_headings,
-            "every planned region should have produced exactly one hunk heading"
+            planned_regions, rendered_hunks,
+            "every planned region should have produced exactly one hunk"
         );
         assert_eq!(
             plan.files.len(),
@@ -1593,11 +1617,7 @@ mod tests {
     }
 
     fn rule() -> Element {
-        Element::Chrome {
-            kind: ChromeKind::Rule,
-            rail: RailJoin::Tees,
-            children: vec![Element::fill('─')],
-        }
+        Element::chrome(vec![Element::fill('─')])
     }
 
     /// Chrome above lines 2 and 5 makes three regions, and line 0 opens one whether or not it has
@@ -1812,52 +1832,34 @@ mod tests {
 }
 
 #[cfg(test)]
-mod rail_tests {
+mod chrome_tests {
     use super::*;
 
-    fn chrome(kind: ChromeKind) -> Element {
-        Element::Chrome {
-            kind,
-            rail: RailJoin::Tees,
-            children: Vec::new(),
-        }
-    }
-
-    fn rails(kinds: &[ChromeKind]) -> Vec<RailJoin> {
-        let mut rows: Vec<Element> = kinds.iter().copied().map(chrome).collect();
-        PatchBuilder::flush_rails(&mut rows);
-        rows.iter()
-            .map(|r| match r {
-                Element::Chrome { rail, .. } => *rail,
-                _ => unreachable!(),
-            })
-            .collect()
-    }
-
-    /// The rail's whole job is making a file's chrome read as belonging to that file. The patch's
-    /// summary caption belongs to no file, so it floats; every *later* file is reached down the
-    /// rail from the one before it, so its rule tees rather than cornering.
+    /// A heading starts in the same column as the code under it.
     ///
-    /// Ported from the terminal shell, which used to derive this itself — as did the GUI and the
-    /// web, differently. The answer is structural, so it is settled here once.
+    /// It used to be set in one space from the rail the *gutter* carried. The file block's box
+    /// draws that rail now, a padding cell clear of the content, so a lead-in here is a second
+    /// helping of the same clearance — and every shell rendered the heading one column right of
+    /// the lines it names. The column itself is each shell's arithmetic; what is pinned here is
+    /// that the server sends nothing in front of the text for them to add it to.
     #[test]
-    fn the_rail_starts_at_the_first_file_not_at_the_summary() {
-        use ChromeKind::*;
-        use RailJoin::*;
-
-        // The opening block: caption, its blank, then the first file.
+    fn a_heading_carries_no_lead_in_before_its_text() {
+        let mut b = PatchBuilder::default();
+        b.heading("a.rs", &[]);
+        let Some(Element::Row { children, band, .. }) = b.pending.first() else {
+            panic!("a chrome row was queued");
+        };
         assert_eq!(
-            rails(&[Summary, Spacer, Rule, FileHeader, Spacer, HunkHeader, Spacer]),
-            [Detached, Detached, Opens, Tees, Tees, Tees, Tees],
-            "the caption and its blank float; the first file corners because nothing runs into it"
+            *band,
+            aether_protocol::ui::Band::Chrome,
+            "on the chrome band"
         );
-
-        // Every later block opens with the blank that closed the previous file — which carries the
-        // rail down into this file's rule, so it tees rather than cornering.
-        assert_eq!(
-            rails(&[Spacer, Rule, FileHeader, Spacer]),
-            [Tees, Tees, Tees, Tees],
-            "the closing blank still carries the rail into the next file's rule"
+        let Some(Element::Row { children, .. }) = children.first() else {
+            panic!("chrome lays its content out as a row");
+        };
+        assert!(
+            matches!(children.first(), Some(Element::Text { text, .. }) if text == "a.rs"),
+            "the row opens with its text, not with a space: {children:?}"
         );
     }
 }

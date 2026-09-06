@@ -2045,6 +2045,11 @@ struct RenderedElement {
     chrome_above: std::sync::Arc<Vec<Element>>,
     first_buffer_line: u32,
     lines: Vec<LogicalLineRender>,
+    /// The box this element belongs to, and what that box draws — carried from the binding so
+    /// `compose_tree` can group a run without going back to the state.
+    box_group: Option<u32>,
+    edges: aether_protocol::ui::Edges,
+    band: aether_protocol::ui::Band,
 }
 
 /// Render the window a viewport shows of its view: the whole tree, every element carrying its
@@ -2135,6 +2140,9 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
             chrome_above: binding.chrome_above.clone(),
             first_buffer_line,
             lines,
+            box_group: binding.box_group,
+            edges: binding.edges,
+            band: binding.band,
         });
     }
 
@@ -2170,6 +2178,7 @@ fn element_geometry(
     geom: wrap::WrapGeometry,
     diff_view: bool,
 ) -> (wrap::WrapGeometry, HashMap<u32, u32>) {
+    let geom = inset(geom, binding.edges);
     match binding.laid_out_by {
         aether_protocol::ui::LayoutOwner::Server => {
             (geom, element_phantom_rows(s, binding, diff_view))
@@ -2181,6 +2190,31 @@ fn element_geometry(
             },
             HashMap::new(),
         ),
+    }
+}
+
+/// The narrowest an element is ever wrapped to, however deep the box around it.
+///
+/// A floor against absurdity, not a target: a viewport this narrow is unusable with or without a
+/// box. Matches the reading view's own floor (`read_layout`'s `max(10)`), which is the same shape
+/// — subtract the chrome, clamp — and the pattern this follows deliberately.
+const MIN_CONTENT_COLS: u32 = 10;
+
+/// An element's wrap width, given the box around it: the viewport's columns less what the box
+/// spends on border and padding.
+///
+/// **Clamped, never collapsed.** A threshold below which frames vanish would be a discontinuity —
+/// a box at 41 columns and none at 40, popping in and out as a window resizes — and it would have
+/// to live here, server-side, where it is least tweakable. Narrowing degrades smoothly on its own:
+/// the text simply wraps more.
+fn inset(geom: wrap::WrapGeometry, edges: aether_protocol::ui::Edges) -> wrap::WrapGeometry {
+    let taken = u32::from(edges.horizontal());
+    if taken == 0 {
+        return geom;
+    }
+    wrap::WrapGeometry {
+        cols: geom.cols.saturating_sub(taken).max(MIN_CONTENT_COLS),
+        ..geom
     }
 }
 
@@ -2269,19 +2303,63 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
     // of one. Everything else composes. Note this asks about the *elements*, not about whether a
     // document was generated — composition is a fact about the view's shape, and a driver that
     // builds elements without generating a document gets the same answer.
-    if rendered.len() == 1 && rendered[0].chrome_above.is_empty() && trailing_chrome.is_empty() {
+    if rendered.len() == 1
+        && rendered[0].chrome_above.is_empty()
+        && rendered[0].box_group.is_none()
+        && trailing_chrome.is_empty()
+    {
         let mut rendered = rendered;
         return node_of(rendered.remove(0));
     }
+    // Consecutive elements sharing a `box_group` are one box: its border and padding around the
+    // run, its band behind them. The chrome standing above an element goes *inside* the box when
+    // that element opens one, which is what puts a file's heading under its own rule rather than
+    // above it.
     let mut children: Vec<Element> = Vec::new();
+    type OpenBox = (
+        u32,
+        aether_protocol::ui::Edges,
+        aether_protocol::ui::Band,
+        Vec<Element>,
+    );
+    let mut open: Option<OpenBox> = None;
+    let close = |children: &mut Vec<Element>, b: OpenBox| {
+        let (_, edges, band, kids) = b;
+        children.push(Element::Column {
+            edges,
+            band,
+            children: kids,
+        });
+    };
     for r in rendered {
-        children.extend(r.chrome_above.iter().cloned());
-        children.push(node_of(r));
+        let group = r.box_group;
+        // Close a box the moment its run ends — a different key, or none at all.
+        if let Some(b) = open.take() {
+            if group == Some(b.0) {
+                open = Some(b);
+            } else {
+                close(&mut children, b);
+            }
+        }
+        if open.is_none() {
+            if let Some(g) = group {
+                open = Some((g, r.edges, r.band, Vec::new()));
+            }
+        }
+        let into = match &mut open {
+            Some((_, _, _, kids)) => kids,
+            None => &mut children,
+        };
+        into.extend(r.chrome_above.iter().cloned());
+        into.push(node_of(r));
+    }
+    if let Some(b) = open {
+        close(&mut children, b);
     }
     // The closing rule has no line to sit above: the patch ends without a trailing newline, so
     // there is no empty last line to anchor it to. As a sibling it simply comes last.
     children.extend(trailing_chrome.iter().cloned());
-    Element::Stack { children }
+    Element::column(children)
 }
 
 /// The match set to paint for `(client, buffer)`: the active search if there is one, else the LSP
@@ -2848,6 +2926,47 @@ mod slice_tests {
         }
     }
 
+    /// A box narrows what its element is wrapped to, and never below the floor.
+    ///
+    /// This is the arithmetic that makes a frame *structure* rather than styling: the server wraps
+    /// to the width the box leaves, so an inset element's lines break where the box ends rather
+    /// than where the viewport does. The shell cannot do this subtraction itself — it does not know
+    /// the tree until the window arrives, and the window's wrapping depends on the answer.
+    #[test]
+    fn a_box_narrows_the_wrap_and_clamps_rather_than_collapsing() {
+        use aether_protocol::ui::{Edges, Sides};
+
+        // No box: byte-for-byte the viewport's own geometry, which is what keeps every ordinary
+        // view untouched by this stage.
+        assert_eq!(inset(geom(80), Edges::NONE).cols, 80);
+
+        // A border and a padding cell either side: four columns gone.
+        let boxed = Edges {
+            border: Sides::all(1),
+            padding: Sides::all(1),
+            collapse: true,
+        };
+        assert_eq!(boxed.horizontal(), 4);
+        assert_eq!(inset(geom(80), boxed).cols, 76);
+
+        // Vertical sides do not touch the wrap — they cost rows, not columns.
+        let tall = Edges {
+            border: Sides {
+                top: 1,
+                bottom: 1,
+                ..Sides::ZERO
+            },
+            ..Edges::NONE
+        };
+        assert_eq!(inset(geom(80), tall).cols, 80);
+
+        // Clamped, not collapsed: a viewport narrower than the box keeps a usable measure instead
+        // of the frame vanishing at a threshold. Degrades smoothly; no discontinuity on resize.
+        assert_eq!(inset(geom(12), boxed).cols, MIN_CONTENT_COLS);
+        assert_eq!(inset(geom(4), boxed).cols, MIN_CONTENT_COLS);
+        assert_eq!(inset(geom(0), boxed).cols, MIN_CONTENT_COLS);
+    }
+
     fn whole(doc: &Document) -> BufferRange {
         let binding = ElementBinding {
             buffer_id: 1,
@@ -2855,6 +2974,9 @@ mod slice_tests {
             decorations: None,
             chrome_above: Default::default(),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            edges: aether_protocol::ui::Edges::NONE,
+            box_group: None,
+            band: aether_protocol::ui::Band::None,
         };
         ViewLayout::of(std::slice::from_ref(&binding), |_| doc.line_count()).element_range(0)
     }
@@ -2967,6 +3089,9 @@ mod tests {
                         decorations: None,
                         chrome_above: Default::default(),
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        edges: aether_protocol::ui::Edges::NONE,
+                        box_group: None,
+                        band: aether_protocol::ui::Band::None,
                     })
                     .collect(),
             },
@@ -3003,15 +3128,10 @@ mod tests {
     /// loaded element says where its slice sits instead.
     #[test]
     fn chrome_travels_with_its_element_not_with_a_document() {
-        use aether_protocol::ui::{Element, RailJoin};
-        use aether_protocol::viewport::ChromeKind;
+        use aether_protocol::ui::Element;
 
         let heading = |text: &str| {
-            std::sync::Arc::new(vec![Element::Chrome {
-                kind: ChromeKind::FileHeader,
-                rail: RailJoin::Opens,
-                children: vec![Element::text(text, Vec::new())],
-            }])
+            std::sync::Arc::new(vec![Element::chrome(vec![Element::text(text, Vec::new())])])
         };
 
         let mut s = ServerState::new();
@@ -3032,10 +3152,10 @@ mod tests {
             let mut out = Vec::new();
             fn walk(n: &Element, out: &mut Vec<String>) {
                 match n {
-                    Element::Chrome { children, .. } => {
+                    Element::Row { children, .. } => {
                         out.push(children.iter().map(Element::text_content).collect())
                     }
-                    Element::Stack { children } => children.iter().for_each(|c| walk(c, out)),
+                    Element::Column { children, .. } => children.iter().for_each(|c| walk(c, out)),
                     _ => {}
                 }
             }
@@ -3215,6 +3335,9 @@ mod tests {
             decorations: None,
             chrome_above: Default::default(),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            edges: aether_protocol::ui::Edges::NONE,
+            box_group: None,
+            band: aether_protocol::ui::Band::None,
         };
         let vp = viewport_over(&mut s, vec![a, b]); // no generated view behind these plain buffers
         *elements_mut(&mut s, &vp) = vec![binding(a), binding(b)];
