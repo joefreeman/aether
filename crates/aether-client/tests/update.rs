@@ -9,22 +9,20 @@ use aether_client::transport::RpcError;
 use aether_protocol::ViewId;
 use serde_json::json;
 
-const ROWS: u32 = 40;
-
 fn session() -> Session {
     Session::placeholder()
 }
 
 fn key(s: &mut Session, c: char) -> Effects {
-    s.on_key(KeyCode::Char(c), Mods::NONE, Some(c.to_string()), ROWS)
+    s.on_key(KeyCode::Char(c), Mods::NONE, Some(c.to_string()))
 }
 
 fn ctrl(s: &mut Session, c: char) -> Effects {
-    s.on_key(KeyCode::Char(c), Mods::CTRL, None, ROWS)
+    s.on_key(KeyCode::Char(c), Mods::CTRL, None)
 }
 
 fn ctrl_alt(s: &mut Session, c: char) -> Effects {
-    s.on_key(KeyCode::Char(c), Mods::CTRL_ALT, None, ROWS)
+    s.on_key(KeyCode::Char(c), Mods::CTRL_ALT, None)
 }
 
 /// No `Effect::Request` in `fx` — the input was swallowed (hint/toast effects may still ride).
@@ -254,7 +252,7 @@ fn goto_line_from_end_counts_up_from_the_bottom() {
     });
 
     let alt_g = |s: &mut Session| -> serde_json::Value {
-        let fx = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+        let fx = s.on_key(KeyCode::Char('g'), Mods::ALT, None);
         let (_, method, params) = the_request(&fx);
         assert_eq!(method, "element/move");
         params["motion"].clone()
@@ -276,7 +274,7 @@ fn goto_line_from_end_counts_up_from_the_bottom() {
     assert_eq!(counted["count"].as_u64().unwrap(), 3);
 
     // And its mirror: bare `g` asks for the field's start rather than absolute line 0.
-    let fx = s.on_key(KeyCode::Char('g'), Mods::NONE, Some("g".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('g'), Mods::NONE, Some("g".into()));
     let (_, _, params) = the_request(&fx);
     assert_eq!(params["motion"]["kind"], "buffer_start");
 }
@@ -437,7 +435,7 @@ fn shift_extends_hunk_and_diagnostic_navigation() {
     let press = |c: char, mods: Mods| -> serde_json::Value {
         let mut s = session();
         s.view.viewport_id = Some(7);
-        let fx = s.on_key(KeyCode::Char(c), mods, None, ROWS);
+        let fx = s.on_key(KeyCode::Char(c), mods, None);
         the_request(&fx).2
     };
 
@@ -462,7 +460,7 @@ fn shift_extends_symbol_navigation() {
     let press = |mods: Mods| -> serde_json::Value {
         let mut s = session();
         s.view.viewport_id = Some(7);
-        let fx = s.on_key(KeyCode::Char('o'), mods, None, ROWS);
+        let fx = s.on_key(KeyCode::Char('o'), mods, None);
         let (_, method, params) = the_request(&fx);
         assert_eq!(method, "view/navigate_change");
         params
@@ -490,7 +488,7 @@ fn shift_arrow_in_insert_mode_does_not_extend_selection() {
     key(&mut s, 'i');
     assert_eq!(s.view.mode, aether_client::session::Mode::Insert);
 
-    let fx = s.on_key(KeyCode::Right, Mods::SHIFT, None, ROWS);
+    let fx = s.on_key(KeyCode::Right, Mods::SHIFT, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "element/move");
     assert_eq!(params["extend_selection"], json!(false));
@@ -730,7 +728,7 @@ fn save_as_prompt_is_value_synced_not_keycode_edited() {
         other => panic!("expected the save-as prompt, got {other:?}"),
     }
     // Esc is a command the core owns: it closes the prompt.
-    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(s.prompt.is_none(), "Esc closes the save-as prompt");
 }
 
@@ -742,8 +740,8 @@ fn save_as_completes_dir_and_files_then_saves_the_literal_path() {
     let mut s = session();
     s.workspace_paths = vec!["/p".into()];
     // `Space Alt-s` opens the save-as prompt and fires a directory/list for the root (empty path).
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('s'), Mods::ALT, None);
     let params = find_request(&fx, "directory/list").expect("open fires a directory/list");
     assert_eq!(params["path"], json!("/p"));
 
@@ -787,7 +785,7 @@ fn save_as_completes_dir_and_files_then_saves_the_literal_path() {
 
     // Enter saves the *literal* typed path (not the highlighted suggestion).
     let _ = s.save_as_set_input("notes.md".into());
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let params = find_request(&fx, "buffer/save").expect("Enter saves");
     assert_eq!(params["relative_path"], json!("notes.md"));
     assert_eq!(params["path_index"], json!(0));
@@ -803,12 +801,12 @@ fn save_as_overwrite_confirms_then_retries_with_the_flag_set() {
     use aether_protocol::error::ErrorCode;
     let mut s = session();
     s.workspace_paths = vec!["/p".into()];
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, None);
     let _ = s.save_as_set_input("existing.md".into());
 
     // Enter saves with the confirm flag unset.
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let params = find_request(&fx, "buffer/save").expect("Enter saves");
     assert_eq!(params["overwrite"], json!(false));
     let token = match fx.0.iter().find_map(|e| match e {
@@ -850,8 +848,8 @@ fn save_as_overwrite_confirms_then_retries_with_the_flag_set() {
 fn space_alt_q_saves_then_quits_on_success() {
     let mut s = session();
     s.workspace_paths = vec!["/p".into()];
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None);
     // Saves in place (overwrite:false), and does NOT quit yet.
     let params = find_request(&fx, "view/save").expect("Space Alt-q saves first");
     assert_eq!(params["overwrite"], json!(false));
@@ -868,8 +866,8 @@ fn space_alt_q_saves_then_quits_on_success() {
 fn space_alt_q_does_not_quit_when_the_save_fails() {
     let mut s = session();
     s.workspace_paths = vec!["/p".into()];
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None);
     let token = save_token(&fx);
     let fx = s.on_rpc_result(
         token,
@@ -892,8 +890,8 @@ fn space_alt_q_survives_the_external_modify_confirm() {
     use aether_protocol::error::ErrorCode;
     let mut s = session();
     s.workspace_paths = vec!["/p".into()];
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None);
     let token = save_token(&fx);
 
     // The file changed on disk → the server refuses; a confirm is raised, still no quit.
@@ -939,10 +937,10 @@ fn declining_save_as_overwrite_reopens_the_prompt_prefilled() {
     use aether_protocol::error::ErrorCode;
     let mut s = session();
     s.workspace_paths = vec!["/p".into()];
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, None);
     let _ = s.save_as_set_input("existing.md".into());
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let token = match fx.0.iter().find_map(|e| match e {
         Effect::Request { token, method, .. } if *method == "buffer/save" => Some(*token),
         _ => None,
@@ -985,7 +983,7 @@ fn confirm_enter_declines_and_only_y_accepts() {
     // Enter dismisses the confirm without running the action.
     let mut s = session();
     stage(&mut s);
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(s.prompt.is_none(), "Enter dismisses the confirm");
     assert!(
         find_request(&fx, "buffer/reload").is_none(),
@@ -994,14 +992,14 @@ fn confirm_enter_declines_and_only_y_accepts() {
 
     // `y` accepts → the action runs (reload forced).
     stage(&mut s);
-    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
     assert!(s.prompt.is_none());
     let params = find_request(&fx, "buffer/reload").expect("`y` runs the confirmed action");
     assert_eq!(params["force"], json!(true));
 
     // `Y` (shifted) accepts too.
     stage(&mut s);
-    let fx = s.on_key(KeyCode::Char('Y'), Mods::NONE, Some("Y".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('Y'), Mods::NONE, Some("Y".into()));
     assert!(
         find_request(&fx, "buffer/reload").is_some(),
         "`Y` also accepts"
@@ -1098,7 +1096,7 @@ fn focusing_another_buffer_rebinds_the_view_content_but_not_its_identity() {
     s.view.view_buffer = 10;
     s.view.buffer.buffer_id = 10;
 
-    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
     let (token, method, _) = the_request(&fx);
     assert_eq!(method, "view/focus_element");
 
@@ -1187,17 +1185,17 @@ fn tab_steps_focus_between_editor_elements() {
     let mut s = session();
 
     // No viewport yet: nothing to focus within.
-    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
     assert!(no_request(&fx), "no viewport, no focus step");
 
     s.view.viewport_id = Some(7);
-    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "view/focus_element");
     assert_eq!(params["target"], json!({"to": "step", "direction": "next"}));
     assert_eq!(params["viewport_id"], 7);
 
-    let fx = s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::BackTab, Mods::NONE, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "view/focus_element");
     assert_eq!(
@@ -1648,7 +1646,7 @@ fn chip_editor_is_value_synced_not_keycode_edited() {
     s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
     // Alt-g opens the glob filter editor (a chip-editor line).
-    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None);
     let glob_open = |s: &Session| -> String {
         s.picker
             .as_ref()
@@ -1662,7 +1660,7 @@ fn chip_editor_is_value_synced_not_keycode_edited() {
     };
     assert_eq!(glob_open(&s), "");
     // A typed char reaching the core must NOT edit the value — that's the shell input's job.
-    let _ = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()));
     assert_eq!(
         glob_open(&s),
         "",
@@ -1672,7 +1670,7 @@ fn chip_editor_is_value_synced_not_keycode_edited() {
     let _ = s.chip_editor_set_input("*.rs".into());
     assert_eq!(glob_open(&s), "*.rs");
     // Esc is a command the core owns: it closes the editor.
-    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(s.picker.as_ref().unwrap().chip_editor.is_none());
 }
 
@@ -1692,7 +1690,7 @@ fn picker_query_is_value_synced_and_chip_row_gestures_work() {
     );
     // Add a filter chip (Alt-w → whole-word), then drive the chip-row gesture the shell forwards
     // only from the query start: Left selects the rightmost chip.
-    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None);
     assert!(s
         .picker
         .as_ref()
@@ -1700,10 +1698,10 @@ fn picker_query_is_value_synced_and_chip_row_gestures_work() {
         .chips
         .iter()
         .any(|c| matches!(c, ChipValue::Word)));
-    let _ = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Left, Mods::NONE, None);
     assert_eq!(s.picker.as_ref().unwrap().chip_selected, Some(0));
     // Typing while a chip is selected deselects it and lands the char in the query (append).
-    let _ = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()));
     let p = s.picker.as_ref().unwrap();
     assert_eq!(p.chip_selected, None, "typing deselects the chip");
     assert_eq!(p.query, "foox", "the typed char lands in the query");
@@ -1718,7 +1716,7 @@ fn files_picker_alt_dot_hides_hidden_with_explorer_polarity() {
     let _ = s.open_picker(PickerKind::Files, None, None, false, None);
     // Files shows hidden files by default; Alt-. *hides* them — the Explorer's inverted polarity,
     // not Grep's `+hidden`. So the chip records `hide: true` and wires to `hide_hidden`.
-    let fx = s.on_key(KeyCode::Char('.'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('.'), Mods::ALT, None);
     assert!(
         s.picker
             .as_ref()
@@ -1736,7 +1734,7 @@ fn files_picker_alt_dot_hides_hidden_with_explorer_polarity() {
         params["filters"]
     );
     // Alt-. again clears the chip.
-    let _ = s.on_key(KeyCode::Char('.'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('.'), Mods::ALT, None);
     assert!(
         !s.picker
             .as_ref()
@@ -1758,12 +1756,12 @@ fn jumplist_path_chips_gate_on_the_path_filterable_echo() {
 
     // Before the view result lands (and whenever the capture isn't worth scoping — one file,
     // or nothing in-root) the dir/glob chords are clean no-ops.
-    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None);
     assert!(
         s.picker.as_ref().unwrap().chip_editor.is_none(),
         "Alt-g must not open the glob editor without the path_filterable echo"
     );
-    let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None);
     assert!(s.picker.as_ref().unwrap().chip_editor.is_none());
 
     // The server says this capture spans in-root files → the path chips apply.
@@ -1785,16 +1783,16 @@ fn jumplist_path_chips_gate_on_the_path_filterable_echo() {
         initial: true,
         result: Ok(view),
     });
-    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None);
     assert!(
         s.picker.as_ref().unwrap().chip_editor.is_some(),
         "Alt-g opens the glob editor once the echo lands"
     );
-    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None);
 
     // The pattern chips never apply to the Jumplist — its query is a fuzzy match over the
     // captured row text, not a content regex — regardless of the flag.
-    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None);
     assert!(
         s.picker.as_ref().unwrap().chips.is_empty(),
         "Alt-w stays a no-op on the Jumplist picker"
@@ -1810,27 +1808,27 @@ fn workspace_symbols_picker_offers_path_chips_and_removal_requeries() {
 
     // Unlike the Jumplist there is no data gate — results are live and workspace-scoped, so
     // Alt-g opens the glob editor straight away, and typing live-previews through the query.
-    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None);
     assert!(s.picker.as_ref().unwrap().chip_editor.is_some());
     let fx = s.chip_editor_set_input("*.rs".into());
     let params = find_request(&fx, "picker/query").expect("the glob preview re-queries");
     assert_eq!(params["filters"]["globs"], json!(["*.rs"]));
 
     // Enter commits the chip.
-    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert_eq!(s.picker.as_ref().unwrap().chips.len(), 1);
 
     // Left (at the empty query's start) selects the chip; Backspace removes it — and the
     // removal must reach the server as a re-query with the filter gone, not just reshape the
     // local chip row.
-    let _ = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
-    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Left, Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None);
     assert!(s.picker.as_ref().unwrap().chips.is_empty());
     let params = find_request(&fx, "picker/query").expect("chip removal re-queries");
     assert_eq!(params["filters"]["globs"], json!(null));
 
     // The pattern chips never apply — the LSP server ran the match, not our regex engine.
-    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None);
     assert!(s.picker.as_ref().unwrap().chips.is_empty());
 }
 
@@ -1859,15 +1857,15 @@ fn jumplist_chip_removal_requeries() {
         initial: true,
         result: Ok(view),
     });
-    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None);
     let _ = s.chip_editor_set_input("*.rs".into());
-    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert_eq!(s.picker.as_ref().unwrap().chips.len(), 1);
 
     // Regression: removal used to reshape the chip row without telling the server, leaving the
     // results filtered by a chip that was no longer showing.
-    let _ = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
-    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Left, Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None);
     assert!(s.picker.as_ref().unwrap().chips.is_empty());
     let params = find_request(&fx, "picker/query").expect("chip removal re-queries");
     assert_eq!(params["filters"]["globs"], json!(null));
@@ -1993,12 +1991,12 @@ fn alt_l_opens_the_highlighted_row_like_enter() {
     p.selected = 1;
     // Alt-h has no counterpart on a flat kind — you can't un-open — and it must not wipe the
     // query (that ladder is Alt-Backspace's). Checked first: Alt-l closes the picker below.
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     assert!(no_request(&fx));
     assert_eq!(s.picker.as_ref().unwrap().selected, 1);
     // A flat kind has no level below its rows, so "deeper" is the row itself: Alt-l resolves the
     // pick exactly as Enter does.
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     let params = find_request(&fx, "picker/select").expect("Alt-l selects the highlighted row");
     assert_eq!(params["kind"], "files");
     assert_eq!(params["item"]["relative_path"], json!("src/f1.rs"));
@@ -2027,10 +2025,10 @@ fn alt_l_leaves_inert_rows_alone() {
         .collect();
     p.total_matches = 6;
     p.selected = 4;
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     assert!(no_request(&fx), "a keybinding row isn't a jump target");
     assert_eq!(s.picker.as_ref().unwrap().selected, 4, "and nothing moves");
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     assert!(no_request(&fx));
 }
 
@@ -2053,7 +2051,7 @@ fn alt_l_declines_the_create_row() {
         s.picker.as_ref().unwrap().selected_is_create(),
         "fixture should land on the synthetic create row",
     );
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     assert!(no_request(&fx));
     assert_eq!(s.picker.as_ref().unwrap().query, "novel.rs");
 }
@@ -2117,7 +2115,7 @@ fn alt_l_expands_the_highlighted_group_and_enters_it() {
     // On a collapsed header: Alt-l expands the group and moves into it. The reply's geometry is
     // what seats the selection, so the row waits for the round trip.
     s.picker.as_mut().unwrap().selected = 0;
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     let params = find_request(&fx, "picker/set_group").expect("Alt-l expands the group");
     assert_eq!(params["kind"], "grep");
     assert_eq!(params["action"]["action"], "expand");
@@ -2141,7 +2139,7 @@ fn alt_l_expands_the_highlighted_group_and_enters_it() {
         p.selected = 1;
         p.level = aether_client::picker::PickerLevel::Group;
     }
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     let params = find_request(&fx, "picker/set_group").expect("Alt-l re-enters an open group");
     assert_eq!(params["action"]["action"], "expand");
     assert_eq!(params["action"]["header"]["relative_path"], "b.rs");
@@ -2157,7 +2155,7 @@ fn alt_l_on_a_group_item_opens_it() {
     // Header → first item (the expand above), then one press further: an item row has no level
     // below it, so Alt-l opens the hit and the picker closes. It used to be a dead key here.
     s.picker.as_mut().unwrap().selected = 1;
-    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     let _ = s.on_event(Event::GroupSet(
         Ok(Some(GroupRunRows {
             header_row: 1,
@@ -2165,7 +2163,7 @@ fn alt_l_on_a_group_item_opens_it() {
         })),
         GroupLanding::RunStart,
     ));
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     let params = find_request(&fx, "picker/select").expect("Alt-l opens the hit");
     assert_eq!(params["kind"], "grep");
     assert_eq!(params["item"]["relative_path"], json!("b.rs"));
@@ -2190,7 +2188,7 @@ fn alt_h_collapses_the_group_and_never_touches_the_query() {
         p.selected = 3;
         p.level = aether_client::picker::PickerLevel::Item;
     }
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     let params = find_request(&fx, "picker/set_group").expect("Alt-h collapses the group");
     assert_eq!(params["action"]["action"], "collapse");
     assert_eq!(params["action"]["header"]["relative_path"], "b.rs");
@@ -2220,7 +2218,7 @@ fn alt_h_collapses_the_group_and_never_touches_the_query() {
     let p = s.picker.as_mut().unwrap();
     p.selected = 0;
     p.query = "needle".into();
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     assert!(no_request(&fx));
     assert_eq!(
         s.picker.as_ref().unwrap().query,
@@ -2228,7 +2226,7 @@ fn alt_h_collapses_the_group_and_never_touches_the_query() {
         "the query survives Alt-h"
     );
     // Alt-Backspace is the unwind: clear the query — and never a group gesture.
-    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert!(find_request(&fx, "picker/set_group").is_none());
     assert!(
         find_request(&fx, "picker/query").is_some(),
@@ -2246,7 +2244,7 @@ fn alt_jk_step_groups_at_group_level_and_walk_the_run_at_item_level() {
     // Group level (selection on a header): Alt-j/k are a server-resolved group *step* — the
     // neighbour may sit past the fetched window.
     s.picker.as_mut().unwrap().selected = 1;
-    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     let params = find_request(&fx, "picker/set_group").expect("group-level Alt-j steps");
     assert_eq!(params["action"]["action"], "step");
     assert_eq!(params["action"]["direction"], "forward");
@@ -2257,14 +2255,14 @@ fn alt_jk_step_groups_at_group_level_and_walk_the_run_at_item_level() {
     // Resolve the gesture (a stop releases the single-flight guard at reply time — no
     // reshaping push follows a stop) so the next key isn't swallowed.
     let _ = s.on_event(Event::GroupSet(Ok(None), GroupLanding::Header));
-    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None);
     let params = find_request(&fx, "picker/set_group").expect("group-level Alt-k steps");
     assert_eq!(params["action"]["direction"], "backward");
     let _ = s.on_event(Event::GroupSet(Ok(None), GroupLanding::Header));
     // Item level — entered by the *expand gesture* (Alt-l), which is what flips the stored
     // level bit; poking `selected` into the run alone must not (that's the held-key guard,
     // see `PickerLevel`). Local moves clamp to the run.
-    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     let _ = s.on_event(Event::GroupSet(
         Ok(Some(aether_protocol::picker::GroupRunRows {
             header_row: 1,
@@ -2274,14 +2272,14 @@ fn alt_jk_step_groups_at_group_level_and_walk_the_run_at_item_level() {
     ));
     s.picker.as_mut().unwrap().group_gesture_in_flight = false;
     assert_eq!(s.picker.as_ref().unwrap().selected, 2);
-    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     assert!(find_request(&fx, "picker/set_group").is_none());
     assert_eq!(s.picker.as_ref().unwrap().selected, 3);
     // At the run's last row Alt-j *spills* into the next group — an RPC, not a local
     // walk-out; the selection waits for the reply. A spill walks into the neighbour's items,
     // so it opens it (and leaves this run open). (Landings are exercised in
     // item_level_spills_across_group_edges.)
-    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     let params = find_request(&fx, "picker/set_group").expect("edge spill steps the group");
     assert_eq!(params["action"]["direction"], "forward");
     assert_eq!(
@@ -2291,11 +2289,11 @@ fn alt_jk_step_groups_at_group_level_and_walk_the_run_at_item_level() {
     assert_eq!(s.picker.as_ref().unwrap().selected, 3);
     let _ = s.on_event(Event::GroupSet(Ok(None), GroupLanding::RunStart)); // the very end: a stop
                                                                            // Back inside, Alt-k walks locally…
-    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None);
     assert!(find_request(&fx, "picker/set_group").is_none());
     assert_eq!(s.picker.as_ref().unwrap().selected, 2);
     // …and at the run's first row it spills backward.
-    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None);
     let params = find_request(&fx, "picker/set_group").expect("upward spill steps back");
     assert_eq!(params["action"]["direction"], "backward");
 }
@@ -2315,7 +2313,7 @@ fn alt_a_toggles_every_group_and_keeps_the_selection() {
         p.selected = 3;
         p.level = PickerLevel::Item;
     }
-    let fx = s.on_key(KeyCode::Char('a'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('a'), Mods::ALT, None);
     let params = find_request(&fx, "picker/set_group").expect("Alt-a toggles every group");
     assert_eq!(params["kind"], "grep");
     assert_eq!(params["action"], json!({ "action": "toggle_all" }));
@@ -2361,7 +2359,7 @@ fn alt_a_toggles_every_group_and_keeps_the_selection() {
     let mut s = session();
     let _ = s.open_picker(PickerKind::Files, None, None, false, None);
     s.picker.as_mut().unwrap().query = "needle".into();
-    let fx = s.on_key(KeyCode::Char('a'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('a'), Mods::ALT, None);
     assert!(no_request(&fx));
     assert_eq!(s.picker.as_ref().unwrap().query, "needle");
 }
@@ -2380,10 +2378,10 @@ fn held_group_step_keeps_stepping_through_the_reply_push_gap() {
     let mut s = session();
     grep_with_groups(&mut s);
     s.picker.as_mut().unwrap().selected = 1; // b.rs's header — group level
-    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     assert!(find_request(&fx, "picker/set_group").is_some());
     // A repeat while the gesture is mid-reshape is swallowed, not misrouted.
-    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     assert!(no_request(&fx), "repeat during the gesture is swallowed");
     // The reply lands the next group's header row *in the incoming row space* (row 2), while
     // the stale local `focus_run` ({header_row: 1, len: 2}) still claims rows 2..=3 as
@@ -2398,7 +2396,7 @@ fn held_group_step_keeps_stepping_through_the_reply_push_gap() {
     assert_eq!(s.picker.as_ref().unwrap().selected, 2);
     // A repeat in the reply→push gap: still swallowed — and crucially NOT a local walk into
     // the stale interval.
-    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     assert!(no_request(&fx));
     assert_eq!(s.picker.as_ref().unwrap().selected, 2, "no local walk");
     // The reshaping push adopts (fresh run + guard release): stepping resumes.
@@ -2410,7 +2408,7 @@ fn held_group_step_keeps_stepping_through_the_reply_push_gap() {
         });
         p.group_gesture_in_flight = false;
     }
-    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     let params = find_request(&fx, "picker/set_group").expect("stepping resumes after adoption");
     assert_eq!(params["action"]["direction"], "forward");
 }
@@ -2427,7 +2425,7 @@ fn item_level_spills_across_group_edges() {
     grep_with_groups(&mut s);
     // Enter b.rs's run (header row 1, items 2..=3) and walk to its last item.
     s.picker.as_mut().unwrap().selected = 1;
-    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS); // expand + enter
+    let _ = s.on_key(KeyCode::Char('l'), Mods::ALT, None); // expand + enter
     let _ = s.on_event(Event::GroupSet(
         Ok(Some(GroupRunRows {
             header_row: 1,
@@ -2436,10 +2434,10 @@ fn item_level_spills_across_group_edges() {
         GroupLanding::RunStart,
     )); // → 2
     s.picker.as_mut().unwrap().group_gesture_in_flight = false;
-    let _ = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS); // → 3 (last)
-                                                                 // Down off the last item: the same step RPC as group navigation — the landing intent
-                                                                 // stays client-side.
-    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('j'), Mods::ALT, None); // → 3 (last)
+                                                           // Down off the last item: the same step RPC as group navigation — the landing intent
+                                                           // stays client-side.
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     let params = find_request(&fx, "picker/set_group").expect("edge spill steps the group");
     assert_eq!(params["action"]["direction"], "forward");
     assert_eq!(params["action"]["expand"], true);
@@ -2485,7 +2483,7 @@ fn item_level_spills_across_group_edges() {
         });
         p.group_gesture_in_flight = false;
     }
-    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None);
     assert!(find_request(&fx, "picker/set_group").is_none());
     assert_eq!(s.picker.as_ref().unwrap().selected, 3, "local move resumes");
 }
@@ -2498,10 +2496,10 @@ fn alt_h_is_unbound_in_flat_pickers() {
     let mut s = session();
     let _ = s.open_picker(PickerKind::Files, None, None, false, None);
     s.picker.as_mut().unwrap().query = "needle".into();
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     assert!(no_request(&fx));
     assert_eq!(s.picker.as_ref().unwrap().query, "needle");
-    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert!(
         find_request(&fx, "picker/query").is_some(),
         "Alt-Backspace still clears"
@@ -2523,7 +2521,7 @@ fn explorer_alt_h_ascends_regardless_of_the_query() {
     // Alt-h is the structural mirror of Alt-l's descend: one press ascends the breadcrumb even
     // with a query typed (navigation starts a fresh listing) — clearing the query *first* and
     // staying put is Alt-Backspace's unwind, not Alt-h's.
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     let view = find_request(&fx, "picker/view").expect("ascends via picker/view");
     assert_eq!(view["directory_path"], json!("/proj/src"));
 }
@@ -2536,7 +2534,7 @@ fn enter_on_a_group_header_jumps_to_its_first_item() {
     // to the group's first item — so type-query-then-Enter takes the top hit without a mandatory
     // descend. The picker closes like any accept.
     s.picker.as_mut().unwrap().selected = 0;
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(find_request(&fx, "picker/set_group").is_none());
     let params = find_request(&fx, "picker/select").expect("Enter selects the header");
     assert_eq!(params["item"]["kind"], "group");
@@ -2632,7 +2630,7 @@ fn enter_on_a_keybinding_row_is_a_noop() {
     }];
     p.total_matches = 1;
     // Informational rows: Enter does nothing — the panel stays open, no hide, no `picker/select`.
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         s.picker.is_some(),
         "Enter leaves the keybindings picker open"
@@ -2669,14 +2667,14 @@ fn closing_the_lsp_dialog_returns_to_the_picker() {
         p.selected = 0;
     }
     // Enter drills into the detail dialog, but the picker stays open underneath.
-    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(matches!(s.prompt, Some(Prompt::LspInfo(_))), "dialog opens");
     assert!(
         s.picker.is_some(),
         "the LSP picker stays open underneath the dialog"
     );
     // Closing the dialog (Esc) returns to the picker rather than the editor.
-    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(s.prompt.is_none(), "dialog closed");
     assert!(s.picker.is_some(), "back at the LSP picker, not the editor");
 }
@@ -2711,7 +2709,7 @@ fn lsp_dialog_working_field_tracks_live_picker_progress() {
         p.items = vec![server(0)];
         p.selected = 0;
     }
-    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None);
 
     // The LSP picker refreshes with new progress (a `report` — no `lsp/status_changed`); the open
     // dialog's Working line must follow it, not freeze at the opening 0% snapshot.
@@ -2754,10 +2752,10 @@ fn space_question_opens_the_app_info_dialog() {
     use aether_client::update::Event;
 
     let mut s = session();
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
     // A terminal reports `?` with SHIFT held; the binding uses `IgnoreShift` so both that and the
     // GUI/web's already-resolved character hit it.
-    let fx = s.on_key(KeyCode::Char('?'), Mods::SHIFT, Some("?".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('?'), Mods::SHIFT, Some("?".into()));
     assert!(
         find_request(&fx, "app/info").is_some(),
         "the dialog's content is fetched from the server"
@@ -2780,8 +2778,8 @@ fn space_question_opens_client_side_info_while_disconnected() {
         attempt: 0,
         had_unsaved: false,
     };
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('?'), Mods::SHIFT, Some("?".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('?'), Mods::SHIFT, Some("?".into()));
     assert!(
         !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
         "nothing to fetch while disconnected"
@@ -2801,7 +2799,7 @@ fn app_info_ctrl_c_copies_and_keeps_the_dialog_open() {
 
     let mut s = session();
     s.prompt = Some(Prompt::AppInfo(Some(Box::new(app_info()))));
-    let fx = s.on_key(KeyCode::Char('c'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('c'), Mods::CTRL, None);
     let copied = written_clipboard(&fx).expect("Ctrl-c copies");
     // The copied text is the rendered dialog, so a row can't exist in one and not the other.
     assert!(copied.contains("0.9.9") && copied.contains("dev") && copied.contains("Paths"));
@@ -2811,12 +2809,12 @@ fn app_info_ctrl_c_copies_and_keeps_the_dialog_open() {
     );
 
     // A bare `c` is not the copy chord — it closes like any other key.
-    let fx = s.on_key(KeyCode::Char('c'), Mods::NONE, Some("c".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('c'), Mods::NONE, Some("c".into()));
     assert!(s.prompt.is_none(), "any other key closes");
     assert!(written_clipboard(&fx).is_none());
 
     s.prompt = Some(Prompt::AppInfo(Some(Box::new(app_info()))));
-    let fx = s.on_key(KeyCode::Char('q'), Mods::NONE, Some("q".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('q'), Mods::NONE, Some("q".into()));
     assert!(s.prompt.is_none(), "any other key closes");
     assert!(written_clipboard(&fx).is_none());
 }
@@ -2882,7 +2880,7 @@ fn lsp_info_restart_is_ctrl_r_not_plain_r() {
     // Plain `r` just closes the dialog — it must NOT restart (that was the old binding).
     let mut s = session();
     s.prompt = Some(Prompt::LspInfo(status()));
-    let fx = s.on_key(KeyCode::Char('r'), Mods::NONE, Some("r".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('r'), Mods::NONE, Some("r".into()));
     assert!(s.prompt.is_none(), "any non-Ctrl key closes the dialog");
     assert!(
         find_request(&fx, "lsp/restart_server").is_none(),
@@ -2891,7 +2889,7 @@ fn lsp_info_restart_is_ctrl_r_not_plain_r() {
 
     // Ctrl-r restarts the server AND keeps the dialog open, showing Restarting immediately.
     s.prompt = Some(Prompt::LspInfo(status()));
-    let fx = s.on_key(KeyCode::Char('r'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('r'), Mods::CTRL, None);
     assert!(
         find_request(&fx, "lsp/restart_server").is_some(),
         "Ctrl-r restarts"
@@ -2976,7 +2974,7 @@ fn lsp_restart_toasts_are_grouped_per_server_and_resolve_to_ready() {
 
     // Ctrl-r in the LSP info dialog emits a grouped "Restarting" toast keyed to this server.
     s.prompt = Some(Prompt::LspInfo(status(LspStatus::Ready)));
-    let fx = s.on_key(KeyCode::Char('r'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('r'), Mods::CTRL, None);
     assert_eq!(
         first_toast(&fx),
         Some(("Restarting rust-analyzer".into(), Some(group.clone()))),
@@ -3135,7 +3133,7 @@ fn glob_editor_live_previews_results_and_reverts_on_cancel() {
     s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None, false, None);
     // Open the glob editor — no chip committed yet, so nothing narrows.
-    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None);
     // Typing a glob folds the would-commit value into the live filters → a re-query carrying it,
     // even though no chip has been committed.
     let fx = s.chip_editor_set_input("*.rs".into());
@@ -3147,7 +3145,7 @@ fn glob_editor_live_previews_results_and_reverts_on_cancel() {
     );
     // Cancelling reverts the results to the committed (empty) set — the glob drops off the wire
     // (an empty `globs` is omitted by `skip_serializing_if`).
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     let params = find_request(&fx, "picker/query").expect("cancel reverts the preview");
     assert_eq!(params["filters"]["globs"], json!(null));
     assert!(s.picker.as_ref().unwrap().chip_editor.is_none());
@@ -3159,7 +3157,7 @@ fn degenerate_glob_preview_does_not_requery() {
     let mut s = session();
     s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None, false, None);
-    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None);
     // "*" normalizes away (match-everything) → the effective set is unchanged → no wasted
     // re-query (and no blank-and-refetch flash).
     let fx = s.chip_editor_set_input("*".into());
@@ -3178,7 +3176,7 @@ fn dir_editor_holds_while_listing_pending_then_previews_on_load() {
     s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None, false, None);
     // Alt-p opens the path-scope editor and fires a directory/list for the root.
-    let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None);
     // Type a leaf before the listing lands: the path's validity is unknown, so results are
     // held — no re-query flapping them wider for a frame.
     let fx = s.chip_editor_set_input("sr".into());
@@ -3224,7 +3222,7 @@ fn invalid_dir_path_preview_contributes_nothing() {
     let mut s = session();
     s.workspace_paths = vec!["/p".into()];
     let _ = s.open_picker(PickerKind::Files, None, None, false, None);
-    let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('p'), Mods::ALT, None);
     let _ = s.chip_editor_set_input("zzz".into());
     // The listing lands with no directory the leaf prefixes → the path is invalid → the preview
     // contributes nothing (results show as if the half-typed chip weren't there).
@@ -3301,7 +3299,7 @@ fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
     s.view.buffer = info;
 
     // Motions still work — reading a diff means moving around in it.
-    let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, Some("j".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, Some("j".into()));
     assert!(
         find_request(&fx, "element/move").is_some(),
         "navigation is unaffected"
@@ -3309,7 +3307,7 @@ fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
 
     // Edits are dropped with a warning rather than sent. The warning is grouped, so holding a key
     // down refreshes one toast in place instead of stacking a column of identical ones.
-    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None);
     assert!(no_request(&fx), "no edit RPC leaves the client");
     assert_eq!(
         first_toast(&fx),
@@ -3320,7 +3318,7 @@ fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
     );
 
     //...and `i` doesn't even change mode, so the next keystroke isn't text either.
-    let fx = s.on_key(KeyCode::Char('i'), Mods::NONE, Some("i".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('i'), Mods::NONE, Some("i".into()));
     assert!(no_request(&fx));
     assert!(matches!(s.view.mode, aether_client::session::Mode::Normal));
     // ...on the same key as the edit refusal: `i` then a delete is one toast, not two.
@@ -3338,16 +3336,16 @@ fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
         (KeyCode::Char('k'), Mods::CTRL, "element/move_lines up"),
         (KeyCode::Char('x'), Mods::CTRL, "buffer/cut"),
     ] {
-        let fx = s.on_key(key, mods, None, ROWS);
+        let fx = s.on_key(key, mods, None);
         assert!(no_request(&fx), "{what} left the client");
     }
 
     // The same gestures on a writable buffer do reach the wire — what's being asserted above is
     // the refusal, not three inert bindings.
     s.view.buffer.read_only = false;
-    let fx = s.on_key(KeyCode::Char('j'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::CTRL, None);
     assert!(find_request(&fx, "element/move_lines").is_some());
-    let fx = s.on_key(KeyCode::Char('x'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::CTRL, None);
     assert!(find_request(&fx, "buffer/cut").is_some());
 }
 
@@ -3374,7 +3372,7 @@ fn enter_on_a_log_row_shows_the_commit() {
         }];
         p.selected = 0;
     }
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let params = find_request(&fx, "git/show").expect("Enter shows the commit");
     assert_eq!(params["repo_id"], json!("/p"));
     // The target is tagged: a commit's whole diff, not one file within it.
@@ -3412,7 +3410,7 @@ fn stash_picker_rows_preview_pop_apply_and_confirm_a_drop() {
     // Enter previews.
     let mut s = session();
     open(&mut s);
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let params = find_request(&fx, "git/show").expect("Enter previews the entry");
     assert_eq!(params["target"]["kind"], json!("commit"));
     assert_eq!(params["target"]["rev"], json!("abc1234def"));
@@ -3420,14 +3418,14 @@ fn stash_picker_rows_preview_pop_apply_and_confirm_a_drop() {
     // Ctrl-p pops; Ctrl-Alt-p applies without dropping.
     let mut s = session();
     open(&mut s);
-    let fx = s.on_key(KeyCode::Char('p'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::CTRL, None);
     let params = find_request(&fx, "git/stash_apply").expect("Ctrl-p pops");
     assert_eq!(params["oid"], json!("abc1234def"));
     assert_eq!(params["pop"], json!(true));
 
     let mut s = session();
     open(&mut s);
-    let fx = s.on_key(KeyCode::Char('p'), Mods::CTRL_ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::CTRL_ALT, None);
     let params = find_request(&fx, "git/stash_apply").expect("Ctrl-Alt-p applies");
     assert!(
         params.get("pop").is_none(),
@@ -3438,7 +3436,7 @@ fn stash_picker_rows_preview_pop_apply_and_confirm_a_drop() {
     // highlight can't redirect it.
     let mut s = session();
     open(&mut s);
-    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None);
     assert!(
         no_request(&fx),
         "nothing fires until the confirm is accepted"
@@ -3450,7 +3448,7 @@ fn stash_picker_rows_preview_pop_apply_and_confirm_a_drop() {
             ..
         }) if message.contains("WIP on main")
     ));
-    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
     let params = find_request(&fx, "git/stash_drop").expect("accepting drops it");
     assert_eq!(params["oid"], json!("abc1234def"));
 }
@@ -3547,7 +3545,7 @@ fn search_query_is_value_synced_not_keycode_edited() {
     let _ = s.search_set_query("ab".into());
     assert_eq!(s.view.search.query, "ab");
     // Esc is a command the core owns: it aborts search.
-    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert_eq!(s.view.mode, Mode::Normal, "Esc aborts search");
 }
 
@@ -3561,17 +3559,17 @@ fn search_alt_backspace_drops_one_query_word() {
     let _ = key(&mut s, '/');
     let _ = s.search_set_query("fn parse".into());
 
-    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert_eq!(s.view.search.query, "fn ");
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "search/set");
     assert_eq!(params["query"], json!("fn "));
 
-    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert_eq!(s.view.search.query, "");
     // Nothing left to take, and no ladder behind the search bar — its option chips have their own
     // toggle chords.
-    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert!(no_request(&fx));
     assert_eq!(s.view.search.query, "");
 }
@@ -3585,20 +3583,20 @@ fn search_option_toggles_cycle_and_ride_the_request() {
     let _ = s.search_set_query("foo".into());
 
     // Alt-e toggles regex; the new query goes back out with the options in the params.
-    let fx = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('e'), Mods::ALT, None);
     assert!(s.view.search.options.regex, "Alt-e enables regex");
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "search/set");
     assert_eq!(params["options"], json!({"regex": true}));
 
     // Alt-w toggles whole-word; Alt-c cycles smart -> sensitive -> insensitive -> smart.
-    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None);
     assert!(s.view.search.options.whole_word);
-    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None);
     assert_eq!(s.view.search.options.case, CaseMode::Sensitive);
-    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None);
     assert_eq!(s.view.search.options.case, CaseMode::Insensitive);
-    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None);
     assert_eq!(
         s.view.search.options.case,
         CaseMode::Smart,
@@ -3606,7 +3604,7 @@ fn search_option_toggles_cycle_and_ride_the_request() {
     );
 
     // Esc restores the pre-prompt options (a cancelled search reverts its toggles too).
-    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert_eq!(
         s.view.search.options,
         aether_protocol::picker::MatchOptions::default()
@@ -3625,9 +3623,9 @@ fn search_prompt_opens_with_default_options() {
     // Commit a regex, case-sensitive search.
     let _ = key(&mut s, '/');
     let _ = s.search_set_query("fn \\w+".into());
-    let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS);
-    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
-    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None);
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None);
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(s.view.search.active);
     assert!(s.view.search.options.regex && s.view.search.options.case == CaseMode::Sensitive);
 
@@ -3645,7 +3643,7 @@ fn search_prompt_opens_with_default_options() {
     assert_eq!(params.get("options"), None, "all-default options, skipped");
 
     // Esc puts the previous search back exactly as it was — query, active flag and options.
-    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert_eq!(s.view.search.query, "fn \\w+");
     assert!(s.view.search.active);
     assert!(s.view.search.options.regex && s.view.search.options.case == CaseMode::Sensitive);
@@ -3660,9 +3658,9 @@ fn search_from_selection_runs_at_default_options() {
     let mut s = session();
     let _ = key(&mut s, '/');
     let _ = s.search_set_query("foo".into());
-    let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS); // regex
-    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS); // whole-word
-    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None); // regex
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None); // whole-word
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None);
 
     let fx = s.search_from_selection();
     let (_, method, params) = the_request(&fx);
@@ -3683,39 +3681,39 @@ fn search_chip_row_select_navigate_cycle_remove() {
     let _ = key(&mut s, '/');
     let _ = s.search_set_query("foo".into());
     // Enable case (sensitive) and whole-word via the Alt-chords → two chips, none selected.
-    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
-    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None);
+    let _ = s.on_key(KeyCode::Char('w'), Mods::ALT, None);
     assert_eq!(s.view.search.option_chips().len(), 2);
     assert_eq!(s.view.search.chip_selected, None);
 
     // Left at the query start steps into the row, selecting the rightmost (word) chip; Left again
     // walks to the case chip; Right walks back.
-    let _ = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Left, Mods::NONE, None);
     assert_eq!(s.view.search.chip_selected, Some(1));
-    let _ = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Left, Mods::NONE, None);
     assert_eq!(s.view.search.chip_selected, Some(0));
-    let _ = s.on_key(KeyCode::Right, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Right, Mods::NONE, None);
     assert_eq!(s.view.search.chip_selected, Some(1));
 
     // Enter on the word chip toggles it off — the chip vanishes, selection clamps onto the case chip.
-    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(!s.view.search.options.whole_word);
     assert_eq!(s.view.search.option_chips().len(), 1);
     assert_eq!(s.view.search.chip_selected, Some(0));
 
     // Enter on the case chip cycles it (sensitive → insensitive); it stays present and selected.
-    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert_eq!(s.view.search.options.case, CaseMode::Insensitive);
     assert_eq!(s.view.search.chip_selected, Some(0));
 
     // Backspace removes the selected case chip; the row empties and selection clears.
-    let _ = s.on_key(KeyCode::Backspace, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Backspace, Mods::NONE, None);
     assert_eq!(s.view.search.options.case, CaseMode::Smart);
     assert!(s.view.search.option_chips().is_empty());
     assert_eq!(s.view.search.chip_selected, None);
 
     // Esc with no chip selected aborts search as usual.
-    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert_eq!(s.view.mode, aether_client::session::Mode::Normal);
 }
 
@@ -3728,6 +3726,31 @@ fn count_prefix_rides_the_request() {
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "element/join_lines");
     assert_eq!(params["count"], json!(3));
+}
+
+/// `100 Alt-j` sends the count the user typed, under the variant whose count the server refuses
+/// when it cannot honour it — the other half of the `100 j` / `100 Alt-j` pair.
+///
+/// `v` is what made these two differ: it borrowed this variant to carry a row span the shell
+/// derived from its own height, so the field could not mean "a count someone typed" and the server
+/// had to clamp both. The page motion has its own variant now (`read_v_rides_the_editor_half_page_motion`).
+#[test]
+fn a_counted_visual_row_motion_sends_the_typed_count() {
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    for c in "100".chars() {
+        let _ = key(&mut s, c);
+    }
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "element/move");
+    assert_eq!(params["motion"]["kind"], json!("visual_line"));
+    assert_eq!(params["motion"]["count"], json!(100));
+
+    // Uncounted, the same key is a bare step — which the server clamps rather than refuses.
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
+    let (_, _, params) = the_request(&fx);
+    assert_eq!(params["motion"]["count"], json!(1));
 }
 
 #[test]
@@ -3752,7 +3775,7 @@ fn ctrl_alt_g_unjoins_in_both_modes() {
 fn enter_is_newline_and_indent_in_insert() {
     let mut s = session();
     let _ = key(&mut s, 'i');
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "element/newline_and_indent");
     // Enter advances onto the new line — no parking.
@@ -3865,7 +3888,7 @@ fn symbol_highlight_follow_is_subscription_shaped() {
     let params = find_request(&fx, "lsp/document_highlight").expect("Insert unsubscribes");
     assert_eq!(params["active"], false);
     // …and returning to Normal re-subscribes.
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     let params = find_request(&fx, "lsp/document_highlight").expect("Normal re-subscribes");
     assert_eq!(params["active"], true);
 }
@@ -3894,7 +3917,7 @@ fn blame_follow_tracks_mode_transitions_only() {
     assert_eq!(params["enabled"], false);
 
     // …and Normal re-follows.
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     let params = find_request(&fx, "git/set_blame_follow").expect("Normal re-follows");
     assert_eq!(params["enabled"], true);
 }
@@ -4125,7 +4148,7 @@ fn clearing_the_jumplist_adopts_the_undecorated_cursor_and_toasts() {
     // The chord: Space arms the leader, Alt-j discards. The buffer rides along so the response
     // can bring back a cursor to adopt.
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "jumplist/clear");
     assert_eq!(params["buffer_id"], s.view.buffer.buffer_id);
@@ -4531,7 +4554,7 @@ fn accepting_a_row_selects_before_it_closes() {
         p.selected = 0;
     }
 
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let methods: Vec<&str> =
         fx.0.iter()
             .filter_map(|e| match e {
@@ -4776,7 +4799,7 @@ fn ctrl_alt_x_cuts_the_selection_and_enters_insert() {
         alt: true,
         shift: false,
     };
-    let fx = s.on_key(KeyCode::Char('x'), ctrl_alt, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), ctrl_alt, None);
 
     // Cuts via the same RPC as a plain Ctrl-x...
     let (_, method, params) = the_request(&fx);
@@ -4798,7 +4821,7 @@ fn a_request_on_a_buffer_the_server_closed_is_dropped_silently() {
     use aether_client::transport::RpcError;
     use aether_protocol::error::ErrorCode;
     let mut s = session();
-    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, None);
     let token =
         fx.0.iter()
             .find_map(|e| match e {
@@ -4823,7 +4846,7 @@ fn a_request_on_a_buffer_the_server_closed_is_dropped_silently() {
 
     // Any *other* failure still surfaces — this is a narrow rule about a vanished buffer, not a
     // blanket swallow.
-    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, None);
     let token =
         fx.0.iter()
             .find_map(|e| match e {
@@ -4889,7 +4912,7 @@ fn explorer_alt_l_enters_the_highlighted_directory_in_one_press() {
     }
     // Alt-j moves the highlight onto the second entry — and the ghost follows it, previewing the
     // whole remainder of *that* name rather than the prefix the two entries share.
-    let _ = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     assert_eq!(
         s.picker.as_ref().unwrap().explorer_completion().as_deref(),
         Some("her-tui"),
@@ -4898,7 +4921,7 @@ fn explorer_alt_l_enters_the_highlighted_directory_in_one_press() {
     // Alt-l takes it: one press descends into the highlighted directory, however much of the name
     // is typed and whatever the other matches happen to share. Descending re-lists from an empty
     // query.
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     let view = find_request(&fx, "picker/view").expect("alt-l descends via picker/view");
     assert_eq!(view["directory_path"], json!("/proj/aether-tui"));
     let requery = find_request(&fx, "picker/query").expect("descending re-lists");
@@ -4930,7 +4953,7 @@ fn explorer_alt_l_opens_a_file() {
     // rewrite (completing the name in place would only restate the highlight). It gets no ghost
     // either: the ghost is what Alt-l would *descend* into.
     assert_eq!(s.picker.as_ref().unwrap().explorer_completion(), None);
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     assert!(find_request(&fx, "picker/view").is_none());
     assert!(find_request(&fx, "picker/query").is_none());
     let params = find_request(&fx, "picker/select").expect("Alt-l opens the file");
@@ -4954,7 +4977,7 @@ fn explorer_alt_backspace_unwinds_breadcrumb_before_chips() {
     }
     // With a deeper directory *and* a chip, Alt-Backspace ascends the breadcrumb (closest to the
     // cursor) and leaves the chip — it has its own toggle binding.
-    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     let view = find_request(&fx, "picker/view").expect("ascends via picker/view");
     assert_eq!(view["directory_path"], json!("/proj/src"));
     assert_eq!(
@@ -4971,7 +4994,7 @@ fn explorer_alt_backspace_unwinds_breadcrumb_before_chips() {
         p.directory_parent = None;
         p.query.clear();
     }
-    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert!(
         s.picker.as_ref().unwrap().chips.is_empty(),
         "with no breadcrumb left, Alt-Backspace removes the chip"
@@ -4996,7 +5019,7 @@ fn picker_alt_backspace_drops_one_query_word_per_press() {
     }
 
     // One atom, separator kept — the query narrows rather than vanishing.
-    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert!(find_request(&fx, "picker/query").is_some());
     assert_eq!(s.picker.as_ref().unwrap().query, "src ");
     assert_eq!(
@@ -5006,12 +5029,12 @@ fn picker_alt_backspace_drops_one_query_word_per_press() {
     );
 
     // The next press takes the last atom and its trailing space together.
-    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert_eq!(s.picker.as_ref().unwrap().query, "");
     assert_eq!(s.picker.as_ref().unwrap().chips.len(), 1);
 
     // Only now does the ladder move on to the chips (Files has no breadcrumb rung).
-    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert!(s.picker.as_ref().unwrap().chips.is_empty());
 }
 
@@ -5023,7 +5046,7 @@ fn picker_alt_backspace_still_clears_a_one_word_query_in_one_press() {
     let mut s = session();
     let _ = s.open_picker(PickerKind::Files, None, None, false, None);
     s.picker.as_mut().unwrap().query = "needle".into();
-    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert!(find_request(&fx, "picker/query").is_some());
     assert_eq!(s.picker.as_ref().unwrap().query, "");
 }
@@ -5148,7 +5171,7 @@ fn a_stale_buffer_error_still_runs_its_callback() {
     use aether_client::transport::RpcError;
     use aether_protocol::error::ErrorCode;
     let mut s = branch_picker_session(None);
-    let fx = s.on_key(KeyCode::Char('o'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('o'), Mods::CTRL, None);
     let token = request_token(&fx, "git/worktree_add").expect("Ctrl-o creates");
 
     let fx = s.on_rpc_result(
@@ -5176,7 +5199,7 @@ fn a_stale_buffer_error_still_runs_its_callback() {
 #[test]
 fn ctrl_enter_on_a_held_branch_targets_its_tree() {
     let mut s = branch_picker_session(Some(linked("feature-auth")));
-    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None);
     let target =
         fx.0.iter()
             .find_map(|e| match e {
@@ -5200,7 +5223,7 @@ fn ctrl_enter_on_a_held_branch_targets_its_tree() {
 #[test]
 fn ctrl_enter_on_a_treeless_branch_refuses_with_guidance() {
     let mut s = branch_picker_session(None);
-    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None);
     assert!(
         find_request(&fx, "git/checkout").is_none(),
         "it must not quietly do what plain Enter does"
@@ -5218,7 +5241,7 @@ fn ctrl_enter_on_a_treeless_branch_refuses_with_guidance() {
 #[test]
 fn ctrl_o_creates_a_worktree_without_moving() {
     let mut s = branch_picker_session(None);
-    let fx = s.on_key(KeyCode::Char('o'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('o'), Mods::CTRL, None);
 
     let req = find_request(&fx, "git/worktree_add").expect("Ctrl-o creates");
     assert_eq!(req["branch"], json!("feature"));
@@ -5244,7 +5267,7 @@ fn ctrl_o_creates_a_worktree_without_moving() {
 #[test]
 fn ctrl_o_refuses_a_branch_that_already_has_a_tree() {
     let mut s = branch_picker_session(Some(linked("feature-auth")));
-    let fx = s.on_key(KeyCode::Char('o'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('o'), Mods::CTRL, None);
     assert!(find_request(&fx, "git/worktree_add").is_none());
     let toast = toast_messages(&fx).join(" ");
     assert!(toast.contains("feature-auth"), "names the tree: {toast}");
@@ -5255,7 +5278,7 @@ fn ctrl_o_refuses_a_branch_that_already_has_a_tree() {
 #[test]
 fn ctrl_d_removes_the_tree_when_there_is_one() {
     let mut s = branch_picker_session(Some(linked("feature-auth")));
-    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None);
 
     let req = find_request(&fx, "git/worktree_remove").expect("Ctrl-d removes the tree");
     assert_eq!(
@@ -5282,7 +5305,7 @@ fn ctrl_d_removes_the_tree_when_there_is_one() {
 #[test]
 fn ctrl_d_deletes_the_branch_when_there_is_no_tree() {
     let mut s = branch_picker_session(None);
-    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None);
     assert!(find_request(&fx, "git/worktree_remove").is_none());
     assert!(s.prompt.is_some(), "branch deletion stages a confirm");
 }
@@ -5292,7 +5315,7 @@ fn ctrl_d_deletes_the_branch_when_there_is_no_tree() {
 #[test]
 fn ctrl_alt_d_forces_the_removal() {
     let mut s = branch_picker_session(Some(linked("feature-auth")));
-    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL_ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL_ALT, None);
     let req = find_request(&fx, "git/worktree_remove").expect("Ctrl-Alt-d removes");
     assert_eq!(req["force"], json!(true));
 }
@@ -5319,7 +5342,7 @@ fn ctrl_d_refuses_the_trees_that_cannot_be_removed() {
         ),
     ] {
         let mut s = branch_picker_session(Some(checkout));
-        let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+        let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None);
         assert!(
             find_request(&fx, "git/worktree_remove").is_none(),
             "{label} cannot be removed"
@@ -5336,7 +5359,7 @@ fn ctrl_d_refuses_the_trees_that_cannot_be_removed() {
 #[test]
 fn branch_picker_enter_checks_out_the_highlighted_branch() {
     let mut s = branch_picker_session(None);
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
 
     let req = find_request(&fx, "git/checkout").expect("Enter checks out");
     assert_eq!(req["branch"], json!("feature"));
@@ -5359,7 +5382,7 @@ fn branch_picker_enter_checks_out_the_highlighted_branch() {
 #[test]
 fn branch_picker_alt_l_checks_out_like_enter() {
     let mut s = branch_picker_session(None);
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     let req = find_request(&fx, "git/checkout").expect("Alt-l checks out");
     assert_eq!(req["branch"], json!("feature"));
 }
@@ -5373,7 +5396,7 @@ fn branch_picker_alt_l_checks_out_like_enter() {
 #[test]
 fn enter_on_a_held_branch_opens_its_worktree() {
     let mut s = branch_picker_session(Some(linked("feature-auth")));
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
 
     assert!(
         find_request(&fx, "git/checkout").is_none(),
@@ -5401,7 +5424,7 @@ fn enter_on_a_held_branch_opens_its_worktree() {
 fn branch_picker_enter_on_the_current_branch_is_a_no_op() {
     let mut s = branch_picker_session(None);
     s.picker.as_mut().unwrap().selected = 0; // "main", the HEAD row
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         find_request(&fx, "git/checkout").is_none(),
         "already on it — nothing to run"
@@ -5423,7 +5446,7 @@ fn branch_picker_create_row_creates_and_switches() {
     }
     s.picker.as_mut().unwrap().selected = s.picker.as_ref().unwrap().create_row_index().unwrap();
 
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let req = find_request(&fx, "git/checkout").expect("the create row checks out");
     assert_eq!(req["branch"], json!("new-thing"));
     assert_eq!(req["create"], json!(true));
@@ -5446,7 +5469,7 @@ fn branch_picker_ctrl_d_confirms_then_deletes() {
     use aether_client::update::Event;
     let mut s = branch_picker_session(None);
 
-    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None);
     assert!(
         find_request(&fx, "git/delete_branch").is_none(),
         "Ctrl-d stages a confirm; it doesn't delete outright"
@@ -5481,7 +5504,7 @@ fn a_branch_held_by_the_main_checkout_unbinds() {
         locked: false,
         prunable: false,
     }));
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
 
     assert!(
         find_request(&fx, "git/checkout").is_none(),
@@ -5500,7 +5523,7 @@ fn a_branch_held_by_the_main_checkout_unbinds() {
 fn branch_picker_ctrl_d_refuses_the_current_branch() {
     let mut s = branch_picker_session(None);
     s.picker.as_mut().unwrap().selected = 0; // "main", the row you are standing on
-    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None);
     assert!(s.prompt.is_none(), "no confirm for a doomed delete");
     assert!(find_request(&fx, "git/delete_branch").is_none());
     assert!(find_request(&fx, "git/worktree_remove").is_none());
@@ -5616,7 +5639,7 @@ fn explorer_delete_confirms_then_trashes_and_relists() {
         other => panic!("expected a confirm prompt, got {other:?}"),
     }
     // `y` accepts → `path/delete` with the absolute path.
-    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
     let path_del = find_request(&fx, "path/delete").expect("path/delete fired");
     assert_eq!(path_del["path"], json!("/proj/src/old.rs"));
     let token = match fx.0.iter().find_map(|e| match e {
@@ -5694,7 +5717,7 @@ fn workspaces_delete_confirms_then_deletes_and_guards_active() {
         other => panic!("expected a confirm prompt, got {other:?}"),
     }
     // `y` accepts → `workspace/delete { name }`.
-    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
     let del = find_request(&fx, "workspace/delete").expect("workspace/delete fired");
     assert_eq!(del["name"], json!("other"));
 
@@ -5735,7 +5758,7 @@ fn chooser_esc_over_placeholder_exits_and_keeps_the_picker() {
     // the picker stays open (shells that can't exit, like the web, no-op `Exit` and keep it up).
     let mut s = session();
     let _ = s.open_picker(PickerKind::Workspaces, None, None, false, None);
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(quits(&fx), "Esc in the mandatory chooser exits");
     assert!(
         s.picker.is_some(),
@@ -5751,7 +5774,7 @@ fn chooser_esc_over_placeholder_exits_and_keeps_the_picker() {
     // The same picker in a real session is an ordinary overlay: Esc closes it, no exit.
     let mut s = hint_session();
     let _ = s.open_picker(PickerKind::Workspaces, None, None, false, None);
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(!quits(&fx), "in-session Esc doesn't exit");
     assert!(s.picker.is_none(), "in-session Esc dismisses the picker");
 }
@@ -5775,7 +5798,7 @@ fn search_option_toggle_follows_its_hint() {
     let keys_before = v.keys;
 
     // Fire the displayed hint's own chord: it must record a follow and rotate out.
-    let fx = s.on_key(KeyCode::Char(chord), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char(chord), Mods::ALT, None);
     assert!(
         hint_records(&fx)
             .iter()
@@ -5798,7 +5821,7 @@ fn picker_esc_records_the_dismiss_gesture() {
     let mut s = hint_session();
     adopt_hints(&mut s);
     let _ = s.open_picker(PickerKind::Files, None, None, false, None);
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(s.picker.is_none(), "Esc closes the picker");
     assert!(
         hint_records(&fx)
@@ -5813,7 +5836,7 @@ fn picker_esc_records_the_dismiss_gesture() {
     let mut s = session();
     adopt_hints(&mut s);
     let _ = s.open_picker(PickerKind::Workspaces, None, None, false, None);
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(quits(&fx));
     assert!(
         !hint_records(&fx)
@@ -5900,7 +5923,7 @@ fn buffers_picker_close_closes_in_place() {
         other => panic!("expected a discard-on-close confirm, got {other:?}"),
     }
     // `y` accepts → view/close { buffer_id: 9, open_next: false } (id 9 isn't the active buffer).
-    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
     let close = find_request(&fx, "view/close").expect("view/close fired on confirm");
     assert_eq!(close["view_id"], json!(9));
     assert_eq!(close["open_next"], json!(false));
@@ -6091,7 +6114,7 @@ fn percent_selects_whole_buffer() {
         shift: true,
         ..Mods::NONE
     };
-    let fx = s.on_key(KeyCode::Char('%'), shifted, Some("%".to_string()), ROWS);
+    let fx = s.on_key(KeyCode::Char('%'), shifted, Some("%".to_string()));
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/select_all");
     assert!(params["buffer_id"].is_number());
@@ -6120,7 +6143,7 @@ fn insert_tab_requests_an_indent_step() {
 
     // Tab still indents in Insert: only Normal and Read vacated it for element focus, so a daily-use
     // key was not spent on a mode where you would press Esc before moving between editors anyway.
-    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/tab");
     // No text on the wire: the payload is just the buffer.
@@ -6136,18 +6159,18 @@ fn insert_alt_tier_sends_word_grain_requests() {
     key(&mut s, 'i');
     assert_eq!(s.view.mode, aether_client::session::Mode::Insert);
 
-    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/delete_word");
     assert_eq!(params["direction"], json!("backward"));
     assert_eq!(params["boundary"], json!("word"));
 
-    let fx = s.on_key(KeyCode::Delete, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Delete, Mods::ALT, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/delete_word");
     assert_eq!(params["direction"], json!("forward"));
 
-    let fx = s.on_key(KeyCode::Left, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Left, Mods::ALT, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/move");
     assert_eq!(
@@ -6155,12 +6178,12 @@ fn insert_alt_tier_sends_word_grain_requests() {
         json!({"kind": "word", "direction": "backward", "count": 1, "boundary": "word"})
     );
 
-    let fx = s.on_key(KeyCode::Right, Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Right, Mods::ALT, None);
     let (_t, _method, params) = the_request(&fx);
     assert_eq!(params["motion"]["direction"], json!("forward"));
 
     // Unmodified, the same keys stay char-grain.
-    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None);
     let (_t, method, _params) = the_request(&fx);
     assert_eq!(method, "element/backspace");
 }
@@ -6172,12 +6195,12 @@ fn insert_home_end_move_to_the_line_ends() {
     let mut s = session();
     key(&mut s, 'i');
 
-    let fx = s.on_key(KeyCode::Home, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Home, Mods::NONE, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/move");
     assert_eq!(params["motion"], json!({"kind": "line_start"}));
 
-    let fx = s.on_key(KeyCode::End, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::End, Mods::NONE, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/move");
     assert_eq!(params["motion"], json!({"kind": "line_end"}));
@@ -6187,8 +6210,8 @@ fn insert_home_end_move_to_the_line_ends() {
 fn space_t_triggers_hover() {
     let mut s = session();
     // Tab fires Hover directly — no leader chord.
-    s.on_key(KeyCode::Char(' '), Mods::NONE, None, ROWS);
-    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Char(' '), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None);
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "lsp/hover");
 }
@@ -6209,14 +6232,14 @@ fn info_toast(fx: &Effects) -> Option<String> {
 fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
     // A ready server with no content for the cursor → the genuine "nothing here" message.
     let mut s = session();
-    s.on_key(KeyCode::Char(' '), Mods::NONE, None, ROWS);
-    let token = the_request(&s.on_key(KeyCode::Char('t'), Mods::NONE, None, ROWS)).0;
+    s.on_key(KeyCode::Char(' '), Mods::NONE, None);
+    let token = the_request(&s.on_key(KeyCode::Char('t'), Mods::NONE, None)).0;
     let fx = s.on_rpc_result(token, Ok(json!({ "contents": null, "readiness": "ready" })));
     assert_eq!(info_toast(&fx).as_deref(), Some("No hover info"));
 
     // A server still starting → say so, not "No hover info".
-    s.on_key(KeyCode::Char(' '), Mods::NONE, None, ROWS);
-    let token = the_request(&s.on_key(KeyCode::Char('t'), Mods::NONE, None, ROWS)).0;
+    s.on_key(KeyCode::Char(' '), Mods::NONE, None);
+    let token = the_request(&s.on_key(KeyCode::Char('t'), Mods::NONE, None)).0;
     let fx = s.on_rpc_result(
         token,
         Ok(json!({ "contents": null, "readiness": "starting" })),
@@ -6227,8 +6250,8 @@ fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
     );
 
     // A crashed/stopped server → "unavailable".
-    s.on_key(KeyCode::Char(' '), Mods::NONE, None, ROWS);
-    let token = the_request(&s.on_key(KeyCode::Char('t'), Mods::NONE, None, ROWS)).0;
+    s.on_key(KeyCode::Char(' '), Mods::NONE, None);
+    let token = the_request(&s.on_key(KeyCode::Char('t'), Mods::NONE, None)).0;
     let fx = s.on_rpc_result(
         token,
         Ok(json!({ "contents": null, "readiness": "unavailable" })),
@@ -6246,7 +6269,7 @@ fn space_n_shows_diagnostic_at_cursor() {
     // which still proves the chord reaches `show_diagnostic`.
     let mut s = session();
     let _ = key(&mut s, ' '); // leader
-    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, Some("n".to_string()), ROWS);
+    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, Some("n".to_string()));
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -6264,7 +6287,7 @@ fn space_m_shows_blame_commit() {
     // Space m → blame the cursor line (round-trip resolves the commit's details).
     let mut s = session();
     let _ = key(&mut s, ' '); // leader
-    let fx = s.on_key(KeyCode::Char('m'), Mods::NONE, Some("m".to_string()), ROWS);
+    let fx = s.on_key(KeyCode::Char('m'), Mods::NONE, Some("m".to_string()));
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "git/blame_line");
 }
@@ -6289,7 +6312,7 @@ fn space_g_arms_the_git_sub_leader_and_the_next_key_completes_it() {
     );
     assert!(fx.0.is_empty(), "the prefix alone does nothing");
 
-    let fx = s.on_key(KeyCode::Char('f'), Mods::NONE, Some("f".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('f'), Mods::NONE, Some("f".into()));
     assert!(
         find_request(&fx, "git/fetch").is_some(),
         "Space g f fetches"
@@ -6301,7 +6324,7 @@ fn space_g_arms_the_git_sub_leader_and_the_next_key_completes_it() {
 
     // The inline diff left the sub-leader for `Space i` — one key, no prefix.
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('i'), Mods::NONE, Some("i".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('i'), Mods::NONE, Some("i".into()));
     assert!(
         find_request(&fx, "git/set_diff_view").is_some(),
         "Space i toggles the inline diff"
@@ -6310,7 +6333,7 @@ fn space_g_arms_the_git_sub_leader_and_the_next_key_completes_it() {
     // An unbound second key cancels: no request, and `j` must not move the cursor either.
     let _ = key(&mut s, ' ');
     let _ = key(&mut s, 'g');
-    let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, Some("j".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, Some("j".into()));
     assert!(
         !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
         "an unbound git chord is silently dropped"
@@ -6328,7 +6351,7 @@ fn space_g_stages_unstages_and_reverts_at_two_scopes() {
         let _ = key(s, ' ');
         let _ = key(s, 'g');
         let text = (mods == Mods::NONE).then(|| ch.to_string());
-        let fx = s.on_key(KeyCode::Char(ch), mods, text, ROWS);
+        let fx = s.on_key(KeyCode::Char(ch), mods, text);
         let params = find_request(&fx, "git/apply_hunk").expect("git/apply_hunk fired");
         (
             params["action"].as_str().unwrap().to_string(),
@@ -6412,7 +6435,7 @@ fn font_size_settings_step_and_persist_independently() {
     assert_eq!(params["ui_font_size"], json!(12));
 
     // Left steps down to the previous preset (no wrap), also persisting.
-    let fx = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Left, Mods::NONE, None);
     assert_eq!(s.editor_font_size, 16, "Left steps down a preset");
     let params = find_request(&fx, "settings/set").expect("settings/set fired");
     assert_eq!(params["editor_font_size"], json!(16));
@@ -6425,7 +6448,7 @@ fn font_size_settings_step_and_persist_independently() {
     let params = find_request(&fx, "settings/set").expect("settings/set fired");
     assert_eq!(params["ui_font_size"], json!(13));
 
-    let fx = s.on_key(KeyCode::Right, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Right, Mods::NONE, None);
     assert_eq!(s.ui_font_size, 14, "Right steps up a preset");
     let params = find_request(&fx, "settings/set").expect("settings/set fired");
     assert_eq!(params["ui_font_size"], json!(14));
@@ -6544,7 +6567,7 @@ fn space_g_alt_p_pushes() {
     let mut s = session();
     let _ = key(&mut s, ' ');
     let _ = key(&mut s, 'g');
-    let fx = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::ALT, None);
     let req = find_request(&fx, "git/push").expect("git/push fired");
     assert!(req.get("repo_id").is_none_or(|v| v.is_null()));
     assert!(req.get("buffer_id").is_some());
@@ -6633,7 +6656,7 @@ fn space_g_t_stashes_the_tree_and_alt_t_only_the_index() {
 
     let _ = key(&mut s, ' ');
     let _ = key(&mut s, 'g');
-    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None);
     let params = find_request(&fx, "git/stash_push").expect("Space g Alt-t stashes the index");
     assert_eq!(params["staged"], json!(true));
 
@@ -6709,7 +6732,7 @@ fn esc_cancels_the_git_leader_rather_than_acting() {
     let _ = key(&mut s, 'g');
     assert!(matches!(s.view.pending, Pending::LeaderGit));
 
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(
         find_request(&fx, "git/cancel").is_none(),
         "Esc must not dispatch a git verb"
@@ -7203,7 +7226,7 @@ fn a_second_git_operation_is_refused_while_one_is_running() {
         let _ = key(&mut s, ' ');
         let _ = key(&mut s, 'g');
         let text = (mods == Mods::NONE).then(|| ch.to_string());
-        let fx = s.on_key(KeyCode::Char(ch), mods, text, ROWS);
+        let fx = s.on_key(KeyCode::Char(ch), mods, text);
         assert!(
             find_request(&fx, method).is_none(),
             "{method} must not start while another operation runs"
@@ -7226,7 +7249,7 @@ fn space_k_toggles_keep_and_guards_unsaved() {
     s.view.buffer.revision = 3;
     s.view.buffer.saved_revision = 3;
     let _ = key(&mut s, ' '); // leader
-    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()));
     let params = find_request(&fx, "view/set_transient").expect("Space k toggles transient");
     assert_eq!(params["view_id"], json!(s.view.view_id));
     assert_eq!(
@@ -7238,7 +7261,7 @@ fn space_k_toggles_keep_and_guards_unsaved() {
     // Clean permanent view: Space k releases it back to transient.
     s.view.view_transient = false;
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()));
     let params = find_request(&fx, "view/set_transient").expect("toggles the other way");
     assert_eq!(params["transient"], json!(true));
 
@@ -7247,7 +7270,7 @@ fn space_k_toggles_keep_and_guards_unsaved() {
     s.view.buffer.revision = 5;
     s.view.buffer.saved_revision = 3;
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()));
     assert!(
         find_request(&fx, "view/set_transient").is_none(),
         "an unsaved buffer can't be made transient"
@@ -7258,7 +7281,7 @@ fn space_k_toggles_keep_and_guards_unsaved() {
     // with the unsaved edits), so the guard only blocks the make-transient direction.
     s.view.view_transient = true;
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()));
     let params = find_request(&fx, "view/set_transient").expect("dirty transient can be pinned");
     assert_eq!(params["transient"], json!(false));
 }
@@ -7311,7 +7334,7 @@ fn space_k_on_a_composed_view_keeps_the_view() {
     s.view.buffer.saved_revision = 1;
 
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()));
     let params = find_request(&fx, "view/set_transient").expect("Space k toggles the view");
     assert_eq!(
         params["view_id"],
@@ -7347,7 +7370,7 @@ fn space_k_refuses_a_view_with_another_element_dirty() {
     });
 
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()));
     assert!(
         find_request(&fx, "view/set_transient").is_none(),
         "a view with unsaved work anywhere in it can't be made transient"
@@ -7362,7 +7385,7 @@ fn reload_moved_to_space_alt_k() {
 
     // Reload now lives on Space Alt-k.
     let _ = key(&mut s, ' '); // leader
-    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None);
     assert!(
         find_request(&fx, "buffer/reload").is_some(),
         "Space Alt-k reloads"
@@ -7371,7 +7394,7 @@ fn reload_moved_to_space_alt_k() {
     //...and its old home, Space a, no longer reloads. (It's unbound outright now stage-hunk
     // has moved to the git sub-leader, so this doubles as the ignore-an-unbound-key path.)
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('a'), Mods::NONE, Some("a".into()));
     assert!(
         find_request(&fx, "buffer/reload").is_none(),
         "Space a is no longer bound to reload"
@@ -7386,12 +7409,12 @@ fn space_p_copies_relative_and_absolute_paths() {
 
     // Space p → workspace-relative path.
     let _ = key(&mut s, ' '); // leader
-    let fx = s.on_key(KeyCode::Char('p'), Mods::NONE, Some("p".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::NONE, Some("p".into()));
     assert_eq!(written_clipboard(&fx).as_deref(), Some("src/main.rs"));
 
     // Space Alt-p → absolute path.
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('p'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::ALT, None);
     assert_eq!(written_clipboard(&fx).as_deref(), Some("/proj/src/main.rs"));
 }
 
@@ -7403,7 +7426,7 @@ fn space_p_multi_root_copies_bare_relative_path() {
 
     // Unlike the status-bar label, the copied path carries no `root:` prefix.
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('p'), Mods::NONE, Some("p".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::NONE, Some("p".into()));
     assert_eq!(written_clipboard(&fx).as_deref(), Some("src/main.rs"));
 }
 
@@ -7412,7 +7435,7 @@ fn copy_path_warns_for_scratch_buffer() {
     let mut s = session();
     s.view.buffer.path = None; // a scratch buffer
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('p'), Mods::NONE, Some("p".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('p'), Mods::NONE, Some("p".into()));
     assert!(
         written_clipboard(&fx).is_none(),
         "no path — nothing is copied"
@@ -7435,7 +7458,7 @@ fn copy_path_warns_for_scratch_buffer() {
 fn app_settings_overlay_opens_via_leader_comma() {
     let mut s = session();
     let _ = key(&mut s, ' '); // leader
-    s.on_key(KeyCode::Char(','), Mods::NONE, Some(','.to_string()), ROWS);
+    s.on_key(KeyCode::Char(','), Mods::NONE, Some(','.to_string()));
     assert!(
         s.app_settings.is_some(),
         "Space , opens the app-settings overlay"
@@ -7445,7 +7468,7 @@ fn app_settings_overlay_opens_via_leader_comma() {
 
     let mut s = session();
     let _ = key(&mut s, ' ');
-    s.on_key(KeyCode::Char('.'), Mods::NONE, Some('.'.to_string()), ROWS);
+    s.on_key(KeyCode::Char('.'), Mods::NONE, Some('.'.to_string()));
     assert!(
         s.workspace_settings.is_some(),
         "Space . opens the workspace-settings overlay"
@@ -7458,7 +7481,7 @@ fn app_settings_esc_closes_the_overlay() {
     let mut s = session();
     s.open_app_settings();
     assert!(s.app_settings.is_some());
-    s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(s.app_settings.is_none());
 }
 
@@ -7470,7 +7493,7 @@ fn app_settings_toggle_persists_and_reflows() {
     assert_eq!(s.wrap, WrapMode::Soft);
     s.open_app_settings();
     // Enter on the (single) soft-wrap row.
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
 
     // Persists the *post-flip* value (off) so disk matches the wrap the shell is about to apply.
     let params = find_request(&fx, "settings/set").expect("settings/set fired");
@@ -7711,10 +7734,10 @@ fn app_settings_apply_and_cycle_markdown_width() {
     }
 
     // Left/Right step without wrapping, and clamp at the ends — a stepper, not a cycle.
-    let fx = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Left, Mods::NONE, None);
     assert_eq!(s.markdown_width, MarkdownWidth::Narrow, "Left narrows");
     assert!(find_request(&fx, "settings/set").is_some());
-    let fx = s.on_key(KeyCode::Left, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Left, Mods::NONE, None);
     assert_eq!(s.markdown_width, MarkdownWidth::Narrow, "clamped at narrow");
     assert!(
         find_request(&fx, "settings/set").is_none(),
@@ -7725,7 +7748,7 @@ fn app_settings_apply_and_cycle_markdown_width() {
         MarkdownWidth::Full,
         MarkdownWidth::Full,
     ] {
-        let _ = s.on_key(KeyCode::Right, Mods::NONE, None, ROWS);
+        let _ = s.on_key(KeyCode::Right, Mods::NONE, None);
         assert_eq!(s.markdown_width, want, "Right widens then clamps at full");
     }
 }
@@ -7843,7 +7866,7 @@ fn create_from_chooser_survives_hint_ticks_mid_flight() {
         );
     };
 
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     no_bounce(&fx, "on accept");
     let create_token = fx
         .0
@@ -7991,12 +8014,12 @@ fn settings_add_root_emits_request_and_its_result_updates_state() {
     s.workspace_paths = vec!["/a".into()];
     s.open_workspace_settings();
     // Open focuses the name field; Tab down to the add-root input (past the single root).
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
     assert!(s.workspace_settings.as_ref().unwrap().on_input());
     // The shell's input owns text entry and syncs the whole value; the core no longer key-edits.
     let _ = s.workspace_settings_set_add("/b".into());
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let add = find_request(&fx, "workspace/add_root").expect("workspace/add_root fired");
     assert_eq!(add["workspace"], json!("aether"));
     assert_eq!(add["path"], json!("/b"));
@@ -8139,7 +8162,7 @@ fn settings_tab_traverses_fields_including_the_editor_segments() {
         SettingsRow::AddRoot,
         SettingsRow::AddProject,
     ] {
-        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+        s.on_key(KeyCode::Tab, Mods::NONE, None);
         assert_eq!(s.workspace_settings.as_ref().unwrap().row(), expected);
     }
 
@@ -8148,7 +8171,7 @@ fn settings_tab_traverses_fields_including_the_editor_segments() {
     let _ = s.workspace_settings_set_add_project_root("be".into());
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.add_project.field, ChipEditorField::Root);
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.row(), SettingsRow::AddProject);
     assert_eq!(ps.add_project.field, ChipEditorField::Path);
@@ -8158,17 +8181,17 @@ fn settings_tab_traverses_fields_including_the_editor_segments() {
     );
 
     // Alt-l is what adopts the ghost — same traversal, but the filter becomes the full label.
-    s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
-    s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    s.on_key(KeyCode::BackTab, Mods::NONE, None);
+    s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.add_project.root_filter.text, "beta");
     assert_eq!(ps.add_project.field, ChipEditorField::Path);
 
     //...and Shift-Tab walks back out the same way.
-    s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::BackTab, Mods::NONE, None);
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.add_project.field, ChipEditorField::Root);
-    s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::BackTab, Mods::NONE, None);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().row(),
         SettingsRow::AddRoot,
@@ -8178,7 +8201,7 @@ fn settings_tab_traverses_fields_including_the_editor_segments() {
     // the forward path rather than skipping a field. From add-root (index 3) that's four steps:
     // root(1), root(0), name, then round to add-project.
     for _ in 0..4 {
-        s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+        s.on_key(KeyCode::BackTab, Mods::NONE, None);
     }
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.row(), SettingsRow::AddProject);
@@ -8197,7 +8220,7 @@ fn settings_alt_j_cycles_candidates_without_leaving_the_editor() {
     s.workspace_paths = vec!["/a".into(), "/b".into()];
     s.open_workspace_settings();
     for _ in 0..4 {
-        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+        s.on_key(KeyCode::Tab, Mods::NONE, None);
     }
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().row(),
@@ -8210,7 +8233,7 @@ fn settings_alt_j_cycles_candidates_without_leaving_the_editor() {
         .unwrap()
         .add_project
         .root_selected;
-    s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.row(), SettingsRow::AddProject, "still on the editor row");
     assert_ne!(
@@ -8229,7 +8252,7 @@ fn settings_alt_j_does_not_traverse_fields() {
     s.workspace = "aether".into();
     s.workspace_paths = vec!["/a".into()];
     s.open_workspace_settings();
-    s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().row(),
         SettingsRow::Name,
@@ -8237,12 +8260,12 @@ fn settings_alt_j_does_not_traverse_fields() {
     );
 
     // The arrows are the non-chord alternative to Tab for people who want one.
-    s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Down, Mods::NONE, None);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().row(),
         SettingsRow::Root(0),
     );
-    s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Up, Mods::NONE, None);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().row(),
         SettingsRow::Name,
@@ -8259,7 +8282,7 @@ fn moving_off_a_segment_drops_its_ghost() {
     s.workspace_paths = vec!["/a".into()];
     s.open_workspace_settings();
     for _ in 0..3 {
-        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+        s.on_key(KeyCode::Tab, Mods::NONE, None);
     }
     // A listing gives the path segment something to suggest.
     let _ = s.workspace_settings_set_add_project("dat".into());
@@ -8281,7 +8304,7 @@ fn moving_off_a_segment_drops_its_ghost() {
     );
 
     // Tab into the language segment: the path's suggestion is no longer being offered.
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
     let ps = s.workspace_settings.as_ref().unwrap();
     assert!(ps.on_add_project_language);
     assert!(
@@ -8300,7 +8323,7 @@ fn settings_language_segment_only_accepts_supported_languages() {
     s.open_workspace_settings();
     // name → root → add-root → add-project(path) → add-project(language).
     for _ in 0..4 {
-        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+        s.on_key(KeyCode::Tab, Mods::NONE, None);
     }
     assert!(
         s.workspace_settings
@@ -8316,7 +8339,7 @@ fn settings_language_segment_only_accepts_supported_languages() {
     assert!(!ps.language_invalid());
     assert_eq!(ps.chosen_language().as_deref(), Some("python"));
     assert_eq!(ps.language_ghost().as_deref(), Some("on"));
-    s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     assert_eq!(
         s.workspace_settings
             .as_ref()
@@ -8329,7 +8352,7 @@ fn settings_language_segment_only_accepts_supported_languages() {
     // Nonsense is refused rather than sent.
     let _ = s.workspace_settings_set_add_project_language("cobol".into());
     assert!(s.workspace_settings.as_ref().unwrap().language_invalid());
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         find_request(&fx, "workspace/add_project").is_none(),
         "an unsupported language must not reach the server",
@@ -8344,7 +8367,7 @@ fn settings_language_segment_only_accepts_supported_languages() {
 
     // Empty means "infer", which is the common case and must still commit.
     let _ = s.workspace_settings_set_add_project_language(String::new());
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let add = find_request(&fx, "workspace/add_project").expect("commits with no language");
     assert!(
         add.get("language").is_none(),
@@ -8388,9 +8411,9 @@ fn typing_a_project_path_infers_its_language() {
 
     // The suggestion commits as an explicit language, exactly as if it had been typed.
     for _ in 0..3 {
-        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS); // name → root → add-root → add-project
+        s.on_key(KeyCode::Tab, Mods::NONE, None); // name → root → add-root → add-project
     }
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let add = find_request(&fx, "workspace/add_project").expect("commits");
     assert_eq!(add["language"], json!("python"));
 }
@@ -8546,26 +8569,26 @@ fn settings_navigation_reaches_the_add_project_row() {
     s.open_workspace_settings();
     // name → root → add-root → add-project.
     for _ in 0..3 {
-        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+        s.on_key(KeyCode::Tab, Mods::NONE, None);
     }
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.row(), SettingsRow::AddProject);
     assert!(ps.on_input(), "both add rows count as text inputs");
 
     // Tab off the path enters the row's trailing language segment, still on the same row...
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
     let ps = s.workspace_settings.as_ref().unwrap();
     assert_eq!(ps.row(), SettingsRow::AddProject);
     assert!(ps.on_add_project_language);
 
     //...and only Tab off *that* cycles round to the first field.
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().row(),
         SettingsRow::Name,
     );
     //...and Shift-Tab off the first wraps back to the last.
-    s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::BackTab, Mods::NONE, None);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().row(),
         SettingsRow::AddProject,
@@ -8583,10 +8606,10 @@ fn settings_add_project_emits_request_and_its_result_updates_state() {
     s.open_workspace_settings();
     // name → root → add-root → add-project.
     for _ in 0..3 {
-        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+        s.on_key(KeyCode::Tab, Mods::NONE, None);
     }
     let _ = s.workspace_settings_set_add_project("crates/core".into());
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let add = find_request(&fx, "workspace/add_project").expect("workspace/add_project fired");
     assert_eq!(add["workspace"], json!("aether"));
     assert_eq!(add["path_index"], json!(0));
@@ -8635,9 +8658,9 @@ fn settings_delete_on_a_project_row_confirms_then_removes() {
     s.open_workspace_settings();
     // name → root → add-root → project(0).
     for _ in 0..3 {
-        s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+        s.on_key(KeyCode::Tab, Mods::NONE, None);
     }
-    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None);
     assert!(
         find_request(&fx, "workspace/remove_project").is_none(),
         "delete confirms first, it doesn't fire straight away"
@@ -8650,7 +8673,7 @@ fn settings_delete_on_a_project_row_confirms_then_removes() {
         })
     ));
 
-    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, None);
     let req = find_request(&fx, "workspace/remove_project").expect("remove fired on accept");
     assert_eq!(req["path_index"], json!(0));
     assert_eq!(req["relative_path"], json!("crates/core"));
@@ -8670,7 +8693,7 @@ fn settings_rename_emits_request_and_its_result_updates_the_name() {
     // The shell's input owns text entry and syncs the whole value; the core no longer key-edits.
     let _ = s.workspace_settings_set_name("oldx".into());
     // Enter commits the rename.
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let rename = find_request(&fx, "workspace/rename").expect("workspace/rename fired");
     assert_eq!(rename["workspace"], json!("old"));
     assert_eq!(rename["new_name"], json!("oldx"));
@@ -8698,10 +8721,10 @@ fn settings_remove_root_needs_confirm_then_emits_request() {
     s.workspace_paths = vec!["/a".into(), "/b".into()];
     s.open_workspace_settings();
     // Open focuses the name field (index 0); Tab down to the first root row (index 1).
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
     assert_eq!(s.workspace_settings.as_ref().unwrap().selected, 1);
     // Delete opens the shared confirm prompt for the highlighted root (no request yet).
-    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None);
     assert!(
         find_request(&fx, "workspace/remove_root").is_none(),
         "Delete only raises the confirm prompt"
@@ -8719,7 +8742,7 @@ fn settings_remove_root_needs_confirm_then_emits_request() {
     // The settings overlay stays open behind the prompt.
     assert!(s.workspace_settings.is_some());
     // Accepting the prompt fires the remove request for the staged root.
-    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
     let remove = find_request(&fx, "workspace/remove_root").expect("workspace/remove_root fired");
     assert_eq!(remove["workspace"], json!("aether"));
     assert_eq!(remove["path"], json!("/a"));
@@ -8819,8 +8842,8 @@ fn add_rows_show_their_affordance_until_something_is_typed() {
     }
 
     // Focusing the add-root row swaps the seed in — which is also when its completions matter.
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
     {
         let ps = s.workspace_settings.as_ref().unwrap();
         assert_eq!(ps.row(), SettingsRow::AddRoot);
@@ -8834,7 +8857,7 @@ fn add_rows_show_their_affordance_until_something_is_typed() {
 
     // Type something and navigate away: now there is content worth showing, so no placeholder.
     let _ = s.workspace_settings_set_add("~/code".into());
-    s.on_key(KeyCode::BackTab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::BackTab, Mods::NONE, None);
     assert_eq!(
         s.workspace_settings
             .as_ref()
@@ -8895,9 +8918,9 @@ fn settings_add_root_completes_absolute_paths() {
 
     // Tab to the row, then a typed prefix ghosts the directory — and only the directory: a root is
     // a directory, so the file is never offered.
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
     assert!(s.workspace_settings.as_ref().unwrap().on_input());
     let _ = s.workspace_settings_set_add("~/Pro".into());
     {
@@ -8917,7 +8940,7 @@ fn settings_add_root_completes_absolute_paths() {
 
     // Alt-l accepts the directory and re-lists one level down.
     let _ = s.workspace_settings_set_add("~/Pro".into());
-    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('l'), Mods::ALT, None);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().add.input.text,
         "~/Projects/"
@@ -8927,7 +8950,7 @@ fn settings_add_root_completes_absolute_paths() {
     assert_eq!(list["unrestricted"], json!(true));
 
     // And Enter commits the literal path, tilde intact — the server expands it.
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let add = find_request(&fx, "workspace/add_root").expect("workspace/add_root fired");
     assert_eq!(add["path"], json!("~/Projects/"));
 }
@@ -8938,7 +8961,7 @@ fn settings_esc_closes_the_overlay() {
     s.workspace = "aether".into();
     s.open_workspace_settings();
     assert!(s.workspace_settings.is_some());
-    s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(s.workspace_settings.is_none());
 }
 
@@ -9186,8 +9209,8 @@ fn closing_a_view_focused_on_the_tethered_file_does_not_exit() {
         "but the view is the patch, not the file"
     );
 
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()));
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "view/close");
     assert_eq!(
@@ -9221,8 +9244,8 @@ fn closing_the_tether_in_a_workspace_context_exits() {
     s.view.buffer.buffer_id = 7;
     s.tether = Some(7);
 
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()));
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "view/close");
     assert_eq!(
@@ -9243,8 +9266,8 @@ fn closing_an_untethered_buffer_switches_to_the_successor() {
     s.workspace = "proj".to_string();
     s.view.buffer.buffer_id = 7;
 
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()));
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "view/close");
     assert_eq!(params["open_next"], json!(true), "adopt the MRU successor");
@@ -9345,8 +9368,8 @@ fn unkeep_releases_the_tether_one_way() {
     s.tether = Some(7);
 
     // `Space k` on the (clean) tether: one set_transient request, demoting the buffer.
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()));
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "view/set_transient");
     assert_eq!(params["view_id"], json!(7), "the tethered view");
@@ -9366,8 +9389,8 @@ fn unkeep_releases_the_tether_one_way() {
 
     // Re-keep (the transient flag itself rides a push; simulate it) — a plain keep, no re-arm.
     s.view.view_transient = true;
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()));
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "view/set_transient");
     assert_eq!(params["transient"], json!(false), "plain keep");
@@ -9392,8 +9415,8 @@ fn unkeep_on_a_dirty_tether_refuses_with_a_warning() {
     s.view.buffer.saved_revision = 2;
     s.tether = Some(7);
 
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()));
     assert!(
         !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
         "no RPC — the release is refused"
@@ -9425,8 +9448,8 @@ fn space_alt_x_saves_closes_and_exits_the_tethered_session() {
     s.view.buffer.buffer_id = 7;
     s.tether = Some(7);
 
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None);
     let params = find_request(&fx, "view/save").expect("Space Alt-x saves first");
     assert_eq!(params["overwrite"], json!(false));
     assert!(!quits(&fx), "no exit before the save lands");
@@ -9457,8 +9480,8 @@ fn space_alt_x_untethered_closes_to_the_successor() {
     s.workspace_paths = vec!["/p".into()];
     s.view.buffer.buffer_id = 7;
 
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None);
     let token = save_token(&fx);
 
     let fx = s.on_rpc_result(token, Ok(view_saved(1)));
@@ -9662,8 +9685,8 @@ fn open_path_prompt_completes_absolute_paths_including_files() {
     s.workspace_paths = Vec::new();
 
     // `Space Alt-w` opens it.
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('w'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('w'), Mods::ALT, None);
     let list = find_request(&fx, "directory/list").expect("opening lists the seed");
     assert_eq!(list["path"], json!("~/"));
     assert_eq!(list["unrestricted"], json!(true));
@@ -9754,15 +9777,15 @@ fn settings_alt_backspace_matches_each_fields_grain() {
     // The name field (focused on open).
     assert!(s.workspace_settings.as_ref().unwrap().on_name());
     let _ = s.workspace_settings_set_name("my old project".into());
-    s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert_eq!(s.workspace_settings.as_ref().unwrap().name.text, "my old ");
 
     // Tab down to the add-root input (past the single root).
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
-    s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
+    s.on_key(KeyCode::Tab, Mods::NONE, None);
     assert!(s.workspace_settings.as_ref().unwrap().on_input());
     let _ = s.workspace_settings_set_add("/home/me/code".into());
-    s.on_key(KeyCode::Backspace, Mods::ALT, None, ROWS);
+    s.on_key(KeyCode::Backspace, Mods::ALT, None);
     assert_eq!(
         s.workspace_settings.as_ref().unwrap().add.input.text,
         "/home/me/",
@@ -9832,9 +9855,9 @@ fn sneak_label_key_selects_and_refine_narrows() {
 fn sneak_shift_select_extends() {
     let mut s = session_with_viewport();
     // `S` (Shift) arms the extend variant.
-    let _ = s.on_key(KeyCode::Char('s'), Mods::SHIFT, Some("S".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char('s'), Mods::SHIFT, Some("S".into()));
     assert!(s.view.sneak.as_ref().unwrap().extend);
-    let fx = s.on_key(KeyCode::Char('g'), Mods::SHIFT, Some("G".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('g'), Mods::SHIFT, Some("G".into()));
     let (token, _, _) = the_request(&fx);
     let _ = s.on_rpc_result(token, Ok(json!({"labels": ["a"], "match_count": 1})));
 
@@ -9852,7 +9875,7 @@ fn sneak_shift_select_extends() {
 fn sneak_alt_s_targets_big_words() {
     let mut s = session_with_viewport();
     // Alt-s arms the big-word variant.
-    let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, Some("s".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char('s'), Mods::ALT, Some("s".into()));
     assert!(s.view.sneak.as_ref().unwrap().big);
     let fx = key(&mut s, 'f');
     let (_, method, params) = the_request(&fx);
@@ -9869,14 +9892,14 @@ fn sneak_backspace_unwinds_and_esc_cancels() {
     let _ = s.on_rpc_result(token, Ok(json!({"labels": ["a"], "match_count": 1})));
 
     // Backspace shortens the query (here back to empty) and re-queries.
-    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "sneak/update");
     assert_eq!(params["query"], json!(""));
     assert!(s.view.sneak.is_some(), "still armed after backspace");
 
     // Esc cancels: a sneak/cancel and the session ends.
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     let (_, method, _) = the_request(&fx);
     assert_eq!(method, "sneak/cancel");
     assert!(s.view.sneak.is_none(), "session ended on Esc");
@@ -9886,8 +9909,8 @@ fn sneak_backspace_unwinds_and_esc_cancels() {
 fn space_z_asks_the_shell_to_open_a_new_window() {
     let mut s = session();
     // `Space z` — was `Space Alt-x` until that chord became save-and-close.
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('z'), Mods::NONE, Some("z".into()), ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('z'), Mods::NONE, Some("z".into()));
     assert!(
         fx.0.iter()
             .any(|e| matches!(e, Effect::ShellAction(ShellAction::NewWindow(_)))),
@@ -10081,7 +10104,7 @@ fn hints_intro_teaches_dismiss_then_toggle() {
 
     // Trying *that* follows the toggle hint, turns hints off, persists, and toasts the way back.
     key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     assert!(!s.hints_enabled);
     assert!(s.hint_view().is_none());
     let recs = hint_records(&fx);
@@ -10147,7 +10170,7 @@ fn hints_space_alt_h_toggles_and_persists() {
 
     // Space Alt-h off: the corner empties, the flip persists, and a toast names the way back.
     key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     assert!(!s.hints_enabled);
     assert!(s.hint_view().is_none());
     assert!(
@@ -10166,7 +10189,7 @@ fn hints_space_alt_h_toggles_and_persists() {
 
     // And back on.
     key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     assert!(s.hints_enabled);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "settings/set");
@@ -10192,7 +10215,7 @@ fn hints_following_the_displayed_binding_records_followed() {
         }
         "toggle" => {
             key(&mut s, ' ');
-            s.on_key(KeyCode::Char('h'), Mods::ALT, None, ROWS)
+            s.on_key(KeyCode::Char('h'), Mods::ALT, None)
         }
         "help" => {
             key(&mut s, ' ');
@@ -10272,7 +10295,7 @@ fn hints_context_follows_overlays_and_reverts() {
     );
 
     // Esc back to Normal: the frozen slot restores the same hint, with no fresh Shown.
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert_eq!(
         s.hint_view(),
         Some(normal_view),
@@ -10466,35 +10489,35 @@ fn search_up_down_walk_the_query_history_and_restore_the_draft() {
     assert_eq!(s.view.mode, Mode::Search);
     let _ = s.search_set_query("draft".into());
 
-    let fx = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None);
     assert_eq!(s.view.search.query, "newer", "Up recalls the newest entry");
     assert_eq!(
         find_request(&fx, "search/set").map(|p| p["query"].clone()),
         Some(json!("newer")),
         "each recall previews its matches"
     );
-    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None);
     assert_eq!(s.view.search.query, "older");
-    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None);
     assert_eq!(
         s.view.search.query, "older",
         "the oldest entry doesn't wrap"
     );
 
-    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None);
     assert_eq!(s.view.search.query, "newer");
-    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None);
     assert_eq!(
         s.view.search.query, "draft",
         "stepping past the newest restores the typed draft"
     );
-    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None);
     assert_eq!(s.view.search.query, "draft", "and stays there");
 
     // Alt-k/j remain as the unlisted alias.
-    let _ = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('k'), Mods::ALT, None);
     assert_eq!(s.view.search.query, "newer");
-    let _ = s.on_key(KeyCode::Char('j'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('j'), Mods::ALT, None);
     assert_eq!(s.view.search.query, "draft");
 }
 
@@ -10505,17 +10528,17 @@ fn typing_abandons_a_history_walk() {
     let mut s = session();
     adopt_history(&mut s, json!({ "search": ["one", "two"] }));
     let _ = key(&mut s, '/');
-    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
-    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None);
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None);
     assert_eq!(s.view.search.query, "one");
 
     let _ = s.search_set_query("typed".into());
-    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None);
     assert_eq!(
         s.view.search.query, "two",
         "the walk restarts from the newest"
     );
-    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None);
     assert_eq!(s.view.search.query, "typed", "and restores the newer draft");
 }
 
@@ -10527,7 +10550,7 @@ fn committing_a_search_records_it_locally_and_server_side() {
     let mut s = session();
     let _ = key(&mut s, '/');
     let _ = s.search_set_query("needle".into());
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert_eq!(
         find_request(&fx, "history/record"),
         Some(&json!({ "kind": "search", "value": "needle" }))
@@ -10537,7 +10560,7 @@ fn committing_a_search_records_it_locally_and_server_side() {
     // Same query again: already the newest entry, so no list change and no traffic.
     let _ = key(&mut s, '/');
     let _ = s.search_set_query("needle".into());
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(find_request(&fx, "history/record").is_none());
     assert_eq!(hist(&s, HistoryKind::Search), ["needle"]);
 }
@@ -10551,18 +10574,18 @@ fn grep_picker_query_recalls_on_up_down() {
     adopt_history(&mut s, json!({ "grep": ["fn resolve", "wrap_state"] }));
 
     let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
-    let fx = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None);
     assert_eq!(s.picker.as_ref().unwrap().query, "wrap_state");
     assert_eq!(
         find_request(&fx, "picker/query").map(|p| p["query"].clone()),
         Some(json!("wrap_state")),
         "the recalled query re-runs the search"
     );
-    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None);
     assert_eq!(s.picker.as_ref().unwrap().query, "fn resolve");
 
     // Alt-k still moves the highlight rather than the history.
-    let _ = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('k'), Mods::ALT, None);
     assert_eq!(s.picker.as_ref().unwrap().query, "fn resolve");
 
     // Files has no query history: Up is inert there (and mustn't touch the query).
@@ -10570,7 +10593,7 @@ fn grep_picker_query_recalls_on_up_down() {
     adopt_history(&mut s, json!({ "grep": ["fn resolve"] }));
     let _ = s.open_picker(PickerKind::Files, None, None, false, None);
     let _ = s.picker_set_query("mai".into());
-    let fx = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None);
     assert_eq!(s.picker.as_ref().unwrap().query, "mai");
     assert!(find_request(&fx, "picker/query").is_none());
 }
@@ -10589,7 +10612,7 @@ fn closing_grep_records_the_settled_query_only() {
         let fx = s.picker_set_query(q.into());
         assert!(find_request(&fx, "history/record").is_none());
     }
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert_eq!(
         find_request(&fx, "history/record"),
         Some(&json!({ "kind": "grep", "value": "wrap" })),
@@ -10600,7 +10623,7 @@ fn closing_grep_records_the_settled_query_only() {
     // A one-character query never ran a search, so it never enters the history.
     let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
     let _ = s.picker_set_query("w".into());
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert!(find_request(&fx, "history/record").is_none());
     assert_eq!(hist(&s, HistoryKind::Grep), ["wrap"]);
 }
@@ -10641,16 +10664,16 @@ fn chip_editor_fields_recall_and_record_separately() {
     let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
 
     // Alt-g opens the glob editor; Up walks the glob list (not the path one).
-    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None, ROWS);
-    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('g'), Mods::ALT, None);
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None);
     let ed = s.picker.as_ref().unwrap().chip_editor.as_ref().unwrap();
     assert_eq!(ed.input.text, "*.rs");
-    let _ = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Up, Mods::NONE, None);
     let ed = s.picker.as_ref().unwrap().chip_editor.as_ref().unwrap();
     assert_eq!(ed.input.text, "*.toml");
 
     // Enter commits: the chip lands and the field text is recorded.
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert_eq!(
         find_request(&fx, "history/record"),
         Some(&json!({ "kind": "glob", "value": "*.toml" }))
@@ -10679,10 +10702,10 @@ fn search_recall_restores_match_options_and_down_restores_yours() {
 
     let _ = key(&mut s, '/');
     let _ = s.search_set_query("plain".into());
-    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS); // smart -> sensitive
+    let _ = s.on_key(KeyCode::Char('c'), Mods::ALT, None); // smart -> sensitive
     assert_eq!(s.view.search.options.case, CaseMode::Sensitive);
 
-    let fx = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None);
     assert_eq!(s.view.search.query, "f.o");
     assert_eq!(
         s.view.search.options,
@@ -10698,7 +10721,7 @@ fn search_recall_restores_match_options_and_down_restores_yours() {
         Some(json!({ "regex": true }))
     );
 
-    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None);
     assert_eq!(s.view.search.query, "plain");
     assert_eq!(
         s.view.search.options.case,
@@ -10737,7 +10760,7 @@ fn grep_recall_restores_the_chip_row() {
         });
     }
 
-    let fx = s.on_key(KeyCode::Up, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Up, Mods::NONE, None);
     let p = s.picker.as_ref().unwrap();
     assert_eq!(p.query, "fn resolve");
     let filters = p.wire_filters();
@@ -10753,7 +10776,7 @@ fn grep_recall_restores_the_chip_row() {
     assert_eq!(q["query"], json!("fn resolve"));
     assert_eq!(q["filters"]["globs"], json!(["*.ts"]));
 
-    let _ = s.on_key(KeyCode::Down, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Down, Mods::NONE, None);
     let restored = s.picker.as_ref().unwrap().wire_filters();
     assert_eq!(restored.globs, ["*.rs"], "Down restores the user's own row");
     assert_eq!(restored.directories.len(), 1);
@@ -10769,8 +10792,8 @@ fn closing_grep_records_the_chip_row_with_the_query() {
     let mut s = session();
     let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
     let _ = s.picker_set_query("wrap".into());
-    let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS); // Alt-e: regex on
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+    let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None); // Alt-e: regex on
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
     assert_eq!(
         find_request(&fx, "history/record"),
         Some(&json!({ "kind": "grep", "value": "wrap", "filters": { "regex": true } })),
@@ -10792,9 +10815,9 @@ fn re_recording_a_term_updates_its_filters_in_place() {
         let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
         let _ = s.picker_set_query("wrap".into());
         if regex {
-            let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None, ROWS);
+            let _ = s.on_key(KeyCode::Char('e'), Mods::ALT, None);
         }
-        let _ = s.on_key(KeyCode::Esc, Mods::NONE, None, ROWS);
+        let _ = s.on_key(KeyCode::Esc, Mods::NONE, None);
     }
     assert_eq!(hist(&s, HistoryKind::Grep), ["wrap"], "one row, not two");
     assert!(
@@ -11058,7 +11081,7 @@ fn read_p_and_alt_jk_alias_the_element_step() {
         })),
     );
     // …and `Alt-k` steps back like `k` (the visual-row variant, same collapse).
-    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('k'), Mods::ALT, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/move");
     assert_eq!(params["motion"]["position"], json!({"line": 0, "col": 0}));
@@ -11074,7 +11097,6 @@ fn read_percent_selects_all_blocks() {
             ..Mods::NONE
         },
         Some("%".into()),
-        ROWS,
     );
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "element/select_all");
@@ -11109,7 +11131,7 @@ fn read_comma_collapses_the_block_selection() {
 #[test]
 fn read_delete_key_aliases_ctrl_d() {
     let mut s = read_session();
-    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Delete, Mods::NONE, None);
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "element/delete_block");
 }
@@ -11158,7 +11180,7 @@ fn read_l_focuses_the_link_in_block_and_enter_opens_it() {
     let mut s = read_session();
     focus_the_link(&mut s);
     // Enter follows the focused link with the system opener.
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -11176,6 +11198,11 @@ fn read_l_focuses_the_link_in_block_and_enter_opens_it() {
 
 /// `v`/`Alt-v`: the editor's half-page cursor motion, verbatim — the server resolves it in editor
 /// wrap geometry and the returned cursor derives focus (best-effort distance, framed landing).
+///
+/// The count is *pages*, not rows: the span is the viewport's own height, read server-side. This
+/// used to send `visual_line` with a count of half the viewport's rows, which is how a number
+/// no one typed reached the field the count rule reads as an assertion — and why `100 Alt-j`
+/// clamped.
 #[test]
 fn read_v_rides_the_editor_half_page_motion() {
     let mut s = read_session();
@@ -11185,9 +11212,10 @@ fn read_v_rides_the_editor_half_page_motion() {
     let fx = key(&mut s, 'v');
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/move");
-    assert_eq!(params["motion"]["kind"], json!("visual_line"));
+    assert_eq!(params["motion"]["kind"], json!("page"));
     assert_eq!(params["motion"]["direction"], json!("down"));
-    assert_eq!(params["motion"]["count"], json!(ROWS / 2));
+    assert_eq!(params["motion"]["count"], json!(1));
+    assert_eq!(params["motion"]["half"], json!(true));
 }
 
 /// `z`/`Alt-z`: the server's cursor-motion history, verbatim — the returned cursor derives
@@ -11198,7 +11226,7 @@ fn read_z_walks_the_reading_position_history() {
     let fx = key(&mut s, 'z');
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "element/cursor_undo");
-    let fx = s.on_key(KeyCode::Char('z'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('z'), Mods::ALT, None);
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "element/cursor_redo");
 }
@@ -11254,8 +11282,8 @@ fn space_t_shows_the_focused_target_without_following() {
     use aether_client::session::HoverText;
     let mut s = read_session();
     // On a plain block: quiet no-op.
-    s.on_key(KeyCode::Char(' '), Mods::NONE, None, ROWS);
-    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Char(' '), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None);
     assert!(
         fx.0.is_empty(),
         "Tab on a non-interactive block does nothing"
@@ -11263,8 +11291,8 @@ fn space_t_shows_the_focused_target_without_following() {
     // On a focused link: the URL in the hover popover (whose own keys then apply — Ctrl-c
     // copies it via `keymap::hover_action`), no open, no cursor move.
     focus_the_link(&mut s);
-    s.on_key(KeyCode::Char(' '), Mods::NONE, None, ROWS);
-    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None, ROWS);
+    s.on_key(KeyCode::Char(' '), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None);
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -11307,7 +11335,7 @@ fn read_shift_j_extends_selection_block_wise() {
     // Shift-j from the heading: a whole-line block selection heading..=first-paragraph via
     // cursor/set + Line granularity — the anchor plants at the heading's line, the cursor
     // lands on the paragraph's; the server snaps both to the normal form.
-    let fx = s.on_key(KeyCode::Char('j'), Mods::SHIFT, Some("J".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::SHIFT, Some("J".into()));
     let (_t, method, p) = the_request(&fx);
     assert_eq!(method, "element/set");
     assert_eq!(p["granularity"], json!("line"));
@@ -11336,7 +11364,7 @@ fn read_x_snaps_then_walks_and_shift_grows() {
     assert_eq!(p["anchor"]["line"], json!(2));
     assert_eq!(p["position"]["line"], json!(2));
     // Shift-x from the same whole-block selection GROWS the bottom instead.
-    let fx = s.on_key(KeyCode::Char('x'), Mods::SHIFT, Some("X".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::SHIFT, Some("X".into()));
     let (_t, _method, p) = the_request(&fx);
     assert_eq!(p["anchor"]["line"], json!(0));
     assert_eq!(p["position"]["line"], json!(2));
@@ -11350,7 +11378,7 @@ fn read_alt_x_selects_the_previous_block_and_saturates() {
     // block *above* (cursor on the first paragraph → the heading), not the focused one.
     s.view.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
     s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
-    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None);
     let (_t, method, p) = the_request(&fx);
     assert_eq!(method, "element/set");
     assert_eq!(p["anchor"]["line"], json!(0));
@@ -11358,7 +11386,7 @@ fn read_alt_x_selects_the_previous_block_and_saturates() {
     // At the document top it saturates: Alt-x on the heading selects the heading itself.
     s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 0 };
     s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
-    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None);
     let (_t, _method, p) = the_request(&fx);
     assert_eq!(p["anchor"]["line"], json!(0));
     assert_eq!(p["position"]["line"], json!(0));
@@ -11768,7 +11796,7 @@ fn read_r_reverses_the_selection_and_alt_r_orients_it_forward() {
     assert_eq!(method, "element/swap_anchor");
     // `forward_only: false` is the wire default and skips (the plain toggle).
     assert!(p.get("forward_only").is_none(), "{p}");
-    let fx = s.on_key(KeyCode::Char('r'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('r'), Mods::ALT, None);
     let (_t, method, p) = the_request(&fx);
     assert_eq!(method, "element/swap_anchor");
     assert_eq!(p["forward_only"], json!(true));
@@ -11865,7 +11893,7 @@ fn enter_toggles_a_task_items_checkbox() {
     let _ = enter_reader(&mut s, "- [ ] open\n- [x] done\n");
     s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 6 };
     s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "element/toggle_task");
     let _ = Event::BlockEditDone; // (adoption covered by the cut test)
@@ -11883,7 +11911,7 @@ fn j_steps_one_block_from_a_selected_fence() {
     // Cursor on the closing fence line's newline, as a whole-line block selection leaves it.
     s.view.buffer.cursor.anchor = LogicalPosition { line: 2, col: 0 };
     s.view.buffer.cursor.position = LogicalPosition { line: 4, col: 3 };
-    let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('j'), Mods::NONE, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/move");
     assert_eq!(params["motion"]["kind"], "goto");
@@ -11901,23 +11929,23 @@ fn ctrl_a_checks_a_task_item_in_markdown_and_still_adjusts_numbers_elsewhere() {
     // One pair of keys, one meaning — "adjust what's under the cursor, up or down" — resolving to
     // whatever the buffer has. Markdown gives up number adjustment for it, deliberately.
     let mut s = md_session();
-    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/toggle_task");
     assert_eq!(params["set"], json!(true), "up checks the box");
-    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL_ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL_ALT, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/toggle_task");
     assert_eq!(params["set"], json!(false), "down unchecks it");
     // The same chord in the reading view resolves the same way — that is the point of it.
     let _ = enter_reader(&mut s, "- [ ] open\n");
-    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/toggle_task");
     assert_eq!(params["set"], json!(true));
     // A non-markdown buffer keeps the number adjust.
     let mut s = session();
-    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('a'), Mods::CTRL, None);
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/adjust_number");
     assert_eq!(params["delta"], json!(1));
@@ -11934,7 +11962,7 @@ fn enter_toggles_a_task_item_holding_more_than_one_block() {
     // On the outer item's own text, whose innermost element is the paragraph, not the item.
     s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 8 };
     s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "element/toggle_task");
 }
@@ -11949,7 +11977,7 @@ fn enter_does_not_follow_a_link_the_selection_has_un_armed() {
     // Point cursor on the link: Enter follows it.
     s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 2 };
     s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         fx.0.iter()
             .any(|e| matches!(e, Effect::ShellAction(ShellAction::OpenUrl(_)))),
@@ -11958,7 +11986,7 @@ fn enter_does_not_follow_a_link_the_selection_has_un_armed() {
     // Same cursor, selection extended over the block: no navigation, no request.
     s.view.buffer.cursor.anchor = LogicalPosition { line: 0, col: 0 };
     s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 30 };
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         !fx.0
             .iter()
@@ -12457,7 +12485,7 @@ fn read_enter_on_a_remote_image_opens_the_url() {
     let mut s = md_session();
     let _ = enter_reader(&mut s, "![logo](https://x.y/logo.svg)\n");
     // The lone image promotes to a block element; the boot cursor (0,0) focuses it.
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -12520,7 +12548,7 @@ fn read_ctrl_enter_opens_relative_links_in_a_new_window() {
     s.view.buffer.path = Some("/ws/docs/doc.md".into());
     let _ = enter_reader(&mut s, "[next](./other.md)\n");
     // The boot cursor (0,0) sits inside the link — Ctrl-Enter opens it in a new window.
-    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None);
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -12535,7 +12563,7 @@ fn read_ctrl_enter_opens_relative_links_in_a_new_window() {
     // An external link falls back to Enter behaviour (open externally).
     let mut s = read_session();
     focus_the_link(&mut s);
-    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::CTRL, None);
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -12555,7 +12583,7 @@ fn read_enter_on_a_local_image_emits_open_buffer_file() {
     let _ = enter_reader(&mut s, "![d](../img.png)\n");
     let id = s.view.buffer.buffer_id;
     // The boot cursor (0,0) sits inside the image markup — armed; Enter opens.
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -12621,9 +12649,9 @@ fn space_g_c_prepares_a_commit_and_alt_x_commits_it() {
     );
 
     // `Space Alt-x` in the commit buffer: save first, so `git commit -F` reads what was written.
-    let fx = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
     assert!(no_request(&fx));
-    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None);
     let (token, method, _) = the_request(&fx);
     assert_eq!(method, "view/save");
 
@@ -12718,8 +12746,8 @@ fn a_refused_commit_keeps_the_message_buffer_open() {
         })),
     );
 
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None);
     let (token, _, _) = the_request(&fx);
     let fx = s.on_rpc_result(token, Ok(view_saved(1)));
     let (token, _, _) = the_request(&fx);
@@ -12746,7 +12774,7 @@ fn space_g_alt_c_amends() {
     let mut s = session();
     let _ = key(&mut s, ' ');
     let _ = key(&mut s, 'g');
-    let fx = s.on_key(KeyCode::Char('c'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('c'), Mods::ALT, None);
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "git/prepare_commit");
     assert_eq!(params["amend"], json!(true));
@@ -12771,8 +12799,8 @@ fn space_g_alt_c_amends() {
         })),
     );
 
-    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None);
     let (token, _, _) = the_request(&fx);
     let fx = s.on_rpc_result(token, Ok(view_saved(1)));
     let (_, method, params) = the_request(&fx);
@@ -13005,7 +13033,7 @@ fn space_alt_i_opens_the_baseline_picker() {
     s.workspace_paths = vec!["/p".into()];
 
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('i'), Mods::ALT, None, ROWS);
+    let fx = s.on_key(KeyCode::Char('i'), Mods::ALT, None);
     let params = find_request(&fx, "picker/view").expect("Space Alt-i opens a picker");
     assert_eq!(params["kind"], "git_baseline");
     assert_eq!(
@@ -13050,14 +13078,14 @@ fn baseline_picker_enter_sets_the_baseline() {
     };
 
     let mut s = open(1);
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let params = find_request(&fx, "git/set_baseline").expect("Enter sets the baseline");
     assert_eq!(params["repo_id"], "/p");
     assert_eq!(params["source"], serde_json::json!({"kind": "saved"}));
     assert!(s.picker.is_none(), "the picker closes behind the choice");
 
     let mut s = open(2);
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let params = find_request(&fx, "git/set_baseline").expect("Enter sets the baseline");
     assert_eq!(
         params["source"],
@@ -13067,7 +13095,7 @@ fn baseline_picker_enter_sets_the_baseline() {
     // The `index` row clears the baseline: absent `source`, which is the same absent the RPC
     // already took to mean "back to the default".
     let mut s = open(0);
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let params = find_request(&fx, "git/set_baseline").expect("Enter sets the baseline");
     assert!(
         params.get("source").is_none(),
@@ -13275,7 +13303,7 @@ fn focusing_another_element_adopts_its_buffer_status() {
         ..Default::default()
     };
 
-    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
     let token =
         fx.0.iter()
             .find_map(|e| match e {
@@ -13446,8 +13474,8 @@ fn closing_a_composed_view_asks_about_unsaved_edits_in_any_element() {
     }
 
     //  — close is a leader chord; bare  selects a line.
-    s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
-    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()), ROWS);
+    s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()));
     assert!(
         find_request(&fx, "view/close").is_none(),
         "a dirty view must stage a confirm rather than closing straight away"
@@ -13487,7 +13515,7 @@ fn enter_in_a_composed_view_opens_the_focused_elements_file() {
         "the fixture must be composed, or this proves nothing"
     );
 
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         find_request(&fx, "lsp/goto_definition").is_none(),
         "the file wins over go-to-definition here"
@@ -13515,7 +13543,7 @@ fn enter_in_an_ordinary_view_still_goes_to_the_definition() {
     let bound = s.view.buffer.buffer_id;
     let line = s.view.buffer.cursor.position.line;
     s.adopt_subscribe(subscribe_over(bound, focus_on(0, bound, line)));
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     assert!(
         find_request(&fx, "lsp/goto_definition").is_some(),
         "one element, so nothing to promote"
@@ -13533,7 +13561,7 @@ fn enter_in_an_ordinary_view_still_goes_to_the_definition() {
 fn read_mode_headings_use_the_same_outline_as_the_editor() {
     let mut s = read_session();
     s.view.viewport_id = Some(7);
-    let fx = s.on_key(KeyCode::Char('o'), Mods::NONE, Some("o".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('o'), Mods::NONE, Some("o".into()));
     let (_t, method, params) = the_request(&fx);
     assert_eq!(
         method, "view/navigate_change",
@@ -13542,7 +13570,7 @@ fn read_mode_headings_use_the_same_outline_as_the_editor() {
     assert_eq!(params["grain"], json!("outline"));
     assert_eq!(params["direction"], json!("next"));
 
-    let fx = s.on_key(KeyCode::Char('o'), Mods::ALT, Some("o".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('o'), Mods::ALT, Some("o".into()));
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "view/navigate_change");
     assert_eq!(params["direction"], json!("previous"));
@@ -13568,7 +13596,7 @@ fn selecting_a_view_row_focuses_its_element_then_sets_the_cursor() {
     // client dispatches on the *result*, which is the point of the variant.
     grep_with_groups(&mut s);
     s.picker.as_mut().unwrap().selected = 0;
-    let accept = s.on_key(KeyCode::Enter, Mods::NONE, None, ROWS);
+    let accept = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let token = accept
         .0
         .iter()

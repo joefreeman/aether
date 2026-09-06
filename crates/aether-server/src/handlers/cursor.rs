@@ -19,7 +19,8 @@ pub async fn cursor_move(
     // dedicated resolver; everything else goes through `resolve_motion` which only needs the
     // scope.
     let virtual_col_in = s.virtual_col.get(&key).copied();
-    // `Some(col)` → set virtual col to `col`; `None` → clear it. Only `VisualLine` preserves it.
+    // `Some(col)` → set virtual col to `col`; `None` → clear it. The vertical motions set it;
+    // everything else falls through and clears it.
     let mut new_virtual_col: Option<u32> = None;
     // Set by `o`/`Alt-o` to land the target's identifier selected (anchor at the name start).
     let mut nav_anchor: Option<LogicalPosition> = None;
@@ -42,6 +43,41 @@ pub async fn cursor_move(
                 virtual_col_in,
                 *direction,
                 *count,
+                // `Alt-j`/`Alt-k`: the count is the user's, so it is honoured in full or not at all.
+                motion::Overshoot::Refuse,
+            );
+            new_virtual_col = Some(target_vcol);
+            pos
+        }
+        Motion::Page {
+            viewport_id,
+            direction,
+            count,
+            half,
+        } => {
+            let vp = s.viewports.get(viewport_id).ok_or_else(|| {
+                RpcError::new(
+                    aether_protocol::error::ErrorCode::VIEWPORT_NOT_FOUND,
+                    format!("unknown viewport_id: {viewport_id}"),
+                )
+            })?;
+            // The span is the viewport's own height, which the server already tracks — no shell has
+            // to turn its geometry into a wire count, and none can disagree about what a page is.
+            // `.max(1)` keeps a one-row viewport (or a half of it) moving at all.
+            let span = if *half {
+                (vp.rows / 2).max(1)
+            } else {
+                vp.rows.max(1)
+            };
+            let (pos, target_vcol) = motion::resolve_visual_line(
+                &scope,
+                vp.wrap_geometry(),
+                current.position,
+                virtual_col_in,
+                *direction,
+                (*count).max(1).saturating_mul(span),
+                // A page is "a screenful, or as far as there is" — clamping *is* honouring it.
+                motion::Overshoot::Clamp,
             );
             new_virtual_col = Some(target_vcol);
             pos

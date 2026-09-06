@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn mode_tracks_session_state() {
         let mut s = WasmSession::new();
-        s.dispatch_key("i", "KeyI", false, false, false, 40);
+        s.dispatch_key("i", "KeyI", false, false, false);
         assert_eq!(build_view(s.session())["mode"], "insert");
     }
 }

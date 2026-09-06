@@ -9174,28 +9174,16 @@ impl Session {
     /// handled. Cursor moves keyed here resolve asynchronously (via `CursorMsg` → `on_event`), so
     /// what this boundary uniquely catches is the *synchronous* search-clear paths — `drop_search`
     /// (Esc in Normal), `abort_search` / `commit_search` (the prompt) — which never reach `on_event`.
-    pub fn on_key(
-        &mut self,
-        code: KeyCode,
-        mods: Mods,
-        text: Option<String>,
-        visible_rows: u32,
-    ) -> Effects {
+    pub fn on_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
         // Every key is hint-relevant activity (the idle gate), and dispatch may have moved the
         // hint context (opened an overlay, left Insert) — re-sync so the corner follows.
         self.hints.note_input();
-        let fx = self.dispatch_key(code, mods, text, visible_rows);
+        let fx = self.dispatch_key(code, mods, text);
         let fx = fx.and(self.sync_hint_context());
         fx.and(self.sync_decoration_follow())
     }
 
-    fn dispatch_key(
-        &mut self,
-        code: KeyCode,
-        mods: Mods,
-        text: Option<String>,
-        visible_rows: u32,
-    ) -> Effects {
+    fn dispatch_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
         // Input isn't gated here: client-only actions (Quit, scroll, help, mode toggles) stay
         // usable while the connection is down — most importantly, the user can still quit. Anything
         // that actually talks to the server is dropped at the point of issue (see `request`), so a
@@ -9294,14 +9282,14 @@ impl Session {
                 if let Some(b) = lookup(KeyContext::Leader, code, mods) {
                     // `Space g` re-arms into the git sub-leader from inside `run_action`, which is
                     // why the clear above happens first.
-                    return self.run_action(b.action, 1, false, mods.shift, visible_rows);
+                    return self.run_action(b.action, 1, false, mods.shift);
                 }
                 return Effects::none();
             }
             Pending::LeaderGit => {
                 self.view.pending = Pending::None;
                 if let Some(b) = lookup(KeyContext::LeaderGit, code, mods) {
-                    return self.run_action(b.action, 1, false, mods.shift, visible_rows);
+                    return self.run_action(b.action, 1, false, mods.shift);
                 }
                 // An unbound key (or Esc) cancels the chord, exactly like the leader.
                 return Effects::none();
@@ -9348,7 +9336,7 @@ impl Session {
             lookup(KeyContext::Global, code, mods)
         };
         if let Some(b) = global.or_else(|| lookup(ctx, code, mods)) {
-            return self.run_action(b.action, count, counted, extend, visible_rows);
+            return self.run_action(b.action, count, counted, extend);
         }
 
         // Insert mode: unmatched printable input is text.
@@ -9380,7 +9368,6 @@ impl Session {
         // the one family for which "no count" and "count 1" are different requests.
         counted: bool,
         extend: bool,
-        visible_rows: u32,
     ) -> Effects {
         // Hint observation: every resolved binding passes through here — except search-mode keys,
         // which resolve in `on_search_key` and observe there. Observed (and its record requests
@@ -9398,7 +9385,7 @@ impl Session {
             self.hints.observe_action(&action, hint_ctx, enabled)
         };
         let hint_fx = self.emit_hint_events(evs);
-        let task = self.dispatch_action(action, count, counted, extend, visible_rows);
+        let task = self.dispatch_action(action, count, counted, extend);
         // Remember the action for `.` to replay. Recorded at dispatch (the RPC is still in flight —
         // a failed motion just leaves a harmless no-op target). `RepeatMotion` itself isn't
         // repeatable, so it never overwrites the target with itself; find records its resolved
@@ -9420,7 +9407,6 @@ impl Session {
         // See `run_action`: distinguishes bare `g` (the field's top) from `1g` (buffer line 1).
         counted: bool,
         extend: bool,
-        visible_rows: u32,
     ) -> Effects {
         use Action as A;
         let buffer_id = self.view.buffer.buffer_id;
@@ -9534,17 +9520,24 @@ impl Session {
                 self.move_jump(motion, extend)
             }
             A::MatchBracket { inner } => self.move_motion(Motion::MatchBracket { inner }, extend),
+            // A page is its own motion, not a visual-line step with a big count. The count here
+            // is *pages* — the row span comes from the viewport's height server-side, which the
+            // server already tracks and which is the same number this shell would have used.
+            //
+            // Sending it as `Motion::VisualLine { count: rows / 2 }` put a number nobody typed into
+            // the field the server's count rule reads as an assertion, so the whole variant had to
+            // clamp to keep `v` working near a file's end — and `Alt-j` clamped with it, which is
+            // how `100 Alt-j` landed short while `100 j` refused.
             A::PageMotion { dir, half } => {
                 let Some(viewport_id) = self.view.viewport_id else {
                     return Effects::none();
                 };
-                let rows = visible_rows;
-                let span = if half { (rows / 2).max(1) } else { rows.max(1) };
                 self.move_motion(
-                    Motion::VisualLine {
+                    Motion::Page {
                         viewport_id,
                         direction: dir,
-                        count: count.saturating_mul(span),
+                        count,
+                        half,
                     },
                     extend,
                 )
@@ -9644,7 +9637,7 @@ impl Session {
                             action,
                             count,
                             counted,
-                        } => self.dispatch_action(*action, *count, *counted, extend, visible_rows),
+                        } => self.dispatch_action(*action, *count, *counted, extend),
                         RepeatTarget::Find(motion) => self.move_motion(motion.clone(), extend),
                     };
                     fx = fx.and(step);

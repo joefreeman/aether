@@ -5,7 +5,8 @@
 use aether_protocol::coords::ElementRow;
 use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
-    CursorSetParams, CursorState, Direction, Granularity, Motion, SelectionEdge, WordBoundary,
+    CursorSetParams, CursorState, Direction, Granularity, Motion, SelectionEdge, VerticalDirection,
+    WordBoundary,
 };
 use aether_protocol::directory::{
     DirectoryCreate, DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryList,
@@ -1130,6 +1131,32 @@ fn motion_is_internally_tagged() {
     assert_eq!(
         v,
         json!({"kind": "goto", "position": {"line": 17, "col": 4}})
+    );
+
+    // The two vertical-row motions are separate variants on the wire, and deliberately so: their
+    // `count` fields mean different things (typed rows vs. pages) and the server reads them under
+    // different rules. A single variant with a synthesised count is the bug this split fixed.
+    let m = Motion::VisualLine {
+        viewport_id: 7,
+        direction: VerticalDirection::Down,
+        count: 100,
+    };
+    let v = to_value(&m).unwrap();
+    assert_eq!(
+        v,
+        json!({"kind": "visual_line", "viewport_id": 7, "direction": "down", "count": 100})
+    );
+
+    let m = Motion::Page {
+        viewport_id: 7,
+        direction: VerticalDirection::Up,
+        count: 2,
+        half: true,
+    };
+    let v = to_value(&m).unwrap();
+    assert_eq!(
+        v,
+        json!({"kind": "page", "viewport_id": 7, "direction": "up", "count": 2, "half": true})
     );
 }
 

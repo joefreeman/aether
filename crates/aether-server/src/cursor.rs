@@ -313,10 +313,11 @@ pub fn resolve_selection_edge(
 /// The list is deliberately short: it holds the motions that need *this* helper to obey the
 /// all-or-nothing rule, not every motion the rule applies to. It excludes:
 ///
-/// - **`VisualLine`**, which must keep clamping: `v`/`Alt-v` send a half-screen count the user
-///   never typed, and the rule only binds a count the user asserted. (`Alt-j`/`Alt-k` do take a
-///   typed count and inherit this exemption by sharing the variant — a known violation, and the fix
-///   is to give the page motion its own.)
+/// - **`VisualLine`**, which refuses inside its own resolver — it needs the viewport's wrap
+///   geometry, so like `LogicalLine` it resolves elsewhere and applies the rule there. Its former
+///   exemption ("must keep clamping") was an artefact of `v`/`Alt-v` borrowing the variant to carry
+///   a synthesised row span; `Motion::Page` carries that now, and clamps because a page span is
+///   not a count anyone asserted.
 /// - **Absolute targets** (`Goto`, `BufferStart`/`End`, `LineStart`/`End`, `MatchBracket`,
 ///   `SelectionEdge`), which name a destination rather than a repetition — they refuse by not
 ///   finding it, which they already do.
@@ -413,9 +414,9 @@ pub fn all_or_nothing<T: PartialEq + Copy>(
 /// the *column*, so at the first line a bare `Alt-p` clamps in place and still snaps to the first
 /// non-blank — behaviour a blanket refusal silently removed.
 ///
-/// Not used by [`Motion::VisualLine`], which must keep clamping outright: the half-page motion
-/// (`v`/`Alt-v`) is sent as a visual-line step with a count of half a screen, so refusing an
-/// unhonourable count there would leave no way to scroll to a file's end.
+/// Reached by [`Motion::VisualLine`] too, but only with soft wrap off — there a visual row *is* a
+/// logical line, so the rule has one implementation for both. The wrapped case walks rows and
+/// applies the same policy at the end of its walk; see [`Overshoot`].
 fn counted_line(scope: &Scope, from: u32, direction: Direction, count: u32) -> Option<u32> {
     let checked = match direction {
         Direction::Forward => from.checked_add(count),
@@ -554,6 +555,7 @@ pub fn resolve_motion(scope: &Scope, current: LogicalPosition, motion: &Motion) 
         // state for wrap mode + width), as are selection-edge motions (they need the anchor).
         // resolve_motion is for buffer-only, cursor-position-only motions.
         Motion::VisualLine { .. }
+        | Motion::Page { .. }
         | Motion::VisualLineStart { .. }
         | Motion::VisualLineEnd { .. }
         | Motion::SelectionEdge { .. } => current,
@@ -689,6 +691,25 @@ fn find_char(
     }
 }
 
+/// What a vertical walk does when it runs out of rows before it has run out of steps.
+///
+/// The two callers of [`resolve_visual_line`] differ here and only here. `Alt-j`/`Alt-k` carry a
+/// count the user typed, so they [`Refuse`](Overshoot::Refuse) — the all-or-nothing rule, for the
+/// reasons in [`all_or_nothing`]. `v`/`Alt-v` carry a row span derived from the viewport's height,
+/// a number nobody asserted, so they [`Clamp`](Overshoot::Clamp): refusing it would make `v` a dead
+/// key for the last screenful of every file, with no way to reach the end.
+///
+/// Which is exactly why the page motion has its own [`Motion::Page`] rather than borrowing
+/// `VisualLine`'s `count` — one field cannot mean both, and the server cannot tell the two numbers
+/// apart once they are in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overshoot {
+    /// Keep the last reachable row.
+    Clamp,
+    /// Leave the cursor exactly where it was.
+    Refuse,
+}
+
 /// Resolve a visual line motion: walk up or down by `count` visual rows under the given wrap
 /// settings, preserving the cursor's visual column where possible. When `wrap` is `None` this
 /// degenerates to a logical line step (each logical line is one visual row).
@@ -697,6 +718,10 @@ fn find_char(
 /// motions; if `None`, the current visual column is used. The returned `u32` is the target
 /// visual column used by this call — the caller should stash it so repeated vertical motions
 /// don't drift across rows with different prefix widths (continuation marker + indent).
+///
+/// `overshoot` decides what happens when the field runs out of rows first — see [`Overshoot`]. A
+/// refusal returns `current` untouched, along with the target column so a chain of vertical
+/// motions doesn't forget its intended column just because one press had nowhere to go.
 pub fn resolve_visual_line(
     scope: &Scope,
     geom: wrap::WrapGeometry,
@@ -704,6 +729,7 @@ pub fn resolve_visual_line(
     virtual_col_in: Option<u32>,
     direction: VerticalDirection,
     count: u32,
+    overshoot: Overshoot,
 ) -> (LogicalPosition, u32) {
     let buf = scope.doc();
     let wrap::WrapGeometry {
@@ -724,11 +750,27 @@ pub fn resolve_visual_line(
         };
         let target_display = virtual_col_in
             .unwrap_or_else(|| visual_col_of_byte(&cur_row, current.col as usize, 0, tab_width));
-        let new_line = match direction {
-            VerticalDirection::Down => current.line.saturating_add(count),
-            VerticalDirection::Up => current.line.saturating_sub(count),
+        // Wrap off: one visual row is one logical line, so this is `counted_line`'s case exactly
+        // and refusing goes through the same implementation `j`/`k` refuse with.
+        let new_line = match overshoot {
+            Overshoot::Refuse => {
+                let dir = match direction {
+                    VerticalDirection::Down => Direction::Forward,
+                    VerticalDirection::Up => Direction::Backward,
+                };
+                match counted_line(scope, current.line, dir, count) {
+                    Some(line) => line,
+                    None => return (current, target_display),
+                }
+            }
+            Overshoot::Clamp => {
+                let stepped = match direction {
+                    VerticalDirection::Down => current.line.saturating_add(count),
+                    VerticalDirection::Up => current.line.saturating_sub(count),
+                };
+                stepped.clamp(scope.first_line(), scope.last_line())
+            }
         };
-        let new_line = new_line.clamp(scope.first_line(), scope.last_line());
         let new_text = line_text(buf, new_line);
         let new_row = RowInfo {
             byte_offset: 0,
@@ -801,6 +843,15 @@ pub fn resolve_visual_line(
             break;
         }
         remaining -= 1;
+    }
+
+    // The walk hit the field's edge with steps still owed. A typed count that cannot be honoured
+    // refuses outright rather than landing short — the rule in `all_or_nothing`, applied here
+    // because a row walk cannot go through `counted_line`. An uncounted step keeps clamping, the
+    // same carve-out `counted_line` makes and for the same reason: a bare `Alt-j` at the last row
+    // is the ordinary "already at the end" no-op, not a refusal.
+    if remaining > 0 && overshoot == Overshoot::Refuse && count > 1 {
+        return (current, target_visual_col);
     }
 
     let row = &rows[row_idx];

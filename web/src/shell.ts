@@ -2103,7 +2103,7 @@ export class Shell {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
         e.preventDefault();
         this.runEffects(
-          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey) as CoreEffect[],
         );
       }
       return;
@@ -2116,7 +2116,7 @@ export class Shell {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
         e.preventDefault();
         this.runEffects(
-          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey) as CoreEffect[],
         );
       }
       return;
@@ -2128,7 +2128,7 @@ export class Shell {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
         e.preventDefault();
         this.runEffects(
-          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey) as CoreEffect[],
         );
       }
       return;
@@ -2168,7 +2168,6 @@ export class Shell {
       e.ctrlKey,
       e.altKey,
       e.shiftKey,
-      this.visibleRows(),
     ) as CoreEffect[];
     this.runEffects(effects);
   }
@@ -3367,7 +3366,7 @@ export class Shell {
     e.preventDefault();
     if (this.session) {
       this.runEffects(
-        this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+        this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey) as CoreEffect[],
       );
     }
   }
@@ -3398,7 +3397,7 @@ export class Shell {
   private saveAsCommand(key: string): void {
     if (!this.session) return;
     // Synthetic key from a button click: no Alt, so the physical-code arg is unused — pass `key`.
-    this.runEffects(this.session.on_key(key, key, false, false, false, this.visibleRows()) as CoreEffect[]);
+    this.runEffects(this.session.on_key(key, key, false, false, false) as CoreEffect[]);
   }
 
   private onSaveAsInputKey(e: KeyboardEvent): void {
@@ -3432,7 +3431,7 @@ export class Shell {
     if (!coreKey) return; // native editing; the `input` event syncs the new text to the core
     e.preventDefault();
     this.runEffects(
-      this.session.on_key(k, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[],
+      this.session.on_key(k, e.code, e.ctrlKey, e.altKey, e.shiftKey) as CoreEffect[],
     );
   }
 
@@ -3576,7 +3575,7 @@ export class Shell {
         if (!this.session) return;
         // Synthetic key from a button click: no Alt, so the physical-code arg is unused — pass `key`.
         this.runEffects(
-          this.session.on_key(key, key, false, false, false, this.visibleRows()) as CoreEffect[],
+          this.session.on_key(key, key, false, false, false) as CoreEffect[],
         );
       };
       // Each button carries a dim `modal-key` hint advertising its keyboard shortcut (`y`/`n` —
@@ -4458,7 +4457,7 @@ export class Shell {
       (k === "Backspace" && !e.altKey && !e.ctrlKey && emptyPath);
     if (!coreKey) return; // native editing; the `input` event syncs the new text to the core
     e.preventDefault();
-    this.runEffects(this.session.on_key(k, e.code, e.ctrlKey, e.altKey, e.shiftKey, this.visibleRows()) as CoreEffect[]);
+    this.runEffects(this.session.on_key(k, e.code, e.ctrlKey, e.altKey, e.shiftKey) as CoreEffect[]);
   }
 
   /** Rebuild just the jumplist (the persistent input/panel stay, keeping focus + caret). */

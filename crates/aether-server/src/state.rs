@@ -94,10 +94,13 @@ pub struct ServerState {
     /// by any buffer mutation (since prior positions may no longer be valid).
     pub motion_history: HashMap<(ClientId, BufferId), MotionHistory>,
     /// The cursor's "intended" *visual* column for vertical motions — preserved across repeated
-    /// `Motion::VisualLine` presses so that landing on rows with different prefixes (continuation
-    /// marker + indent) doesn't cause the visual column to drift. Cleared by any non-vertical
-    /// motion, explicit cursor set, or buffer mutation. Only meaningful for `VisualLine`; logical
-    /// `j/k` clears it (mixing motion kinds resets intent).
+    /// vertical presses so that landing on rows with different prefixes (continuation marker +
+    /// indent) doesn't cause the visual column to drift. Cleared by any non-vertical motion,
+    /// explicit cursor set, or buffer mutation.
+    ///
+    /// Every vertical motion keeps it: `Motion::VisualLine` (`Alt-j`/`Alt-k`), `Motion::Page`
+    /// (`v`/`Alt-v`), and `Motion::LogicalLine` (`j`/`k`) when it preserves the column — which is
+    /// why that resolver takes a `tab_width` at all.
     pub virtual_col: HashMap<(ClientId, BufferId), u32>,
     /// Per-`(client, buffer)` selection-expansion history. Each entry is a prior cursor state
     /// that `cursor/contract` will restore. Pushed by `cursor/expand`; cleared by any other

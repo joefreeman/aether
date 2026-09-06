@@ -1957,12 +1957,11 @@ impl App {
         // caret mid-string. Snapshot it for the same caret-to-end treatment. (Plain typing flows
         // through `OverlayInput`, not here, so this never fights click-to-position-then-type.)
         let query_before = self.session.picker.as_ref().map(|p| p.query.clone());
-        let visible_rows = self.visible_rows();
         // Report the on-screen line range so sneak scopes labels to what's visible (the core owns
         // no pixel scroll): the active scroller's offset and extent in layout units.
         let (top, visible) = (self.scroll_top_units(), self.visible_units());
         self.session.set_visible_lines(top, visible, &self.measured);
-        let fx = self.session.on_key(code, mods, text, visible_rows);
+        let fx = self.session.on_key(code, mods, text);
         let mut task = self.run_core(fx);
         let field_after = self.overlay_field_snapshot();
         if let Some((field, _)) = &field_after {

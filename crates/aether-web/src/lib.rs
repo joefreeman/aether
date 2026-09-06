@@ -102,9 +102,8 @@ impl WasmSession {
         ctrl: bool,
         alt: bool,
         shift: bool,
-        visible_rows: u32,
     ) -> Result<JsValue, JsValue> {
-        let effects = self.dispatch_key(key, code, ctrl, alt, shift, visible_rows);
+        let effects = self.dispatch_key(key, code, ctrl, alt, shift);
         to_js(&effects)
     }
 
@@ -712,7 +711,6 @@ impl WasmSession {
         ctrl: bool,
         alt: bool,
         shift: bool,
-        visible_rows: u32,
     ) -> Vec<Value> {
         // Resolve the binding against the physical key (`code`) when Alt is held and the modified
         // key (`key`) otherwise: on macOS `key` is Option-composed (Option-`l` → `¬`) and would
@@ -724,7 +722,7 @@ impl WasmSession {
         // The browser reports Shift-Tab as Tab + Shift; the core wants it as its own key.
         let keycode = aether_client::keymap::apply_backtab(keycode, mods);
         let text = key_text(key, &mods);
-        let fx = self.inner.on_key(keycode, mods, text, visible_rows);
+        let fx = self.inner.on_key(keycode, mods, text);
         effects_to_json(fx)
     }
 
@@ -1212,7 +1210,7 @@ mod tests {
         // `i` enters Insert mode — proves a key crosses into the core and produces a real effect
         // list (the whole point of Phase 1's boundary), without needing a live server.
         let mut s = WasmSession::new();
-        let _effects = s.dispatch_key("i", "KeyI", false, false, false, 40);
+        let _effects = s.dispatch_key("i", "KeyI", false, false, false);
         assert_eq!(s.inner.view.mode, aether_client::session::Mode::Insert);
     }
 

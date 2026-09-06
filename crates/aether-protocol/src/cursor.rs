@@ -77,10 +77,33 @@ pub enum Motion {
     LineFromEnd {
         count: u32,
     },
+    /// `Alt-j` / `Alt-k` — step `count` **visual** rows, the wrapped-row sibling of
+    /// [`Motion::LogicalLine`].
+    ///
+    /// `count` is a count the *user typed*, so it obeys the all-or-nothing rule: a count the field
+    /// cannot honour refuses rather than landing short. [`Motion::Page`] is the variant for a
+    /// screenful, precisely so this one can carry only counts someone asserted.
     VisualLine {
         viewport_id: ViewportId,
         direction: VerticalDirection,
         count: u32,
+    },
+    /// `v` / `Alt-v` — move a page (`half`: half a page) of visual rows, **clamping** at the
+    /// field's edges.
+    ///
+    /// Split from [`Motion::VisualLine`] because the two carry different kinds of number. A page is
+    /// "about a screenful, or as far as there is": pressing `v` ten rows from the end must reach the
+    /// end, so this clamps. Sending it as a visual-line step with a synthesised row count put a
+    /// number nobody typed into a field the count rule reads as an assertion — which is why
+    /// `100 Alt-j` clamped instead of refusing while `100 j` refused.
+    ///
+    /// `count` is pages, not rows: the row span comes from the viewport's own height server-side,
+    /// so no shell has to turn its geometry into a count.
+    Page {
+        viewport_id: ViewportId,
+        direction: VerticalDirection,
+        count: u32,
+        half: bool,
     },
     VisualLineStart {
         viewport_id: ViewportId,

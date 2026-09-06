@@ -973,7 +973,6 @@ impl Shell {
         let Some((code, mods, text)) = translate_key(&k) else {
             return;
         };
-        let visible_rows = self.visible_rows();
         // A focused overlay input (save-as, etc.) is edited shell-side: the shell owns the caret
         // and text mechanics, syncing the whole value into the core. Command keys (commit / cancel
         // / nav / chord) still route through the core's keycode dispatch.
@@ -991,7 +990,7 @@ impl Shell {
                 return;
             }
         }
-        let fx = self.session.on_key(code, mods, text, visible_rows);
+        let fx = self.session.on_key(code, mods, text);
         self.run_effects(fx);
     }
 
@@ -3633,9 +3632,7 @@ mod scroll_tests {
             "the fixture wants the target off screen"
         );
 
-        let fx = sh
-            .session
-            .on_key(KeyCode::Tab, Mods::NONE, None, sh.visible_rows());
+        let fx = sh.session.on_key(KeyCode::Tab, Mods::NONE, None);
         let (token, method) = the_request(&fx);
         assert_eq!(method, "view/focus_element");
         sh.run_effects(fx);
@@ -3673,9 +3670,7 @@ mod scroll_tests {
             "the fixture wants it visible"
         );
 
-        let fx = sh
-            .session
-            .on_key(KeyCode::Tab, Mods::NONE, None, sh.visible_rows());
+        let fx = sh.session.on_key(KeyCode::Tab, Mods::NONE, None);
         let (token, _) = the_request(&fx);
         sh.run_effects(fx);
         sh.on_response(
@@ -3701,9 +3696,7 @@ mod scroll_tests {
         // The cursor (element 1's first line, row 22) is the viewport's top row: visible, so a
         // reveal has nothing to do and only a placement would move the view.
         sh.top_visual_row = VisualRow(22);
-        let fx = sh
-            .session
-            .on_key(KeyCode::Tab, Mods::NONE, None, sh.visible_rows());
+        let fx = sh.session.on_key(KeyCode::Tab, Mods::NONE, None);
         let (token, _) = the_request(&fx);
         sh.run_effects(fx);
         // The server clamps at the end: focus comes back unchanged.

@@ -4,6 +4,8 @@ mod common;
 
 use common::*;
 
+use aether_protocol::{BufferId, ViewportId};
+
 // ---- cursor + input ----------------------------------------------------------------------------
 
 #[tokio::test]
@@ -5306,6 +5308,292 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
     )
     .await;
     assert_eq!(st.position, LogicalPosition { line: 1, col: 2 }); // line 1 = "hi", len 2
+
+    drop(server);
+}
+
+// ---- Motion::Page vs Motion::VisualLine --------------------------------------------------------
+
+/// Subscribe a viewport over `buffer_id` and hand back its id.
+async fn subscribe(
+    ws: &mut Ws,
+    buffer_id: BufferId,
+    cols: u32,
+    rows: u32,
+    wrap: WrapMode,
+) -> ViewportId {
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        ws,
+        &ViewportSubscribeParams {
+            view_id: view_of(buffer_id),
+            cols,
+            rows,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap,
+
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    sub.viewport_id
+}
+
+async fn move_to(ws: &mut Ws, buffer_id: BufferId, line: u32, col: u32) {
+    send_request::<CursorSet>(
+        ws,
+        &CursorSetParams {
+            granularity: Granularity::Char,
+            buffer_id,
+            position: LogicalPosition { line, col },
+            anchor: LogicalPosition { line, col },
+        },
+    )
+    .await;
+}
+
+async fn step(ws: &mut Ws, buffer_id: BufferId, motion: Motion) -> LogicalPosition {
+    let st: CursorState = send_request::<CursorMove>(
+        ws,
+        &CursorMoveParams {
+            buffer_id,
+            motion,
+            extend_selection: false,
+        },
+    )
+    .await;
+    st.position
+}
+
+/// **The count rule reaches `Alt-j` too: `100 Alt-j` refuses, exactly as `100 j` does.**
+///
+/// Both used to be one wire variant. `v`/`Alt-v` borrowed `Motion::VisualLine` to carry a row span
+/// the shell computed from its own height, so the server could not tell that number from a count
+/// the user typed — and since refusing a synthesised span would strand `v` a screenful from the end
+/// of every file, the whole variant clamped. `Alt-j` clamped with it.
+///
+/// `Motion::Page` carries the span now, so each number is read under its own rule. This test pins
+/// the pair: same effective distance, opposite outcomes.
+#[tokio::test]
+async fn a_typed_row_count_refuses_where_a_page_clamps() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("aaaa\nbbbb\ncccc\ndddd\n").await;
+    // rows=100 so a *half* page is 50 rows — far past this buffer's end, like the 100 in `100 Alt-j`.
+    let viewport_id = subscribe(&mut ws, buffer_id, 10, 100, WrapMode::Soft).await;
+
+    // Find the field's last line without assuming how a trailing newline counts.
+    let last = step(&mut ws, buffer_id, Motion::BufferEnd).await;
+    assert!(last.line >= 2, "test needs a field at least 3 lines deep");
+
+    // A count the field cannot honour: the cursor does not move at all.
+    move_to(&mut ws, buffer_id, 0, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::VisualLine {
+            viewport_id,
+            direction: VerticalDirection::Down,
+            count: 50,
+        },
+    )
+    .await;
+    assert_eq!(
+        pos,
+        LogicalPosition { line: 0, col: 0 },
+        "a typed count that cannot be honoured moves nothing"
+    );
+
+    // The same distance as a *page* still clamps — `v` must be able to reach a file's end.
+    move_to(&mut ws, buffer_id, 0, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::Page {
+            viewport_id,
+            direction: VerticalDirection::Down,
+            count: 1,
+            half: true,
+        },
+    )
+    .await;
+    assert_eq!(
+        pos.line, last.line,
+        "a page span is not a count anyone asserted, so it lands on the last row"
+    );
+
+    // And refusal isn't over-eager: a count the field *can* honour still walks.
+    move_to(&mut ws, buffer_id, 0, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::VisualLine {
+            viewport_id,
+            direction: VerticalDirection::Down,
+            count: 2,
+        },
+    )
+    .await;
+    assert_eq!(pos.line, 2, "an honourable count moves the full distance");
+
+    drop(server);
+}
+
+/// The carve-out `counted_line` already makes, now made by the row walk as well: an *uncounted*
+/// step past the edge is the ordinary "already at the end" no-op, not a refusal. Bare `Alt-j` on
+/// the last row and bare `Alt-k` on the first must stay pressable.
+#[tokio::test]
+async fn a_bare_visual_row_step_still_clamps_at_the_edges() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("aaaa\nbbbb\ncccc\ndddd\n").await;
+    let viewport_id = subscribe(&mut ws, buffer_id, 10, 5, WrapMode::Soft).await;
+
+    let last = step(&mut ws, buffer_id, Motion::BufferEnd).await;
+    move_to(&mut ws, buffer_id, last.line, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::VisualLine {
+            viewport_id,
+            direction: VerticalDirection::Down,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(pos.line, last.line, "bare Alt-j at the last row stays put");
+
+    move_to(&mut ws, buffer_id, 0, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::VisualLine {
+            viewport_id,
+            direction: VerticalDirection::Up,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(pos.line, 0, "bare Alt-k at the first row stays put");
+
+    drop(server);
+}
+
+/// The rule holds on both sides of the wrap split. With soft wrap the walk counts *rows* inside a
+/// wrapped line, so a count can be honourable without ever leaving line 0 — and unhonourable
+/// without the buffer being short. With wrap off the resolver hands the same decision to
+/// `counted_line`, the implementation `j`/`k` refuse with.
+#[tokio::test]
+async fn the_count_rule_holds_across_wrapped_rows_and_with_wrap_off() {
+    // One logical line, 4 rows at cols=10: "the quick ", "brown fox ", "jumps over", " it".
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("the quick brown fox jumps over it\nnext\n").await;
+    let viewport_id = subscribe(&mut ws, buffer_id, 10, 20, WrapMode::Soft).await;
+
+    // Honourable within the wrapped line: 2 rows down is still line 0.
+    move_to(&mut ws, buffer_id, 0, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::VisualLine {
+            viewport_id,
+            direction: VerticalDirection::Down,
+            count: 2,
+        },
+    )
+    .await;
+    assert_eq!(
+        pos.line, 0,
+        "two visual rows down stays inside the long line"
+    );
+    assert!(pos.col > 0, "but it did move — onto a continuation row");
+
+    // Unhonourable: more rows than the field has, so nothing moves.
+    move_to(&mut ws, buffer_id, 0, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::VisualLine {
+            viewport_id,
+            direction: VerticalDirection::Down,
+            count: 99,
+        },
+    )
+    .await;
+    assert_eq!(pos, LogicalPosition { line: 0, col: 0 });
+
+    // Wrap off: a visual row is a logical line, and the refusal goes through `counted_line`.
+    let viewport_id = subscribe(&mut ws, buffer_id, 10, 20, WrapMode::None).await;
+    move_to(&mut ws, buffer_id, 0, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::VisualLine {
+            viewport_id,
+            direction: VerticalDirection::Down,
+            count: 99,
+        },
+    )
+    .await;
+    assert_eq!(pos, LogicalPosition { line: 0, col: 0 });
+
+    drop(server);
+}
+
+/// The page span is the viewport's own height, read server-side — no shell turns its geometry into
+/// a wire count, so `half` is the only thing that distinguishes `v` from a full page.
+#[tokio::test]
+async fn a_page_spans_the_viewports_own_height() {
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n").await;
+    // rows=4: a page is 4 rows, half a page is 2.
+    let viewport_id = subscribe(&mut ws, buffer_id, 40, 4, WrapMode::None).await;
+
+    move_to(&mut ws, buffer_id, 0, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::Page {
+            viewport_id,
+            direction: VerticalDirection::Down,
+            count: 1,
+            half: true,
+        },
+    )
+    .await;
+    assert_eq!(pos.line, 2, "half of a 4-row viewport");
+
+    move_to(&mut ws, buffer_id, 0, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::Page {
+            viewport_id,
+            direction: VerticalDirection::Down,
+            count: 1,
+            half: false,
+        },
+    )
+    .await;
+    assert_eq!(pos.line, 4, "a whole 4-row viewport");
+
+    // A typed count multiplies pages, not rows: `2 v` is two half-pages.
+    move_to(&mut ws, buffer_id, 0, 0).await;
+    let pos = step(
+        &mut ws,
+        buffer_id,
+        Motion::Page {
+            viewport_id,
+            direction: VerticalDirection::Down,
+            count: 2,
+            half: true,
+        },
+    )
+    .await;
+    assert_eq!(pos.line, 4, "two half-pages of a 4-row viewport");
 
     drop(server);
 }
