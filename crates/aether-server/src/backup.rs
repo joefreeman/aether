@@ -38,9 +38,22 @@ pub fn shell_backup_path(root: &Path, workspace: &str, number: u32) -> PathBuf {
     root.join("shell").join(workspace).join(number.to_string())
 }
 
-/// The shell numbers `workspace` holds snapshots for on disk — the shells that can come back.
-pub fn shell_keys(root: &Path, workspace: &str) -> std::collections::HashSet<u32> {
-    std::fs::read_dir(root.join("shell").join(workspace))
+/// Backup path for an agent conversation: `<root>/agent/<workspace>/<number>`. Holds a snapshot of
+/// the whole conversation — its blocks and their text, the unsent input, and which agent and ACP
+/// session it belonged to — as JSON, keyed the way a shell's is.
+pub fn agent_backup_path(root: &Path, workspace: &str, number: u32) -> PathBuf {
+    root.join("agent").join(workspace).join(number.to_string())
+}
+
+/// The conversation numbers `workspace` holds snapshots for on disk.
+pub fn agent_keys(root: &Path, workspace: &str) -> std::collections::HashSet<u32> {
+    numbered_keys(&root.join("agent").join(workspace))
+}
+
+/// The numbers a snapshot directory holds, ignoring in-progress writes. Shared by the shell's keys
+/// and the agent's: they differ only in which directory they read.
+fn numbered_keys(dir: &Path) -> std::collections::HashSet<u32> {
+    std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
                 .filter_map(|e| e.file_name().to_str().map(str::to_string))
@@ -49,6 +62,11 @@ pub fn shell_keys(root: &Path, workspace: &str) -> std::collections::HashSet<u32
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The shell numbers `workspace` holds snapshots for on disk — the shells that can come back.
+pub fn shell_keys(root: &Path, workspace: &str) -> std::collections::HashSet<u32> {
+    numbered_keys(&root.join("shell").join(workspace))
 }
 
 /// The scratch numbers `workspace` currently holds backups for on disk. Each one is a scratch with

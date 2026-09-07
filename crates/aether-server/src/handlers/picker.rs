@@ -96,6 +96,7 @@ fn dormant_candidate(
         ),
         crate::state::DormantSource::Scratch { number } => (format!("(scratch {number})"), None),
         crate::state::DormantSource::Shell { number } => (format!("Shell {number}"), None),
+        crate::state::DormantSource::Agent { number } => (format!("Agent {number}"), None),
         // Named as the live view names itself, as far as the key allows: the working changes are
         // `Working changes`, a revision its short hash (`abc1234`, `abc1234:src/a.rs`) — the
         // subject is generated with the content, which a dormant entry hasn't paid for yet. A key
@@ -121,10 +122,12 @@ fn dormant_candidate(
     let status = match &d.source {
         // A revision is Clean for the same reason a file is, and more so: it is read-only, so
         // there was never anything to save.
-        // A shell's snapshot is safe on disk, and a shell is never unsaved work.
+        // A shell's snapshot is safe on disk, and a shell is never unsaved work. Nor is a
+        // conversation: it is a record of what was said, not a document you owe a save to.
         crate::state::DormantSource::File(_)
         | crate::state::DormantSource::Virtual { .. }
-        | crate::state::DormantSource::Shell { .. } => BufferDirtyState::Clean,
+        | crate::state::DormantSource::Shell { .. }
+        | crate::state::DormantSource::Agent { .. } => BufferDirtyState::Clean,
         crate::state::DormantSource::Scratch { .. } => BufferDirtyState::Unsaved,
     };
     picker_state::ViewCandidate {
@@ -140,7 +143,8 @@ fn dormant_candidate(
             // with nowhere on disk to live.
             crate::state::DormantSource::Scratch { .. }
             | crate::state::DormantSource::Virtual { .. }
-            | crate::state::DormantSource::Shell { .. } => None,
+            | crate::state::DormantSource::Shell { .. }
+            | crate::state::DormantSource::Agent { .. } => None,
         },
         transient: false,
     }

@@ -230,6 +230,10 @@ pub struct ServerState {
     /// Language-server sessions (one per workspace-root × language) and the buffers synced against
     /// them. See [`crate::lsp::manager`].
     pub lsp: crate::lsp::manager::LspManager,
+    /// Where `agent/open` gets an agent from. See [`AgentLauncher`] — the point of it being an
+    /// enum rather than an optional dummy is that a test server cannot fall through to launching
+    /// a real one.
+    pub agent_launcher: AgentLauncher,
     /// Latest diagnostics per buffer, in buffer coordinates (byte columns). Replaced wholesale on
     /// each `publishDiagnostics`; cleared on close. Empty/absent when a buffer has none. Drives the
     /// open-buffer surfaces: squiggles, gutter counts, and the buffer-scoped `Space d` picker.
@@ -592,6 +596,10 @@ pub enum DormantSource {
     Virtual { key: String },
     /// A shell, restored from its snapshot in the backups directory by its per-workspace number.
     Shell { number: u32 },
+    /// An agent conversation, restored from its snapshot. Opening one shows what was on screen and
+    /// launches **nothing**: an agent is a subprocess that costs money to run, so it starts when
+    /// you prompt it, not when you glance at yesterday's conversation.
+    Agent { number: u32 },
 }
 
 impl DormantView {
@@ -601,7 +609,8 @@ impl DormantView {
             DormantSource::File(p) => Some(p.as_path()),
             DormantSource::Scratch { .. }
             | DormantSource::Virtual { .. }
-            | DormantSource::Shell { .. } => None,
+            | DormantSource::Shell { .. }
+            | DormantSource::Agent { .. } => None,
         }
     }
 }
@@ -713,6 +722,7 @@ impl ServerState {
             git_blame: HashMap::new(),
             matcher: picker_state::make_matcher(),
             lsp: crate::lsp::manager::LspManager::default(),
+            agent_launcher: AgentLauncher::Subprocess,
             diagnostics: HashMap::new(),
             path_diagnostics: HashMap::new(),
             document_symbols: HashMap::new(),
@@ -997,8 +1007,74 @@ impl ServerState {
                 View::over_generated(buffer_id, g)
             }
             Some(Generated::Shell(t)) => View::over_transcript(buffer_id, t),
+            Some(Generated::Agent(c)) => {
+                View::over_conversation(buffer_id, c, |id| self.doc_of(id).content_lines())
+            }
             Some(Generated::Patch(_)) | None => View::whole(buffer_id),
         }
+    }
+
+    /// Append to one conversation block's document, and rebuild the view that shows it.
+    ///
+    /// The agent view's counterpart to [`Self::extend_transcript`], and the reason the two are
+    /// separate: a shell writes into the *view's own* document and has to carry the active run's
+    /// extent with the write, while a block **is** a document and binds `ElementLines::Whole`, so
+    /// there is no extent to move — the element's length is the document's length by construction.
+    /// That is what makes appending to a block that is no longer the last one safe, which is
+    /// exactly what ACP does every time it updates a tool call.
+    ///
+    /// Always paired with the layout rebuild, for the same reason `extend_transcript` is: a write
+    /// that lands without one leaves a shell painting the block at its old height.
+    pub fn extend_block(&mut self, view_buffer: BufferId, block: BufferId, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        let Some(doc) = self.try_doc_of_mut(block) else {
+            return false;
+        };
+        // Only ever a block's own document: `write_tail` is generation, not editing, and letting
+        // it reach an ordinary document would put un-undoable text into a file.
+        if doc.virtual_source.is_none() {
+            return false;
+        }
+        let from = doc.text.len_chars();
+        doc.write_tail(from, text);
+        if let Some(c) = self
+            .try_doc_of_mut(view_buffer)
+            .and_then(|d| d.generated.as_mut())
+            .and_then(Generated::conversation_mut)
+        {
+            c.generation += 1;
+        }
+        self.rebuild_view_layout(view_buffer);
+        self.rebind_viewports_of(view_buffer);
+        true
+    }
+
+    /// Replace one conversation block's document with `text`, and rebuild the view.
+    ///
+    /// The other half of [`Self::extend_block`], for the blocks whose content arrives whole rather
+    /// than in pieces: a diff the agent re-sent, and the plan, which is replaced every time it
+    /// changes. Same discipline — through `write_tail` from the start of the document, so the wrap
+    /// cache splices, the revision moves, and undo is never touched.
+    pub fn set_block_text(&mut self, view_buffer: BufferId, block: BufferId, text: &str) -> bool {
+        let Some(doc) = self.try_doc_of_mut(block) else {
+            return false;
+        };
+        if doc.virtual_source.is_none() {
+            return false;
+        }
+        doc.write_tail(0, text);
+        if let Some(c) = self
+            .try_doc_of_mut(view_buffer)
+            .and_then(|d| d.generated.as_mut())
+            .and_then(Generated::conversation_mut)
+        {
+            c.generation += 1;
+        }
+        self.rebuild_view_layout(view_buffer);
+        self.rebind_viewports_of(view_buffer);
+        true
     }
 
     /// Lay `elements` out in view order against their buffers' **live** line counts — the one way
@@ -1105,6 +1181,13 @@ impl ServerState {
             None => return false,
             Some(Generated::Shell(t)) => {
                 let view = View::over_transcript(view_buffer, t);
+                self.reinstate(view_id, view);
+                return true;
+            }
+            Some(Generated::Agent(c)) => {
+                let view = View::over_conversation(view_buffer, c, |id| {
+                    self.try_doc_of(id).map_or(0, |d| d.content_lines())
+                });
                 self.reinstate(view_id, view);
                 return true;
             }
@@ -1949,6 +2032,62 @@ impl ServerState {
     /// deletion so they can't drift out of sync.
     /// Returns the key of a language server that was torn down because this was its last buffer
     /// (so the caller can refresh open status views), or `None`.
+    /// Write a conversation down, if `id` is one.
+    ///
+    /// The blocks' text lives in their own documents, so unlike a shell's this has to gather it —
+    /// which is also why the snapshot is the *display* and not the agent's memory: those are the
+    /// blocks we watched arrive, including the tool calls and diffs an agent is under no obligation
+    /// to replay when a session is loaded back.
+    ///
+    /// A session id is recorded only once the agent has **confirmed** it (`Conversation::session`,
+    /// set from `AgentEvent::Ready`), never one we were merely trying to resume: a snapshot naming
+    /// a session that failed to load would claim a context nobody holds.
+    pub fn snapshot_agent(&self, id: BufferId) {
+        let Some(root) = self.backups_path.as_deref() else {
+            return;
+        };
+        let Some(workspace) = self.buffer_workspaces.get(&id) else {
+            return;
+        };
+        if self
+            .workspaces
+            .get(workspace)
+            .is_none_or(|w| w.name.is_none())
+        {
+            return;
+        }
+        let Some(doc) = self.try_doc_of(id) else {
+            return;
+        };
+        let Some(c) = doc.conversation() else {
+            return;
+        };
+        let Some(VirtualTarget::Agent { number, .. }) =
+            doc.virtual_source.as_ref().map(|v| &v.target)
+        else {
+            return;
+        };
+        let input: String = self
+            .try_doc_of(c.input)
+            .map(|d| d.text.chunks().collect())
+            .unwrap_or_default();
+        let snap = c
+            .snapshot(&input, |b| {
+                self.try_doc_of(b)
+                    .map(|d| d.text.chunks().collect())
+                    .unwrap_or_default()
+            })
+            .trimmed(crate::agent::SNAPSHOT_BUDGET);
+        if let Ok(json) = serde_json::to_string(&snap) {
+            if let Err(e) = crate::backup::write(
+                &crate::backup::agent_backup_path(root, workspace, *number),
+                &json,
+            ) {
+                tracing::warn!(error = %e, "failed to write agent snapshot");
+            }
+        }
+    }
+
     pub fn close_buffer(&mut self, id: BufferId) -> Option<crate::lsp::manager::LspServerKey> {
         // A shell owns two documents and a process group. Stopping the runs here — rather than in
         // the `shell/*` handlers — is what makes it unconditional: a view closed by a workspace
@@ -1959,6 +2098,9 @@ impl ServerState {
         // and what it held since the last flush must not go with it. An explicit close deletes
         // the file again afterwards, which is what makes closing a discard.
         self.snapshot_shell(id);
+        // Same reason, same moment: a conversation torn down by a switch or a disconnect keeps
+        // what it held.
+        self.snapshot_agent(id);
         let input = match self
             .try_doc_of_mut(id)
             .and_then(|d| d.generated.as_mut())
@@ -2366,6 +2508,7 @@ impl ServerState {
             std::collections::HashSet::new();
         let mut seen_scratch: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
+        let mut seen_agent: std::collections::HashSet<u32> = Default::default();
         let mut seen_shell: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut seen_virtual: std::collections::HashSet<String> = std::collections::HashSet::new();
         for view_id in &workspace.mru_views {
@@ -2396,6 +2539,16 @@ impl ServerState {
                 if let VirtualTarget::Shell { number, .. } = source.target {
                     if seen_shell.insert(number) {
                         out.push(SessionView::Shell { number });
+                    }
+                    continue;
+                }
+                // A conversation is recorded the same way, and for the same reason: it comes back
+                // from its snapshot, not by re-materialising a target. Recorded as a *`Virtual`*
+                // entry it came back as a dormant row nothing could open — `virtual_buffer_for`
+                // only finds buffers that are already live.
+                if let VirtualTarget::Agent { number, .. } = source.target {
+                    if seen_agent.insert(number) {
+                        out.push(SessionView::Agent { number });
                     }
                     continue;
                 }
@@ -2435,6 +2588,11 @@ impl ServerState {
                 DormantSource::Shell { number } => {
                     if seen_shell.insert(*number) {
                         out.push(SessionView::Shell { number: *number });
+                    }
+                }
+                DormantSource::Agent { number } => {
+                    if seen_agent.insert(*number) {
+                        out.push(SessionView::Agent { number: *number });
                     }
                 }
             }
@@ -2764,6 +2922,10 @@ pub enum VirtualTarget {
     },
     /// One shell view's transcript, numbered per workspace like a scratch buffer.
     Shell { workspace: String, number: u32 },
+    /// One agent view's conversation, numbered per workspace like a shell. The document this
+    /// targets holds no text of its own — every block has a document — but it is still the thing
+    /// the view presents, and so still needs a target.
+    Agent { workspace: String, number: u32 },
 }
 
 impl VirtualTarget {
@@ -2781,12 +2943,19 @@ impl VirtualTarget {
         }
     }
 
+    pub fn agent(workspace: impl Into<String>, number: u32) -> Self {
+        Self::Agent {
+            workspace: workspace.into(),
+            number,
+        }
+    }
+
     /// The repo this is of, for the git-shaped targets. `None` for a shell, which has none —
     /// which is the whole point of asking rather than reading a field.
     pub fn repo_id(&self) -> Option<&str> {
         match self {
             Self::Git { repo_id, .. } => Some(repo_id),
-            Self::Shell { .. } => None,
+            Self::Shell { .. } | Self::Agent { .. } => None,
         }
     }
 
@@ -2794,7 +2963,7 @@ impl VirtualTarget {
     pub fn what(&self) -> Option<&aether_protocol::git::ShowTarget> {
         match self {
             Self::Git { what, .. } => Some(what),
-            Self::Shell { .. } => None,
+            Self::Shell { .. } | Self::Agent { .. } => None,
         }
     }
 
@@ -2818,6 +2987,7 @@ impl VirtualTarget {
         match self {
             Self::Git { .. } => None, // generated with the content; see `VirtualSource::title`
             Self::Shell { number, .. } => Some(format!("Shell {number}")),
+            Self::Agent { number, .. } => Some(format!("Agent {number}")),
         }
     }
 
@@ -2835,6 +3005,7 @@ impl VirtualTarget {
                 ShowTarget::WorkingChanges => format!("{repo_id}#worktree"),
             },
             Self::Shell { workspace, number } => format!("shell:{number}:{workspace}"),
+            Self::Agent { workspace, number } => format!("agent:{number}:{workspace}"),
         }
     }
 
@@ -2845,6 +3016,10 @@ impl VirtualTarget {
         if let Some(rest) = key.strip_prefix("shell:") {
             let (number, workspace) = rest.split_once(':')?;
             return Some(Self::shell(workspace, number.parse().ok()?));
+        }
+        if let Some(rest) = key.strip_prefix("agent:") {
+            let (number, workspace) = rest.split_once(':')?;
+            return Some(Self::agent(workspace, number.parse().ok()?));
         }
         if let Some(repo_id) = key.strip_suffix("#worktree") {
             return Some(Self::new(repo_id, ShowTarget::WorkingChanges));
@@ -2865,6 +3040,34 @@ impl VirtualTarget {
     }
 }
 
+/// Where an agent view's agent comes from.
+///
+/// A three-way enum rather than an optional dummy, because the third state is the one that
+/// matters: a **test server refuses to launch anything**. The seam that installs a dummy is opt-in
+/// per test, and an `Option` would have meant that a test which forgot to install one silently ran
+/// `npx @agentclientprotocol/claude-agent-acp` — spawning a real coding agent, with real
+/// credentials, doing real work, per test. That is not a mistake to leave one forgotten line away;
+/// [`Self::Refuse`] makes it unreachable by construction instead, and the test that forgot gets a
+/// clear error rather than a subprocess.
+pub enum AgentLauncher {
+    /// Production: launch the subprocess the agent table names.
+    Subprocess,
+    /// A test with an in-process dummy agent installed. See [`crate::agent::dummy`].
+    Dummy(std::sync::Arc<dyn Fn() -> agent_client_protocol::Channel + Send + Sync>),
+    /// A test server that has not installed one. Launches nothing, ever.
+    Refuse,
+}
+
+impl std::fmt::Debug for AgentLauncher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Subprocess => f.write_str("Subprocess"),
+            Self::Dummy(_) => f.write_str("Dummy"),
+            Self::Refuse => f.write_str("Refuse"),
+        }
+    }
+}
+
 /// Decorations and structure computed once when a document's content was **generated** — for the
 /// documents no grammar spans and no file backs.
 ///
@@ -2880,27 +3083,43 @@ pub enum Generated {
     Patch(crate::patch::GeneratedPatch),
     /// A shell view's transcript — its runs, its input, and where it runs.
     Shell(crate::shell::Transcript),
+    /// An agent view's conversation — its blocks, its input, and the agent behind it.
+    Agent(crate::agent::Conversation),
 }
 
 impl Generated {
     pub fn patch(&self) -> Option<&crate::patch::GeneratedPatch> {
         match self {
             Generated::Patch(p) => Some(p),
-            Generated::Shell(_) => None,
+            Generated::Shell(_) | Generated::Agent(_) => None,
         }
     }
 
     pub fn transcript(&self) -> Option<&crate::shell::Transcript> {
         match self {
             Generated::Shell(t) => Some(t),
-            Generated::Patch(_) => None,
+            Generated::Patch(_) | Generated::Agent(_) => None,
         }
     }
 
     pub fn transcript_mut(&mut self) -> Option<&mut crate::shell::Transcript> {
         match self {
             Generated::Shell(t) => Some(t),
-            Generated::Patch(_) => None,
+            Generated::Patch(_) | Generated::Agent(_) => None,
+        }
+    }
+
+    pub fn conversation(&self) -> Option<&crate::agent::Conversation> {
+        match self {
+            Generated::Agent(c) => Some(c),
+            Generated::Patch(_) | Generated::Shell(_) => None,
+        }
+    }
+
+    pub fn conversation_mut(&mut self) -> Option<&mut crate::agent::Conversation> {
+        match self {
+            Generated::Agent(c) => Some(c),
+            Generated::Patch(_) | Generated::Shell(_) => None,
         }
     }
 }
@@ -3009,6 +3228,10 @@ pub enum EditKindTag {
     Format,
     /// Hunk revert (`git/apply_hunk`). Like `Format`: one revert, one undo step.
     Revert,
+    /// A write the **agent** made (`fs/write_text_file`). Its own tag so one agent write is one
+    /// undo step: it must never coalesce with the user's own typing burst, or a single `u` would
+    /// take back some of each and the user could not cleanly reject what the agent did.
+    Agent,
     /// Case transform (`input/transform_case`). Distinct so a recase is its own undo step and
     /// never folds into adjacent typing.
     Transform,
@@ -3351,6 +3574,11 @@ impl Document {
         self.generated.as_ref()?.transcript()
     }
 
+    /// The agent conversation this document holds, if it is one.
+    pub fn conversation(&self) -> Option<&crate::agent::Conversation> {
+        self.generated.as_ref()?.conversation()
+    }
+
     /// An **internal** document: a field of a view rather than a document of the user's — a
     /// shell's input line, and nothing else so far. Editable and ordinary in every other respect,
     /// so the whole edit surface works in it unchanged; see [`Self::internal`] for what it is
@@ -3359,6 +3587,25 @@ impl Document {
         Document {
             internal: true,
             ..Document::scratch(id, language)
+        }
+    }
+
+    /// One conversation block's document: **virtual and internal** at once.
+    ///
+    /// Virtual because a block is a record of what happened and must refuse every edit there is
+    /// — the same construction that makes a patch and a shell transcript read-only. Internal
+    /// because it is a part of a view rather than a document of the user's: never listed in a
+    /// picker, never backed up, never written to the session file, never counted in a view's
+    /// dirty aggregate. A shell's input is internal but editable; a block is the other pairing,
+    /// and both are wanted.
+    ///
+    /// `language` is the block's own: an agent's prose is Markdown, a diff is a patch, a tool
+    /// call's output is nothing in particular. That per-block choice is only possible because
+    /// each block has a document of its own, and is one of the reasons it does.
+    pub fn block(id: DocumentId, source: VirtualSource, language: Option<String>) -> Self {
+        Document {
+            internal: true,
+            ..Document::virtual_content(id, source, String::new(), language, None, false)
         }
     }
 
@@ -4150,6 +4397,7 @@ impl View {
                 chrome_before: Default::default(),
                 chrome_above: std::sync::Arc::new(Vec::new()),
                 laid_out_by: LayoutOwner::Server,
+                prose: false,
                 role: aether_protocol::ui::ElementRole::Field,
                 edges: aether_protocol::ui::Edges::NONE,
                 box_group: None,
@@ -4174,6 +4422,7 @@ impl View {
                 chrome_before: Default::default(),
                 chrome_above: std::sync::Arc::new(Vec::new()),
                 laid_out_by: LayoutOwner::Client,
+                prose: false,
                 role: aether_protocol::ui::ElementRole::Field,
                 edges: aether_protocol::ui::Edges::NONE,
                 box_group: None,
@@ -4276,6 +4525,7 @@ impl View {
                 // own name, on the border above it.
                 chrome_above: std::sync::Arc::new(crate::shell::command_row(run)),
                 laid_out_by: LayoutOwner::Server,
+                prose: false,
                 role: aether_protocol::ui::ElementRole::Field,
                 edges: boxed,
                 box_group: Some(i as u32),
@@ -4295,11 +4545,119 @@ impl View {
             // Nothing above the line you type: the box says where you are, and the box is enough.
             chrome_above: std::sync::Arc::new(Vec::new()),
             laid_out_by: LayoutOwner::Server,
+            prose: false,
             role: aether_protocol::ui::ElementRole::Input,
             edges: boxed,
             box_group: Some(t.runs.len() as u32),
             title: std::sync::Arc::new(crate::shell::input_title(&t.cwd)),
             band: Band::Chrome,
+        });
+        View {
+            presenting: view_buffer,
+            last_used: 0,
+            transient: false,
+            elements,
+        }
+    }
+
+    /// One element per block, each over the block's **own** document, and the input last.
+    ///
+    /// The shape [`Self::over_transcript`] has, with one difference that is the whole reason the
+    /// agent view is built this way: a shell's runs are line ranges into one transcript, so only
+    /// the last one can grow; a conversation's blocks are separate documents, so any of them can.
+    /// ACP updates a tool call by its id long after later blocks exist, and this is what lets that
+    /// be an append rather than a splice.
+    pub fn over_conversation(
+        view_buffer: BufferId,
+        c: &crate::agent::Conversation,
+        content_lines: impl Fn(BufferId) -> u32,
+    ) -> Self {
+        use aether_protocol::ui::{Band, Edges, Sides};
+        // **Prose is not boxed.** What you typed and what the agent said back are the conversation
+        // itself, and a box around each turn makes a reply look like a machine's output rather
+        // than like something written to be read. What stays boxed is the machinery — a tool call,
+        // a diff, the plan, the thinking — because each of those *is* a named thing that happened,
+        // and a name belongs to one box. The blank row between blocks does the separating either
+        // way.
+        let boxed = Edges {
+            border: Sides::all(1),
+            padding: Sides::ZERO,
+            collapse: false,
+        };
+        let gap =
+            || std::sync::Arc::new(vec![aether_protocol::viewport::Element::chrome(Vec::new())]);
+        let mut elements: Vec<ElementBinding> = c
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, block)| {
+                let bare = crate::agent::is_prose(&block.kind);
+                // The agent's reply is prose: the server sends the markdown *parse* and the shell
+                // renders it as type, which is also why the client owns its height.
+                let rendered = crate::agent::is_rendered(&block.kind);
+                ElementBinding {
+                    buffer_id: block.buffer,
+                    // The block's **content** lines, not its buffer's. A block's text is a record
+                    // of something that happened and almost always ends in a newline; bound
+                    // `Whole` that terminator becomes a line of its own and every block trails a
+                    // blank row. A file's trailing empty line is a real place to put the cursor,
+                    // which is why the layout counts it in general — a block has no cursor to put
+                    // there.
+                    lines: ElementLines::Range {
+                        start: 0,
+                        end_exclusive: content_lines(block.buffer),
+                    },
+                    decorations: None,
+                    chrome_before: if i == 0 { Default::default() } else { gap() },
+                    // Inside a box: a tool call's permission question. Above bare prose: who is
+                    // speaking, when that is not obvious — the agent's own reply wears nothing,
+                    // because it is the thing you are reading.
+                    chrome_above: std::sync::Arc::new(if bare {
+                        crate::agent::speaker_row(block)
+                    } else {
+                        crate::agent::permission_row(block)
+                    }),
+                    laid_out_by: if rendered {
+                        LayoutOwner::Client
+                    } else {
+                        LayoutOwner::Server
+                    },
+                    prose: rendered,
+                    role: aether_protocol::ui::ElementRole::Field,
+                    edges: if bare { Edges::NONE } else { boxed },
+                    box_group: (!bare).then_some(i as u32),
+                    title: std::sync::Arc::new(if bare {
+                        Vec::new()
+                    } else {
+                        crate::agent::block_title(block)
+                    }),
+                    band: if bare { Band::None } else { Band::Chrome },
+                }
+            })
+            .collect();
+        elements.push(ElementBinding {
+            buffer_id: c.input,
+            // The input keeps `Whole`, unlike the blocks above: it is a document you type in, so
+            // its trailing empty line is a place the cursor can be, exactly as in a file.
+            lines: ElementLines::Whole,
+            decorations: None,
+            chrome_before: if c.blocks.is_empty() {
+                Default::default()
+            } else {
+                gap()
+            },
+            chrome_above: std::sync::Arc::new(Vec::new()),
+            laid_out_by: LayoutOwner::Server,
+            prose: false,
+            role: aether_protocol::ui::ElementRole::Input,
+            // Bare, like the prose around it. The box and its label said which agent, in which
+            // directory, doing what, and which key stops it — all of which the status bar already
+            // says (`Session::work_indicator`) or the tool call's own box does ("needs
+            // permission"). What is left is the line you are typing on, and the cursor is in it.
+            edges: Edges::NONE,
+            box_group: None,
+            title: Default::default(),
+            band: Band::None,
         });
         View {
             presenting: view_buffer,
@@ -4336,6 +4694,7 @@ impl View {
                             .unwrap_or_default(),
                     ),
                     laid_out_by: LayoutOwner::Server,
+                    prose: false,
                     role: aether_protocol::ui::ElementRole::Field,
                     edges: aether_protocol::ui::Edges::NONE,
                     box_group: None,
@@ -4474,6 +4833,7 @@ impl ElementLayout {
             chrome_above: self.chrome_above.clone(),
             chrome_before: self.chrome_before.clone(),
             laid_out_by: LayoutOwner::Server,
+            prose: false,
             role: self.role,
             edges: self.edges,
             box_group: self.box_group,
@@ -4553,6 +4913,14 @@ pub struct ElementBinding {
     /// and the client measures it. Decided by the view's kind, never per viewport: two clients
     /// presenting one view see the same elements.
     pub laid_out_by: LayoutOwner,
+    /// Whether the element's lines are **markdown to be rendered** rather than text to be shown.
+    /// The window carries such an element as [`aether_protocol::viewport::Element::Prose`] — the
+    /// parse, not the lines — and a shell renders it with real typography.
+    ///
+    /// Implies [`LayoutOwner::Client`]: proportional type can only be measured where it is drawn.
+    /// The converse does not hold yet — the reading view is client-laid-out and still ships its
+    /// source, because its focus and its edit-toggle resolve against the buffer.
+    pub prose: bool,
     /// What the element is *for* — see [`aether_protocol::ui::ElementRole`]. `Field` for every
     /// element of an ordinary or composed view; `Input` for the line a shell's next command is
     /// typed into. Rides to the client on the window, so no shell has to re-derive it from the
@@ -4812,6 +5180,7 @@ mod view_layout_tests {
             chrome_before: Default::default(),
             chrome_above: Default::default(),
             laid_out_by: LayoutOwner::Server,
+            prose: false,
             role: aether_protocol::ui::ElementRole::Field,
             edges: aether_protocol::ui::Edges::NONE,
             box_group: None,

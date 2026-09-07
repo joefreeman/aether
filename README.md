@@ -41,8 +41,8 @@ Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to ea
 
 Type `Space y` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
 `Shift-w`); a leading **count** repeats a motion (e.g. `3w`). `Space` is the leader for
-app/file/code commands, `Space g` the sub-leader for git operations, and `Space t` reveals hover info
-at the cursor.
+app/file/code commands, `Space g` the sub-leader for git operations, `Space n` the sub-leader for
+talking to a coding agent, and `Space t` reveals hover info at the cursor.
 
 ### Motions (normal mode)
 
@@ -206,6 +206,9 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space z`/`Space Alt-z` | Open another window / copy this view's web URL |
 | `Space ,`/`Space .` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
 | `Space b`/`Space Alt-b` | A shell you can type into (a new one when you are in one already) / stop what it is running |
+| `Space n n` | A conversation with a coding agent (a new one when you are in one already) |
+| `Space n c` | Stop what the agent is doing |
+| `Space n a`/`Space n d` | Allow / decline what the agent is asking to do |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save and quit |
 | `Space y`/`Space ?` | Show keyboard shortcuts / about this build |
@@ -246,7 +249,7 @@ scopes — plain takes the change under the cursor (or the selected lines), Alt 
 | `Enter` | Follow what's under the cursor: the definition — or, in a patch or a shell's output, the file that line names. In a shell's input, run the command |
 | `Space r` | Go to references |
 | `d`/`Alt-d` | Next/previous diagnostic |
-| `Space n` | Diagnostic at cursor |
+| `Space Alt-t` | Diagnostic at cursor |
 | `Space d`/`Space Alt-d` | Diagnostics: this file / workspace |
 | `Space o`/`Space Alt-o` | Document / workspace symbols |
 | `Space l` | LSP servers (status, restart) |

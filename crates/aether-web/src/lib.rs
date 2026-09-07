@@ -176,6 +176,21 @@ impl WasmSession {
         )
     }
 
+    /// Record the height a shell measured for a client-laid-out element, in its own units.
+    ///
+    /// Proportional type can only be measured once it is laid out, so a reply's height is the
+    /// shell's answer rather than the core's — and everything that scrolls or places this view
+    /// positions by it.
+    pub fn set_element_measured(&mut self, element: u32, end: u32) -> Result<JsValue, JsValue> {
+        let measured = aether_client::grid::MeasuredElement {
+            first_row: aether_protocol::coords::ElementRow::ZERO,
+            starts: vec![0],
+            end,
+        };
+        self.measured.elements.insert(element, measured);
+        measured_to_js(&self.measured)
+    }
+
     /// A server push (a JSON-RPC notification): `method` + `params` JSON. Returns `Effect[]`.
     pub fn on_event(&mut self, method: String, params: JsValue) -> Result<JsValue, JsValue> {
         let params: Value = from_js(params)?;

@@ -359,3 +359,41 @@ pub struct ViewStateParams {
 fn is_false(b: &bool) -> bool {
     !*b
 }
+
+// ---- view/submit_input -------------------------------------------------------------------------
+
+/// Submit the focused view's input — `Enter` in an input element.
+///
+/// **Total over the kinds of composed view**, which is the point: a shell and an agent view both
+/// end in an element you type into, and the client cannot tell them apart — deliberately, because
+/// the window marks the input by [`crate::ui::ElementRole`] and carries no view kind at all. So the
+/// client asks one question and the server decides what submitting means here, exactly as
+/// [`ViewFollowLine`] decides what `Enter` on a line means. A view with no input answers
+/// `submitted: false` rather than erroring, so a stale route costs nothing.
+///
+/// `shell/run` and `agent/prompt` remain methods in their own right: the shapes differ, and the
+/// tests that pin them are about those shapes rather than about the key that reaches them.
+pub struct ViewSubmitInput;
+impl RpcMethod for ViewSubmitInput {
+    const NAME: &'static str = "view/submit_input";
+    type Params = ViewSubmitInputParams;
+    type Result = ViewSubmitInputResult;
+    // The document this edits is the input, which is an ordinary one; the buffer the view presents
+    // is read-only. Declaring a mutation would have the client decline every `Enter` locally.
+    const MUTATES_TEXT: bool = false;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewSubmitInputParams {
+    pub view_id: crate::ViewId,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewSubmitInputResult {
+    /// False when there was nothing to submit — an empty input, or a view with none.
+    pub submitted: bool,
+    /// Which recall list the submitted line belongs to, so the client can file it without knowing
+    /// what sort of view it was in. `None` when nothing was submitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<crate::history::HistoryKind>,
+}

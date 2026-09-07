@@ -639,6 +639,12 @@ pub async fn spawn_for_test_full(
         // server, so parallel tests can't collide. Swept when the handle drops (see below) — a
         // worktree is a full checkout, and leaking one per test is how /tmp ran out of inodes.
         s.worktree_store = Some(worktree_store.clone());
+        // No test server may launch a real coding agent. Unconditional and without a parameter,
+        // like the worktree store above and for a sharper version of the same reason: falling
+        // through to `npx @agentclientprotocol/claude-agent-acp` would spawn a real agent with the
+        // developer's credentials, per test. A test that wants one installs the in-process dummy
+        // (`agent::dummy`) over this.
+        s.agent_launcher = crate::state::AgentLauncher::Refuse;
         // In-process dummy language servers (test seam — see `lsp::dummy`). Seeded before the run
         // task starts so any buffer opened afterwards launches the dummy, not a real process.
         for (language, config) in dummy_lsp {

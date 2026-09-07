@@ -169,6 +169,14 @@ struct BootSpec {
 
 type DoneFuture = Pin<Box<dyn std::future::Future<Output = Done> + Send>>;
 
+/// One prose element as this shell laid it out: the blocks and width it was laid out *for*, so a
+/// re-layout is skipped when neither moved, and the rows themselves.
+type ProseLayout = (
+    Vec<aether_client::markdown::Block>,
+    u16,
+    std::sync::Arc<Vec<aether_client::read_layout::ReadRow>>,
+);
+
 pub struct Shell {
     pub handle: Handle,
     /// Server messages — replies and pushes — in wire order (see `connection.rs`).
@@ -198,6 +206,11 @@ pub struct Shell {
     /// What this shell has measured of the elements it lays out itself — none yet: every element
     /// the terminal shows is server-laid-out, so the tree's heights are the whole story.
     measured: aether_client::grid::Measured,
+    /// Laid-out rows for the view's [`aether_protocol::viewport::Element::Prose`] nodes — an agent
+    /// conversation's replies. Keyed by element, cached against the blocks and width they were laid
+    /// out for, and rebuilt whenever either moves. The heights go into [`Self::measured`], which is
+    /// what makes the grid scroll and place them correctly.
+    md_layouts: std::collections::HashMap<aether_protocol::viewport::FieldId, ProseLayout>,
     fetch_in_flight: bool,
     refetch_queued: bool,
     /// The cursor reveal owed to the viewport: armed when a cursor move lands outside the loaded
@@ -311,6 +324,7 @@ pub async fn run(
         sent_grid: None,
         subscribe_scroll: ScrollPosition::default(),
         measured: aether_client::grid::Measured::default(),
+        md_layouts: std::collections::HashMap::new(),
         fetch_in_flight: false,
         refetch_queued: false,
         pending_reveal: PendingReveal::default(),
@@ -588,6 +602,12 @@ impl Shell {
                 }
                 Effect::DismissHover => self.state.hover = None,
                 Effect::WindowAdopted => {
+                    // Before the anchor, the sticky tail and the clamp below — every one of them
+                    // positions by the measured heights, and an element the client lays out has
+                    // none until this runs. Measuring only in `sync` left each of them reading a
+                    // height from before the reply was rendered, and a rendered block is taller
+                    // than the source lines it came from.
+                    self.lay_out_markdown();
                     // Diff toggle re-layout: if a content anchor is pending, restore the view to
                     // it (keep the same content on screen); otherwise clamp + reveal as before.
                     // A reading view not yet laid out cannot be placed by rows: `read_view`
@@ -2036,6 +2056,10 @@ impl Shell {
     // ---- view sync (Session → the render model ui::draw reads) ---------------------------
 
     fn sync(&mut self) {
+        // Before anything reads `measured`: a client-laid-out element has no height until this
+        // shell gives it one, and the scroll report, the placement and the paint below all position
+        // by it.
+        self.lay_out_markdown();
         // Report the current on-screen line range to the core (it owns no pixel scroll), so sneak
         // scopes its labels to what's actually visible rather than the overscan-padded window.
         self.session
@@ -2052,7 +2076,7 @@ impl Shell {
         st.workspace_name = s.workspace.clone();
         st.tether = s.tether;
         st.git_operation = s.git_operation.as_ref().map(|(_, op)| op.clone());
-        st.shell_indicator = s.shell_indicator();
+        st.shell_indicator = s.work_indicator();
         if st.workspace_paths != s.workspace_paths {
             st.workspace_paths = s.workspace_paths.clone();
             st.root_labels = labels::root_labels(&st.workspace_paths);
@@ -2583,6 +2607,70 @@ impl Shell {
         })
     }
 
+    /// Lay out every element the window asks the client to lay out, and record how tall each came
+    /// out.
+    ///
+    /// The reading view proper replaces the whole pane; this is the same layout applied to one
+    /// element of a composed view, so an agent's reply reads as a document while the tool calls
+    /// around it stay plain text. Measured heights land in [`Self::measured`] before anything
+    /// paints or scrolls, because the grid places every row below by them.
+    fn lay_out_markdown(&mut self) {
+        use aether_protocol::viewport::Element;
+
+        let Some(window) = self.session.view.window.as_ref() else {
+            return;
+        };
+        // The **full** width, not the reading measure. The reader centres a narrow column because
+        // it is a page; a reply is one block in a conversation, sharing the view with tool calls
+        // and diffs that run the whole width, and a narrow column left-aligned among them reads as
+        // ragged wrapping rather than as a measure.
+        //
+        // Full width means the width the row actually gets: the gutter and whatever box encloses
+        // the element come off it, exactly as they do for a line the server wrapped. Laying prose
+        // out to a width it is not painted at is how it comes to wrap early.
+        let placements = aether_client::grid::element_origins(&window.root, &self.measured);
+        let mut live: Vec<aether_protocol::viewport::FieldId> = Vec::new();
+        let mut updates = Vec::new();
+        for node in window.root.content() {
+            let Element::Prose {
+                element, blocks, ..
+            } = node
+            else {
+                continue;
+            };
+            live.push(*element);
+            let taken = placements
+                .get(element)
+                .map_or(0, |p| (p.inset.left + p.inset.right) as u16);
+            let cols = crate::ui::text_cols(self.term.0.saturating_sub(taken));
+            // The parse itself is the cache key: the server sends it whole on every push, and a
+            // streaming reply's blocks change under one element id.
+            if self
+                .md_layouts
+                .get(element)
+                .is_some_and(|(b, c, _)| b == blocks && *c == cols)
+            {
+                continue;
+            }
+            let laid = aether_client::read_layout::element(
+                blocks,
+                cols,
+                self.measured.units_per_row,
+                0,
+                0,
+            );
+            updates.push((*element, blocks.clone(), cols, laid));
+        }
+        for (element, blocks, cols, laid) in updates {
+            self.measured.elements.insert(element, laid.measured);
+            self.md_layouts
+                .insert(element, (blocks, cols, std::sync::Arc::new(laid.rows)));
+        }
+        // Drop layouts for elements this window no longer has, so a stale height cannot position
+        // a view it was never measured for.
+        self.md_layouts.retain(|id, _| live.contains(id));
+    }
+
     fn editor_view(&self) -> EditorState {
         let s = &self.session;
         let window = s.view.window.as_ref();
@@ -2610,6 +2698,11 @@ impl Shell {
             cursor: s.view.buffer.cursor,
             paint_top,
             measured: self.measured.clone(),
+            markdown: self
+                .md_layouts
+                .iter()
+                .map(|(id, (_, _, rows))| (*id, rows.clone()))
+                .collect(),
             focused_element: self.session.view.focused_element,
             root: window
                 .map(|w| w.root.clone())
@@ -3555,6 +3648,7 @@ mod scroll_tests {
         session.view.buffer.cursor.anchor = session.view.buffer.cursor.position;
         session.view.window = Some(window);
         Shell {
+            md_layouts: std::collections::HashMap::new(),
             handle: crate::connection::dummy_handle(),
             inbound: crate::connection::dummy_inbound(),
             session,

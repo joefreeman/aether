@@ -1,5 +1,6 @@
 //! Aether editor server.
 
+pub mod agent;
 mod backup;
 mod brackets;
 mod case;
@@ -22,7 +23,7 @@ mod process;
 mod server;
 mod shell;
 mod sneak;
-mod state;
+pub mod state;
 mod status;
 mod surround;
 mod symbols;

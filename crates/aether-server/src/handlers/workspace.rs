@@ -421,6 +421,8 @@ pub async fn activate_context(
                         crate::state::DormantSource::Virtual { .. } => false,
                         // A shell's snapshot is safe on disk until it is opened; nothing to rescue.
                         crate::state::DormantSource::Shell { .. } => false,
+                        // Nothing to rescue either: the snapshot is already on disk.
+                        crate::state::DormantSource::Agent { .. } => false,
                     })
                     .map(|d| d.view)
                     .collect();
@@ -686,6 +688,17 @@ fn restore_dormant_sources(
                 });
                 has_snapshot.then_some((DormantSource::Shell { number: *number }, None))
             }
+            // As a shell: only from its snapshot, and an entry without one is dropped.
+            SessionView::Agent { number } => {
+                let has_snapshot = backups_root.is_some_and(|root| {
+                    crate::backup::exists(&crate::backup::agent_backup_path(
+                        root,
+                        workspace_name,
+                        *number,
+                    ))
+                });
+                has_snapshot.then_some((DormantSource::Agent { number: *number }, None))
+            }
         })
         .collect();
     if let Some(root) = backups_root {
@@ -695,7 +708,8 @@ fn restore_dormant_sources(
                 DormantSource::Scratch { number } => Some(*number),
                 DormantSource::File(_)
                 | DormantSource::Virtual { .. }
-                | DormantSource::Shell { .. } => None,
+                | DormantSource::Shell { .. }
+                | DormantSource::Agent { .. } => None,
             })
             .collect();
         if let Ok(dir) = std::fs::read_dir(root.join("scratch").join(workspace_name)) {
@@ -729,6 +743,27 @@ fn restore_dormant_sources(
             recovered
                 .into_iter()
                 .map(|number| (DormantSource::Shell { number }, None)),
+        );
+
+        // The same rescue for conversations: a snapshot on disk that no session entry mentions is
+        // one the session file lost (a crash between the snapshot flush and the session write), and
+        // it is the only copy of what was said.
+        let known_agents: std::collections::HashSet<u32> = sources
+            .iter()
+            .filter_map(|(src, _)| match src {
+                DormantSource::Agent { number } => Some(*number),
+                _ => None,
+            })
+            .collect();
+        let mut recovered: Vec<u32> = crate::backup::agent_keys(root, workspace_name)
+            .into_iter()
+            .filter(|n| !known_agents.contains(n))
+            .collect();
+        recovered.sort_unstable();
+        sources.extend(
+            recovered
+                .into_iter()
+                .map(|number| (DormantSource::Agent { number }, None)),
         );
     }
     sources
@@ -780,6 +815,9 @@ pub(crate) async fn flush_backups(state: &SharedState) {
         Delete,
         /// A shell's snapshot, stamped with the generation and input revision it captured.
         Shell(String, (u64, aether_protocol::Revision)),
+        /// A conversation's, stamped the same way and for the same reason: most of what changes
+        /// about it is not in any one document's text.
+        Agent(String, (u64, aether_protocol::Revision)),
     }
     struct Job {
         doc: DocumentId,
@@ -833,6 +871,49 @@ pub(crate) async fn flush_backups(state: &SharedState) {
                 }
                 continue;
             }
+            // A conversation likewise, under its own key. Its text is spread across its blocks'
+            // documents rather than held in this one, so the gather happens here — and the stamp
+            // is the conversation's generation plus the input's revision, because a status change
+            // or a new block moves neither this document's text nor its revision.
+            if let Some(c) = doc.conversation() {
+                let Some(crate::state::VirtualTarget::Agent { number, .. }) =
+                    doc.virtual_source.as_ref().map(|v| &v.target)
+                else {
+                    continue;
+                };
+                let workspace = s
+                    .buffers
+                    .values()
+                    .find(|b| b.document == doc.id)
+                    .and_then(|b| s.buffer_workspaces.get(&b.id));
+                let Some(workspace) = workspace else { continue };
+                if s.workspaces.get(workspace).is_none_or(|w| w.name.is_none()) {
+                    continue;
+                }
+                let Some(input) = s.try_doc_of(c.input) else {
+                    continue;
+                };
+                let stamp = (c.generation, input.revision);
+                if c.backed_up == Some(stamp) {
+                    continue;
+                }
+                let typed: String = input.text.chunks().collect();
+                let snap = c
+                    .snapshot(&typed, |b| {
+                        s.try_doc_of(b)
+                            .map(|d| d.text.chunks().collect())
+                            .unwrap_or_default()
+                    })
+                    .trimmed(crate::agent::SNAPSHOT_BUDGET);
+                if let Ok(json) = serde_json::to_string(&snap) {
+                    jobs.push(Job {
+                        doc: doc.id,
+                        path: crate::backup::agent_backup_path(&root, workspace, *number),
+                        action: Action::Agent(json, stamp),
+                    });
+                }
+                continue;
+            }
             // Every *file-backed* document is backup-worthy, whatever kind of workspace holds
             // it: the backup key is path-only (`files/<hash>`) and recover-on-open is
             // workspace-agnostic, so content edited through an ephemeral tether context is
@@ -881,6 +962,7 @@ pub(crate) async fn flush_backups(state: &SharedState) {
     }
     let mut stamps: Vec<(DocumentId, Option<aether_protocol::Revision>)> = Vec::new();
     let mut shell_stamps: Vec<(DocumentId, (u64, aether_protocol::Revision))> = Vec::new();
+    let mut agent_stamps: Vec<(DocumentId, (u64, aether_protocol::Revision))> = Vec::new();
     for job in jobs {
         match job.action {
             Action::Write(content, rev) => match crate::backup::write(&job.path, &content) {
@@ -899,6 +981,12 @@ pub(crate) async fn flush_backups(state: &SharedState) {
                     tracing::warn!(document = job.doc.0, error = %e, "failed to write shell snapshot")
                 }
             },
+            Action::Agent(json, stamp) => match crate::backup::write(&job.path, &json) {
+                Ok(()) => agent_stamps.push((job.doc, stamp)),
+                Err(e) => {
+                    tracing::warn!(document = job.doc.0, error = %e, "failed to write agent snapshot")
+                }
+            },
         }
     }
     let mut s = state.lock().await;
@@ -910,6 +998,16 @@ pub(crate) async fn flush_backups(state: &SharedState) {
             .and_then(crate::state::Generated::transcript_mut)
         {
             t.backed_up = Some(stamp);
+        }
+    }
+    for (doc_id, stamp) in agent_stamps {
+        if let Some(c) = s
+            .documents
+            .get_mut(&doc_id)
+            .and_then(|d| d.generated.as_mut())
+            .and_then(crate::state::Generated::conversation_mut)
+        {
+            c.backed_up = Some(stamp);
         }
     }
     for (doc_id, stamp) in stamps {

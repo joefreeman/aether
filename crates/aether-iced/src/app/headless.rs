@@ -925,3 +925,154 @@ fn a_running_shell_shows_in_the_status_bar() {
     );
     snapshot(&mut sim, &app, "shell-indicator");
 }
+
+/// An agent conversation as the server composes one: the prose bare, the machinery boxed, and the
+/// reply laid out by *this shell* rather than wrapped by the server.
+fn agent_view() -> Window {
+    use aether_protocol::ui::{Band, Edges, Sides};
+    let boxed = |title: &str, children: Vec<ViewElement>| {
+        ViewElement::titled(
+            Edges {
+                border: Sides::all(1),
+                padding: Sides::ZERO,
+                collapse: false,
+            },
+            Band::Chrome,
+            vec![ViewElement::text(title, Vec::new())],
+            children,
+        )
+    };
+    let prose = |element: u32, source: &str| ViewElement::Prose {
+        element,
+        blocks: aether_client::markdown::parse(source),
+    };
+    window_of(vec![
+        chrome("You"),
+        editor(0, 10, 0, vec![line(0, "why are semicolons dropped?")]),
+        chrome(""),
+        prose(1, AGENT_REPLY),
+        chrome(""),
+        boxed(
+            "● Running cargo test",
+            vec![editor(2, 12, 0, vec![line(0, "42 passed")])],
+        ),
+        chrome(""),
+        input(3, 13, vec![line(0, "and now fix it")]),
+    ])
+}
+
+const AGENT_REPLY: &str =
+    "# Findings\n\nThe parser drops `;` in **two** places:\n\n- `stmt()`\n- `block()`";
+
+/// A cell size and pane size, as the editor widget reports on its first frame. Without them the
+/// prose layer has no idea how wide a gutter column is and declines to build.
+fn laid_out(mut app: App) -> App {
+    app.cell = Some(Size::new(8.0, 18.0));
+    app.view_size = Size::new(WIDTH, HEIGHT);
+    app
+}
+
+/// The bounds of a prose element's container, by id — the same thing `ProseMeasureProbe` reads, as
+/// a selector so a test can ask the simulator for it.
+#[derive(Clone)]
+struct ProseBounds(iced::advanced::widget::Id);
+
+impl Selector for ProseBounds {
+    type Output = Rectangle;
+
+    fn select(&mut self, candidate: Candidate<'_>) -> Option<Rectangle> {
+        match candidate {
+            Candidate::Container { id, bounds, .. } if id == Some(&self.0) => Some(bounds),
+            _ => None,
+        }
+    }
+
+    fn description(&self) -> String {
+        format!("prose container {:?}", self.0)
+    }
+}
+
+/// The reply renders as **real type**, in the layer over the editor: a container of its own,
+/// starting where the grid puts the element and taller than the row the grid gives an unmeasured
+/// one.
+///
+/// This is what the layer is answerable for. That the *blocks* look right is the reading view's
+/// job, tested there and shared verbatim; what only this can go wrong at is placement — an earlier
+/// version of the cell-based renderer drew a whole reply within a pixel of its first row. Run with
+/// `AETHER_SNAPSHOT_DIR` to look at it.
+#[test]
+fn an_agent_reply_renders_as_prose() {
+    let window = agent_view();
+    let origin = aether_client::grid::element_origins(
+        &window.root,
+        &grid::Measured::at_resolution(crate::app::UNITS_PER_ROW),
+    )[&1]
+        .row
+        .get();
+
+    let mut session = session_showing(window);
+    session.view.focused_element = 3;
+    let mut app = laid_out(app_with(session));
+    let (row_px, cell_w) = {
+        let cell = app.cell.expect("laid out");
+        (cell.height, cell.width)
+    };
+    let bounds = {
+        let mut sim = simulate(&app);
+        sim.find(ProseBounds(crate::app::prose_id(app.window, 1)))
+            .expect("the reply has a container of its own in the layer")
+    };
+
+    // Where the grid put the element — the layer's whole job.
+    let want_y = crate::editor::PAD + origin as f32 / crate::app::UNITS_PER_ROW as f32 * row_px;
+    assert!(
+        (bounds.y - want_y).abs() < 1.0,
+        "the reply is at {} rather than at its origin {want_y}",
+        bounds.y
+    );
+    // Proportional type, not the one row an unmeasured element stands at: a heading, a paragraph
+    // and two bullets cannot fit in one.
+    assert!(
+        bounds.height > row_px * 4.0,
+        "the reply came out {} px tall — one row is {row_px}",
+        bounds.height
+    );
+    // Inset past the gutter, so it starts where the lines around it do.
+    assert!(bounds.x >= cell_w);
+
+    // Feed the measurement back the way the probe does, and the settled frame is what to look at.
+    let _ = app.update(crate::app::Message::ProseMeasured(vec![(1, bounds.height)]));
+    let mut sim = simulate(&app);
+    snapshot(&mut sim, &app, "agent-reply");
+}
+
+/// A measured reply is **taller than the row an unmeasured one stands at**, and everything below it
+/// moves down by the difference.
+///
+/// The heights arrive a frame late in this shell — proportional type has no height until it has
+/// been drawn — so the thing to pin is that folding one in actually re-places the view. The bug
+/// this stands against: the height going into the table but nothing re-clamping, so a conversation
+/// could not be scrolled to its own bottom.
+#[test]
+fn a_measured_reply_extends_the_scrollable_height() {
+    let window = agent_view();
+    let unmeasured = aether_client::grid::total_rows(
+        &window.root,
+        &grid::Measured::at_resolution(crate::app::UNITS_PER_ROW),
+    );
+
+    let mut app = laid_out(app_showing(window));
+    // Ten rows' worth of reply, as the probe would report it.
+    let px = app.cell.unwrap().height * 10.0;
+    let _ = app.update(crate::app::Message::ProseMeasured(vec![(1, px)]));
+
+    let rendered = aether_client::grid::total_rows(
+        &app.session.view.window.as_ref().unwrap().root,
+        &app.measured,
+    );
+    assert!(
+        rendered > unmeasured,
+        "a measured reply ({rendered} rows) is no taller than the row an unmeasured one stands at \
+         ({unmeasured}); this test can no longer tell whether the height was folded in"
+    );
+}

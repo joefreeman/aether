@@ -37,6 +37,10 @@ pub enum HistoryKind {
     /// reason the others are separate: a shell command is not a search term, and `Up` in a shell
     /// that walked grep queries would be unusable.
     Shell,
+    /// An agent conversation's input, recorded when a prompt is sent. Its own list for the same
+    /// reason the shell's is: a prompt is prose, and `Up` in a conversation that walked shell
+    /// commands would be unusable.
+    Agent,
 }
 
 /// One recalled value together with the configuration it ran under. Recall restores both: a regex
@@ -87,6 +91,8 @@ pub struct HistoryLists {
     pub path: Vec<HistoryEntry>,
     #[serde(default)]
     pub shell: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub agent: Vec<HistoryEntry>,
 }
 
 impl HistoryLists {
@@ -97,6 +103,7 @@ impl HistoryLists {
             HistoryKind::Glob => &self.glob,
             HistoryKind::Path => &self.path,
             HistoryKind::Shell => &self.shell,
+            HistoryKind::Agent => &self.agent,
         }
     }
 
@@ -107,6 +114,7 @@ impl HistoryLists {
             HistoryKind::Glob => &mut self.glob,
             HistoryKind::Path => &mut self.path,
             HistoryKind::Shell => &mut self.shell,
+            HistoryKind::Agent => &mut self.agent,
         }
     }
 

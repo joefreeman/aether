@@ -106,6 +106,15 @@ streaming-iterator = "0.1"
 # Git integration (diff/blame). Local-only: default features (ssh/https/network) disabled so
 # the build doesn't pull in openssl/libssh2 — we never talk to a remote.
 git2 = { version = "0.21", default-features = false }
+# ACP (Agent Client Protocol) client: the agent view talks to coding agents over their stdio.
+# Stable protocol v1 only — v2 is a draft behind the crate's `unstable_protocol_v2` feature and no
+# released agent speaks it. Pinned exactly: this is somebody else's wire and it moves.
+agent-client-protocol = "=2.1.0"
+# The compat shims that let the ACP crate's futures-io transports run over tokio pipes. The
+# alternative — the SDK's own `AcpAgent`, built on `async_process` — busy-polls its stdio when
+# driven by a tokio runtime.
+tokio-util = { version = "0.7", features = ["compat"] }
+
 notify = "8"
 toml = "1"
 directories = "6"

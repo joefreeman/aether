@@ -100,6 +100,32 @@ pub enum Element {
         #[serde(default, skip_serializing_if = "ElementRole::is_field")]
         role: ElementRole,
     },
+    /// **Rendered prose** — a span of a buffer as markdown, not as lines.
+    ///
+    /// The vocabulary's answer to "this is a document to read", as [`Element::Editor`] is its
+    /// answer to "this is text to edit". A shell renders it with real typography: headings that
+    /// are headings, lists, quotes, code panels. What that costs each shell is one renderer,
+    /// written once — which is the point. Before this existed the reading view had to be a whole
+    /// *view kind* with a painter of its own in every shell, and prose anywhere else (an agent's
+    /// reply inside a conversation) had nowhere to live but an `Editor` element pretending.
+    ///
+    /// `blocks` is the **tree**, not a flattened list: a list item holds blocks, a quote holds
+    /// blocks, a table cell holds inlines. Rendering recurses, and so must anything that walks it.
+    ///
+    /// Its height is the shell's to report ([`LayoutOwner::Client`] is implied — proportional type
+    /// cannot be measured anywhere else), through the same `Measured` table an editor element the
+    /// client lays out uses.
+    ///
+    /// **A field id and the parse, and nothing else.** No buffer id and no source line, because a
+    /// prose element has no wire rows: nothing addresses it by position, and the one path that
+    /// resolves an element to a buffer — a pointer press — walks the editors. Selecting or copying
+    /// inside rendered prose wants both back, and wants an answer to which of a block's inlines a
+    /// pixel is in; that answer is what would decide the shape of them, so they are not guessed at
+    /// here in the meantime.
+    Prose {
+        element: FieldId,
+        blocks: Vec<aether_markdown::Block>,
+    },
     /// Literal text with role-styled runs over it. `highlights` are byte offsets into `text` and
     /// carry the same capture names buffer text does, so they resolve through the theme table a
     /// shell already has.
@@ -335,6 +361,29 @@ impl Element {
             }
         });
         out
+    }
+
+    /// Every **content** element: the editors and the prose, in view order.
+    ///
+    /// What anything asking "which elements does this view have, and where do they sit" wants —
+    /// measurement, focus order, the row walk. Distinct from [`Self::editors`], whose callers want
+    /// an editor's *fields* (lines, rows, the buffer slice) and would have to skip prose anyway.
+    pub fn content(&self) -> Vec<&Element> {
+        let mut out = Vec::new();
+        self.walk(&mut |e| {
+            if matches!(e, Element::Editor { .. } | Element::Prose { .. }) {
+                out.push(e);
+            }
+        });
+        out
+    }
+
+    /// The field id of a content element — an editor's or prose's.
+    pub fn field_id(&self) -> Option<FieldId> {
+        match self {
+            Element::Editor { element, .. } | Element::Prose { element, .. } => Some(*element),
+            _ => None,
+        }
     }
 
     /// The [`ElementRole::Input`] element of this tree, if it has one — which is also the answer

@@ -33,12 +33,12 @@
 pub mod edit;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A byte range into the source the AST was parsed from. Start-inclusive, end-exclusive.
 /// Hover ASTs carry spans too (the parse is shared) — they're just never queried there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Span {
     pub start: u32,
     pub end: u32,
@@ -55,7 +55,7 @@ impl Span {
 }
 
 /// A block-level node.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Block {
     Heading {
@@ -168,7 +168,7 @@ impl Block {
 }
 
 /// One item of a [`Block::List`].
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ListItem {
     /// `Some(done)` for a task-list item (`- [x]` / `- [ ]`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -186,7 +186,7 @@ impl ListItem {
 }
 
 /// GFM blockquote alert kinds (`> [!NOTE]` …).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertKind {
     Note,
@@ -197,7 +197,7 @@ pub enum AlertKind {
 }
 
 /// Table column alignment, from the delimiter row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ColAlign {
     None,
@@ -209,7 +209,7 @@ pub enum ColAlign {
 /// An inline (span-level) node. Interactive inlines (link, image, footnote ref) carry source spans —
 /// they're focusable stops in the reading view; plain text runs don't (match painting, which
 /// needs text-run spans, is a later phase).
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Inline {
     Text {
@@ -685,7 +685,7 @@ fn inlines_text(inlines: &[Inline]) -> String {
 /// starts). The reading view's focus model runs entirely over this list: block-grain stops are
 /// `j`/`k` stops, interactive ones are `Tab` stops and `Enter` targets, headings serve the
 /// `o`/`Alt-o` motion and anchor-link resolution.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Stop {
     /// A non-heading block-grain stop: paragraph, code block, rule, table, quote, footnote

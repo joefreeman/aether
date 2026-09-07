@@ -904,6 +904,12 @@ pub enum SessionView {
     Shell {
         number: u32,
     },
+    /// An agent conversation, by its per-workspace number. Its content survives as a snapshot in
+    /// the backups directory, keyed the same way; an entry with no snapshot is dropped at
+    /// activation exactly as a shell's is.
+    Agent {
+        number: u32,
+    },
     /// A session written before the tag was the view's kind: a file with an optional `view`. Read
     /// as the editor or reader it named ([`WorkspaceSessions::normalise`]); never written.
     #[doc(hidden)]
@@ -933,7 +939,8 @@ impl SessionView {
             SessionView::File { path, view } => Some((path, view.unwrap_or(ViewKind::Editor))),
             SessionView::Scratch { .. }
             | SessionView::Virtual { .. }
-            | SessionView::Shell { .. } => None,
+            | SessionView::Shell { .. }
+            | SessionView::Agent { .. } => None,
         }
     }
 

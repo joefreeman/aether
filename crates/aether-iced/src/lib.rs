@@ -11,6 +11,7 @@ mod input;
 #[cfg(target_os = "macos")]
 mod mac_open;
 mod picker;
+mod prose;
 mod theme;
 
 // The core crate under the path the shell has always used, plus its modules at their pre-extraction

@@ -6265,13 +6265,14 @@ fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
 }
 
 #[test]
-fn space_n_shows_diagnostic_at_cursor() {
-    // Space n → diagnostic at cursor (moved off Space j, which now opens the jumplist picker).
-    // With no diagnostics loaded it reports "none" via a toast (resolved locally — no RPC),
-    // which still proves the chord reaches `show_diagnostic`.
+fn space_alt_t_shows_diagnostic_at_cursor() {
+    // Space Alt-t → diagnostic at cursor. It moved here from `Space n` when that became the agent
+    // sub-leader, pairing it with `Space t` (hover). With no diagnostics loaded it reports "none"
+    // via a toast (resolved locally — no RPC), which still proves the chord reaches
+    // `show_diagnostic`.
     let mut s = session();
     let _ = key(&mut s, ' '); // leader
-    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, Some("n".to_string()));
+    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, Some("t".to_string()));
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -6280,7 +6281,7 @@ fn space_n_shows_diagnostic_at_cursor() {
                 ..
             }
         )),
-        "Space n with no diagnostics toasts an info message"
+        "Space Alt-t with no diagnostics toasts an info message"
     );
 }
 
@@ -13799,7 +13800,9 @@ fn normal_mode_enter_on_the_input_submits() {
     let mut s = shell_session(1);
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let (_, method, _) = the_request(&fx);
-    assert_eq!(method, "shell/run");
+    // One method for both kinds of composed view: the client cannot tell a shell from an agent
+    // conversation, so the server decides what submitting means here.
+    assert_eq!(method, "view/submit_input");
 
     // On the transcript it is `Enter`'s composed-view meaning: follow what the line names.
     let mut s = shell_session(0);
@@ -14035,7 +14038,9 @@ fn submitting_records_the_command_for_recall() {
         s.history.list(HistoryKind::Shell).is_empty(),
         "not until the server has accepted it"
     );
-    let _ = s.on_rpc_result(token, Ok(json!({"run": 1})));
+    // The server says which recall list the line belongs to; the client files it there without
+    // ever learning what sort of view it was typed in.
+    let _ = s.on_rpc_result(token, Ok(json!({"submitted": true, "history": "shell"})));
     let values: Vec<&str> = s
         .history
         .list(HistoryKind::Shell)
@@ -14076,9 +14081,9 @@ fn a_rejected_line_is_not_accepted_and_not_recalled() {
 
 /// The status indicator names the command you are waiting on, and counts the ones you are not.
 #[test]
-fn the_shell_indicator_names_the_focused_run_and_counts_the_rest() {
+fn the_work_indicator_names_the_focused_run_and_counts_the_rest() {
     let mut s = shell_session(1);
-    assert_eq!(s.shell_indicator(), None, "nothing running");
+    assert_eq!(s.work_indicator(), None, "nothing running");
 
     let _ = s.on_event(shell_run_push(
         10,
@@ -14086,14 +14091,14 @@ fn the_shell_indicator_names_the_focused_run_and_counts_the_rest() {
         json!({"kind": "running"}),
     ));
     assert_eq!(
-        s.shell_indicator().as_deref(),
+        s.work_indicator().as_deref(),
         Some("cargo build"),
         "the shell in front of you is named by its command"
     );
 
     let _ = s.on_event(shell_run_push(99, "npm test", json!({"kind": "running"})));
     assert_eq!(
-        s.shell_indicator().as_deref(),
+        s.work_indicator().as_deref(),
         Some("cargo build"),
         "the focused one still wins"
     );
@@ -14104,7 +14109,66 @@ fn the_shell_indicator_names_the_focused_run_and_counts_the_rest() {
         "cargo build",
         json!({"kind": "exited", "code": 0}),
     ));
-    assert_eq!(s.shell_indicator().as_deref(), Some("1 running"));
+    assert_eq!(s.work_indicator().as_deref(), Some("1 running"));
     let _ = s.on_event(shell_run_push(99, "npm test", json!({"kind": "killed"})));
-    assert_eq!(s.shell_indicator(), None);
+    assert_eq!(s.work_indicator(), None);
+}
+
+/// A composed view containing a client-laid-out element is **not** the reading view.
+///
+/// The reader is a whole view — one element over its whole buffer, nothing around it — and the
+/// client recognised it by that element's *kind* alone. An agent's reply is laid out by the client
+/// too, so focusing one replaced the entire conversation with a reading view over that single
+/// block: the native client showed one paragraph and nothing else.
+#[test]
+fn a_client_laid_out_block_does_not_turn_a_conversation_into_the_reader() {
+    use aether_protocol::viewport::{Element, Window};
+
+    // The reader itself still is one: one element, nothing around it.
+    let mut s = session();
+    let _ = adopt_reader_window(&mut s, "# A document\n\nProse.");
+    assert!(
+        s.view.read.is_some(),
+        "the reading view stopped recognising itself"
+    );
+
+    // A conversation is not, even with the same kind of element in it and the cursor on it.
+    let mut s = session();
+    let reader = reader_subscribe(s.view.buffer.buffer_id, "# Findings\n\nProse.");
+    let Element::Editor { lines, buffer, .. } = reader.window.root.clone() else {
+        panic!("the reader's window is one editor");
+    };
+    let block = Element::Editor {
+        element: 0,
+        buffer,
+        rows: lines.len() as u32,
+        first_row: aether_protocol::coords::ElementRow::ZERO,
+        laid_out_by: aether_protocol::ui::LayoutOwner::Client,
+        role: aether_protocol::ui::ElementRole::Field,
+        first_buffer_line: 0,
+        lines,
+    };
+    let input = Element::Editor {
+        element: 1,
+        buffer: buffer + 1,
+        rows: 1,
+        first_row: aether_protocol::coords::ElementRow::ZERO,
+        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+        role: aether_protocol::ui::ElementRole::Input,
+        first_buffer_line: 0,
+        lines: vec![],
+    };
+    let conversation = aether_protocol::viewport::ViewportSubscribeResult {
+        window: Window {
+            root: Element::column(vec![block, input]),
+            ..reader.window
+        },
+        ..reader
+    };
+    let _ = s.adopt_subscribe(conversation);
+    assert!(
+        s.view.read.is_none(),
+        "focusing a rendered reply put the whole client into the reading view"
+    );
+    assert_ne!(s.view.mode, aether_client::session::Mode::Read);
 }

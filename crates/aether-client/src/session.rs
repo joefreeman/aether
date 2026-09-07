@@ -880,6 +880,8 @@ pub enum Pending {
     /// (`crates/aether-client/src/keymap.rs`). Its own variant rather than a flag on `Leader` so
     /// the shells can say *which* chord is in flight; the awaiting-key cursor treats both alike.
     LeaderGit,
+    /// `Space n` pressed: the next keystroke is looked up in [`crate::keymap::KeyContext::LeaderAgent`]
+    LeaderAgent,
     Find {
         dir: Direction,
         till: bool,
@@ -1242,6 +1244,11 @@ pub struct Session {
     /// running and counts the others when they are not, which is a question only the whole set can
     /// answer. Keyed by view id, so `Space Alt-b` knows which one it is stopping.
     pub shell_runs: std::collections::HashMap<ViewId, aether_protocol::shell::RunState>,
+    /// The turn each agent conversation is running, pushed by `agent/turn_changed` and rendered in
+    /// the same status-bar slot as the shell's. A map for the same reason that one is: a workspace
+    /// can hold several conversations and more than one can be working at once, and `Space n c`
+    /// needs to know which it is stopping.
+    pub agent_turns: std::collections::HashMap<ViewId, aether_protocol::agent::TurnState>,
     /// The line a `shell/run` in flight was sent with. Recorded into the shell history only once
     /// the server accepts it, so a refused line is not recalled by `Up` — and held here because
     /// by the time the answer arrives the input has been cleared.
@@ -1699,6 +1706,7 @@ impl Session {
             worktree_store: String::new(),
             git_operation: None,
             shell_runs: std::collections::HashMap::new(),
+            agent_turns: Default::default(),
             pending_shell_submit: None,
             diff_view: false,
             markdown_read_default: true,
@@ -1886,20 +1894,29 @@ impl Session {
         crate::grid::sticky_tail(top, viewport_rows, before, after)
     }
 
-    /// What the status bar says about shells, or `None` when none is running.
+    /// What the status bar says about work in progress, or `None` when there is none.
     ///
-    /// The shell you are looking at is named by its **command**, because that is the thing you are
-    /// waiting on; shells you are not looking at are counted, because their commands are not what
-    /// the row is for and three of them would not fit anyway. One definition, in the core, so the
-    /// terminal, the GUI and the browser cannot disagree about what the indicator says.
+    /// Covers both kinds of composed view that can be busy — a shell running a command and an
+    /// agent working through a turn — because they share one status slot and only one of them can
+    /// be the view you are looking at. The one you *are* looking at is named by the thing you are
+    /// waiting on (the command, or the agent's current tool call); the rest are counted, because
+    /// their names are not what the row is for and three of them would not fit anyway.
     ///
+    /// One definition, in the core, so the terminal, the GUI and the browser cannot disagree.
     /// Presentation stays with the shells: no glyph, no colour — the same division the git
     /// operation's label draws.
-    pub fn shell_indicator(&self) -> Option<String> {
+    pub fn work_indicator(&self) -> Option<String> {
         if let Some(run) = self.shell_runs.get(&self.view.view_id) {
             return Some(run.command.clone());
         }
-        match self.shell_runs.len() {
+        if let Some(turn) = self.agent_turns.get(&self.view.view_id) {
+            return Some(
+                turn.activity
+                    .clone()
+                    .unwrap_or_else(|| "thinking".to_string()),
+            );
+        }
+        match self.shell_runs.len() + self.agent_turns.len() {
             0 => None,
             n => Some(format!("{n} running")),
         }

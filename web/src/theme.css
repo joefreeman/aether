@@ -691,6 +691,31 @@ html, body, #app {
    because the gutter belongs to the rows the cursor *can* reach and chrome is not one of them.
    That is what makes "unreachable" legible: the row is simply not in a well. */
 .row.patch-chrome { color: var(--fg-muted); background: var(--bg-app); }
+/* An agent's reply: the reading view's typography, at the conversation's full width.
+   `.md-read`'s own rules carry the type — headings, lists, quotes, code panels — so this only has
+   to undo the things that belong to a *page*: the centred narrow measure, and the page padding.
+   Nothing here marks a reading position or styles a focused block, because a reply has neither. */
+.md-reply-box { background: var(--bg); }
+.md-read.md-reply {
+  /* The reading type itself, which the pane cannot supply here: the whole-pane reader gets it from
+     `#buffer.md-read-host`, and a reply lives inside the *editor's* pane, whose monospace and
+     `white-space: pre` it would otherwise inherit. Same family, scale and leading as the reader —
+     the one place the two are declared apart, and they have to agree. */
+  font-family: "Source Serif 4", Charter, "Bitstream Charter", Georgia, serif;
+  font-size: 1.125em;
+  line-height: 1.65;
+  white-space: normal;
+  cursor: default;
+  user-select: text;
+  /* And what belongs to a *page* rather than to prose, undone: the centred narrow measure and the
+     page padding. */
+  max-width: none;
+  margin: 0;
+  padding: 0.2em 0 0.6em 0;
+}
+/* A link out of a reply is text, not navigation: a conversation is a record of what was said, and
+   following a path out of it is not something this view offers. */
+.md-read.md-reply a { color: inherit; text-decoration: none; cursor: default; }
 /* The gutter takes the *ground's* colour rather than the well it paints on every other row: it is
    opaque either way (it has to be — it is sticky, so text scrolls under it), and painting the
    editor shade here left a strip of well down the left of every chrome row.

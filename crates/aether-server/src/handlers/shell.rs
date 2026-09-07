@@ -69,17 +69,33 @@ async fn land_in_input(
     ctx: &mut ConnectionCtx,
     transcript: BufferId,
 ) -> Result<(ViewOpenResult, aether_protocol::ui::FieldId), RpcError> {
+    let input_buffer = {
+        let s = state.lock().await;
+        s.try_doc_of(transcript)
+            .and_then(|d| d.transcript())
+            .map(|t| t.input)
+            .ok_or_else(|| RpcError::internal("a shell view has lost its input"))?
+    };
+    land_in_field(state, ctx, transcript, input_buffer).await
+}
+
+/// Present `view_buffer` and put the caret at the end of `input_buffer`, its input element.
+///
+/// Shared by the shell and the agent views: both are composed views whose last element is a field
+/// you type into, and the focus dance below is fiddly enough that a second copy of it would drift.
+pub(crate) async fn land_in_field(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    view_buffer: BufferId,
+    input_buffer: BufferId,
+) -> Result<(ViewOpenResult, aether_protocol::ui::FieldId), RpcError> {
+    let transcript = view_buffer;
     let client_id = ctx.client_id;
     let mut opened = present_buffer(state, ctx, transcript, OpenIntent::Navigate).await?;
 
     let mut s = state.lock().await;
     let input_element = input_element_of(&s, transcript)
-        .ok_or_else(|| RpcError::internal("a shell view has lost its input"))?;
-    let input_buffer = s
-        .try_doc_of(transcript)
-        .and_then(|d| d.transcript())
-        .map(|t| t.input)
-        .ok_or_else(|| RpcError::internal("a shell view has lost its input"))?;
+        .ok_or_else(|| RpcError::internal("a composed view has lost its input"))?;
     // Land in the input. Two halves, because two different things read them: the *scroll* names
     // the element, and a fresh subscribe takes its focused element from the scroll — while a
     // viewport already showing this view needs telling directly, since it will re-subscribe with
@@ -272,7 +288,9 @@ async fn mint_shell(
 
 /// The environment a new shell starts with: the daemon's, overlaid with what the user's login
 /// shell sets for this directory.
-async fn shell_environment(cwd: &std::path::Path) -> std::collections::HashMap<String, String> {
+pub(crate) async fn shell_environment(
+    cwd: &std::path::Path,
+) -> std::collections::HashMap<String, String> {
     let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
     if let Some(resolved) = crate::lsp::shell_env::resolve(cwd).await {
         env.extend(resolved);
@@ -285,7 +303,7 @@ async fn shell_environment(cwd: &std::path::Path) -> std::collections::HashMap<S
 ///
 /// Decided once, at open, and never revisited — a header that named a directory the commands are
 /// no longer run in would be worse than no header at all.
-fn shell_cwd(s: &ServerState, client_id: ClientId) -> PathBuf {
+pub(crate) fn shell_cwd(s: &ServerState, client_id: ClientId) -> PathBuf {
     let roots = s
         .active_workspace(client_id)
         .map(|w| w.paths.clone())
@@ -1075,6 +1093,53 @@ pub async fn view_follow_line(
                     None => Follow::Nothing,
                 }
             }
+            // A conversation answers the same question two ways, in this order: a tool call that
+            // told us where it was working is followed to *there*, which is the whole reason ACP
+            // sends locations; otherwise the line is read for a `path:line:col` exactly as a
+            // shell's output is, so an agent that merely printed a compiler error is still
+            // followable.
+            Some(Generated::Agent(c)) => {
+                let located = c
+                    .blocks
+                    .iter()
+                    .find(|b| b.buffer == focused)
+                    .and_then(|b| match &b.kind {
+                        crate::agent::BlockKind::ToolCall(tc) => tc.locations.first(),
+                        _ => None,
+                    })
+                    .map(|loc| {
+                        (
+                            loc.path.clone(),
+                            LogicalPosition {
+                                line: loc.line.unwrap_or(0),
+                                col: 0,
+                            },
+                        )
+                    });
+                match located {
+                    Some((path, position)) => Follow::File(path, position),
+                    None => {
+                        let doc = s.doc_of(focused);
+                        let text: String = doc
+                            .text
+                            .get_line(line as usize)
+                            .map(|l| l.chars().collect())
+                            .unwrap_or_default();
+                        match crate::shell::parse_location(&text)
+                            .and_then(|loc| crate::shell::resolve(&loc, &c.cwd).map(|p| (loc, p)))
+                        {
+                            Some((loc, path)) => Follow::File(
+                                path,
+                                LogicalPosition {
+                                    line: loc.line,
+                                    col: loc.col,
+                                },
+                            ),
+                            None => Follow::Nothing,
+                        }
+                    }
+                }
+            }
             None => Follow::Nothing,
         }
     };
@@ -1112,6 +1177,74 @@ pub async fn view_follow_line(
             .await?;
             Ok(ViewFollowLineResult {
                 opened: Some(opened),
+            })
+        }
+    }
+}
+
+// ---- view/submit_input -------------------------------------------------------------------------
+
+/// **Total** over the kinds of composed view: what `Enter` in an input element means here.
+///
+/// The client cannot tell a shell from an agent view — the window marks the input by role and
+/// carries no kind — so it asks this and the server decides, the same arrangement
+/// [`view_follow_line`] uses for `Enter` on a line. A view with no input, or one whose kind has no
+/// notion of submitting, answers `submitted: false`.
+pub async fn view_submit_input(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::view::ViewSubmitInputParams,
+) -> Result<aether_protocol::view::ViewSubmitInputResult, RpcError> {
+    use aether_protocol::history::HistoryKind;
+    use aether_protocol::view::ViewSubmitInputResult;
+
+    enum Submit {
+        Shell,
+        Agent,
+        Nothing,
+    }
+    let submit = {
+        let s = state.lock().await;
+        let Some(view_buffer) = s.try_presenting_buffer(params.view_id) else {
+            return Ok(ViewSubmitInputResult::default());
+        };
+        match s.try_doc_of(view_buffer).and_then(|d| d.generated.as_ref()) {
+            Some(Generated::Shell(_)) => Submit::Shell,
+            Some(Generated::Agent(_)) => Submit::Agent,
+            Some(Generated::Patch(_)) | None => Submit::Nothing,
+        }
+    };
+
+    match submit {
+        Submit::Nothing => Ok(ViewSubmitInputResult::default()),
+        Submit::Shell => {
+            // A directory change runs nothing but is still a submission: the line left the input
+            // and belongs in the recall list, which is why the run id is not what decides this.
+            shell_run(
+                state,
+                ctx,
+                ShellRunParams {
+                    view_id: params.view_id,
+                },
+            )
+            .await?;
+            Ok(ViewSubmitInputResult {
+                submitted: true,
+                history: Some(HistoryKind::Shell),
+            })
+        }
+        Submit::Agent => {
+            let sent = crate::handlers::agent_prompt(
+                state,
+                ctx,
+                aether_protocol::agent::AgentPromptParams {
+                    view_id: params.view_id,
+                },
+            )
+            .await?;
+            Ok(ViewSubmitInputResult {
+                submitted: sent.sent,
+                history: sent.sent.then_some(HistoryKind::Agent),
             })
         }
     }

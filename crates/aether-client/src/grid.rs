@@ -256,6 +256,9 @@ impl Measured {
                 laid_out_by: LayoutOwner::Client,
                 ..
             } => self.elements.get(element),
+            // Prose has no height until a shell has rendered it — proportional type cannot be
+            // counted in rows — so it is always the shell's measurement or nothing.
+            Element::Prose { element, .. } => self.elements.get(element),
             _ => None,
         }
     }
@@ -269,6 +272,10 @@ impl Measured {
         match (node, self.of(node)) {
             (Element::Editor { rows, .. }, Some(m)) => m.height(*rows, self.units_per_row),
             (Element::Editor { rows, .. }, None) => rows * self.units_per_row,
+            (Element::Prose { .. }, Some(m)) => m.end,
+            // Unmeasured prose stands at one row: it is about to be measured, and a guess in rows
+            // would only put everything below it somewhere it has to move back from.
+            (Element::Prose { .. }, None) => self.units_per_row,
             (Element::Column { edges, .. }, _) => self.box_rows(*edges),
             (Element::Row { edges, .. }, _) => self.units_per_row + self.box_rows(*edges),
             _ => self.units_per_row,
@@ -378,8 +385,8 @@ pub fn element_start_row_of(
     let mut found = None;
     walk_rows(root, measured, Frame::default(), &mut |visit, _, rows| {
         if found.is_none() {
-            if let Visit::Node(Element::Editor { element: id, .. }) = visit {
-                if *id == element {
+            if let Visit::Node(node) = visit {
+                if node.field_id() == Some(element) {
                     found = Some(VisualRow(at));
                 }
             }
@@ -448,14 +455,16 @@ pub fn slices_for(
 /// measured for. Called by a shell on every window adoption, before anything resolves through it.
 pub fn prune_measured(measured: &mut Measured, root: &Element) {
     let client: Vec<FieldId> = root
-        .editors()
+        .content()
         .into_iter()
         .filter_map(|node| match node {
             Element::Editor {
                 element,
                 laid_out_by: LayoutOwner::Client,
                 ..
-            } => Some(*element),
+            }
+            // Prose is always the shell's to measure: proportional type has no height in rows.
+            | Element::Prose { element, .. } => Some(*element),
             _ => None,
         })
         .collect();
@@ -466,14 +475,14 @@ pub fn prune_measured(measured: &mut Measured, root: &Element) {
 /// cannot place a window by rows it has not counted, so a placement into such a view waits for
 /// the shell's layout — the reader's, once it has parsed what the window carries.
 pub fn awaits_measure(root: &Element, measured: &Measured) -> bool {
-    root.editors().into_iter().any(|node| {
+    root.content().into_iter().any(|node| {
         matches!(
             node,
             Element::Editor {
                 element,
                 laid_out_by: LayoutOwner::Client,
                 ..
-            } if !measured.elements.contains_key(element)
+            } | Element::Prose { element, .. } if !measured.elements.contains_key(element)
         )
     })
 }
@@ -612,7 +621,11 @@ fn walk_rows<'a>(
                 );
             }
         }
-        Element::Editor { .. } => f(Visit::Node(node), frame, measured.height(node)),
+        // Both kinds of content element occupy the height the shell measured for them: an editor
+        // the client lays out, and prose, which has no height at all until a shell has rendered it.
+        Element::Editor { .. } | Element::Prose { .. } => {
+            f(Visit::Node(node), frame, measured.height(node))
+        }
         Element::Row {
             children,
             edges,
@@ -894,12 +907,58 @@ pub fn painted_rows_of<'a>(
                         }
                     }
                 }
+                // Prose paints no rows here. It occupies its measured height — the rows below it
+                // are placed past it — but *what* is in those rows is the shell's own layout of
+                // the blocks, found through [`element_origins`]. A row list cannot carry it: a
+                // rendered block has more rows than the wire has anything to put in them.
+                Element::Prose { .. } => {}
                 _ => out.push((place(at), PaintedRow::Chrome(node))),
             }
             at = at.saturating_add(height);
         },
     );
     resolve_joins(&mut out);
+    out
+}
+
+/// Where each content element starts — its visual row in the units [`Measured`] counts in, and the
+/// box around it.
+///
+/// What a shell needs to paint an element it laid out **itself**: the rows of its own layout go at
+/// `origin + row`, indented by the placement's inset. [`painted_rows`] cannot answer this for
+/// prose, which contributes no rows of its own, and for a client-laid-out editor it places the
+/// *source lines* instead — a rendered block has more rows than lines, so the two cannot be
+/// derived from each other. The placement is the fixed point they share.
+///
+/// Derived here rather than in each shell for the reason [`resolve_joins`] is: three shells
+/// computing the same geometry three ways is how they come to disagree.
+pub fn element_origins(
+    root: &Element,
+    measured: &Measured,
+) -> std::collections::HashMap<FieldId, Placement> {
+    let mut out = std::collections::HashMap::new();
+    let mut at = 0u32;
+    walk_rows(
+        root,
+        measured,
+        Frame::default(),
+        &mut |visit, frame, height| {
+            if let Visit::Node(node) = visit {
+                if let Some(element) = node.field_id() {
+                    out.insert(
+                        element,
+                        Placement {
+                            row: VisualRow(at),
+                            inset: frame.inset,
+                            rails: frame.rails,
+                            band: frame.band,
+                        },
+                    );
+                }
+            }
+            at = at.saturating_add(height);
+        },
+    );
     out
 }
 
@@ -3165,5 +3224,134 @@ mod tests {
         // A screen entirely below it — the prose is 13 rows under its chrome — asks nothing of it.
         let below = slices_for(&w.root, VisualRow(15), 3, 0, &m);
         assert_eq!(below.iter().map(|s| s.element).collect::<Vec<_>>(), vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    /// An element's origin is where [`painted_rows`] puts its first line — the fixed point a shell
+    /// paints its own layout against.
+    #[test]
+    fn an_origin_is_where_the_elements_first_line_lands() {
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![
+                test_editor(0, 2),
+                Element::chrome(Vec::new()),
+                test_editor(1, 3),
+            ],
+        };
+        let measured = Measured::default();
+        let origins = element_origins(&root, &measured);
+        for (place, row) in painted_rows_of(&root, &measured) {
+            if let PaintedRow::Text {
+                element, row_index, ..
+            } = row
+            {
+                if row_index == 0 {
+                    // Only the *first* line of each element starts at the origin.
+                    let first = origins[&element];
+                    assert!(
+                        place.row.get() >= first.row.get(),
+                        "element {element} painted above its own origin"
+                    );
+                }
+            }
+        }
+        // Second element starts after the first's two lines plus the chrome row between them.
+        assert_eq!(origins[&0].row.get(), 0);
+        assert_eq!(origins[&1].row.get(), 3);
+    }
+
+    fn test_editor(element: FieldId, lines: usize) -> Element {
+        Element::Editor {
+            element,
+            buffer: 1,
+            rows: lines as u32,
+            first_row: ElementRow::ZERO,
+            laid_out_by: LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
+            first_buffer_line: 0,
+            lines: (0..lines)
+                .map(|i| aether_protocol::viewport::LogicalLineRender {
+                    change: Default::default(),
+                    logical_line: i as u32,
+                    visual_rows: vec![aether_protocol::viewport::WrappedRow {
+                        segments: Vec::new(),
+                        byte_offset: 0,
+                        continuation_indent: 0,
+                    }],
+                    search_matches: vec![],
+                    baseline_above: vec![],
+                    diagnostics: vec![],
+                    sneak_targets: vec![],
+                })
+                .collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod prose_tests {
+    use super::*;
+
+    fn prose(element: FieldId, blocks: usize) -> Element {
+        Element::Prose {
+            element,
+            blocks: (0..blocks)
+                .map(|_| aether_markdown::Block::Rule {
+                    span: aether_markdown::Span { start: 0, end: 0 },
+                })
+                .collect(),
+        }
+    }
+
+    /// Prose is a content element: it has an origin, it is measured by the shell, and until the
+    /// shell has measured it the view is not placeable.
+    ///
+    /// The reason it cannot simply be counted in rows is the whole reason it exists — proportional
+    /// type has no height until something has laid it out.
+    #[test]
+    fn prose_is_measured_by_the_shell() {
+        let root = Element::column(vec![prose(0, 2), prose(1, 1)]);
+        let mut measured = Measured::at_resolution(1000);
+
+        assert!(
+            awaits_measure(&root, &measured),
+            "an unmeasured prose element did not hold the placement"
+        );
+
+        measured.elements.insert(
+            0,
+            MeasuredElement {
+                first_row: ElementRow::ZERO,
+                starts: vec![0],
+                end: 5_000,
+            },
+        );
+        measured.elements.insert(
+            1,
+            MeasuredElement {
+                first_row: ElementRow::ZERO,
+                starts: vec![0],
+                end: 2_000,
+            },
+        );
+        assert!(!awaits_measure(&root, &measured));
+
+        // Height is what the shell said, and the second block starts after the first.
+        assert_eq!(total_rows(&root, &measured), 7_000);
+        let origins = element_origins(&root, &measured);
+        assert_eq!(origins[&0].row.get(), 0);
+        assert_eq!(origins[&1].row.get(), 5_000);
+
+        // A window that no longer holds an element drops its measurement.
+        prune_measured(&mut measured, &Element::column(vec![prose(0, 2)]));
+        assert!(measured.elements.contains_key(&0));
+        assert!(!measured.elements.contains_key(&1));
     }
 }

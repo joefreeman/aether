@@ -5,6 +5,8 @@
 //! cleanly even when they overlap.
 
 import { decodeRow, utf8ByteLen } from "./text";
+import type { MdBlock } from "./markdown";
+import { renderReply } from "./read";
 import type {
   Band,
   BufferWindow,
@@ -20,14 +22,18 @@ import type {
   RailJoin,
   UiElement,
   BaselineRow,
+  ElementPlacement,
+  PaintedRow,
   ViewNode,
   WrappedRow,
 } from "./protocol";
 // Value imports: the `change*` accessors mirror the Rust ones on `LineChange`, so the call sites
 // below stay as short as the five parallel fields they replaced.
 import {
+  elementOrigins,
   inlineOf,
   paintedRows,
+  proseOf,
   nodeLines,
   changeConflict,
   changeEmphasis,
@@ -719,28 +725,60 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
   // a fetch still in flight — are a gap the same height, so everything below keeps its row.
   // Offsets are in the measured resolution; a row is `units_per_row` of them.
   const unit = measured.units_per_row;
+  // Cells the enclosing boxes claimed, applied to whatever the row turns out to be. `boxed`
+  // is what puts the band behind those cells and takes the pre-frame rail out of the gutter:
+  // inside a box the rail is the box's border, and drawing both is two lines down one file.
+  const insetBy = (place: ElementPlacement | PaintedRow, el: HTMLElement): HTMLElement => {
+    if (!place.left && !place.right) return el;
+    el.classList.add("boxed");
+    el.style.setProperty("--inset-left", `${place.left}ch`);
+    el.style.setProperty("--inset-right", `${place.right}ch`);
+    // A rail per side the box actually draws — the padding beside it gets no line.
+    if (place.rails.left) el.classList.add("rail-left");
+    if (place.rails.right) el.classList.add("rail-right");
+    return el;
+  };
   let next = 0;
-  for (const item of paintedRows(window.root, measured)) {
-    if (item.at > next) {
-      const gap = document.createElement("div");
-      gap.className = "row-gap";
-      gap.style.height = `${((item.at - next) / unit) * rowHeightPx}px`;
-      frag.appendChild(gap);
+  const gapTo = (row: number): void => {
+    if (row <= next) return;
+    const gap = document.createElement("div");
+    gap.className = "row-gap";
+    gap.style.height = `${((row - next) / unit) * rowHeightPx}px`;
+    frag.appendChild(gap);
+  };
+  // Prose contributes no rows to the walk below — the window carries its parse, not its lines — so
+  // it is placed from its own origin and emitted in row order between the rows around it. At the
+  // *origin*, not at whatever row happened to be nearest: with the top of a long reply scrolled
+  // away there is no row at its start, and hanging the block off a surviving row slid it down the
+  // screen by however much was missing.
+  const placements = elementOrigins(window.root, measured);
+  const pending = proseOf(window.root)
+    .map((node) => ({ node, place: placements[node.element] }))
+    .filter((p) => p.place !== undefined)
+    .sort((a, b) => a.place.at - b.place.at);
+  let emitted = 0;
+  const flushProse = (upTo: number): void => {
+    while (emitted < pending.length && pending[emitted].place.at <= upTo) {
+      const { node, place } = pending[emitted++];
+      gapTo(place.at);
+      const box = document.createElement("div");
+      box.className = "md-reply-box";
+      // The shell finds this again to measure what the browser made of it: proportional type has
+      // no height until it is laid out, so the grid's idea of how tall this reply is comes back
+      // on the pass after this one.
+      box.dataset.element = String(node.element);
+      renderReply(box, node.blocks);
+      frag.appendChild(insetBy(place, box));
+      // The measured height if the shell has one; a single row until then, which is wrong and is
+      // corrected the moment the measure lands.
+      next = place.at + (measured.elements[node.element]?.end ?? unit);
     }
+  };
+  for (const item of paintedRows(window.root, measured)) {
+    flushProse(item.at);
+    gapTo(item.at);
     next = item.at + unit;
-    // Cells the enclosing boxes claimed, applied to whatever the row turns out to be. `boxed`
-    // is what puts the band behind those cells and takes the pre-frame rail out of the gutter:
-    // inside a box the rail is the box's border, and drawing both is two lines down one file.
-    const inset = (el: HTMLElement): HTMLElement => {
-      if (!item.left && !item.right) return el;
-      el.classList.add("boxed");
-      el.style.setProperty("--inset-left", `${item.left}ch`);
-      el.style.setProperty("--inset-right", `${item.right}ch`);
-      // A rail per side the box actually draws — the padding beside it gets no line.
-      if (item.rails.left) el.classList.add("rail-left");
-      if (item.rails.right) el.classList.add("rail-right");
-      return el;
-    };
+    const inset = (el: HTMLElement): HTMLElement => insetBy(item, el);
     if (item.kind === "chrome") {
       frag.appendChild(inset(chromeRow(item.node, item.band)));
       continue;

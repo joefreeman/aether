@@ -284,7 +284,7 @@ impl OverlayField {
 /// [`OverlayField::id`] for why every id in this shell is scoped this way.
 /// The shared vertical layout's resolution — units per editor row. One editor row is one cell
 /// tall; the reading view's proportional blocks measure to the nearest thousandth of a row.
-const UNITS_PER_ROW: u32 = 1000;
+pub(crate) const UNITS_PER_ROW: u32 = 1000;
 
 pub(crate) fn scoped_id(window: window::Id, name: &str) -> iced::advanced::widget::Id {
     iced::advanced::widget::Id::from(format!("{name}#{window}"))
@@ -404,6 +404,8 @@ pub enum Message {
     /// The [`ReadMeasureProbe`] measured the reading view as laid out (`None`: no read
     /// scrollable this frame), and what to do on the refreshed layout table.
     ReadMeasured(Option<ReadGeometry>, ReadThen),
+    /// The [`ProseMeasureProbe`] measured the view's prose elements: a pixel height each.
+    ProseMeasured(Vec<(aether_protocol::viewport::FieldId, f32)>),
     /// The read scrollable scrolled (any cause — our glide ticks or the user's wheel): its
     /// new offset and scroll range, mirrored for targeting/clamping.
     ReadScrolled {
@@ -529,6 +531,12 @@ pub struct App {
     /// row): server-rendered editors count rows, the reading view's blocks are measured off the
     /// widgets ([`ReadMeasureProbe`]) into it.
     measured: grid::Measured,
+    /// What each [`aether_protocol::viewport::Element::Prose`] node was last *measured* at — the
+    /// blocks, the pane width and the type size that produced the height now in [`Self::measured`].
+    ///
+    /// The probe is scheduled only when this no longer describes the view ([`App::prose_key`]),
+    /// which is what stops measuring from feeding itself a frame at a time forever.
+    prose_measured: std::collections::HashMap<aether_protocol::viewport::FieldId, ProseKey>,
     fetch_in_flight: bool,
     refetch_queued: bool,
     /// The cursor reveal owed to the viewport: armed when a cursor move lands outside the loaded
@@ -641,6 +649,7 @@ impl App {
             sent_grid: None,
             subscribe_scroll: ScrollPosition::default(),
             measured: grid::Measured::at_resolution(UNITS_PER_ROW),
+            prose_measured: std::collections::HashMap::new(),
             fetch_in_flight: false,
             refetch_queued: false,
             pending_reveal: PendingReveal::default(),
@@ -837,7 +846,22 @@ impl App {
 
     // ---- update ---------------------------------------------------------------------------
 
+    /// Handle one message, then measure any prose the result left un-measured.
+    ///
+    /// The measure rides *here*, on every message, rather than at the handful of sites that adopt a
+    /// window: prose's height depends on the pane width and the type size as much as on the blocks,
+    /// so a resize and a settings change move it too, and a site-by-site list of what can move it
+    /// is a list to keep in step. [`App::measure_prose`] is a no-op unless something actually
+    /// moved, which is what keeps this from arming itself once a frame forever.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_message(message);
+        match self.measure_prose() {
+            Some(measure) => Task::batch([task, measure]),
+            None => task,
+        }
+    }
+
+    fn update_message(&mut self, message: Message) -> Task<Message> {
         // Keep live modifier state current in every phase (boot/connecting/session) — Ctrl-click on a
         // picker row reads it, and a `mouse_area` press hands over no modifiers of its own.
         if let Message::ModifiersChanged(m) = message {
@@ -1123,7 +1147,7 @@ impl App {
                 // is on-screen (it may sit below a restored scroll after a `jump_to` open).
                 let scroll = self.subscribe_scroll;
                 let read_fx = self.session.adopt_subscribe(res);
-                self.prune_measured();
+                self.remeasure_client_elements();
                 if self.session.view.read.is_some() {
                     // The reading view's geometry is its widgets' — measure it as laid out,
                     // then place ([`Self::read_place_subscribed`]), which also rests the
@@ -1180,7 +1204,7 @@ impl App {
             Message::WindowUpdate(Ok(res)) => {
                 self.fetch_in_flight = false;
                 let read_fx = self.session.adopt_window(res);
-                self.prune_measured();
+                self.remeasure_client_elements();
                 // A wrap toggle left a content anchor pending: restore the view to it (same content
                 // on screen across the reflow), suppressing the reveal/center this fetch would do.
                 // The reading view resolves it once its widgets are measured.
@@ -1374,6 +1398,33 @@ impl App {
                 }
                 None => Task::none(),
             },
+            Message::ProseMeasured(heights) => {
+                // The heights the layer just drew at. Everything below a reply is placed by them,
+                // so a changed one moves the view: a conversation whose tail you were watching
+                // follows the reply as it grows, and the scroll bound follows its new height.
+                let mut moved = false;
+                for (element, px) in heights {
+                    let end = (self.units_of_px(px).round().max(0.0) as u32).max(UNITS_PER_ROW);
+                    let measured = grid::MeasuredElement {
+                        first_row: aether_protocol::coords::ElementRow::ZERO,
+                        // Prose has no wire rows — the window carries its parse, not its lines —
+                        // so there is no source line for an offset to name. One indivisible thing.
+                        starts: vec![0],
+                        end,
+                    };
+                    moved |= self.measured.elements.get(&element) != Some(&measured);
+                    self.measured.elements.insert(element, measured);
+                }
+                if moved {
+                    if let Some(px) = self.sticky_tail_px() {
+                        self.scroll_px = px;
+                    }
+                    self.clamp_scroll();
+                    let (top, visible) = (self.scroll_top_units(), self.visible_units());
+                    self.session.set_visible_lines(top, visible, &self.measured);
+                }
+                Task::none()
+            }
             Message::ReadScrolled { y, max } => {
                 // An offset the glide didn't emit is user input (wheel/drag): snap the glide
                 // off rather than fighting it — the editor's wheel behaviour.
@@ -1629,7 +1680,7 @@ impl App {
                 Effect::WindowAdopted => {
                     // Diff toggle re-layout: restore the view to the pending content anchor (same
                     // content on screen) if there is one; otherwise clamp + reveal as before.
-                    self.prune_measured();
+                    self.remeasure_client_elements();
                     if self.session.view.read.is_some() {
                         // Measured once the widgets have laid the new document out; a pending
                         // content anchor resolves there.
@@ -2673,8 +2724,14 @@ impl App {
         })
     }
 
-    /// Drop layout measurements for elements the window no longer has.
-    fn prune_measured(&mut self) {
+    /// Bring the measured table in line with the window that just arrived: drop what this shell no
+    /// longer lays out.
+    ///
+    /// A prose element the window has just gained keeps no measurement — it stands at one row until
+    /// [`App::measure_prose`] has drawn and measured it, a frame later. That is the one thing this
+    /// shell cannot do the way the terminal does, where a rendered row *is* a row and the height is
+    /// known before anything paints.
+    fn remeasure_client_elements(&mut self) {
         if let Some(w) = self.session.view.window.as_ref() {
             grid::prune_measured(&mut self.measured, &w.root);
         }
@@ -2722,6 +2779,80 @@ impl App {
         self.read_measure_key = self.read_geometry_key();
         iced::advanced::widget::operate(ReadMeasureProbe::new(self.window, ids))
             .map(move |geometry| Message::ReadMeasured(geometry, then))
+    }
+
+    /// Measure the view's prose as this shell laid it out, when what it was last measured at no
+    /// longer describes it.
+    ///
+    /// Proportional type has no height until it has been laid out, so — unlike the terminal, where
+    /// a rendered row *is* a row — this shell cannot answer "how tall is that reply" before it has
+    /// drawn it. Everything that scrolls or places the view positions by that height, so the answer
+    /// arrives a frame late and the view settles on the one after: the same two-pass shape the
+    /// reading view and the browser shell both use, and bounded the same way — only a **changed**
+    /// height re-places anything, and [`ProseKey`] is what stops the probe re-arming itself.
+    ///
+    /// The comparison walks the blocks rather than hashing them, because a streaming reply changes
+    /// its blocks under one element id and nothing cheaper tells that from a redraw. It runs on
+    /// every message, so it compares *before* it clones: the clone is the record of what was
+    /// measured, and only a change is worth one.
+    fn measure_prose(&mut self) -> Option<Task<Message>> {
+        use aether_protocol::viewport::Element;
+
+        let (width, font) = (
+            self.view_size.width.to_bits(),
+            self.session.editor_font_size,
+        );
+        let fresh = |key: Option<&ProseKey>, blocks: &[MdBlock]| {
+            key.is_some_and(|k| k.width == width && k.font == font && k.blocks == blocks)
+        };
+        let mut prose = 0usize;
+        let mut stale = false;
+        if let Some(window) = self.session.view.window.as_ref() {
+            for node in window.root.content() {
+                if let Element::Prose {
+                    element, blocks, ..
+                } = node
+                {
+                    prose += 1;
+                    stale |= !fresh(self.prose_measured.get(element), blocks);
+                }
+            }
+        }
+        if prose == 0 {
+            self.prose_measured.clear();
+            return None;
+        }
+        if !stale && prose == self.prose_measured.len() {
+            return None;
+        }
+        let window = self.session.view.window.as_ref()?;
+        let measured: std::collections::HashMap<_, _> = window
+            .root
+            .content()
+            .into_iter()
+            .filter_map(|node| match node {
+                Element::Prose {
+                    element, blocks, ..
+                } => Some((
+                    *element,
+                    ProseKey {
+                        blocks: blocks.clone(),
+                        width,
+                        font,
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
+        let ids = measured
+            .keys()
+            .map(|id| (prose_id(self.window, *id), *id))
+            .collect();
+        self.prose_measured = measured;
+        Some(
+            iced::advanced::widget::operate(ProseMeasureProbe::new(ids))
+                .map(Message::ProseMeasured),
+        )
     }
 
     /// Fold a probe's measurements into the layout table: block tops in px become the read
@@ -3157,7 +3288,14 @@ impl App {
                     },
                     Message::Editor,
                 );
-                column![Element::from(editor), self.status_bar()].into()
+                // Prose is a layer over the editor rather than rows inside it: the editor widget
+                // paints every row itself, from an absolute row under a pixel scroll, and real
+                // typography is not rows. See [`crate::prose`].
+                let pane: Element<'_, Message> = match self.prose_layer() {
+                    Some(layer) => iced::widget::stack![Element::from(editor), layer].into(),
+                    None => Element::from(editor),
+                };
+                column![pane, self.status_bar()].into()
             };
         let mut layers: Vec<Element<'_, Message>> = vec![base];
         if self.session.view.mode == Mode::Search {
@@ -4761,7 +4899,7 @@ impl App {
         // The running-shell indicator sits beside git's, in the same slot and the same shade: both
         // answer "something is happening that you are waiting on". The text is the core's, so the
         // three shells cannot phrase it three ways.
-        if let Some(label) = self.session.shell_indicator() {
+        if let Some(label) = self.session.work_indicator() {
             let seg = format!("⟳ {label}");
             left = left.push(section_divider(&self.ui(), p));
             used += DIVIDER_COLS + seg.chars().count();
@@ -5571,6 +5709,77 @@ pub enum ReadThen {
     Place(ViewportPlace),
 }
 
+/// A prose element's container id — what [`ProseMeasureProbe`] measures. Scoped to the window and
+/// to the element, not to a source span the way the reading view's blocks are: two replies in one
+/// conversation are two documents, and both their first blocks start at byte 0.
+fn prose_id(
+    window: window::Id,
+    element: aether_protocol::viewport::FieldId,
+) -> iced::advanced::widget::Id {
+    scoped_id(window, &format!("prose-{element}"))
+}
+
+/// What one prose element's height depends on: the blocks themselves, the pane width they wrap to,
+/// and the type size. See [`App::prose_key`].
+#[derive(Debug, Clone, PartialEq)]
+struct ProseKey {
+    blocks: Vec<MdBlock>,
+    /// `f32::to_bits`, so the key is comparable and hashable.
+    width: u32,
+    font: u32,
+}
+
+/// The prose layer's height probe: every [`prose_id`]-stamped container's bounds, back as a height
+/// per element. The layer lays each element out to its natural height whether or not it is on
+/// screen, so a reply scrolled out of view still reports the height everything below it is placed
+/// by — which is why this is an `Operation` over the whole tree rather than a visibility sensor.
+struct ProseMeasureProbe {
+    ids: std::collections::HashMap<iced::advanced::widget::Id, aether_protocol::viewport::FieldId>,
+    heights: Vec<(aether_protocol::viewport::FieldId, f32)>,
+}
+
+impl ProseMeasureProbe {
+    fn new(
+        ids: std::collections::HashMap<
+            iced::advanced::widget::Id,
+            aether_protocol::viewport::FieldId,
+        >,
+    ) -> Self {
+        Self {
+            ids,
+            heights: Vec::new(),
+        }
+    }
+}
+
+impl iced::advanced::widget::Operation<Vec<(aether_protocol::viewport::FieldId, f32)>>
+    for ProseMeasureProbe
+{
+    fn traverse(
+        &mut self,
+        operate: &mut dyn FnMut(
+            &mut dyn iced::advanced::widget::Operation<
+                Vec<(aether_protocol::viewport::FieldId, f32)>,
+            >,
+        ),
+    ) {
+        operate(self);
+    }
+
+    fn container(&mut self, id: Option<&iced::advanced::widget::Id>, bounds: iced::Rectangle) {
+        if let Some(&element) = id.and_then(|id| self.ids.get(id)) {
+            self.heights.push((element, bounds.height));
+        }
+    }
+
+    fn finish(
+        &self,
+    ) -> iced::advanced::widget::operation::Outcome<Vec<(aether_protocol::viewport::FieldId, f32)>>
+    {
+        iced::advanced::widget::operation::Outcome::Some(self.heights.clone())
+    }
+}
+
 /// The reading view's layout probe: collects the read scrollable's viewport, offset and content
 /// bounds, and every [`read_span_id`]-stamped container's bounds (scrollable children operate in
 /// untranslated content coordinates), finishing with a [`ReadGeometry`] the app folds into the
@@ -5646,6 +5855,97 @@ impl iced::advanced::widget::Operation<Option<ReadGeometry>> for ReadMeasureProb
 }
 
 impl App {
+    /// The view's prose, as a layer over the editor: each element's blocks rendered with the
+    /// reading view's own typography, placed at the origin the shared grid gives it.
+    ///
+    /// `None` when the view has no prose, so an ordinary buffer pays nothing for this.
+    ///
+    /// **Full width, not the reading measure.** The reader centres a narrow column because it is a
+    /// page; a reply is one block in a conversation, sharing the view with tool calls and diffs
+    /// that run the whole width, and a narrow column left-aligned among them reads as ragged
+    /// wrapping rather than as a measure.
+    fn prose_layer(&self) -> Option<Element<'_, Message>> {
+        use aether_protocol::viewport::Element as ViewElement;
+
+        let window = self.session.view.window.as_ref()?;
+        let cell = self.cell?;
+        let origins = grid::element_origins(&window.root, &self.measured);
+        let body = self.session.editor_font_size as f32 * READ_SCALE;
+        let children: Vec<_> = window
+            .root
+            .content()
+            .into_iter()
+            .filter_map(|node| {
+                let ViewElement::Prose {
+                    element, blocks, ..
+                } = node
+                else {
+                    return None;
+                };
+                let place = origins.get(element)?;
+                // The gutter and whatever box encloses the element, exactly as the editor insets
+                // its own rows: prose that started at the pane edge would sit a column left of
+                // every line around it.
+                let left = (place.inset.left + editor::GUTTER_COLS) as f32 * cell.width;
+                let right = (place.inset.right as f32 * cell.width) + theme::SCROLLBAR_W;
+                Some(crate::prose::Placed {
+                    y: editor::PAD + self.px_of_units(place.row.get() as f32) - self.scroll_px,
+                    // The inset is the *outer* container's, so the stamped one's bounds are the
+                    // element's own box: what the probe reads is the height of the prose, and
+                    // nothing about where the pane put it.
+                    content: container(
+                        container(self.prose_document(blocks, body))
+                            .width(Length::Fill)
+                            // What the height probe measures — see [`ProseMeasureProbe`].
+                            .id(prose_id(self.window, *element)),
+                    )
+                    .width(Length::Fill)
+                    .padding(iced::Padding {
+                        left,
+                        right,
+                        ..iced::Padding::ZERO
+                    })
+                    .into(),
+                })
+            })
+            .collect();
+        (!children.is_empty()).then(|| crate::prose::prose_layer(children).into())
+    }
+
+    /// One prose element's blocks as a column of typographic widgets.
+    ///
+    /// The reading view's own [`App::read_block`], with everything that belongs to *reading a page*
+    /// left off: no focus bar, no selection tint, no click-to-focus, no measure cap, no page
+    /// padding. A reply is a record of what was said — Joe's spec is the reader's formatting
+    /// without being the reader — so the blocks are the same and the page around them is not.
+    fn prose_document(&self, blocks: &[MdBlock], body: f32) -> Element<'static, Message> {
+        let ui = self.ui();
+        let mut col = column![].spacing(body * 0.8);
+        for (i, b) in blocks.iter().enumerate() {
+            // Air above headings, as the reader gives them: the column spacing supplies 0.8 body of
+            // the gap and the rest rides the block's own top padding. The first block keeps the
+            // plain padding — nothing above it to breathe away from.
+            let air = match b {
+                MdBlock::Heading { level, .. } if i > 0 => {
+                    read_heading_size(*level, body) * 1.6 - body * 0.8
+                }
+                _ => 0.0,
+            };
+            col = col.push(
+                container(self.read_block(b, body, ui, None, None, None, false))
+                    .width(Length::Fill)
+                    .padding(iced::Padding {
+                        top: air,
+                        ..iced::Padding::ZERO
+                    }),
+            );
+        }
+        // The layer never delivers events, so no message this maps can ever be produced; mapping at
+        // all is what lets the reader's blocks — written against `ReadMsg` — be reused verbatim.
+        Element::from(container(col).width(Length::Fill).padding([2, 0]))
+            .map(|_: ReadMsg| Message::Noop)
+    }
+
     /// The reading-view document: a centered, measure-capped column of typographic blocks in a
     /// scrollable. The focused element's top-level block is tinted (focus is derived from the
     /// server cursor; per-span focus painting is renderer polish).

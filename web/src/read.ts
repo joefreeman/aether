@@ -77,6 +77,36 @@ export function renderReadView(container: HTMLElement, doc: ReadDoc): void {
  *  coincide (a block image is both position and target). An extended selection adds
  *  `.md-selected` — the editor's selection tint — to every *top-level* block intersecting its
  *  byte range (the core suppresses the pill while one exists). */
+/** Render an agent's reply: the reading view's typography, and none of its behaviour.
+ *
+ *  A reply is a **static render** — it is not a projection of a document you are editing. So the
+ *  reading position is never marked, no `internalHref` is supplied (so links to other files render
+ *  as plain text rather than as navigation), and nothing here reads or writes a cursor. What it
+ *  keeps is `renderBlock`: real headings, lists, quotes and code panels, so a reply reads as prose
+ *  rather than as the source it arrived as.
+ *
+ *  Full width by design. The reader centres a narrow column because it is a page; a reply shares
+ *  its view with tool calls and diffs that run the whole width. */
+export function renderReply(container: HTMLElement, blocks: MdBlock[]): void {
+  const doc: ReadDoc = {
+    loading: false,
+    placeholder: null,
+    blocks,
+    focus_span: null,
+    target_span: null,
+    buffer_id: 0,
+    revision: 0,
+    hl_gen: 0,
+    code_highlights: {},
+  };
+  const root = document.createElement("div");
+  // Both classes: `md-read` is where the reading view's typography lives, and `md-reply`
+  // overrides the parts of it that belong to a *page* — the centred narrow measure and its padding.
+  root.className = "md-read md-reply";
+  for (const b of blocks) root.append(renderBlock(b, doc));
+  container.replaceChildren(root);
+}
+
 export function markFocus(
   container: HTMLElement,
   block: MdSpan | null,

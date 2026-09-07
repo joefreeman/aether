@@ -2154,3 +2154,132 @@ mod measure_tests {
         );
     }
 }
+
+// ---- reading one element of a composed view ------------------------------------------------------
+
+/// A markdown element laid out: the rows to paint, and how tall the grid should think it is.
+///
+/// See [`element`].
+pub struct ReadElement {
+    pub rows: Vec<ReadRow>,
+    pub measured: crate::grid::MeasuredElement,
+}
+
+/// Lay out one [`aether_protocol::viewport::Element::Prose`] node as character-cell rows.
+///
+/// The blocks arrive parsed — the server parses once, for every shell — so this is layout only:
+/// the tree becomes rows of styled spans, at `cols` columns.
+///
+/// A prose element has **no wire rows**: the window carries its parse, not its lines, so there is
+/// nothing to fetch and no source line for an offset to name. It measures as one indivisible
+/// thing, which is what `starts` being a single zero says.
+///
+/// `units_per_row` is the shell's [`crate::grid::Measured`] resolution, so the height comes back in
+/// the units that shell scrolls by.
+///
+/// Written here rather than in a shell because all three have to agree about how tall the element
+/// is: the grid scrolls, anchors and fetches by that height, and a shell that measured it
+/// differently would place every window below it wrong.
+pub fn element(
+    blocks: &[crate::markdown::Block],
+    cols: u16,
+    units_per_row: u32,
+    pad_top: u32,
+    pad_bottom: u32,
+) -> ReadElement {
+    let stops = crate::markdown::stops(blocks);
+    let rows = layout(blocks, &stops, cols, &std::collections::HashMap::new());
+    // The layout counts whole rows; a [`crate::grid::Measured`] counts in whatever units the shell
+    // resolves to — one for the terminal, a thousand for the pixel shells. Scaled here so the two
+    // shells cannot disagree about a height, which is the whole reason this function is in the
+    // core.
+    let unit = units_per_row.max(1);
+    let measured = crate::grid::MeasuredElement {
+        first_row: aether_protocol::coords::ElementRow::ZERO,
+        starts: vec![0],
+        end: (rows.len() as u32)
+            .saturating_add(pad_top)
+            .saturating_add(pad_bottom)
+            .saturating_mul(unit),
+    };
+    ReadElement { rows, measured }
+}
+
+#[cfg(test)]
+mod element_tests {
+    use super::*;
+
+    #[test]
+    fn a_heading_is_rendered_not_shown_as_source() {
+        let laid = element(
+            &crate::markdown::parse("# Title\n\nSome prose.\n"),
+            40,
+            1,
+            0,
+            0,
+        );
+        let text: String = laid
+            .rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(text.contains("Title"), "the heading's text is missing");
+        assert!(
+            !text.contains('#'),
+            "the heading was painted as source: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_measured_height_covers_every_row() {
+        // The grid scrolls and anchors by this: an element measured shorter than it paints would
+        // put every element below it in the wrong place.
+        let laid = element(
+            &crate::markdown::parse("# Title\n\nSome prose that is long enough to wrap.\n"),
+            20,
+            1,
+            1,
+            2,
+        );
+        assert!(laid.measured.end >= laid.rows.len() as u32);
+    }
+
+    #[test]
+    fn an_empty_element_still_measures() {
+        // A tool call that has been announced but has said nothing yet, and the first frame of a
+        // streaming reply. Neither may be un-measurable: `grid::awaits_measure` would hold the
+        // whole view's placement forever.
+        let laid = element(&crate::markdown::parse(""), 40, 1, 0, 0);
+        assert!(laid.rows.is_empty());
+        assert_eq!(laid.measured.end, 0);
+    }
+}
+
+#[cfg(test)]
+mod element_unit_tests {
+    use super::*;
+
+    /// A pixel shell counts a thousand units to the row; the terminal counts one. The same layout
+    /// must come back in whichever the shell asked for, or the two disagree about how tall a reply
+    /// is and everything below it lands in the wrong place.
+    #[test]
+    fn the_height_comes_back_in_the_shells_units() {
+        let blocks = crate::markdown::parse("# Title\n\nSome prose.\n");
+        let rows = element(&blocks, 40, 1, 0, 0);
+        let units = element(&blocks, 40, 1000, 0, 0);
+        assert_eq!(units.measured.end, rows.measured.end * 1000);
+        assert_eq!(
+            units.rows.len(),
+            rows.rows.len(),
+            "the layout itself is the same"
+        );
+        for (a, b) in rows
+            .measured
+            .starts
+            .iter()
+            .zip(units.measured.starts.iter())
+        {
+            assert_eq!(*b, *a * 1000);
+        }
+    }
+}

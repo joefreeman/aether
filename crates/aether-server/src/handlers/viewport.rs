@@ -443,6 +443,20 @@ fn change_anchors(
             .map(|(idx, run)| (idx as aether_protocol::viewport::FieldId, run.start_line))
             .collect();
     }
+    // An agent view's changes are its **blocks**, for the reason a shell's are its runs: the
+    // elements carry no decorations, so the diff walk below would answer "no changes at all".
+    if let Some(c) = s.try_doc_of(view_buffer).and_then(|d| d.conversation()) {
+        return c
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| {
+                s.try_doc_of(block.buffer)
+                    .is_some_and(|d| d.content_lines() > 0)
+            })
+            .map(|(idx, _)| (idx as aether_protocol::viewport::FieldId, 0))
+            .collect();
+    }
     let generated = s.try_doc_of(view_buffer).and_then(|d| d.patch());
     let layout = s.layout_of(&view.elements);
     for (idx, binding) in view.elements.iter().enumerate() {
@@ -742,6 +756,7 @@ pub fn view_outline_of(
     let generated = match doc.generated.as_ref() {
         None => return Vec::new(),
         Some(crate::state::Generated::Shell(t)) => return transcript_outline(t),
+        Some(crate::state::Generated::Agent(c)) => return conversation_outline(s, c),
         Some(crate::state::Generated::Patch(g)) => g,
     };
     // How a file the view shows is named when nothing windows it: the same name the buffer a bound
@@ -879,6 +894,43 @@ fn transcript_outline(t: &crate::shell::Transcript) -> Vec<OutlineEntry> {
             // captured from one can never be found again in another.
             identity: None,
             file_lines: run.start_line..run.end_line_exclusive,
+        })
+        .collect()
+}
+
+/// An agent view's structure: one entry per block, labelled by what the block is.
+///
+/// The same job [`transcript_outline`] does for a shell — `o`, `Space o` and the breadcrumb work
+/// in a conversation with no client-side check of what sort of view it is. The input is not an
+/// entry: it is where you are going to type, not something that happened.
+fn conversation_outline(s: &ServerState, c: &crate::agent::Conversation) -> Vec<OutlineEntry> {
+    c.blocks
+        .iter()
+        .enumerate()
+        // A block with no text yet has no line to jump to — a tool call that has only been
+        // announced, most often.
+        .filter(|(_, block)| {
+            s.try_doc_of(block.buffer)
+                .is_some_and(|d| d.content_lines() > 0)
+        })
+        .map(|(idx, block)| {
+            let lines = s
+                .try_doc_of(block.buffer)
+                .map_or(1, |d| d.content_lines().max(1));
+            OutlineEntry {
+                element: idx as aether_protocol::viewport::FieldId,
+                line: 0,
+                // Every block of one conversation belongs to that conversation; its title is the
+                // only name it has.
+                file: c.title.clone(),
+                label: crate::agent::outline_label(block),
+                patch_line: 0,
+                patch_lines: 0..lines,
+                // Nothing durable to name: a conversation does not survive a restart, so an entry
+                // captured from one can never be found again in another.
+                identity: None,
+                file_lines: 0..lines,
+            }
         })
         .collect()
 }
@@ -2118,6 +2170,10 @@ struct RenderedElement {
     edges: aether_protocol::ui::Edges,
     band: aether_protocol::ui::Band,
     title: std::sync::Arc<Vec<Element>>,
+    /// The parsed markdown this element renders as, when it is prose rather than lines. Parsed
+    /// **here**, once, rather than in each shell: the server already holds the document and the
+    /// parser, and one parse is what makes every client show the same thing.
+    prose: Option<Vec<aether_markdown::Block>>,
 }
 
 /// Render the window a viewport shows of its view: the whole tree, every element carrying its
@@ -2180,7 +2236,10 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
             .and_then(|slice| layout.clip(element, slice));
         let (geom, phantom_rows) = &geometry[idx];
         let geom = *geom;
-        let (first_row, first_buffer_line, lines) = match loaded {
+        // Prose ships its parse and nothing else: rendering its lines as well would wrap, highlight
+        // and diff text no shell will ever paint, on every frame of a conversation.
+        let prose = binding.prose.then(|| element_prose(doc, range));
+        let (first_row, first_buffer_line, lines) = match loaded.filter(|_| prose.is_none()) {
             Some(r) => (
                 element_rows_before(doc, geom, phantom_rows, range, r.start()),
                 r.start(),
@@ -2214,6 +2273,7 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
             edges: binding.edges,
             band: binding.band,
             title: binding.title.clone(),
+            prose,
         });
     }
 
@@ -2236,6 +2296,25 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         other_elements_dirty: other_elements_dirty(s, elements, focused),
         root: compose_tree(rendered, trailing_chrome),
     }
+}
+
+/// The markdown an element renders as: the lines it windows, parsed.
+///
+/// Once, here, rather than in each shell. The server already holds the document and the parser, so
+/// parsing three times would be three chances for three clients to disagree about where a list
+/// ends — and the block tree is smaller on the wire than the source it came from.
+///
+/// Spans are byte offsets into **the element's own text**, not the document's: the element is the
+/// unit a shell renders and the unit it measures, and a span that pointed outside it would name
+/// bytes the shell was never sent.
+fn element_prose(doc: &Document, range: BufferRange) -> Vec<aether_markdown::Block> {
+    let lines = range.lines();
+    let chars = |line: u32| doc.text.line_to_char(line as usize);
+    aether_markdown::parse(
+        &doc.text
+            .slice(chars(lines.start)..chars(lines.end))
+            .to_string(),
+    )
 }
 
 /// How an element's rows are counted: the viewport's wrapping and the element's phantom rows for
@@ -2361,15 +2440,23 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
     // would take its height with it and everything below would slide up as you scrolled. Chrome is
     // always in it for the same reason: it occupies rows whether or not the lines under it are
     // loaded, and a client laying the view out has to know where.
-    let node_of = |r: RenderedElement| Element::Editor {
-        element: r.element,
-        buffer: r.buffer,
-        rows: r.rows,
-        first_row: r.first_row,
-        laid_out_by: r.laid_out_by,
-        role: r.role,
-        first_buffer_line: r.first_buffer_line,
-        lines: r.lines,
+    let node_of = |r: RenderedElement| match r.prose {
+        // Prose carries its own content: nothing downstream reads the buffer's lines to paint it,
+        // which is what lets a shell render it with real typography instead of as rows.
+        Some(blocks) => Element::Prose {
+            element: r.element,
+            blocks,
+        },
+        None => Element::Editor {
+            element: r.element,
+            buffer: r.buffer,
+            rows: r.rows,
+            first_row: r.first_row,
+            laid_out_by: r.laid_out_by,
+            role: r.role,
+            first_buffer_line: r.first_buffer_line,
+            lines: r.lines,
+        },
     };
     // One element and no chrome at all is an ordinary buffer: the tree is that editor, not a stack
     // of one. Everything else composes. Note this asks about the *elements*, not about whether a
@@ -3050,6 +3137,7 @@ mod slice_tests {
             chrome_before: Default::default(),
             chrome_above: Default::default(),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            prose: false,
             role: aether_protocol::ui::ElementRole::Field,
             edges: aether_protocol::ui::Edges::NONE,
             box_group: None,
@@ -3168,6 +3256,7 @@ mod tests {
                         chrome_before: Default::default(),
                         chrome_above: Default::default(),
                         laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                        prose: false,
                         role: aether_protocol::ui::ElementRole::Field,
                         edges: aether_protocol::ui::Edges::NONE,
                         box_group: None,
@@ -3417,6 +3506,7 @@ mod tests {
             chrome_before: Default::default(),
             chrome_above: Default::default(),
             laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            prose: false,
             role: aether_protocol::ui::ElementRole::Field,
             edges: aether_protocol::ui::Edges::NONE,
             box_group: None,

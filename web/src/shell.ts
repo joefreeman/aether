@@ -62,7 +62,7 @@ import type {
   ViewportWindowResult,
   WrapMode,
 } from "./protocol";
-import { WHOLE_ROWS } from "./protocol";
+import { WHOLE_ROWS, proseOf } from "./protocol";
 // Row arithmetic shared with the core: a chrome row occupies a screen row like any other.
 import { REPO_OPERATION_LABELS } from "./protocol";
 
@@ -504,9 +504,9 @@ interface CoreView {
   /** The long-running git operation in flight, or null. Only user-initiated ones appear. */
   git_operation: GitOperation | null;
   /** What to say about shells running commands — the focused shell's command, or "N running"
-   *  for the ones elsewhere. Composed by the core (`Session::shell_indicator`), so this is the
+   *  for the ones elsewhere. Composed by the core (`Session::work_indicator`), so this is the
    *  whole string bar its glyph. Null when nothing is running. */
-  shell_indicator: string | null;
+  work_indicator: string | null;
   diagnostics: DiagnosticCounts;
   lsp: LspServerStatus | null;
   search: SearchView;
@@ -3095,7 +3095,43 @@ export class Shell {
     this.measured = { units_per_row: UNITS_PER_ROW, elements: {} };
   }
 
-  /** Re-read the core's measured table into the painter's mirror — after every adoption, which
+  /** The heights this shell last told the core for each rendered reply, so a measure pass only
+   *  disturbs the view when the browser's answer actually moved. Dropped for elements the current
+   *  window no longer has, so a stale height cannot place a view it was never measured for. */
+  private mdHeights: Record<number, number> = {};
+
+  private forgetStaleReplyHeights(window: BufferWindow): void {
+    const live = new Set(proseOf(window.root).map((n) => n.element));
+    for (const id of Object.keys(this.mdHeights)) {
+      if (!live.has(Number(id))) delete this.mdHeights[Number(id)];
+    }
+  }
+
+  /** Measure the replies as the browser laid them out, into the core's table.
+   *
+   *  Proportional type has no height until it is on screen, so a reply's height is the browser's
+   *  answer, not the core's — and the grid scrolls, places and stacks everything below it by that.
+   *  The same two-pass shape `measureReader` uses, per block instead of per view: render, measure,
+   *  and re-render only when an answer actually changed, which is what stops it looping. */
+  private measureReplies(): boolean {
+    let moved = false;
+    for (const el of this.bufferEl.querySelectorAll("[data-element].md-reply-box")) {
+      if (!(el instanceof HTMLElement)) continue;
+      const element = Number(el.dataset.element);
+      if (!Number.isFinite(element)) continue;
+      const units = Math.max(
+        UNITS_PER_ROW,
+        Math.round((el.offsetHeight / this.cell.h) * UNITS_PER_ROW),
+      );
+      if (this.mdHeights[element] === units) continue;
+      this.mdHeights[element] = units;
+      this.measured = this.session.set_element_measured(element, units) as Measured;
+      moved = true;
+    }
+    return moved;
+  }
+
+  /** Re-read the core's measured table into the painter's mirror  /** Re-read the core's measured table into the painter's mirror — after every adoption, which
    *  may have pruned it, and every measurement. */
   private refreshMeasured(): void {
     this.measured = this.session.measured() as Measured;
@@ -3321,6 +3357,9 @@ export class Shell {
       return;
     }
     if (!v.window) return;
+    // Prose has no height until this shell has drawn it, and the spacer, the scroll and every row
+    // below it are positioned by that height — measured after the paint, below.
+    this.forgetStaleReplyHeights(v.window);
     this.bufferEl.classList.toggle("hscroll", v.wrap === "none");
     // Coding ligatures: the `ligatures` app setting flips the JetBrains Mono `calt`/`liga` features.
     this.bufferEl.classList.toggle("ligatures-off", !v.ligatures);
@@ -3345,6 +3384,13 @@ export class Shell {
       focusedElement: v.focused_element,
       diffView: v.diff_view,
     });
+    // A reply's height is whatever the browser made of it, and the grid places everything below by
+    // that. Measured after the paint, and the paint repeated once when an answer moved — the same
+    // two-pass shape `measureReader` uses, and bounded the same way: only a *changed* height
+    // re-renders, so it settles after one extra pass rather than looping.
+    if (this.measureReplies()) {
+      this.render();
+    }
   }
 
   /** Whether a keydown is plain text-editing (the native <input> should handle it and sync via its
@@ -5167,10 +5213,10 @@ export class Shell {
     left.append(fileGroup);
     // The running-shell indicator sits beside git's, in the same slot and the same shade: both
     // answer "something is happening that you are waiting on".
-    if (v.shell_indicator) {
+    if (v.work_indicator) {
       const el = document.createElement("span");
       el.className = "status-git git-branch";
-      el.textContent = `⟳ ${v.shell_indicator}`;
+      el.textContent = `⟳ ${v.work_indicator}`;
       used += [...el.textContent].length + DIVIDER_COLS;
       left.append(sectionDivider(), el);
     }

@@ -5180,6 +5180,26 @@ fn read_table_band(spans: &[aether_client::read_layout::ReadSpan]) -> Option<Col
         .and_then(|s| read_span_style(s.style).bg)
 }
 
+/// One row of a **composed view's** markdown element as a painted line.
+///
+/// The reading view's own row painter carries things that belong to a whole-pane reader — the
+/// reading-position bar, block selection tints, table bands. Inside a conversation none of those
+/// apply: the element is a block of prose among other blocks, so this is the styling and nothing
+/// else.
+fn markdown_row_line(row: &aether_client::read_layout::ReadRow, indent: u16) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if indent > 0 {
+        spans.push(Span::styled(
+            " ".repeat(indent as usize),
+            Style::default().bg(c(th().bg)),
+        ));
+    }
+    for s in &row.spans {
+        spans.push(Span::styled(s.text.clone(), read_span_style(s.style)));
+    }
+    Line::from(spans)
+}
+
 fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
     use aether_client::markdown::AlertKind;
     use aether_client::read_layout::SpanKind as K;
@@ -5694,6 +5714,15 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     // painter walking the lines itself and summing chrome as it went is how they used to.
     let top = state.ed().paint_top.get();
     let painted = aether_client::grid::painted_rows_of(&state.ed().root, &state.ed().measured);
+    // Prose contributes no rows to the walk — the window carries its parse, not its lines — so the
+    // rows it occupies come up empty above and are filled from this shell's own layout of it,
+    // placed at the element's origin.
+    let markdown = &state.ed().markdown;
+    let md_origins = if markdown.is_empty() {
+        Default::default()
+    } else {
+        aether_client::grid::element_origins(&state.ed().root, &state.ed().measured)
+    };
     let mut next = painted
         .iter()
         .position(|(at, _)| at.row.get() >= top)
@@ -5707,7 +5736,21 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         let (place, item) = match painted.get(next) {
             Some((at, item)) if at.row.get() == want => (at, item),
             _ => {
-                lines.push(Line::default());
+                // A row inside an element the client laid out: its own layout says what is here.
+                let md = md_origins.iter().find_map(|(element, origin)| {
+                    let rows = markdown.get(element)?;
+                    let within = want.checked_sub(origin.row.get())? as usize;
+                    // The gutter and the box's cells alike: prose starts where a wrapped line's
+                    // text starts, and it was laid out to what is left after them.
+                    rows.get(within)
+                        .map(|row| (row, origin.inset.left as u16 + GUTTER_WIDTH))
+                });
+                lines.push(match md {
+                    // Indented by whatever box encloses the element: an agent's reply is bare, but
+                    // prose inside a box has to start inside its rails.
+                    Some((row, indent)) => markdown_row_line(row, indent),
+                    None => Line::default(),
+                });
                 continue;
             }
         };
@@ -11465,6 +11508,162 @@ mod painter_tests {
         );
         assert_eq!(content[0].trim(), "ls -la");
         assert_eq!(rows[0].trim(), "ls -la", "and it is the first row");
+    }
+
+    /// The shape an agent conversation paints: the prose bare, the machinery boxed, and the input
+    /// last.
+    ///
+    /// What you typed and what the agent said back carry no box — a box around a reply makes it
+    /// read as output rather than as writing — while a tool call keeps one, because it *is* a
+    /// named thing that happened. A tool call waiting on the user carries its options inside its
+    /// box. Every block windows its own document, which is what lets one grow after later ones
+    /// exist.
+    #[test]
+    fn an_agent_view_paints_its_blocks_then_its_input() {
+        let chrome = |text: &str| {
+            UiElement::chrome(vec![UiElement::row(vec![UiElement::text(
+                text,
+                Vec::new(),
+            )])])
+        };
+        let editor =
+            |element: u32, buffer: u64, lines: Vec<LogicalLineRender>, role| Element::Editor {
+                element,
+                buffer,
+                rows: lines.len() as u32,
+                first_row: ElementRow::ZERO,
+                laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                role,
+                first_buffer_line: 0,
+                lines,
+            };
+        let boxed = |title: &str, children: Vec<Element>| {
+            use aether_protocol::ui::{Band, Edges, Sides};
+            UiElement::titled(
+                Edges {
+                    border: Sides::all(1),
+                    padding: Sides::ZERO,
+                    collapse: false,
+                },
+                Band::Chrome,
+                vec![UiElement::text(title, Vec::new())],
+                children,
+            )
+        };
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![
+                // Prose is bare: no box, and each block windows a **different** buffer — the
+                // thing that makes a tool call able to grow after later blocks exist.
+                chrome("You"),
+                editor(
+                    0,
+                    10,
+                    vec![line(0, "fix the parser")],
+                    aether_protocol::ui::ElementRole::Field,
+                ),
+                chrome(""),
+                editor(
+                    1,
+                    11,
+                    vec![line(0, "Looking at it.")],
+                    aether_protocol::ui::ElementRole::Field,
+                ),
+                chrome(""),
+                boxed(
+                    "run cargo test  needs permission",
+                    vec![
+                        chrome("Allow   Decline"),
+                        editor(
+                            2,
+                            12,
+                            vec![line(0, "cargo test")],
+                            aether_protocol::ui::ElementRole::Field,
+                        ),
+                    ],
+                ),
+                chrome(""),
+                editor(
+                    3,
+                    13,
+                    vec![line(0, "and now this")],
+                    aether_protocol::ui::ElementRole::Input,
+                ),
+            ],
+        };
+        let mut ed = editor_over(root, 0);
+        ed.focused_element = 3;
+        let state = crate::app::test_state(ed);
+        let rows = painted(&state);
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|r| r.trim().trim_matches(|c: char| c == '│' || c == ' ') == needle)
+                .unwrap_or_else(|| panic!("no row reading {needle:?}:\n{}", rows.join("\n")))
+        };
+
+        // The user's turn is marked so a prompt is not mistaken for the reply under it; the
+        // reply itself wears nothing.
+        let speaker = row_of("You");
+        let prompt = row_of("fix the parser");
+        let reply = row_of("Looking at it.");
+        let options = row_of("Allow   Decline");
+        let command = row_of("cargo test");
+        let input = row_of("and now this");
+
+        // Conversation order, and the input at the bottom where you type.
+        assert_eq!(prompt, speaker + 1);
+        assert!(
+            prompt < reply && reply < options && options < command && command < input,
+            "blocks are out of order:\n{}",
+            rows.join("\n")
+        );
+        // The question sits above the thing it is asking about, inside the same box.
+        assert_eq!(command, options + 1);
+        // The machinery is named; the prose and the input are not — they are what you read and
+        // what you type. The tool call is the only box left in this view.
+        let boxed_title = "run cargo test  needs permission";
+        assert!(
+            rows.iter().any(|r| r.contains(boxed_title)),
+            "no box titled {boxed_title:?}:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// An agent's reply is **rendered**, not shown as source: the window carries the parse, the
+    /// shell lays it out with the reading view's own layout and paints that — so a heading loses
+    /// its `#` and the row count is the layout's rather than the source's.
+    ///
+    /// The one thing a row-order assertion cannot check elsewhere, because it is the difference
+    /// between painting the wire's lines and painting our own layout of them.
+    #[test]
+    fn a_prose_element_paints_rendered_markdown() {
+        let blocks = aether_client::markdown::parse("# Heading\n\nSome prose.");
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![Element::Prose {
+                element: 0,
+                blocks: blocks.clone(),
+            }],
+        };
+        let mut ed = editor_over(root, 0);
+        // What the shell's layout pass produces, and the height it reports for the element.
+        let laid = aether_client::read_layout::element(&blocks, TEST_PAINT_COLS, 1, 0, 0);
+        ed.measured.elements.insert(0, laid.measured);
+        ed.markdown.insert(0, std::sync::Arc::new(laid.rows));
+        let state = crate::app::test_state(ed);
+        let rows = painted(&state);
+        let text = rows.join("\n");
+
+        assert!(text.contains("Heading"), "the heading is missing:\n{text}");
+        assert!(
+            !text.contains('#'),
+            "the reply was painted as markdown source:\n{text}"
+        );
+        assert!(text.contains("Some prose."), "the body is missing:\n{text}");
     }
 
     /// width instead of the box's ran clean over the right rail and off the screen.

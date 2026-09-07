@@ -396,7 +396,7 @@ fn highlight(start: usize, end: usize, kind: &str) -> aether_protocol::viewport:
 
 /// `$HOME` shortened to `~`, as every shell prompt does — a header naming an absolute path three
 /// levels deep spends the whole row on saying where you already are.
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     let full = path.to_string_lossy().into_owned();
     let Some(home) = std::env::var_os("HOME") else {
         return full;

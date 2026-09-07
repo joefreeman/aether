@@ -6418,6 +6418,66 @@ fn an_editor_says_when_the_client_lays_it_out() {
     );
 }
 
+/// A prose element carries the **parse**, not the lines it was parsed from: the block tree is the
+/// content, and its recursion (a list item holds blocks, a quote holds blocks) survives the wire.
+///
+/// Pinned because this is the whole point of the element — a shell that got a flattened list, or
+/// the source text back, would render something no other shell renders.
+///
+/// The node's *whole* shape is pinned with it: a field id and the parse. Prose is addressed by
+/// element and by nothing else, and a buffer id or a source line back on it would be a position
+/// the wire carries that no shell can resolve.
+#[test]
+fn prose_carries_the_block_tree() {
+    use aether_protocol::ui::Element;
+    let blocks = aether_markdown::parse("- one\n\n  > quoted\n");
+    let prose = Element::Prose {
+        element: 3,
+        blocks: blocks.clone(),
+    };
+    let value = to_value(&prose).unwrap();
+    assert_eq!(value["node"], "prose");
+    // As a set rather than one absence at a time, so a field added back here has to be added to
+    // the TypeScript mirror and to this list together.
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["blocks", "element", "node"],
+        "the prose node's fields changed: {value}"
+    );
+    assert!(
+        value["blocks"][0]["items"][0]["blocks"][1]["content"][0]["kind"] == "paragraph",
+        "the quote nested inside the list item did not survive: {}",
+        value["blocks"]
+    );
+    let back: Element = from_value(value).unwrap();
+    match back {
+        // Exhaustive on purpose: a field added to the variant fails to compile here, next to the
+        // mirror check below, rather than shipping unmirrored.
+        Element::Prose {
+            element,
+            blocks: round,
+        } => {
+            assert_eq!(element, 3);
+            assert_eq!(round, blocks);
+        }
+        other => panic!("not prose: {other:?}"),
+    }
+    let ts = include_str!("../../../web/src/protocol.ts");
+    for needle in ["node: \"prose\"", "blocks:"] {
+        assert!(
+            ts.contains(needle),
+            "web/src/protocol.ts must declare the prose node's `{needle}`"
+        );
+    }
+}
+
 /// A step's `Gone` outcome and the count of entries a landing stepped over — both new, both
 /// mirrored nowhere but here.
 #[test]
@@ -6986,3 +7046,152 @@ fn view_follow_line_names_only_the_view() {
 /// getting this wrong makes `Enter` in a shell do nothing at all, with no error to explain it.
 const _: () = assert!(!aether_protocol::shell::ShellRun::MUTATES_TEXT);
 const _: () = assert!(!aether_protocol::view::ViewFollowLine::MUTATES_TEXT);
+
+// ---- agent views ---------------------------------------------------------------------------------
+
+/// `agent/*`'s wire shapes, pinned.
+///
+/// Three of these encode a decision rather than a convenience, and a change to any of them is a
+/// change to what the client is allowed to know: `agent/open` says *where the key was pressed*
+/// rather than whether to make a new conversation, `agent/respond` says *which way* rather than
+/// which option, and `view/submit_input` says nothing about the kind of view at all. All three
+/// exist because the client cannot tell a shell from an agent view — the window marks an input by
+/// role and carries no kind — and the server can.
+#[test]
+fn the_agent_wire_says_where_you_were_not_what_you_are_looking_at() {
+    use aether_protocol::agent::*;
+
+    // Absent, not `false`: there is no default "make a new one", only "I was nowhere in
+    // particular", and the server's rule reads the same either way.
+    let anywhere = to_value(AgentOpenParams::default()).unwrap();
+    assert_eq!(anywhere, json!({}));
+
+    let from_a_view = to_value(AgentOpenParams {
+        from_view: Some(aether_protocol::ViewId(7)),
+        agent: Some("claude".into()),
+    })
+    .unwrap();
+    assert_eq!(from_a_view, json!({ "from_view": 7, "agent": "claude" }));
+
+    // The answer is a direction, not one of the agent's option ids: the agent supplies the
+    // wording, the server picks the option of the asked-for kind, and a key can never come to
+    // mean the opposite of what it says.
+    let allow = to_value(AgentRespondParams {
+        view_id: aether_protocol::ViewId(7),
+        answer: Answer::Allow,
+        block: None,
+    })
+    .unwrap();
+    assert_eq!(
+        allow,
+        json!({ "view_id": 7, "answer": { "kind": "allow" } })
+    );
+
+    // A client that renders the options itself hands one back by id instead.
+    let chosen = to_value(AgentRespondParams {
+        view_id: aether_protocol::ViewId(7),
+        answer: Answer::Option {
+            id: "allow_always".into(),
+        },
+        block: Some(3),
+    })
+    .unwrap();
+    assert_eq!(
+        chosen,
+        json!({
+            "view_id": 7,
+            "answer": { "kind": "option", "id": "allow_always" },
+            "block": 3,
+        })
+    );
+}
+
+/// A turn's push, and the closed vocabulary a shell paints it with.
+#[test]
+fn a_turn_says_whether_it_is_going_and_how_it_stopped() {
+    use aether_protocol::agent::*;
+
+    let running = to_value(AgentTurnChangedParams {
+        view_id: aether_protocol::ViewId(7),
+        turn: Some(TurnState {
+            running: true,
+            activity: Some("Reading a.txt".into()),
+            stop_reason: None,
+        }),
+    })
+    .unwrap();
+    assert_eq!(
+        running,
+        json!({
+            "view_id": 7,
+            "turn": { "running": true, "activity": "Reading a.txt" },
+        })
+    );
+
+    // Idle with nothing to add is an absent turn, not a null one.
+    let idle = to_value(AgentTurnChangedParams {
+        view_id: aether_protocol::ViewId(7),
+        turn: None,
+    })
+    .unwrap();
+    assert_eq!(idle, json!({ "view_id": 7 }));
+
+    // Tagged, so a shell matches exhaustively and a reason it does not know still round-trips
+    // rather than rendering as a blank.
+    let refused = to_value(StopReason::Refusal).unwrap();
+    assert_eq!(refused, json!({ "kind": "refusal" }));
+    let unknown = to_value(StopReason::Other {
+        reason: "quota".into(),
+    })
+    .unwrap();
+    assert_eq!(unknown, json!({ "kind": "other", "reason": "quota" }));
+    assert_eq!(
+        from_value::<StopReason>(unknown).unwrap(),
+        StopReason::Other {
+            reason: "quota".into()
+        }
+    );
+
+    // The kinds a shell binds accept and decline by, without reading the agent's wording.
+    let option = to_value(PermissionOption {
+        id: "allow_always".into(),
+        label: "Always allow".into(),
+        kind: PermissionKind::AllowAlways,
+    })
+    .unwrap();
+    assert_eq!(
+        option,
+        json!({ "id": "allow_always", "label": "Always allow", "kind": "allow_always" })
+    );
+}
+
+/// `view/submit_input` is the one method `Enter` in an input reaches, and it names no kind.
+#[test]
+fn submitting_an_input_names_only_the_view() {
+    use aether_protocol::view::{ViewSubmitInputParams, ViewSubmitInputResult};
+
+    let v = to_value(ViewSubmitInputParams {
+        view_id: aether_protocol::ViewId(9),
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "view_id": 9 }));
+
+    // The recall list comes back from the server, because deciding it here would mean the client
+    // knowing what sort of view it just typed in.
+    let sent = to_value(ViewSubmitInputResult {
+        submitted: true,
+        history: Some(aether_protocol::history::HistoryKind::Agent),
+    })
+    .unwrap();
+    assert_eq!(sent, json!({ "submitted": true, "history": "agent" }));
+
+    let nothing = to_value(ViewSubmitInputResult::default()).unwrap();
+    assert_eq!(nothing, json!({ "submitted": false }));
+}
+
+/// Neither `agent/prompt` nor `view/submit_input` mutates the buffer it *names* — both edit the
+/// view's input, which is an ordinary document, while the view itself is read-only. A client that
+/// declined them locally would make `Enter` in a conversation do nothing, with no error to explain
+/// it. `const` for the same reason the shell's is: the answer is one.
+const _: () = assert!(!aether_protocol::agent::AgentPrompt::MUTATES_TEXT);
+const _: () = assert!(!aether_protocol::view::ViewSubmitInput::MUTATES_TEXT);

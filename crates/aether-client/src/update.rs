@@ -201,7 +201,10 @@ pub enum Event {
     ShellOpened(Result<aether_protocol::shell::ShellOpenResult, RpcError>),
     /// A submit landed, or was refused — the refusal is the interesting half, since it names the
     /// command in the way and the typed text is deliberately still there.
-    ShellRan(Result<aether_protocol::shell::ShellRunResult, RpcError>),
+    InputSubmitted(Result<aether_protocol::view::ViewSubmitInputResult, RpcError>),
+    AgentOpened(Result<aether_protocol::agent::AgentOpenResult, RpcError>),
+    AgentAnswered(Result<aether_protocol::agent::AgentRespondResult, RpcError>),
+    AgentCancelled(Result<aether_protocol::agent::AgentCancelResult, String>),
     /// `Space Alt-b` answered. Nothing to do either way: the finish arrives as a push.
     ShellCancelled(Result<aether_protocol::shell::ShellCancelResult, String>),
     /// `view/open` for the current buffer's other view (`Space u`, an edit transition out of
@@ -818,6 +821,35 @@ impl Session {
             // `Space b`, type, `Enter` reads like a REPL. The focused element is set before the
             // resubscribe so the server is told which element to focus rather than being asked to
             // guess from a scroll the client may not have adopted yet.
+            // The same landing a shell gets: adopt, focus the input, and start typing. Both are
+            // composed views whose last element is a field, and the arrival should feel identical.
+            Event::AgentOpened(Ok(r)) => {
+                let input = r.input;
+                let same_view = r.opened.view_id == self.view.view_id;
+                let fx = self.adopt_open(r.opened);
+                self.view.focused_element = input;
+                self.view.mode = Mode::Insert;
+                if same_view {
+                    return fx.and(Effects::one(Effect::Resubscribe));
+                }
+                fx
+            }
+            Event::AgentOpened(Err(e)) if e.code == ErrorCode::AGENT_UNAVAILABLE.code() => {
+                Effects::toast_detail("No agent available", e.message, ToastKind::Info)
+            }
+            Event::AgentOpened(Err(e)) => {
+                Effects::error_detail("Couldn't start an agent", e.message)
+            }
+            // Nothing to say when it worked — the block's chrome stops showing the question, which
+            // is the feedback. Saying nothing happened is worth a word, though: it means the agent
+            // stopped asking before you answered.
+            Event::AgentAnswered(Ok(r)) if !r.answered => {
+                Effects::toast("Nothing was waiting for an answer", ToastKind::Info)
+            }
+            Event::AgentAnswered(Ok(_)) => Effects::none(),
+            Event::AgentAnswered(Err(e)) => {
+                Effects::error_detail("Couldn't answer that", e.message)
+            }
             Event::ShellOpened(Ok(r)) => {
                 let input = r.input;
                 let same_view = r.opened.view_id == self.view.view_id;
@@ -832,10 +864,11 @@ impl Session {
                 fx
             }
             Event::ShellOpened(Err(e)) => Effects::error_detail("Couldn't open a shell", e.message),
-            Event::ShellRan(Ok(_)) => {
-                if let Some(line) = self.pending_shell_submit.take() {
-                    self.history
-                        .record(HistoryKind::Shell, HistoryEntry::bare(line));
+            // The server says which recall list the line belongs to, so the client files it
+            // without ever learning what sort of view it was typed in.
+            Event::InputSubmitted(Ok(r)) => {
+                if let (Some(line), Some(kind)) = (self.pending_shell_submit.take(), r.history) {
+                    self.history.record(kind, HistoryEntry::bare(line));
                 }
                 Effects::none()
             }
@@ -843,19 +876,23 @@ impl Session {
             // the text you typed is still in the input. A refusal is not one either: the line did
             // not pass, the word at fault is already selected, and the message says why. Anything
             // else is an error.
-            Event::ShellRan(Err(e)) if e.code == ErrorCode::SHELL_BUSY.code() => {
+            Event::InputSubmitted(Err(e))
+                if e.code == ErrorCode::SHELL_BUSY.code()
+                    || e.code == ErrorCode::AGENT_BUSY.code() =>
+            {
                 self.pending_shell_submit = None;
                 Effects::toast_detail("Already running", e.message, ToastKind::Info)
             }
-            Event::ShellRan(Err(e)) if e.code == ErrorCode::SHELL_REJECTED.code() => {
+            Event::InputSubmitted(Err(e)) if e.code == ErrorCode::SHELL_REJECTED.code() => {
                 self.pending_shell_submit = None;
                 Effects::toast_detail("Not accepted", e.message, ToastKind::Info)
             }
-            Event::ShellRan(Err(e)) => {
+            Event::InputSubmitted(Err(e)) => {
                 self.pending_shell_submit = None;
                 Effects::error_detail("Couldn't run that", e.message)
             }
             Event::ShellCancelled(_) => Effects::none(),
+            Event::AgentCancelled(_) => Effects::none(),
             // Same landing as any other switch, and the same silence when the line leads nowhere:
             // `Enter` is a common key, and being told off for pressing it on a line of output
             // would be noise.
@@ -3458,6 +3495,15 @@ impl Session {
     fn sync_read_presentation(&mut self) -> Effects {
         let buffer_id = self.view.buffer.buffer_id;
         let prose = self.view.window.as_ref().and_then(|w| {
+            // **The reader is a whole view, not an element.** Rendered prose elsewhere — an
+            // agent's reply inside a conversation — is an `Element::Prose` and never matches the
+            // arm below; this guard is the second half of the same rule, and the test is the one
+            // `View::kind` uses server-side: one element, and nothing else in the view. Without it
+            // a composed view holding a single client-laid-out editor would be adopted as the
+            // reader, which replaced a whole conversation with a reading view over one block.
+            if w.root.editors().len() != 1 {
+                return None;
+            }
             w.root.editors().into_iter().find_map(|node| match node {
                 Element::Editor {
                     element,
@@ -6828,6 +6874,38 @@ impl Session {
                 }
                 Effects::none()
             }
+            aether_protocol::agent::AgentTurnChanged::NAME => {
+                use aether_protocol::agent::AgentTurnChangedParams;
+                let Ok(p) = serde_json::from_value::<AgentTurnChangedParams>(n.params) else {
+                    return Effects::none();
+                };
+                let finished = p.turn.clone().filter(|t| !t.running);
+                match p.turn.filter(|t| t.running) {
+                    Some(turn) => {
+                        self.agent_turns.insert(p.view_id, turn);
+                    }
+                    None => {
+                        self.agent_turns.remove(&p.view_id);
+                    }
+                }
+                // Say how it went only when you are looking somewhere else, and only when there is
+                // something to say: a turn that simply ended is not news, and the conversation on
+                // screen shows its own state. Grouped by view so one conversation replaces its own
+                // notice rather than stacking a column of them.
+                match finished
+                    .filter(|_| p.view_id != self.view.view_id)
+                    .and_then(|t| t.stop_reason)
+                    .filter(|r| r.is_notable())
+                {
+                    Some(reason) => Effects::toast_grouped_detail(
+                        "Agent".to_string(),
+                        reason.label(),
+                        ToastKind::Warning,
+                        format!("agent-{}", p.view_id.get()),
+                    ),
+                    None => Effects::none(),
+                }
+            }
             aether_protocol::shell::ShellRunChanged::NAME => {
                 use aether_protocol::shell::ShellRunChangedParams;
                 let Ok(p) = serde_json::from_value::<ShellRunChangedParams>(n.params) else {
@@ -9396,6 +9474,13 @@ impl Session {
                 // An unbound key (or Esc) cancels the chord, exactly like the leader.
                 return Effects::none();
             }
+            Pending::LeaderAgent => {
+                self.view.pending = Pending::None;
+                if let Some(b) = lookup(KeyContext::LeaderAgent, code, mods) {
+                    return self.run_action(b.action, 1, false, mods.shift);
+                }
+                return Effects::none();
+            }
             Pending::None => {}
         }
 
@@ -9934,6 +10019,10 @@ impl Session {
                 self.view.pending = Pending::LeaderGit;
                 Effects::none()
             }
+            A::BeginAgentLeader => {
+                self.view.pending = Pending::LeaderAgent;
+                Effects::none()
+            }
 
             // ---- edits ----
             A::Backspace => self.edit::<InputBackspace>(BufferOnlyParams { buffer_id }),
@@ -10338,6 +10427,39 @@ impl Session {
             // The shell you can type into. Which one that is, is the server's to decide — it
             // holds the shells and knows which are busy; the client only says whether the view in
             // front of it is already a shell, since a `Space b` there means "another one".
+            // Where the key was pressed is all the client says: whether that view is already a
+            // conversation — and so whether this means "another one" — is the server's to know.
+            A::AgentOpen => self.request::<aether_protocol::agent::AgentOpen>(
+                aether_protocol::agent::AgentOpenParams {
+                    from_view: Some(self.view.view_id),
+                    agent: None,
+                },
+                Event::AgentOpened,
+            ),
+            // Cancelling names the *view*, exactly as `Space Alt-b` does for a shell: the
+            // conversation in front of you is the one you meant.
+            A::AgentCancel if !self.agent_turns.contains_key(&self.view.view_id) => {
+                Effects::toast("Nothing is running here", ToastKind::Info)
+            }
+            A::AgentCancel => self.request_str::<aether_protocol::agent::AgentCancel>(
+                aether_protocol::agent::AgentCancelParams {
+                    view_id: self.view.view_id,
+                },
+                Event::AgentCancelled,
+            ),
+            A::AgentAnswer { allow } => self.request::<aether_protocol::agent::AgentRespond>(
+                aether_protocol::agent::AgentRespondParams {
+                    view_id: self.view.view_id,
+                    answer: if allow {
+                        aether_protocol::agent::Answer::Allow
+                    } else {
+                        aether_protocol::agent::Answer::Decline
+                    },
+                    // The one the conversation is blocked on: there is only ever one.
+                    block: None,
+                },
+                Event::AgentAnswered,
+            ),
             A::ShellOpen => self.request::<aether_protocol::shell::ShellOpen>(
                 aether_protocol::shell::ShellOpenParams {
                     new: self.shell_input().is_some(),
@@ -10361,19 +10483,19 @@ impl Session {
             ),
             // Reached from Normal-mode `Enter` (`Activate`) with the input focused. The guard is
             // kept so that nothing can submit from anywhere else, whatever dispatches it.
-            A::ShellSubmit if self.shell_input_focused() => {
+            A::SubmitInput if self.shell_input_focused() => {
                 // Kept until the server answers: the line enters the recall list only if it was
                 // accepted, which is the same rule the server records by, so the two cannot
                 // disagree — and the input is cleared by the time the answer comes.
                 self.pending_shell_submit = self.shell_input_text().map(|t| t.trim().to_string());
-                self.request::<aether_protocol::shell::ShellRun>(
-                    aether_protocol::shell::ShellRunParams {
+                self.request::<aether_protocol::view::ViewSubmitInput>(
+                    aether_protocol::view::ViewSubmitInputParams {
                         view_id: self.view.view_id,
                     },
-                    Event::ShellRan,
+                    Event::InputSubmitted,
                 )
             }
-            A::ShellSubmit => Effects::none(),
+            A::SubmitInput => Effects::none(),
 
             A::GitUncommit => self.request_str::<GitReset>(
                 GitResetParams {
@@ -10456,7 +10578,7 @@ impl Session {
             // input windows a different buffer than the view's own, so it looks like a hunk over a
             // file and `Enter` would promote it to a view of its own.
             A::Activate if self.shell_input_focused() => {
-                self.dispatch_action(A::ShellSubmit, count, counted, extend)
+                self.dispatch_action(A::SubmitInput, count, counted, extend)
             }
             A::Activate if self.view.buffer.buffer_id != self.view.view_buffer => {
                 // Not transient: you asked for this file, so it stays. `record_nav_from` is the

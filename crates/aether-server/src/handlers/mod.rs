@@ -137,6 +137,7 @@ pub struct ConnectionCtx {
 // One module per protocol namespace, plus `edit` (the shared apply/undo/push pipeline every
 // mutating handler routes through). Each is re-exported flat, so `handlers::buffer_save` still
 // resolves for `connection.rs`'s dispatch table and for the dozen other modules that call in.
+mod agent;
 mod app;
 mod blocks;
 mod buffer;
@@ -153,6 +154,7 @@ mod sneak;
 mod viewport;
 mod workspace;
 
+pub use agent::*;
 pub use app::*;
 pub use blocks::*;
 pub use buffer::*;

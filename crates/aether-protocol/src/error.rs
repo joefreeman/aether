@@ -101,6 +101,16 @@ impl ErrorCode {
     /// typed so it can be corrected rather than retyped. Its own code so the client can say
     /// "not accepted" rather than "failed".
     pub const SHELL_REJECTED: Self = Self(-32051);
+    /// `agent/prompt` was asked to start a turn in a conversation that is already running one.
+    /// One turn at a time, so the client says so and offers the key that stops it — and keeps the
+    /// text the user typed, since typing ahead of an agent is a reasonable thing to do. Its own
+    /// code (rather than a generic refusal) exactly so the client can tell this apart from a
+    /// conversation whose agent has gone away.
+    pub const AGENT_BUSY: Self = Self(-32060);
+    /// The conversation's agent could not be reached: it failed to launch, the handshake failed,
+    /// or it exited. Distinct from [`Self::AGENT_BUSY`] because there is nothing to wait for —
+    /// the view is still there, but it has no agent behind it.
+    pub const AGENT_UNAVAILABLE: Self = Self(-32061);
 
     pub fn code(self) -> i32 {
         self.0

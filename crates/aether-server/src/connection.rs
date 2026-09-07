@@ -11,6 +11,7 @@
 use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::{ClientSession, SharedState};
+use aether_protocol::agent::{AgentCancel, AgentOpen, AgentPrompt, AgentRespond};
 use aether_protocol::app::AppInfoGet;
 use aether_protocol::buffer::{BufferContent, BufferCopy, BufferCut, BufferReload, BufferSave};
 use aether_protocol::cursor::{
@@ -49,6 +50,7 @@ use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::shell::{ShellCancel, ShellOpen, ShellRun};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::syntax::SyntaxHighlightSnippet;
+use aether_protocol::view::ViewSubmitInput;
 use aether_protocol::view::{ViewClose, ViewFollowLine, ViewOpen, ViewSetTransient};
 use aether_protocol::viewport::{
     ViewSave, ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportSetWrap,
@@ -595,6 +597,11 @@ async fn dispatch(
         ShellOpen::NAME => run!(ShellOpen, handlers::shell_open),
         ShellRun::NAME => run!(ShellRun, handlers::shell_run),
         ShellCancel::NAME => run!(ShellCancel, handlers::shell_cancel),
+        ViewSubmitInput::NAME => run!(ViewSubmitInput, handlers::view_submit_input),
+        AgentOpen::NAME => run!(AgentOpen, handlers::agent_open),
+        AgentPrompt::NAME => run!(AgentPrompt, handlers::agent_prompt),
+        AgentCancel::NAME => run!(AgentCancel, handlers::agent_cancel),
+        AgentRespond::NAME => run!(AgentRespond, handlers::agent_respond),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),
         LspGotoDefinition::NAME => run!(LspGotoDefinition, handlers::lsp_goto_definition),

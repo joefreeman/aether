@@ -118,7 +118,7 @@ async fn terminate(child: &mut tokio::process::Child) -> std::io::Result<std::pr
 }
 
 #[cfg(unix)]
-fn libc_sigterm() -> i32 {
+pub(crate) fn libc_sigterm() -> i32 {
     libc::SIGTERM
 }
 #[cfg(unix)]
@@ -126,7 +126,7 @@ fn libc_sigkill() -> i32 {
     libc::SIGKILL
 }
 #[cfg(not(unix))]
-fn libc_sigterm() -> i32 {
+pub(crate) fn libc_sigterm() -> i32 {
     0
 }
 #[cfg(not(unix))]

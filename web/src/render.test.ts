@@ -15,9 +15,10 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { renderBuffer } from "./render";
-import { paintedRows, totalRows } from "./protocol";
+import { editorsOf, paintedRows, totalRows } from "./protocol";
 import { WHOLE_ROWS } from "./protocol";
 import type { BufferWindow, CursorState, LogicalLineRender, Measured, ViewNode } from "./protocol";
+import type { MdBlock } from "./markdown";
 
 const line = (n: number, text: string): LogicalLineRender => ({
   logical_line: n,
@@ -51,7 +52,14 @@ const cursor: CursorState = {
 };
 
 /** Paint into a detached element and read back one string per row, tagged by kind. */
-function painted(window: BufferWindow, opts: { cursor?: CursorState; focused?: number } = {}): string[] {
+function painted(
+  window: BufferWindow,
+  opts: {
+    cursor?: CursorState;
+    focused?: number;
+    measured?: Measured;
+  } = {},
+): string[] {
   const container = document.createElement("div");
   renderBuffer(container, {
     window,
@@ -62,7 +70,7 @@ function painted(window: BufferWindow, opts: { cursor?: CursorState; focused?: n
     spacerHeightPx: 0,
     contentTopPx: 0,
     rowHeightPx: 0,
-    measured: WHOLE_ROWS,
+    measured: opts.measured ?? WHOLE_ROWS,
     blame: null,
     diffView: false,
     focusedElement: opts.focused ?? 0,
@@ -785,5 +793,118 @@ describe("the buffer painter", () => {
   it("paints a plain buffer as plain rows", () => {
     const w = windowOf(editor(0, 0, [line(0, "one"), line(1, "two")]));
     expect(painted(w)).toEqual(["text one", "text two"]);
+  });
+});
+
+const replyBlocks = (heading: string, body: string): MdBlock[] =>
+  [
+    { kind: "heading", level: 1, content: [{ kind: "text", text: heading }], span: { start: 0, end: 0 } },
+    { kind: "paragraph", content: [{ kind: "text", text: body }], span: { start: 0, end: 0 } },
+  ] as unknown as MdBlock[];
+
+const renderOnly = (window: BufferWindow): HTMLElement => {
+  const container = document.createElement("div");
+  renderBuffer(container, {
+    window,
+    cursor,
+    insertMode: false,
+    awaitingKey: false,
+    contentWidthPx: 0,
+    spacerHeightPx: 0,
+    contentTopPx: 0,
+    rowHeightPx: 0,
+    measured: WHOLE_ROWS,
+    blame: null,
+    diffView: false,
+    focusedElement: 0,
+  });
+  return container;
+};
+
+describe("a prose element", () => {
+  /** An agent's reply is rendered with the reading view's own block renderer — real headings, from
+   *  the parse the window carries rather than from any source lines. */
+  it("renders the blocks the window carries", () => {
+    const window: BufferWindow = {
+      root: {
+        node: "column",
+        children: [
+          {
+            node: "prose",
+            element: 0,
+            blocks: replyBlocks("Heading", "body"),
+          },
+          { node: "editor", element: 1, buffer: 2, rows: 1, first_row: 0, first_buffer_line: 0, lines: [line(0, "after")] },
+        ],
+      },
+      max_line_width: 20,
+    } as unknown as BufferWindow;
+
+    const container = renderOnly(window);
+    // A real heading element, not a row of text with a `#` in it.
+    const reply = container.querySelector(".md-reply");
+    expect(reply).not.toBeNull();
+    expect(reply?.querySelector("h1")?.textContent).toBe("Heading");
+    expect(container.textContent).not.toContain("#");
+    // And the element after it still paints, below.
+    expect([...container.querySelectorAll(".row")].some((r) => r.textContent === "after")).toBe(true);
+  });
+
+  /** Prose contributes no rows to the row walk, so nothing in the painted list triggers it: it is
+   *  placed from its own origin, in row order among the rows around it. An element *before* it is
+   *  the case that catches a flush that runs too late — the reply would land above the row it
+   *  follows. */
+  it("is emitted in row order between the rows around it", () => {
+    const window: BufferWindow = {
+      root: {
+        node: "column",
+        children: [
+          { node: "editor", element: 0, buffer: 1, rows: 1, first_row: 0, first_buffer_line: 0, lines: [line(0, "before")] },
+          {
+            node: "prose",
+            element: 1,
+            blocks: replyBlocks("Heading", "body"),
+          },
+          { node: "editor", element: 2, buffer: 3, rows: 1, first_row: 0, first_buffer_line: 0, lines: [line(0, "after")] },
+        ],
+      },
+      max_line_width: 20,
+    } as unknown as BufferWindow;
+
+    const container = renderOnly(window);
+    const order = [...container.querySelectorAll(".row, .md-reply-box")].map((c) =>
+      c.classList.contains("md-reply-box") ? "reply" : c.textContent,
+    );
+    expect(order).toEqual(["before", "reply", "after"]);
+  });
+});
+
+describe("editorsOf", () => {
+  /** It walks *containers*, not `inlineOf` — which flattens a subtree to its inline leaves and
+   *  answers `[n]` for a text node, so walking it as if it were a children accessor recursed until
+   *  the browser gave up ("too much recursion"). Every real window has chrome rows with text in
+   *  them, so this is the shape that crashed. */
+  it("does not recurse forever on chrome text", () => {
+    const root: ViewNode = {
+      node: "column",
+      children: [
+        chrome("You"),
+        {
+          node: "editor",
+          element: 0,
+          buffer: 1,
+          rows: 1,
+          first_row: 0,
+          first_buffer_line: 0,
+          lines: [line(0, "a")],
+        },
+        {
+          node: "row",
+          children: [{ node: "text", text: "nested", highlights: [] }],
+        },
+      ],
+    } as unknown as ViewNode;
+
+    expect(editorsOf(root).map((e) => e.element)).toEqual([0]);
   });
 });

@@ -103,6 +103,11 @@ pub async fn view_close(
                         crate::state::DormantSource::Shell { number } => crate::backup::delete(
                             &crate::backup::shell_backup_path(root, &workspace, *number),
                         ),
+                        // Likewise a conversation: closing the row discards what it would have
+                        // come back from.
+                        crate::state::DormantSource::Agent { number } => crate::backup::delete(
+                            &crate::backup::agent_backup_path(root, &workspace, *number),
+                        ),
                     }
                 }
                 let pushes = refresh_view_pickers(&mut s);
@@ -2034,6 +2039,12 @@ async fn view_open_inner(
             // what it had assigned, and what was being typed.
             Some(crate::state::DormantSource::Shell { number }) => {
                 return Box::pin(crate::handlers::shell::open_restored_shell(
+                    state, ctx, number,
+                ))
+                .await;
+            }
+            Some(crate::state::DormantSource::Agent { number }) => {
+                return Box::pin(crate::handlers::agent::open_restored_agent(
                     state, ctx, number,
                 ))
                 .await;

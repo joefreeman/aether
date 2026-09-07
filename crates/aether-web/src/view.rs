@@ -75,7 +75,7 @@ pub fn build_view(s: &Session) -> Value {
         // What the status bar says about shells — the focused shell's running command, or a count
         // of the ones running elsewhere. Composed in the core so all three shells say the same
         // thing; the browser only paints it.
-        "shell_indicator": s.shell_indicator(),
+        "work_indicator": s.work_indicator(),
         // Raw blame fields (from the server's `git/blame_changed` push): the TS shell formats
         // the label — "3w ago" needs a clock, and the shell already has one for its own chrome.
         "blame": s.view.blame.as_ref().map(|(line, b)| json!({
@@ -485,6 +485,7 @@ fn pending(p: &Pending) -> Value {
         // The git sub-leader is a leader with a prefix already typed; the shell only tests for a
         // non-null `pending` to pick the awaiting-key cursor, so this needs no TS counterpart.
         Pending::LeaderGit => json!({ "kind": "leader", "prefix": "g" }),
+        Pending::LeaderAgent => json!({ "kind": "leader", "prefix": "n" }),
         Pending::Find {
             dir,
             till,

@@ -14,6 +14,8 @@
 //!
 //! Keep field names exactly matching the serde wire format.
 
+import type { MdBlock } from "./markdown";
+
 export type BufferId = number;
 export type ViewportId = number;
 export type Revision = number;
@@ -226,6 +228,19 @@ export type ViewNode =
        *  element of an ordinary or composed view. `input`: the line a shell's next command is
        *  typed into, which is also how a client knows the view it is showing is a shell. */
       role?: "field" | "input";
+    }
+  | {
+      /** Rendered prose — a span of a buffer as markdown, not as lines. Mirrors `Element::Prose`.
+       *
+       *  It carries no lines at all: the server parses once, for every shell, and the blocks *are*
+       *  the content. Its height is whatever this shell measured of the type it drew, so it is
+       *  absent from `paintedRows` — `elementOrigins` is where it is placed.
+       *
+       *  A field id and the parse, and nothing else. No buffer id and no source line: prose has no
+       *  wire rows, so nothing addresses it by position. */
+      node: "prose";
+      element: number;
+      blocks: MdBlock[];
     };
 
 /** What the shell measured of an element it laid out itself — mirrors `grid::MeasuredElement`:
@@ -252,6 +267,7 @@ export interface Measured {
 export const WHOLE_ROWS: Measured = { units_per_row: 1, elements: {} };
 
 function measuredOf(n: ViewNode, measured: Measured): MeasuredElement | undefined {
+  if (n.node === "prose") return measured.elements[n.element];
   return n.node === "editor" && n.laid_out_by === "client"
     ? measured.elements[n.element]
     : undefined;
@@ -280,6 +296,39 @@ export function offsetOf(n: ViewNode, row: number, measured: Measured): number {
 }
 
 /** Every rendered line of a view, in order — for the paths that want lines and no structure. */
+/** Every editor node in the tree, in view order — mirrors `Element::editors` in the core.
+ *
+ *  Recurses through the **container** kinds only. Not `inlineOf`: that flattens a subtree to its
+ *  inline *leaves* and answers `[n]` for a text/space/fill node, so walking it as if it gave
+ *  children recurses forever — which is exactly what it did.
+ */
+export function editorsOf(root: ViewNode): Extract<ViewNode, { node: "editor" }>[] {
+  const out: Extract<ViewNode, { node: "editor" }>[] = [];
+  const walk = (n: ViewNode): void => {
+    if (n.node === "editor") {
+      out.push(n);
+      return;
+    }
+    if (n.node === "column" || n.node === "row") n.children.forEach(walk);
+  };
+  walk(root);
+  return out;
+}
+
+/** Every prose node in the tree, in view order — mirrors the prose half of `Element::content`. */
+export function proseOf(root: ViewNode): Extract<ViewNode, { node: "prose" }>[] {
+  const out: Extract<ViewNode, { node: "prose" }>[] = [];
+  const walk = (n: ViewNode): void => {
+    if (n.node === "prose") {
+      out.push(n);
+      return;
+    }
+    if (n.node === "column" || n.node === "row") n.children.forEach(walk);
+  };
+  walk(root);
+  return out;
+}
+
 export function nodeLines(n: ViewNode): LogicalLineRender[] {
   if (n.node === "editor") return n.lines;
   // Descends into `row` as well as `column`, matching `Element::lines`'s walk. It only matters for
@@ -401,6 +450,11 @@ function walkRows(
     for (let i = 0; i < b.b + p.b; i++) f({ node: n, edge: "bottom" }, inner, unit);
   } else if (n.node === "editor") {
     f({ node: n }, frame, editorHeight(n, measured));
+  } else if (n.node === "prose") {
+    // Prose has no height until this shell has drawn it — proportional type cannot be counted in
+    // rows — so it stands at one row until the measure lands, and a guess would only put
+    // everything below it somewhere it has to move back from.
+    f({ node: n }, frame, measured.elements[n.element]?.end ?? unit);
   } else if (n.node === "row") {
     const inner = deeper(frame, n.edges, n.band);
     const b = sides(n.edges?.border);
@@ -439,6 +493,45 @@ function resolveJoins(rows: PaintedRow[]): void {
     const below = neighbour(i, 1);
     r.join = above && below ? "tees" : below ? "opens" : above ? "closes" : "detached";
   });
+}
+
+/** Where each content element starts — its absolute row in the measured resolution, and the box
+ *  around it. Mirrors `grid::element_origins`.
+ *
+ *  What a shell needs to paint an element it laid out **itself**: the rendered rows go at
+ *  `origin + row`, indented by the placement's inset. `paintedRows` cannot answer this for prose,
+ *  which contributes no rows of its own, and for a client-laid-out editor it places the *source
+ *  lines* instead. The origin is also right when the top of a long block has scrolled out of the
+ *  loaded slice, which the first placed line is not. */
+export function elementOrigins(
+  root: ViewNode,
+  measured: Measured = WHOLE_ROWS,
+): Record<number, ElementPlacement> {
+  const out: Record<number, ElementPlacement> = {};
+  let at = 0;
+  walkRows(root, measured, NO_FRAME, (v, frame, height) => {
+    if (v.edge === undefined && (v.node.node === "editor" || v.node.node === "prose")) {
+      out[v.node.element] = {
+        at,
+        left: frame.left,
+        right: frame.right,
+        rails: frame.rails,
+        band: frame.band,
+      };
+    }
+    at += height;
+  });
+  return out;
+}
+
+/** Where one content element sits: its absolute row and the cells the boxes around it claim — the
+ *  placement half of a `PaintedRow`, for an element whose rows this walk does not produce. */
+export interface ElementPlacement {
+  at: number;
+  left: number;
+  right: number;
+  rails: Sides;
+  band: Band;
 }
 
 /** Every loaded visual row of the view, top to bottom, each at its absolute row. Mirrors
@@ -491,6 +584,11 @@ export function paintedRows(root: ViewNode, measured: Measured = WHOLE_ROWS): Pa
           row += unit;
         });
       });
+    } else if (n.node === "prose") {
+      // Prose paints no rows here. It occupies its measured height — the rows below it are placed
+      // past it — but *what* is in those rows is the shell's own rendering of the blocks, placed
+      // by `elementOrigins`. A row list cannot carry it: a rendered block has more rows than the
+      // wire has anything to put in them.
     } else out.push({ ...place(at), kind: "chrome", node: n });
     at += height;
   });

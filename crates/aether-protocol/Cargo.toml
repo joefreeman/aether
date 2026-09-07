@@ -7,5 +7,9 @@ description = "JSON-RPC message types for the Aether editor protocol."
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
+# The markdown AST is a wire type: a `Prose` element carries it, so the reader and an agent's
+# replies are the same thing to every shell. A leaf crate (pulldown-cmark + serde), so this does
+# not drag anything into the protocol.
+aether-markdown.workspace = true
 serde_json.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }

@@ -542,6 +542,13 @@ pub struct EditorState {
     /// it: painting from one meant re-counting chrome and phantom rows here, and the cursor and
     /// click maths each counting them again, differently.
     pub root: aether_protocol::viewport::Element,
+    /// The client-laid-out elements' markdown rows, by element — an agent conversation's replies.
+    /// The painter draws these instead of the element's source lines, at the element's origin
+    /// (`grid::element_origins`).
+    pub markdown: std::collections::HashMap<
+        aether_protocol::viewport::FieldId,
+        std::sync::Arc<Vec<aether_client::read_layout::ReadRow>>,
+    >,
     /// Buffer-level Git status (branch + staged/unstaged counts) for the status bar; `None` outside
     /// a repo. Refreshed from every window.
     pub git_status: Option<GitBufferStatus>,
@@ -664,6 +671,7 @@ pub enum BufferStatusKind {
 pub(crate) fn test_editor_state() -> EditorState {
     EditorState {
         unsaved: false,
+        markdown: Default::default(),
         root: aether_protocol::viewport::Element::Editor {
             element: 0,
             buffer: 0,
@@ -1274,6 +1282,7 @@ mod tests {
     fn stub_editor_state(label: &str) -> EditorState {
         EditorState {
             unsaved: false,
+            markdown: Default::default(),
             root: aether_protocol::viewport::Element::Editor {
                 element: 0,
                 buffer: 0,
