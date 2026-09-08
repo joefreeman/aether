@@ -141,6 +141,55 @@ fn blank_run_before(text: &str, upto: usize) -> usize {
 /// resolve forward at the top and back at the bottom, so a range edge sitting on a separator
 /// line never rounds outward past its own blocks. (The reading view's
 /// `ReadView::selection_blocks` derives from this.)
+/// The **append byte** of a block's span: the caret gap *before* this byte is "after the block's
+/// last content char" — its terminating newline when it has one, else one past the span.
+///
+/// Where `a` lands in the reading view. Trailing blank lines are walked off first: separator blanks
+/// belong to the gaps *between* blocks, but a loose list item's parser span swallows the one after
+/// it, so the raw last byte is the separator's newline and `a` would land a line low — typing there
+/// opens a new block in the gap instead of extending the item.
+///
+/// Here rather than in a client because it needs the block's **text**, and a reading view carried
+/// as a parse has none: the server owns the buffer, so the server answers.
+pub fn block_append_byte(text: &str, span: Span) -> u32 {
+    let base = (span.start as usize).min(text.len());
+    let end = (span.end as usize).min(text.len()).max(base);
+    let content = &text[base..end];
+    let bytes = content.as_bytes();
+    // Walk back over whole blank lines: `cut` ends on the last content line's terminator.
+    let mut cut = bytes.len();
+    while cut > 0 {
+        let ls = bytes[..cut - 1]
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(0, |i| i + 1);
+        if !content[ls..cut].trim().is_empty() {
+            break;
+        }
+        cut = ls;
+    }
+    match bytes.get(cut.wrapping_sub(1)) {
+        Some(b'\n') => (base + cut - 1) as u32,
+        _ => (base + cut) as u32,
+    }
+}
+
+/// The byte of a block's last **content** char, excluding its terminating newline when present.
+///
+/// The end of a content-only change range: the newline, and every separator, survives the rewrite,
+/// so the document's block structure does. Text-dependent for the same reason
+/// [`block_append_byte`] is.
+pub fn block_content_end(text: &str, span: Span) -> u32 {
+    let start = (span.start as usize).min(text.len());
+    let end = (span.end as usize).min(text.len()).max(start);
+    let content = &text[start..end];
+    let content = content.strip_suffix('\n').unwrap_or(content);
+    match content.char_indices().last() {
+        Some((i, _)) => start as u32 + i as u32,
+        None => start as u32,
+    }
+}
+
 pub fn selection_block_range(
     text: &str,
     stops: &[Stop],
@@ -2610,5 +2659,47 @@ mod tests {
         assert_eq!(opened(doc, &e), "[a]: https://example.com\n\n|");
         let e = open(doc, 0, true).unwrap();
         assert_eq!(opened(doc, &e), "|\n\n[a]: https://example.com\n");
+    }
+
+    /// A loose list item's span swallows the blank line after it, so the raw last byte is the
+    /// *separator's* newline: `a` landed on the blank line between the bullets and typing opened a
+    /// new top-level block in the gap instead of extending the item.
+    #[test]
+    fn block_append_byte_parks_before_the_blocks_own_terminator() {
+        let text = "- First para.\n\n  Second para.\n\n- Next item.\n";
+        let stops = crate::stops(&crate::parse(text));
+        let item = stops
+            .iter()
+            .position(|e| matches!(e, Stop::Item { .. }))
+            .expect("the item is a stop");
+        let at = block_append_byte(text, stops[item].span()) as usize;
+        assert_eq!(&text[at..at + 1], "\n");
+        assert!(
+            text[..at].ends_with("Second para."),
+            "parks on the item's own terminator, not the separator below it: {:?}",
+            &text[..at]
+        );
+
+        // A final block with no trailing newline appends one past its last char, and that char
+        // being multi-byte does not move it.
+        let text = "Alpha.\n\nCafé";
+        let stops = crate::stops(&crate::parse(text));
+        let at = block_append_byte(text, stops[stops.len() - 1].span()) as usize;
+        assert_eq!(at, text.len());
+    }
+
+    /// The content end stops before the block's own terminator, so a rewrite leaves the document's
+    /// block structure standing.
+    #[test]
+    fn block_content_end_excludes_the_terminating_newline() {
+        let text = "# Title\n\nBody text.\n";
+        let stops = crate::stops(&crate::parse(text));
+        let heading = block_content_end(text, stops[0].span()) as usize;
+        assert_eq!(&text[heading..heading + 1], "e", "the last content char");
+        // A multi-byte last char lands on its first byte, not past it.
+        let text = "Café\n";
+        let stops = crate::stops(&crate::parse(text));
+        let at = block_content_end(text, stops[0].span()) as usize;
+        assert_eq!(&text[at..], "é\n");
     }
 }

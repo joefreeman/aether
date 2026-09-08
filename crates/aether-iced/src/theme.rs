@@ -97,7 +97,8 @@ pub struct Palette {
 
     // ---- Markdown reading view ----
     pub md_code_bg: Color,
-    pub md_table_stripe_bg: Color,
+    pub md_chip_bg: Color,
+    pub md_panel_bg: Color,
     pub md_alert_important: Color,
 }
 
@@ -166,7 +167,8 @@ impl Palette {
             git_ref_remote: color(t.git_ref_remote),
             git_ref_tag: color(t.git_ref_tag),
             md_code_bg: color(t.md_code_bg),
-            md_table_stripe_bg: color(t.md_table_stripe_bg),
+            md_chip_bg: color(t.md_chip_bg),
+            md_panel_bg: color(t.md_panel_bg),
             md_alert_important: color(t.md_alert_important),
         }
     }
@@ -399,7 +401,10 @@ mod tests {
         assert_eq!(p.git_added_bg, c(0x2d3a2d)); // GIT_ADDED_BG
         assert_eq!(p.cursor_line_added_bg, c(0x3a4d3a)); // CURSOR_LINE_ADDED_BG
         assert_eq!(p.cursor_line_staged_modified_bg, c(0x434138));
-        assert_eq!(p.md_code_bg, c(0x3b4252)); // reading-view code panel (NORD1)
+        // The reading view's code panel is the editor's own well now that the page around it is
+        // the ground — the panel and an editor are the same surface, which is the point of it.
+        assert_eq!(p.md_code_bg, c(0x2e3440)); // NORD0 = `bg`
+        assert_eq!(p.md_code_bg, p.bg);
     }
 
     /// Light is a real second table, not dark re-served.
@@ -411,7 +416,10 @@ mod tests {
         assert_ne!(l.bg, d.bg);
         assert_ne!(l.fg, d.fg);
         assert_ne!(l.warning, d.warning, "aurora yellow is unreadable on light");
-        assert_eq!(l.bg, c(0xeceff4)); // NORD6 — the ends swap
+        // The ends swap, and within light the *ground* takes the palest shade: the well is a step
+        // down from it, so an editor is the darker of the two backgrounds in both themes.
+        assert_eq!(l.bg_app, c(0xeceff4)); // NORD6
+        assert_eq!(l.bg, c(0xe1e6ee));
         assert_eq!(l.fg, c(0x2e3440)); // NORD0
     }
 

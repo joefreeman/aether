@@ -43,8 +43,8 @@ use aether_protocol::cursor::{
     CursorMove, CursorMoveParams, CursorRedo, CursorSelectAll, CursorSelectAllParams,
     CursorSelectLine, CursorSelectLineParams, CursorSelectWord, CursorSelectWordParams, CursorSet,
     CursorSetParams, CursorState, CursorSwapAnchor, CursorSwapAnchorParams, CursorTreeSelect,
-    CursorTreeSelectParams, CursorUndo, CursorUndoParams, CursorUndoResult, Granularity, Motion,
-    SelectionEdge, TreeSelectDirection,
+    CursorTreeSelectParams, CursorUndo, CursorUndoParams, CursorUndoResult, ElementBlockContent,
+    ElementSelectBlock, Granularity, Motion, SelectBlockParams, SelectionEdge, TreeSelectDirection,
 };
 use aether_protocol::cursor::{Direction, VerticalDirection};
 use aether_protocol::directory::{
@@ -81,16 +81,16 @@ use aether_protocol::history::{
 };
 use aether_protocol::input::{
     BlockDepthParams, BlockEditResult, BufferOnlyParams, CaseKind, CountedEditParams, EditRedo,
-    EditResult, EditUndo, InputAdjustNumber, InputAdjustNumberParams, InputBackspace,
-    InputBlockDepth, InputChange, InputChangeLine, InputDedent, InputDelete, InputDeleteBlock,
-    InputDeleteLine, InputDeleteWord, InputDeleteWordParams, InputIndent, InputJoinLines,
-    InputMoveBlock, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent,
-    InputNewlineAndIndentParams, InputOpenBlock, InputOpenLine, InputOpenLineParams,
-    InputPasteBlock, InputReplaceLine, InputReplaceLineParams, InputSurround, InputSurroundParams,
-    InputTab, InputText, InputTextParams, InputToggleComment, InputToggleTask, InputTransformCase,
-    InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide, MoveBlockParams,
-    OpenBlockParams, PasteBlockParams, ToggleCommentParams, ToggleTaskParams, UndoRedoParams,
-    UndoResult,
+    EditResult, EditUndo, ElementSource, ElementSourceResult, InputAdjustNumber,
+    InputAdjustNumberParams, InputBackspace, InputBlockDepth, InputChange, InputChangeLine,
+    InputDedent, InputDelete, InputDeleteBlock, InputDeleteLine, InputDeleteWord,
+    InputDeleteWordParams, InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines,
+    InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenBlock,
+    InputOpenLine, InputOpenLineParams, InputPasteBlock, InputReplaceLine, InputReplaceLineParams,
+    InputSurround, InputSurroundParams, InputTab, InputText, InputTextParams, InputToggleComment,
+    InputToggleTask, InputTransformCase, InputTransformCaseParams, InputUnsurround,
+    InputUnsurroundParams, LineSide, MoveBlockParams, OpenBlockParams, PasteBlockParams,
+    ToggleCommentParams, ToggleTaskParams, UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCapture, JumplistCaptureParams, JumplistCaptureResult, JumplistChanged, JumplistClear,
@@ -162,6 +162,15 @@ pub enum Event {
     ReloadTried(Result<ReloadTry, String>),
     /// A cursor-returning RPC resolved (motions, selections, clicks). Reveals as a `Follow`.
     CursorMsg(Result<CursorState, String>),
+    /// `element/source` answered a reading-view copy: the Markdown the cursor had.
+    ///
+    /// `what` is what the toast calls it, decided when the request went out — the client knows
+    /// whether it asked about a selection or a single element, and the server has no reason to
+    /// say it back.
+    ReadCopied {
+        what: &'static str,
+        result: Result<String, String>,
+    },
     /// As [`CursorMsg`](Event::CursorMsg), but the move was a targeted jump (go-to-line) so the
     /// reveal rests the cursor a quarter down rather than scrolling the minimum.
     CursorJump(Result<CursorState, String>),
@@ -903,6 +912,13 @@ impl Session {
             Event::LineFollowed(Err(e)) => Effects::error_detail("Couldn't open the file", e),
 
             Event::Switched(Err(e)) => self.open_failed(e),
+
+            Event::ReadCopied { what, result } => match result {
+                // A failed copy is quiet: nothing was put on the clipboard, and a toast saying so
+                // would be the only sign anything had happened at all.
+                Ok(text) if !text.is_empty() => Self::copied(text, what),
+                _ => Effects::none(),
+            },
 
             Event::ReadHighlights {
                 buffer_id,
@@ -3425,8 +3441,9 @@ impl Session {
 
     /// Ask for the current view's sibling — its file's editor, or its reader. Named as this view
     /// plus the other kind: the server finds its buffer's view of that kind or makes one and
-    /// answers with it; [`Self::adopt_sibling`] takes it up. The content anchor captured first
-    /// keeps the same lines on screen when the sibling has no scroll of its own to come back to.
+    /// answers with it; [`Self::adopt_sibling`] takes it up. The content anchor captured first is
+    /// what keeps the same lines on screen across the re-presentation — always, not only when the
+    /// sibling has no remembered scroll of its own (see [`Self::adopt_sibling`]).
     fn open_sibling(&mut self, kind: aether_protocol::ui::ViewKind) -> Effects {
         Effects::one(Effect::SaveContentAnchor).and(self.request_str::<ViewOpen>(
             ViewOpenParams {
@@ -3440,10 +3457,18 @@ impl Session {
 
     /// Adopt the sibling view an [`Self::open_sibling`] answered with: the same buffer, another
     /// view of it. Not a switch — the cursor is the buffer's and shared by both views, and a mode
-    /// an edit transition set stays set — and not a same-buffer move either, which would keep
-    /// the window: the view is new, so the shell re-subscribes, at the view's own remembered
-    /// scroll when it has one, else where the content anchor says. The reading view, if this was
-    /// one, goes: the new window decides whether the sibling is.
+    /// an edit transition set stays set — and not a same-buffer move either, which would keep the
+    /// window: the view is new, so the shell re-subscribes, **where the content anchor says**. The
+    /// reading view, if this was one, goes: the new window decides whether the sibling is.
+    ///
+    /// The sibling's own remembered scroll used to win whenever it had one, and that is what made
+    /// `Space u` unreliable: only the *first* switch to a view carried your place, and every one
+    /// after it landed wherever that view had last been subscribed — in practice the top, since a
+    /// view's remembered scroll is written by a subscribe or a fetch and neither happens while you
+    /// scroll a view you are already in, so landing at the top re-recorded the top. Coming back to
+    /// where a view was is a coherent idea for opening one afresh; it is not one for a pair that
+    /// shares a cursor, where "where that view was" and "where you are" are answers to different
+    /// questions and only the second is the one being asked.
     fn adopt_sibling(&mut self, open: ViewOpenResult) -> Effects {
         if open.buffer_id != self.view.buffer.buffer_id {
             return self.adopt_switch(open);
@@ -3453,11 +3478,7 @@ impl Session {
         // scroll off the open one by one left the kept flag behind: the status bar said the
         // editor was kept because the reader had been, the picker said it was not, and the first
         // `Space k` "released" a view that was never kept.
-        let remembered_scroll = open.scroll.is_some();
         self.view.rebind(open, &self.workspace_paths);
-        if remembered_scroll {
-            self.forget_scroll_anchor();
-        }
         self.view.read = None;
         if self.view.mode == Mode::Read {
             self.view.mode = Mode::Normal;
@@ -3481,55 +3502,20 @@ impl Session {
 
     /// The reading view is a consequence of the window, and this is where the client notices.
     ///
-    /// The server presents a markdown file as the reader by sending it as one element the client
-    /// lays out — unwrapped, whole, one wire row per line. Every window adoption comes through
-    /// here: an element of that kind under the cursor puts the session in the reading view over
-    /// the lines it carries, re-parsing whenever they change (an edit, an undo, another client's
+    /// The server presents a markdown file as the reader by sending it as one **prose** element:
+    /// the parse and the line table, never the source. Every window adoption comes through here:
+    /// an element of that kind under the cursor puts the session in the reading view over the
+    /// document it carries, re-adopting whenever that changes (an edit, an undo, another client's
     /// change — all of them arrive as a pushed window, so nothing is fetched); an ordinary editor
     /// takes the reading view down. Nothing else decides which view is showing: `Space u` and the
     /// edit transitions only *ask*, through the subscribe, and adopt whatever comes back.
     ///
-    /// A partial load — the element has more lines than the window carries — is a window still
-    /// on its way (the server loads such an element whole, and the grid asks for all of it), so
-    /// the view stays loading rather than parsing half a document.
+    /// There is no half-loaded case to guard any more. A prose element has no wire rows, so the
+    /// server sends its content entire or not at all — where an element the client laid out could
+    /// arrive with the top half of a document in it and had to be held back until the rest came.
     fn sync_read_presentation(&mut self) -> Effects {
         let buffer_id = self.view.buffer.buffer_id;
-        let prose = self.view.window.as_ref().and_then(|w| {
-            // **The reader is a whole view, not an element.** Rendered prose elsewhere — an
-            // agent's reply inside a conversation — is an `Element::Prose` and never matches the
-            // arm below; this guard is the second half of the same rule, and the test is the one
-            // `View::kind` uses server-side: one element, and nothing else in the view. Without it
-            // a composed view holding a single client-laid-out editor would be adopted as the
-            // reader, which replaced a whole conversation with a reading view over one block.
-            if w.root.editors().len() != 1 {
-                return None;
-            }
-            w.root.editors().into_iter().find_map(|node| match node {
-                Element::Editor {
-                    element,
-                    laid_out_by: aether_protocol::ui::LayoutOwner::Client,
-                    rows,
-                    first_row,
-                    lines,
-                    ..
-                } if *element == self.view.focused_element => {
-                    let whole = first_row.get() == 0 && lines.len() as u32 == *rows;
-                    let text = lines
-                        .iter()
-                        .map(|l| {
-                            l.visual_rows
-                                .iter()
-                                .flat_map(|r| r.segments.iter().map(|s| s.text.as_str()))
-                                .collect::<String>()
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    Some((whole, text))
-                }
-                _ => None,
-            })
-        });
-        let Some((whole, text)) = prose else {
+        let Some((blocks, source)) = self.window_prose() else {
             // The editor. A pending cross-file anchor could only have landed in a reading view.
             self.pending_read_anchor = None;
             if self.view.read.take().is_some() && self.view.mode == Mode::Read {
@@ -3537,6 +3523,22 @@ impl Session {
             }
             return Effects::none();
         };
+        // The push was about something other than the document — a cursor move, a git status.
+        // Asked of the parse and its lines rather than of the revision, because re-adopting drops
+        // the fence highlights and asks for them again: a document that did not change must not
+        // flicker every time the cursor does.
+        if self
+            .view
+            .read
+            .as_ref()
+            .is_some_and(|r| !r.loading && r.blocks == *blocks && r.same_source(source))
+        {
+            return Effects::none();
+        }
+        let (blocks, source) = self
+            .window_prose()
+            .map(|(b, s)| (b.clone(), s.clone()))
+            .expect("checked above");
         let mut fx = Effects::none();
         if self.view.read.is_none() {
             self.view.mode = Mode::Read;
@@ -3545,23 +3547,59 @@ impl Session {
             fx = fx.and(self.cancel_sneak_on(buffer_id));
             self.view.read = Some(ReadView::loading(buffer_id));
         }
-        if !whole {
-            return fx;
-        }
         let revision = self.view.buffer.revision;
-        let read = self.view.read.as_mut().expect("installed above");
-        if !read.loading && read.text == text {
-            return fx; // the push was about something other than the text
-        }
         // A followed cross-file anchor is pending: stage the parse instead of installing it —
         // the document paints once, already in place.
         if self.pending_read_anchor.is_some() {
             let mut staged = ReadView::loading(buffer_id);
-            staged.adopt(revision, text);
+            staged.adopt(revision, blocks, source);
             return fx.and(self.stage_read_place(staged));
         }
-        read.adopt(revision, text);
+        self.view
+            .read
+            .as_mut()
+            .expect("installed above")
+            .adopt(revision, blocks, source);
         fx.and(self.read_fence_requests())
+    }
+
+    /// The document the window is showing as the reader: the focused element's parse and its line
+    /// table, or `None` for anything else on screen.
+    ///
+    /// **The reader is a whole view, not an element.** Rendered prose elsewhere — an agent's reply
+    /// inside a conversation — is the same kind of element, so the element alone cannot say; the
+    /// test is the one `View::kind` uses server-side: one content element, and nothing else in the
+    /// view. Without it a conversation whose cursor sat on a reply would be adopted as the reader,
+    /// replacing the whole thing with that one block.
+    /// Whether the window **on screen** is the reading view's, whatever the session has since
+    /// decided about it.
+    ///
+    /// A shell picking between two scrollers must ask this and not [`ViewState::read`], because
+    /// the two answers come apart for exactly one frame and it is the frame that matters: leaving
+    /// the reader clears `read` at the keystroke (so the mode and the keymap change at once), and
+    /// the content anchor that carries your place across the switch is captured *after* that,
+    /// while the reader is still what is drawn. A shell that asked the session read its editor's
+    /// scroll instead — a stale mirror, usually zero — and pinned the top of the document.
+    pub fn window_shows_prose(&self) -> bool {
+        self.window_prose().is_some()
+    }
+
+    fn window_prose(
+        &self,
+    ) -> Option<(
+        &Vec<crate::markdown::Block>,
+        &aether_protocol::ui::SourceLines,
+    )> {
+        let content = self.view.window.as_ref()?.root.content();
+        let [node] = content[..] else { return None };
+        match node {
+            Element::Prose {
+                element,
+                blocks,
+                source,
+            } if *element == self.view.focused_element => Some((blocks, source)),
+            _ => None,
+        }
     }
 
     /// Ask the server to highlight every fenced code block of the freshly parsed document —
@@ -10834,78 +10872,33 @@ impl Session {
     /// and can't get stuck on separators. Counts iterate the machine; one `cursor/set` +
     /// `Granularity::Line` lands the result in whole-line normal form.
     fn read_select_block(&mut self, forward: bool, count: u32, extend: bool) -> Effects {
-        let (position, anchor) = {
-            let Some(read) = self.view.read.as_ref() else {
-                return Effects::none();
-            };
-            let cursor = self.view.buffer.cursor;
-            let is_block = crate::markdown::Stop::is_block;
-            let step = |idx: usize, fwd: bool| {
-                crate::markdown::step_element(&read.elements, idx, fwd, is_block)
-            };
-            let (a, p) = (read.byte_of(cursor.anchor), read.byte_of(cursor.position));
-            let cursor_at_top = !cursor.is_point() && p < a;
-            // Current state: the block range under the selection, and whether the selection
-            // already covers it whole ([`crate::session::ReadView::selection_blocks`]). A
-            // point cursor is "the focused block, not yet selected".
-            let Some((mut top, mut bottom, mut whole)) = read.selection_blocks(&cursor) else {
-                return Effects::none();
-            };
-            let mut fresh = cursor.is_point();
-            for _ in 0..count.max(1) {
-                if fresh {
-                    if !forward {
-                        // Alt-x's first press selects the block *above*, saturating at the top.
-                        top = step(top, false).unwrap_or(top);
-                    }
-                    bottom = top;
-                    (fresh, whole) = (false, true);
-                    continue;
-                }
-                if !whole {
-                    // Snap before advancing: Shift keeps the (now whole) range, a plain press
-                    // collapses to the direction's edge block.
-                    if !extend {
-                        if forward {
-                            top = bottom;
-                        } else {
-                            bottom = top;
-                        }
-                    }
-                    whole = true;
-                    continue;
-                }
-                if forward {
-                    let next = step(bottom, true).unwrap_or(bottom);
-                    if !extend {
-                        top = next;
-                    }
-                    bottom = next;
-                } else {
-                    let prev = step(top, false).unwrap_or(top);
-                    if !extend {
-                        bottom = prev;
-                    }
-                    top = prev;
-                }
-            }
-            let (top_first, _) = read.block_lines(top);
-            let (_, bottom_last) = read.block_lines(bottom);
-            if cursor_at_top {
-                (top_first, bottom_last)
-            } else {
-                (bottom_last, top_first)
-            }
-        };
-        self.request_str::<CursorSet>(
-            CursorSetParams {
+        if !self.read_has_blocks() {
+            return Effects::none();
+        }
+        // The whole step resolves server-side: it reads the selection it already has, and telling a
+        // partial range from a whole one needs the block boundaries under the current bytes.
+        self.request_str::<ElementSelectBlock>(
+            SelectBlockParams {
                 buffer_id: self.view.buffer.buffer_id,
-                position,
-                anchor,
-                granularity: Granularity::Line,
+                direction: if forward {
+                    VerticalDirection::Down
+                } else {
+                    VerticalDirection::Up
+                },
+                extend,
+                count,
             },
             Event::CursorMsg,
         )
+    }
+
+    /// Whether the reading view has anything a block-grain command could act on. A document of
+    /// only blank lines parses to no block stops, and every such command was a quiet no-op there.
+    fn read_has_blocks(&self) -> bool {
+        self.view
+            .read
+            .as_ref()
+            .is_some_and(|r| r.elements.iter().any(crate::markdown::Stop::is_block))
     }
 
     /// Leave the reading view for the editor, locally and at once — the caller sets the
@@ -10929,29 +10922,16 @@ impl Session {
     /// fallback the reading view is a dead end on exactly the buffer you most want to type
     /// into — nothing on screen and every edit transition a silent no-op.
     fn read_insert(&mut self, at_end: bool) -> Effects {
-        let target = {
-            let Some(read) = self.view.read.as_ref() else {
-                return Effects::none();
-            };
-            let cursor = self.view.buffer.cursor;
-            if cursor.is_point() {
-                let byte = match read.block_focus(cursor.position) {
-                    Some(f) if at_end => read.block_append_byte(f),
-                    Some(f) => read.elements[f].span().start,
-                    None if at_end => read.text.len() as u32,
-                    None => 0,
-                };
-                Some(read.pos_of(byte))
-            } else {
-                None
-            }
-        };
+        let point = self.view.read.is_some() && self.view.buffer.cursor.is_point();
         self.read_exit_for_edit();
         self.view.mode = Mode::Insert;
         let fx = self.open_sibling(aether_protocol::ui::ViewKind::Editor);
-        fx.and(match target {
-            Some(position) => self.move_motion(Motion::Goto { position }, false),
-            None => self.enter_insert_at(if at_end {
+        fx.and(if point {
+            // The block's edge is the server's to find: the append point walks back over the
+            // block's own trailing blank lines, and that needs the block's text.
+            self.move_motion(Motion::BlockEdge { at_end }, false)
+        } else {
+            self.enter_insert_at(if at_end {
                 // `LastLineEnd`, not `SelectionEnd`: a block selection is always in whole-line
                 // normal form, so its last char *is* the terminating newline and "one past the
                 // last char" is column 0 of the separator line below — typing there wedges the
@@ -10960,7 +10940,7 @@ impl Session {
                 InsertWhere::LastLineEnd
             } else {
                 InsertWhere::SelectionStart
-            }),
+            })
         })
     }
 
@@ -10971,30 +10951,17 @@ impl Session {
     /// either side (vim's `cc` shape, not a raw block-delete that would splice the next
     /// block up). A multi-block selection collapses to one new block the same way.
     fn read_change(&mut self) -> Effects {
-        let (anchor, position) = {
-            let Some(read) = self.view.read.as_ref() else {
-                return Effects::none();
-            };
-            let Some((top, bottom, _)) = read.selection_blocks(&self.view.buffer.cursor) else {
-                return Effects::none();
-            };
-            let start = read.elements[top].span().start;
-            (
-                read.pos_of(start),
-                read.pos_of(read.block_content_end(bottom).max(start)),
-            )
-        };
+        if !self.read_has_blocks() {
+            return Effects::none();
+        }
         self.read_exit_for_edit();
         self.view.mode = Mode::Insert;
         let buffer_id = self.view.buffer.buffer_id;
+        // The content range is the server's: its end is the block's last content char, which means
+        // looking at the block's text. Requests are ordered, so the change lands on this selection.
         self.open_sibling(aether_protocol::ui::ViewKind::Editor)
-            .and(self.request_str::<CursorSet>(
-                CursorSetParams {
-                    buffer_id,
-                    position,
-                    anchor,
-                    granularity: Granularity::Char,
-                },
+            .and(self.request_str::<ElementBlockContent>(
+                BufferOnlyParams { buffer_id },
                 Event::CursorMsg,
             ))
             .and(self.edit::<InputChange>(CountedEditParams {
@@ -11065,9 +11032,12 @@ impl Session {
             match &read.elements[idx] {
                 crate::markdown::Stop::Link { href, .. } => href.clone(),
                 crate::markdown::Stop::Image { src, .. } => src.clone(),
+                // The definition's blocks flattened, not its source sliced. The popover renders
+                // plain text, so the source showed its own markup through; and the slice was one
+                // of the last things here that needed the buffer's text at all.
                 crate::markdown::Stop::FootnoteRef { label, .. } => {
-                    match crate::markdown::footnote_def_span(&read.blocks, label) {
-                        Some(span) => read.slice(span).trim_end().to_string(),
+                    match crate::markdown::footnote_def_content(&read.blocks, label) {
+                        Some(content) => crate::markdown::to_plain(content),
                         None => format!("No definition for footnote [{label}]"),
                     }
                 }
@@ -11089,7 +11059,7 @@ impl Session {
             let Some(read) = self.view.read.as_ref() else {
                 return Effects::none();
             };
-            if read.loading && read.text.is_empty() {
+            if read.loading && read.byte_len() == 0 {
                 return Effects::none();
             }
             read.pos_of(byte)
@@ -11560,42 +11530,41 @@ impl Session {
     /// `Ctrl-c`: copy — an extended selection's source (whole blocks, separators included),
     /// else the focused element: a link's URL, otherwise its markdown source.
     fn read_copy(&mut self) -> Effects {
-        let (text, what) = {
-            let Some(read) = self.view.read.as_ref() else {
+        let Some(read) = self.view.read.as_ref() else {
+            return Effects::none();
+        };
+        let cursor = self.view.buffer.cursor;
+        if cursor.is_point() {
+            let Some(idx) = read.focus(cursor.position) else {
                 return Effects::none();
             };
-            let cursor = self.view.buffer.cursor;
-            if !cursor.is_point() {
-                // Inclusive selection: the end cursor's char (the newline, in whole-line
-                // normal form) is part of the range.
-                let (a, b) = (read.byte_of(cursor.anchor), read.byte_of(cursor.position));
-                let (start, end) = (a.min(b) as usize, a.max(b) as usize);
-                let end = end
-                    + read.text[end..]
-                        .chars()
-                        .next()
-                        .map(char::len_utf8)
-                        .unwrap_or(0);
-                (
-                    read.text.get(start..end).unwrap_or("").to_string(),
-                    "selection",
-                )
-            } else {
-                let Some(idx) = read.focus(cursor.position) else {
-                    return Effects::none();
-                };
-                match &read.elements[idx] {
-                    crate::markdown::Stop::Link { href, .. } => (href.clone(), "link URL"),
-                    el => (
-                        read.slice(el.span()).trim_end().to_string(),
-                        "element source",
-                    ),
-                }
+            // The URL is in the parse, so it is answered here and now.
+            if let crate::markdown::Stop::Link { href, .. } = &read.elements[idx] {
+                return Self::copied(href.clone(), "link URL");
             }
-        };
-        if text.is_empty() {
-            return Effects::none();
         }
+        // Source is the server's: a parse is not the text it was made from, and re-rendering the
+        // blocks would copy characters the file never held (smart punctuation rewrites every run).
+        // The round trip also makes this the same resolution `Ctrl-x` cuts by.
+        let what = if cursor.is_point() {
+            "element source"
+        } else {
+            "selection"
+        };
+        self.request_str::<ElementSource>(
+            BufferOnlyParams {
+                buffer_id: self.view.buffer.buffer_id,
+            },
+            move |result| Event::ReadCopied {
+                what,
+                result: result.map(|r: ElementSourceResult| r.text),
+            },
+        )
+    }
+
+    /// The clipboard write and its toast — the one place a reading-view copy is announced,
+    /// whether it was answered here or a round trip later.
+    fn copied(text: String, what: &str) -> Effects {
         let mut fx =
             Effects::toast_grouped(format!("Copied {what}"), ToastKind::Success, "read-copy");
         fx.push(Effect::WriteClipboard(text));
@@ -12019,43 +11988,40 @@ mod tests {
         s
     }
 
-    /// The window the server sends for a markdown file presented as the reader: one element the
-    /// client lays out, carrying every line of `text` unwrapped.
-    fn prose_window(buffer: BufferId, text: &str) -> aether_protocol::viewport::Window {
-        use aether_protocol::viewport::{LogicalLineRender, Segment, Window, WrappedRow};
-        let lines: Vec<LogicalLineRender> = text
-            .split('\n')
-            .enumerate()
-            .map(|(i, t)| LogicalLineRender {
-                change: Default::default(),
-                logical_line: i as u32,
-                visual_rows: vec![WrappedRow {
-                    byte_offset: 0,
-                    continuation_indent: 0,
-                    segments: vec![Segment {
-                        text: t.into(),
-                        highlights: vec![],
-                    }],
-                }],
-                search_matches: vec![],
-                baseline_above: vec![],
-                diagnostics: vec![],
-                sneak_targets: vec![],
-            })
-            .collect();
+    /// The window the server sends for a markdown file presented as the reader: one prose element
+    /// carrying the parse of `text` and the table that says where its lines begin. The server's
+    /// own `element_prose`, in three lines — the parse and the table come from one string there
+    /// too, which is the property that keeps a span and a line agreeing.
+    fn prose_window(text: &str) -> aether_protocol::viewport::Window {
+        use aether_protocol::viewport::Window;
         Window {
+            other_elements_dirty: false,
+            max_line_width: 0,
+            git_status: None,
+            root: Element::Prose {
+                element: 0,
+                blocks: crate::markdown::parse(text),
+                source: aether_protocol::ui::SourceLines::of(text),
+            },
+        }
+    }
+
+    /// The window for the same file presented as the *editor*: one editor element, no lines
+    /// loaded — enough to be recognised as not the reader.
+    fn editor_window(buffer: BufferId) -> aether_protocol::viewport::Window {
+        aether_protocol::viewport::Window {
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
             root: Element::Editor {
                 element: 0,
                 buffer,
-                rows: lines.len() as u32,
+                rows: 1,
                 first_row: aether_protocol::coords::ElementRow::ZERO,
-                laid_out_by: aether_protocol::ui::LayoutOwner::Client,
+                laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                 role: aether_protocol::ui::ElementRole::Field,
                 first_buffer_line: 0,
-                lines,
+                lines: vec![],
             },
         }
     }
@@ -12102,55 +12068,42 @@ mod tests {
         assert!(s.view.read.is_none());
     }
 
-    /// The reading view is a consequence of the window: an element the client lays out puts the
-    /// session in Read over its lines; an ordinary editor takes it down again.
+    /// The reading view is a consequence of the window: a prose element puts the session in Read
+    /// over the document it carries; an ordinary editor takes it down again.
     #[test]
     fn the_window_decides_the_reading_view() {
         let mut s = reading_session();
         s.view.read = None;
         s.view.mode = Mode::Normal;
-        let id = s.view.buffer.buffer_id;
-        s.view.window = Some(prose_window(id, "# Title\n\nbody\n"));
+        s.view.window = Some(prose_window("# Title\n\nbody\n"));
         let fx = s.sync_read_presentation();
         assert_eq!(s.view.mode, Mode::Read);
         let read = s.view.read.as_ref().expect("reading view");
         assert!(!read.loading);
-        assert_eq!(read.text, "# Title\n\nbody\n");
         assert_eq!(read.blocks.len(), 2);
+        // The line table came off the wire with the parse, and the document is what it describes:
+        // three lines, and a byte length nothing in the client had the text to count.
+        assert_eq!((read.line_count(), read.byte_len()), (4, 14));
         assert!(
             !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
             "no fences, nothing to ask for"
         );
 
-        // The same text again (a push about the cursor) is not a re-parse.
+        // The same document again (a push about the cursor) is not a re-adoption — which would
+        // throw away the fence highlights and ask for them all over again.
         let gen = s.view.read.as_ref().unwrap().hl_gen;
         let _ = s.sync_read_presentation();
         assert_eq!(s.view.read.as_ref().unwrap().hl_gen, gen);
 
-        // Changed text re-parses in place.
-        s.view.window = Some(prose_window(id, "# Title\n\nbody\n\nmore\n"));
+        // A changed document re-adopts in place.
+        s.view.window = Some(prose_window("# Title\n\nbody\n\nmore\n"));
         let _ = s.sync_read_presentation();
         let read = s.view.read.as_ref().unwrap();
         assert_eq!(read.blocks.len(), 3);
         assert_eq!(read.hl_gen, gen + 1);
 
-        // A partial load is a window still on its way: the view waits rather than parsing half.
-        let mut partial = prose_window(id, "# Title\n\nbody\n");
-        if let Element::Editor { rows, .. } = &mut partial.root {
-            *rows += 5;
-        }
-        s.view.read = None;
-        s.view.window = Some(partial);
-        let _ = s.sync_read_presentation();
-        let read = s.view.read.as_ref().expect("entered, loading");
-        assert!(read.loading && read.blocks.is_empty());
-
         // An editor window takes the reading view down.
-        let mut editor = prose_window(id, "# Title\n");
-        if let Element::Editor { laid_out_by, .. } = &mut editor.root {
-            *laid_out_by = aether_protocol::ui::LayoutOwner::Server;
-        }
-        s.view.window = Some(editor);
+        s.view.window = Some(editor_window(s.view.buffer.buffer_id));
         let _ = s.sync_read_presentation();
         assert!(s.view.read.is_none());
         assert_eq!(s.view.mode, Mode::Normal);
@@ -12170,14 +12123,10 @@ mod tests {
         );
         assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
 
-        // The switch lands: the new buffer's window carries the document, laid out by us.
+        // The switch lands: the new buffer's window carries the document as prose.
         s.view.buffer.buffer_id += 1;
         s.view.read = None;
-        let id = s.view.buffer.buffer_id;
-        s.view.window = Some(prose_window(
-            id,
-            "# One\n\ntext\n\n## Section Two\n\nbody\n",
-        ));
+        s.view.window = Some(prose_window("# One\n\ntext\n\n## Section Two\n\nbody\n"));
         let fx = s.sync_read_presentation();
         assert_eq!(s.pending_read_anchor, None, "the anchor is consumed");
         // The parse is *staged*, not installed: the visible view stays "Loading…" for the
@@ -12233,8 +12182,7 @@ mod tests {
         assert_eq!(s.pending_read_anchor.as_deref(), Some("nope"));
         s.view.buffer.buffer_id += 1;
         s.view.read = None;
-        let id = s.view.buffer.buffer_id;
-        s.view.window = Some(prose_window(id, "# Only Heading\n"));
+        s.view.window = Some(prose_window("# Only Heading\n"));
         let fx = s.sync_read_presentation();
         assert_eq!(s.pending_read_anchor, None);
         assert!(
@@ -12268,7 +12216,7 @@ mod tests {
             .read
             .as_mut()
             .unwrap()
-            .adopt(0, "# One\n\ntext\n\n## Section Two\n\nbody\n".into());
+            .adopt_source(0, "# One\n\ntext\n\n## Section Two\n\nbody\n");
         let fx = s.read_follow_link("#section-two");
         let open =
             fx.0.iter()

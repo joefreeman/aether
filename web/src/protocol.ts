@@ -236,12 +236,22 @@ export type ViewNode =
        *  the content. Its height is whatever this shell measured of the type it drew, so it is
        *  absent from `paintedRows` — `elementOrigins` is where it is placed.
        *
-       *  A field id and the parse, and nothing else. No buffer id and no source line: prose has no
-       *  wire rows, so nothing addresses it by position. */
+       *  A field id, the parse, and `source` — where the parsed text's lines begin and how long it
+       *  is. The reading view is addressed by position (the server owns the cursor and reports it
+       *  as a line and a column), and that table is what resolves one against a block. The core
+       *  reads it; this shell measures blocks and lets the core place the lines. */
       node: "prose";
       element: number;
       blocks: MdBlock[];
+      source: SourceLines;
     };
+
+/** Mirrors `ui::SourceLines`: the shape of the text a parse came from, without the text — the byte
+ *  offset each line starts at (one entry per line, always starting 0) and the text's byte length. */
+export interface SourceLines {
+  starts: number[];
+  byte_len: number;
+}
 
 /** What the shell measured of an element it laid out itself — mirrors `grid::MeasuredElement`:
  *  the wire row of the first loaded line, the offset within the element each loaded line starts

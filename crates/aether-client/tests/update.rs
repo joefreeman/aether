@@ -10853,32 +10853,33 @@ fn git_leader(s: &mut Session, c: char) -> Effects {
 }
 
 /// The window the server answers a subscribe with when it presents `buffer_id` as the reader:
-/// one element laid out by the client, carrying every line of `text` unwrapped.
+/// one prose element carrying the parse of `text` and the line table that places it.
 fn reader_subscribe(
     buffer_id: u64,
     text: &str,
 ) -> aether_protocol::viewport::ViewportSubscribeResult {
-    use aether_protocol::viewport::{Element, LogicalLineRender, Segment, Window, WrappedRow};
-    let lines: Vec<LogicalLineRender> = text
-        .split('\n')
-        .enumerate()
-        .map(|(i, t)| LogicalLineRender {
-            change: Default::default(),
-            logical_line: i as u32,
-            visual_rows: vec![WrappedRow {
-                byte_offset: 0,
-                continuation_indent: 0,
-                segments: vec![Segment {
-                    text: t.into(),
-                    highlights: vec![],
-                }],
-            }],
-            search_matches: vec![],
-            baseline_above: vec![],
-            diagnostics: vec![],
-            sneak_targets: vec![],
-        })
-        .collect();
+    use aether_protocol::viewport::{Element, Window};
+    aether_protocol::viewport::ViewportSubscribeResult {
+        viewport_id: 7,
+        buffer_status: Default::default(),
+        focus: focus_on(0, buffer_id, 0),
+        window: Window {
+            other_elements_dirty: false,
+            max_line_width: 0,
+            git_status: None,
+            root: Element::Prose {
+                element: 0,
+                blocks: aether_client::markdown::parse(text),
+                source: aether_protocol::ui::SourceLines::of(text),
+            },
+        },
+    }
+}
+
+/// The window for the same file presented as the **editor**: one editor element, no lines
+/// loaded. What `Space u` toggles to, and what the reader is recognised as *not* being.
+fn editor_subscribe(buffer_id: u64) -> aether_protocol::viewport::ViewportSubscribeResult {
+    use aether_protocol::viewport::{Element, Window};
     aether_protocol::viewport::ViewportSubscribeResult {
         viewport_id: 7,
         buffer_status: Default::default(),
@@ -10890,12 +10891,12 @@ fn reader_subscribe(
             root: Element::Editor {
                 element: 0,
                 buffer: buffer_id,
-                rows: lines.len() as u32,
+                rows: 1,
                 first_row: aether_protocol::coords::ElementRow::ZERO,
-                laid_out_by: aether_protocol::ui::LayoutOwner::Client,
+                laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                 role: aether_protocol::ui::ElementRole::Field,
                 first_buffer_line: 0,
-                lines,
+                lines: vec![],
             },
         },
     }
@@ -11048,6 +11049,54 @@ fn space_v_asks_for_the_reader_and_its_window_delivers_it() {
     assert_eq!(read.elements.len(), 4);
 }
 
+/// `Space u` carries **where you are**, not where the sibling view was last left.
+///
+/// The sibling's own remembered scroll used to win whenever it had one, which made the switch
+/// unreliable in the way that is hardest to notice: the *first* switch to a view carried your
+/// place, and every one after it landed wherever that view had last been subscribed. A view's
+/// remembered scroll is only written by a subscribe or a fetch — never while you scroll a view you
+/// are already in — so that was usually the top, and landing there recorded the top again.
+///
+/// The two views share one cursor, which is what settles it: "where that view was" and "where you
+/// are" are answers to different questions, and the switch is asking the second.
+#[test]
+fn a_sibling_switch_keeps_your_place_over_the_siblings_remembered_scroll() {
+    use aether_protocol::coords::VisualRow;
+    use aether_protocol::viewport::ScrollPosition;
+    let mut s = md_session();
+    let _ = adopt_reader_window(&mut s, "# Title\n\nFirst para.\n\nSecond para.\n");
+
+    // The switch: the shell captures the anchor for where the reader is, then asks for the editor.
+    let fx = leader(&mut s, 'u');
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)));
+    s.capture_scroll_anchor(VisualRow(0), 20, &Default::default());
+    let anchored = s
+        .relayout_anchor_position()
+        .expect("an anchor for the switch");
+    let token = the_sibling_request(&s, &fx, "editor");
+
+    // The editor answers with a scroll of its own — it has been shown before.
+    let mut open = sibling_open(&s, 900);
+    open["scroll"] = json!({"element": 0, "line": 40, "sub_row": 0.0});
+    let _ = s.on_rpc_result(token, Ok(open));
+
+    assert_eq!(
+        s.relayout_anchor_position(),
+        Some(anchored),
+        "the sibling's remembered scroll threw away the place the switch was carrying"
+    );
+    // The remembered scroll is still recorded — it is the fallback for a view opened with no
+    // anchor at all, and only that.
+    assert_eq!(
+        s.view.buffer.scroll,
+        Some(ScrollPosition {
+            element: 0,
+            line: 40,
+            sub_row: 0.0
+        })
+    );
+}
+
 #[test]
 fn space_v_on_non_markdown_toasts_and_stays_normal() {
     use aether_client::session::Mode;
@@ -11116,7 +11165,7 @@ fn read_comma_collapses_the_block_selection() {
     // Build a real block selection: `x` selects the focused heading whole-line…
     let fx = key(&mut s, 'x');
     let (t, method, _p) = the_request(&fx);
-    assert_eq!(method, "element/set");
+    assert_eq!(method, "element/select_block");
     let _ = s.on_rpc_result(
         t,
         Ok(json!({
@@ -11318,8 +11367,17 @@ fn space_t_shows_the_focused_target_without_following() {
 #[test]
 fn read_ctrl_c_copies_the_focused_elements_source() {
     let mut s = read_session();
-    // Cursor on the heading: `Ctrl-c` (the editor's clipboard chord) copies its markdown source.
+    // Cursor on the heading: `Ctrl-c` asks the *server* for the element's source. The reading
+    // view holds a parse, and a parse is not the text it was made from.
     let fx = ctrl(&mut s, 'c');
+    let (t, method, params) = the_request(&fx);
+    assert_eq!(method, "element/source");
+    assert_eq!(params["buffer_id"], json!(s.view.buffer.buffer_id));
+    assert!(
+        !fx.0.iter().any(|e| matches!(e, Effect::WriteClipboard(_))),
+        "nothing reaches the clipboard until the answer does"
+    );
+    let fx = s.on_rpc_result(t, Ok(json!({"text": "# Title"})));
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -11349,68 +11407,31 @@ fn read_shift_j_extends_selection_block_wise() {
     assert_eq!(p["position"]["line"], json!(2));
 }
 
+/// `x` / `Shift-x` / `Alt-x` ask the server to step the block selection.
+///
+/// The stepping rule itself lives server-side now — it reads the selection it already has, and
+/// telling a partial range from a whole one needs the block boundaries under the current bytes,
+/// which needs the document's text. What is left here is which way, and whether to extend.
 #[test]
-fn read_x_snaps_then_walks_and_shift_grows() {
-    use aether_protocol::LogicalPosition;
+fn read_x_asks_the_server_to_step_the_block_selection() {
     let mut s = read_session();
-    // First press: the focused block alone, whole-line form (the editor's `x` snaps the
-    // current line before walking; a one-line heading: both ends line 0).
     let fx = key(&mut s, 'x');
     let (_t, method, p) = the_request(&fx);
-    assert_eq!(method, "element/set");
-    assert_eq!(p["granularity"], json!("line"));
-    assert_eq!(p["anchor"]["line"], json!(0));
-    assert_eq!(p["position"]["line"], json!(0));
-    // With the whole heading selected (as the server would hold it), plain `x` WALKS: the
-    // next block alone — not an extension.
-    s.view.buffer.cursor.anchor = LogicalPosition { line: 0, col: 0 };
-    s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 7 };
-    let fx = key(&mut s, 'x');
-    let (_t, _method, p) = the_request(&fx);
-    assert_eq!(p["anchor"]["line"], json!(2));
-    assert_eq!(p["position"]["line"], json!(2));
-    // Shift-x from the same whole-block selection GROWS the bottom instead.
+    assert_eq!(method, "element/select_block");
+    assert_eq!(p["direction"], json!("down"));
+    assert_eq!(p["extend"], json!(false));
+
+    // Shift extends rather than walking.
     let fx = s.on_key(KeyCode::Char('x'), Mods::SHIFT, Some("X".into()));
-    let (_t, _method, p) = the_request(&fx);
-    assert_eq!(p["anchor"]["line"], json!(0));
-    assert_eq!(p["position"]["line"], json!(2));
-}
+    let (_t, _m, p) = the_request(&fx);
+    assert_eq!(p["direction"], json!("down"));
+    assert_eq!(p["extend"], json!(true));
 
-#[test]
-fn read_alt_x_selects_the_previous_block_and_saturates() {
-    use aether_protocol::LogicalPosition;
-    let mut s = read_session();
-    // The editor's first-press asymmetry: Alt-x from a bare reading position selects the
-    // block *above* (cursor on the first paragraph → the heading), not the focused one.
-    s.view.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
-    s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
+    // Alt goes the other way.
     let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None);
-    let (_t, method, p) = the_request(&fx);
-    assert_eq!(method, "element/set");
-    assert_eq!(p["anchor"]["line"], json!(0));
-    assert_eq!(p["position"]["line"], json!(0));
-    // At the document top it saturates: Alt-x on the heading selects the heading itself.
-    s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 0 };
-    s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
-    let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None);
-    let (_t, _method, p) = the_request(&fx);
-    assert_eq!(p["anchor"]["line"], json!(0));
-    assert_eq!(p["position"]["line"], json!(0));
-}
-
-#[test]
-fn read_x_snaps_a_partial_selection_before_advancing() {
-    use aether_protocol::LogicalPosition;
-    let mut s = read_session();
-    // A non-whole selection (a few chars inside the first paragraph): plain `x` collapses
-    // to the direction's edge block whole — consuming the press without advancing, exactly
-    // like the editor's snap-before-walk.
-    s.view.buffer.cursor.anchor = LogicalPosition { line: 2, col: 1 };
-    s.view.buffer.cursor.position = LogicalPosition { line: 2, col: 5 };
-    let fx = key(&mut s, 'x');
-    let (_t, _method, p) = the_request(&fx);
-    assert_eq!(p["anchor"]["line"], json!(2));
-    assert_eq!(p["position"]["line"], json!(2));
+    let (_t, _m, p) = the_request(&fx);
+    assert_eq!(p["direction"], json!("up"));
+    assert_eq!(p["extend"], json!(false));
 }
 
 #[test]
@@ -11422,6 +11443,12 @@ fn read_ctrl_c_copies_the_extended_selections_source() {
     s.view.buffer.cursor.anchor = LogicalPosition { line: 0, col: 0 };
     s.view.buffer.cursor.position = LogicalPosition { line: 2, col: 11 };
     let fx = ctrl(&mut s, 'c');
+    let (t, method, _p) = the_request(&fx);
+    assert_eq!(
+        method, "element/source",
+        "the selection's source is the server's too"
+    );
+    let fx = s.on_rpc_result(t, Ok(json!({"text": "# Title\n\nFirst para.\n"})));
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -11496,77 +11523,68 @@ fn read_extended_selection_suppresses_the_display_target() {
     assert!(read.display_target(&s.view.buffer.cursor).is_none());
 }
 
+/// `i` and `a` leave for the editor and ask for the block's edge.
+///
+/// Which edge is the only thing said here. Finding the append point walks back over the block's
+/// trailing blank lines, which needs the block's text, so the landing is the server's.
 #[test]
-fn read_i_and_a_enter_insert_at_the_blocks_edges() {
+fn read_i_and_a_ask_for_the_blocks_edges() {
     use aether_client::session::Mode;
-    use aether_protocol::LogicalPosition;
-    // `i` from a bare reading position on the first paragraph: caret at the block's start,
-    // editor in Insert, the reading view gone — and no presentation preference recorded.
     let mut s = read_session();
-    s.view.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
-    s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
     let fx = key(&mut s, 'i');
     assert_eq!(s.view.mode, Mode::Insert);
     assert!(s.view.read.is_none());
     let (_t, method, p) = the_request_beside_open(&fx);
     assert_eq!(method, "element/move");
-    assert_eq!(p["motion"]["kind"], json!("goto"));
-    assert_eq!(p["motion"]["position"], json!({"line": 2, "col": 0}));
-    // `a`: the append position — the caret gap before the block's terminating newline.
+    assert_eq!(p["motion"]["kind"], json!("block_edge"));
+    assert_eq!(p["motion"]["at_end"], json!(false));
+
     let mut s = read_session();
-    s.view.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
-    s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
     let fx = key(&mut s, 'a');
     assert_eq!(s.view.mode, Mode::Insert);
     let (_t, _m, p) = the_request_beside_open(&fx);
-    assert_eq!(p["motion"]["position"], json!({"line": 2, "col": 11}));
+    assert_eq!(p["motion"]["at_end"], json!(true));
+
+    // A document with no blocks is not a dead end: the same ask goes out, and the server lands on
+    // the element's own edges.
+    let mut s = blockless_read_session("");
+    let fx = key(&mut s, 'i');
+    assert_eq!(s.view.mode, Mode::Insert);
+    let (_t, method, _p) = the_request_beside_open(&fx);
+    assert_eq!(method, "element/move");
 }
 
 #[test]
 fn read_placeholder_names_the_loading_and_empty_states() {
+    use aether_client::update::Event;
+    use aether_protocol::cursor::CursorState;
+    use aether_protocol::input::UndoResult;
     // The line every shell paints when there's nothing to lay out — spelled once, in the core.
-    let mut s = md_session();
-    // A window whose element is taller than the lines it carries is still on its way.
-    let mut partial = reader_subscribe(s.view.buffer.buffer_id, "# T\n");
-    if let aether_protocol::viewport::Element::Editor { rows, .. } = &mut partial.window.root {
-        *rows = 40;
-    }
-    let _ = s.adopt_subscribe(partial);
-    assert_eq!(
-        s.view.read.as_ref().unwrap().placeholder(),
-        Some("Loading…")
-    );
-    let _ = adopt_reader_window(&mut s, "");
+    // A parsed document with no blocks in it is empty…
+    let mut s = blockless_read_session("");
     assert_eq!(
         s.view.read.as_ref().unwrap().placeholder(),
         Some("Empty document")
+    );
+    // …and the same view is "Loading…" once an edit of ours moves the text under it. That is the
+    // whole of loading now: prose has no wire rows, so a document arrives entire or not at all,
+    // and the only gap left is the round trip to the window that re-parses it.
+    s.view.read.as_mut().unwrap().revision = 1;
+    let _ = s.on_event(Event::UndoRedoDone(Ok(UndoResult {
+        buffer: 0,
+        revision: 0,
+        applied: true,
+        cursor: CursorState::default(),
+    })));
+    assert_eq!(
+        s.view.read.as_ref().unwrap().placeholder(),
+        Some("Loading…")
     );
     // A document with blocks shows itself.
     assert_eq!(
         read_session().view.read.as_ref().unwrap().placeholder(),
         None
     );
-}
-
-#[test]
-fn read_i_and_a_open_a_blockless_document_at_its_ends() {
-    use aether_client::session::Mode;
-    // No blocks means no focus to resolve: the *document* is the target, so `i` opens at its
-    // start. Without the fallback this is a silent no-op — a blank page you can't type into.
-    let mut s = blockless_read_session("");
-    let fx = key(&mut s, 'i');
-    assert_eq!(s.view.mode, Mode::Insert);
-    assert!(s.view.read.is_none());
-    let (_t, method, p) = the_request_beside_open(&fx);
-    assert_eq!(method, "element/move");
-    assert_eq!(p["motion"]["kind"], json!("goto"));
-    assert_eq!(p["motion"]["position"], json!({"line": 0, "col": 0}));
-    // Blank lines are blockless too, and `a` still means the end — past them.
-    let mut s = blockless_read_session("\n\n");
-    let fx = key(&mut s, 'a');
-    assert_eq!(s.view.mode, Mode::Insert);
-    let (_t, _m, p) = the_request_beside_open(&fx);
-    assert_eq!(p["motion"]["position"], json!({"line": 2, "col": 0}));
 }
 
 #[test]
@@ -11585,16 +11603,15 @@ fn read_i_extended_uses_the_editors_selection_edge() {
     assert_eq!(p["motion"]["kind"], json!("selection_edge"));
 }
 
+/// `Ctrl-e` asks for the block's content range, then changes it.
+///
+/// The range's end is the block's last *content* char, so the terminating newline and both
+/// separators survive the change — which is why the range is the server's to work out, and why the
+/// two requests have to arrive in this order.
 #[test]
-fn read_ctrl_e_changes_block_content_keeping_the_newline() {
+fn read_ctrl_e_asks_for_the_content_range_then_changes_it() {
     use aether_client::session::Mode;
-    use aether_protocol::LogicalPosition;
     let mut s = read_session();
-    // Rewrite the first paragraph: the selection re-materializes over the *content* only —
-    // (2,0)..(2,10), the final '.' — so the terminating newline and both separators survive
-    // the editor's Change; then Insert on the emptied line.
-    s.view.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
-    s.view.buffer.cursor.anchor = s.view.buffer.cursor.position;
     let fx = ctrl(&mut s, 'e');
     assert_eq!(s.view.mode, Mode::Insert);
     assert!(s.view.read.is_none());
@@ -11602,14 +11619,8 @@ fn read_ctrl_e_changes_block_content_keeping_the_newline() {
         .into_iter()
         .filter(|(m, _)| *m != "view/open") // the editor view asked for, first
         .collect();
-    assert_eq!(reqs.len(), 2, "element/set then input/change: {reqs:?}");
-    assert_eq!(reqs[0].0, "element/set");
-    assert_eq!(reqs[0].1["anchor"], json!({"line": 2, "col": 0}));
-    assert_eq!(reqs[0].1["position"], json!({"line": 2, "col": 10}));
-    assert!(
-        reqs[0].1.get("granularity").is_none(),
-        "exact char range, no snap"
-    );
+    assert_eq!(reqs.len(), 2, "content range then change: {reqs:?}");
+    assert_eq!(reqs[0].0, "element/block_content");
     assert_eq!(reqs[1].0, "element/change");
 }
 
@@ -11797,7 +11808,10 @@ fn read_r_reverses_the_selection_and_alt_r_orients_it_forward() {
     // `read_step` extends from the cursor's block and keeps the anchor.
     let mut s = read_session();
     let (_t, method, _p) = the_request(&key(&mut s, 'x'));
-    assert_eq!(method, "element/set", "a block selection to reverse");
+    assert_eq!(
+        method, "element/select_block",
+        "a block selection to reverse"
+    );
     let (_t, method, p) = the_request(&key(&mut s, 'r'));
     assert_eq!(method, "element/swap_anchor");
     // `forward_only: false` is the wire default and skips (the plain toggle).
@@ -12026,12 +12040,7 @@ fn space_v_toggles_back_to_the_editor() {
     assert_eq!(s.view.view_id, ViewId(901));
     // The editor's window confirms it.
     let id = s.view.buffer.buffer_id;
-    let mut editor = reader_subscribe(id, "# Title\n");
-    if let aether_protocol::viewport::Element::Editor { laid_out_by, .. } = &mut editor.window.root
-    {
-        *laid_out_by = aether_protocol::ui::LayoutOwner::Server;
-    }
-    let _ = s.adopt_subscribe(editor);
+    let _ = s.adopt_subscribe(editor_subscribe(id));
     assert_eq!(s.view.mode, Mode::Normal);
     assert!(s.view.read.is_none());
     // `Space u` again asks for the reader, whatever the app default says.
@@ -12139,8 +12148,9 @@ fn a_pushed_window_reparses_the_reader() {
     assert!(fx.0.iter().any(|e| matches!(e, Effect::WindowAdopted)));
     let read = s.view.read.as_ref().unwrap();
     assert_eq!(
-        read.text, "# Title\n\nChanged.\n",
-        "re-parsed from the push"
+        read.blocks,
+        aether_client::markdown::parse("# Title\n\nChanged.\n"),
+        "re-adopted from the push"
     );
     assert_eq!(read.revision, 2);
     assert_eq!(read.hl_gen, gen + 1);
@@ -12357,6 +12367,41 @@ fn read_click_activate_follows_a_link() {
             Effect::ShellAction(ShellAction::OpenUrl(url)) if url == "https://x.y"
         )),
         "the external link opens like Enter"
+    );
+}
+
+/// `Space t` on a footnote reference shows the definition's **text**, flattened from the parse.
+///
+/// Not its source: the popover renders plain text, so slicing the definition's span showed its
+/// markup through and led with the `[^1]:` marker that names the very footnote you are standing
+/// on.
+#[test]
+fn space_t_shows_a_footnote_definition_as_text_not_source() {
+    use aether_client::session::HoverText;
+    let mut s = md_session();
+    let _ = enter_reader(&mut s, "A claim[^1].\n\n[^1]: The **bold** definition.\n");
+    // On the reference itself (its span starts at byte 7, which is line 0 column 7).
+    s.view.buffer.cursor.position = aether_protocol::LogicalPosition { line: 0, col: 7 };
+    s.on_key(KeyCode::Char(' '), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None);
+    let shown =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::ShowHover(HoverText::Blocks(b)) if b.len() == 1 => Some(b[0].text.clone()),
+                _ => None,
+            })
+            .expect("the popover shows the definition");
+    assert!(
+        shown.contains("bold definition"),
+        "the definition's text is missing: {shown:?}"
+    );
+    assert!(
+        !shown.contains('*'),
+        "markup leaked into the popover: {shown:?}"
+    );
+    assert!(
+        !shown.contains("[^1]"),
+        "the label marker is not part of the definition: {shown:?}"
     );
 }
 
@@ -14114,14 +14159,14 @@ fn the_work_indicator_names_the_focused_run_and_counts_the_rest() {
     assert_eq!(s.work_indicator(), None);
 }
 
-/// A composed view containing a client-laid-out element is **not** the reading view.
+/// A composed view containing a prose element is **not** the reading view.
 ///
 /// The reader is a whole view — one element over its whole buffer, nothing around it — and the
-/// client recognised it by that element's *kind* alone. An agent's reply is laid out by the client
-/// too, so focusing one replaced the entire conversation with a reading view over that single
-/// block: the native client showed one paragraph and nothing else.
+/// client recognised it by that element's *kind* alone. An agent's reply is prose too, the very
+/// same element the reader is now made of, so focusing one replaced the entire conversation with
+/// a reading view over that single block: the native client showed one paragraph and nothing else.
 #[test]
-fn a_client_laid_out_block_does_not_turn_a_conversation_into_the_reader() {
+fn a_prose_block_does_not_turn_a_conversation_into_the_reader() {
     use aether_protocol::viewport::{Element, Window};
 
     // The reader itself still is one: one element, nothing around it.
@@ -14132,25 +14177,14 @@ fn a_client_laid_out_block_does_not_turn_a_conversation_into_the_reader() {
         "the reading view stopped recognising itself"
     );
 
-    // A conversation is not, even with the same kind of element in it and the cursor on it.
+    // A conversation is not, even with the very same element in it and the cursor on it.
     let mut s = session();
     let reader = reader_subscribe(s.view.buffer.buffer_id, "# Findings\n\nProse.");
-    let Element::Editor { lines, buffer, .. } = reader.window.root.clone() else {
-        panic!("the reader's window is one editor");
-    };
-    let block = Element::Editor {
-        element: 0,
-        buffer,
-        rows: lines.len() as u32,
-        first_row: aether_protocol::coords::ElementRow::ZERO,
-        laid_out_by: aether_protocol::ui::LayoutOwner::Client,
-        role: aether_protocol::ui::ElementRole::Field,
-        first_buffer_line: 0,
-        lines,
-    };
+    let block = reader.window.root.clone();
+    assert!(matches!(block, Element::Prose { .. }), "the reply is prose");
     let input = Element::Editor {
         element: 1,
-        buffer: buffer + 1,
+        buffer: s.view.buffer.buffer_id + 1,
         rows: 1,
         first_row: aether_protocol::coords::ElementRow::ZERO,
         laid_out_by: aether_protocol::ui::LayoutOwner::Server,

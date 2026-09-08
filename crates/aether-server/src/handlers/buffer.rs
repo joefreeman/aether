@@ -354,8 +354,9 @@ pub async fn syntax_highlight_snippet(
     Ok(aether_protocol::syntax::SyntaxHighlightSnippetResult { highlights })
 }
 
-/// Full buffer text at its current revision — the markdown reading view's content fetch. The whole
-/// rope is materialized; markdown documents are small, and the reading view is the only caller.
+/// Full buffer text at its current revision. The whole rope is materialized, so this is for
+/// documents rather than for logs: it was the reading view's content fetch, back when the client
+/// parsed its own markdown, and no shell has called it since the reader became prose.
 pub async fn buffer_content(
     state: &SharedState,
     _ctx: &mut ConnectionCtx,

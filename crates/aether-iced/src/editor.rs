@@ -540,33 +540,12 @@ where
         // nothing is loaded. It no longer walks the lines counting chrome and phantoms as it goes
         // — the count the terminal, this shell and the browser each did differently.
         let painted = grid::painted_rows(window, self.content.measured);
-        // Prose contributes no rows to the walk — the window carries its parse, not its lines — and
-        // its *type* is drawn by [`crate::prose`], a layer over this widget. What stays here is the
-        // ground under it: every other content row paints the editor's well over the app's, and
-        // without this the reply sat in a differently coloured well than the prompt above it and
-        // the input below.
-        let origins = grid::element_origins(&window.root, self.content.measured);
-        for node in window.root.content() {
-            let ViewElement::Prose { element, .. } = node else {
-                continue;
-            };
-            let Some(place) = origins.get(element).copied() else {
-                continue;
-            };
-            let left = place.inset.left;
-            let y = bounds.y + PAD + place.row.get() as f32 * unit_px - scroll;
-            let height = self.content.measured.height(node) as f32 * unit_px;
-            fill(
-                renderer,
-                Rectangle {
-                    x: content_left_of(left),
-                    y,
-                    width: (bounds.width - (left + GUTTER_COLS) as f32 * cell.width).max(0.0),
-                    height,
-                },
-                p.bg,
-            );
-        }
+        // Prose contributes no rows to the walk — the window carries its parse, not its lines —
+        // and its *type* is drawn by [`crate::prose`], a layer over this widget. Nothing is
+        // painted for it here: the pane's own fill is the app's ground, which is the surface a
+        // rendered document belongs on. This used to lay the editor's well under a reply so it
+        // matched the rows around it; the backgrounds now split by what a surface *is*, and a
+        // reply is not text you can put a cursor in.
         for (abs_row, item) in &painted {
             let (abs_row, item) = (*abs_row, item);
             let y = bounds.y + PAD + abs_row.row.get() as f32 * unit_px - scroll;

@@ -120,7 +120,12 @@ pub enum SpanKind {
     TaskDone,
     /// List bullets / numbers / task checkboxes.
     Marker,
-    /// The quote bar (`┃ `) — coloured by the alert kind when present.
+    /// The quote bar (`▎ `) — coloured by the alert kind when present.
+    ///
+    /// A left-flush block glyph, not a box-drawing `┃`: the box glyph is centred in its cell, so
+    /// with a panel behind the quote a sliver of the shade showed to its left and the bar read as
+    /// floating rather than as the panel's edge. The same quarter block the reading-position bar
+    /// uses — the two are told apart by colour, which is the distinction that carries at a glance.
     QuoteBar(Option<AlertKind>),
     /// The alert's label row text ("Note", "Warning", …).
     AlertLabel(AlertKind),
@@ -460,7 +465,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
         } => layout_list(*ordered, *start, items, ctx, own, cols, out),
         Block::Quote { alert, content, .. } => {
             let bar = ReadSpan {
-                text: "┃ ".into(),
+                text: "▎ ".into(),
                 style: SpanStyle::plain(SpanKind::QuoteBar(*alert)),
                 element: None,
                 syntax: None,
@@ -551,7 +556,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
         }
         Block::FrontMatter { text, .. } => {
             // The dim literal panel's terminal projection: a thin light rule beside dim italic
-            // lines — lighter than the quote's heavy `┃` bar, marking literal metadata rather
+            // lines — a different mark from the quote's `▎` bar, for literal metadata rather
             // than speech (web/iced draw the same thin rule in NORD2).
             for line in text.lines() {
                 out.push(ReadRow {
@@ -1318,7 +1323,7 @@ mod tests {
         let els = stops(&blocks);
         let text = rows_text(&layout(&blocks, &els, 20, &Default::default()));
         // The bar and the marker *are* the row when there's no content to ride.
-        assert!(text.contains(&"┃ ".to_string()), "quote bar row: {text:?}");
+        assert!(text.contains(&"▎ ".to_string()), "quote bar row: {text:?}");
         assert!(
             text.contains(&"• ".to_string()),
             "item marker row: {text:?}"
@@ -1563,8 +1568,8 @@ mod tests {
         let els = stops(&blocks);
         let rows = layout(&blocks, &els, 30, &Default::default());
         let text = rows_text(&rows);
-        assert_eq!(text[0], "┃ Warning");
-        assert_eq!(text[1], "┃ Careful now.");
+        assert_eq!(text[0], "▎ Warning");
+        assert_eq!(text[1], "▎ Careful now.");
         assert!(matches!(
             rows[0].spans[0].style.kind,
             SpanKind::QuoteBar(Some(AlertKind::Warning))
@@ -2021,10 +2026,15 @@ pub fn block_rows(
     let first = line_of(start);
     let last = line_of(end.saturating_sub(1).max(start));
     let top = grid::line_top_row(window, element, first, measured)?;
+    // Past the last line there is no row to take: the block closes the document, so its bottom is
+    // the element's own end. Found among the view's *content* elements — the reader's is prose,
+    // and asking only the editors answered `None` for every last block in it.
     let bottom = grid::line_top_row(window, element, last + 1, measured).or_else(|| {
-        let node = window.root.editors().into_iter().find(|n| {
-            matches!(n, aether_protocol::viewport::Element::Editor { element: e, .. } if *e == element)
-        })?;
+        let node = window
+            .root
+            .content()
+            .into_iter()
+            .find(|n| n.field_id() == Some(element))?;
         let start = grid::element_start_row(window, element, measured)?;
         Some(start.saturating_add(measured.height(node)))
     });
@@ -2171,8 +2181,11 @@ pub struct ReadElement {
 /// the tree becomes rows of styled spans, at `cols` columns.
 ///
 /// A prose element has **no wire rows**: the window carries its parse, not its lines, so there is
-/// nothing to fetch and no source line for an offset to name. It measures as one indivisible
-/// thing, which is what `starts` being a single zero says.
+/// nothing to fetch. This measures it as one indivisible thing — `starts` a single zero — which is
+/// what an agent's reply is: a block of a conversation, addressed as a whole and never by a line
+/// inside it. The reading view is the other case, where the server's cursor names a line of the
+/// document: it measures per line instead, through [`measured_element`], off the same table the
+/// window now carries beside the parse.
 ///
 /// `units_per_row` is the shell's [`crate::grid::Measured`] resolution, so the height comes back in
 /// the units that shell scrolls by.

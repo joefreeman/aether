@@ -1312,9 +1312,14 @@ pub struct Session {
 }
 
 /// The markdown reading view of the current buffer: the parsed document, its navigable element
-/// list, and the source text they were parsed from. Present iff the buffer is displayed as a
+/// list, and the shape of the text they were parsed from. Present iff the buffer is displayed as a
 /// reading view — [`Session::mode`] is `Read` whenever this is `Some`, except while a search prompt
 /// entered *from* Read holds the keyboard.
+///
+/// **No source text.** The window carries an [`Element::Prose`](aether_protocol::ui::Element) —
+/// the server's parse and its line table — and every question this used to answer by slicing the
+/// document is now answered either from the parse or by the server, which owns the buffer. What is
+/// left of the source here is its shape, which is all a position ever needed of it.
 ///
 /// There is no focus field: the focused element is a pure function of the server cursor
 /// ([`Self::focus`]), so outline jumps, jumplist steps and search all land correctly with no extra
@@ -1322,16 +1327,15 @@ pub struct Session {
 pub struct ReadView {
     pub buffer_id: BufferId,
     /// Content revision the document was parsed at; a change notification with a newer revision
-    /// triggers a re-fetch.
+    /// marks the parse stale until the next window re-parses it.
     pub revision: u64,
-    /// The source text (for span → text slices and byte ↔ position conversion).
-    pub text: String,
     pub blocks: Vec<crate::markdown::Block>,
     pub elements: Vec<crate::markdown::Stop>,
-    /// Byte offset of each line start in `text`, for byte ↔ `LogicalPosition` conversion.
-    line_starts: Vec<u32>,
-    /// A content fetch is in flight (`true` until the first parse adopts, and again during a
-    /// re-fetch after an external change).
+    /// Where the parsed text's lines begin and how long it is, off the wire beside the parse —
+    /// what byte ↔ [`LogicalPosition`] conversion is made of.
+    source: aether_protocol::ui::SourceLines,
+    /// The parse is stale: no window has carried this document yet, or an edit of our own moved
+    /// the text under it and the re-parse is still a round trip away.
     pub loading: bool,
     /// Fenced-code tree-sitter highlights, keyed by the code block's span start — filled
     /// asynchronously from `syntax/highlight_snippet` results; offsets index the block's `code`
@@ -1349,15 +1353,14 @@ pub struct ReadView {
 }
 
 impl ReadView {
-    /// An empty view awaiting its first `buffer/content` result.
+    /// An empty view awaiting the first window that carries its prose.
     pub fn loading(buffer_id: BufferId) -> Self {
         ReadView {
             buffer_id,
             revision: 0,
-            text: String::new(),
             blocks: Vec::new(),
             elements: Vec::new(),
-            line_starts: Vec::new(),
+            source: Default::default(),
             loading: true,
             code_highlights: std::collections::HashMap::new(),
             hl_gen: 0,
@@ -1365,18 +1368,19 @@ impl ReadView {
         }
     }
 
-    /// Adopt fetched content: parse and index it. Fence highlights reset — the spans they were
-    /// keyed to may have moved — and re-request via the update loop.
-    pub fn adopt(&mut self, revision: u64, text: String) {
-        self.blocks = crate::markdown::parse(&text);
-        self.elements = crate::markdown::stops(&self.blocks);
-        self.line_starts = std::iter::once(0)
-            .chain(
-                text.char_indices()
-                    .filter_map(|(i, c)| (c == '\n').then_some(i as u32 + 1)),
-            )
-            .collect();
-        self.text = text;
+    /// Adopt the document a window's prose element carries: the server's parse, and the line table
+    /// that places it. Only the stop list is derived here — it is an index into the parse, not a
+    /// second opinion about it. Fence highlights reset, since the spans they were keyed to may
+    /// have moved, and re-request via the update loop.
+    pub fn adopt(
+        &mut self,
+        revision: u64,
+        blocks: Vec<crate::markdown::Block>,
+        source: aether_protocol::ui::SourceLines,
+    ) {
+        self.elements = crate::markdown::stops(&blocks);
+        self.blocks = blocks;
+        self.source = source;
         self.revision = revision;
         self.loading = false;
         // Newer content outranks a parse held back for an anchor landing.
@@ -1385,31 +1389,68 @@ impl ReadView {
         self.hl_gen += 1;
     }
 
-    /// The byte offset of a cursor position, clamped to the text *and* to a char boundary.
+    /// [`Self::adopt`] from source text, standing in for the server's parse of it.
     ///
-    /// The boundary clamp is not defensive tidiness: cursors arrive from the server at the
-    /// current revision while this parse may still be a revision behind (an edit adopts its new
-    /// cursor a round trip before the re-parse lands), so a byte column measured on one document
-    /// can land mid-character when applied to another. Every reading-view slice is indexed with
-    /// what this returns, and `&str` indexing inside a multi-byte char panics — taking the whole
-    /// client down, wasm shell included. Clamp once, here, rather than at each use.
+    /// Tests only, and deliberately the only place in the client that parses markdown: what
+    /// arrives at runtime is a parse the server made, and a client that could make its own would
+    /// eventually be asked to.
+    #[cfg(test)]
+    pub(crate) fn adopt_source(&mut self, revision: u64, text: &str) {
+        self.adopt(
+            revision,
+            crate::markdown::parse(text),
+            aether_protocol::ui::SourceLines::of(text),
+        );
+    }
+
+    /// The byte offset of a cursor position, clamped to the document's length.
+    ///
+    /// It used to clamp to a **char boundary** as well, and that was not tidiness: cursors arrive
+    /// at the current revision while this parse may still be a revision behind, so a byte column
+    /// measured on one document can land mid-character in another, and every reading-view slice
+    /// was indexed with what this returns — `&str` indexing inside a multi-byte char panics, which
+    /// took the whole client down, wasm shell included.
+    ///
+    /// There are no slices here any more. Copy, the footnote popover and every block-edge
+    /// resolution ask the server, which owns the buffer, so what this returns is only ever
+    /// *compared* against block spans. A byte landing mid-character can now at worst pick a
+    /// neighbouring stop for one frame — which is what let the source text go.
     pub fn byte_of(&self, pos: LogicalPosition) -> u32 {
-        let line = (pos.line as usize).min(self.line_starts.len().saturating_sub(1));
-        let start = self.line_starts.get(line).copied().unwrap_or(0);
-        let mut at = (start + pos.col).min(self.text.len() as u32) as usize;
-        while at > 0 && !self.text.is_char_boundary(at) {
-            at -= 1;
-        }
-        at as u32
+        let starts = &self.source.starts;
+        let line = (pos.line as usize).min(starts.len().saturating_sub(1));
+        let start = starts.get(line).copied().unwrap_or(0);
+        (start + pos.col).min(self.source.byte_len)
+    }
+
+    /// The document's length in bytes.
+    pub fn byte_len(&self) -> u32 {
+        self.source.byte_len
+    }
+
+    /// Whether a window's line table is the one this parse was adopted with — half of "is this
+    /// the document we already have", the parse itself being the other half.
+    pub fn same_source(&self, source: &aether_protocol::ui::SourceLines) -> bool {
+        self.source == *source
+    }
+
+    /// How many lines the document has.
+    ///
+    /// Off the line table, which holds one entry per line by construction. It reads as a detail
+    /// and is not one — this and [`Self::pos_of`] are what the reading view's *measurement* is
+    /// made of, and a document that arrives as a parse has no text to count lines in: the table
+    /// the wire sends beside the parse is the whole answer.
+    pub fn line_count(&self) -> u32 {
+        self.source.line_count()
     }
 
     /// The `LogicalPosition` of a byte offset (line via binary search; col is a byte col).
     pub fn pos_of(&self, byte: u32) -> LogicalPosition {
-        let line = match self.line_starts.binary_search(&byte) {
+        let starts = &self.source.starts;
+        let line = match starts.binary_search(&byte) {
             Ok(i) => i,
             Err(i) => i.saturating_sub(1),
         };
-        let start = self.line_starts.get(line).copied().unwrap_or(0);
+        let start = starts.get(line).copied().unwrap_or(0);
         LogicalPosition {
             line: line as u32,
             col: byte.saturating_sub(start),
@@ -1450,12 +1491,15 @@ impl ReadView {
     /// drawn on is the block a step moves from.
     pub fn focus_byte(&self, cursor: LogicalPosition) -> u32 {
         let byte = self.byte_of(cursor);
-        let on_newline = self.text.as_bytes().get(byte as usize) == Some(&b'\n');
-        let line_start = self
-            .line_starts
-            .get(cursor.line as usize)
-            .copied()
-            .unwrap_or(0);
+        // A byte is a line's terminator exactly when the next line begins one past it, which the
+        // line table says without consulting the text — and this document arrived as a parse, so
+        // there is no text to consult. The line is the byte's own, not the cursor's, so an
+        // over-long column resolves the same way it did when this read the source.
+        let starts = &self.source.starts;
+        let on_newline = starts
+            .get(self.pos_of(byte).line as usize + 1)
+            .is_some_and(|next| *next == byte.saturating_add(1));
+        let line_start = starts.get(cursor.line as usize).copied().unwrap_or(0);
         if on_newline && byte > line_start {
             byte - 1
         } else {
@@ -1572,84 +1616,10 @@ impl ReadView {
         (first, last)
     }
 
-    /// The block range under the selection — `(top, bottom, whole)`: top/bottom element
-    /// indices plus whether the selection already covers those blocks whole (whole-line at
-    /// both ends). A point cursor resolves to the focused block, not-whole. A range edge on a
-    /// separator line resolves forward at the top and back at the bottom, so the range never
-    /// rounds outward past its own blocks.
-    pub fn selection_blocks(
-        &self,
-        cursor: &aether_protocol::cursor::CursorState,
-    ) -> Option<(usize, usize, bool)> {
-        let (a, p) = (self.byte_of(cursor.anchor), self.byte_of(cursor.position));
-        let (min, max) = (a.min(p), a.max(p));
-        // Resolution shared with the server's structural edits — the one definition of "which
-        // blocks does this selection cover" (aether-markdown): a point resolves like
-        // [`Self::block_focus`] (innermost containing block), a range by whole-line extent.
-        let (tb, bb) =
-            crate::markdown::edit::selection_block_range(&self.text, &self.elements, min, max)?;
-        let (ts, bs) = (self.elements[tb].span(), self.elements[bb].span());
-        Some((
-            tb,
-            bb,
-            !cursor.is_point() && min <= ts.start && max + 1 >= bs.end,
-        ))
-    }
-
-    /// The append byte of `elements[idx]`'s block: the caret gap *before* this byte is "after the
-    /// last content char" — the terminating newline when present, or one past the span for a final
-    /// block without one. `i`/`a`/`Ctrl-o`'s landing math.
-    ///
-    /// Trailing blank lines are walked off first. Separator blanks belong to the gaps *between*
-    /// blocks, but a loose list item's parser span swallows the one after it, so the raw
-    /// last byte was the separator's newline and `a` landed a line low — typing then opened a new
-    /// block in the gap instead of extending the item.
-    pub fn block_append_byte(&self, idx: usize) -> u32 {
-        let span = self.elements[idx].span();
-        let base = span.start as usize;
-        let end = (span.end as usize).min(self.text.len()).max(base);
-        let content = &self.text[base..end];
-        let bytes = content.as_bytes();
-        // Walk back over whole blank lines: `cut` ends on the last content line's terminator.
-        let mut cut = bytes.len();
-        while cut > 0 {
-            let ls = bytes[..cut - 1]
-                .iter()
-                .rposition(|b| *b == b'\n')
-                .map_or(0, |i| i + 1);
-            if !content[ls..cut].trim().is_empty() {
-                break;
-            }
-            cut = ls;
-        }
-        match bytes.get(cut.wrapping_sub(1)) {
-            Some(b'\n') => (base + cut - 1) as u32,
-            _ => (base + cut) as u32,
-        }
-    }
-
-    /// The byte of the last *content* char of `elements[idx]` — excluding the block's terminating
-    /// newline when present. The end of `Ctrl-e`'s content-only change range: the newline (and
-    /// every separator) survives the rewrite, so the document's block structure does.
-    pub fn block_content_end(&self, idx: usize) -> u32 {
-        let span = self.elements[idx].span();
-        let end = (span.end as usize).min(self.text.len());
-        let content = &self.text[span.start as usize..end];
-        let content = content.strip_suffix('\n').unwrap_or(content);
-        match content.char_indices().last() {
-            Some((i, _)) => span.start + i as u32,
-            None => span.start,
-        }
-    }
-
-    /// The source text of an element's span, for `Ctrl-c` copies.
-    pub fn slice(&self, span: crate::markdown::Span) -> &str {
-        let (s, e) = (
-            span.start as usize,
-            (span.end as usize).min(self.text.len()),
-        );
-        self.text.get(s..e).unwrap_or("")
-    }
+    // No `slice` here any more. Cutting a span out of the buffer was what copy and the footnote
+    // popover used, and both now get their text from the parse or from the server — so the
+    // affordance goes with them rather than waiting to be picked up again by something that has
+    // no source to slice.
 }
 
 /// The toast group key identifying one LSP *server instance* — `language` + its `workspace_root`,
@@ -1807,12 +1777,6 @@ impl Session {
             .into_iter()
             .flat_map(|g| g.rows)
             .collect()
-    }
-
-    /// Forget a content anchor captured for a re-presentation the shell will not need it for —
-    /// a sibling view that remembers its own scroll positions itself.
-    pub(crate) fn forget_scroll_anchor(&mut self) {
-        self.view.relayout_anchor = None;
     }
 
     /// Capture a content scroll anchor for the current view, ahead of a wrap/diff re-layout. The
@@ -2218,66 +2182,36 @@ mod tests {
         assert_eq!(boot_backoff(30), reconnect_backoff(10));
     }
 
+    /// A byte offset is clamped to the document's length, and a cursor a revision ahead of the
+    /// parse resolves to *some* stop rather than falling over.
+    ///
+    /// This used to assert the offset was a char boundary, because every reading-view slice was
+    /// indexed with it and `&str` indexing mid-character panics. There are no slices here now —
+    /// copy, the footnote popover and the block edges all ask the server — so what is left to
+    /// guarantee is that the offset stays inside the document and still resolves.
     #[test]
-    fn block_append_byte_parks_before_the_blocks_own_terminator() {
-        // A loose list item's span swallows the blank line after it, so the raw last byte was
-        // the *separator's* newline: `a` landed on the blank line between the bullets and typing
-        // opened a new top-level block in the gap instead of extending the item.
+    fn read_view_byte_of_stays_inside_the_document() {
         let mut read = ReadView::loading(1);
-        let text = "- First para.\n\n  Second para.\n\n- Next item.\n".to_string();
-        read.adopt(1, text.clone());
-        let item = read
-            .elements
-            .iter()
-            .position(|e| matches!(e, crate::markdown::Stop::Item { .. }))
-            .expect("the item is an element");
-        let at = read.block_append_byte(item) as usize;
-        assert_eq!(&text[at..at + 1], "\n");
-        assert!(
-            text[..at].ends_with("Second para."),
-            "parks on the item's own terminator, not the separator below it: {:?}",
-            &text[..at]
-        );
-        // A final block without a trailing newline still appends one past its last char — and
-        // that char being multi-byte doesn't move it.
-        let mut read = ReadView::loading(1);
-        read.adopt(1, "Alpha.\n\nCafé".to_string());
-        let last = read.elements.len() - 1;
-        assert_eq!(
-            read.block_append_byte(last) as usize,
-            "Alpha.\n\nCafé".len()
-        );
-    }
+        let text = "Alpha — beta.\n\nGamma.\n".to_string();
+        read.adopt_source(1, &text);
 
-    #[test]
-    fn read_view_byte_of_clamps_to_a_char_boundary() {
-        // A cursor is adopted from an edit's own reply while this parse is still a revision
-        // behind, so a byte column measured on the new document gets applied to the old one and
-        // can land inside a multi-byte char. Every reading-view slice indexes with `byte_of`, and
-        // `&str` indexing there panics — so it clamps back to the boundary instead.
-        let mut read = ReadView::loading(1);
-        read.adopt(1, "Alpha — beta.\n\nGamma.\n".to_string());
+        // Inside the em dash: a column measured on another revision of this document.
         let em_dash = "Alpha ".len() as u32; // the dash occupies 6..9
         for col in em_dash..em_dash + 3 {
-            let at = read.byte_of(LogicalPosition { line: 0, col });
+            let pos = LogicalPosition { line: 0, col };
+            assert!(read.byte_of(pos) <= read.byte_len());
             assert!(
-                read.text.is_char_boundary(at as usize),
-                "col {col} resolved to {at}, inside a char"
+                read.focus(pos).is_some(),
+                "col {col} resolved to no element at all"
             );
         }
-        // Past the end of the text clamps to its length, still a boundary.
+        // Past the end clamps to the document's length.
         let end = read.byte_of(LogicalPosition {
             line: 99,
             col: 9999,
         });
-        assert_eq!(end as usize, read.text.len());
-        // And the block ops that slice with it resolve rather than panic.
-        let cursor = aether_protocol::cursor::CursorState {
-            anchor: LogicalPosition { line: 0, col: 7 },
-            position: LogicalPosition { line: 2, col: 3 },
-            ..Default::default()
-        };
-        assert!(read.selection_blocks(&cursor).is_some());
+        assert_eq!(end, read.byte_len());
+        assert_eq!(end as usize, text.len());
     }
 
     #[test]
@@ -2289,5 +2223,67 @@ mod tests {
         // Capped: attempts 5+ all wait 5s.
         assert_eq!(reconnect_backoff(5), Duration::from_millis(5000));
         assert_eq!(reconnect_backoff(50), Duration::from_millis(5000));
+    }
+
+    /// Every position of every document resolves its focus byte exactly as the rule that read
+    /// the source did: step back off a line's terminating newline, and nowhere else.
+    ///
+    /// Exhaustive over lines and columns, including columns past the end of their line, because
+    /// that is the case where "the byte's line" and "the cursor's line" come apart and a cursor a
+    /// revision ahead of the parse can genuinely land there.
+    #[test]
+    fn the_terminator_rule_matches_the_one_that_read_the_source() {
+        for text in ["a\nbb\n\nccc", "x\n", "\n\n", "one\ntwo\nthree\n", ""] {
+            let mut read = ReadView::loading(1);
+            read.adopt_source(1, text);
+            for line in 0..read.line_count() {
+                for col in 0..10u32 {
+                    let pos = LogicalPosition { line, col };
+                    let byte = read.byte_of(pos);
+                    // The rule as it was, straight off the source.
+                    let was_newline = text.as_bytes().get(byte as usize) == Some(&b'\n');
+                    let line_start = read.source.starts.get(line as usize).copied().unwrap_or(0);
+                    let want = if was_newline && byte > line_start {
+                        byte - 1
+                    } else {
+                        byte
+                    };
+                    assert_eq!(
+                        read.focus_byte(pos),
+                        want,
+                        "{text:?} at line {line} col {col}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The line table holds exactly one entry per line, so counting it and splitting the text
+    /// agree — for a trailing newline, for no trailing newline, and for nothing at all.
+    ///
+    /// Pinned because measurement counts lines this way and the source text is the thing a
+    /// reading view sent as a parse would not have. The three shells all size their measured
+    /// element by this, and a table one short of the split would silently drop the document's
+    /// last line out of every scroll, anchor and reveal.
+    #[test]
+    fn the_line_table_counts_the_same_lines_the_text_does() {
+        for text in [
+            "",
+            "\n",
+            "one",
+            "one\n",
+            "one\ntwo",
+            "one\ntwo\n",
+            "# H\n\nbody\n\n- a\n- b\n",
+            "trailing blanks\n\n\n",
+        ] {
+            let mut read = ReadView::loading(1);
+            read.adopt_source(1, text);
+            assert_eq!(
+                read.line_count() as usize,
+                text.split('\n').count(),
+                "line count disagrees for {text:?}"
+            );
+        }
     }
 }

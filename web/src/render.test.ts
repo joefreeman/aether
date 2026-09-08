@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { renderBuffer } from "./render";
+import { MEASURABLE_BLOCKS, renderReply } from "./read";
 import { editorsOf, paintedRows, totalRows } from "./protocol";
 import { WHOLE_ROWS } from "./protocol";
 import type { BufferWindow, CursorState, LogicalLineRender, Measured, ViewNode } from "./protocol";
@@ -439,8 +440,16 @@ describe("the box stylesheet", () => {
       css.indexOf(".row.patch-chrome {"),
       "the chrome rule must follow the plain `.row` one it overrides",
     ).toBeGreaterThan(css.indexOf(".row {"));
-    // Prose is an editor element too, so the whole reading pane is a well.
-    expect(rule("#buffer.md-read-host {")).toContain("background: var(--bg)");
+    // A rendered document is read, not edited: the page is the ground, and so is a reply.
+    expect(rule("#buffer.md-read-host {")).toContain("background: var(--bg-app)");
+    expect(rule(".md-reply-box {")).toContain("background: var(--bg-app)");
+    // A quote is a panel, at the quieter of the two lifts; literal source is not a panel at all.
+    expect(rule(".md-read blockquote {")).toContain("background: var(--md-panel-bg)");
+    expect(rule(".md-read .md-rawhtml,")).toContain("background: none");
+    // The code panels inside a document are the exception, and they are the well itself.
+    expect(rule(":root {"), "the code panel is the editor's well").toContain(
+      "--md-code-bg: var(--nord0)",
+    );
     // The retired role must not linger in either theme block or any rule.
     expect(css, "--patch-chrome-bg is retired; the ground is one role").not.toContain(
       "--patch-chrome-bg",
@@ -876,6 +885,52 @@ describe("a prose element", () => {
       c.classList.contains("md-reply-box") ? "reply" : c.textContent,
     );
     expect(order).toEqual(["before", "reply", "after"]);
+  });
+});
+
+describe("what the reader measures", () => {
+  /** A span-stamped node is one of two grains, and only one of them is measured.
+   *
+   *  Focus marking finds a node by span whichever grain it is, so both carry `data-espan`. The
+   *  measurement probe must take block-grain nodes alone: the core reads the innermost span
+   *  covering a source line as that line's top, an interactive span is shorter than the paragraph
+   *  around it, and a line that merely contains a link would otherwise take the link's top rather
+   *  than its own. The GUI stamps blocks and items only, so measuring every stamp here made the
+   *  two shells disagree about a height — the one thing the shared measuring rule exists to stop.
+   */
+  const spansOf = (root: HTMLElement, sel: string): string[] =>
+    [...root.querySelectorAll(sel)].map((n) => (n as HTMLElement).dataset.espan ?? "");
+
+  const doc = (): HTMLElement => {
+    const container = document.createElement("div");
+    renderReply(container, [
+      {
+        kind: "paragraph",
+        span: { start: 0, end: 40 },
+        content: [
+          { kind: "text", text: "see " },
+          { kind: "link", href: "http://x", content: [{ kind: "text", text: "this" }], span: { start: 4, end: 12 } },
+          { kind: "footnote_ref", label: "a", span: { start: 20, end: 24 } },
+        ],
+      },
+      { kind: "code", language: "rust", code: "fn a() {}", span: { start: 41, end: 60 } },
+      { kind: "image", src: "pic.png", alt: "p", span: { start: 61, end: 80 }, inner_span: { start: 62, end: 79 } },
+    ] as unknown as MdBlock[]);
+    return container;
+  };
+
+  it("measures the block-grain stamps and not the interactive ones inside them", () => {
+    const root = doc();
+    // The paragraph, the fence, and the display image's wrapper. Not the link, the footnote ref,
+    // or the image markup itself.
+    expect(spansOf(root, MEASURABLE_BLOCKS)).toEqual(["0:40", "41:60", "61:80"]);
+  });
+
+  it("still stamps the interactive nodes, so focus can find them", () => {
+    const root = doc();
+    expect(spansOf(root, "[data-etarget]")).toEqual(["4:12", "20:24", "62:79"]);
+    // Findable by span exactly as a block is — this is what `markFocus` looks up.
+    expect(root.querySelector('[data-espan="4:12"]')?.tagName).toBe("A");
   });
 });
 

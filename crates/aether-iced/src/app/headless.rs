@@ -613,18 +613,22 @@ fn editor_rows_are_the_well_and_the_pane_around_them_is_the_ground() {
     }
 }
 
-/// The reading view is a well too, edge to edge.
+/// The reading view is the app's **ground**, edge to edge.
 ///
-/// Prose is an editor element, so the whole reading pane is the editor's shade: every row in it is
-/// document, with no chrome rows for the ground to show through between. The pane used to take
-/// that shade from the base iced theme by accident — nothing painted a background at all — which
-/// stopped being the editor's shade the moment the app's ground became a role of its own.
+/// The well is for text you can put a cursor in; a rendered document is read, so the page takes
+/// the shade everything that is not a row of buffer text takes. (It painted the well until the
+/// backgrounds were split by what a surface *is* rather than by which element carried it — and
+/// before that it painted nothing at all, taking iced's own theme by accident.)
 #[test]
-fn the_reading_view_is_one_well_from_edge_to_edge() {
+fn the_reading_view_is_one_ground_from_edge_to_edge() {
+    // A quote with two children and a list in it: the shape that showed the panel banding, one
+    // page-coloured bar per child, when a child's focus wrapper assumed it sat on the page.
+    let text = "# Reading\n\nProse sits on the app's ground.\n\n> A quote, holding a paragraph\n> and a list:\n>\n> - first item\n> - second item\n\nAfter the quote, with `a chip` in it.\n\n| Name | Role |\n| --- | --- |\n| Ada | Engineer |\n| Bo | Designer |\n";
     let mut read = aether_client::session::ReadView::loading(7);
     read.adopt(
         1,
-        "# Reading\n\nProse sits in the editor's own shade.\n".into(),
+        aether_client::markdown::parse(text),
+        aether_protocol::ui::SourceLines::of(text),
     );
     let mut session = session_showing(plain_file());
     session.view.read = Some(read);
@@ -645,12 +649,12 @@ fn the_reading_view_is_one_well_from_edge_to_edge() {
     // Halfway down the empty part of the pane, below the document and above the status bar.
     let y = ((status.bounds.y / 2.0) * scale) as usize;
     assert!(
-        !columns_painted(&frame, y, rgb(p.bg)).is_empty(),
-        "the reading pane is the editor's well"
+        !columns_painted(&frame, y, rgb(p.bg_app)).is_empty(),
+        "the reading pane is the app's ground"
     );
     assert!(
-        columns_painted(&frame, y, rgb(p.bg_app)).is_empty(),
-        "…and no ground shows inside it"
+        columns_painted(&frame, y, rgb(p.bg)).is_empty(),
+        "…and no editor well shows inside it"
     );
     snapshot(&mut sim, &app, "reading-view");
 }
@@ -945,6 +949,7 @@ fn agent_view() -> Window {
     let prose = |element: u32, source: &str| ViewElement::Prose {
         element,
         blocks: aether_client::markdown::parse(source),
+        source: aether_protocol::ui::SourceLines::of(source),
     };
     window_of(vec![
         chrome("You"),
@@ -1074,5 +1079,227 @@ fn a_measured_reply_extends_the_scrollable_height() {
         rendered > unmeasured,
         "a measured reply ({rendered} rows) is no taller than the row an unmeasured one stands at \
          ({unmeasured}); this test can no longer tell whether the height was folded in"
+    );
+}
+
+/// `Space u` from the editor lands the reading view with the focused block **on screen**.
+///
+/// The switch captures a content anchor and this shell hands the whole placement to
+/// [`App::read_place_subscribed`] — `Message::Subscribed` stands the focus-change reveal down for
+/// the reader precisely because that function is supposed to rest the focus itself. It did not:
+/// the anchor branch returned first, so an anchor that named content far from the cursor (an
+/// editor scrolled away from it, which is the normal way to end up switching) opened the reader on
+/// that content with the focused block somewhere below the fold and nothing left to reveal it.
+///
+/// Driven through the real messages rather than the widgets, because keys never reach a simulated
+/// widget tree and the reader's geometry arrives as a probe result either way.
+#[test]
+fn a_switch_into_the_reader_rests_the_focus_the_anchor_left_off_screen() {
+    use aether_protocol::ui::SourceLines;
+    use aether_protocol::viewport::ViewportWindowResult;
+
+    // Forty paragraphs, two lines each: long enough that the cursor's block is far below an
+    // anchor pinned to the top of the document.
+    let text: String = (0..40).map(|n| format!("Paragraph {n}.\n\n")).collect();
+    let blocks = aether_client::markdown::parse(&text);
+    let stops = aether_client::markdown::stops(&blocks);
+
+    // The editor of that file, scrolled to the top with the cursor way below the loaded slice —
+    // so the capture pins the top line, as it does whenever the cursor is off screen.
+    let mut app = laid_out(app_showing(window_of(vec![editor(
+        0,
+        7,
+        0,
+        (0..10).map(|n| line(n, "Paragraph 0.")).collect(),
+    )])));
+    app.session.view.buffer.cursor.position = aether_protocol::LogicalPosition { line: 60, col: 0 };
+    app.session
+        .capture_scroll_anchor(aether_protocol::coords::VisualRow(0), 20_000, &app.measured);
+
+    // The reader's window arrives: one prose element carrying the parse and its line table.
+    let _ = app.session.adopt_window(ViewportWindowResult {
+        window: window_of(vec![ViewElement::Prose {
+            element: 0,
+            blocks: blocks.clone(),
+            source: SourceLines::of(&text),
+        }]),
+    });
+    assert!(
+        app.session.view.read.is_some(),
+        "the prose window did not become the reading view"
+    );
+
+    // What the probe would report: each block twice a row tall, in document order.
+    let row_px = app.cell.unwrap().height;
+    let view_h = 400.0;
+    let spans: Vec<(u32, u32, f32)> = stops
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.span().start, s.span().end, i as f32 * 2.0 * row_px))
+        .collect();
+    let content_h = stops.len() as f32 * 2.0 * row_px;
+    let _ = app.update(crate::app::Message::ReadMeasured(
+        Some(crate::app::ReadGeometry {
+            spans,
+            content_h,
+            view_h,
+            offset: 0.0,
+        }),
+        crate::app::ReadThen::Placement,
+    ));
+
+    // The focused block is the cursor's, and it is on screen — not left below the fold by an
+    // anchor that pinned the document's first line.
+    let (_, start, end) = app.read_focus_key().expect("a focused block");
+    let (top, bottom) = app
+        .read_block_px((start, end))
+        .expect("the block is measured");
+    let scroll = app.read_scroll_px;
+    assert!(
+        top >= scroll && bottom <= scroll + view_h,
+        "the focused block ({top}..{bottom}) is outside the viewport ({scroll}..{}) — the switch \
+         placed the document and never revealed the focus",
+        scroll + view_h
+    );
+}
+
+/// Leaving the reader captures the anchor from **the reader's** scroller.
+///
+/// This shell has two — `read_scroll_px` for the reading view, `scroll_px` for the editor — and
+/// picked between them on `session.view.read`. The core clears that at the keystroke, before the
+/// shell runs the `SaveContentAnchor` the same keystroke produced, so the capture read the
+/// editor's mirror: untouched since before the reader opened, so zero. The anchor pinned the top
+/// of the document, and `Space u` back to the editor threw away however far down you had read.
+///
+/// The window is the honest witness — it still holds the prose — and is what both scroller
+/// questions ask now.
+#[test]
+fn leaving_the_reader_anchors_where_the_reader_was() {
+    use aether_client::effect::{Effect, Effects};
+    use aether_protocol::ui::SourceLines;
+    use aether_protocol::viewport::ViewportWindowResult;
+
+    let text: String = (0..40).map(|n| format!("Paragraph {n}.\n\n")).collect();
+    let blocks = aether_client::markdown::parse(&text);
+    let stops = aether_client::markdown::stops(&blocks);
+
+    let mut app = laid_out(app_showing(window_of(vec![ViewElement::Prose {
+        element: 0,
+        blocks: blocks.clone(),
+        source: SourceLines::of(&text),
+    }])));
+    let _ = app.session.adopt_window(ViewportWindowResult {
+        window: window_of(vec![ViewElement::Prose {
+            element: 0,
+            blocks,
+            source: SourceLines::of(&text),
+        }]),
+    });
+
+    // Measured as drawn, and scrolled well down — the cursor's block in the middle of the screen.
+    let row_px = app.cell.unwrap().height;
+    let spans: Vec<(u32, u32, f32)> = stops
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.span().start, s.span().end, i as f32 * 2.0 * row_px))
+        .collect();
+    let _ = app.update(crate::app::Message::ReadMeasured(
+        Some(crate::app::ReadGeometry {
+            spans,
+            content_h: stops.len() as f32 * 2.0 * row_px,
+            view_h: 400.0,
+            offset: 0.0,
+        }),
+        crate::app::ReadThen::Refresh,
+    ));
+    app.session.view.buffer.cursor.position = aether_protocol::LogicalPosition { line: 60, col: 0 };
+    // Block 30 sits at 60 rows down; rest the viewport just above it, as reading there would.
+    app.read_scroll_px = 58.0 * row_px;
+    app.read_view_h = 400.0;
+    app.scroll_px = 0.0; // the editor's mirror: stale, and what this used to read
+
+    // `Space u` out of the reader: the core drops the reading view at the keystroke, *then* the
+    // shell runs the effect it produced.
+    app.session.view.read = None;
+    let _ = app.run_core(Effects::one(Effect::SaveContentAnchor));
+
+    let anchored = app
+        .session
+        .relayout_anchor_position()
+        .expect("the switch captured an anchor");
+    assert_eq!(
+        anchored.line, 60,
+        "the anchor pinned line {} — the capture read the editor's scroller, not the reader's",
+        anchored.line
+    );
+}
+
+/// A quote is **one panel**, not a bar per child.
+///
+/// Its children are reading stops in their own right, so each carries a focus wrapper — and a
+/// wrapper repaints an opaque background behind itself to keep the bar strip from bleeding
+/// through. While that background was hard-coded to the page, every child of a quote painted a
+/// page-coloured band across the quote's own panel: the quote came out striped, one bar per
+/// paragraph and list item, which is exactly what a container is not.
+#[test]
+fn a_quote_paints_one_panel() {
+    let text = "Before.\n\n> A quote, holding a paragraph\n> and a list:\n>\n> - first item\n> - second item\n\nAfter.\n";
+    let mut read = aether_client::session::ReadView::loading(7);
+    read.adopt(
+        1,
+        aether_client::markdown::parse(text),
+        aether_protocol::ui::SourceLines::of(text),
+    );
+    let mut session = session_showing(plain_file());
+    session.view.read = Some(read);
+    let app = app_with(session);
+    let p = crate::theme::palette(app.session.theme);
+    let rgb = |c: iced::Color| {
+        let b = c.into_rgba8();
+        [b[0], b[1], b[2]]
+    };
+    let mut sim = simulate(&app);
+    // The status bar shares this shade (it is the panel shade too), so the scan stops above it.
+    let status = seen(&mut sim)
+        .into_iter()
+        .find(|s| s.visible && s.text.contains("1:1"))
+        .expect("the status bar is on the frame");
+    let frame = pixels(&mut sim, &app);
+    let scale = frame.0 as f32 / WIDTH;
+    let floor = ((status.bounds.y - 4.0) * scale) as usize;
+
+    // Every row the quote's shade appears on, and the rows between the first and last of them.
+    let rows: Vec<usize> = (0..floor)
+        .filter(|y| !columns_painted(&frame, *y, rgb(p.md_panel_bg)).is_empty())
+        .collect();
+    assert!(
+        rows.len() > 10,
+        "the quote painted no panel at all (rows: {})",
+        rows.len()
+    );
+    let (top, bottom) = (rows[0], rows[rows.len() - 1]);
+    // The panel's own extent, from the rows that are unmistakably it.
+    let cols = columns_painted(&frame, top + 2, rgb(p.md_panel_bg));
+    let (left, right) = (cols[0] + 8, cols[cols.len() - 1] - 8);
+    // Inside those bounds nothing may paint the *page*: a child that repainted the page behind
+    // itself is precisely the banding, and it covers most of the panel's width where it happens.
+    let banded: Vec<usize> = (top..=bottom)
+        .filter(|y| {
+            columns_painted(&frame, *y, rgb(p.bg_app))
+                .iter()
+                .filter(|x| (left..=right).contains(x))
+                .count()
+                > (right - left) / 4
+        })
+        .collect();
+    assert!(
+        banded.is_empty(),
+        "{} rows inside the quote paint the page across it — a band per child, not one panel",
+        banded.len()
+    );
+    // And the page still shows outside it, so the panel has edges.
+    assert!(
+        !columns_painted(&frame, top.saturating_sub(6), rgb(p.bg_app)).is_empty(),
+        "no page above the quote"
     );
 }

@@ -914,6 +914,20 @@ fn draw_vertical_scrollbar(f: &mut Frame, area: Rect, offset: u16, total: u16, v
 /// Inputs are `u64` so the editor can pass full visual-row counts on very large files without
 /// the old `u16` ceiling.
 fn render_scrollbar(f: &mut Frame, area: Rect, offset: u64, total: u64, visible: u64) {
+    render_scrollbar_on(f, area, offset, total, visible, c(th().bg));
+}
+
+/// [`render_scrollbar`] over a given surface — the editor's well for a buffer, the app's ground
+/// for the reading view, whose page is the ground. The bar is opaque (it paints a whole column),
+/// so naming the wrong surface leaves a stripe of it down the edge of the view.
+fn render_scrollbar_on(
+    f: &mut Frame,
+    area: Rect,
+    offset: u64,
+    total: u64,
+    visible: u64,
+    surface: Color,
+) {
     let track_h = area.height;
     if track_h == 0 {
         return;
@@ -936,8 +950,8 @@ fn render_scrollbar(f: &mut Frame, area: Rect, offset: u64, total: u64, visible:
     // glyphs are centred in the cell, so the thumb reads as a denser stretch of one thin line
     // rather than a block punched out of it — and the thumb is a grey, not an accent, matching
     // the iced editor's theme-grey scrollbar.
-    let thumb_style = Style::default().fg(c(th().fg_dim)).bg(c(th().bg));
-    let track_style = Style::default().fg(c(th().bg_selection)).bg(c(th().bg));
+    let thumb_style = Style::default().fg(c(th().fg_dim)).bg(surface);
+    let track_style = Style::default().fg(c(th().bg_selection)).bg(surface);
     for i in 0..track_h {
         let in_thumb = i >= thumb_y && i < thumb_y + thumb_h;
         let glyph = if in_thumb { "┃" } else { "│" };
@@ -4828,10 +4842,12 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
         width: (content_cols + READ_GUTTER).min(area.width),
         height: area.height,
     };
-    // Fill the whole area (margins included) with the editor's base background, so the reading
-    // view sits on the same canvas as the buffer.
+    // Fill the whole area (margins included) with the app's **ground**: a rendered document is
+    // read, not edited, so it sits on the shade everything that is not a row of buffer text does.
+    // The well is for the editor, and for the code panels inside this page — which are the one
+    // part of a document that is still text of the kind an editor holds.
     f.render_widget(
-        Paragraph::new("").style(Style::default().bg(c(th().bg))),
+        Paragraph::new("").style(Style::default().bg(c(th().bg_app))),
         area,
     );
     if rv.rows.is_empty() {
@@ -4852,7 +4868,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                     text,
                     Style::default()
                         .fg(c(th().fg_faint))
-                        .bg(c(th().bg))
+                        .bg(c(th().bg_app))
                         // Slanted like the other shells' stand-in line, and like a transient
                         // buffer's status label: this app's mark for state over content.
                         // Terminals without italic support just show it upright.
@@ -4897,8 +4913,8 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 spans
                     .into_iter()
                     .map(|mut s| {
-                        if s.style.bg.is_none() || s.style.bg == Some(c(th().bg)) {
-                            s.style = s.style.bg(c(th().bg_selection));
+                        if s.style.bg.is_none() || s.style.bg == Some(c(th().bg_app)) {
+                            s.style = s.style.bg(c(th().bg_visual));
                         }
                         s
                     })
@@ -4906,9 +4922,9 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             )
         };
         let mut spans: Vec<Span> = vec![if row_focused {
-            Span::styled("▎ ", Style::default().fg(c(th().accent)).bg(c(th().bg)))
+            Span::styled("▎ ", Style::default().fg(c(th().accent)).bg(c(th().bg_app)))
         } else {
-            Span::styled("  ", Style::default().bg(c(th().bg)))
+            Span::styled("  ", Style::default().bg(c(th().bg_app)))
         }];
         // The language-tag row renders as a small "tab": panel background only under
         // ` json ` (the tag plus a space either side), the rest of the row on the page
@@ -4920,13 +4936,31 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             .position(|s| matches!(s.style.kind, SpanKind::CodeFrame))
         {
             for rs in &row.spans[..t] {
-                spans.push(Span::styled(rs.text.clone(), read_span_style(rs.style)));
+                let mut style = read_span_style(rs.style);
+                if let Some(bg) = read_row_band(&row.spans) {
+                    if style.bg.is_none() {
+                        style = style.bg(bg);
+                    }
+                }
+                spans.push(Span::styled(rs.text.clone(), style));
             }
             let tag = &row.spans[t];
-            spans.push(Span::styled(
-                format!("{} ", tag.text),
-                read_span_style(tag.style),
-            ));
+            let mut used =
+                READ_GUTTER as usize + row.spans[..t].iter().map(|s| s.text.width()).sum::<usize>();
+            let tag_text = format!("{} ", tag.text);
+            used += tag_text.width();
+            spans.push(Span::styled(tag_text, read_span_style(tag.style)));
+            // The panel opens *on this row*, not below it: the tag sits inside the block, as it
+            // does in the browser (`.md-codeblock` holds `.md-codeblock-lang`) and in the GUI.
+            // Left as a bare tag with the page behind the rest of the row, a fence inside a quote
+            // read as a hole punched in the quote's own fill.
+            let fill = (content.width as usize).saturating_sub(used);
+            if fill > 0 {
+                spans.push(Span::styled(
+                    " ".repeat(fill),
+                    Style::default().bg(c(th().md_code_bg)),
+                ));
+            }
             lines.push(finish_row(spans));
             continue;
         }
@@ -4943,7 +4977,17 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             let mut used = 2usize;
             for rs in prefix {
                 used += rs.text.width();
-                spans.push(Span::styled(rs.text.clone(), read_span_style(rs.style)));
+                // What stands in front of a panel — the quote bar, when the fence or table is
+                // inside a quote — belongs to the *quote*, not to the panel: it is the enclosing
+                // block showing past the one nested in it. Without this the bar cell fell back to
+                // the page and the quote's fill looked as though it stopped at the fence.
+                let mut style = read_span_style(rs.style);
+                if let Some(bg) = read_row_band(&row.spans) {
+                    if style.bg.is_none() {
+                        style = style.bg(bg);
+                    }
+                }
+                spans.push(Span::styled(rs.text.clone(), style));
             }
             let off = row
                 .element
@@ -5028,7 +5072,17 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             let mut used = 2usize;
             for rs in prefix {
                 used += rs.text.width();
-                spans.push(Span::styled(rs.text.clone(), read_span_style(rs.style)));
+                // What stands in front of a panel — the quote bar, when the fence or table is
+                // inside a quote — belongs to the *quote*, not to the panel: it is the enclosing
+                // block showing past the one nested in it. Without this the bar cell fell back to
+                // the page and the quote's fill looked as though it stopped at the fence.
+                let mut style = read_span_style(rs.style);
+                if let Some(bg) = read_row_band(&row.spans) {
+                    if style.bg.is_none() {
+                        style = style.bg(bg);
+                    }
+                }
+                spans.push(Span::styled(rs.text.clone(), style));
             }
             let off = row
                 .element
@@ -5047,7 +5101,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             } else {
                 avail
             };
-            let indicator = Style::default().fg(c(th().fg_dim)).bg(c(th().bg));
+            let indicator = Style::default().fg(c(th().fg_dim)).bg(c(th().bg_app));
             if overflows {
                 spans.push(Span::styled(if off > 0 { "…" } else { " " }, indicator));
             }
@@ -5082,7 +5136,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                         .collect()
                 };
                 let base = read_span_style(clipped[0].style);
-                let thumb = Style::default().fg(c(th().fg_dim)).bg(c(th().bg));
+                let thumb = Style::default().fg(c(th().fg_dim)).bg(c(th().bg_app));
                 spans.push(Span::styled(seg(0..tx), base));
                 spans.push(Span::styled(seg(tx..tx + tw).replace('─', "━"), thumb));
                 spans.push(Span::styled(seg(tx + tw..chars.len()), base));
@@ -5092,7 +5146,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 // two frame bars that close the row (`TableBorder`), so the box keeps its own
                 // edges. Spans with a background of their own (inline-code chips) keep it, so a
                 // chip still reads as a chip on top of the band.
-                let band = read_table_band(&row.spans);
+                let band = read_row_band(&row.spans);
                 for rs in &clipped {
                     let mut style = read_span_style(rs.style);
                     if let Some(bg) = band {
@@ -5112,7 +5166,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             if fill > 0 {
                 spans.push(Span::styled(
                     " ".repeat(fill),
-                    Style::default().bg(c(th().bg)),
+                    Style::default().bg(c(th().bg_app)),
                 ));
             }
             if overflows {
@@ -5124,18 +5178,36 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             lines.push(finish_row(spans));
             continue;
         }
+        // A quote is a panel: the band runs under its whole interior, not just behind the glyphs.
+        // (Tables band in their own branch above, where the pan window decides the width.)
+        let band = read_row_band(&row.spans);
+        let mut used = READ_GUTTER as usize;
         for rs in &row.spans {
             let mut style = read_span_style(rs.style);
+            if let Some(bg) = band {
+                if style.bg.is_none() {
+                    style = style.bg(bg);
+                }
+            }
             // The Enter target (the interactive span the cursor sits inside) inverts on top.
             if rs.element.is_some() && rs.element == rv.target_focus {
                 style = style.add_modifier(Modifier::REVERSED);
             }
+            used += rs.text.width();
             spans.push(Span::styled(rs.text.clone(), style));
+        }
+        if let Some(bg) = band {
+            // Out to the measure's edge, so a short line inside a quote does not leave the panel
+            // ragged — the other two shells fill a container, which is the same thing.
+            let fill = (content.width as usize).saturating_sub(used);
+            if fill > 0 {
+                spans.push(Span::styled(" ".repeat(fill), Style::default().bg(bg)));
+            }
         }
         lines.push(finish_row(spans));
     }
     f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(c(th().bg)).fg(c(th().fg))),
+        Paragraph::new(lines).style(Style::default().bg(c(th().bg_app)).fg(c(th().fg))),
         content,
     );
     // The same scrollbar the editor pane draws, in the area's rightmost column (over the
@@ -5148,7 +5220,14 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
             width: 1,
             height: area.height,
         };
-        render_scrollbar(f, track, rv.scroll as u64, total, area.height as u64);
+        render_scrollbar_on(
+            f,
+            track,
+            rv.scroll as u64,
+            total,
+            area.height as u64,
+            c(th().bg_app),
+        );
     }
 }
 
@@ -5172,12 +5251,24 @@ pub fn read_measure(term_cols: u16, width: MarkdownWidth) -> (u16, u16) {
 /// body row's cell padding [`SpanKind::TableStripe`], and the colour lives on that kind in
 /// [`read_span_style`]. Header and border rows carry no band — the header reads as the header
 /// through weight and colour, and the frame stays on the page background.
-fn read_table_band(spans: &[aether_client::read_layout::ReadSpan]) -> Option<Color> {
+fn read_row_band(spans: &[aether_client::read_layout::ReadSpan]) -> Option<Color> {
     use aether_client::read_layout::SpanKind as K;
-    spans
-        .iter()
-        .find(|s| matches!(s.style.kind, K::TableStripe))
-        .and_then(|s| read_span_style(s.style).bg)
+    // The two shapes that are a *panel* rather than plain prose: a banded table row, and a quote
+    // (its bar opens every row of one). Each takes its own shade — a stripe is small and can hold
+    // the chip's lift, a quote is large and takes the quieter one — and where the other two shells
+    // fill a container, this fills the row's interior.
+    //
+    // Literal source (raw HTML, front matter) is deliberately absent: it reads as itself, with the
+    // dim tone and the thin rule beside it and no panel at all.
+    spans.iter().find_map(|s| match s.style.kind {
+        // A header band, not weight alone: the browser and the GUI both give the header row the
+        // editor's well, and three clients disagreeing about one table is what this tidies.
+        K::TableHead => Some(c(th().md_code_bg)),
+        // A band and a quote are the same kind of surface, so they take the same shade — the
+        // chip's step is for a few characters, not for a row of a table.
+        K::TableStripe | K::QuoteBar(_) | K::AlertLabel(_) => Some(c(th().md_panel_bg)),
+        _ => None,
+    })
 }
 
 /// One row of a **composed view's** markdown element as a painted line.
@@ -5189,9 +5280,11 @@ fn read_table_band(spans: &[aether_client::read_layout::ReadSpan]) -> Option<Col
 fn markdown_row_line(row: &aether_client::read_layout::ReadRow, indent: u16) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     if indent > 0 {
+        // The ground, like the prose it precedes: a reply is not an editor row, and the indent is
+        // the same surface as the text after it.
         spans.push(Span::styled(
             " ".repeat(indent as usize),
-            Style::default().bg(c(th().bg)),
+            Style::default().bg(c(th().bg_app)),
         ));
     }
     for s in &row.spans {
@@ -5220,13 +5313,16 @@ fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
         K::Heading(3) => Style::default().fg(c(t.syn_type)),
         K::Heading(4) => Style::default().fg(c(t.fg_bright)),
         K::Heading(_) => Style::default().fg(c(t.fg)),
-        // Inline code: body-coloured text on the panel shade (matches the web chip).
-        K::Code => Style::default().fg(c(t.fg)).bg(c(t.md_code_bg)),
+        // Inline code: a chip lifted off the prose — the raised surface, where a *fenced* block
+        // takes the editor's own well below. Matches the web and GUI chips.
+        K::Code => Style::default().fg(c(t.fg)).bg(c(t.md_chip_bg)),
         K::CodeBlock => Style::default().fg(c(t.fg)).bg(c(t.md_code_bg)),
         // The pinned language tag on the panel: the overlay-border grey, over the panel
         // background so the pad row reads as one solid strip.
         K::CodeFrame => Style::default().fg(c(t.overlay_border)).bg(c(t.md_code_bg)),
-        K::Rule | K::TableBorder | K::TableDivider | K::Dim => Style::default().fg(c(t.fg_faint)),
+        K::Rule | K::Dim => Style::default().fg(c(t.fg_faint)),
+        // The frame takes the border role the other two shells draw their table's frame in.
+        K::TableBorder | K::TableDivider => Style::default().fg(c(t.border_subtle)),
         // A completed task item reads as done without becoming chrome: the muted shade —
         // still legible prose rather than `Dim`'s border grey.
         K::TaskDone => Style::default().fg(c(t.fg_muted)),
@@ -5236,11 +5332,10 @@ fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
         K::QuoteBar(None) => Style::default().fg(c(t.fg_faint)),
         K::QuoteBar(Some(k)) => Style::default().fg(c(alert_color(k))),
         K::AlertLabel(k) => Style::default().fg(c(alert_color(k))),
-        // The header sets itself off with weight and colour alone (bold-bright over the body's
-        // grey, plus the separator rule) — no band. Only the body stripe carries a background,
-        // which the painter lifts onto the whole row interior (`read_table_band`).
+        // Bold and bright over the body's grey; the band itself belongs to the row, lifted onto
+        // the whole interior by `read_row_band`.
         K::TableHead => Style::default().fg(c(t.fg_bright)),
-        K::TableStripe => Style::default().fg(c(t.fg)).bg(c(t.md_table_stripe_bg)),
+        K::TableStripe => Style::default().fg(c(t.fg)).bg(c(t.md_panel_bg)),
     };
     if s.bold {
         st = st.add_modifier(Modifier::BOLD);
@@ -10435,9 +10530,14 @@ mod tests {
 
         set_theme_mode(ThemeMode::Light);
         assert_eq!(
-            c(th().bg),
+            c(th().bg_app),
             Color::Rgb(0xec, 0xef, 0xf4),
-            "light bg swaps to Snow Storm"
+            "light's ground swaps to Snow Storm's palest"
+        );
+        assert_eq!(
+            c(th().bg),
+            Color::Rgb(0xe1, 0xe6, 0xee),
+            "and the well is a step down from it — an editor is the darker shade in both themes"
         );
         assert_ne!(theme_for("comment").fg, dark_comment.fg);
         assert!(
@@ -11639,7 +11739,8 @@ mod painter_tests {
     /// between painting the wire's lines and painting our own layout of them.
     #[test]
     fn a_prose_element_paints_rendered_markdown() {
-        let blocks = aether_client::markdown::parse("# Heading\n\nSome prose.");
+        let text = "# Heading\n\nSome prose.";
+        let blocks = aether_client::markdown::parse(text);
         let root = Element::Column {
             edges: aether_protocol::ui::Edges::NONE,
             band: aether_protocol::ui::Band::None,
@@ -11647,6 +11748,7 @@ mod painter_tests {
             children: vec![Element::Prose {
                 element: 0,
                 blocks: blocks.clone(),
+                source: aether_protocol::ui::SourceLines::of(text),
             }],
         };
         let mut ed = editor_over(root, 0);
@@ -11829,5 +11931,173 @@ mod painter_tests {
                     .to_string()
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod read_surface_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Paint a document in the reading view and return each row as `(text, background colours)`.
+    fn painted(md: &str, cols: u16, rows: u16) -> Vec<(String, Vec<Color>)> {
+        let blocks = aether_client::markdown::parse(md);
+        let stops = aether_client::markdown::stops(&blocks);
+        let (content_cols, _) =
+            read_measure(cols, aether_protocol::settings::MarkdownWidth::Narrow);
+        let laid = aether_client::read_layout::layout(
+            &blocks,
+            &stops,
+            content_cols,
+            &std::collections::HashMap::new(),
+        );
+        let mut state = crate::app::test_state(crate::app::test_editor_state());
+        state.read = Some(crate::app::ReadViewState {
+            rows: std::sync::Arc::new(laid),
+            bar_rows: None,
+            sel_rows: None,
+            target_focus: None,
+            scroll: 0,
+            hscroll: std::collections::HashMap::new(),
+            placeholder: None,
+            width: aether_protocol::settings::MarkdownWidth::Narrow,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        terminal
+            .draw(|f| draw_read_view(f, &state, f.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..rows)
+            .map(|y| {
+                let mut text = String::new();
+                let mut bgs = Vec::new();
+                for x in 0..cols {
+                    let cell = &buf[(x, y)];
+                    text.push_str(cell.symbol());
+                    bgs.push(cell.bg); // per column: some tests ask *where*, not just whether
+                }
+                (text.trim_end().to_string(), bgs)
+            })
+            .collect()
+    }
+
+    /// A quote is a **panel**: its rows carry the quote shade across the interior, not just the
+    /// bar glyph, and the page shows above and below it.
+    #[test]
+    fn a_quote_bands_its_rows() {
+        let rows = painted("Before.\n\n> Quoted line.\n\n After.\n", 60, 12);
+        let quoted = rows
+            .iter()
+            .find(|(t, _)| t.contains("Quoted line."))
+            .expect("the quote painted");
+        assert!(
+            quoted.1.contains(&c(th().md_panel_bg)),
+            "a quote row carries no quote background: {:?}",
+            quoted
+        );
+        let plain = rows
+            .iter()
+            .find(|(t, _)| t.contains("Before."))
+            .expect("the paragraph painted");
+        assert!(
+            plain.1.contains(&c(th().bg_app)) && !plain.1.contains(&c(th().md_panel_bg)),
+            "ordinary prose took the quote's shade: {plain:?}"
+        );
+    }
+
+    /// A panel *inside* a quote keeps the quote behind what stands in front of it.
+    ///
+    /// A fence's rows are painted by their own branch — they pan, so the panel and its `…`
+    /// indicators are laid out separately — and that branch drew the leading spans plainly. The
+    /// quote bar in front of a nested fence therefore fell back to the page, and the quote's fill
+    /// looked as though it stopped wherever a fence started.
+    #[test]
+    fn a_fence_inside_a_quote_keeps_the_quote_behind_its_bar() {
+        let rows = painted(
+            "> A quote:\n>\n> ```rust\n> fn quoted() {}\n> ```\n",
+            44,
+            10,
+        );
+        let fence = rows
+            .iter()
+            .find(|(t, _)| t.contains("fn quoted"))
+            .expect("the fence painted");
+        assert!(
+            fence.1.contains(&c(th().md_code_bg)),
+            "the fence lost its panel: {fence:?}"
+        );
+        assert!(
+            fence.1.contains(&c(th().md_panel_bg)),
+            "the quote does not run behind the fence's bar: {fence:?}"
+        );
+    }
+
+    /// A fence's **language tag row is part of its panel**, not a tab perched above it.
+    ///
+    /// Left bare, the row's remainder took the page — and inside a quote that read as a hole
+    /// punched in the quote's own fill. The browser and the GUI both hold the tag inside the code
+    /// block; this is the terminal saying the same thing.
+    #[test]
+    fn a_fences_language_row_is_part_of_the_panel() {
+        let rows = painted("> ```rust\n> fn quoted() {}\n> ```\n", 44, 8);
+        let tag = rows
+            .iter()
+            .find(|(t, _)| t.contains("rust"))
+            .expect("the language row painted");
+        assert_eq!(
+            tag.1.last(),
+            Some(&c(th().md_code_bg)),
+            "the language row stops short of the measure, leaving a hole beside the tag"
+        );
+        assert!(
+            tag.1.contains(&c(th().md_panel_bg)),
+            "and the quote still runs behind its bar: {:?}",
+            tag.0
+        );
+    }
+
+    /// The table's header row is banded with the editor's well, as the browser's `th` and the
+    /// GUI's header row are — one table, three clients, one set of shades.
+    #[test]
+    fn a_table_header_is_banded_like_the_other_shells() {
+        let rows = painted(
+            "| Name | Role |\n| --- | --- |\n| Ada | Eng |\n| Bo | Des |\n",
+            44,
+            10,
+        );
+        let head = rows
+            .iter()
+            .find(|(t, _)| t.contains("Name"))
+            .expect("the header painted");
+        assert!(
+            head.1.contains(&c(th().md_code_bg)),
+            "the header row carries no band: {head:?}"
+        );
+        let striped = rows
+            .iter()
+            .find(|(t, _)| t.contains("Bo"))
+            .expect("the second body row painted");
+        assert!(
+            striped.1.contains(&c(th().md_panel_bg)),
+            "the zebra stripe is missing: {striped:?}"
+        );
+    }
+
+    /// Raw HTML and front matter are shown as literal source and take **no** panel: the tone and
+    /// the thin rule carry them, as they do in the browser.
+    #[test]
+    fn literal_source_takes_no_panel() {
+        let rows = painted("---\ntitle: X\n---\n\n<div>raw</div>\n", 60, 12);
+        for needle in ["title: X", "<div>raw</div>"] {
+            let row = rows
+                .iter()
+                .find(|(t, _)| t.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} painted"));
+            assert!(
+                !row.1.contains(&c(th().md_panel_bg)) && !row.1.contains(&c(th().md_chip_bg)),
+                "literal source took a panel shade: {row:?}"
+            );
+        }
     }
 }

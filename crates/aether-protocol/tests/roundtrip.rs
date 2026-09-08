@@ -6424,16 +6424,18 @@ fn an_editor_says_when_the_client_lays_it_out() {
 /// Pinned because this is the whole point of the element — a shell that got a flattened list, or
 /// the source text back, would render something no other shell renders.
 ///
-/// The node's *whole* shape is pinned with it: a field id and the parse. Prose is addressed by
-/// element and by nothing else, and a buffer id or a source line back on it would be a position
-/// the wire carries that no shell can resolve.
+/// The node's *whole* shape is pinned with it: a field id, the parse, and the line table that
+/// places it. Prose is addressed by element and by position within it, and nothing else — a buffer
+/// id back on it would be a coordinate the wire carries that no shell can resolve.
 #[test]
-fn prose_carries_the_block_tree() {
-    use aether_protocol::ui::Element;
-    let blocks = aether_markdown::parse("- one\n\n  > quoted\n");
+fn prose_carries_the_block_tree_and_its_line_table() {
+    use aether_protocol::ui::{Element, SourceLines};
+    let text = "- one\n\n  > quoted\n";
+    let blocks = aether_markdown::parse(text);
     let prose = Element::Prose {
         element: 3,
         blocks: blocks.clone(),
+        source: SourceLines::of(text),
     };
     let value = to_value(&prose).unwrap();
     assert_eq!(value["node"], "prose");
@@ -6448,9 +6450,14 @@ fn prose_carries_the_block_tree() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["blocks", "element", "node"],
+        ["blocks", "element", "node", "source"],
         "the prose node's fields changed: {value}"
     );
+    // The table is the shape of the text the parse came from, and the reading view resolves the
+    // server's cursor against it: four lines (a trailing newline opens the last), and a byte
+    // length the parse alone could not have said.
+    assert_eq!(value["source"]["starts"], json!([0, 6, 7, 18]));
+    assert_eq!(value["source"]["byte_len"], 18);
     assert!(
         value["blocks"][0]["items"][0]["blocks"][1]["content"][0]["kind"] == "paragraph",
         "the quote nested inside the list item did not survive: {}",
@@ -6463,14 +6470,22 @@ fn prose_carries_the_block_tree() {
         Element::Prose {
             element,
             blocks: round,
+            source,
         } => {
             assert_eq!(element, 3);
             assert_eq!(round, blocks);
+            assert_eq!(source, SourceLines::of(text));
         }
         other => panic!("not prose: {other:?}"),
     }
     let ts = include_str!("../../../web/src/protocol.ts");
-    for needle in ["node: \"prose\"", "blocks:"] {
+    for needle in [
+        "node: \"prose\"",
+        "blocks:",
+        "source:",
+        "starts:",
+        "byte_len:",
+    ] {
         assert!(
             ts.contains(needle),
             "web/src/protocol.ts must declare the prose node's `{needle}`"
@@ -7195,3 +7210,57 @@ fn submitting_an_input_names_only_the_view() {
 /// it. `const` for the same reason the shell's is: the answer is one.
 const _: () = assert!(!aether_protocol::agent::AgentPrompt::MUTATES_TEXT);
 const _: () = assert!(!aether_protocol::view::ViewSubmitInput::MUTATES_TEXT);
+
+/// `element/source` is a **read**, and the wire has to say so.
+///
+/// The client refuses a mutating method on a read-only buffer, structurally, off this constant —
+/// so a copy marked as mutating would silently stop working in exactly the buffers a reading view
+/// is most often pointed at.
+#[test]
+fn element_source_is_a_read_not_an_edit() {
+    use aether_protocol::envelope::RpcMethod;
+    use aether_protocol::input::{ElementSource, ElementSourceResult};
+    assert_eq!(ElementSource::NAME, "element/source");
+    // Compile-time, so flipping the constant fails the build rather than one test run.
+    const _: () = assert!(!ElementSource::MUTATES_TEXT, "copying is not an edit");
+    let v = to_value(ElementSourceResult {
+        text: "# Title".into(),
+    })
+    .unwrap();
+    assert_eq!(v["text"], "# Title");
+}
+
+/// The reading view's three server-side resolutions, pinned by name and wire shape.
+///
+/// All three exist because the answer needs the document's **text**: the block boundaries under a
+/// selection, a block's last content char, and the append point past its trailing blanks. A
+/// reading view carries a parse, so none of them can be worked out where they are used.
+#[test]
+fn the_reading_views_resolutions_keep_their_wire_shape() {
+    use aether_protocol::cursor::{
+        ElementBlockContent, ElementSelectBlock, Motion, SelectBlockParams, VerticalDirection,
+    };
+    use aether_protocol::envelope::RpcMethod;
+    assert_eq!(ElementSelectBlock::NAME, "element/select_block");
+    assert_eq!(ElementBlockContent::NAME, "element/block_content");
+    // Neither is an edit: both only move the cursor.
+    const _: () = assert!(!ElementSelectBlock::MUTATES_TEXT);
+    const _: () = assert!(!ElementBlockContent::MUTATES_TEXT);
+
+    let v = to_value(SelectBlockParams {
+        buffer_id: 4,
+        direction: VerticalDirection::Up,
+        extend: true,
+        count: 2,
+    })
+    .unwrap();
+    assert_eq!(v["direction"], "up");
+    assert_eq!(v["extend"], true);
+    assert_eq!(v["count"], 2);
+
+    let v = to_value(Motion::BlockEdge { at_end: true }).unwrap();
+    assert_eq!(v["kind"], "block_edge");
+    assert_eq!(v["at_end"], true);
+    let back: Motion = from_value(v).unwrap();
+    assert_eq!(back, Motion::BlockEdge { at_end: true });
+}

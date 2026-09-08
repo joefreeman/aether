@@ -30,7 +30,13 @@ import init, {
 } from "./wasm/aether_web";
 import { RpcClient, type ConnState } from "./client";
 import { renderBuffer } from "./render";
-import { applyFenceHighlights, markFocus, renderReadView, type ReadDoc } from "./read";
+import {
+  applyFenceHighlights,
+  markFocus,
+  MEASURABLE_BLOCKS,
+  renderReadView,
+  type ReadDoc,
+} from "./read";
 import { decodeRow } from "./text";
 import { statusIcon, severityIcon, lspStateClass, type IconKind } from "./icons";
 import { truncatePath, charBudget } from "./paths";
@@ -3161,7 +3167,14 @@ export class Shell {
   /** Measure the reading view as drawn — each block node's top within the scrolled content — into
    *  the core's table, so the grid scrolls, reveals and anchors the document by where its lines
    *  really are. Runs after every rebuild or patch of the reader's DOM and whenever an image
-   *  finishes loading, since that moves everything below it. */
+   *  finishes loading, since that moves everything below it.
+   *
+   *  Block-grain nodes only ([`MEASURABLE_BLOCKS`]). This used to take every stamped node, which
+   *  swept in the links, images and footnote refs *inside* a paragraph: the core takes the
+   *  innermost span covering a line as that line's top, an interactive span is shorter than the
+   *  paragraph holding it, and so a line whose text merely contains a link took the link's top
+   *  instead of its own. Invisible while the paragraph fits one row, a row or two of drift once it
+   *  wraps — and the GUI, which stamps blocks and items only, disagreed with it the whole time. */
   private measureReader(): void {
     const v = this.snapshot;
     const root = this.bufferEl.querySelector(":scope > .md-read");
@@ -3169,7 +3182,7 @@ export class Shell {
     const el = this.bufferEl;
     const origin = el.getBoundingClientRect().top + el.clientTop - el.scrollTop;
     const spans: [number, number, number][] = [];
-    for (const node of root.querySelectorAll("[data-espan]")) {
+    for (const node of root.querySelectorAll(MEASURABLE_BLOCKS)) {
       if (!(node instanceof HTMLElement)) continue;
       const [start, end] = (node.getAttribute("data-espan") ?? "").split(":").map(Number);
       if (!Number.isFinite(start) || !Number.isFinite(end)) continue;

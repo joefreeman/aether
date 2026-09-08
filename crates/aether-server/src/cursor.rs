@@ -435,6 +435,19 @@ fn counted_line(scope: &Scope, from: u32, direction: Direction, count: u32) -> O
     }
 }
 
+/// Byte offset of a char index within `text`, and its inverse. The scope hands out char indices
+/// and the Markdown parse speaks bytes, so every reading-grain motion crosses between them.
+pub(crate) fn byte_of_local(text: &str, chars: usize) -> u32 {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(i, _)| i) as u32
+}
+
+pub(crate) fn char_of_local(text: &str, byte: u32) -> usize {
+    let byte = (byte as usize).min(text.len());
+    text[..byte].chars().count()
+}
+
 /// Resolve a motion within `scope` — the element's window onto its buffer, and every character the
 /// motion is allowed to see. See [`Scope`] for why that is the argument rather than a document.
 pub fn resolve_motion(scope: &Scope, current: LogicalPosition, motion: &Motion) -> LogicalPosition {
@@ -497,6 +510,36 @@ pub fn resolve_motion(scope: &Scope, current: LogicalPosition, motion: &Motion) 
             col: 0,
         },
         Motion::BufferEnd => scope.pos_of(scope.text().len_chars()),
+        // Resolved against the **scope's** slice, so its byte offsets are the element's own and
+        // the answer physically cannot leave it — the bound is the coordinate system rather than
+        // a check afterwards.
+        Motion::BlockEdge { at_end } => {
+            let text = scope.text().to_string();
+            let byte = byte_of_local(&text, scope.char_of(current));
+            let blocks = aether_markdown::parse(&text);
+            let stops = aether_markdown::stops(&blocks);
+            let Some(idx) =
+                aether_markdown::element_at_matching(&stops, byte, aether_markdown::Stop::is_block)
+            else {
+                // No blocks at all — an empty document, or one holding only blank lines. The
+                // element's own edges, which is where `i`/`a` landed there before this moved.
+                return if *at_end {
+                    scope.pos_of(scope.text().len_chars())
+                } else {
+                    LogicalPosition {
+                        line: scope.first_line(),
+                        col: 0,
+                    }
+                };
+            };
+            let span = stops[idx].span();
+            let target = if *at_end {
+                aether_markdown::edit::block_append_byte(&text, span)
+            } else {
+                span.start
+            };
+            scope.pos_of(char_of_local(&text, target))
+        }
         // `N g` names one line, so a line outside the field is not a destination — refuse, the way
         // `MatchBracket` below does, rather than clamping onto the field's edge and reporting an
         // arrival. The gutter prints buffer line numbers, so the number the user typed and the

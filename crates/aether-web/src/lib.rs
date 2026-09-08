@@ -321,7 +321,7 @@ impl WasmSession {
     ) -> Result<JsValue, JsValue> {
         let spans: Vec<(u32, u32, u32)> = from_js(spans)?;
         if let Some(read) = self.inner.view.read.as_ref() {
-            let line_count = read.text.split('\n').count() as u32;
+            let line_count = read.line_count();
             let measured = aether_client::read_layout::measured_from_spans(
                 spans,
                 |byte| read.pos_of(byte).line,

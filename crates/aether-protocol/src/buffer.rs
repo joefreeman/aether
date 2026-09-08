@@ -138,10 +138,13 @@ pub struct BufferContentParams {
     pub buffer_id: BufferId,
 }
 
-/// The buffer's full text at `revision`. The markdown reading view renders from the whole document
-/// (fences, tables and link reference definitions span arbitrarily, so a windowed view of the
-/// source can't drive the parse); it re-fetches whenever a change notification carries a revision
-/// newer than the one it parsed.
+/// The buffer's full text at `revision`.
+///
+/// It exists because the reading view used to render from the whole document — fences, tables and
+/// link reference definitions span arbitrarily, so a windowed view of the source cannot drive a
+/// parse — and re-fetched on every change. The server parses now and the reader is sent
+/// [`Element::Prose`](crate::ui::Element), so no shell calls this any more; what still asks is
+/// anything that wants the text *as the buffer holds it*, independent of how a view presents it.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BufferContentResult {
     pub revision: Revision,

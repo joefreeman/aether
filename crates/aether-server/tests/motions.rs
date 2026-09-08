@@ -2713,6 +2713,8 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
         },
     )
     .await;
+    // As the **editor**: this is about the source's highlighting, and a markdown file's default
+    // view is the reader, whose element carries the parse instead of any lines to highlight.
     let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
         &ViewOpenParams {
@@ -2722,6 +2724,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
             language: None,
             create_if_missing: false,
             jump_to: None,
+            kind: Some(aether_protocol::ui::ViewKind::Editor),
             ..Default::default()
         },
     )

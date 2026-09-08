@@ -174,8 +174,26 @@ export function applyFenceHighlights(container: HTMLElement, doc: ReadDoc): void
   }
 }
 
-function stamp(el: HTMLElement, span: MdSpan): void {
+/** Selects the nodes a shell **measures**: the block-grain stamps, and not the interactive ones
+ *  sitting inside them.
+ *
+ *  Both grains carry `data-espan`, because focus marking looks a span up whichever grain it is.
+ *  Measurement must not. The core takes the *innermost* span covering a source line as where that
+ *  line starts, and a link beginning partway through a line is not where the line starts. The GUI
+ *  stamps blocks and list items only, and the entire reason the measuring rule lives in the core
+ *  is that the two shells cannot be allowed to disagree about a height. */
+export const MEASURABLE_BLOCKS = "[data-espan]:not([data-etarget])";
+
+/** Stamp a block-grain node: a `j`/`k` reading stop, and a node measurement places lines by. */
+function stampBlock(el: HTMLElement, span: MdSpan): void {
   el.dataset.espan = spanKey(span);
+}
+
+/** Stamp an interactive-grain node: a `Tab` stop and `Enter` target, living inside some block.
+ *  Findable by span exactly like a block, and deliberately invisible to measurement. */
+function stampTarget(el: HTMLElement, span: MdSpan): void {
+  el.dataset.espan = spanKey(span);
+  el.dataset.etarget = "";
 }
 
 function renderBlock(b: MdBlock, doc: ReadDoc): Node {
@@ -183,20 +201,20 @@ function renderBlock(b: MdBlock, doc: ReadDoc): Node {
   switch (b.kind) {
     case "heading": {
       const h = document.createElement(`h${Math.min(Math.max(b.level, 1), 6)}`);
-      stamp(h, b.span);
+      stampBlock(h, b.span);
       renderInlines(b.content, h, doc);
       return h;
     }
     case "paragraph": {
       const p = document.createElement("p");
-      stamp(p, b.span);
+      stampBlock(p, b.span);
       renderInlines(b.content, p, doc);
       return p;
     }
     case "code": {
       const wrap = document.createElement("div");
       wrap.className = "md-codeblock";
-      stamp(wrap, b.span);
+      stampBlock(wrap, b.span);
       if (b.language) {
         const tag = document.createElement("div");
         tag.className = "md-codeblock-lang";
@@ -223,7 +241,7 @@ function renderBlock(b: MdBlock, doc: ReadDoc): Node {
       // Raw HTML is shown literally, never interpreted.
       const pre = document.createElement("pre");
       pre.className = "md-rawhtml";
-      stamp(pre, b.span);
+      stampBlock(pre, b.span);
       pre.textContent = b.raw;
       return pre;
     }
@@ -232,7 +250,7 @@ function renderBlock(b: MdBlock, doc: ReadDoc): Node {
       if (b.ordered && (b.start ?? 1) !== 1) (list as HTMLOListElement).start = b.start;
       for (const item of b.items) {
         const li = document.createElement("li");
-        stamp(li, item.span);
+        stampBlock(li, item.span);
         if (item.checked !== undefined) {
           li.className = "md-task" + (item.checked ? " md-task-done" : "");
           const box = document.createElement("span");
@@ -247,7 +265,7 @@ function renderBlock(b: MdBlock, doc: ReadDoc): Node {
     }
     case "quote": {
       const q = document.createElement("blockquote");
-      stamp(q, b.span);
+      stampBlock(q, b.span);
       if (b.alert) {
         q.className = `md-alert md-alert-${b.alert}`;
         const label = document.createElement("div");
@@ -263,7 +281,7 @@ function renderBlock(b: MdBlock, doc: ReadDoc): Node {
       // <hr> (~1px tall) the bar's inset top/bottom collapse it to nothing.
       const wrap = document.createElement("div");
       wrap.className = "md-rule";
-      stamp(wrap, b.span);
+      stampBlock(wrap, b.span);
       wrap.append(document.createElement("hr"));
       return wrap;
     }
@@ -272,7 +290,7 @@ function renderBlock(b: MdBlock, doc: ReadDoc): Node {
       // (an overflow container would clip the bar pseudo-element).
       const outer = document.createElement("div");
       outer.className = "md-table-outer";
-      stamp(outer, b.span);
+      stampBlock(outer, b.span);
       const scroll = document.createElement("div");
       scroll.className = "md-table-scroll";
       const table = document.createElement("table");
@@ -315,14 +333,14 @@ function renderBlock(b: MdBlock, doc: ReadDoc): Node {
     case "front_matter": {
       const fm = document.createElement("pre");
       fm.className = "md-front-matter";
-      stamp(fm, b.span);
+      stampBlock(fm, b.span);
       fm.textContent = b.text;
       return fm;
     }
     case "footnote_def": {
       const d = document.createElement("div");
       d.className = "md-footnote-def";
-      stamp(d, b.span);
+      stampBlock(d, b.span);
       const label = document.createElement("span");
       label.className = "md-footnote-label";
       label.textContent = `[${b.label}]: `;
@@ -356,7 +374,7 @@ function renderImage(
   if ((external && !remote) || src.startsWith("//")) {
     const ph = document.createElement(block ? "div" : "span");
     ph.className = block ? "md-image-alt md-image-block" : "md-image-alt";
-    stamp(ph, span);
+    (block ? stampBlock : stampTarget)(ph, span);
     ph.textContent = `▨ [${alt || "image"}]  (${src})`;
     return ph;
   }
@@ -376,12 +394,12 @@ function renderImage(
     // itself is stamped with the target span, hosting the armed ring.
     const wrap = document.createElement("div");
     wrap.className = "md-image-block";
-    stamp(wrap, span);
-    stamp(img, innerSpan ?? span);
+    stampBlock(wrap, span);
+    stampTarget(img, innerSpan ?? span);
     wrap.append(img);
     return wrap;
   }
-  stamp(img, span);
+  stampTarget(img, span);
   return img;
 }
 
@@ -417,7 +435,7 @@ function renderInline(inl: MdInline, doc: ReadDoc): Node {
     case "link": {
       const a = document.createElement("a");
       a.className = "md-link";
-      stamp(a, inl.span);
+      stampTarget(a, inl.span);
       renderInlines(inl.content, a, doc);
       if (EXTERNAL.test(inl.href)) {
         a.href = inl.href;
@@ -440,7 +458,7 @@ function renderInline(inl: MdInline, doc: ReadDoc): Node {
     case "footnote_ref": {
       const sup = document.createElement("sup");
       sup.className = "md-footnote-ref";
-      stamp(sup, inl.span);
+      stampTarget(sup, inl.span);
       sup.textContent = `[${inl.label}]`;
       return sup;
     }

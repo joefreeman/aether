@@ -28,8 +28,8 @@ use aether_protocol::buffer::{
 use aether_protocol::cursor::{
     CursorMoveParams, CursorSelectAllParams, CursorSelectLineParams, CursorSelectWordParams,
     CursorSetParams, CursorState, CursorSwapAnchorParams, CursorTreeSelectParams, CursorUndoParams,
-    CursorUndoResult, Direction, Granularity, JumplistPosition, Motion, TreeSelectDirection,
-    VerticalDirection, WordBoundary,
+    CursorUndoResult, Direction, Granularity, JumplistPosition, Motion, SelectBlockParams,
+    TreeSelectDirection, VerticalDirection, WordBoundary,
 };
 use aether_protocol::directory::{
     DirectoryCreateParams, DirectoryCreateResult, DirectoryEntry, DirectoryListParams,
@@ -62,11 +62,11 @@ use aether_protocol::history::{
 };
 use aether_protocol::input::{
     BlockDepthParams, BlockEditResult, BlockUnit, BufferOnlyParams, CaseKind, CommentStyle,
-    CountedEditParams, EditResult, InputAdjustNumberParams, InputDeleteWordParams,
-    InputMoveLinesParams, InputNewlineAndIndentParams, InputOpenLineParams, InputSurroundParams,
-    InputTextParams, InputTransformCaseParams, InputUnsurroundParams, LineSide, MoveBlockParams,
-    OpenBlockParams, PasteBlockParams, SurroundTarget, ToggleCommentParams, ToggleTaskParams,
-    UndoRedoParams, UndoResult,
+    CountedEditParams, EditResult, ElementSourceResult, InputAdjustNumberParams,
+    InputDeleteWordParams, InputMoveLinesParams, InputNewlineAndIndentParams, InputOpenLineParams,
+    InputSurroundParams, InputTextParams, InputTransformCaseParams, InputUnsurroundParams,
+    LineSide, MoveBlockParams, OpenBlockParams, PasteBlockParams, SurroundTarget,
+    ToggleCommentParams, ToggleTaskParams, UndoRedoParams, UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCaptureParams, JumplistCaptureResult, JumplistClearParams, JumplistClearResult,
@@ -101,7 +101,7 @@ use aether_protocol::view::{
 };
 use aether_protocol::viewport::{
     BaselineRow, BufferStatusSnapshot, ConflictLine, DiagnosticSpan, DiffMarker, DiffStage,
-    Element, EmphasisRange, LineChange, LogicalLineRender, PatchLine, ScrollPosition,
+    Element, EmphasisRange, LineChange, LogicalLineRender, PatchLine, ScrollPosition, SourceLines,
     ViewportLinesChanged, ViewportLinesChangedParams, ViewportResizeParams, ViewportSetWrapParams,
     ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindowResult, Window,
 };

@@ -2687,10 +2687,21 @@ impl App {
         }
     }
 
+    /// Which of this shell's two scrollers is the live one — the reading view's or the editor's.
+    ///
+    /// Off the **window**, not off `view.read`: leaving the reader clears that at the keystroke,
+    /// and the content anchor for the switch is captured after it, while the reader is still on
+    /// screen and `read_scroll_px` is still where the reader is. Asking the session read the
+    /// editor's mirror instead — untouched since before the reader opened, so usually zero — and
+    /// `Space u` back to the editor pinned the top of the document however far down you were.
+    fn reader_scroller(&self) -> bool {
+        self.session.window_shows_prose()
+    }
+
     /// The active scroller's offset (the reading view's, else the editor's) as the layout's top
     /// visible row.
     fn scroll_top_units(&self) -> VisualRow {
-        let px = if self.session.view.read.is_some() {
+        let px = if self.reader_scroller() {
             self.read_scroll_px
         } else {
             self.scroll_px
@@ -2700,7 +2711,7 @@ impl App {
 
     /// The active scroller's viewport height in layout units (at least one row).
     fn visible_units(&self) -> u32 {
-        let px = if self.session.view.read.is_some() {
+        let px = if self.reader_scroller() {
             self.read_viewport_px()
         } else {
             self.view_size.height - PAD
@@ -2862,7 +2873,7 @@ impl App {
         let unit = self.unit_px();
         let element = self.session.view.focused_element;
         let measured = self.session.view.read.as_ref().map(|read| {
-            let line_count = read.text.split('\n').count() as u32;
+            let line_count = read.line_count();
             let spans = geometry
                 .spans
                 .iter()
@@ -2953,15 +2964,24 @@ impl App {
 
     /// The reading view's half of `Message::Subscribed`, once measured: restore a pending
     /// content anchor (the same document's editor, `Space u`), else the subscribe's remembered
-    /// position — then rest the focused block, which a remembered position can leave off screen.
+    /// position — then rest the focused block, which **either** can leave off screen.
+    ///
+    /// The reveal runs after the anchor, not instead of it. `Message::Subscribed` stands the
+    /// focus-change trigger down for the reading view and leaves the placement to this, so an
+    /// anchor that returned here was the last word: `Space u` from an editor whose cursor was
+    /// scrolled out of sight opened the reader on that same content with the focused block
+    /// somewhere off screen and nothing left to bring it back. Resting it costs nothing when the
+    /// anchor already did the right thing — [`read_layout::reveal_offset`] answers `None` for a
+    /// block sitting comfortably inside both edges — and `read_scroll_to` mirrors the scroll ahead
+    /// of the widget, so the reveal below sees where the anchor just put the document. This is
+    /// what the terminal does with its own two steps.
     fn read_place_subscribed(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
         if let Some(row) = self.session.resolve_scroll_anchor(&self.measured) {
             self.pending_reveal.abandon();
             let px = self.px_of_units(row.get() as f32);
-            return self.read_scroll_to(px, false);
-        }
-        let mut tasks = Vec::new();
-        if let Some(row) = self.remembered_row(self.subscribe_scroll) {
+            tasks.push(self.read_scroll_to(px, false));
+        } else if let Some(row) = self.remembered_row(self.subscribe_scroll) {
             let px = self.px_of_units(row);
             tasks.push(self.read_scroll_to(px, false));
         }
@@ -3023,6 +3043,21 @@ impl App {
     }
 
     fn ensure_cursor_visible_inner(&mut self, style: RevealStyle) -> Task<Message> {
+        // The reading view reveals its *block*, at block grain and on focus changes only (see the
+        // `ReadThen::Reveal` this render pass arms), so a reveal owed against the cursor's line
+        // would fight the reader's own on every window. It cannot even be answered here: prose
+        // carries no lines, so the loaded check below reads "not loaded" for every line of a
+        // document that is entirely present, and each cursor step would fetch a window that
+        // changes nothing. The terminal shell has always drawn this line in the same place.
+        //
+        // Asked of the window rather than the session for the reason [`Self::reader_scroller`]
+        // gives: the last reveal of all is the one the core sends on the way *out* of the reader,
+        // by which time `view.read` is already gone — and answering that one by the editor's rules
+        // fetched a cursor window against a document made of prose.
+        if self.reader_scroller() {
+            self.pending_reveal.abandon();
+            return Task::none();
+        }
         let Some(window) = &self.session.view.window else {
             return Task::none();
         };
@@ -3250,14 +3285,15 @@ impl App {
                     .into()
             } else if self.session.view.read.is_some() {
                 // The markdown reading view replaces the editor wholesale while active — the same
-                // status bar and overlays around it. A client-laid-out prose element is an editor
-                // element too, so the whole reading pane is the editor's well: every row in it is
-                // document, with no chrome rows for the ground to show through between.
+                // status bar and overlays around it. The whole page is the app's **ground**: the
+                // well is for text you can put a cursor in, and a rendered document is read. The
+                // code panels inside it take the well instead, which is what makes them read as
+                // panels on the page.
                 let page = container(self.read_view())
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .style(move |_| container::Style {
-                        background: Some(p.bg.into()),
+                        background: Some(p.bg_app.into()),
                         ..container::Style::default()
                     });
                 column![page, self.status_bar()].into()
@@ -5412,7 +5448,9 @@ fn md_block<M: 'static>(
         .width(Length::Fill)
         .padding([6, 8])
         .style(move |_| container::Style {
-            background: Some(p.bg.into()),
+            // The panel role, which is the editor's well — named rather than spelled, so the
+            // panel follows the well if the well ever moves.
+            background: Some(p.md_code_bg.into()),
             border: iced::Border {
                 radius: 4.0.into(),
                 ..iced::Border::default()
@@ -5932,12 +5970,21 @@ impl App {
                 _ => 0.0,
             };
             col = col.push(
-                container(self.read_block(b, body, ui, None, None, None, false))
-                    .width(Length::Fill)
-                    .padding(iced::Padding {
-                        top: air,
-                        ..iced::Padding::ZERO
-                    }),
+                container(self.read_block(
+                    b,
+                    body,
+                    ui,
+                    None,
+                    None,
+                    None,
+                    false,
+                    self.palette().bg_app,
+                ))
+                .width(Length::Fill)
+                .padding(iced::Padding {
+                    top: air,
+                    ..iced::Padding::ZERO
+                }),
             );
         }
         // The layer never delivers events, so no message this maps can ever be produced; mapping at
@@ -6003,7 +6050,16 @@ impl App {
             // inside `read_block` (item-grain position).
             let focused = !matches!(b, MdBlock::List { .. }) && block_span == Some(b.span());
             let selected = span_selected(sel_range, b.span());
-            let block = self.read_block(b, body, ui, block_span, target_span, sel_range, false);
+            let block = self.read_block(
+                b,
+                body,
+                ui,
+                block_span,
+                target_span,
+                sel_range,
+                false,
+                p.bg_app,
+            );
             // Clicking a block focuses it (list items carry their own inner mouse areas, which
             // capture the press first — see `read_block`'s List arm).
             let block: Element<'_, ReadMsg> = iced::widget::mouse_area(block)
@@ -6016,7 +6072,7 @@ impl App {
             let wrapped: Element<'_, ReadMsg> = if matches!(b, MdBlock::List { .. }) {
                 block
             } else {
-                read_focus_wrap(focused, selected, p, block)
+                read_focus_wrap(focused, selected, p.bg_app, p, block)
             };
             // Air above headings (web parity: `margin: 1.6em 0 0.5em` in the heading's own
             // size — sections breathe): the uniform column spacing supplies 0.8 body of the
@@ -6092,6 +6148,12 @@ impl App {
     /// inherited by everything nested inside it, matching the web client's `li.md-task-done`
     /// colour (which cascades the same way) and the terminal client's `SpanKind::TaskDone` remap.
     #[allow(clippy::too_many_arguments)] // the focus/selection/tone family, threaded as one
+    /// `on` is the surface this block is being drawn *on* — the page for a top-level block, the
+    /// quote's own shade for one inside a quote. Every focus wrapper repaints it behind the
+    /// content (the bar strip is painted by the container under it, and the wrapper covers all but
+    /// the strip), so a wrapper that assumed the page put a page-coloured band across every child
+    /// of a quote: the panel came out striped, one bar per paragraph.
+    #[allow(clippy::too_many_arguments)] // one styling family; `on` is the surface, not an option
     fn read_block(
         &self,
         b: &MdBlock,
@@ -6101,6 +6163,7 @@ impl App {
         target: Option<MdSpan>,
         sel: Option<(u32, u32)>,
         dim: bool,
+        on: iced::Color,
     ) -> Element<'static, ReadMsg> {
         // Whichever block is focused claims the reveal probe's anchor, wherever it is
         // rendered — top level, inside a quote, or as a loose list item's second paragraph.
@@ -6199,7 +6262,7 @@ impl App {
                     let dim_item = item.checked == Some(true);
                     let mut inner = column![].spacing(body * 0.35);
                     for ib in &item.blocks {
-                        let child = self.read_block(ib, body, ui, block, target, sel, dim_item);
+                        let child = self.read_block(ib, body, ui, block, target, sel, dim_item, on);
                         // A child that is a reading stop of its own carries its own bar/tint
                         // wrapper, exactly like a quote's children — without this a focused
                         // second paragraph or fence inside a loose item painted no bar at all
@@ -6209,6 +6272,7 @@ impl App {
                                 block == Some(ib.span()),
                                 span_selected(sel, ib.span()),
                                 6.0,
+                                on,
                                 p,
                                 child,
                             )
@@ -6225,6 +6289,7 @@ impl App {
                     let area = iced::widget::mouse_area(read_focus_wrap(
                         item_focused,
                         item_selected,
+                        on,
                         p,
                         row![
                             text(marker)
@@ -6271,7 +6336,9 @@ impl App {
                     // carries its own bar/tint wrapper — the outer loop only wraps top-level
                     // blocks, and without this a focused paragraph inside a quote painted no bar at
                     // all. Lists keep wrapping per item inside their own arm.
-                    let child = self.read_block(cb, body, ui, block, target, sel, dim);
+                    // Inside the quote's panel: what its children repaint behind themselves.
+                    let child =
+                        self.read_block(cb, body, ui, block, target, sel, dim, p.md_panel_bg);
                     inner = inner.push(if matches!(cb, MdBlock::List { .. }) {
                         child
                     } else {
@@ -6279,6 +6346,7 @@ impl App {
                             block == Some(cb.span()),
                             span_selected(sel, cb.span()),
                             6.0,
+                            p.md_panel_bg,
                             p,
                             child,
                         )
@@ -6298,7 +6366,10 @@ impl App {
                         .width(Length::Fill)
                         .padding([8, 10])
                         .style(move |_| container::Style {
-                            background: Some(p.bg.into()),
+                            // The quote's own faint lift off the page — a quarter of the chip's
+                            // step, because it covers a hundred times the area. The strip is
+                            // repainted over by it either way.
+                            background: Some(p.md_panel_bg.into()),
                             ..container::Style::default()
                         });
                 container(panel)
@@ -6445,7 +6516,9 @@ impl App {
                 .width(Length::Fill)
                 .padding([4, 10])
                 .style(move |_| container::Style {
-                    background: Some(p.bg.into()),
+                    // No panel: literal source reads as itself, with the dim tone and the thin
+                    // rule beside it. The surface is repainted here only to cover the bar strip.
+                    background: Some(on.into()),
                     ..container::Style::default()
                 });
                 container(panel)
@@ -6565,7 +6638,9 @@ impl App {
                 r = r.push(cell(head.get(ci).unwrap_or(&empty), true, *w));
             }
             col = col.push(container(r).style(move |_| container::Style {
-                background: Some(p.bg_panel.into()),
+                // The editor's well, as the browser gives its `th` and the terminal now bands its
+                // header row with — the panel shade here was the odd one of the three.
+                background: Some(p.md_code_bg.into()),
                 ..container::Style::default()
             }));
         }
@@ -6576,14 +6651,17 @@ impl App {
                 r = r.push(cell(c, false, *w));
             }
             let striped = ri % 2 == 1;
-            // Alpha-scaled panel over the page, not `md_table_stripe_bg`: the stripe has
-            // always been a 40% composite here, and an opaque near-match would shift dark.
+            // The panel shade a quote takes, opaque — this was a 40% composite of the *chrome*
+            // panel shade, which is how the banding ended up too faint to track a row by.
             col = col.push(container(r).style(move |_| container::Style {
-                background: striped.then(|| p.bg_panel.scale_alpha(0.4).into()),
+                background: striped.then(|| p.md_panel_bg.into()),
                 ..container::Style::default()
             }));
         }
-        let framed = container(col).style(move |_| container::Style {
+        // The frame the browser draws too, and the hairline of padding that lets it show: a row's
+        // band fills the container to its edge, so without this the header's band painted straight
+        // over the border and the table came out frameless here and framed there.
+        let framed = container(col).padding(1).style(move |_| container::Style {
             border: iced::Border {
                 color: p.border_subtle,
                 width: 1.0,
@@ -6850,12 +6928,13 @@ fn span_selected(sel: Option<(u32, u32)>, span: MdSpan) -> bool {
 }
 
 fn read_focus_wrap(
-    on: bool,
+    focused: bool,
     selected: bool,
+    surface: iced::Color,
     p: &'static theme::Palette,
     content: Element<'static, ReadMsg>,
 ) -> Element<'static, ReadMsg> {
-    read_focus_wrap_inset(on, selected, 10.0, p, content)
+    read_focus_wrap_inset(focused, selected, 10.0, surface, p, content)
 }
 
 /// Whether a block inside a list item is a reading stop in its own right — and so hosts its own
@@ -6877,15 +6956,17 @@ fn item_child_is_stop(item: &crate::core::markdown::ListItem, child: &MdBlock) -
 /// tighter one: the container already pads its contents away from its own bar, so the full
 /// top-level gap would inset quoted text twice over.
 fn read_focus_wrap_inset(
-    on: bool,
+    focused: bool,
     selected: bool,
     gap: f32,
+    surface: iced::Color,
     p: &'static theme::Palette,
     content: Element<'static, ReadMsg>,
 ) -> Element<'static, ReadMsg> {
-    // The inner container's opaque background doubles as the selection tint: the chrome
-    // selection shade when the block is inside the extended selection, the page background
-    // otherwise — either way it keeps the bar strip from bleeding through.
+    // The inner container's opaque background doubles as the selection tint: the content-selection
+    // shade when the block is inside the extended selection, **the surface it is drawn on**
+    // otherwise — either way it keeps the bar strip from bleeding through. Taking the surface as an
+    // argument is what stops a quote's children from banding the page over their quote's panel.
     let inner = container(content)
         .width(Length::Fill)
         .padding(iced::Padding {
@@ -6893,7 +6974,7 @@ fn read_focus_wrap_inset(
             ..iced::Padding::ZERO
         })
         .style(move |_| container::Style {
-            background: Some(if selected { p.bg_selection } else { p.bg }.into()),
+            background: Some(if selected { p.bg_visual } else { surface }.into()),
             ..container::Style::default()
         });
     container(inner)
@@ -6903,7 +6984,7 @@ fn read_focus_wrap_inset(
             ..iced::Padding::ZERO
         })
         .style(move |_| container::Style {
-            background: on.then(|| p.accent.into()),
+            background: focused.then(|| p.accent.into()),
             ..container::Style::default()
         })
         .into()
@@ -7112,7 +7193,9 @@ fn md_span(
     let mut s = iced::widget::span(text.to_string()).font(font).color(color);
     if code {
         // The web reading view's inline-code chip: body-coloured text on the code-panel shade.
-        s = s.background(p.md_code_bg);
+        // The raised surface, not the well: a fenced block is a slab of editor, an inline chip
+        // lifts off the prose it sits in.
+        s = s.background(p.md_chip_bg);
     }
     match link {
         Some(href) => s.link(href.to_string()).underline(true),

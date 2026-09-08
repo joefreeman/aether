@@ -140,11 +140,11 @@ impl ElementLine {
 /// view's vertical layout that does not come from the tree.
 ///
 /// An editor the server laid out has a height the server computed: its wrapped rows and phantoms.
-/// An element the client lays out — prose it wraps and renders from source — has no height the
-/// server could know. So the server sends such an element's lines unwrapped, one row per line on
-/// the wire, and the shell measures it: how tall it is, and the row each loaded line starts on.
-/// Absent from here, the element is taken at one row per line, which is what the server counted
-/// and a serviceable estimate until the shell has measured.
+/// An element the client lays out has no height the server could know — an editor it wraps itself
+/// (whose lines come unwrapped, one row per line on the wire), and prose, which is rendered as
+/// type and has no rows at all. Either way the shell measures it: how tall it is, and where each
+/// **source line** starts within it. Absent from here, an editor is taken at one row per line, and
+/// prose at a single row until the measurement lands.
 ///
 /// The unit throughout is the **row at the shell's resolution**: [`Self::units_per_row`] units
 /// make one row. A terminal counts whole rows and sets it to 1. A pixel shell sets it to 1000 and
@@ -1024,6 +1024,41 @@ fn resolve_joins(rows: &mut [(Placement, PaintedRow<'_>)]) {
     }
 }
 
+/// Every prose element in the tree, with the offset it starts at and the height it occupies.
+///
+/// Prose paints no rows — [`painted_rows`] says why — so the row walk cannot answer where a line
+/// of one is, and the reading view asks exactly that: the server owns the cursor and reports it as
+/// a *line*, while the shell drew *blocks*. The bridge is the same measurement a client-laid-out
+/// editor's lines are placed by ([`MeasuredElement::starts`], one entry per source line, filled by
+/// `read_layout::measured_from_spans`), so both directions are answered off it here.
+fn prose_placements<'a>(
+    root: &'a Element,
+    measured: &Measured,
+) -> Vec<(&'a Element, VisualRow, u32)> {
+    let mut out = Vec::new();
+    let mut at = 0u32;
+    walk_rows(root, measured, Frame::default(), &mut |visit, _, height| {
+        if let Visit::Node(node @ Element::Prose { .. }) = visit {
+            out.push((node, VisualRow(at), height));
+        }
+        at = at.saturating_add(height);
+    });
+    out
+}
+
+/// The prose element `element` names, and where it starts — `None` unless the shell has measured
+/// it, since an unmeasured element has no lines to place.
+fn prose_element<'a>(
+    root: &'a Element,
+    element: FieldId,
+    measured: &Measured,
+) -> Option<(&'a Element, VisualRow)> {
+    let (node, at, _) = prose_placements(root, measured)
+        .into_iter()
+        .find(|(node, ..)| node.field_id() == Some(element))?;
+    measured.of(node).map(|_| (node, at))
+}
+
 /// The first painted row of a line: its first phantom row if it has any, else its first text row.
 /// `None` when the line isn't loaded.
 pub fn line_top_row(
@@ -1032,6 +1067,19 @@ pub fn line_top_row(
     logical_line: u32,
     measured: &Measured,
 ) -> Option<VisualRow> {
+    // Prose: where the shell drew the block that line belongs to. A line past the end of the
+    // measurement has no row — the caller's cue that it has run off the document, which is how
+    // `read_layout::block_rows` knows to close the last block at the element's end.
+    if let Some((node, start)) = prose_element(&window.root, element, measured) {
+        let lines = measured.of(node).map_or(0, |m| m.starts.len() as u32);
+        return (logical_line < lines).then(|| {
+            VisualRow(
+                start
+                    .get()
+                    .saturating_add(measured.offset_of(node, ElementRow(logical_line))),
+            )
+        });
+    }
     painted_rows(window, measured)
         .into_iter()
         .find_map(|(at, item)| match item {
@@ -1060,6 +1108,22 @@ pub fn line_block_start(
     measured: &Measured,
 ) -> Option<VisualRow> {
     let rows = painted_rows(window, measured);
+    let unit = measured.row();
+    if prose_element(&window.root, element, measured).is_some() {
+        // Prose has no row of its own in this list, so there is no index to walk back from: the
+        // chrome above it is whatever ends where the element begins, and only the element's first
+        // line reaches it.
+        let top = line_top_row(window, element, logical_line, measured)?;
+        let mut start = top;
+        if element_start_row(window, element, measured) == Some(top) {
+            while let Some((at, _)) = rows.iter().rfind(|(at, item)| {
+                matches!(item, PaintedRow::Chrome(_)) && at.row.saturating_add(unit) == start
+            }) {
+                start = at.row;
+            }
+        }
+        return Some(start);
+    }
     let idx = rows.iter().position(|(_, item)| match item {
         PaintedRow::Baseline {
             element: e, line, ..
@@ -1073,12 +1137,17 @@ pub fn line_block_start(
     })?;
     // Walk back over chrome immediately above, but only if the line is the first row of its element
     // — chrome above an element belongs to the element, not to a line in its middle.
+    //
+    // "Immediately above" is one row, which is `unit` units and not 1: a pixel shell counts a row
+    // as a thousand, so testing for 1 was testing for adjacency that never holds there, and the
+    // two GUI shells silently placed a patch's first line with its file heading above the fold —
+    // the very thing this walk exists to prevent.
     let starts_element = element_start_row(window, element, measured) == Some(rows[idx].0.row);
     let mut start = idx;
     if starts_element {
         while start > 0
             && matches!(rows[start - 1].1, PaintedRow::Chrome(_))
-            && rows[start - 1].0.row.saturating_add(1) == rows[start].0.row
+            && rows[start - 1].0.row.saturating_add(unit) == rows[start].0.row
         {
             start -= 1;
         }
@@ -1111,6 +1180,23 @@ fn line_at_offset(
     abs_row: VisualRow,
     measured: &Measured,
 ) -> (FieldId, u32, u32, VisualRow) {
+    // An offset inside a prose element is that element's, whatever the rows around it say: prose
+    // paints none, so the row walk would answer with the nearest editor above or below — a scroll
+    // anchor taken part-way down a document would name a line in some other element, and come back
+    // somewhere else entirely. Which line it is, is what the shell measured.
+    if let Some((node, start, _)) =
+        prose_placements(&window.root, measured)
+            .into_iter()
+            .find(|(_, start, height)| {
+                (start.get()..start.get().saturating_add(*height)).contains(&abs_row.get())
+            })
+    {
+        if let (Some(element), Some(m)) = (node.field_id(), measured.of(node)) {
+            let line = m.row_at(abs_row.get().saturating_sub(start.get()), measured.row());
+            let at = start.get().saturating_add(measured.offset_of(node, line));
+            return (element, line.get(), 0, VisualRow(at));
+        }
+    }
     let rows = painted_rows(window, measured);
     let unit = measured.row();
     let content = |item: &PaintedRow<'_>| -> Option<LineRow> {
@@ -1255,7 +1341,7 @@ pub fn capture_scroll_anchor(
     tab_width: u32,
     measured: &Measured,
 ) -> ScrollAnchor {
-    if let Some((cursor_row, _, _)) = position_cell(window, element, cursor, tab_width, measured) {
+    if let Some(cursor_row) = position_row(window, element, cursor, tab_width, measured) {
         if cursor_row >= top_row && cursor_row < top_row.saturating_add(viewport_rows) {
             return ScrollAnchor::Cursor {
                 screen_row_offset: top_row.distance_to(cursor_row),
@@ -1282,8 +1368,7 @@ pub fn resolve_scroll_anchor(
 ) -> VisualRow {
     match anchor {
         ScrollAnchor::Cursor { screen_row_offset } => {
-            let cursor_row = position_cell(window, element, cursor, tab_width, measured)
-                .map(|(row, _, _)| row)
+            let cursor_row = position_row(window, element, cursor, tab_width, measured)
                 .unwrap_or_else(|| first_loaded_row(window, measured));
             cursor_row.saturating_sub(screen_row_offset)
         }
@@ -1306,14 +1391,47 @@ pub fn resolve_scroll_anchor(
     }
 }
 
+/// The row the cursor sits on, whichever kind of element holds it.
+///
+/// [`position_cell`] answers this for text and cannot answer it for prose: it locates a *grid
+/// cell*, and rendered markdown has none to locate — proportional type, blocks rather than rows.
+/// What both kinds do have is the row a line was drawn at, which is all the scroll anchor ever
+/// wanted of the cursor.
+///
+/// Without this the reading view had no cursor row at all, and the anchor's whole first clause —
+/// *pin the cursor if it is visible* — was dead there: every capture fell through to the top line,
+/// and a cursor anchor captured in a file's editor resolved against its reader to "wherever the
+/// first thing is loaded", which is the top of the document. `Space u` threw the position away in
+/// both directions.
+fn position_row(
+    window: &Window,
+    element: FieldId,
+    pos: LogicalPosition,
+    tab_width: u32,
+    measured: &Measured,
+) -> Option<VisualRow> {
+    if prose_element(&window.root, element, measured).is_some() {
+        return line_top_row(window, element, pos.line, measured);
+    }
+    position_cell(window, element, pos, tab_width, measured).map(|(row, _, _)| row)
+}
+
 /// The first row anything is loaded at, or row 0 with nothing loaded — the fallback a placement
 /// takes when the content it was pinned to is gone.
+///
+/// Prose loads nothing and paints nothing, so its own start is the honest answer for a view made
+/// of it: the top of the document, after whatever chrome stands above it.
 fn first_loaded_row(window: &Window, measured: &Measured) -> VisualRow {
     painted_rows(window, measured)
         .into_iter()
         .find_map(|(at, item)| match item {
             PaintedRow::Chrome(_) | PaintedRow::Edge { .. } => None,
             _ => Some(at.row),
+        })
+        .or_else(|| {
+            prose_placements(&window.root, measured)
+                .first()
+                .map(|(_, at, _)| *at)
         })
         .unwrap_or(VisualRow::ZERO)
 }
@@ -3307,6 +3425,7 @@ mod prose_tests {
                     span: aether_markdown::Span { start: 0, end: 0 },
                 })
                 .collect(),
+            source: Default::default(),
         }
     }
 
@@ -3353,5 +3472,167 @@ mod prose_tests {
         prune_measured(&mut measured, &Element::column(vec![prose(0, 2)]));
         assert!(measured.elements.contains_key(&0));
         assert!(!measured.elements.contains_key(&1));
+    }
+
+    /// A prose element whose lines the shell measured one by one — the reading view, where the
+    /// document's lines are what the server's cursor is expressed in.
+    ///
+    /// `starts` means the same thing it does for an editor the client lays out: the offset each
+    /// **source line** begins at, filled by `read_layout::measured_from_spans` from the blocks the
+    /// shell drew. Lines inside one block share that block's offset.
+    fn measured_reader() -> (Window, Measured) {
+        let window = Window {
+            other_elements_dirty: false,
+            max_line_width: 0,
+            git_status: None,
+            root: Element::column(vec![
+                Element::chrome(vec![Element::text("a.md", Vec::new())]),
+                prose(0, 3),
+            ]),
+        };
+        let mut measured = Measured::at_resolution(1000);
+        measured.elements.insert(
+            0,
+            MeasuredElement {
+                first_row: ElementRow::ZERO,
+                // A heading, a blank, then a paragraph wrapping to two rows' worth.
+                starts: vec![0, 1_500, 1_500, 4_000],
+                end: 6_000,
+            },
+        );
+        (window, measured)
+    }
+
+    /// Where a line of a prose element sits is what the shell measured, offset by the element's
+    /// own start.
+    ///
+    /// It cannot come from the row walk: prose paints no rows there, so `line_top_row` answered
+    /// `None` for every line of a reading view — and the reading view is addressed by line, since
+    /// the server owns the cursor and reports one. Every reveal, placement and block extent in
+    /// the reader resolves through here.
+    #[test]
+    fn a_prose_elements_lines_are_placed_by_the_measurement() {
+        let (w, measured) = measured_reader();
+        // The chrome row above it is one row: 1000 units at this resolution.
+        assert_eq!(element_start_row(&w, 0, &measured), Some(VisualRow(1_000)));
+        let top = |line| line_top_row(&w, 0, line, &measured).map(|r| r.get());
+        assert_eq!(top(0), Some(1_000), "the first line opens the element");
+        assert_eq!(top(1), Some(2_500));
+        assert_eq!(
+            top(2),
+            Some(2_500),
+            "a line sharing its block shares its top"
+        );
+        assert_eq!(top(3), Some(5_000));
+        assert_eq!(top(4), None, "past the document there is no row");
+        // The element's first line reaches the chrome above it; a later one does not.
+        assert_eq!(line_block_start(&w, 0, 0, &measured), Some(VisualRow(0)));
+        assert_eq!(
+            line_block_start(&w, 0, 3, &measured),
+            Some(VisualRow(5_000))
+        );
+    }
+
+    /// `Space u` keeps the cursor where it was on screen, in **both** directions.
+    ///
+    /// A file's editor and its reader are two views over one buffer, and switching captures a
+    /// content anchor across the re-presentation: the cursor's screen offset when the cursor is
+    /// visible, the top line otherwise. The cursor clause needs the cursor's *row*, which prose
+    /// has to answer differently — it has no grid cell to locate — and while it could not, the
+    /// reader lost the position each way: a capture there always fell through to the top line, and
+    /// an editor's cursor anchor resolved against a reader to the top of the document.
+    #[test]
+    fn the_cursor_anchor_survives_a_switch_between_editor_and_reader() {
+        let (reader, measured) = measured_reader();
+        let cursor = LogicalPosition { line: 3, col: 0 };
+        // Line 3 was drawn at 5_000, and the reader is scrolled to 4_000: one row down the screen.
+        let anchor =
+            capture_scroll_anchor(&reader, VisualRow(4_000), 10_000, 0, cursor, 4, &measured);
+        assert_eq!(
+            anchor,
+            ScrollAnchor::Cursor {
+                screen_row_offset: 1_000
+            },
+            "the reading view pinned the top line instead of the visible cursor"
+        );
+
+        // The editor of the same file, at the same resolution: line 3 is its fourth wire row.
+        let editor = Window {
+            other_elements_dirty: false,
+            max_line_width: 0,
+            git_status: None,
+            root: Element::Editor {
+                element: 0,
+                buffer: 1,
+                rows: 6,
+                first_row: ElementRow::ZERO,
+                laid_out_by: LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Field,
+                first_buffer_line: 0,
+                lines: (0..6)
+                    .map(|n| LogicalLineRender {
+                        change: Default::default(),
+                        logical_line: n,
+                        visual_rows: vec![aether_protocol::viewport::WrappedRow {
+                            byte_offset: 0,
+                            continuation_indent: 0,
+                            segments: vec![aether_protocol::viewport::Segment {
+                                text: "x".into(),
+                                highlights: vec![],
+                            }],
+                        }],
+                        search_matches: vec![],
+                        baseline_above: vec![],
+                        diagnostics: vec![],
+                        sneak_targets: vec![],
+                    })
+                    .collect(),
+            },
+        };
+        // Resolved against the editor, the cursor keeps its one-row offset: line 3 sits at row 3.
+        assert_eq!(
+            resolve_scroll_anchor(&editor, anchor, 0, cursor, 4, &measured),
+            VisualRow(2_000)
+        );
+        // And back the other way — an anchor captured in the editor, resolved against the reader,
+        // lands on the cursor's block rather than at the top of the document.
+        assert_eq!(
+            resolve_scroll_anchor(
+                &reader,
+                ScrollAnchor::Cursor {
+                    screen_row_offset: 1_000
+                },
+                0,
+                cursor,
+                4,
+                &measured
+            ),
+            VisualRow(4_000)
+        );
+    }
+
+    /// And the inverse: an offset inside a prose element is that element's line, not the nearest
+    /// row the walk can see.
+    ///
+    /// This is the scroll anchor. Prose paints no rows, so `anchor_at` would otherwise reach back
+    /// to whatever was painted above — the chrome's line 0 — and a reader scrolled half-way down
+    /// would come back to the top on every wrap toggle, resize or reconnect.
+    #[test]
+    fn an_offset_inside_prose_resolves_to_its_line() {
+        let (w, measured) = measured_reader();
+        let at = |row| {
+            let (element, line, _) = line_at_row(&w, VisualRow(row), &measured);
+            (element, line)
+        };
+        assert_eq!(at(1_000), (0, 0), "the element's own start");
+        assert_eq!(at(3_000), (0, 2), "inside the block holding lines 1 and 2");
+        assert_eq!(at(5_500), (0, 3), "part-way into the last line");
+        // The anchor a `view/window` reports carries that line, and how far into it the top sits.
+        let anchor = anchor_at(&w, VisualRow(5_400), &measured);
+        assert_eq!((anchor.element, anchor.line), (0, 3));
+        assert!(
+            (anchor.sub_row - 0.4).abs() < 0.01,
+            "the fraction into the line is lost: {anchor:?}"
+        );
     }
 }

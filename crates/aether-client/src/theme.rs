@@ -89,20 +89,28 @@ pub struct Theme {
     /// The application's ground: everything that is not a well of editable text — the editor
     /// pane behind and between its elements, the rows past the end of the content, the gaps an
     /// unloaded element leaves, a chrome row's band, the cells a box's border and padding
-    /// occupy, and the whole canvas when no view is open.
+    /// occupy, the whole canvas when no view is open, and **rendered prose**: the reading view's
+    /// page and an agent's reply.
     ///
     /// It is the shade [`Self::bg`] sits *in*, which is what makes an unreachable row legible:
     /// chrome is simply the ground showing through between wells, rather than text the cursor
     /// mysteriously skips.
     pub bg_app: Rgb,
-    /// The editor well: rows of buffer text, gutter included — and a client-laid-out prose
-    /// element (the Markdown reader), which is an editor element too.
+    /// The editor well: rows of buffer text, gutter included. **Text you can put a cursor in**,
+    /// and nothing else — which is what the shade means, and why prose left it: a rendered
+    /// document is read, not edited, and it sits on the ground like every other thing that is not
+    /// a row of the buffer.
     pub bg: Rgb,
     /// Status line, panels, picker surfaces.
     pub bg_panel: Rgb,
     /// Chrome selection: picker active row, chips, in-chrome selections.
     pub bg_selection: Rgb,
-    /// Editor visual-mode selection.
+    /// Content selection: the editor's visual mode, and the reading view's selected blocks.
+    ///
+    /// Distinct from [`Self::bg_selection`], which is *chrome* selection — a picker's active row,
+    /// a chip. The reading view used the chrome shade until the raised surface below claimed it
+    /// in dark, and a selection you cannot see on a quote is not a selection; a selected block is
+    /// selected content either way, which is what this role is for.
     pub bg_visual: Rgb,
     /// Muted fills: search-hit tint, the sneak word band, scroll tracks.
     pub fill_dim: Rgb,
@@ -231,10 +239,29 @@ pub struct Theme {
     pub git_ref_tag: Rgb,
 
     // ---- Markdown reading view ----
-    /// Code spans/blocks panel.
+    /// Code spans/blocks panel — **the editor's own well** ([`Self::bg`]), now that the page
+    /// around it is the ground. Code in a document is the one thing in it that is still text of
+    /// the kind an editor holds, so it sits in the shade an editor would give it: a step away
+    /// from the page in whichever direction the theme has room, without a third shade to tune.
     pub md_code_bg: Rgb,
-    /// Alternating table-row band, between `bg` and `md_code_bg`.
-    pub md_table_stripe_bg: Rgb,
+    /// An **inline code chip**: one step further from the well than the page is, so a few
+    /// characters of code lift cleanly out of the prose around them.
+    ///
+    /// It runs *away* from the editor's well in both themes (lighter in dark, paler still in
+    /// light), which is what keeps it distinct from [`Self::md_code_bg`]: a fenced block is a slab
+    /// of editor and takes the well itself, while a chip is a mark in a sentence.
+    ///
+    /// Small things only, which is why nothing else uses it: a shade that reads as a neat chip
+    /// behind three characters reads as a slab behind three paragraphs. Everything larger takes
+    /// [`Self::md_panel_bg`].
+    pub md_chip_bg: Rgb,
+    /// The reading view's **panel** fill: quote blocks, and a table's banded rows.
+    ///
+    /// A quarter of the chip's step, because these cover a hundred times the area — a quote's bar
+    /// and indent already say where it starts and ends, and a zebra band only has to let the eye
+    /// track one row across wide columns. One shade for both, so a quote and a table read as the
+    /// same kind of surface.
+    pub md_panel_bg: Rgb,
     /// The "Important" alert's hue. The other four alert kinds are genuine statuses (note =
     /// [`Self::info`], tip = [`Self::ok`], warning, caution = [`Self::error`]); purple has no
     /// status meaning, so it gets its own role rather than borrowing [`Self::syn_constant`].
@@ -330,8 +357,11 @@ impl Theme {
         git_ref_branch: NORD14,
         git_ref_remote: NORD15,
         git_ref_tag: NORD13,
-        md_code_bg: NORD1,
-        md_table_stripe_bg: rgb(0x323845), // between NORD0 and NORD1
+        md_code_bg: NORD0, // the editor's well, a step down from the page
+        // One step lighter than the page, as the page is one step lighter than the well; a panel
+        // takes a quarter of that step, for a hundred times the area.
+        md_chip_bg: NORD2,
+        md_panel_bg: NORD1,
         md_alert_important: NORD15,
         syn_keyword: NORD9,
         syn_string: NORD14,
@@ -345,11 +375,16 @@ impl Theme {
 
     /// Nord light: Polar Night and Snow Storm swap ends, Frost/Aurora accents darken to hold
     /// contrast on the pale backgrounds. The salience ladders (comment below keyword; staged
-    /// dimmer than unstaged; stripe between bg and panel) keep their dark-theme ordering.
+    /// dimmer than unstaged; stripe between the page and the panel) keep their dark-theme
+    /// ordering — including the one the two background roles make: the well is a step *darker*
+    /// than the ground here as it is there, so "an editor is the darker shade" is a rule about
+    /// the app rather than about the theme you happen to be in.
     pub const LIGHT: Theme = Theme {
         mode: ThemeMode::Light,
-        bg_app: rgb(0xe1e6ee), // ~60% from NORD6 toward NORD5, as the dark pair is
-        bg: NORD6,
+        bg_app: NORD6, // the ground: the palest shade, as dark's ground is its lightest
+        bg: rgb(0xe1e6ee), // the well, ~60% from NORD6 toward NORD5 — a step *down* from the
+        // ground, so an editor is the darker of the two shades in both
+        // themes and everything else is the lighter one
         bg_panel: NORD5,
         bg_selection: NORD4,
         bg_visual: rgb(0xc2d6e7), // pale Frost — dark text stays readable inside a selection
@@ -357,7 +392,7 @@ impl Theme {
         sneak_prefix_bg: rgb(0xc4cedb), // darker than fill_dim: prominence inverts on light
         match_highlight: rgb(0x9a7522), // = warning today; free to diverge
         match_bracket: rgb(0xab5f38),   // = syn_macro today; free to diverge
-        cursor_line_bg: rgb(0xe4e9f0),  // ~40% from NORD6 toward NORD5
+        cursor_line_bg: rgb(0xe4e9f0),  // a step up from the well toward the ground
         overlay_border: rgb(0xaab4c4),
         border_subtle: rgb(0xd8dfe8), // = fill_dim today; borders can darken independently
         fg: NORD0,
@@ -411,8 +446,9 @@ impl Theme {
         git_ref_branch: rgb(0x5a7547),
         git_ref_remote: rgb(0x8d6488),
         git_ref_tag: rgb(0x9a7522),
-        md_code_bg: rgb(0xe1e6ee),
-        md_table_stripe_bg: rgb(0xe9edf3),
+        md_code_bg: rgb(0xe1e6ee), // = the editor's well, a step down from the page
+        md_chip_bg: rgb(0xf6f8fb), // a step paler than the page, as dark's is lighter
+        md_panel_bg: rgb(0xf1f3f8), // the fainter lift, for the larger area
         md_alert_important: rgb(0x8d6488), // = syn_constant today; free to diverge
         syn_keyword: NORD10,
         syn_string: rgb(0x5a7547),
@@ -604,7 +640,9 @@ mod tests {
         assert_eq!(t.cursor_line_bg.css(), "#343a48");
         assert_eq!(t.git_staged_modified.css(), "#9e8a62");
         assert_eq!(t.syn_comment.css(), "#7b88a1");
-        assert_eq!(t.md_table_stripe_bg.css(), "#323845");
+        // The reading view's two lifts off the page: a chip's, and the quieter one its panels take.
+        assert_eq!(t.md_chip_bg.css(), "#434c5e");
+        assert_eq!(t.md_panel_bg.css(), "#3b4252");
         // The chrome roles that share a dark shade with a semantically unrelated role — the
         // shade is pinned here so renaming call sites can never shift dark rendering.
         assert_eq!(t.match_highlight, NORD13);
@@ -640,7 +678,10 @@ mod tests {
         assert_eq!(d.mode, ThemeMode::Dark);
         assert_eq!(l.mode, ThemeMode::Light);
         assert_eq!(Theme::of(ThemeMode::Light).bg, l.bg);
-        assert_eq!(l.bg, NORD6);
+        // The *ground* is the palest shade in light, as it is the darkest in dark: the well is a
+        // step in from it either way, because an editor is the darker of the two in both themes.
+        assert_eq!(l.bg_app, NORD6);
+        assert_eq!(l.bg.css(), "#e1e6ee");
         assert_eq!(l.fg, NORD0);
         assert_ne!(l.warning, NORD13, "aurora yellow is unreadable on light");
         // The staged-dimmer-than-unstaged ladder holds in both directions.
@@ -672,9 +713,20 @@ mod tests {
                 t.bg_app.css(),
             );
         }
-        // The shades the ground took over from the chrome band it replaced.
+        // And the direction is a rule, not a coincidence of one palette: the well is darker than
+        // the ground in **both** themes, which is what makes "an editor is the darker shade"
+        // something a reader of this file can rely on.
+        for t in [Theme::DARK, Theme::LIGHT] {
+            assert!(
+                t.bg.r < t.bg_app.r,
+                "{:?}: the well ({}) must be darker than the ground ({})",
+                t.mode,
+                t.bg.css(),
+                t.bg_app.css(),
+            );
+        }
         assert_eq!(Theme::DARK.bg_app.css(), "#373e4d");
-        assert_eq!(Theme::LIGHT.bg_app.css(), "#e1e6ee");
+        assert_eq!(Theme::LIGHT.bg_app.css(), "#eceff4");
     }
 
     /// A commit row's decorations exist to be told apart at a glance, so the four ref roles must

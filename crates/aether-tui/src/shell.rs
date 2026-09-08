@@ -270,6 +270,13 @@ pub struct Shell {
     read_last_focus: Option<usize>,
     /// Reading-view layout cache, keyed by `(buffer, revision, hl_gen, content_cols)` —
     /// `hl_gen` moves when fence highlights land, which revision alone doesn't capture.
+    ///
+    /// The **measurement rides with the rows** because the two are one answer — how the document
+    /// laid out — and they were previously written together but dropped apart: `prune_measured`
+    /// takes the grid's copy the moment the view shows something else, while this cache survives,
+    /// so coming back to the same document hit the cache, skipped the layout, and left the grid
+    /// with no measurement for an element it was about to place. Held here, the render can put it
+    /// back every frame and the two cannot drift.
     #[allow(clippy::type_complexity)]
     read_cache: Option<(
         u64,
@@ -277,6 +284,7 @@ pub struct Shell {
         u64,
         u16,
         std::sync::Arc<Vec<aether_client::read_layout::ReadRow>>,
+        aether_client::grid::MeasuredElement,
     )>,
     /// Per-code-block horizontal scroll, keyed by the block's element index: code rows are laid out
     /// unchunked and the painter clips them to this offset. Cleared when the parse changes (element
@@ -1714,8 +1722,11 @@ impl Shell {
     fn ensure_cursor_visible(&mut self, style: RevealStyle) {
         // The reading view reveals its *block*, at block grain and on focus changes only
         // (`read_view`); the cursor's line is not what it shows, and a reveal owed against it
-        // would fight the reader's own on every window.
-        if self.session.view.read.is_some() {
+        // would fight the reader's own on every window. Asked of the **window**, which still shows
+        // the reader when the core's `read` has gone: leaving it sends one last reveal, and
+        // answering that by the editor's rules fetches a cursor window against a document made of
+        // prose — where no line is ever "loaded", so nothing comes of it but the round trip.
+        if self.session.window_shows_prose() {
             self.pending_reveal.abandon();
             return;
         }
@@ -2358,16 +2369,30 @@ impl Shell {
                 &rows,
                 &read.elements,
                 |byte| read.pos_of(byte).line,
-                read.text.split('\n').count() as u32,
+                read.line_count(),
                 u32::from(crate::ui::READ_PAD_TOP),
                 u32::from(crate::ui::READ_PAD_BOTTOM),
             );
-            self.measured
-                .elements
-                .insert(self.session.view.focused_element, measured);
-            self.read_cache = Some((key.0, key.1, key.2, key.3, std::sync::Arc::new(rows)));
+            self.read_cache = Some((
+                key.0,
+                key.1,
+                key.2,
+                key.3,
+                std::sync::Arc::new(rows),
+                measured,
+            ));
         }
-        let rows = self.read_cache.as_ref().expect("just filled").4.clone();
+        let cache = self.read_cache.as_ref().expect("just filled");
+        let (rows, measured) = (cache.4.clone(), cache.5.clone());
+        // Every frame, not only the ones that laid the document out: the grid's copy goes whenever
+        // the view shows something else (`prune_measured`), and the scroll, the anchor and every
+        // reveal resolve through it.
+        // Every frame, not only the ones that laid the document out: the grid's copy goes whenever
+        // the view shows something else (`prune_measured`), and the scroll, the anchor and every
+        // reveal resolve through it.
+        self.measured
+            .elements
+            .insert(self.session.view.focused_element, measured);
         // A placement the window's adoption left for this layout: the content anchor a `Space u`
         // captured, else the subscribe's scroll — the same two answers the editor places by.
         if std::mem::take(&mut self.read_place_pending) {
@@ -4037,6 +4062,76 @@ mod scroll_tests {
             sh.top_visual_row,
             VisualRow(22 + 50 - rest),
             "one press, and the placement lands where a loaded cursor's would"
+        );
+    }
+
+    /// The reading view's measurement survives a trip through another view, even though its layout
+    /// cache does not miss.
+    ///
+    /// `prune_measured` takes the grid's copy the moment the view shows something else — an editor
+    /// element is not the client's to lay out — while the layout cache, keyed by the document,
+    /// stays valid. Coming back therefore *hit* the cache, skipped the layout, and never put the
+    /// measurement back, leaving the grid to place a document it had no heights for: `Space u`
+    /// into the reader landed at row 0 however far down you were, and the anchor captured there
+    /// next was line 0, so the way back was wrong too. The first switch always worked, which is
+    /// what made it look intermittent.
+    #[test]
+    fn the_readers_measurement_comes_back_with_its_cached_layout() {
+        let text = "# Title\n\nFirst para.\n\nSecond para.\n";
+        let window = Window {
+            other_elements_dirty: false,
+            max_line_width: 0,
+            git_status: None,
+            root: aether_protocol::viewport::Element::Prose {
+                element: 0,
+                blocks: aether_client::markdown::parse(text),
+                source: aether_protocol::ui::SourceLines::of(text),
+            },
+        };
+        let mut sh = shell_with(window, 0, 0);
+        sh.session.view.read = {
+            let mut read = aether_client::session::ReadView::loading(0);
+            read.adopt(
+                0,
+                aether_client::markdown::parse(text),
+                aether_protocol::ui::SourceLines::of(text),
+            );
+            Some(read)
+        };
+
+        let _ = sh.read_view();
+        let measured = sh
+            .measured
+            .elements
+            .get(&0)
+            .cloned()
+            .expect("the first layout measured the document");
+
+        // The view shows something else for a while: the grid drops what it cannot place.
+        aether_client::grid::prune_measured(
+            &mut sh.measured,
+            &aether_protocol::viewport::Element::Editor {
+                element: 0,
+                buffer: 1,
+                rows: 1,
+                first_row: aether_protocol::coords::ElementRow::ZERO,
+                laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Field,
+                first_buffer_line: 0,
+                lines: vec![],
+            },
+        );
+        assert!(
+            sh.measured.elements.is_empty(),
+            "the grid kept a stale height"
+        );
+
+        // Back to the same document: the cache hits, and the measurement comes back with it.
+        let _ = sh.read_view();
+        assert_eq!(
+            sh.measured.elements.get(&0),
+            Some(&measured),
+            "the reading view was placed against a document the grid had no heights for"
         );
     }
 }

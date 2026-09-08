@@ -1104,6 +1104,36 @@ pub fn footnote_def_span(blocks: &[Block], label: &str) -> Option<Span> {
     None
 }
 
+/// The blocks of a footnote's definition — its *content*, without the `[^label]:` marker.
+///
+/// The sibling of [`footnote_def_span`], which says where the definition sits. The difference is
+/// not convenience: a popover renders plain text, so slicing the span shows the definition's own
+/// markup through verbatim, and a reading view carried as a parse has no source to slice at all.
+/// Flattening this with [`to_plain`] answers both.
+pub fn footnote_def_content<'a>(blocks: &'a [Block], label: &str) -> Option<&'a [Block]> {
+    for block in blocks {
+        match block {
+            Block::FootnoteDef {
+                label: l, content, ..
+            } if l == label => return Some(content),
+            Block::Quote { content, .. } | Block::FootnoteDef { content, .. } => {
+                if let Some(c) = footnote_def_content(content, label) {
+                    return Some(c);
+                }
+            }
+            Block::List { items, .. } => {
+                for item in items {
+                    if let Some(c) = footnote_def_content(&item.blocks, label) {
+                        return Some(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 // ---- plain flattening ---------------------------------------------------------------------------
 
 /// Flatten a parsed document back to plain text, for "copy whole popover" (the AST is the only

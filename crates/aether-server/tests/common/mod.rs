@@ -549,35 +549,17 @@ pub async fn set_snapped(
 
 // ---- input/move_lines ---------------------------------------------------------------------------
 
+/// What the buffer holds, asked of the buffer.
+///
+/// Off `buffer/content` rather than out of a window's rendered lines, which is not a tidying: a
+/// markdown file's default view is the **reader**, and a reader's element is prose — the parse and
+/// its line table, no lines at all. Reading text out of the view answered `""` for every `.md`
+/// fixture the moment that landed, which is the wire working as intended: what a view shows and
+/// what a buffer holds are different questions, and this one is about the buffer.
 pub async fn buffer_text(ws: &mut Ws, buffer_id: u64) -> String {
-    // Subscribe to a wide-enough viewport and concatenate the visible-text lines.
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
-        ws,
-        &ViewportSubscribeParams {
-            view_id: view_of(buffer_id),
-            cols: 200,
-            rows: 100,
-            overscan_rows: 0,
-            scroll: ScrollPosition {
-                element: 0,
-                line: 0,
-                sub_row: 0.0,
-            },
-            focus: None,
-            wrap: WrapMode::None,
-            continuation_marker_width: 0,
-            tab_width: 4,
-            diff_view: false,
-        },
-    )
-    .await;
-    sub.window
-        .root
-        .lines()
-        .into_iter()
-        .map(|l| l.visual_rows[0].segments[0].text.as_str().to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let res: BufferContentResult =
+        send_request::<BufferContent>(ws, &BufferContentParams { buffer_id }).await;
+    res.text
 }
 
 /// Boilerplate for the comment-toggle tests that need a language: write `content` to

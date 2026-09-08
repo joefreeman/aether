@@ -116,15 +116,20 @@ pub enum Element {
     /// cannot be measured anywhere else), through the same `Measured` table an editor element the
     /// client lays out uses.
     ///
-    /// **A field id and the parse, and nothing else.** No buffer id and no source line, because a
-    /// prose element has no wire rows: nothing addresses it by position, and the one path that
-    /// resolves an element to a buffer — a pointer press — walks the editors. Selecting or copying
-    /// inside rendered prose wants both back, and wants an answer to which of a block's inlines a
-    /// pixel is in; that answer is what would decide the shape of them, so they are not guessed at
-    /// here in the meantime.
+    /// **The parse, and the shape of the text it came from — no source and no wire rows.** A prose
+    /// element carries its own content, so nothing fetches it and no row addresses it. What
+    /// `source` adds is the one thing a parse loses: the reading view *is* addressed by position,
+    /// because the server owns the cursor and reports it as a line and a byte column, and
+    /// resolving that against a block means knowing where each line starts. The line table is what
+    /// a client wanted the source for; the source itself stays where the buffer is.
+    ///
+    /// Still no buffer id: the one path that resolves an element to a buffer — a pointer press —
+    /// walks the editors, and which of a block's inlines a *pixel* is in is unanswered, so it is
+    /// not guessed at here in the meantime.
     Prose {
         element: FieldId,
         blocks: Vec<aether_markdown::Block>,
+        source: SourceLines,
     },
     /// Literal text with role-styled runs over it. `highlights` are byte offsets into `text` and
     /// carry the same capture names buffer text does, so they resolve through the theme table a
@@ -146,14 +151,65 @@ pub enum Element {
     Fill { glyph: char },
 }
 
+/// Where a prose element's lines begin, and how long its text is — the shape of the text a parse
+/// came from, without the text.
+///
+/// A reading view is addressed by **position**: the server owns the cursor and reports it as a
+/// line and a byte column, while everything resolved against it client-side — which block the
+/// cursor is in, which line a rendered block starts at, where a measured block's lines sit — is a
+/// byte offset into the same text. Converting between the two is all a client ever wanted the
+/// source for, so this is what it is sent instead: the two numbers that conversion needs.
+///
+/// Offsets are into the **element's own text**, exactly as the spans in `blocks` are, so both
+/// sides of any comparison speak one set of coordinates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceLines {
+    /// The byte offset each line starts at, ascending, one entry per line. Always begins with 0:
+    /// text with no newline in it is one line, and empty text is still one line.
+    pub starts: Vec<u32>,
+    /// The text's length in bytes — where the last line ends, and what a byte offset is clamped
+    /// against. Derivable from neither `starts` (which says where the last line begins, not where
+    /// it ends) nor the parse (trailing blank lines belong to no block).
+    pub byte_len: u32,
+}
+
+impl SourceLines {
+    /// The table for a piece of text. One definition of where a line begins, used by the server
+    /// that sends it and by every test that fakes one — the alternative is two rules that agree
+    /// until a document ends without a newline.
+    ///
+    /// Counts lines as a rope does: a trailing newline opens a final empty line, so `"a\nb\n"` is
+    /// three lines. That is the count the cursor's line numbers are in.
+    pub fn of(text: &str) -> Self {
+        SourceLines {
+            starts: std::iter::once(0)
+                .chain(
+                    text.char_indices()
+                        .filter_map(|(i, c)| (c == '\n').then_some(i as u32 + 1)),
+                )
+                .collect(),
+            byte_len: text.len() as u32,
+        }
+    }
+
+    /// How many lines the text has — the length of the table, by construction.
+    pub fn line_count(&self) -> u32 {
+        self.starts.len() as u32
+    }
+}
+
 /// Who lays an editor element's lines out — whose arithmetic its height is.
 ///
 /// The server wraps monospace text and knows exactly how many rows that made; that is every
-/// ordinary editor, and the tree carries its height. Prose the client renders from source has no
-/// height the server could know, so the server sends its lines unwrapped — one row per line on
-/// the wire, `rows` the line count — and the client measures the rest. The grid reads the tree
-/// for the first and the shell's measurements for the second, and nothing else about scrolling
-/// changes between them.
+/// ordinary editor, and the tree carries its height. An editor the *client* wraps has no height
+/// the server could know, so its lines go out unwrapped — one row per line on the wire, `rows` the
+/// line count — and the shell measures the rest. The grid reads the tree for the first and the
+/// shell's measurements for the second, and nothing else about scrolling changes between them.
+///
+/// Rendered markdown is not one of these: it is [`Element::Prose`], which carries no lines at all
+/// and is always the shell's to measure. The reading view was the one client-laid-out editor there
+/// was — a whole document sent as unwrapped lines for the client to parse — until it became prose
+/// like any other.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutOwner {

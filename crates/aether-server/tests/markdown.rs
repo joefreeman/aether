@@ -1086,6 +1086,195 @@ async fn move_paragraph_unit_works_on_plain_text() {
     drop(server);
 }
 
+/// `x` snaps the focused block whole, then walks; `Shift-x` grows instead.
+///
+/// The reading view's block-selection rule, which moved here from the client because telling a
+/// partial range from a whole one needs the block boundaries under the current bytes.
+#[tokio::test]
+async fn select_block_snaps_then_walks_and_extends() {
+    use aether_protocol::cursor::{ElementSelectBlock, SelectBlockParams, VerticalDirection};
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("# Title\n\nFirst para.\n\nSee here.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    let step = |direction, extend| SelectBlockParams {
+        buffer_id,
+        direction,
+        extend,
+        count: 1,
+    };
+
+    // First press from a bare reading position: the focused block alone, whole-line.
+    set_cursor(&mut ws, buffer_id, 0, 0).await;
+    let r: CursorState =
+        send_request::<ElementSelectBlock>(&mut ws, &step(VerticalDirection::Down, false)).await;
+    assert_eq!((r.anchor.line, r.position.line), (0, 0));
+
+    // With that block whole, a plain press WALKS to the next one rather than extending.
+    let r: CursorState =
+        send_request::<ElementSelectBlock>(&mut ws, &step(VerticalDirection::Down, false)).await;
+    assert_eq!((r.anchor.line, r.position.line), (2, 2));
+
+    // From the heading selected whole, extending grows the bottom.
+    // `set_snapped` takes (position, anchor): the cursor at the heading's end, anchored at 0.
+    set_snapped(&mut ws, buffer_id, p(0, 7), p(0, 0), Granularity::Line).await;
+    let r: CursorState =
+        send_request::<ElementSelectBlock>(&mut ws, &step(VerticalDirection::Down, true)).await;
+    assert_eq!((r.anchor.line, r.position.line), (0, 2));
+    drop(server);
+}
+
+/// `Alt-x` from a bare position selects the block *above*, and saturates at the top.
+#[tokio::test]
+async fn select_block_upward_selects_above_and_saturates() {
+    use aether_protocol::cursor::{ElementSelectBlock, SelectBlockParams, VerticalDirection};
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("# Title\n\nFirst para.\n\nSee here.\n").await;
+    let up = SelectBlockParams {
+        buffer_id,
+        direction: VerticalDirection::Up,
+        extend: false,
+        count: 1,
+    };
+    set_cursor(&mut ws, buffer_id, 2, 0).await;
+    let r: CursorState = send_request::<ElementSelectBlock>(&mut ws, &up).await;
+    assert_eq!((r.anchor.line, r.position.line), (0, 0), "the block above");
+
+    set_cursor(&mut ws, buffer_id, 0, 0).await;
+    let r: CursorState = send_request::<ElementSelectBlock>(&mut ws, &up).await;
+    assert_eq!(
+        (r.anchor.line, r.position.line),
+        (0, 0),
+        "saturates at the top"
+    );
+    drop(server);
+}
+
+/// A partial selection snaps whole before it advances — the press is consumed by the snap.
+#[tokio::test]
+async fn select_block_snaps_a_partial_selection_before_advancing() {
+    use aether_protocol::cursor::{ElementSelectBlock, SelectBlockParams, VerticalDirection};
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("# Title\n\nFirst para.\n\nSee here.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    set_snapped(&mut ws, buffer_id, p(2, 5), p(2, 1), Granularity::Char).await;
+    let r: CursorState = send_request::<ElementSelectBlock>(
+        &mut ws,
+        &SelectBlockParams {
+            buffer_id,
+            direction: VerticalDirection::Down,
+            extend: false,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!((r.anchor.line, r.position.line), (2, 2));
+    drop(server);
+}
+
+/// `Ctrl-e`'s range stops at the block's last content char, so its terminator survives the change.
+#[tokio::test]
+async fn block_content_stops_before_the_terminator() {
+    use aether_protocol::cursor::ElementBlockContent;
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("# Title\n\nFirst para.\n\nSee here.\n").await;
+    set_cursor(&mut ws, buffer_id, 2, 0).await;
+    let r: CursorState =
+        send_request::<ElementBlockContent>(&mut ws, &BufferOnlyParams { buffer_id }).await;
+    assert_eq!(r.anchor, LogicalPosition { line: 2, col: 0 });
+    assert_eq!(
+        r.position,
+        LogicalPosition { line: 2, col: 10 },
+        "the final '.', not the newline after it"
+    );
+    drop(server);
+}
+
+/// `i` and `a` land at the block's start and at its append point.
+#[tokio::test]
+async fn block_edge_lands_at_the_blocks_start_and_append_point() {
+    use aether_protocol::cursor::{CursorMove, CursorMoveParams, Motion};
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("# Title\n\nFirst para.\n\nSee here.\n").await;
+    let edge = |at_end| CursorMoveParams {
+        buffer_id,
+        motion: Motion::BlockEdge { at_end },
+        extend_selection: false,
+    };
+    set_cursor(&mut ws, buffer_id, 2, 4).await;
+    let r: CursorState = send_request::<CursorMove>(&mut ws, &edge(false)).await;
+    assert_eq!(r.position, LogicalPosition { line: 2, col: 0 });
+    let r: CursorState = send_request::<CursorMove>(&mut ws, &edge(true)).await;
+    assert_eq!(
+        r.position,
+        LogicalPosition { line: 2, col: 11 },
+        "the caret gap before the block's own terminator"
+    );
+    drop(server);
+}
+
+/// A document with no blocks is not a dead end: the edges are the element's own.
+#[tokio::test]
+async fn block_edge_falls_back_to_the_elements_ends_without_blocks() {
+    use aether_protocol::cursor::{CursorMove, CursorMoveParams, Motion};
+    let (server, mut ws, buffer_id) = setup_with_buffer("").await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::BlockEdge { at_end: false },
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(r.position, LogicalPosition { line: 0, col: 0 });
+    drop(server);
+
+    // Blank lines parse to no blocks either, and `a` still means the end, past them.
+    let (server, mut ws, buffer_id) = setup_with_buffer("\n\n").await;
+    let r: CursorState = send_request::<CursorMove>(
+        &mut ws,
+        &CursorMoveParams {
+            buffer_id,
+            motion: Motion::BlockEdge { at_end: true },
+            extend_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(r.position, LogicalPosition { line: 2, col: 0 });
+    drop(server);
+}
+
+/// `element/source` answers a reading-view copy: the source of whatever the cursor has.
+///
+/// The point-cursor case is the one worth pinning, because its grain is the **innermost stop of
+/// any kind** rather than the innermost block — copying inside a link yields the link, where
+/// `element/delete_block` on the same cursor would take the whole paragraph. The two are
+/// deliberately different rules resolved against one parse.
+#[tokio::test]
+async fn element_source_answers_copy_at_reading_grain() {
+    use aether_protocol::input::{ElementSource, ElementSourceResult};
+    let (server, mut ws, buffer_id) =
+        setup_with_buffer("# Title\n\nSee [docs](https://x.y) here.\n\nLast.\n").await;
+    let p = |line: u32, col: u32| LogicalPosition { line, col };
+    let params = BufferOnlyParams { buffer_id };
+
+    // In the heading: that block's source, its trailing newline trimmed off.
+    set_cursor(&mut ws, buffer_id, 0, 2).await;
+    let r: ElementSourceResult = send_request::<ElementSource>(&mut ws, &params).await;
+    assert_eq!(r.text, "# Title");
+
+    // Inside the link: the link's own source, not the paragraph holding it.
+    set_cursor(&mut ws, buffer_id, 2, 6).await;
+    let r: ElementSourceResult = send_request::<ElementSource>(&mut ws, &params).await;
+    assert_eq!(r.text, "[docs](https://x.y)");
+
+    // An extended selection: the whole range, inclusive of the char the cursor sits on.
+    set_snapped(&mut ws, buffer_id, p(2, 28), p(0, 0), Granularity::Char).await;
+    let r: ElementSourceResult = send_request::<ElementSource>(&mut ws, &params).await;
+    assert_eq!(r.text, "# Title\n\nSee [docs](https://x.y) here.");
+    drop(server);
+}
+
 #[tokio::test]
 async fn delete_block_cuts_around_and_paste_block_restores() {
     use aether_protocol::input::{InputDeleteBlock, InputPasteBlock, PasteBlockParams};
@@ -1715,39 +1904,71 @@ fn the_element(
     }
 }
 
-/// Who lays out the view a subscribe to `view_id` shows.
-async fn layout_owner_of(
-    ws: &mut Ws,
-    view_id: aether_protocol::ViewId,
-) -> aether_protocol::ui::LayoutOwner {
-    let sub: ViewportSubscribeResult =
-        send_request::<ViewportSubscribe>(ws, &reader_sub_params(view_id)).await;
-    the_element(&sub.window).0
+/// The parse and line table a window's single prose element carries.
+fn the_prose(
+    window: &aether_protocol::viewport::Window,
+) -> (
+    &Vec<aether_markdown::Block>,
+    &aether_protocol::ui::SourceLines,
+) {
+    match &window.root {
+        aether_protocol::viewport::Element::Prose { blocks, source, .. } => (blocks, source),
+        other => panic!("one prose element, got {other:?}"),
+    }
 }
 
-/// A markdown file opened with no opinion — a plain open — is the reader, the app setting's
-/// default: one element the client lays out, sent **unwrapped** (a wire row is a line, however
-/// narrow the viewport) and **whole** (every line, however short the viewport).
+/// Whether the view a subscribe to `view_id` shows is the **reader** — which is to say whether it
+/// sends its document as prose or as lines. The one question every "which view is this" assertion
+/// here asks, and the wire answers it outright.
+async fn presents_as_reader(ws: &mut Ws, view_id: aether_protocol::ViewId) -> bool {
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(ws, &reader_sub_params(view_id)).await;
+    matches!(
+        sub.window.root,
+        aether_protocol::viewport::Element::Prose { .. }
+    )
+}
+
+/// A markdown file opened with no opinion — a plain open — is the reader: one **prose** element
+/// carrying the server's parse of the whole file and the table that says where its lines begin.
+///
+/// Not a line of the source goes out. That is the point of the element and not an optimisation:
+/// the client has no text to parse differently, so three shells cannot disagree about where a list
+/// ends, and the line table is what still lets the server's cursor — a line and a column — be
+/// resolved against a block.
 #[tokio::test]
 async fn a_markdown_file_is_presented_as_the_reader_by_default() {
     let (_server, mut ws, open) = setup_reader_workspace().await;
     let sub: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(open.view_id)).await;
-    let (owner, rows, first_row, lines) = the_element(&sub.window);
-    assert_eq!(owner, aether_protocol::ui::LayoutOwner::Client);
-    assert_eq!(rows, 6, "one wire row per line, six lines");
-    assert_eq!(first_row, 0);
+    let (blocks, source) = the_prose(&sub.window);
+    assert!(
+        !blocks.is_empty(),
+        "the reader's window carries the parse, not an empty tree"
+    );
     assert_eq!(
-        lines,
-        (0..6).map(|l| (l, 1)).collect::<Vec<_>>(),
-        "every line, none of them wrapped, in a two-row viewport of twenty columns"
+        source.starts.len(),
+        6,
+        "one entry per line of the file, in a two-row viewport of twenty columns"
+    );
+    assert_eq!(
+        source.starts[0], 0,
+        "the table always opens at the file's start"
+    );
+    // Ascending, and never past the end — the last entry *reaches* it, since a file ending in a
+    // newline opens a final empty line, which is the line the rope counts too.
+    assert!(
+        source.starts.windows(2).all(|w| w[0] < w[1])
+            && *source.starts.last().unwrap() <= source.byte_len,
+        "line starts ascend and stay inside the document: {source:?}"
     );
 }
 
-/// A window request into a reader's element answers with the whole element, whatever slice was
-/// asked for: a partial document is nothing the client could lay out.
+/// A window request into a reader answers with the prose again, whatever slice was asked for: an
+/// element with no wire rows has no slice to fetch, and half a document is nothing a shell could
+/// lay out.
 #[tokio::test]
-async fn a_window_request_loads_a_reader_element_whole() {
+async fn a_window_request_answers_a_reader_with_its_prose() {
     use aether_protocol::viewport::{SliceRequest, ViewportWindow, ViewportWindowParams};
     let (_server, mut ws, open) = setup_reader_workspace().await;
     let sub: ViewportSubscribeResult =
@@ -1769,12 +1990,10 @@ async fn a_window_request_loads_a_reader_element_whole() {
         },
     )
     .await;
-    let (owner, rows, first_row, lines) = the_element(&res.window);
-    assert_eq!(owner, aether_protocol::ui::LayoutOwner::Client);
     assert_eq!(
-        (rows, first_row, lines.len()),
-        (6, 0, 6),
-        "whole, from the top"
+        the_prose(&res.window),
+        the_prose(&sub.window),
+        "the same document, whole, from the top"
     );
 }
 
@@ -1787,10 +2006,7 @@ async fn a_file_has_an_editor_and_a_reader_and_reopens_in_the_last_used() {
     use aether_protocol::ui::{LayoutOwner, ViewKind};
     let (server, mut ws, reader) = setup_reader_workspace().await;
     let buffer_id = reader.buffer_id;
-    assert_eq!(
-        layout_owner_of(&mut ws, reader.view_id).await,
-        LayoutOwner::Client
-    );
+    assert!(presents_as_reader(&mut ws, reader.view_id).await);
 
     let editor = open_as(&mut ws, buffer_id, Some(ViewKind::Editor)).await;
     assert_eq!(editor.buffer_id, buffer_id, "the same buffer");
@@ -1877,9 +2093,8 @@ async fn a_file_has_an_editor_and_a_reader_and_reopens_in_the_last_used() {
         reopened.view_id != editor.view_id && reopened.view_id != reader.view_id,
         "a new view"
     );
-    assert_eq!(
-        layout_owner_of(&mut ws2, reopened.view_id).await,
-        LayoutOwner::Client,
+    assert!(
+        presents_as_reader(&mut ws2, reopened.view_id).await,
         "the setting's kind"
     );
 }
@@ -1889,19 +2104,15 @@ async fn a_file_has_an_editor_and_a_reader_and_reopens_in_the_last_used() {
 /// editor whatever the setting says.
 #[tokio::test]
 async fn the_setting_decides_a_file_never_presented() {
-    use aether_protocol::ui::{LayoutOwner, ViewKind};
+    use aether_protocol::ui::ViewKind;
     let (server, mut ws, reader) = setup_reader_workspace().await;
-    assert_eq!(
-        layout_owner_of(&mut ws, reader.view_id).await,
-        LayoutOwner::Client
-    );
+    assert!(presents_as_reader(&mut ws, reader.view_id).await);
 
     server.state.lock().await.app_settings.markdown_read = false;
     let other: ViewOpenResult =
         send_request::<ViewOpen>(&mut ws, &file_open_params("other.md", None)).await;
-    assert_eq!(
-        layout_owner_of(&mut ws, other.view_id).await,
-        LayoutOwner::Server,
+    assert!(
+        !presents_as_reader(&mut ws, other.view_id).await,
         "no view yet → the setting"
     );
     assert_eq!(
@@ -1913,9 +2124,8 @@ async fn the_setting_decides_a_file_never_presented() {
     let text: ViewOpenResult =
         send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
     let plain = open_as(&mut ws, text.buffer_id, Some(ViewKind::Reader)).await;
-    assert_eq!(
-        layout_owner_of(&mut ws, plain.view_id).await,
-        LayoutOwner::Server,
+    assert!(
+        !presents_as_reader(&mut ws, plain.view_id).await,
         "no reader for a text file"
     );
 
@@ -1944,10 +2154,7 @@ async fn the_setting_decides_a_file_never_presented() {
         },
     )
     .await;
-    assert_eq!(
-        layout_owner_of(&mut ws, jumped.view_id).await,
-        LayoutOwner::Server
-    );
+    assert!(!presents_as_reader(&mut ws, jumped.view_id).await);
 }
 
 /// A jump into the document you are reading stays on the page: the outline picker, a reference,
@@ -1987,9 +2194,8 @@ async fn a_jump_into_the_reader_on_screen_stays_in_it() {
         jumped.view_id, other.view_id,
         "not the reader nobody is looking at"
     );
-    assert_eq!(
-        layout_owner_of(&mut ws, jumped.view_id).await,
-        aether_protocol::ui::LayoutOwner::Server,
+    assert!(
+        !presents_as_reader(&mut ws, jumped.view_id).await,
         "an editor"
     );
 }
@@ -2375,7 +2581,7 @@ async fn closing_a_sibling_tells_its_other_viewers() {
 /// brings the other back kept beside it.
 #[tokio::test]
 async fn a_kept_reader_and_editor_come_back_as_two_views() {
-    use aether_protocol::ui::{LayoutOwner, ViewKind};
+    use aether_protocol::ui::ViewKind;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     std::fs::write(root.join("doc.md"), "# Title\n\nbody\n").unwrap();
@@ -2403,10 +2609,7 @@ async fn a_kept_reader_and_editor_come_back_as_two_views() {
     activate(&mut ws).await;
     let reader: ViewOpenResult =
         send_request::<ViewOpen>(&mut ws, &file_open_params("doc.md", None)).await;
-    assert_eq!(
-        layout_owner_of(&mut ws, reader.view_id).await,
-        LayoutOwner::Client
-    );
+    assert!(presents_as_reader(&mut ws, reader.view_id).await);
     let editor = open_as(&mut ws, reader.buffer_id, Some(ViewKind::Editor)).await;
     let _: ViewSetTransientResult = send_request::<ViewSetTransient>(
         &mut ws,
@@ -2507,10 +2710,7 @@ async fn a_kept_reader_and_editor_come_back_as_two_views() {
         },
     )
     .await;
-    assert_eq!(
-        layout_owner_of(&mut ws, opened.view_id).await,
-        LayoutOwner::Client
-    );
+    assert!(presents_as_reader(&mut ws, opened.view_id).await);
     assert!(!opened.transient, "restored kept");
     // …and the editor it stood beside comes back kept, as a sibling, not as a vanished row.
     let editor = open_as(&mut ws, opened.buffer_id, Some(ViewKind::Editor)).await;
@@ -2518,8 +2718,5 @@ async fn a_kept_reader_and_editor_come_back_as_two_views() {
         !editor.transient,
         "the kept editor, restored beside the reader"
     );
-    assert_eq!(
-        layout_owner_of(&mut ws, editor.view_id).await,
-        LayoutOwner::Server
-    );
+    assert!(!presents_as_reader(&mut ws, editor.view_id).await);
 }

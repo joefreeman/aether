@@ -162,6 +162,260 @@ async fn block_edit_rpc(
     })
 }
 
+/// The Markdown source of what the reading cursor has — [`aether_protocol::input::ElementSource`].
+///
+/// Bounded by the scope like every op here, for the same reason though this one writes nothing:
+/// a prose element inside a composed view must not hand back text the view never drew. Clamped
+/// rather than refused — a read has nothing to undo, and an empty answer is the honest one.
+pub fn resolve_source(scope: &crate::cursor::Scope, cursor: &CursorState) -> String {
+    let buf = scope.doc();
+    let text = buf.text.to_string();
+    let to_byte =
+        |p: LogicalPosition| -> u32 { buf.text.char_to_byte(motion::pos_to_char(buf, p)) as u32 };
+    let field = scope.byte_range();
+    let clamp = |x: usize| x.clamp(field.start, field.end);
+    if !cursor.is_point() {
+        let (a, b) = (to_byte(cursor.anchor), to_byte(cursor.position));
+        let (min, max) = (a.min(b), a.max(b));
+        // Inclusive on both ends: the cursor's own char belongs to the range, and in whole-line
+        // normal form that char is the terminating newline.
+        let end = max as usize
+            + text[max as usize..]
+                .chars()
+                .next()
+                .map_or(0, char::len_utf8);
+        return text
+            .get(clamp(min as usize)..clamp(end))
+            .unwrap_or("")
+            .to_string();
+    }
+    let blocks = aether_markdown::parse(&text);
+    let stops = aether_markdown::stops(&blocks);
+    let Some(idx) = aether_markdown::element_at(&stops, to_byte(cursor.position)) else {
+        return String::new();
+    };
+    let span = stops[idx].span();
+    text.get(clamp(span.start as usize)..clamp(span.end as usize))
+        .unwrap_or("")
+        .trim_end()
+        .to_string()
+}
+
+/// `x` / `Alt-x`: the block selection after one step, as `(position, anchor)`.
+///
+/// The client's state machine moved here whole. It reads the selection it already has — whether a
+/// partial range must snap whole before advancing, and which edge a plain press collapses to — and
+/// that reading needs the block boundaries under the current bytes, which needs the text.
+///
+/// Scope-local throughout: the parse is of the **element's** slice, so its byte offsets are the
+/// element's own and no answer can name a place outside it. The bound is the coordinate system
+/// rather than a check afterwards.
+pub fn resolve_select_block(
+    scope: &crate::cursor::Scope,
+    cursor: &CursorState,
+    forward: bool,
+    extend: bool,
+    count: u32,
+) -> Option<(LogicalPosition, LogicalPosition)> {
+    use crate::cursor::{byte_of_local, char_of_local};
+    let text = scope.text().to_string();
+    let stops = aether_markdown::stops(&aether_markdown::parse(&text));
+    let byte = |p: LogicalPosition| byte_of_local(&text, scope.char_of(p));
+    let (a, p) = (byte(cursor.anchor), byte(cursor.position));
+    let (min, max) = (a.min(p), a.max(p));
+    let cursor_at_top = !cursor.is_point() && p < a;
+    let (mut top, mut bottom) =
+        aether_markdown::edit::selection_block_range(&text, &stops, min, max)?;
+    let (ts, bs) = (stops[top].span(), stops[bottom].span());
+    // Whether the selection already covers those blocks whole, at both ends.
+    let mut whole = !cursor.is_point() && min <= ts.start && max + 1 >= bs.end;
+    let mut fresh = cursor.is_point();
+    let step = |idx: usize, fwd: bool| {
+        aether_markdown::step_element(&stops, idx, fwd, aether_markdown::Stop::is_block)
+    };
+    for _ in 0..count.max(1) {
+        if fresh {
+            if !forward {
+                // `Alt-x`'s first press selects the block *above*, saturating at the top.
+                top = step(top, false).unwrap_or(top);
+            }
+            bottom = top;
+            (fresh, whole) = (false, true);
+            continue;
+        }
+        if !whole {
+            // Snap before advancing: extend keeps the (now whole) range, a plain press collapses
+            // to the direction's edge block.
+            if !extend {
+                if forward {
+                    top = bottom;
+                } else {
+                    bottom = top;
+                }
+            }
+            whole = true;
+            continue;
+        }
+        if forward {
+            let next = step(bottom, true).unwrap_or(bottom);
+            if !extend {
+                top = next;
+            }
+            bottom = next;
+        } else {
+            let prev = step(top, false).unwrap_or(top);
+            if !extend {
+                bottom = prev;
+            }
+            top = prev;
+        }
+    }
+    let pos_of = |b: u32| scope.pos_of(char_of_local(&text, b));
+    let edges = |idx: usize| {
+        let s = stops[idx].span();
+        // `end - 1` is the span's last byte: on the last content line whether or not the parser's
+        // span takes in the trailing newline.
+        (
+            pos_of(s.start),
+            pos_of(s.end.saturating_sub(1).max(s.start)),
+        )
+    };
+    let (top_first, _) = edges(top);
+    let (_, bottom_last) = edges(bottom);
+    Some(if cursor_at_top {
+        (top_first, bottom_last)
+    } else {
+        (bottom_last, top_first)
+    })
+}
+
+/// `Ctrl-e`: the focused block(s) from their start to their last content char, as
+/// `(position, anchor)`.
+pub fn resolve_block_content(
+    scope: &crate::cursor::Scope,
+    cursor: &CursorState,
+) -> Option<(LogicalPosition, LogicalPosition)> {
+    use crate::cursor::{byte_of_local, char_of_local};
+    let text = scope.text().to_string();
+    let stops = aether_markdown::stops(&aether_markdown::parse(&text));
+    let byte = |p: LogicalPosition| byte_of_local(&text, scope.char_of(p));
+    let (a, p) = (byte(cursor.anchor), byte(cursor.position));
+    let (top, bottom) =
+        aether_markdown::edit::selection_block_range(&text, &stops, a.min(p), a.max(p))?;
+    let start = stops[top].span().start;
+    let end = aether_markdown::edit::block_content_end(&text, stops[bottom].span()).max(start);
+    let pos_of = |b: u32| scope.pos_of(char_of_local(&text, b));
+    Some((pos_of(end), pos_of(start)))
+}
+
+pub async fn element_select_block(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: SelectBlockParams,
+) -> Result<CursorState, RpcError> {
+    let forward = params.direction == VerticalDirection::Down;
+    let resolved = {
+        let s = state.lock().await;
+        let cursor = read_cursor(&s, ctx.client_id, params.buffer_id)?;
+        let scope = s.motion_scope(ctx.client_id, params.buffer_id)?;
+        match resolve_select_block(&scope, &cursor, forward, params.extend, params.count) {
+            Some(pair) => pair,
+            // Nothing to select: a document with no blocks. The cursor stands.
+            None => {
+                return Ok(wrap_for_response(
+                    &s,
+                    ctx.client_id,
+                    params.buffer_id,
+                    cursor,
+                ))
+            }
+        }
+    };
+    apply_read_selection(state, ctx, params.buffer_id, resolved, Granularity::Line).await
+}
+
+pub async fn element_block_content(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<CursorState, RpcError> {
+    let resolved = {
+        let s = state.lock().await;
+        let cursor = read_cursor(&s, ctx.client_id, params.buffer_id)?;
+        let scope = s.motion_scope(ctx.client_id, params.buffer_id)?;
+        match resolve_block_content(&scope, &cursor) {
+            Some(pair) => pair,
+            None => {
+                return Ok(wrap_for_response(
+                    &s,
+                    ctx.client_id,
+                    params.buffer_id,
+                    cursor,
+                ))
+            }
+        }
+    };
+    apply_read_selection(state, ctx, params.buffer_id, resolved, Granularity::Char).await
+}
+
+/// This client's cursor in `buffer_id`, or the default when it has none yet.
+fn read_cursor(
+    s: &ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> Result<CursorState, RpcError> {
+    s.try_doc_of(buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
+    Ok(s.cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default())
+}
+
+/// Apply a resolved reading selection through the ordinary cursor-set path, so the motion history,
+/// the virtual column, the tree-selection reset and the search counter all update exactly as they
+/// do for any other selection. Resolving here and applying there is what keeps this from being a
+/// second way to move the cursor.
+async fn apply_read_selection(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    buffer_id: BufferId,
+    (position, anchor): (LogicalPosition, LogicalPosition),
+    granularity: Granularity,
+) -> Result<CursorState, RpcError> {
+    super::cursor_set(
+        state,
+        ctx,
+        CursorSetParams {
+            buffer_id,
+            position,
+            anchor,
+            granularity,
+        },
+    )
+    .await
+}
+
+pub async fn element_source(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: BufferOnlyParams,
+) -> Result<ElementSourceResult, RpcError> {
+    let client_id = ctx.client_id;
+    let s = state.lock().await;
+    s.try_doc_of(params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    let cursor = s
+        .cursors
+        .get(&(client_id, params.buffer_id))
+        .copied()
+        .unwrap_or_default();
+    let scope = s.motion_scope(client_id, params.buffer_id)?;
+    Ok(ElementSourceResult {
+        text: resolve_source(&scope, &cursor),
+    })
+}
+
 pub async fn input_move_block(
     state: &SharedState,
     ctx: &mut ConnectionCtx,

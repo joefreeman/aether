@@ -35,11 +35,13 @@
   /* ---- Roles: the DARK table (theme.rs Theme::DARK) ---- */
   color-scheme: dark; /* native scrollbars/checkboxes follow the app theme */
   /* Backgrounds */
-  --bg-app: #373e4d; /* the app's ground: the pane behind the rows, chrome bands, a box's frame */
-  --bg: var(--nord0); /* the editor well: rows of buffer text, gutter included */
+  --bg-app: #373e4d; /* the app's ground: the pane behind the rows, chrome bands, a box's frame,
+                        and rendered prose — the reading page and an agent's reply */
+  --bg: var(--nord0); /* the editor well: rows of buffer text, gutter included — and the code
+                         panels in a rendered document, which are text of that kind */
   --bg-panel: var(--nord1); /* status line, panels, picker surfaces */
   --bg-selection: var(--nord2); /* chrome selection: picker active row, chips */
-  --bg-visual: var(--nord10); /* editor visual-mode selection */
+  --bg-visual: var(--nord10); /* content selection: visual mode, and the reader's blocks */
   --fill-dim: var(--nord3); /* muted fills: search-hit tint, sneak word band */
   --sneak-prefix-bg: var(--nord3-bright); /* sneak typed-prefix band */
   --match-highlight: var(--nord13); /* fuzzy-match/sneak emphasis: picker match chars, the sneak label */
@@ -115,8 +117,11 @@
   --git-ref-remote: var(--nord15);
   --git-ref-tag: var(--nord13);
   /* Markdown reading view */
-  --md-code-bg: var(--nord1); /* code spans/blocks panel */
-  --md-table-stripe-bg: #323845; /* alternating table row, between bg and md-code-bg */
+  --md-code-bg: var(--nord0); /* code spans/blocks panel = the editor's well */
+  --md-chip-bg: var(--nord2); /* an inline code chip: one step lighter than the page — a few
+                                 characters, which can take the whole step */
+  --md-panel-bg: var(--nord1); /* quote blocks and table bands: a quarter of that step, for a
+                                  hundred times the area */
   --md-alert-important: var(--nord15); /* the "Important" alert's hue — purple, not a status */
   /* Syntax (tree-sitter capture roles) */
   --syn-keyword: var(--nord9);
@@ -158,8 +163,9 @@
    keep their dark-theme ordering. */
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg-app: #e1e6ee; /* ~60% from NORD6 toward NORD5, as the dark pair is */
-  --bg: var(--nord6);
+  --bg-app: var(--nord6); /* the ground is the palest shade here, as it is the darkest in dark */
+  --bg: #e1e6ee; /* the well, a step *down* from the ground — an editor is the darker of the two
+                    shades in both themes */
   --bg-panel: var(--nord5);
   --bg-selection: var(--nord4);
   --bg-visual: #c2d6e7; /* pale Frost — dark text stays readable inside a selection */
@@ -221,8 +227,9 @@
   --git-ref-branch: #5a7547;
   --git-ref-remote: #8d6488;
   --git-ref-tag: #9a7522;
-  --md-code-bg: #e1e6ee;
-  --md-table-stripe-bg: #e9edf3;
+  --md-code-bg: #e1e6ee; /* = the editor's well */
+  --md-chip-bg: #f6f8fb; /* a step paler than the page, as dark's is lighter */
+  --md-panel-bg: #f1f3f8; /* the fainter lift, for the larger area */
   --md-alert-important: #8d6488; /* = syn-constant today; free to diverge */
   --syn-keyword: var(--nord10);
   --syn-string: #5a7547;
@@ -695,7 +702,9 @@ html, body, #app {
    `.md-read`'s own rules carry the type — headings, lists, quotes, code panels — so this only has
    to undo the things that belong to a *page*: the centred narrow measure, and the page padding.
    Nothing here marks a reading position or styles a focused block, because a reply has neither. */
-.md-reply-box { background: var(--bg); }
+/* An agent's reply is prose, so it sits on the ground like the reading view's page — the rows of
+   the conversation around it are the editor's, and they keep the well. */
+.md-reply-box { background: var(--bg-app); }
 .md-read.md-reply {
   /* The reading type itself, which the pane cannot supply here: the whole-pane reader gets it from
      `#buffer.md-read-host`, and a reply lives inside the *editor's* pane, whose monospace and
@@ -1686,10 +1695,10 @@ a.picker-row:not(.selected):hover .picker-main {
    grid's `white-space: pre` must not leak in (it would kill paragraph wrapping), and native text
    selection is deliberately re-enabled — reading is where select-to-copy belongs. */
 #buffer.md-read-host {
-  /* Prose is an editor element too, so the reading pane is the editor's well rather than the
-     app's ground: every row in it is document, with no chrome rows for the ground to show
-     through between. */
-  background: var(--bg);
+  /* The app's ground, not the editor's well: the well is for text you can put a cursor in, and a
+     rendered document is read. The code panels inside the page take the well instead (see
+     `--md-code-bg`), which is what makes them read as panels on it. */
+  background: var(--bg-app);
   font-family: "Source Serif 4", Charter, "Bitstream Charter", Georgia, serif;
   /* One step above the editor text size (the buffer font-size set on #app): reading wants
      larger type than code. Em-relative, so the buffer-font-size setting still governs reading,
@@ -1788,7 +1797,9 @@ a.picker-row:not(.selected):hover .picker-main {
 .md-read code {
   font-family: "JetBrains Mono", ui-monospace, monospace;
   font-size: 0.85em;
-  background: var(--md-code-bg);
+  /* A chip lifted off the prose, not a slab of editor: the fence below takes the well
+     (`--md-code-bg`), inline code takes the raised surface the quotes and bands share. */
+  background: var(--md-chip-bg);
   border-radius: 3px;
   padding: 0.1em 0.35em;
 }
@@ -1835,6 +1846,7 @@ a.picker-row:not(.selected):hover .picker-main {
      left sibling quotes sitting at different indents. */
   padding: 0.4em 0.9em 0.4em calc(0.9em + 0.6rem);
   border-left: 3px solid var(--border-subtle);
+  background: var(--md-panel-bg);
   color: var(--fg);
 }
 /* A block holding nothing (`>`, `#`, `-` on their own) still owns a line. A DOM box exists as
@@ -1893,7 +1905,7 @@ a.picker-row:not(.selected):hover .picker-main {
   text-align: left;
 }
 .md-read th { color: var(--fg-bright); background: var(--md-code-bg); }
-.md-read tbody tr:nth-child(even) { background: var(--md-table-stripe-bg); }
+.md-read tbody tr:nth-child(even) { background: var(--md-panel-bg); }
 
 .md-read a.md-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 .md-read a.md-link:hover { color: var(--syn-type); }
@@ -1993,7 +2005,7 @@ a.picker-row:not(.selected):hover .picker-main {
    core suppresses the target pill while a selection is extended. */
 .md-read :where(p, h1, h2, h3, h4, h5, h6, li, blockquote, .md-codeblock, .md-table-outer,
     .md-rawhtml, .md-front-matter, .md-footnote-def, .md-rule, .md-image-block).md-selected {
-  background: var(--bg-selection);
+  background: var(--bg-visual);
 }
 /* The Enter target — the interactive span (link, footnote ref, image) the cursor sits inside —
    inverts *on top of* the block bar: the bar says "you are reading here", the pill says "Enter

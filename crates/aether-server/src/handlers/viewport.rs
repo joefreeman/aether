@@ -2170,10 +2170,11 @@ struct RenderedElement {
     edges: aether_protocol::ui::Edges,
     band: aether_protocol::ui::Band,
     title: std::sync::Arc<Vec<Element>>,
-    /// The parsed markdown this element renders as, when it is prose rather than lines. Parsed
-    /// **here**, once, rather than in each shell: the server already holds the document and the
-    /// parser, and one parse is what makes every client show the same thing.
-    prose: Option<Vec<aether_markdown::Block>>,
+    /// The parsed markdown this element renders as, when it is prose rather than lines, and the
+    /// line table that says where the text it was parsed from begins each line. Parsed **here**,
+    /// once, rather than in each shell: the server already holds the document and the parser, and
+    /// one parse is what makes every client show the same thing.
+    prose: Option<(Vec<aether_markdown::Block>, SourceLines)>,
 }
 
 /// Render the window a viewport shows of its view: the whole tree, every element carrying its
@@ -2298,7 +2299,7 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
     }
 }
 
-/// The markdown an element renders as: the lines it windows, parsed.
+/// The markdown an element renders as: the lines it windows, parsed — and where those lines begin.
 ///
 /// Once, here, rather than in each shell. The server already holds the document and the parser, so
 /// parsing three times would be three chances for three clients to disagree about where a list
@@ -2306,15 +2307,16 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
 ///
 /// Spans are byte offsets into **the element's own text**, not the document's: the element is the
 /// unit a shell renders and the unit it measures, and a span that pointed outside it would name
-/// bytes the shell was never sent.
-fn element_prose(doc: &Document, range: BufferRange) -> Vec<aether_markdown::Block> {
+/// bytes the shell was never sent. The line table is in those same coordinates, and is built from
+/// the same string the parse is — one slice, so the two cannot describe different text.
+fn element_prose(doc: &Document, range: BufferRange) -> (Vec<aether_markdown::Block>, SourceLines) {
     let lines = range.lines();
     let chars = |line: u32| doc.text.line_to_char(line as usize);
-    aether_markdown::parse(
-        &doc.text
-            .slice(chars(lines.start)..chars(lines.end))
-            .to_string(),
-    )
+    let text = doc
+        .text
+        .slice(chars(lines.start)..chars(lines.end))
+        .to_string();
+    (aether_markdown::parse(&text), SourceLines::of(&text))
 }
 
 /// How an element's rows are counted: the viewport's wrapping and the element's phantom rows for
@@ -2443,9 +2445,10 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
     let node_of = |r: RenderedElement| match r.prose {
         // Prose carries its own content: nothing downstream reads the buffer's lines to paint it,
         // which is what lets a shell render it with real typography instead of as rows.
-        Some(blocks) => Element::Prose {
+        Some((blocks, source)) => Element::Prose {
             element: r.element,
             blocks,
+            source,
         },
         None => Element::Editor {
             element: r.element,

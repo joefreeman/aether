@@ -16,7 +16,7 @@ use aether_protocol::app::AppInfoGet;
 use aether_protocol::buffer::{BufferContent, BufferCopy, BufferCut, BufferReload, BufferSave};
 use aether_protocol::cursor::{
     CursorMove, CursorRedo, CursorSelectAll, CursorSelectLine, CursorSelectWord, CursorSet,
-    CursorSwapAnchor, CursorTreeSelect, CursorUndo,
+    CursorSwapAnchor, CursorTreeSelect, CursorUndo, ElementBlockContent, ElementSelectBlock,
 };
 use aether_protocol::directory::{DirectoryCreate, DirectoryList};
 use aether_protocol::envelope::{
@@ -31,11 +31,12 @@ use aether_protocol::git::{
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
 use aether_protocol::input::{
-    EditRedo, EditUndo, InputAdjustNumber, InputBackspace, InputBlockDepth, InputChange,
-    InputChangeLine, InputDedent, InputDelete, InputDeleteBlock, InputDeleteLine, InputDeleteWord,
-    InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines, InputNewlineAndIndent,
-    InputOpenBlock, InputOpenLine, InputPasteBlock, InputReplaceLine, InputSurround, InputTab,
-    InputText, InputToggleComment, InputToggleTask, InputTransformCase, InputUnsurround,
+    EditRedo, EditUndo, ElementSource, InputAdjustNumber, InputBackspace, InputBlockDepth,
+    InputChange, InputChangeLine, InputDedent, InputDelete, InputDeleteBlock, InputDeleteLine,
+    InputDeleteWord, InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines,
+    InputNewlineAndIndent, InputOpenBlock, InputOpenLine, InputPasteBlock, InputReplaceLine,
+    InputSurround, InputTab, InputText, InputToggleComment, InputToggleTask, InputTransformCase,
+    InputUnsurround,
 };
 use aether_protocol::jumplist::{JumplistCapture, JumplistClear, JumplistStep};
 use aether_protocol::lsp::{
@@ -541,6 +542,9 @@ async fn dispatch(
         InputMoveLines::NAME => run!(InputMoveLines, handlers::input_move_lines),
         InputMoveBlock::NAME => run!(InputMoveBlock, handlers::input_move_block),
         InputDeleteBlock::NAME => run!(InputDeleteBlock, handlers::input_delete_block),
+        ElementSource::NAME => run!(ElementSource, handlers::element_source),
+        ElementSelectBlock::NAME => run!(ElementSelectBlock, handlers::element_select_block),
+        ElementBlockContent::NAME => run!(ElementBlockContent, handlers::element_block_content),
         InputPasteBlock::NAME => run!(InputPasteBlock, handlers::input_paste_block),
         InputBlockDepth::NAME => run!(InputBlockDepth, handlers::input_block_depth),
         InputOpenBlock::NAME => run!(InputOpenBlock, handlers::input_open_block),

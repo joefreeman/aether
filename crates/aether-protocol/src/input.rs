@@ -650,6 +650,31 @@ impl RpcMethod for InputDeleteBlock {
     type Result = BlockEditResult;
 }
 
+/// The Markdown **source** of what the reading cursor has: an extended selection's whole range,
+/// else the innermost element a point cursor sits in.
+///
+/// A read, not an edit, and the only member of this family that changes nothing. It exists because
+/// the reading view holds a *parse*, and a parse is not the source it came from — smart
+/// punctuation alone rewrites the text of every run, so re-rendering blocks back to Markdown would
+/// hand back characters the file never held. The server owns the buffer, so the server answers.
+///
+/// Copy's grain is deliberately not [`InputDeleteBlock`]'s: a point cursor here takes the innermost
+/// stop of **any** kind, so copying with a link focused yields that link's source, while cutting
+/// takes the innermost whole block. Resolving both against one parse is what keeps them from
+/// drifting; it does not make them the same rule.
+pub struct ElementSource;
+impl RpcMethod for ElementSource {
+    const NAME: &'static str = "element/source";
+    type Params = BufferOnlyParams;
+    type Result = ElementSourceResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ElementSourceResult {
+    /// Empty when the cursor resolves to nothing: an empty document, or a parse with no stops.
+    pub text: String,
+}
+
 /// Paste text as its own block before the selection (`replace: false`) or in place of the
 /// selected block(s) (`replace: true`), separator-normalized either way.
 pub struct InputPasteBlock;

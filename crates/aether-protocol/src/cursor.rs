@@ -159,7 +159,50 @@ pub enum Motion {
     SelectionEdge {
         edge: SelectionEdge,
     },
+    /// An edge of the **block** the reading cursor is in: its first byte, or the caret gap after
+    /// its last content char. `i` and `a` in the reading view.
+    ///
+    /// Server-side for [`SelectionEdge`]'s reason and one more. Finding the append point means
+    /// walking back over the block's trailing blank lines, which needs the block's *text* — and a
+    /// reading view carries a parse, not the source it was made from. Resolved against the
+    /// element's own slice, so a prose element inside a composed view cannot land outside itself.
+    BlockEdge {
+        at_end: bool,
+    },
     // Tree-sitter motions are added when phase 2 lands.
+}
+
+/// Step the reading view's **block selection** (`x` / `Alt-x`), and apply it.
+///
+/// Not a [`Motion`]: it sets both ends, and it reads the selection it already has — a plain press
+/// snaps a partial range whole before it advances, and `extend` keeps the far edge where it is.
+/// That rule needs the block boundaries under the current selection, which needs the document's
+/// text, which a reading view carried as a parse does not have.
+pub struct ElementSelectBlock;
+impl RpcMethod for ElementSelectBlock {
+    const NAME: &'static str = "element/select_block";
+    type Params = SelectBlockParams;
+    type Result = CursorState;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SelectBlockParams {
+    pub buffer_id: BufferId,
+    pub direction: VerticalDirection,
+    /// Keep the far edge and grow, rather than collapsing to the direction's edge block.
+    pub extend: bool,
+    pub count: u32,
+}
+
+/// Select the focused block(s) from their start to their last **content** char (`Ctrl-e`).
+///
+/// Exact rather than whole-line, which is the whole point: the bottom block's terminating newline
+/// and every separator survive the rewrite that follows, so the document's block structure does.
+pub struct ElementBlockContent;
+impl RpcMethod for ElementBlockContent {
+    const NAME: &'static str = "element/block_content";
+    type Params = crate::input::BufferOnlyParams;
+    type Result = CursorState;
 }
 
 /// Where [`Motion::SelectionEdge`] lands, relative to the selection's inclusive

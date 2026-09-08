@@ -4407,9 +4407,14 @@ impl View {
         }
     }
 
-    /// The reader over a markdown buffer: one element over the whole of it, laid out by the client
-    /// from the source it is sent unwrapped. Blocks, focus and the reading position are the
+    /// The reader over a markdown buffer: one **prose** element over the whole of it — the parse
+    /// and its line table, never the source. Blocks, focus and the reading position are the
     /// client's subdivision of that one element; the server sees a file, and the cursor in it.
+    ///
+    /// The same element an agent's reply rides on, which is the point of it: the reading view was
+    /// a view kind with a painter in every shell, and is now one element with a renderer written
+    /// once. What stays particular to the reader is that its element is the *whole* view — see
+    /// [`View::kind`].
     pub fn reader(buffer_id: BufferId) -> Self {
         View {
             presenting: buffer_id,
@@ -4422,7 +4427,7 @@ impl View {
                 chrome_before: Default::default(),
                 chrome_above: std::sync::Arc::new(Vec::new()),
                 laid_out_by: LayoutOwner::Client,
-                prose: false,
+                prose: true,
                 role: aether_protocol::ui::ElementRole::Field,
                 edges: aether_protocol::ui::Edges::NONE,
                 box_group: None,
@@ -4455,9 +4460,14 @@ impl View {
                     && only.box_group.is_none()
                     && only.role.is_field() =>
             {
-                Some(match only.laid_out_by {
-                    LayoutOwner::Server => ViewKind::Editor,
-                    LayoutOwner::Client => ViewKind::Reader,
+                // Prose is what makes it the reader — the element sends a parse instead of lines,
+                // which is the whole difference between reading a file and editing it. Asking
+                // `laid_out_by` came to the same answer only while the reader was an editor
+                // element the client wrapped itself, and a prose element carries no such field.
+                Some(if only.prose {
+                    ViewKind::Reader
+                } else {
+                    ViewKind::Editor
                 })
             }
             _ => None,
