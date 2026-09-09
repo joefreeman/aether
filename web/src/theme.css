@@ -323,6 +323,42 @@ html, body, #app {
   font-display: swap;
 }
 
+/* Source Sans 3 (OFL, see fonts/OFL-SourceSans3.txt): the reading view's *label* face — headings,
+   alert labels, table headers. The serif's sibling in the same superfamily, so it sits at the
+   serif's proportions and the heading size ladder below needed no re-tuning. Bundled, not the
+   system sans the chrome uses, for the same reason the serif is: a document looks the same on
+   every machine. Semibold is the heading weight and Bold the header/strong one; each has its
+   italic so an emphasised run inside a heading resolves in the family rather than being
+   synthesised. Nothing here asks for 400, so no Regular is bundled. */
+@font-face {
+  font-family: "Source Sans 3";
+  src: url("./fonts/SourceSans3-Semibold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Source Sans 3";
+  src: url("./fonts/SourceSans3-SemiboldIt.woff2") format("woff2");
+  font-weight: 600;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Source Sans 3";
+  src: url("./fonts/SourceSans3-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Source Sans 3";
+  src: url("./fonts/SourceSans3-BoldIt.woff2") format("woff2");
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+
 #buffer {
   flex: 1 1 auto;
   overflow-y: auto; /* native vertical scrolling over the full-height spacer (virtual scroll) */
@@ -1745,7 +1781,10 @@ a.picker-row:not(.selected):hover .picker-main {
 .md-read h6 {
   line-height: 1.25;
   margin: 1.6em 0 0.5em;
-  font-weight: 600; /* the bundled Semibold face */
+  /* Sans against the body serif, at the same em sizes: the ladder below was tuned on the serif's
+     proportions and Source Sans 3 shares them (native parity: `READ_SANS_FAMILY`). */
+  font-family: "Source Sans 3", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  font-weight: 600; /* the bundled Semibold face; a `**strong**` run inside still steps up to 700 */
 }
 /* The terminal's heading colour ladder: frost blue majors, teal H3, white H4, body-grey
    H5/H6 — colour distinguishes the minor levels, which share the 1.1em size. */
@@ -1861,7 +1900,14 @@ a.picker-row:not(.selected):hover .picker-main {
 .md-read blockquote > :first-child { margin-top: 0.2em; }
 .md-read blockquote > :last-child { margin-bottom: 0.2em; }
 .md-read blockquote.md-alert { border-left-width: 3px; }
-.md-read .md-alert-label { font-weight: 650; margin-top: 0.4em; }
+/* The alert's kind is a label, not prose: the heading sans, semibold. 600 rather than the 650 it
+   carried before — with static faces that resolved to the 700 one, while the native shell drew the
+   Semibold both this file and `read_block` describe. */
+.md-read .md-alert-label {
+  font-family: "Source Sans 3", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  font-weight: 600;
+  margin-top: 0.4em;
+}
 .md-read .md-alert-note { border-left-color: var(--info); }
 .md-read .md-alert-note .md-alert-label { color: var(--info); }
 .md-read .md-alert-tip { border-left-color: var(--ok); }
@@ -1904,7 +1950,13 @@ a.picker-row:not(.selected):hover .picker-main {
   padding: 0.35em 0.75em;
   text-align: left;
 }
-.md-read th { color: var(--fg-bright); background: var(--md-code-bg); }
+/* A header cell labels its column rather than reading as prose, so it takes the heading sans at
+   the browser's default `th` weight (700 — the bundled Bold). The body cells stay serif. */
+.md-read th {
+  color: var(--fg-bright);
+  background: var(--md-code-bg);
+  font-family: "Source Sans 3", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+}
 .md-read tbody tr:nth-child(even) { background: var(--md-panel-bg); }
 
 .md-read a.md-link { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }

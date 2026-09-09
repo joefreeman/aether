@@ -5434,11 +5434,23 @@ fn md_block<M: 'static>(
                 3 => 14.0,
                 _ => MD_TEXT,
             };
-            md_rich(content, true, p.fg_bright, ui.at(size), p, on_link)
+            md_rich(
+                content,
+                iced::font::Weight::Bold,
+                p.fg_bright,
+                ui.at(size),
+                p,
+                on_link,
+            )
         }
-        MdBlock::Paragraph { content, .. } => {
-            md_rich(content, false, p.fg, ui.at(MD_TEXT), p, on_link)
-        }
+        MdBlock::Paragraph { content, .. } => md_rich(
+            content,
+            iced::font::Weight::Normal,
+            p.fg,
+            ui.at(MD_TEXT),
+            p,
+            on_link,
+        ),
         MdBlock::Code { code, .. } => container(
             text(code.clone())
                 .font(iced::Font::MONOSPACE)
@@ -6186,10 +6198,13 @@ impl App {
                 };
                 let h = md_rich_in(
                     content,
-                    true,
+                    // Semibold, not bold: the heading ladder is carried by size and colour, and
+                    // the sans face at 600 is the web's `.md-read h1..h6`. A `**strong**` run
+                    // inside one still steps up to bold, as it does in the browser.
+                    iced::font::Weight::Semibold,
                     color,
                     size,
-                    READ_FONT_FAMILY,
+                    READ_SANS_FAMILY,
                     1.3, // headings stay tight; the body carries the airiness
                     target,
                     p,
@@ -6216,7 +6231,7 @@ impl App {
             }
             MdBlock::Paragraph { content, .. } => md_rich_in(
                 content,
-                false,
+                iced::font::Weight::Normal,
                 // Done-task prose dims to the `fg_muted` rung (NORD3_BRIGHTER in dark).
                 if dim { p.fg_muted } else { p.fg },
                 body,
@@ -6319,7 +6334,7 @@ impl App {
                     let (label, color) = alert_style(*kind, p);
                     inner =
                         inner.push(text(label).size(body * 0.95).color(color).font(iced::Font {
-                            family: READ_FONT_FAMILY,
+                            family: READ_SANS_FAMILY,
                             weight: iced::font::Weight::Semibold,
                             ..iced::Font::DEFAULT
                         }));
@@ -6616,12 +6631,19 @@ impl App {
         let widths = table_column_widths(&naturals, &minimums, self.read_table_avail(body));
         let cell = |content: &[MdInline], header: bool, w: f32| -> Element<'static, ReadMsg> {
             let color = if header { p.fg_bright } else { p.fg };
+            // A header cell labels the column rather than reading as prose, so it takes the sans
+            // (bold, as the browser's default `th` weight); the body cells stay on the serif.
+            let (weight, family) = if header {
+                (iced::font::Weight::Bold, READ_SANS_FAMILY)
+            } else {
+                (iced::font::Weight::Normal, READ_FONT_FAMILY)
+            };
             container(md_rich_in(
                 content,
-                header,
+                weight,
                 color,
                 cell_size,
-                READ_FONT_FAMILY,
+                family,
                 1.4,
                 target,
                 p,
@@ -6843,12 +6865,14 @@ fn md_bar_style(p: &theme::Palette) -> container::Style {
     }
 }
 
-/// A `rich_text` of the inline AST. `bold`/`base_color` seed the styling (headings pass bold +
-/// white); code and link spans override colour, and links also get an underline + click handler.
-/// Hover popovers render sans (the UI face); the reading view passes serif via [`md_rich_in`].
+/// A `rich_text` of the inline AST. `weight`/`base_color` seed the styling (headings pass semibold
+/// and their ladder colour); code and link spans override colour, and links also get an underline
+/// and a click handler. Hover popovers render the *system* sans (the UI face); the reading view
+/// passes the bundled reading faces via [`md_rich_in`] — serif for prose, [`READ_SANS_FAMILY`]
+/// for headings.
 fn md_rich<M: 'static>(
     inlines: &[MdInline],
-    bold: bool,
+    weight: iced::font::Weight,
     base_color: iced::Color,
     size: f32,
     p: &'static theme::Palette,
@@ -6857,7 +6881,7 @@ fn md_rich<M: 'static>(
     // Hover density: iced's default line height.
     md_rich_in(
         inlines,
-        bold,
+        weight,
         base_color,
         size,
         iced::font::Family::SansSerif,
@@ -6871,7 +6895,7 @@ fn md_rich<M: 'static>(
 #[allow(clippy::too_many_arguments)] // same styling-parameter family as `md_spans` below
 fn md_rich_in<M: 'static>(
     inlines: &[MdInline],
-    bold: bool,
+    weight: iced::font::Weight,
     base_color: iced::Color,
     size: f32,
     family: iced::font::Family,
@@ -6882,7 +6906,7 @@ fn md_rich_in<M: 'static>(
 ) -> Element<'static, M> {
     let mut spans = Vec::new();
     md_spans(
-        inlines, bold, false, None, base_color, size, family, target, p, &mut spans,
+        inlines, weight, false, None, base_color, size, family, target, p, &mut spans,
     );
     iced::widget::rich_text(shape_split(spans))
         .size(size)
@@ -6897,6 +6921,14 @@ const READ_LINE_HEIGHT: f32 = 1.65;
 /// The reading view's body face — bundled Source Serif 4 (loaded with the JetBrains Mono
 /// faces at boot; OFL, see fonts/OFL-SourceSerif4.txt).
 const READ_FONT_FAMILY: iced::font::Family = iced::font::Family::Name("Source Serif 4");
+
+/// The reading view's label face — bundled Source Sans 3, the serif's sibling in the same
+/// superfamily, so it sits at the serif's proportions and the size ladder needs no re-tuning
+/// (OFL, see fonts/OFL-SourceSans3.txt). Headings, alert labels and table headers take it;
+/// everything that reads as prose stays on [`READ_FONT_FAMILY`]. Chrome outside the document
+/// keeps the *system* sans ([`SANS`]) — this one is bundled because a document has to look the
+/// same on every machine.
+const READ_SANS_FAMILY: iced::font::Family = iced::font::Family::Name("Source Sans 3");
 
 /// Alert kind → (label, colour) — the ladder shared with the terminal's `alert_color` and
 /// the web's `.md-alert-*` rules.
@@ -7008,7 +7040,7 @@ enum ReadMsg {
 #[allow(clippy::too_many_arguments)]
 fn md_spans(
     inlines: &[MdInline],
-    bold: bool,
+    weight: iced::font::Weight,
     italic: bool,
     link: Option<&str>,
     base: iced::Color,
@@ -7021,16 +7053,25 @@ fn md_spans(
     for inl in inlines {
         match inl {
             MdInline::Text { text } => {
-                out.push(md_span(text, bold, italic, false, link, base, family, p))
+                out.push(md_span(text, weight, italic, false, link, base, family, p))
             }
             MdInline::Code { text } => {
-                out.push(md_span(text, bold, italic, true, link, base, family, p))
+                out.push(md_span(text, weight, italic, true, link, base, family, p))
             }
             MdInline::Strong { content } => md_spans(
-                content, true, italic, link, base, size, family, target, p, out,
+                content,
+                iced::font::Weight::Bold,
+                italic,
+                link,
+                base,
+                size,
+                family,
+                target,
+                p,
+                out,
             ),
             MdInline::Emphasis { content } => md_spans(
-                content, bold, true, link, base, size, family, target, p, out,
+                content, weight, true, link, base, size, family, target, p, out,
             ),
             MdInline::Link {
                 href,
@@ -7053,7 +7094,7 @@ fn md_spans(
                     let mut inner = Vec::new();
                     md_spans(
                         content,
-                        bold,
+                        weight,
                         italic,
                         Some(&value),
                         base,
@@ -7067,7 +7108,7 @@ fn md_spans(
                 } else {
                     md_spans(
                         content,
-                        bold,
+                        weight,
                         italic,
                         Some(&value),
                         base,
@@ -7082,7 +7123,7 @@ fn md_spans(
             MdInline::Strikethrough { content } => {
                 let mut inner = Vec::new();
                 md_spans(
-                    content, bold, italic, link, base, size, family, target, p, &mut inner,
+                    content, weight, italic, link, base, size, family, target, p, &mut inner,
                 );
                 out.extend(inner.into_iter().map(|s| s.strikethrough(true)));
             }
@@ -7092,7 +7133,7 @@ fn md_spans(
                 // sentinel makes it clickable (click focuses it, like the web/TUI).
                 let s = md_span(
                     &format!("▨ [{alt}]"),
-                    bold,
+                    weight,
                     italic,
                     false,
                     None,
@@ -7110,7 +7151,7 @@ fn md_spans(
             MdInline::FootnoteRef { label, span } => {
                 let s = md_span(
                     &format!("[{label}]"),
-                    bold,
+                    weight,
                     italic,
                     false,
                     None,
@@ -7126,7 +7167,7 @@ fn md_spans(
                 });
             }
             MdInline::HardBreak => {
-                out.push(md_span("\n", bold, italic, false, link, base, family, p))
+                out.push(md_span("\n", weight, italic, false, link, base, family, p))
             }
         }
     }
@@ -7156,7 +7197,7 @@ fn read_pill(
 #[allow(clippy::too_many_arguments)] // the same styling-parameter family as `md_spans`
 fn md_span(
     text: &str,
-    bold: bool,
+    weight: iced::font::Weight,
     italic: bool,
     code: bool,
     link: Option<&str>,
@@ -7168,11 +7209,7 @@ fn md_span(
         iced::Font::MONOSPACE
     } else {
         iced::Font {
-            weight: if bold {
-                iced::font::Weight::Bold
-            } else {
-                iced::font::Weight::Normal
-            },
+            weight,
             style: if italic {
                 iced::font::Style::Italic
             } else {
@@ -8012,8 +8049,8 @@ pub(crate) fn settings() -> iced::Settings {
                 .as_slice()
                 .into(),
             // Source Serif 4 (OFL, see fonts/OFL-SourceSerif4.txt): the reading view's body face.
-            // Regular/Italic for prose, Semibold+Bold so heading and strong runs resolve inside the
-            // family rather than falling back.
+            // Regular/Italic for prose, Bold so strong runs resolve inside the family rather than
+            // falling back; Semibold keeps the family complete for a 600-weight prose run.
             include_bytes!("../fonts/SourceSerif4-Regular.ttf")
                 .as_slice()
                 .into(),
@@ -8024,6 +8061,23 @@ pub(crate) fn settings() -> iced::Settings {
                 .as_slice()
                 .into(),
             include_bytes!("../fonts/SourceSerif4-Bold.ttf")
+                .as_slice()
+                .into(),
+            // Source Sans 3 (OFL, see fonts/OFL-SourceSans3.txt): the reading view's label face
+            // ([`READ_SANS_FAMILY`]) — headings, alert labels, table headers. Semibold is the
+            // heading weight and Bold the header/strong one, each with its italic so an
+            // emphasised run inside a heading resolves in the family instead of falling back to
+            // a face of another (the trap the mono and serif comments above both record).
+            include_bytes!("../fonts/SourceSans3-Semibold.ttf")
+                .as_slice()
+                .into(),
+            include_bytes!("../fonts/SourceSans3-SemiboldIt.ttf")
+                .as_slice()
+                .into(),
+            include_bytes!("../fonts/SourceSans3-Bold.ttf")
+                .as_slice()
+                .into(),
+            include_bytes!("../fonts/SourceSans3-BoldIt.ttf")
                 .as_slice()
                 .into(),
         ],
@@ -8168,19 +8222,19 @@ mod tests {
 
     /// The rendered spans for one line of inline Markdown, as `(text, font)` pairs.
     fn read_spans(inlines: &[MdInline]) -> Vec<(String, Option<iced::Font>)> {
+        read_spans_in(inlines, iced::font::Weight::Normal, READ_FONT_FAMILY)
+    }
+
+    /// [`read_spans`] with the face and weight the block seeds — what a heading varies.
+    fn read_spans_in(
+        inlines: &[MdInline],
+        weight: iced::font::Weight,
+        family: iced::font::Family,
+    ) -> Vec<(String, Option<iced::Font>)> {
         let p = theme::palette(aether_protocol::settings::ThemeMode::Dark);
         let mut spans = Vec::new();
         md_spans(
-            inlines,
-            false,
-            false,
-            None,
-            p.fg,
-            MD_TEXT,
-            READ_FONT_FAMILY,
-            None,
-            p,
-            &mut spans,
+            inlines, weight, false, None, p.fg, MD_TEXT, family, None, p, &mut spans,
         );
         shape_split(spans)
             .into_iter()
@@ -8236,6 +8290,48 @@ mod tests {
                 .map(|(t, _)| t.as_str())
                 .collect::<Vec<_>>(),
             ["e.g. ", "this", SHAPE_SPLITTER, "."],
+        );
+    }
+
+    /// The reading view splits its two bundled faces by role: a heading labels the document, so it
+    /// takes the sans at semibold, while prose keeps the serif. A `**strong**` run *inside* a
+    /// heading steps up to bold rather than flattening into the heading's own weight — the browser's
+    /// `<strong>` inside an `h1` — which the shared `Strong` arm has to produce from whatever weight
+    /// it is sitting in.
+    #[test]
+    fn a_heading_runs_sans_and_strong_steps_up_inside_it() {
+        let inlines = [
+            text("Title "),
+            MdInline::Strong {
+                content: vec![text("part")],
+            },
+        ];
+        let heading = read_spans_in(&inlines, iced::font::Weight::Semibold, READ_SANS_FAMILY);
+        let faces: Vec<_> = heading
+            .iter()
+            .map(|(t, f)| (t.as_str(), f.map(|f| (f.family, f.weight))))
+            .collect();
+        assert_eq!(
+            faces,
+            [
+                (
+                    "Title ",
+                    Some((READ_SANS_FAMILY, iced::font::Weight::Semibold))
+                ),
+                ("part", Some((READ_SANS_FAMILY, iced::font::Weight::Bold))),
+            ],
+        );
+        // The same inlines as prose: the serif throughout, and the strong run still bold.
+        let prose: Vec<_> = read_spans(&inlines)
+            .iter()
+            .map(|(_, f)| f.map(|f| (f.family, f.weight)))
+            .collect();
+        assert_eq!(
+            prose,
+            [
+                Some((READ_FONT_FAMILY, iced::font::Weight::Normal)),
+                Some((READ_FONT_FAMILY, iced::font::Weight::Bold)),
+            ],
         );
     }
 
