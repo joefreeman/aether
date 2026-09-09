@@ -19,10 +19,10 @@ use aether_protocol::git::{
     ApplyHunkStatus, ApplyScope, BlameInfo, CommitInfo, GitApplyHunk, GitApplyHunkParams,
     GitApplyHunkResult, GitBaselineChoice, GitBaselineSource, GitBlameChanged,
     GitBlameChangedParams, GitBlameLine, GitBlameLineParams, GitBlameLineResult, GitBufferStatus,
-    GitChangeCounts, GitHead, GitNavigateHunk, GitNavigateHunkParams, GitRefresh, GitRefreshParams,
-    GitRefreshResult, GitRepoInfo, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult,
-    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitStashPush,
-    GitStashPushParams, GitStashResult, GitStashStatus, HunkAction, HunkDirection,
+    GitChangeCounts, GitHead, GitRefresh, GitRefreshParams, GitRefreshResult, GitRepoInfo,
+    GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult, GitSetBlameFollow,
+    GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitStashPush,
+    GitStashPushParams, GitStashResult, GitStashStatus, HunkAction,
 };
 use aether_protocol::input::{
     BufferOnlyParams, CountedEditParams, InputAdjustNumber, InputAdjustNumberParams,
@@ -1078,37 +1078,6 @@ fn git_resolve_conflict_shapes() {
     ] {
         assert_eq!(to_value(side).unwrap(), json!(wire));
     }
-}
-
-#[test]
-fn git_navigate_hunk_shapes() {
-    let p = GitNavigateHunkParams {
-        buffer_id: 2,
-        from_line: 10,
-        direction: HunkDirection::Next,
-        count: 1,
-        extend: false,
-    };
-    let v = to_value(&p).unwrap();
-    // count == 1 and extend == false are the defaults and stay off the wire.
-    assert_eq!(
-        v,
-        json!({"buffer_id": 2, "from_line": 10, "direction": "next"})
-    );
-    // A larger count and extend ride along when set.
-    let v3 = to_value(&GitNavigateHunkParams {
-        buffer_id: 2,
-        from_line: 10,
-        direction: HunkDirection::Next,
-        count: 3,
-        extend: true,
-    })
-    .unwrap();
-    assert_eq!(
-        v3,
-        json!({"buffer_id": 2, "from_line": 10, "direction": "next", "count": 3, "extend": true})
-    );
-    assert_eq!(GitNavigateHunk::NAME, "git/navigate_hunk");
 }
 
 #[test]

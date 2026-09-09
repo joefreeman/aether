@@ -23,10 +23,9 @@ use aether_protocol::envelope::{
 };
 use aether_protocol::git::{
     GitAbortOperation, GitApplyHunk, GitBlameLine, GitCancel, GitCheckout, GitCommit,
-    GitDeleteBranch, GitFetch, GitFollowPatchLine, GitNavigateHunk, GitPrepareCommit, GitPull,
-    GitPush, GitRefresh, GitReset, GitResolveConflict, GitSetBaseline, GitSetBlameFollow,
-    GitSetDiffView, GitShow, GitStashApply, GitStashDrop, GitStashPush, GitWorktreeAdd,
-    GitWorktreeRemove,
+    GitDeleteBranch, GitFetch, GitFollowPatchLine, GitPrepareCommit, GitPull, GitPush, GitRefresh,
+    GitReset, GitResolveConflict, GitSetBaseline, GitSetBlameFollow, GitSetDiffView, GitShow,
+    GitStashApply, GitStashDrop, GitStashPush, GitWorktreeAdd, GitWorktreeRemove,
 };
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
@@ -570,7 +569,6 @@ async fn dispatch(
         GitBlameLine::NAME => run!(GitBlameLine, handlers::git_blame_line),
         GitSetDiffView::NAME => run!(GitSetDiffView, handlers::git_set_diff_view),
         GitSetBlameFollow::NAME => run!(GitSetBlameFollow, handlers::git_set_blame_follow),
-        GitNavigateHunk::NAME => run!(GitNavigateHunk, handlers::git_navigate_hunk),
         GitApplyHunk::NAME => run!(GitApplyHunk, handlers::git_apply_hunk),
         GitResolveConflict::NAME => run!(GitResolveConflict, handlers::git_resolve_conflict),
         GitAbortOperation::NAME => run!(GitAbortOperation, handlers::git_abort_operation),

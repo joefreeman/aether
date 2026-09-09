@@ -1347,7 +1347,7 @@ async fn git_log_rows_carry_what_git_show_needs() {
     )
     .await;
     assert!(opened.read_only);
-    assert!(opened.title.is_some_and(|t| t.ends_with("init")));
+    assert!(opened.title.as_deref().is_some_and(|t| t.ends_with("init")));
 
     drop(server);
 }
@@ -3275,26 +3275,6 @@ async fn setup_two_block_conflict() -> (
     (server, ws, dir, ours, buffer_id)
 }
 
-/// One `git/navigate_hunk` step from `from_line`.
-async fn navigate_hunk_from(
-    ws: &mut Ws,
-    buffer_id: u64,
-    from_line: u32,
-    direction: HunkDirection,
-) -> GitNavigateHunkResult {
-    send_request::<GitNavigateHunk>(
-        ws,
-        &GitNavigateHunkParams {
-            buffer_id,
-            from_line,
-            direction,
-            count: 1,
-            extend: false,
-        },
-    )
-    .await
-}
-
 /// The conflict markers reach the viewport as per-line sides, so the shells can tell ours from
 /// theirs without re-parsing the text — and the *diff* decoration is gone from the same lines.
 ///
@@ -3366,30 +3346,46 @@ async fn hunk_navigation_steps_conflict_blocks() {
 
     // The first block starts at line 0 — where the cursor already is — and `Next` moves strictly
     // forward, so one press lands on the *second* block.
-    let second = navigate_hunk_from(&mut ws, buffer_id, 0, HunkDirection::Next).await;
+    let second = navigate_change_from(
+        &mut ws,
+        buffer_id,
+        0,
+        aether_protocol::viewport::FocusStep::Next,
+        1,
+    )
+    .await;
     assert!(
         second.moved && second.cursor.position.line > 0,
         "{second:?}"
     );
     // Nothing past the last block...
-    let past = navigate_hunk_from(
+    let past = navigate_change_from(
         &mut ws,
         buffer_id,
         second.cursor.position.line,
-        HunkDirection::Next,
+        aether_protocol::viewport::FocusStep::Next,
+        1,
     )
     .await;
     assert!(!past.moved);
     // ...and stepping back reaches the first, then stops.
-    let first = navigate_hunk_from(
+    let first = navigate_change_from(
         &mut ws,
         buffer_id,
         second.cursor.position.line,
-        HunkDirection::Prev,
+        aether_protocol::viewport::FocusStep::Previous,
+        1,
     )
     .await;
     assert_eq!(first.cursor.position.line, 0, "{first:?}");
-    let before = navigate_hunk_from(&mut ws, buffer_id, 0, HunkDirection::Prev).await;
+    let before = navigate_change_from(
+        &mut ws,
+        buffer_id,
+        0,
+        aether_protocol::viewport::FocusStep::Previous,
+        1,
+    )
+    .await;
     assert!(!before.moved);
 
     // Each landing is a `<<<<<<<` line: the top of a block, not somewhere inside one.

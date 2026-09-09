@@ -1314,7 +1314,7 @@ async fn apply_symbol_highlights(
 }
 
 /// Jump the cursor to the next/previous diagnostic in the buffer. The server holds the diagnostics,
-/// so it resolves the target and moves the cursor authoritatively (mirrors [`git_navigate_hunk`]).
+/// so it resolves the target and moves the cursor authoritatively (mirrors `view/navigate_change`).
 pub async fn lsp_navigate_diagnostic(
     state: &SharedState,
     ctx: &mut ConnectionCtx,

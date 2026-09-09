@@ -695,137 +695,6 @@ async fn git_gutter_marker_present_without_diff_view() {
     drop(server);
 }
 
-#[tokio::test]
-async fn git_navigate_hunk_jumps_between_changes() {
-    let dir = tempfile::tempdir().unwrap();
-    git_commit_file(dir.path(), "nav.rs", "l0\nl1\nl2\nl3\nl4\n");
-
-    let server = spawn_for_test("nav-proj", vec![dir.path().to_path_buf()])
-        .await
-        .unwrap();
-    let mut ws = Ws::connect(&server).await;
-    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
-        &mut ws,
-        &WorkspaceActivateParams {
-            worktrees: None,
-            name: "nav-proj".into(),
-            open_last: false,
-        },
-    )
-    .await;
-    let open: ViewOpenResult = send_request::<ViewOpen>(
-        &mut ws,
-        &ViewOpenParams {
-            transient: None,
-            path_index: Some(0),
-            relative_path: Some("nav.rs".into()),
-            language: None,
-            create_if_missing: false,
-            jump_to: None,
-            ..Default::default()
-        },
-    )
-    .await;
-    let buffer_id = open.buffer_id;
-
-    // Two separate changed regions: edit line 0, then line 3.
-    let _: EditResult = send_request::<InputText>(
-        &mut ws,
-        &InputTextParams {
-            buffer_id,
-            text: "X".into(),
-            select_pasted: false,
-            replace_selection: false,
-            at: None,
-        },
-    )
-    .await;
-    let _: CursorState = send_request::<CursorSet>(
-        &mut ws,
-        &CursorSetParams {
-            granularity: Granularity::Char,
-            buffer_id,
-            position: LogicalPosition { line: 3, col: 0 },
-            anchor: LogicalPosition { line: 3, col: 0 },
-        },
-    )
-    .await;
-    let _: EditResult = send_request::<InputText>(
-        &mut ws,
-        &InputTextParams {
-            buffer_id,
-            text: "Y".into(),
-            select_pasted: false,
-            replace_selection: false,
-            at: None,
-        },
-    )
-    .await;
-
-    // From line 0, Next lands on the line-3 hunk.
-    let next: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
-        &mut ws,
-        &GitNavigateHunkParams {
-            buffer_id,
-            from_line: 0,
-            direction: HunkDirection::Next,
-            count: 1,
-            extend: false,
-        },
-    )
-    .await;
-    assert!(next.moved);
-    assert_eq!(next.cursor.position.line, 3);
-
-    // From line 3, there's nothing further forward.
-    let none: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
-        &mut ws,
-        &GitNavigateHunkParams {
-            buffer_id,
-            from_line: 3,
-            direction: HunkDirection::Next,
-            count: 1,
-            extend: false,
-        },
-    )
-    .await;
-    assert!(!none.moved);
-
-    // From line 3, Prev lands back on the line-0 hunk.
-    let prev: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
-        &mut ws,
-        &GitNavigateHunkParams {
-            buffer_id,
-            from_line: 3,
-            direction: HunkDirection::Prev,
-            count: 1,
-            extend: false,
-        },
-    )
-    .await;
-    assert!(prev.moved);
-    assert_eq!(prev.cursor.position.line, 0);
-
-    // Extend (Shift) keeps the anchor and grows the selection to the hunk: from the point at line 0,
-    // an extending Next lands the cursor on line 3 while the anchor stays at line 0.
-    let grown: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
-        &mut ws,
-        &GitNavigateHunkParams {
-            buffer_id,
-            from_line: 0,
-            direction: HunkDirection::Next,
-            count: 1,
-            extend: true,
-        },
-    )
-    .await;
-    assert!(grown.moved);
-    assert_eq!(grown.cursor.position.line, 3);
-    assert_eq!(grown.cursor.anchor.line, 0, "extend keeps the anchor");
-
-    drop(server);
-}
-
 /// The same two keys over an ordinary buffer go through the **view** too: `view/navigate_change`
 /// is total, so the client no longer routes `c` by what kind of view it is looking at. An ordinary
 /// view's changes are its one buffer's own hunks, stepped with the semantics `git/navigate_hunk`
@@ -925,7 +794,7 @@ async fn an_ordinary_views_changes_are_stepped_through_the_view() {
 }
 
 #[tokio::test]
-async fn git_navigate_hunk_honours_count() {
+async fn navigate_change_honours_count() {
     let dir = tempfile::tempdir().unwrap();
     git_commit_file(dir.path(), "nav.rs", "l0\nl1\nl2\nl3\nl4\nl5\nl6\n");
 
@@ -984,15 +853,12 @@ async fn git_navigate_hunk_honours_count() {
 
     // From line 0: count 1 → first hunk (2), count 2 → second (4), count 3 → third (6).
     for (count, expected) in [(1u32, 2u32), (2, 4), (3, 6)] {
-        let r: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+        let r = navigate_change_from(
             &mut ws,
-            &GitNavigateHunkParams {
-                buffer_id,
-                from_line: 0,
-                direction: HunkDirection::Next,
-                count,
-                extend: false,
-            },
+            buffer_id,
+            0,
+            aether_protocol::viewport::FocusStep::Next,
+            count,
         )
         .await;
         assert!(r.moved, "count {count} should move");
@@ -1004,15 +870,12 @@ async fn git_navigate_hunk_honours_count() {
     // the third and reporting `moved` claimed an arrival that did not happen, and made `9c` then
     // `9C` fail to return you where you started. `moved: false` is what the client turns into its
     // grouped "No more changes" toast.
-    let over: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+    let over = navigate_change_from(
         &mut ws,
-        &GitNavigateHunkParams {
-            buffer_id,
-            from_line: 0,
-            direction: HunkDirection::Next,
-            count: 9,
-            extend: false,
-        },
+        buffer_id,
+        0,
+        aether_protocol::viewport::FocusStep::Next,
+        9,
     )
     .await;
     assert!(
@@ -1020,20 +883,17 @@ async fn git_navigate_hunk_honours_count() {
         "an over-large count refuses rather than clamping"
     );
     assert_eq!(
-        over.cursor.position.line, 6,
-        "and leaves the cursor untouched — line 6, where the count-3 walk above left it"
+        over.cursor.position.line, 0,
+        "and leaves the cursor where the step started"
     );
 
     // Prev honours the count symmetrically: from line 6, count 2 lands on line 2.
-    let back: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+    let back = navigate_change_from(
         &mut ws,
-        &GitNavigateHunkParams {
-            buffer_id,
-            from_line: 6,
-            direction: HunkDirection::Prev,
-            count: 2,
-            extend: false,
-        },
+        buffer_id,
+        6,
+        aether_protocol::viewport::FocusStep::Previous,
+        2,
     )
     .await;
     assert_eq!(back.cursor.position.line, 2);
@@ -1717,15 +1577,12 @@ async fn buffer_reload_leaves_a_fresh_gutter() {
     );
 
     // And the hunk itself is addressable — the gutter has something to point at, not just a count.
-    let nav: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+    let nav = navigate_change_from(
         &mut ws,
-        &GitNavigateHunkParams {
-            buffer_id,
-            from_line: 0,
-            direction: HunkDirection::Next,
-            count: 1,
-            extend: false,
-        },
+        buffer_id,
+        0,
+        aether_protocol::viewport::FocusStep::Next,
+        1,
     )
     .await;
     assert!(nav.moved, "reload should leave a navigable hunk");
@@ -1783,15 +1640,12 @@ async fn subscribing_refreshes_a_gutter_left_stale_while_hidden() {
     );
 
     // And it's the hunks themselves that were refreshed, not just the summary counts.
-    let nav: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+    let nav = navigate_change_from(
         &mut ws,
-        &GitNavigateHunkParams {
-            buffer_id,
-            from_line: 1,
-            direction: HunkDirection::Prev,
-            count: 1,
-            extend: false,
-        },
+        buffer_id,
+        1,
+        aether_protocol::viewport::FocusStep::Previous,
+        1,
     )
     .await;
     assert!(nav.moved, "the modified line should be navigable");
@@ -2830,24 +2684,22 @@ async fn set_baseline_diffs_against_an_older_commit() {
     assert_eq!(gs.baseline.as_ref().map(baseline_label), Some(&*first));
 
     // The hunk is real, not just a count.
-    let nav: GitNavigateHunkResult = send_request::<GitNavigateHunk>(
+    let nav = navigate_change_from(
         &mut ws,
-        &GitNavigateHunkParams {
-            buffer_id,
-            from_line: 0,
-            direction: HunkDirection::Next,
-            count: 1,
-            extend: false,
-        },
+        buffer_id,
+        0,
+        aether_protocol::viewport::FocusStep::Next,
+        1,
     )
     .await;
     assert!(nav.moved);
     assert_eq!(nav.cursor.position.line, 1);
 
-    // Clearing restores HEAD, and the buffer reads clean again.
+    // Clearing restores HEAD, and the buffer reads clean again — read through the viewport the
+    // step left this connection with.
     let cleared = set_baseline(&mut ws, &root, None).await;
     assert!(cleared.baseline.is_none());
-    let gs = git_status_now(&mut ws, sub.viewport_id).await;
+    let gs = git_status_now(&mut ws, nav.viewport_id).await;
     assert!(gs.unstaged.is_empty(), "back to HEAD: {gs:?}");
     assert!(gs.baseline.is_none());
     drop(server);
@@ -3022,7 +2874,7 @@ async fn git_show_opens_a_commit_as_a_read_only_virtual_buffer() {
     assert_eq!(opened.scratch_number, None, "not a scratch either");
     assert!(opened.read_only);
     assert!(opened.transient, "a revision view is a preview");
-    let title = opened.title.expect("virtual buffers are titled");
+    let title = opened.title.clone().expect("virtual buffers are titled");
     assert!(
         title.starts_with(&head[..7]) && title.ends_with("init"),
         "title is `<short> — <subject>`, got {title:?}"

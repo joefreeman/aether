@@ -960,11 +960,9 @@ pub async fn viewport_navigate_change(
     // moves off it rather than finding itself. A count steps that many changes, not that many
     // lines.
     //
-    // A count that the view cannot honour **refuses**, exactly as `c`/`Alt-c` over an ordinary
-    // buffer already did (`git_navigate_hunk` takes the `n`th or answers `moved: false`). These are
-    // the same two keys, and clamping here gave them two different meanings depending on which kind
-    // of view they were pressed in: `5c` with three changes left jumped to the last one in a patch
-    // and did nothing in a file. The count names *which* change; there isn't a fifth.
+    // A count that the view cannot honour **refuses**: the count names *which* change, and there
+    // isn't a fifth. Clamping instead gave `5c` with three changes left a landing on the last one,
+    // which is a different gesture from the one pressed.
     let count = params.count.unwrap_or(1).max(1) as usize;
     let last = anchors.len().saturating_sub(1);
     let target = if forward {

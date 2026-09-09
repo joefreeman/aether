@@ -36,18 +36,17 @@ pub use aether_protocol::git::{
     GitCommitParams, GitCommitResult, GitDeleteBranch, GitDeleteBranchParams,
     GitDeleteBranchResult, GitDeleteBranchStatus, GitFetch, GitFetchParams, GitFetchResult,
     GitFetchStatus, GitFollowPatchLine, GitFollowPatchLineParams, GitFollowPatchLineResult,
-    GitHead, GitNavigateHunk, GitNavigateHunkParams, GitNavigateHunkResult, GitOperationChanged,
-    GitOperationKind, GitPrepareCommit, GitPrepareCommitParams, GitPrepareCommitResult, GitPull,
-    GitPullParams, GitPullResult, GitPullStatus, GitPush, GitPushParams, GitPushResult,
-    GitPushStatus, GitRefresh, GitRefreshParams, GitRefreshResult, GitRepoOperation, GitReset,
-    GitResetParams, GitResetResult, GitResolveConflict, GitResolveConflictParams,
-    GitResolveConflictResult, GitSetBaseline, GitSetBaselineParams, GitSetBaselineResult,
-    GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView, GitSetDiffViewParams, GitShow,
-    GitShowParams, GitStashApply, GitStashApplyParams, GitStashDrop, GitStashDropParams,
-    GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus, GitWorktreeAdd,
-    GitWorktreeAddParams, GitWorktreeAddResult, GitWorktreeAddStatus, GitWorktreeRemove,
-    GitWorktreeRemoveParams, GitWorktreeRemoveResult, GitWorktreeRemoveStatus, HunkAction,
-    HunkDirection, ResolveConflictStatus, ShowTarget,
+    GitHead, GitOperationChanged, GitOperationKind, GitPrepareCommit, GitPrepareCommitParams,
+    GitPrepareCommitResult, GitPull, GitPullParams, GitPullResult, GitPullStatus, GitPush,
+    GitPushParams, GitPushResult, GitPushStatus, GitRefresh, GitRefreshParams, GitRefreshResult,
+    GitRepoOperation, GitReset, GitResetParams, GitResetResult, GitResolveConflict,
+    GitResolveConflictParams, GitResolveConflictResult, GitSetBaseline, GitSetBaselineParams,
+    GitSetBaselineResult, GitSetBlameFollow, GitSetBlameFollowParams, GitSetDiffView,
+    GitSetDiffViewParams, GitShow, GitShowParams, GitStashApply, GitStashApplyParams, GitStashDrop,
+    GitStashDropParams, GitStashPush, GitStashPushParams, GitStashResult, GitStashStatus,
+    GitWorktreeAdd, GitWorktreeAddParams, GitWorktreeAddResult, GitWorktreeAddStatus,
+    GitWorktreeRemove, GitWorktreeRemoveParams, GitWorktreeRemoveResult, GitWorktreeRemoveStatus,
+    HunkAction, ResolveConflictStatus, ShowTarget,
 };
 pub use aether_protocol::input::{
     BlockDepthParams, BlockUnit, BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams,
@@ -1220,6 +1219,57 @@ pub fn file_open_params(rel: &str, transient: Option<bool>) -> ViewOpenParams {
         jump_to: None,
         transient,
         ..Default::default()
+    }
+}
+
+/// Where a change step landed: what `git/navigate_hunk` used to answer, read off
+/// `view/navigate_change`'s focus result so a test that steps by buffer still reads as it did.
+#[derive(Debug)]
+pub struct Landed {
+    pub moved: bool,
+    pub cursor: CursorState,
+    /// The viewport the step was taken in — the connection's current one, since the subscribe
+    /// that made it superseded whatever came before.
+    pub viewport_id: aether_protocol::ViewportId,
+}
+
+/// One `view/navigate_change` step of `count` changes from `from_line` in `buffer_id`'s own view:
+/// the cursor is parked there first and a viewport opened over the view — the step is a
+/// viewport's, and a fresh subscribe supersedes whatever this connection had.
+pub async fn navigate_change_from(
+    ws: &mut Ws,
+    buffer_id: u64,
+    from_line: u32,
+    direction: aether_protocol::viewport::FocusStep,
+    count: u32,
+) -> Landed {
+    set_point_cursor(
+        ws,
+        buffer_id,
+        LogicalPosition {
+            line: from_line,
+            col: 0,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(ws, &transient_sub_params(buffer_id)).await;
+    let landed: aether_protocol::viewport::ViewportFocusElementResult =
+        send_request::<aether_protocol::viewport::ViewportNavigateChange>(
+            ws,
+            &aether_protocol::viewport::ViewportNavigateChangeParams {
+                viewport_id: sub.viewport_id,
+                direction,
+                count: Some(count),
+                grain: aether_protocol::viewport::NavigateGrain::Change,
+                extend: false,
+            },
+        )
+        .await;
+    Landed {
+        moved: landed.buffer.cursor.position.line != from_line,
+        cursor: landed.buffer.cursor,
+        viewport_id: sub.viewport_id,
     }
 }
 

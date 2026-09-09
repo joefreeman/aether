@@ -207,7 +207,7 @@ pub enum FormatStatus {
 
 // ---- lsp/navigate_diagnostic --------------------------------------------------------------------
 
-/// Jump the cursor to the next/previous diagnostic in the buffer. Mirrors `git/navigate_hunk`: the
+/// Jump the cursor to the next/previous diagnostic in the buffer. Mirrors `view/navigate_change`: the
 /// server holds the diagnostics, so it resolves the target and moves the cursor authoritatively.
 pub struct LspNavigateDiagnostic;
 impl RpcMethod for LspNavigateDiagnostic {

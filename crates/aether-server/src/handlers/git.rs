@@ -3471,42 +3471,6 @@ pub async fn git_set_diff_view(
     Ok(ViewportWindowResult { window })
 }
 
-/// Jump the cursor to the start of the next/previous changed region (hunk). Works whether or not
-/// the diff view is on, so it recomputes the buffer's hunks fresh — the call is user-initiated and
-/// infrequent, so a one-off `git diff` is fine, and it keeps navigation correct even when edits
-/// happened with the view off (which skips the per-edit recompute). Returns the (possibly
-/// unchanged) cursor and whether it moved.
-///
-/// **In a conflicted file the targets are the conflict blocks instead.** There are no hunks there
-/// to step between (no baseline to diff against), and the blocks are what the same gesture is
-/// asking for. The client keeps one pair of keys either way.
-pub async fn git_navigate_hunk(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: GitNavigateHunkParams,
-) -> Result<GitNavigateHunkResult, RpcError> {
-    let client_id = ctx.client_id;
-    let s = state.lock().await;
-    if !s.buffers.contains_key(&params.buffer_id) {
-        return Err(RpcError::buffer_not_found(params.buffer_id));
-    }
-    let key = (client_id, params.buffer_id);
-    let current = s.cursors.get(&key).copied().unwrap_or_default();
-    let anchors = buffer_change_anchors(&s, params.buffer_id);
-    // The field's extent. `c` is a *target* motion, so a hunk outside the element the cursor is in
-    // is not a destination — the same rule `d` follows. In an ordinary editor view the field is the
-    // whole buffer and this filters nothing; it matters wherever a view windows part of a file.
-    let (field_first, field_last) = {
-        let scope = s.motion_scope(client_id, params.buffer_id)?;
-        (scope.first_line(), scope.last_line())
-    };
-    let anchors: Vec<u32> = anchors
-        .into_iter()
-        .filter(|&a| a >= field_first && a <= field_last)
-        .collect();
-    finish_hunk_navigation(s, client_id, params, current, anchors).await
-}
-
 /// The lines a buffer's own changes start on — what `c`/`Alt-c` step between in it, and what a
 /// view whose element windows the buffer without a diff of its own steps through
 /// `view/navigate_change`.
@@ -3565,77 +3529,6 @@ pub fn buffer_change_anchors(s: &ServerState, buffer_id: BufferId) -> Vec<u32> {
         anchors.dedup();
         anchors
     }
-}
-
-/// The step itself, over the anchors already scoped to the field.
-async fn finish_hunk_navigation(
-    mut s: tokio::sync::MutexGuard<'_, ServerState>,
-    client_id: ClientId,
-    params: GitNavigateHunkParams,
-    current: CursorState,
-    anchors: Vec<u32>,
-) -> Result<GitNavigateHunkResult, RpcError> {
-    let key = (client_id, params.buffer_id);
-    // Walk `count` hunks in `direction`. An over-large count **refuses** rather than landing on the
-    // last/first change: the count names which hunk, and there isn't one. At `count == 1` the two
-    // readings coincide, so this changes nothing for a bare `c`.
-    let skip = (params.count.max(1) - 1) as usize;
-    let target = match params.direction {
-        HunkDirection::Next => anchors
-            .iter()
-            .filter(|&&a| a > params.from_line)
-            .nth(skip)
-            .copied(),
-        HunkDirection::Prev => anchors
-            .iter()
-            .rev()
-            .filter(|&&a| a < params.from_line)
-            .nth(skip)
-            .copied(),
-    };
-
-    let Some(target_line) = target else {
-        let response = wrap_for_response(&s, client_id, params.buffer_id, current);
-        return Ok(GitNavigateHunkResult {
-            cursor: response,
-            moved: false,
-        });
-    };
-
-    let buf = s.doc_of(params.buffer_id);
-    let position = motion::clamp_position(
-        buf,
-        LogicalPosition {
-            line: target_line,
-            col: 0,
-        },
-    );
-    let result = CursorState {
-        position,
-        // Extend keeps the existing anchor (grow the selection to the hunk); otherwise collapse to
-        // a point at the landing line.
-        anchor: if params.extend {
-            current.anchor
-        } else {
-            position
-        },
-        match_bracket: None,
-        jumplist_position: None,
-    };
-    set_cursor(&mut s, key, result);
-    s.record_motion(key, current, result);
-    s.virtual_col.remove(&key);
-    s.clear_tree_selection_history(client_id, params.buffer_id);
-    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let response = wrap_for_response(&s, client_id, params.buffer_id, result);
-    drop(s);
-    if let Some((sender, notif)) = search_update {
-        let _ = sender.send(notif).await;
-    }
-    Ok(GitNavigateHunkResult {
-        cursor: response,
-        moved: true,
-    })
 }
 
 /// What a stage/unstage issued from a patch buffer addresses.

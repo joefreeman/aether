@@ -11,50 +11,6 @@ use crate::viewport::ViewportWindowResult;
 use crate::{BufferId, ViewportId};
 use serde::{Deserialize, Serialize};
 
-// ---- git/navigate_hunk --------------------------------------------------------------------------
-
-pub struct GitNavigateHunk;
-impl RpcMethod for GitNavigateHunk {
-    const NAME: &'static str = "git/navigate_hunk";
-    type Params = GitNavigateHunkParams;
-    type Result = GitNavigateHunkResult;
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GitNavigateHunkParams {
-    pub buffer_id: BufferId,
-    /// The cursor's current 0-based line; the search for the next/previous changed region starts
-    /// from here.
-    pub from_line: u32,
-    pub direction: HunkDirection,
-    /// How many hunks to skip in `direction`. Defaults to 1; when fewer than `count` remain the
-    /// cursor lands on the furthest reachable hunk rather than not moving at all.
-    #[serde(
-        default = "crate::count_one",
-        skip_serializing_if = "crate::count_is_one"
-    )]
-    pub count: u32,
-    /// Grow the selection to the landing hunk (Shift) rather than collapsing to a point there: the
-    /// anchor is kept and the cursor jumps to the hunk.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub extend: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HunkDirection {
-    Next,
-    Prev,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct GitNavigateHunkResult {
-    /// Cursor after the jump. Equal to the incoming cursor when `moved` is false.
-    pub cursor: CursorState,
-    /// False when there's no hunk in the requested direction (cursor unchanged).
-    pub moved: bool,
-}
-
 // ---- change counts (status-bar summary) ---------------------------------------------------------
 
 /// Per-class Git change counts: how many buffer lines fall into each change class for one diff.
