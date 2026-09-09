@@ -68,6 +68,15 @@ fn install_panic_hook() {
     }
 }
 
+/// Which build this bundle is, from the stamp the crate's `build.rs` left — the same script the
+/// `ae` binary runs, included. Idempotent: every entry point calls it, whichever runs first.
+fn stamp_build() {
+    aether_protocol::set_build_info(aether_protocol::BuildInfo::stamped(
+        env!("AETHER_COMMIT"),
+        env!("AETHER_COMMIT_DIRTY"),
+    ));
+}
+
 #[wasm_bindgen]
 impl WasmSession {
     /// A placeholder session (no workspace, empty buffer). Phase 1 uses this to prove the boundary;
@@ -75,6 +84,7 @@ impl WasmSession {
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmSession {
         install_panic_hook();
+        stamp_build();
         WasmSession {
             inner: Session::placeholder(),
             measured: aether_client::grid::Measured::default(),
@@ -112,6 +122,7 @@ impl WasmSession {
     /// path that seeds a session without a `sync_workspace_info`, so anything left behind here stays
     /// missing for the life of the client.
     pub fn bootstrap(workspace: JsValue, open: JsValue) -> Result<WasmSession, JsValue> {
+        stamp_build();
         let workspace: aether_protocol::workspace::WorkspaceInfo = from_js(workspace)?;
         let open: ViewOpenResult = from_js(open)?;
         Ok(WasmSession {

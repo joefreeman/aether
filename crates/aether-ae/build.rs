@@ -1,17 +1,23 @@
-//! Stamps the build's git identity into the binary as `AETHER_COMMIT` / `AETHER_COMMIT_DIRTY`,
-//! read back by [`aether_protocol::BUILD_COMMIT`] / [`aether_protocol::BUILD_DIRTY`].
-//!
-//! Why: the release version (`0.2.0`) doesn't identify a *build*. A hand-built dev binary, a
-//! release AppImage, and a colleague's checkout can all report the same version while behaving
-//! differently, and the app-info dialog exists precisely to answer "which build am I running?".
-//!
-//! Both values are best-effort: a source tarball, a shallow export, or a machine without `git`
-//! yields an empty commit and a `false` dirty flag, which the app renders as "unknown build".
-//! Never fails the build — build identity is a diagnostic, not a requirement.
-//!
-//! The dirty flag is a snapshot of the *build moment*: committing afterwards doesn't un-dirty an
-//! already-built binary. That's the intended reading ("this binary was built from a modified
-//! tree"), and it's why the flag is worth as much as the SHA.
+// Stamps the build's git identity into the binary as `AETHER_COMMIT` / `AETHER_COMMIT_DIRTY`,
+// which `main` hands to `aether_protocol::set_build_info` at startup.
+//
+// Lives with the leaf binary rather than the protocol crate, where it used to: every crate
+// depends on the protocol, so a commit there recompiled the whole workspace (and the dev server's
+// binary underneath it); here it relinks `ae`. The wasm bundle is the other leaf, and includes
+// this file rather than copying it — so the header is plain comments: an included file cannot
+// open with inner doc comments.
+//
+// Why: the release version (`0.2.0`) doesn't identify a *build*. A hand-built dev binary, a
+// release AppImage, and a colleague's checkout can all report the same version while behaving
+// differently, and the app-info dialog exists precisely to answer "which build am I running?".
+//
+// Both values are best-effort: a source tarball, a shallow export, or a machine without `git`
+// yields an empty commit and a `false` dirty flag, which the app renders as "unknown build".
+// Never fails the build — build identity is a diagnostic, not a requirement.
+//
+// The dirty flag is a snapshot of the *build moment*: committing afterwards doesn't un-dirty an
+// already-built binary. That's the intended reading ("this binary was built from a modified
+// tree"), and it's why the flag is worth as much as the SHA.
 
 use std::path::Path;
 use std::process::Command;

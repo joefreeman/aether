@@ -148,6 +148,12 @@ struct EditArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Which build this is, from the stamp `build.rs` left: the one fact the about panel and
+    // `ae status` cannot learn from the protocol crate, which no longer carries it.
+    aether_protocol::set_build_info(aether_protocol::BuildInfo::stamped(
+        env!("AETHER_COMMIT"),
+        env!("AETHER_COMMIT_DIRTY"),
+    ));
     let cli = Cli::parse();
     let version = env!("CARGO_PKG_VERSION").to_string();
 

@@ -196,8 +196,8 @@ fn disconnected_sections(conn: &ConnState) -> Vec<InfoSection> {
         InfoRow::new(
             "Build",
             format_build_line(
-                aether_protocol::BUILD_COMMIT,
-                aether_protocol::BUILD_DIRTY,
+                aether_protocol::build_info().commit,
+                aether_protocol::build_info().dirty,
                 aether_protocol::BUILD_DEBUG,
             ),
         ),
@@ -236,7 +236,7 @@ fn disconnected_sections(conn: &ConnState) -> Vec<InfoSection> {
 /// nothing else in the dialog can be trusted, so it earns the warning tone.
 fn client_drift_row(info: &AppInfo) -> Option<InfoRow> {
     let ours = aether_protocol::PROTOCOL_VERSION;
-    let our_commit = aether_protocol::BUILD_COMMIT;
+    let our_commit = aether_protocol::build_info().commit;
     if info.version == ours && info.commit.as_deref() == our_commit {
         return None;
     }
@@ -317,7 +317,7 @@ mod tests {
     fn info() -> AppInfo {
         AppInfo {
             version: aether_protocol::PROTOCOL_VERSION.to_string(),
-            commit: aether_protocol::BUILD_COMMIT.map(str::to_string),
+            commit: aether_protocol::build_info().commit.map(str::to_string),
             commit_dirty: false,
             debug_build: false,
             appimage: None,

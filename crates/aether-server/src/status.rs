@@ -22,8 +22,8 @@ pub fn app_info(s: &crate::state::ServerState, git_version: Option<String>) -> A
     let now = crate::config::now_unix_ms();
     AppInfo {
         version: aether_protocol::PROTOCOL_VERSION.to_string(),
-        commit: aether_protocol::BUILD_COMMIT.map(str::to_string),
-        commit_dirty: aether_protocol::BUILD_DIRTY,
+        commit: aether_protocol::build_info().commit.map(str::to_string),
+        commit_dirty: aether_protocol::build_info().dirty,
         debug_build: aether_protocol::BUILD_DEBUG,
         // Read at snapshot time rather than cached at boot: it's the environment of the *server*
         // process, which is the binary this whole struct describes.

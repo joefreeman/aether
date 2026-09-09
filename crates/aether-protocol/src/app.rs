@@ -35,16 +35,16 @@ pub struct AppInfoParams {}
 /// A snapshot of the running application. Describes the **server**: on native shells the client is
 /// the same binary, so its build fields describe both, but the web client's bundle can lag behind
 /// the daemon that serves it — which is why the client compares these against its own compiled-in
-/// [`crate::PROTOCOL_VERSION`] / [`crate::BUILD_COMMIT`] rather than assuming they match.
+/// [`crate::PROTOCOL_VERSION`] / [`crate::build_info`] rather than assuming they match.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppInfo {
     // ---- build ----
     /// Release version ([`crate::PROTOCOL_VERSION`]).
     pub version: String,
-    /// Short git SHA the server was built from ([`crate::BUILD_COMMIT`]); absent outside a checkout.
+    /// Short git SHA the server was built from ([`crate::BuildInfo::commit`]); absent outside a checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
-    /// The server's tree had uncommitted changes at build time ([`crate::BUILD_DIRTY`]).
+    /// The server's tree had uncommitted changes at build time ([`crate::BuildInfo::dirty`]).
     #[serde(default)]
     pub commit_dirty: bool,
     /// The server is a debug build ([`crate::BUILD_DEBUG`]).

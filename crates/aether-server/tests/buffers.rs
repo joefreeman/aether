@@ -3863,7 +3863,7 @@ async fn app_info_matches_the_status_endpoint() {
     let info: AppInfo = send_request::<AppInfoGet>(&mut ws, &AppInfoParams {}).await;
 
     assert_eq!(info.version, aether_protocol::PROTOCOL_VERSION);
-    assert_eq!(info.commit.as_deref(), aether_protocol::BUILD_COMMIT);
+    assert_eq!(info.commit.as_deref(), aether_protocol::build_info().commit);
     assert!(info.debug_build, "tests run against a debug build");
     assert_eq!(info.pid, std::process::id(), "in-process test server");
     assert_eq!(

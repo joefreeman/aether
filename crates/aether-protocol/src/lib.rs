@@ -113,24 +113,50 @@ pub const RESERVED_WORKSPACE_NAME: &str = "ephemeral";
 /// server's/native clients' `CARGO_PKG_VERSION` are guaranteed equal within a build.
 pub const PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Short git SHA this binary was built from, or `None` when it wasn't built from a checkout (a
-/// source tarball, a machine without `git`). Stamped by `build.rs`.
-///
-/// [`PROTOCOL_VERSION`] identifies a *release*; this identifies a *build*. Between releases the
-/// version is constant while the code moves daily, so the SHA is what actually answers "which
+/// Which build this binary is: the short git SHA it was built from, and whether the tree was
+/// dirty. [`PROTOCOL_VERSION`] identifies a *release*; this identifies a *build*. Between releases
+/// the version is constant while the code moves daily, so the SHA is what actually answers "which
 /// binary is this?" — the question `app/info` exists to settle.
-pub const BUILD_COMMIT: Option<&str> = {
-    let c = env!("AETHER_COMMIT");
-    if c.is_empty() {
-        None
-    } else {
-        Some(c)
-    }
-};
+///
+/// Stamped by the leaf binaries' build scripts (`ae`, the wasm bundle) and handed in through
+/// [`set_build_info`] at startup, rather than baked into this crate: a build script here made a
+/// commit recompile every crate in the workspace, since everything depends on the protocol. A
+/// library test, or a process that never calls in, reads as an unknown build.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BuildInfo {
+    /// Short git SHA, or `None` outside a checkout (a source tarball, a machine without `git`).
+    pub commit: Option<&'static str>,
+    /// The working tree had uncommitted changes when the binary was built — i.e. whether `commit`
+    /// fully describes it. Always `false` when the commit is unknown.
+    pub dirty: bool,
+}
 
-/// Whether the working tree had uncommitted changes when this binary was built — i.e. whether
-/// [`BUILD_COMMIT`] fully describes it. Always `false` when the commit is unknown.
-pub const BUILD_DIRTY: bool = matches!(env!("AETHER_COMMIT_DIRTY").as_bytes(), [b'1']);
+impl BuildInfo {
+    /// From a build script's stamp — the `AETHER_COMMIT` / `AETHER_COMMIT_DIRTY` values as `env!`
+    /// reads them: an empty commit is unknown, and dirty is `"1"` or `"0"`.
+    pub const fn stamped(commit: &'static str, dirty: &'static str) -> Self {
+        Self {
+            commit: if commit.is_empty() {
+                None
+            } else {
+                Some(commit)
+            },
+            dirty: matches!(dirty.as_bytes(), [b'1']),
+        }
+    }
+}
+
+static BUILD_INFO: std::sync::OnceLock<BuildInfo> = std::sync::OnceLock::new();
+
+/// Record which build this process is. The first call wins; later ones are ignored.
+pub fn set_build_info(info: BuildInfo) {
+    let _ = BUILD_INFO.set(info);
+}
+
+/// Which build this process is — unknown until [`set_build_info`] has been called.
+pub fn build_info() -> BuildInfo {
+    BUILD_INFO.get().copied().unwrap_or_default()
+}
 
 /// Whether this is a debug build (`debug_assertions` on). Worth reporting next to the commit: a
 /// debug build of the same commit performs differently enough to explain a "why is this slow?".
