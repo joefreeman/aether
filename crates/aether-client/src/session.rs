@@ -847,6 +847,13 @@ pub enum SaveTry {
         /// through any overwrite confirm.
         after: AfterSave,
     },
+    /// A **view** save: however many documents its elements windowed. Distinct from `Saved` because
+    /// there is no single revision to report — the toast counts files, and the focused document's
+    /// own result rides along only when it was one of them.
+    SavedView {
+        result: aether_protocol::viewport::ViewSaveResult,
+        after: AfterSave,
+    },
     NeedsConfirm {
         kind: ConfirmKind,
         action: ConfirmAction,
@@ -934,6 +941,14 @@ pub struct ViewState {
     /// `buffer` to whichever file the cursor is in and a file is not a patch. Decides where a
     /// change-step goes: through the view's elements, or through one file's own diff.
     pub view_is_patch: bool,
+    /// Whether this **view** is transient — a preview that closes itself once hidden.
+    ///
+    /// [`Self::buffer`] cannot answer it, for the same reason it cannot answer the label: focus
+    /// rebinds that to whichever file the cursor is in, and a working-changes view is a *transient
+    /// view over permanent files*. Reading the focused buffer's flag made `Space k` keep whichever
+    /// file the cursor happened to be in, leaving the view itself as transient as before — it still
+    /// vanished on the next thing you opened.
+    pub view_transient: bool,
     /// The buffer the cursor is in — the focused element's. Every text operation addresses this.
     pub buffer: BufferInfo,
     pub mode: Mode,
@@ -1001,6 +1016,7 @@ impl ViewState {
     pub fn rebind(&mut self, buffer: BufferInfo) {
         self.view_id = ViewId(buffer.buffer_id);
         self.view_is_patch = buffer.is_patch;
+        self.view_transient = buffer.transient;
         self.view_label = buffer.label.clone();
         self.buffer = buffer;
         self.focused_element = 0;
@@ -1047,6 +1063,7 @@ impl ViewState {
             // A view opens on its own buffer; focus moves it off only in a multi-buffer view.
             view_id: ViewId(buffer.buffer_id),
             view_is_patch: buffer.is_patch,
+            view_transient: buffer.transient,
             view_label: buffer.label.clone(),
             buffer,
             mode: Mode::Normal,

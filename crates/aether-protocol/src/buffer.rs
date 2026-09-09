@@ -157,7 +157,7 @@ pub struct BufferSaveParams {
     pub overwrite: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct BufferSaveResult {
     pub saved_at_unix_ms: u64,
     pub revision: Revision,

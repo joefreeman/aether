@@ -465,6 +465,10 @@ interface CoreView {
   /** What to call the view in the status bar and the tab title. The view's own label, which focus
    *  does not move — `buffer.label` is the focused element's file and changes on every `Tab`. */
   view_label: string;
+  /** Whether the *view* is a preview that closes itself once hidden — a fact about the view, not
+   *  about whichever file the cursor is in (focus rebinds `buffer`, and a working-changes view is a
+   *  transient view over permanent files). */
+  view_transient: boolean;
   /** Which editor element holds the cursor — see `grid::line_is_loaded`. */
   focused_element: number;
   buffer: {
@@ -5044,7 +5048,7 @@ export class Shell {
     // (the bar is proportional) — the same approximation `labelBudget` below already makes.
     let used = (color ? 2 : 0) + [...proj].length;
     const name = document.createElement("span");
-    if (v.buffer.transient) name.className = "status-transient"; // preview buffers slant
+    if (v.view_transient) name.className = "status-transient"; // preview views slant
     // The file label takes at most the left half of the bar, segment-elided so the filename
     // survives (CSS ellipsis is the safety net for the char-budget estimate's error).
     const barStyle = getComputedStyle(this.statusEl);

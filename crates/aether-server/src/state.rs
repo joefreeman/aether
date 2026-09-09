@@ -1540,6 +1540,32 @@ impl ServerState {
     /// still holds the document, in which case closing this attachment loses nothing. Returns
     /// the ids closed and the keys of language servers torn down with them (so callers can
     /// refresh picker views).
+    /// Whether closing `id` would drop the **last in-memory copy of unsaved work**.
+    ///
+    /// The question every *automatic* close has to ask, given a name and one definition. It was
+    /// written out inline in the collector as `has_sibling || !dirty`, which is the same rule
+    /// stated as a coincidence of two locals — and a rule stated inline is a rule the next
+    /// automatic close path will restate slightly differently, or not at all.
+    ///
+    /// A sibling buffer on the same document keeps the content reachable, which is why this asks
+    /// about the *document* rather than the buffer: two views of one file are two buffers and one
+    /// piece of unsaved work.
+    ///
+    /// Not consulted by `buffer/close`: closing on purpose with unsaved changes is the user's call
+    /// to make (they are prompted), and this is about closes nobody asked for.
+    pub fn close_would_orphan_unsaved(&self, id: BufferId) -> bool {
+        let Some(buffer) = self.buffers.get(&id) else {
+            return false;
+        };
+        if !self.try_doc_of(id).is_some_and(|d| d.dirty) {
+            return false;
+        }
+        !self
+            .buffers
+            .values()
+            .any(|o| o.document == buffer.document && o.id != id)
+    }
+
     pub fn close_orphaned_transients(
         &mut self,
         candidates: impl IntoIterator<Item = BufferId>,
@@ -1547,13 +1573,8 @@ impl ServerState {
         let mut closed = Vec::new();
         let mut stopped = Vec::new();
         for id in candidates {
-            let has_sibling = self.buffers.get(&id).is_some_and(|b| {
-                self.buffers
-                    .values()
-                    .any(|o| o.document == b.document && o.id != id)
-            });
             let eligible = self.buffers.get(&id).is_some_and(|b| b.transient)
-                && (has_sibling || !self.try_doc_of(id).is_some_and(|d| d.dirty))
+                && !self.close_would_orphan_unsaved(id)
                 // `shows`, not `binds`: a patch's viewers are watching the *view*, and no element
                 // windows it, so asking only about bindings said "nothing is showing this" about
                 // the document on screen. The GC and the push fan-out now ask the same question —

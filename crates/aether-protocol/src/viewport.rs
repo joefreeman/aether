@@ -392,6 +392,50 @@ pub struct LogicalLineRange {
     pub end_view_line_exclusive: ViewLine,
 }
 
+// ---- view/save ----------------------------------------------------------------------------------
+
+/// Save every document the view's elements window.
+///
+/// **Not `buffer/save` with more arguments.** One saves a named document; this saves a *set* the
+/// caller cannot enumerate — the elements of a composed view are the server's business, and a
+/// working-changes view routinely windows a dozen files at once. `Space s` saving only whichever
+/// element happened to hold the cursor was the bug: the other files stayed dirty with nothing on
+/// screen saying so beyond the view-wide dot.
+///
+/// An ordinary view windows exactly one document, so this is `buffer/save` for it and no client
+/// needs to ask which kind of view it is looking at.
+///
+/// Documents that are clean, read-only, or generated are skipped rather than refused — saving a
+/// view means "write what I have changed here", and a patch's own text is not that.
+pub struct ViewSave;
+impl RpcMethod for ViewSave {
+    const NAME: &'static str = "view/save";
+    const MUTATES_TEXT: bool = true;
+    type Params = ViewSaveParams;
+    type Result = ViewSaveResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewSaveParams {
+    pub view_id: crate::ViewId,
+    /// Acknowledges a divergence from disk, exactly as [`crate::buffer::BufferSaveParams`] does —
+    /// and with the same two-step handshake. The first document that needs confirming aborts the
+    /// call with its own error code; documents already written stay written, and the retry with
+    /// `overwrite` finds them clean and skips them.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct ViewSaveResult {
+    /// How many documents were written. `0` when the view had nothing dirty.
+    pub saved: u32,
+    /// The focused element's own result, when its document was among them — what a client folds
+    /// into the buffer state it is already tracking. `None` when the focused element was clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused: Option<crate::buffer::BufferSaveResult>,
+}
+
 // ---- viewport/subscribe -------------------------------------------------------------------------
 
 pub struct ViewportSubscribe;

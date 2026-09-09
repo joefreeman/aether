@@ -1318,6 +1318,55 @@ mod tests {
         );
     }
 
+    /// **View**-addressed entries step from inside the view they name.
+    ///
+    /// A commit patch's rows: no path (the elements window files *at a revision*, which are
+    /// virtual), and a buffer id that dies with the view. They match on the view key instead, which
+    /// is what lets `]` keep walking after the view has been closed and re-materialised under a new
+    /// id — the case a buffer-id match cannot express at all.
+    #[test]
+    fn step_walks_view_addressed_entries_from_inside_the_view() {
+        let key = "/repo@abc123:src/one.rs";
+        let at = |line: u32| JumplistEntry {
+            view: Some("/repo@abc123".into()),
+            target: JumplistTarget::View { key: key.into() },
+            position: Some(pos(line, 0)),
+            anchor: None,
+            group: Some(GroupHeader::Label {
+                label: "one.rs".into(),
+            }),
+            display: format!("line {line}"),
+        };
+        let e = vec![at(2), at(42)];
+
+        // The buffer id differs from anything captured — the view was reopened — and there is no
+        // path. Only the key can match, and stepping still makes progress.
+        assert_eq!(
+            step_index(&e, Direction::Forward, Location::view(key, 999), pos(0, 0), 1),
+            Some(0)
+        );
+        assert_eq!(
+            step_index(&e, Direction::Forward, Location::view(key, 999), pos(2, 0), 1),
+            Some(1)
+        );
+        assert_eq!(
+            step_index(&e, Direction::Backward, Location::view(key, 999), pos(42, 0), 1),
+            Some(0)
+        );
+        // A different view's entries are not this view's.
+        assert_eq!(
+            step_index(
+                &e,
+                Direction::Forward,
+                Location::view("/repo@other:src/one.rs", 999),
+                pos(2, 0),
+                1
+            ),
+            Some(0),
+            "an unrelated view enters the list from outside rather than stepping within it"
+        );
+    }
+
     /// A captured file list steps one file per press, from anywhere in the file: a whole-target
     /// entry is never "past" the cursor, so the walk always falls through to the neighbour.
     #[test]

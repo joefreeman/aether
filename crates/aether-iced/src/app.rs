@@ -4403,8 +4403,8 @@ impl App {
             .size(ui.body())
             .color(p.fg)
             .font(
-                // A transient (preview) buffer slants the file label, like the other clients.
-                if self.session.view.buffer.transient {
+                // A transient (preview) *view* slants the file label, like the other clients.
+                if self.session.view.view_transient {
                     SANS_ITALIC
                 } else {
                     SANS

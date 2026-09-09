@@ -43,6 +43,9 @@ pub fn build_view(s: &Session) -> Value {
         // What to call the view in the status bar and the document title — the view's own label,
         // which focus does not move. See `ViewState::view_label`.
         "view_label": s.view.view_label,
+        // Whether the *view* is a preview that closes itself once hidden — a fact about the view,
+        // not about whichever file the cursor is in. See `ViewState::view_transient`.
+        "view_transient": s.view.view_transient,
         // Which element holds the cursor: "is this line loaded?" is a per-element question.
         "focused_element": s.view.focused_element,
         "buffer": buffer(s),

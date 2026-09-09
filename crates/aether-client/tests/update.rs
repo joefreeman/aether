@@ -59,14 +59,23 @@ fn the_request(fx: &Effects) -> (u64, &'static str, serde_json::Value) {
     req
 }
 
-/// The token of the (single) `buffer/save` request in `fx`.
+/// The token of the (single) plain-save request in `fx`.
+///
+/// `view/save`, not `buffer/save`: a plain save saves the **view** — every document its elements
+/// window, which for an ordinary view is the one document. Save-*as* still names a single file and
+/// still goes through `buffer/save`.
 fn save_token(fx: &Effects) -> u64 {
     fx.0.iter()
         .find_map(|e| match e {
-            Effect::Request { token, method, .. } if *method == "buffer/save" => Some(*token),
+            Effect::Request { token, method, .. } if *method == "view/save" => Some(*token),
             _ => None,
         })
-        .expect("a buffer/save request was emitted")
+        .expect("a view/save request was emitted")
+}
+
+/// A `view/save` reply that wrote `n` documents.
+fn view_saved(n: u32) -> serde_json::Value {
+    json!({ "saved": n, "focused": { "saved_at_unix_ms": 0, "revision": 4 } })
 }
 
 fn quits(fx: &Effects) -> bool {
@@ -705,13 +714,13 @@ fn space_alt_q_saves_then_quits_on_success() {
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
     let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None, ROWS);
     // Saves in place (overwrite:false), and does NOT quit yet.
-    let params = find_request(&fx, "buffer/save").expect("Space Alt-q saves first");
+    let params = find_request(&fx, "view/save").expect("Space Alt-q saves first");
     assert_eq!(params["overwrite"], json!(false));
     assert!(!quits(&fx), "quit is deferred until the save succeeds");
     let token = save_token(&fx);
 
     // Save lands → now it quits.
-    let fx = s.on_rpc_result(token, Ok(json!({ "saved_at_unix_ms": 0, "revision": 3 })));
+    let fx = s.on_rpc_result(token, Ok(view_saved(1)));
     assert!(quits(&fx), "a successful save quits");
 }
 
@@ -772,13 +781,13 @@ fn space_alt_q_survives_the_external_modify_confirm() {
     // Accept → retry carries overwrite:true; the quit intent is threaded through, so still no
     // quit until the retry lands.
     let fx = s.on_event(Event::PromptAccept);
-    let params = find_request(&fx, "buffer/save").expect("the confirmed save retries");
+    let params = find_request(&fx, "view/save").expect("the confirmed save retries");
     assert_eq!(params["overwrite"], json!(true));
     assert!(!quits(&fx), "no quit until the retry succeeds");
     let token = save_token(&fx);
 
     // Retry succeeds → now it quits.
-    let fx = s.on_rpc_result(token, Ok(json!({ "saved_at_unix_ms": 0, "revision": 4 })));
+    let fx = s.on_rpc_result(token, Ok(view_saved(1)));
     assert!(quits(&fx), "save-and-quit survives the confirm detour");
 }
 
@@ -7039,8 +7048,8 @@ fn a_second_git_operation_is_refused_while_one_is_running() {
 fn space_k_toggles_keep_and_guards_unsaved() {
     let mut s = session();
 
-    // Clean transient buffer: Space k pins it permanent (transient: false).
-    s.view.buffer.transient = true;
+    // Clean transient view: Space k pins it permanent (transient: false).
+    s.view.view_transient = true;
     s.view.buffer.revision = 3;
     s.view.buffer.saved_revision = 3;
     let _ = key(&mut s, ' '); // leader
@@ -7053,15 +7062,15 @@ fn space_k_toggles_keep_and_guards_unsaved() {
         "pins the transient buffer permanent"
     );
 
-    // Clean permanent buffer: Space k releases it back to transient.
-    s.view.buffer.transient = false;
+    // Clean permanent view: Space k releases it back to transient.
+    s.view.view_transient = false;
     let _ = key(&mut s, ' ');
     let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
     let params = find_request(&fx, "buffer/set_transient").expect("toggles the other way");
     assert_eq!(params["transient"], json!(true));
 
-    // Dirty permanent buffer: Space k refuses to make it transient — silent no-op, no RPC.
-    s.view.buffer.transient = false;
+    // Dirty permanent view: Space k refuses to make it transient — silent no-op, no RPC.
+    s.view.view_transient = false;
     s.view.buffer.revision = 5;
     s.view.buffer.saved_revision = 3;
     let _ = key(&mut s, ' ');
@@ -7072,13 +7081,78 @@ fn space_k_toggles_keep_and_guards_unsaved() {
     );
     assert!(fx.0.is_empty(), "the refusal is a silent no-op");
 
-    // A dirty *transient* buffer can still be pinned permanent — that's safe (stops it auto-closing
+    // A dirty *transient* view can still be pinned permanent — that's safe (stops it auto-closing
     // with the unsaved edits), so the guard only blocks the make-transient direction.
-    s.view.buffer.transient = true;
+    s.view.view_transient = true;
     let _ = key(&mut s, ' ');
     let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
     let params = find_request(&fx, "buffer/set_transient").expect("dirty transient can be pinned");
     assert_eq!(params["transient"], json!(false));
+}
+
+/// `Space k` keeps the **view**, not the file the cursor happens to be in.
+///
+/// A working-changes view is a transient view over permanent files. Toggling the focused element
+/// pinned a file that was never going anywhere and left the view as transient as before — it still
+/// closed itself on the next thing opened, which is the one thing `Space k` exists to prevent.
+#[test]
+fn space_k_on_a_composed_view_keeps_the_view() {
+    let mut s = session();
+    // A composed view: its identity is the patch, the cursor is in one of the files it windows.
+    s.view.view_id = ViewId(9);
+    s.view.view_transient = true;
+    s.view.buffer.buffer_id = 42;
+    s.view.buffer.transient = false; // the *file* is permanent; the view is not
+    s.view.buffer.revision = 1;
+    s.view.buffer.saved_revision = 1;
+
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    let params = find_request(&fx, "buffer/set_transient").expect("Space k toggles the view");
+    assert_eq!(
+        params["buffer_id"],
+        json!(9),
+        "addresses the view, not the focused element's buffer"
+    );
+    assert_eq!(params["transient"], json!(false), "pins the view permanent");
+}
+
+/// The unsaved guard is **view-wide**: closing a view drops every document it windows, so a dirty
+/// element elsewhere blocks making it transient just as the focused one does.
+#[test]
+fn space_k_refuses_a_view_with_another_element_dirty() {
+    let mut s = session();
+    s.view.view_transient = false;
+    // The focused element is clean...
+    s.view.buffer.revision = 3;
+    s.view.buffer.saved_revision = 3;
+    // ...but the view knows something else in it is not.
+    s.view.window = Some(aether_protocol::viewport::Window {
+        other_elements_dirty: true,
+        first_view_line: ViewLine(0),
+        last_view_line_exclusive: ViewLine(1),
+        view_line_count: 1,
+        max_scroll_view_line: ViewLine(0),
+        total_visual_rows: 1,
+        first_visual_row: VisualRow(0),
+        max_line_width: 0,
+        git_status: None,
+        root: aether_protocol::viewport::Element::Editor {
+            element: 0,
+            buffer: 0,
+            rows: 0,
+            first_buffer_line: 0,
+            lines: vec![],
+        },
+    });
+
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
+    assert!(
+        find_request(&fx, "buffer/set_transient").is_none(),
+        "a view with unsaved work anywhere in it can't be made transient"
+    );
+    assert!(fx.0.is_empty(), "the refusal is a silent no-op");
 }
 
 #[test]
@@ -9048,7 +9122,7 @@ fn unkeep_releases_the_tether_one_way() {
     );
 
     // Re-keep (the transient flag itself rides a push; simulate it) — a plain keep, no re-arm.
-    s.view.buffer.transient = true;
+    s.view.view_transient = true;
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
     let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()), ROWS);
     let (_, method, params) = the_request(&fx);
@@ -9057,7 +9131,7 @@ fn unkeep_releases_the_tether_one_way() {
     assert_eq!(s.tether, None, "re-keeping does not re-arm the tether");
 
     // And closing now behaves like any ordinary buffer: successor, no exit.
-    s.view.buffer.transient = false;
+    s.view.view_transient = false;
     let fx = s.close_buffer();
     let (_, _, params) = the_request(&fx);
     assert_eq!(params["open_next"], json!(true));
@@ -9109,13 +9183,13 @@ fn space_alt_x_saves_closes_and_exits_the_tethered_session() {
 
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
     let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
-    let params = find_request(&fx, "buffer/save").expect("Space Alt-x saves first");
+    let params = find_request(&fx, "view/save").expect("Space Alt-x saves first");
     assert_eq!(params["overwrite"], json!(false));
     assert!(!quits(&fx), "no exit before the save lands");
     let token = save_token(&fx);
 
     // Save lands → the close fires (tether style: no successor). Still no exit.
-    let fx = s.on_rpc_result(token, Ok(json!({ "saved_at_unix_ms": 0, "revision": 4 })));
+    let fx = s.on_rpc_result(token, Ok(view_saved(1)));
     let close_token =
         fx.0.iter()
             .find_map(|e| match e {
@@ -9143,7 +9217,7 @@ fn space_alt_x_untethered_closes_to_the_successor() {
     let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
     let token = save_token(&fx);
 
-    let fx = s.on_rpc_result(token, Ok(json!({ "saved_at_unix_ms": 0, "revision": 4 })));
+    let fx = s.on_rpc_result(token, Ok(view_saved(1)));
     let close = fx.0.iter().find_map(|e| match e {
         Effect::Request { method, params, .. } if *method == "buffer/close" => Some(params.clone()),
         _ => None,
@@ -12178,9 +12252,9 @@ fn space_g_c_prepares_a_commit_and_alt_x_commits_it() {
     assert!(no_request(&fx));
     let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
     let (token, method, _) = the_request(&fx);
-    assert_eq!(method, "buffer/save");
+    assert_eq!(method, "view/save");
 
-    let fx = s.on_rpc_result(token, Ok(json!({"saved_at_unix_ms": 0, "revision": 2})));
+    let fx = s.on_rpc_result(token, Ok(view_saved(1)));
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "git/commit", "the save is followed by the commit");
     assert_eq!(
@@ -12273,7 +12347,7 @@ fn a_refused_commit_keeps_the_message_buffer_open() {
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
     let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
     let (token, _, _) = the_request(&fx);
-    let fx = s.on_rpc_result(token, Ok(json!({"saved_at_unix_ms": 0, "revision": 2})));
+    let fx = s.on_rpc_result(token, Ok(view_saved(1)));
     let (token, _, _) = the_request(&fx);
 
     let fx = s.on_rpc_result(
@@ -12329,7 +12403,7 @@ fn space_g_alt_c_amends() {
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
     let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None, ROWS);
     let (token, _, _) = the_request(&fx);
-    let fx = s.on_rpc_result(token, Ok(json!({"saved_at_unix_ms": 0, "revision": 2})));
+    let fx = s.on_rpc_result(token, Ok(view_saved(1)));
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "git/commit");
     assert_eq!(

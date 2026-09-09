@@ -482,6 +482,37 @@ pub struct OutlineEntry {
     pub patch_line: u32,
 }
 
+/// Every buffer a **view** shows, in view order, each named once.
+///
+/// The set a listing kind fans out over. For an ordinary view it is `[focused]` and the fan-out is
+/// a loop of one — which is the whole point of defining these at view level: a one-element view
+/// keeps behaving exactly as it did, so a regression can only be a regression in composed views.
+///
+/// Falls back to `[focused]` when the client sent no view id, which covers an older client and the
+/// re-view calls that carry no ids at all. Duplicates are dropped: two hunks of one file are two
+/// elements over one buffer, and its diagnostics should be listed once.
+pub fn view_element_buffers(
+    s: &ServerState,
+    view_id: Option<aether_protocol::ViewId>,
+    focused: BufferId,
+) -> Vec<BufferId> {
+    let Some(view) = view_id else {
+        return vec![focused];
+    };
+    let view_buffer = view.presenting_buffer();
+    let mut out: Vec<BufferId> = Vec::new();
+    for layout in s.element_layout_of(view_buffer) {
+        let id = layout.extent.buffer(view_buffer);
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    if out.is_empty() {
+        out.push(focused);
+    }
+    out
+}
+
 /// Which element of the view named by `view_key` holds `(abs_path, line)`, and the buffer that
 /// element currently windows — where a jumplist entry captured from that view should be seated.
 ///
@@ -3457,4 +3488,63 @@ mod tests {
             "the widest line in the view lives in the second element"
         );
     }
+}
+
+/// `view/save`: write every document the view's elements window.
+///
+/// A loop over [`view_element_buffers`] calling `buffer/save`, so every rule that path enforces —
+/// read-only refusal, external-change detection, the change notifications — holds per document
+/// without being restated here. Clean and read-only documents are skipped rather than refused: a
+/// working-changes view windows the files you edited *and* the ones you only looked at, and a
+/// commit's patch windows nothing writable at all.
+///
+/// The first document needing confirmation aborts with its own error code. Ones already written
+/// stay written and are clean, so the client's existing confirm-and-retry lands on the rest.
+pub async fn view_save(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::viewport::ViewSaveParams,
+) -> Result<aether_protocol::viewport::ViewSaveResult, RpcError> {
+    let client_id = ctx.client_id;
+    let (buffers, focused_buffer) = {
+        let s = state.lock().await;
+        let focused = s
+            .viewports
+            .values()
+            .find(|vp| vp.client_id == client_id && vp.view_id == params.view_id)
+            .map(|vp| vp.focus().buffer_id)
+            .unwrap_or_else(|| params.view_id.presenting_buffer());
+        let dirty: Vec<BufferId> = view_element_buffers(&s, Some(params.view_id), focused)
+            .into_iter()
+            .filter(|id| {
+                s.try_doc_of(*id)
+                    .is_some_and(|d| d.dirty && !d.read_only())
+            })
+            .collect();
+        (dirty, focused)
+    };
+
+    let mut saved = 0;
+    let mut focused_result = None;
+    for buffer_id in buffers {
+        let result = crate::handlers::buffer_save(
+            state,
+            ctx,
+            aether_protocol::buffer::BufferSaveParams {
+                buffer_id,
+                path_index: None,
+                relative_path: None,
+                overwrite: params.overwrite,
+            },
+        )
+        .await?;
+        saved += 1;
+        if buffer_id == focused_buffer {
+            focused_result = Some(result);
+        }
+    }
+    Ok(aether_protocol::viewport::ViewSaveResult {
+        saved,
+        focused: focused_result,
+    })
 }

@@ -135,7 +135,7 @@ use aether_protocol::viewport::{
     ViewportFocusElementParams,
     ViewportFocusElementResult, ViewportLinesChanged, ViewportLinesChangedParams,
     ViewportNavigateChange, ViewportNavigateChangeParams, ViewportSubscribeResult,
-    ViewportWindowResult, Window, WrapMode,
+    ViewportWindowResult, Window, WrapMode, ViewSave, ViewSaveParams,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProject,
@@ -2541,15 +2541,18 @@ impl Session {
             Event::KeepToggled(result) => match result {
                 Err(e) => Effects::error_detail("Keep failed", e),
                 // Grouped: toggling keep/release updates one toast rather than stacking a pair.
-                Ok(transient) => Effects::toast_grouped(
-                    if transient {
-                        "Buffer released"
-                    } else {
-                        "Buffer kept"
-                    },
-                    ToastKind::Success,
-                    "transient",
-                ),
+                Ok(transient) => {
+                    // The reply is about the *view's* document. For an ordinary view that is also
+                    // the focused buffer and the `buffer/state` push updates it too; for a composed
+                    // one the push is about a document the client is not tracking, so this is the
+                    // only thing that moves the flag.
+                    self.view.view_transient = transient;
+                    Effects::toast_grouped(
+                        if transient { "View released" } else { "View kept" },
+                        ToastKind::Success,
+                        "transient",
+                    )
+                }
             },
             Event::DirCreated(Err(e)) => Effects::error_detail("Create directory failed", e),
             Event::DirCreated(Ok(r)) => {
@@ -2743,6 +2746,40 @@ impl Session {
                 }
                 fx
             }
+            // A view save: N documents, so the news is how many rather than a revision. The focused
+            // document's own result still updates the buffer state the client tracks, when it was
+            // one of them — a save that wrote only *other* elements leaves this one as it was.
+            Event::SaveTried(Ok(SaveTry::SavedView { result, after })) => {
+                let note = match result.saved {
+                    0 => "Nothing to save".to_string(),
+                    1 => "Saved".to_string(),
+                    n => format!("Saved {n} files"),
+                };
+                let kind = if result.saved == 0 {
+                    ToastKind::Info
+                } else {
+                    ToastKind::Success
+                };
+                // A save that exists only to feed a commit isn't news — the commit's own toast is
+                // the outcome, and stacking both makes one gesture look like two. Same rule the
+                // single-document arm follows.
+                let feeds_commit = after == AfterSave::Close
+                    && self
+                        .pending_commit
+                        .as_ref()
+                        .is_some_and(|p| p.buffer_id == self.view.buffer.buffer_id);
+                let mut fx = if feeds_commit {
+                    Effects::none()
+                } else {
+                    Effects::toast(note, kind)
+                };
+                match after {
+                    AfterSave::Nothing => {}
+                    AfterSave::Quit => fx.push(Effect::Exit),
+                    AfterSave::Close => fx = fx.and(self.close_buffer()),
+                }
+                fx
+            }
             Event::SaveTried(Ok(SaveTry::NeedsConfirm { kind, action })) => {
                 self.prompt = Some(Prompt::Confirm { kind, action });
                 Effects::none()
@@ -2781,6 +2818,42 @@ impl Session {
             Some((i, p)) => (Some(*i), Some(p.clone())),
             None => (None, None),
         };
+
+        // A plain save saves the **view**: every document its elements window, which for an
+        // ordinary view is the one document and so is unchanged. Save-*as* stays per-document —
+        // it names a path, and a path names one file.
+        if target.is_none() {
+            let view_id = self.view.view_id;
+            {
+                return self.request::<ViewSave>(
+                    ViewSaveParams { view_id, overwrite },
+                    move |__r| {
+                        Event::SaveTried(match __r {
+                            Ok(result) => Ok(SaveTry::SavedView { result, after }),
+                            Err(e) if e.code == ErrorCode::WOULD_OVERWRITE.code() => {
+                                Ok(SaveTry::NeedsConfirm {
+                                    kind: ConfirmKind::Overwrite { path: None },
+                                    action: ConfirmAction::Save { target: None, after },
+                                })
+                            }
+                            Err(e) if e.code == ErrorCode::EXTERNALLY_MODIFIED.code() => {
+                                Ok(SaveTry::NeedsConfirm {
+                                    kind: ConfirmKind::OverwriteModified,
+                                    action: ConfirmAction::Save { target: None, after },
+                                })
+                            }
+                            Err(e) if e.code == ErrorCode::EXTERNALLY_DELETED.code() => {
+                                Ok(SaveTry::NeedsConfirm {
+                                    kind: ConfirmKind::RecreateDeleted,
+                                    action: ConfirmAction::Save { target: None, after },
+                                })
+                            }
+                            Err(e) => Err(e.message),
+                        })
+                    },
+                );
+            }
+        }
 
         self.request::<BufferSave>(
             BufferSaveParams {
@@ -6551,6 +6624,11 @@ impl Session {
                 let Ok(p) = serde_json::from_value::<BufferStateParams>(n.params) else {
                     return Effects::none();
                 };
+                // A push about the view's *own* document — which for a composed view is not the
+                // focused buffer — still moves the view's transient flag.
+                if p.buffer_id == self.view.view_id.presenting_buffer() {
+                    self.view.view_transient = p.transient;
+                }
                 if p.buffer_id != self.view.buffer.buffer_id {
                     return Effects::none();
                 }
@@ -9717,16 +9795,27 @@ impl Session {
                         |r| Event::TetherReleased(r.map(|res| res.transient)),
                     );
                 }
-                let target = !self.view.buffer.transient;
-                // Refuse to make a buffer with unsaved edits transient — it would auto-close (and
-                // discard them) once hidden. Silent no-op; pinning permanent, or toggling a clean
-                // buffer, is fine.
-                if target && self.view.buffer.revision != self.view.buffer.saved_revision {
+                // Keeps the **view**, not the file the cursor is in. A working-changes view is a
+                // transient view over permanent files: toggling the focused element pinned a file
+                // that was never going anywhere and left the view to close itself on the next
+                // thing opened. For an ordinary view the two ids are the same and nothing changes.
+                let target = !self.view.view_transient;
+                // Refuse to make a view with unsaved edits transient — it would auto-close (and
+                // discard them) once hidden. View-wide: *any* of its documents being dirty counts,
+                // since closing the view drops them all. Silent no-op; pinning permanent, or
+                // toggling a clean view, is fine.
+                let dirty = self.view.buffer.revision != self.view.buffer.saved_revision
+                    || self
+                        .view
+                        .window
+                        .as_ref()
+                        .is_some_and(|w| w.other_elements_dirty);
+                if target && dirty {
                     return Effects::none();
                 }
                 self.request_str::<BufferSetTransient>(
                     BufferSetTransientParams {
-                        buffer_id,
+                        buffer_id: self.view.view_id.presenting_buffer(),
                         transient: target,
                     },
                     |r| Event::KeepToggled(r.map(|res| res.transient)),

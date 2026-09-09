@@ -53,7 +53,7 @@ use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::syntax::SyntaxHighlightSnippet;
 use aether_protocol::viewport::{
-    ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportScroll,
+    ViewSave, ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportScroll,
     ViewportScrollToRow, ViewportSetWrap, ViewportSubscribe, ViewportWindowAtCursor,
 };
 use aether_protocol::workspace::{
@@ -561,6 +561,7 @@ async fn dispatch(
         InputTransformCase::NAME => run!(InputTransformCase, handlers::input_transform_case),
         PickerView::NAME => run!(PickerView, handlers::picker_view),
         PickerQuery::NAME => run!(PickerQuery, handlers::picker_query),
+        ViewSave::NAME => run!(ViewSave, handlers::view_save),
         PickerSelect::NAME => run!(PickerSelect, handlers::picker_select),
         PickerHide::NAME => run!(PickerHide, handlers::picker_hide),
         PickerSetGroup::NAME => run!(PickerSetGroup, handlers::picker_set_group),

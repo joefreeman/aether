@@ -5,6 +5,183 @@ mod common;
 use aether_protocol::coords::ViewLine;
 use common::*;
 
+// -------- transient reachability -----------------------------------------------------------------
+
+/// Editing a preview **promotes** it, so unsaved work is never sitting in a collectable buffer.
+///
+/// This is what actually keeps unsaved work reachable, and it is worth pinning as the mechanism
+/// rather than trusting the collector's own dirty check: that check only ever fires for a document
+/// dirtied through a *sibling* buffer, and a rule that never fires is a rule nobody notices
+/// breaking. The invariant here is stronger and easier to state — a buffer holding unsaved edits is
+/// not transient in the first place, so the question of collecting one does not arise.
+#[tokio::test]
+async fn editing_a_preview_promotes_it_so_it_survives_going_hidden() {
+    let (server, mut ws, anchor) = setup_with_named_file("anchor.rs", "anchor\n").await;
+    // A **transient** open of a *different* file — what a picker preview does. Only these are ever
+    // collected, and re-opening a path that is already open would just reuse the permanent buffer.
+    let root = std::path::Path::new(anchor.path.as_deref().unwrap())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::write(root.join("preview.rs"), "alpha\n").unwrap();
+    let preview_open: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            transient: Some(true),
+            path_index: Some(0),
+            relative_path: Some("preview.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let preview = preview_open.buffer_id;
+    assert!(preview_open.transient, "the fixture opened a preview");
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(preview),
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Dirty it, then look at something else — which is what makes a transient collectable.
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        &InputTextParams {
+            buffer_id: preview,
+            text: "X".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    let other: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            transient: None,
+            buffer_id: None,
+            path_index: None,
+            relative_path: None,
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(other.buffer_id),
+            cols: 80,
+            rows: 10,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Still there, and still holding the edit: asking for its state answers rather than erroring.
+    let state: BufferOpenResult = send_request::<BufferOpen>(
+        &mut ws,
+        &BufferOpenParams {
+            buffer_id: Some(preview),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(state.buffer_id, preview, "the edited preview was not collected");
+    assert!(
+        !state.transient,
+        "because the edit promoted it out of preview — that is the mechanism, not a rescue by the \
+         collector's dirty check"
+    );
+    assert_ne!(
+        state.revision, state.saved_revision,
+        "and it still holds the unsaved edit"
+    );
+
+    drop(server);
+}
+
+// -------- view/save ------------------------------------------------------------------------------
+
+/// An **ordinary** view is a fan-out of one: `view/save` writes its single document and nothing
+/// else changes.
+///
+/// The load-bearing half of making `Space s` view-wide. Composed views are the reason it exists,
+/// but every save in the editor now goes through it, so a one-element view has to behave exactly as
+/// `buffer/save` did — otherwise the change is a regression for every ordinary file.
+#[tokio::test]
+async fn saving_an_ordinary_view_writes_its_one_document() {
+    use aether_protocol::viewport::{ViewSave, ViewSaveParams, ViewSaveResult};
+
+    let (server, mut ws, open) = setup_with_named_file("one.rs", "alpha\n").await;
+    let buffer_id = open.buffer_id;
+    let path = open.path.clone().expect("the file has a path");
+
+    // Dirty it.
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        &InputTextParams {
+            buffer_id,
+            text: "X".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let saved: ViewSaveResult = send_request::<ViewSave>(
+        &mut ws,
+        &ViewSaveParams {
+            view_id: aether_protocol::ViewId(buffer_id),
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(saved.saved, 1, "the one document was written");
+    assert!(
+        saved.focused.is_some(),
+        "and it is the focused one, so its result rides back for the client's buffer state"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Xalpha\n");
+
+    // Clean now: saving again writes nothing rather than rewriting the file.
+    let again: ViewSaveResult = send_request::<ViewSave>(
+        &mut ws,
+        &ViewSaveParams {
+            view_id: aether_protocol::ViewId(buffer_id),
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(again.saved, 0);
+    assert_eq!(again.focused, None);
+
+    drop(server);
+}
+
 // -------- save-as --------------------------------------------------------------------------------
 
 /// Save-as: writes a scratch buffer to a new file under the workspace root. The buffer picks up

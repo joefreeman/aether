@@ -4509,6 +4509,43 @@ fn picker_select_result_file_at_is_tagged() {
     );
 }
 
+/// `view/save` reports a count, not a revision — there may be many documents, or none.
+#[test]
+fn view_save_wire_shape() {
+    use aether_protocol::buffer::BufferSaveResult;
+    use aether_protocol::viewport::{ViewSaveParams, ViewSaveResult};
+
+    let p = ViewSaveParams {
+        view_id: aether_protocol::ViewId(7),
+        overwrite: false,
+    };
+    assert_eq!(to_value(&p).unwrap(), json!({ "view_id": 7, "overwrite": false }));
+
+    // Nothing dirty: no `focused` on the wire at all.
+    let r = ViewSaveResult {
+        saved: 0,
+        focused: None,
+    };
+    assert_eq!(to_value(&r).unwrap(), json!({ "saved": 0 }));
+
+    // The focused document was one of them, so its own result rides along for the client to fold
+    // into the buffer state it already tracks.
+    let r = ViewSaveResult {
+        saved: 3,
+        focused: Some(BufferSaveResult {
+            saved_at_unix_ms: 1_700_000_000_000,
+            revision: 12,
+        }),
+    };
+    assert_eq!(
+        to_value(&r).unwrap(),
+        json!({
+            "saved": 3,
+            "focused": { "saved_at_unix_ms": 1_700_000_000_000u64, "revision": 12 },
+        })
+    );
+}
+
 #[test]
 fn picker_kind_explorer_is_snake_case() {
     use aether_protocol::picker::PickerKind;

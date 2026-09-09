@@ -9061,6 +9061,132 @@ async fn a_patch_jumplist_steps_from_another_editor() {
     drop(server);
 }
 
+/// `Space s` on a composed view saves **every** file it windows, not just the focused one.
+///
+/// A working-changes view is several files at once, and editing in it edits those files. Saving
+/// through the focused element left the others dirty with nothing on screen saying which — the
+/// view-wide dirty dot says *that* something is unsaved, never *what*.
+#[tokio::test]
+async fn saving_a_composed_view_writes_every_file_it_windows() {
+    use aether_protocol::viewport::{ViewSave, ViewSaveParams, ViewSaveResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    for name in ["aaa.rs", "zzz.rs"] {
+        commit_file(&repo, name, &base);
+        std::fs::write(
+            root.join(name),
+            base.replace("fn line5() {}", "fn EARLY() {}"),
+        )
+        .unwrap();
+    }
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Dirty *both* files through the view's elements.
+    let element_buffers: Vec<u64> = sub
+        .window
+        .root
+        .editors()
+        .iter()
+        .filter_map(|e| match e {
+            aether_protocol::viewport::Element::Editor { buffer, .. } => Some(*buffer),
+            _ => None,
+        })
+        .collect();
+    let mut distinct: Vec<u64> = element_buffers.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 2, "the view windows two files: {distinct:?}");
+    for buffer_id in &distinct {
+        let _: CursorState = send_request::<CursorSet>(
+            &mut ws,
+            &CursorSetParams {
+                granularity: Granularity::Char,
+                buffer_id: *buffer_id,
+                position: LogicalPosition { line: 0, col: 0 },
+                anchor: LogicalPosition { line: 0, col: 0 },
+            },
+        )
+        .await;
+        let _: EditResult = send_request::<InputText>(
+            &mut ws,
+            &InputTextParams {
+                buffer_id: *buffer_id,
+                text: "// edited\n".into(),
+                select_pasted: false,
+                replace_selection: false,
+                at: None,
+            },
+        )
+        .await;
+    }
+
+    let saved: ViewSaveResult = send_request::<ViewSave>(
+        &mut ws,
+        &ViewSaveParams {
+            view_id: aether_protocol::ViewId(patch.buffer_id),
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(saved.saved, 2, "both files written, not just the focused one");
+
+    // On disk, which is the only place that settles it.
+    // (The edit lands at the element's own start, not line 0 — a cursor set outside an element's
+    // extent is clamped into it, which is the point of elements.)
+    for name in ["aaa.rs", "zzz.rs"] {
+        let text = std::fs::read_to_string(root.join(name)).unwrap();
+        assert!(
+            text.contains("// edited"),
+            "{name} was written: {:?}",
+            &text[..text.len().min(60)]
+        );
+    }
+
+    // And a second save has nothing left to do — the count is documents *written*.
+    let again: ViewSaveResult = send_request::<ViewSave>(
+        &mut ws,
+        &ViewSaveParams {
+            view_id: aether_protocol::ViewId(patch.buffer_id),
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(again.saved, 0, "nothing dirty left: {again:?}");
+
+    drop(server);
+}
+
 /// A jumplist captured from a **commit** patch goes back to that commit.
 ///
 /// Same requirement as the working-changes outline, and it has to hold for the same reason: the row

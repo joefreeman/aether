@@ -2592,7 +2592,9 @@ impl Shell {
                     .as_ref()
                     .map(|(_, b)| aether_client::labels::format_blame(b)),
             },
-            transient: s.view.buffer.transient,
+            // The view's, not the focused element's — same reason as `file_label` below: the slot
+            // describes the view, and a composed one is a transient view over permanent files.
+            transient: s.view.view_transient,
             tethered: s.tethered(),
             file_path: s.view.buffer.path.clone(),
             // The view's label, not the focused element's: in a composed view the file slot is the
