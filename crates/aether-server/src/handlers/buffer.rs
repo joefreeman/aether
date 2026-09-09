@@ -191,12 +191,8 @@ pub async fn view_close(
     }
     // Closing is an explicit discard: drop any unsaved backup now, so the content isn't resurrected
     // the next time this path is opened (recover-on-open). Done before teardown drops the buffer.
-    if let (Some(ws), Some(buf), Some(doc)) = (
-        owning_workspace.as_deref(),
-        s.buffers.get(&buffer_id),
-        s.try_doc_of(buffer_id),
-    ) {
-        delete_buffer_backups(&s, ws, buf, doc);
+    if let (Some(buf), Some(doc)) = (s.buffers.get(&buffer_id), s.try_doc_of(buffer_id)) {
+        delete_buffer_backups(&s, owning_workspace.as_deref(), buf, doc);
     }
     let shell_number =
         s.try_doc_of(buffer_id)
@@ -705,12 +701,12 @@ pub async fn buffer_save(
         // The content is now on disk — drop any unsaved backup (under both the file path and, for a
         // saved-as scratch, its old number). Cheap and immediate; the flush would otherwise clear it
         // on its next tick.
-        if let (Some(ws), Some(buf), Some(doc)) = (
-            s.workspace_for_buffer(params.buffer_id).map(str::to_string),
+        let ws = s.workspace_for_buffer(params.buffer_id).map(str::to_string);
+        if let (Some(buf), Some(doc)) = (
             s.buffers.get(&params.buffer_id),
             s.try_doc_of(params.buffer_id),
         ) {
-            delete_buffer_backups(&s, &ws, buf, doc);
+            delete_buffer_backups(&s, ws.as_deref(), buf, doc);
         }
         let mut state_pushes = collect_buffer_state_pushes(&s, params.buffer_id);
         state_pushes.extend(collect_view_state_pushes(&s, &promoted));
@@ -2353,6 +2349,17 @@ async fn view_open_inner(
                     .is_some_and(|disk| disk > *backup_mtime)
                 {
                     doc.externally_modified = true;
+                    // Worth a line in the log: what the buffer now holds is not what the file
+                    // holds, and the two diverged while we were not running. The flag is how a
+                    // client is told, but a buffer that comes back looking wrong (or empty, if the
+                    // rescued content was) is hard to explain after the fact without this.
+                    tracing::warn!(
+                        path = %canonical.display(),
+                        backup_bytes = content.len(),
+                        backup_mtime,
+                        disk_mtime = doc.last_modified_unix_ms,
+                        "restored unsaved content over a file that changed since the backup"
+                    );
                 }
             }
             s.documents.insert(doc_id, doc);

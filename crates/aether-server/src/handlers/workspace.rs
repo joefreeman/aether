@@ -776,7 +776,12 @@ fn restore_dormant_sources(
 /// attachment — closing one workspace's view of a shared *dirty* document must not discard the
 /// content's backup out from under the surviving workspaces. Called at the explicit "this content
 /// is resolved" edges: save and close. No-op when backups aren't enabled.
-pub fn delete_buffer_backups(s: &ServerState, workspace: &str, buf: &Buffer, doc: &Document) {
+pub fn delete_buffer_backups(
+    s: &ServerState,
+    workspace: Option<&str>,
+    buf: &Buffer,
+    doc: &Document,
+) {
     let Some(root) = s.backups_path.as_deref() else {
         return;
     };
@@ -789,6 +794,15 @@ pub fn delete_buffer_backups(s: &ServerState, workspace: &str, buf: &Buffer, doc
             crate::backup::delete(&crate::backup::file_backup_path(root, p));
         }
     }
+    // Only the *scratch* and *shell* keys name a workspace; the file key above deliberately does
+    // not, and must not be gated on one. A caller that cannot attribute the buffer to a workspace
+    // (an ephemeral context already retired, say) still has a file backup to drop — and since save
+    // clears `backed_up_revision` on its way past, the flush's delete arm can no longer fire for it
+    // either, so a miss here leaked that backup permanently. Recover-on-open would then resurrect
+    // it over whatever the file had become.
+    let Some(workspace) = workspace else {
+        return;
+    };
     if let Some(n) = buf.scratch_number {
         crate::backup::delete(&crate::backup::scratch_backup_path(root, workspace, n));
     }
@@ -2346,6 +2360,39 @@ mod restore_tests {
     use super::*;
     use crate::config::SessionView;
     use crate::state::DormantSource;
+
+    /// A **file** backup is dropped whether or not the buffer can be attributed to a workspace.
+    ///
+    /// The file key is `files/<hash(path)>` with no workspace in it, so requiring one to delete it
+    /// was a guard the key never needed — and the one caller that could fail it (a save, which
+    /// clears `backed_up_revision` on its way past) left the flush unable to delete it either. The
+    /// backup then outlived the edit for good, and recover-on-open would resurrect it over whatever
+    /// the file had become. Only the scratch and shell keys, which really are per-workspace, still
+    /// need one.
+    #[test]
+    fn a_file_backup_is_dropped_without_a_workspace_to_attribute_it_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::path::PathBuf::from("/p/a.rs");
+        let mut s = ServerState::new();
+        s.backups_path = Some(dir.path().to_path_buf());
+
+        let id = s.allocate_buffer_id();
+        s.insert_buffer_with_document(id, None, false, |d| {
+            Document::new_at_path(d, path.clone(), None)
+        });
+        // Deliberately no `buffer_workspaces` entry: the shape a retired ephemeral context leaves.
+        let backup = crate::backup::file_backup_path(dir.path(), &path);
+        crate::backup::write(&backup, "unsaved work").unwrap();
+
+        let buf = s.buffers.get(&id).unwrap();
+        let doc = &s.documents[&buf.document];
+        delete_buffer_backups(&s, None, buf, doc);
+
+        assert!(
+            !crate::backup::exists(&backup),
+            "the file backup goes with no workspace to name"
+        );
+    }
 
     /// `restore_dormant_sources` decides what comes back as dormant buffers after a restart. Files
     /// need to still exist (or have a backup); scratches need a backup — from the session entry, or

@@ -14206,3 +14206,80 @@ fn a_prose_block_does_not_turn_a_conversation_into_the_reader() {
     );
     assert_ne!(s.view.mode, aether_client::session::Mode::Read);
 }
+
+// ---- external-change notices --------------------------------------------------------------------
+
+/// A subscribe whose status snapshot already carries the external-change flag has to *say* so.
+///
+/// The flags used to be announced only from the `buffer/state` push — the file changing while you
+/// watched. Arriving in the open snapshot they were installed in silence, which is the shape that
+/// hurts most: recover-on-open can put rescued unsaved content on screen in place of the file, so
+/// the buffer looks wrong (or, if that content was empty, looks empty) with nothing but a status
+/// dot to explain it.
+#[test]
+fn subscribing_to_a_file_that_changed_on_disk_says_so() {
+    let mut s = session();
+    let mut sub = subscribe_over(9, focus_on(0, 9, 17));
+    sub.buffer_status.externally_modified = true;
+    let fx = s.adopt_subscribe(sub);
+
+    assert!(s.view.externally_modified, "the flag is adopted");
+    assert_eq!(
+        toast_parts(&fx),
+        vec![(
+            "File changed on disk".to_string(),
+            Some("Save to overwrite it, or reload".to_string())
+        )],
+        "and announced, not installed in silence"
+    );
+}
+
+/// When the buffer *also* holds unsaved content, the notice says which of the two you are looking
+/// at. This is the recover-on-open shape — a backup restored over a file that moved on — and
+/// "the file changed" alone would leave the content on screen unexplained.
+#[test]
+fn a_changed_file_under_unsaved_content_names_the_content() {
+    let mut s = session();
+    let mut focus = focus_on(0, 9, 17);
+    focus.buffer.revision = 4;
+    focus.buffer.saved_revision = 1; // restored from a backup: dirty on arrival
+    let mut sub = subscribe_over(9, focus);
+    sub.buffer_status.externally_modified = true;
+    let fx = s.adopt_subscribe(sub);
+
+    let (title, body) = toast_parts(&fx).into_iter().next().expect("a notice");
+    assert_eq!(title, "File changed on disk");
+    assert!(
+        body.as_deref()
+            .is_some_and(|b| b.contains("unsaved changes")),
+        "the body names the unsaved content on screen, got {body:?}"
+    );
+}
+
+/// Said once per buffer, not once per message. The flags are a *state* the server re-sends with
+/// every snapshot and every push, so announcing on "is it set" would toast on every focus reply.
+/// A save clears the flag, and a fresh divergence after that speaks again.
+#[test]
+fn the_external_change_notice_is_raised_once_per_buffer() {
+    let mut s = session();
+    let flagged = || {
+        let mut sub = subscribe_over(9, focus_on(0, 9, 17));
+        sub.buffer_status.externally_modified = true;
+        sub
+    };
+    assert_eq!(toast_parts(&s.adopt_subscribe(flagged())).len(), 1);
+    assert!(
+        toast_parts(&s.adopt_subscribe(flagged())).is_empty(),
+        "re-subscribing to the same flagged buffer repeats nothing"
+    );
+
+    // Back in step with disk, then diverged again: a new fact, said again.
+    let mut clear = subscribe_over(9, focus_on(0, 9, 17));
+    clear.buffer_status.externally_modified = false;
+    let _ = s.adopt_subscribe(clear);
+    assert_eq!(
+        toast_parts(&s.adopt_subscribe(flagged())).len(),
+        1,
+        "a divergence after the buffer went clean is news again"
+    );
+}

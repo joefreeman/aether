@@ -987,6 +987,13 @@ pub struct ViewState {
     pub symbol_path: Vec<SymbolCrumb>,
     pub externally_modified: bool,
     pub externally_deleted: bool,
+    /// The buffer the external-change notice has already been raised for.
+    ///
+    /// The flags above are a **state** the server re-sends — on every `buffer/state` push, every
+    /// subscribe snapshot, every focus reply — so "is it set" cannot decide whether to say
+    /// something; "have we said it for this buffer" can. Cleared when the flags go false (a save
+    /// or reload puts the buffer back in step with disk), so a later divergence speaks again.
+    pub external_announced: Option<BufferId>,
     /// The press a drag extends from: the element it landed in, its anchor, and its granularity.
     /// The element is part of it because a drag's `cursor/set` must name the same buffer the press
     /// did — the focus reply for the press can still be in flight.
@@ -1143,6 +1150,7 @@ impl ViewState {
             symbol_path: Vec::new(),
             externally_modified: false,
             externally_deleted: false,
+            external_announced: None,
             drag: None,
             blame: None,
             sneak: None,

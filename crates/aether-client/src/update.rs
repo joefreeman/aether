@@ -692,12 +692,13 @@ impl Session {
                 //
                 // Focus that didn't move (`Tab` at the last element) still reveals rather than
                 // jumps: nothing was navigated to, so there is nothing to rest.
-                let style = if self.adopt_focus(r) {
+                let (moved, fx) = self.adopt_focus(r);
+                let style = if moved {
                     RevealStyle::Jump
                 } else {
                     RevealStyle::Follow
                 };
-                Effects::one(Effect::RevealCursor(style))
+                fx.and(Effects::one(Effect::RevealCursor(style)))
             }
             Event::ElementFocused(Err(e)) => Effects::error_detail("Focus failed", e),
 
@@ -705,8 +706,8 @@ impl Session {
             // sends next is what moves the cursor, and its own reveal keeps it on screen if the
             // click landed at the very edge.
             Event::ElementClicked(Ok(r)) => {
-                self.adopt_focus(r);
-                Effects::none()
+                let (_moved, fx) = self.adopt_focus(r);
+                fx
             }
             Event::ElementClicked(Err(e)) => Effects::error_detail("Focus failed", e),
 
@@ -1282,7 +1283,7 @@ impl Session {
                 // Moved or not is read off the reply: the server answers with where the cursor is,
                 // and "nowhere further" is the same place it was — in the same element.
                 let before = (self.view.focused_element, self.view.buffer.cursor);
-                let crossed = self.adopt_focus(r);
+                let (crossed, focus_fx) = self.adopt_focus(r);
                 let moved = crossed || self.view.buffer.cursor != before.1;
                 let mut fx = if moved {
                     Effects::none()
@@ -1304,7 +1305,9 @@ impl Session {
                         RevealStyle::Follow
                     },
                 ));
-                fx
+                // A step that crossed into a file that changed on disk says so, ahead of the
+                // navigation's own feedback.
+                focus_fx.and(fx)
             }
             Event::ViewStepped { result: Err(e), .. } => {
                 Effects::error_detail("Navigation failed", e)
@@ -2864,9 +2867,8 @@ impl Session {
             })) => {
                 self.view.buffer.revision = result.revision;
                 self.view.buffer.saved_revision = result.revision;
+                self.clear_external_flags();
                 self.view.view_transient = false; // saving promotes the view it was made in
-                self.view.externally_modified = false;
-                self.view.externally_deleted = false;
                 let note = match target {
                     Some((path_index, rel)) => {
                         // Save-as: the buffer's identity changed — adopt the new path/label. The
@@ -2951,9 +2953,8 @@ impl Session {
             Event::ReloadTried(Ok(ReloadTry::Reloaded(r))) => {
                 self.view.buffer.revision = r.revision;
                 self.view.buffer.saved_revision = r.revision;
+                self.clear_external_flags();
                 self.view.view_transient = false; // reloading promotes, like save
-                self.view.externally_modified = false;
-                self.view.externally_deleted = false;
                 Effects::toast(format!("Reloaded (rev {})", r.revision), ToastKind::Success)
             }
             Event::ReloadTried(Ok(ReloadTry::NeedsConfirm)) => {
@@ -3691,7 +3692,7 @@ impl Session {
     /// path, label, read-only, revision — so the whole `BufferInfo` is rebuilt through the same path
     /// an open uses. `view_id` deliberately does *not* move: the view is still the patch, and it is
     /// what `view/close` and `viewport/subscribe` go on addressing.
-    fn adopt_focus(&mut self, r: ViewportFocusElementResult) -> bool {
+    fn adopt_focus(&mut self, r: ViewportFocusElementResult) -> (bool, Effects) {
         let moved = r.element != self.view.focused_element;
         self.view.focused_element = r.element;
         self.view.buffer = buffer_info(r.buffer, &self.workspace_paths);
@@ -3700,19 +3701,88 @@ impl Session {
         // that would correct them are keyed to a buffer and only fire on a *change*, so a `Tab`
         // between two files' hunks showed the previous file's breadcrumb, diagnostic counts and
         // language-server glyph until something unrelated happened to move.
-        self.adopt_buffer_status(r.buffer_status);
-        moved
+        let fx = self.adopt_buffer_status(r.buffer_status);
+        (moved, fx)
     }
 
     /// Install a buffer-level status snapshot. Shared by subscribe and focus because it is the same
     /// snapshot about the same thing — the buffer under the cursor — and the two drifting apart is
     /// what left focus updating only half of it.
-    fn adopt_buffer_status(&mut self, status: aether_protocol::viewport::BufferStatusSnapshot) {
+    fn adopt_buffer_status(
+        &mut self,
+        status: aether_protocol::viewport::BufferStatusSnapshot,
+    ) -> Effects {
         self.view.diagnostics = status.diagnostics;
         self.view.lsp = status.lsp_status;
         self.view.symbol_path = status.symbol_path;
-        self.view.externally_modified = status.externally_modified;
-        self.view.externally_deleted = status.externally_deleted;
+        // Both callers rebind `self.view.buffer` first, so the snapshot is announced against the
+        // buffer it describes rather than the one focus just left.
+        self.adopt_external_flags(
+            self.view.buffer.buffer_id,
+            status.externally_modified,
+            status.externally_deleted,
+        )
+    }
+
+    /// Put the buffer back in step with disk — what a save or a reload just did.
+    ///
+    /// Routed through [`Self::adopt_external_flags`] rather than assigning the two fields, so the
+    /// announced-latch is released along with the flags it belongs to and a *later* divergence is
+    /// news again. Clearing never has anything to announce, which is the whole of why this is the
+    /// one place the effects are dropped.
+    fn clear_external_flags(&mut self) {
+        let _ = self.adopt_external_flags(self.view.buffer.buffer_id, false, false);
+    }
+
+    /// Adopt the external-change flags for `buffer_id` — **the one place they are written**.
+    ///
+    /// They reach the client from three directions, and only one of them used to say anything: the
+    /// `buffer/state` push (the file changed while you were looking at it), the `viewport/subscribe`
+    /// snapshot (it had already changed when you got here), and a focus reply crossing into another
+    /// element's buffer. The open case is the one that needs a voice most, because recover-on-open
+    /// can put *rescued unsaved content* on screen in place of the file — a buffer that looks wrong,
+    /// or empty, with nothing but a status dot to explain it.
+    ///
+    /// Announced once per buffer rather than once per transition, because the flags are a state the
+    /// server re-sends rather than an event it fires — see [`ViewState::external_announced`].
+    fn adopt_external_flags(
+        &mut self,
+        buffer_id: BufferId,
+        modified: bool,
+        deleted: bool,
+    ) -> Effects {
+        self.view.externally_modified = modified;
+        self.view.externally_deleted = deleted;
+        if !modified && !deleted {
+            if self.view.external_announced == Some(buffer_id) {
+                self.view.external_announced = None;
+            }
+            return Effects::none();
+        }
+        if self.view.external_announced == Some(buffer_id) {
+            return Effects::none();
+        }
+        self.view.external_announced = Some(buffer_id);
+        // Grouped per buffer: a deleted-then-modified (or repeated) disk event updates the one
+        // external-change toast rather than stacking.
+        let group = format!("external-change:{buffer_id}");
+        let (title, body) = if deleted {
+            (
+                "File removed on disk",
+                "Save to recreate it, or close the view",
+            )
+        } else if self.view.focused_unsaved() {
+            // What is on screen is this buffer's unsaved content, not the file's — whether it was
+            // typed here or restored from a backup on open. Saying so is the difference between
+            // "why does this look wrong" and a fact about the buffer.
+            (
+                "File changed on disk",
+                "This buffer holds unsaved changes — save to overwrite the file, or reload to discard them",
+            )
+        } else {
+            ("File changed on disk", "Save to overwrite it, or reload")
+        };
+        Effects::toast_grouped_detail(title, body, ToastKind::Warning, group)
     }
 
     /// Focus the element a click landed in, if it isn't already focused.
@@ -3817,7 +3887,6 @@ impl Session {
     /// this is, and a reader's parse asks for its fence highlights.
     pub fn adopt_subscribe(&mut self, res: ViewportSubscribeResult) -> Effects {
         self.view.viewport_id = Some(res.viewport_id);
-        self.adopt_buffer_status(res.buffer_status);
         self.view.window = Some(res.window);
         // The server decides which element holds the cursor (from the scroll the subscribe named,
         // today), so the mirror starts from its answer — whichever element that is, including
@@ -3837,7 +3906,10 @@ impl Session {
         if focus.buffer.buffer_id != self.view.buffer.buffer_id {
             self.view.buffer = buffer_info(focus.buffer, &self.workspace_paths);
         }
-        self.sync_read_presentation()
+        // After the rebind, deliberately: the status is about the buffer named above, and its
+        // external-change notice is the one thing here that speaks to the user.
+        let status_fx = self.adopt_buffer_status(res.buffer_status);
+        status_fx.and(self.sync_read_presentation())
     }
 
     /// Adopt the window from a geometry RPC the shell issued (`view/window`, `view/set_wrap`,
@@ -7030,29 +7102,7 @@ impl Session {
                         self.view.buffer.path = Some(new_path);
                     }
                 }
-                let was_external = self.view.externally_modified || self.view.externally_deleted;
-                self.view.externally_modified = p.externally_modified;
-                self.view.externally_deleted = p.externally_deleted;
-                // Grouped per buffer: a deleted-then-modified (or repeated) disk event updates the
-                // one external-change toast rather than stacking.
-                let group = format!("external-change:{}", self.view.buffer.buffer_id);
-                if !was_external && p.externally_deleted {
-                    Effects::toast_grouped_detail(
-                        "File removed on disk",
-                        "Save to recreate it, or close the view",
-                        ToastKind::Warning,
-                        group,
-                    )
-                } else if !was_external && p.externally_modified {
-                    Effects::toast_grouped_detail(
-                        "File changed on disk",
-                        "Save to overwrite it, or reload",
-                        ToastKind::Warning,
-                        group,
-                    )
-                } else {
-                    Effects::none()
-                }
+                self.adopt_external_flags(p.buffer_id, p.externally_modified, p.externally_deleted)
             }
             LspDiagnosticsChanged::NAME => {
                 if let Ok(p) = serde_json::from_value::<LspDiagnosticsChangedParams>(n.params) {
