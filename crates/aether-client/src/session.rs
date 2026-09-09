@@ -920,6 +920,16 @@ pub struct ViewState {
     /// hunk. Keeping them apart is what lets an edit address the file under the cursor while
     /// closing still closes the patch rather than one of the files it happens to show.
     pub view_id: ViewId,
+    /// What to call this view in the status bar's file slot — the view's own label, captured when
+    /// the view was bound and *not* moved by focus.
+    ///
+    /// [`Self::buffer`] cannot answer it: focus rebinds that to whichever file the cursor is in, so
+    /// the slot showed the current hunk's filename and changed on every `Tab`. Worse, with the
+    /// cursor in an unbound element the focused buffer *is* the generated patch, whose label is
+    /// `Working changes — <repo>` — so the slot flipped between a view title and a filename
+    /// depending on which hunk you were in. Identical to `buffer.label` for an ordinary view, which
+    /// is one element windowing the buffer it is.
+    pub view_label: String,
     /// Whether this *view* is a patch — which its focused buffer cannot answer, since focus rebinds
     /// `buffer` to whichever file the cursor is in and a file is not a patch. Decides where a
     /// change-step goes: through the view's elements, or through one file's own diff.
@@ -991,8 +1001,45 @@ impl ViewState {
     pub fn rebind(&mut self, buffer: BufferInfo) {
         self.view_id = ViewId(buffer.buffer_id);
         self.view_is_patch = buffer.is_patch;
+        self.view_label = buffer.label.clone();
         self.buffer = buffer;
         self.focused_element = 0;
+    }
+
+    /// The status bar's breadcrumb: the path from the view's root down to the cursor.
+    ///
+    /// For a **composed** view that is the focused element's file followed by the symbol chain
+    /// inside it (`b.rs › impl Foo › fn bar`), because the file slot to the left names the *view*
+    /// and nothing else would say which file you are in. For an ordinary view it is the symbol chain
+    /// alone — the file slot already names the file, and printing it in both slots says the same
+    /// thing twice.
+    ///
+    /// Composed here rather than in each shell so the three cannot disagree about it, and expressed
+    /// as crumbs rather than a string so the truncation ladder still sees the segments.
+    pub fn breadcrumb(&self) -> Vec<SymbolCrumb> {
+        if self.buffer.buffer_id == self.view_id.presenting_buffer() {
+            return self.symbol_path.clone();
+        }
+        let mut crumbs = Vec::with_capacity(self.symbol_path.len() + 1);
+        crumbs.push(SymbolCrumb {
+            name: self.buffer.label.clone(),
+            kind: aether_protocol::picker::SymbolKind::File,
+        });
+        crumbs.extend(self.symbol_path.iter().cloned());
+        crumbs
+    }
+
+    /// Rename the focused buffer, carrying the view's own label with it when the two are the same
+    /// buffer — a save-as on an ordinary view renames the view, a save-as on one file of a composed
+    /// view does not.
+    ///
+    /// One method rather than two assignments at each rename site, because a `view_label` left on
+    /// the old name is invisible until someone reads the status bar.
+    pub fn relabel_focused(&mut self, label: String) {
+        if self.buffer.buffer_id == self.view_id.presenting_buffer() {
+            self.view_label = label.clone();
+        }
+        self.buffer.label = label;
     }
 
     /// Where the cursor is **in the view**: the focused element, and its line in that element's
@@ -1009,6 +1056,7 @@ impl ViewState {
             // A view opens on its own buffer; focus moves it off only in a multi-buffer view.
             view_id: ViewId(buffer.buffer_id),
             view_is_patch: buffer.is_patch,
+            view_label: buffer.label.clone(),
             buffer,
             mode: Mode::Normal,
             pending: Pending::None,

@@ -310,15 +310,23 @@ pub fn resolve_selection_edge(
 /// A counted motion split into its single step and how many of them, for the motions where "N
 /// steps" and "count N" are the same thing. `None` for everything else, which then resolves once.
 ///
-/// The list is deliberately short. A motion qualifies only if repeating it is *defined* — `3w` is
-/// three words, `3f;` is the third semicolon. It excludes:
+/// The list is deliberately short: it holds the motions that need *this* helper to obey the
+/// all-or-nothing rule, not every motion the rule applies to. It excludes:
 ///
-/// - **`VisualLine`**, which must keep clamping: `v`/`Alt-v` send a half-screen count, and refusing
-///   an unhonourable one would leave no way to scroll to a file's end.
+/// - **`VisualLine`**, which must keep clamping: `v`/`Alt-v` send a half-screen count the user
+///   never typed, and the rule only binds a count the user asserted. (`Alt-j`/`Alt-k` do take a
+///   typed count and inherit this exemption by sharing the variant — a known violation, and the fix
+///   is to give the page motion its own.)
 /// - **Absolute targets** (`Goto`, `BufferStart`/`End`, `LineStart`/`End`, `MatchBracket`,
 ///   `SelectionEdge`), which name a destination rather than a repetition — they refuse by not
 ///   finding it, which they already do.
-/// - **Navigation units**, whose own walk already filters candidates to the scope.
+/// - **`FindChar`**, which obeys the rule through its own counted walk: `find_char` returns `None`
+///   unless the count-th match exists, so `3f;` with two semicolons left does not move.
+/// - **`LogicalLine`** and **`LogicalLineFirstNonblank`**, which route through `counted_line` —
+///   they need the virtual column and tab width, so they resolve elsewhere and refuse there.
+/// - **Navigation units**, which are scope-filtered but do **not** yet honour the count rule: their
+///   walk keeps the last reachable symbol instead of refusing. Scope and count are separate rules
+///   and this exclusion only answers the first.
 pub fn single_step(motion: &Motion) -> Option<(Motion, u32)> {
     match motion {
         Motion::Char { direction, count } => Some((
@@ -954,9 +962,6 @@ pub fn resolve_logical_line(
     // The same all-or-nothing rule `resolve_motion` applies — and this is the resolver `j`/`k`
     // actually reach, because the handler intercepts `Motion::LogicalLine` here for the virtual
     // column and tab width. Refusing in only one of the two is how `100j` kept clamping.
-    // The same all-or-nothing rule `resolve_motion` applies — and this is the resolver `j`/`k`
-    // actually reach, because the handler intercepts `Motion::LogicalLine` here for the virtual
-    // column and tab width. Refusing in only one of the two is how `100j` kept clamping.
     let Some(new_line) = counted_line(scope, current.line, direction, count) else {
         return (current, virtual_col_in);
     };
@@ -1289,7 +1294,15 @@ pub fn resolve_navigation_motion(
             // off the cursor would let `Alt-o` re-find the current symbol (whose own start precedes
             // its end). When extending we key off the leading edge in the direction of travel and
             // grow the selection outward. Each step re-keys off the symbol just landed on, so a
-            // count walks the outline; if it runs out first we keep the last reachable symbol.
+            // count walks the outline.
+            //
+            // A count the outline cannot honour **refuses**, like every other counted motion: `5o`
+            // with three symbols left does nothing rather than landing on the third. The count
+            // names *which* symbol, and there isn't a fifth — the same rule `all_or_nothing`
+            // applies to the motions that route through `single_step`. Nav units resolve here
+            // instead (they need the symbol list), so the rule has to be spelled out again;
+            // being scope-filtered, which is why they were excluded from `single_step`, answers a
+            // different question.
             let mut from = match (extend, forward) {
                 (false, _) => lo,
                 (true, true) => hi,
@@ -1307,7 +1320,10 @@ pub fn resolve_navigation_motion(
                         landed = Some(i);
                         from = symbols[i].start;
                     }
-                    None => break,
+                    None => {
+                        landed = None;
+                        break;
+                    }
                 }
             }
             match landed {
@@ -1329,7 +1345,19 @@ pub fn resolve_navigation_motion(
         }
         Motion::StartOfNavigationUnit | Motion::EndOfNavigationUnit => {
             let to_end = matches!(motion, Motion::EndOfNavigationUnit);
-            (symbol_edge(buf, symbols, position, to_end), None)
+            let edge = symbol_edge(buf, symbols, position, to_end);
+            // The candidate filter vets a symbol's **name** span; this returns its **body** edge,
+            // and a body can reach past the field its name sits in. A target motion denies at the
+            // field's edge, so an edge outside it is not a shorter move — it is no move.
+            //
+            // Latent today: nothing in the keymap constructs these two motions (`Shift-o` is
+            // `IgnoreShift` over `o`, which resolves elsewhere). Guarded anyway, because the next
+            // binding that reaches them should not have to rediscover this.
+            if scope.contains(edge) {
+                (edge, None)
+            } else {
+                unchanged
+            }
         }
         // Not a navigation motion — kept total; the handler only routes the nav motions here.
         _ => unchanged,
@@ -1628,8 +1656,12 @@ mod symbol_nav_tests {
         assert_eq!(nav(1, true), (o[1].end, Some(o[1].start)));
         assert_eq!(nav(2, true), (o[2].end, Some(o[2].start)));
         assert_eq!(nav(3, true), (o[3].end, Some(o[3].start)));
-        // An over-large count clamps to the last reachable symbol rather than snapping back.
-        assert_eq!(nav(99, true), (o[5].end, Some(o[5].start)));
+        // An over-large count **refuses**, like every other counted motion. This assertion used to
+        // pin the opposite — "clamps to the last reachable symbol rather than snapping back" — and
+        // that was the last counted motion still doing so. The count names *which* symbol; with
+        // five in the outline there is no ninety-ninth, and landing on the fifth is a different
+        // request from the one that was made.
+        assert_eq!(nav(99, true), (at(0), Some(at(0))));
         // count 0 behaves as 1 (the keymap never sends 0, but the resolver must stay total).
         assert_eq!(nav(0, true), (o[1].end, Some(o[1].start)));
         // From the top there's nothing before it, so Prev at any count is a no-op.

@@ -3018,6 +3018,9 @@ async fn changes_picker_in_a_patch_lists_its_hunks_grouped_by_file() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+            // The **view**, as the client sends it: `Space c` in a patch lists the whole review,
+            // not the hunk the cursor is in.
+            view_id: Some(aether_protocol::ViewId(buffer_id)),
             buffer_id: Some(buffer_id),
             limit: 50,
             ..view_params(PickerKind::GitChangesFile)
@@ -3171,6 +3174,7 @@ async fn changes_picker_in_a_patch_centres_on_the_cursors_change() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+            view_id: Some(aether_protocol::ViewId(buffer_id)),
             buffer_id: Some(buffer_id),
             center_on_cursor: Some(buffer_id),
             limit: 50,
@@ -3645,6 +3649,105 @@ async fn working_changes_compose_staged_and_unstaged_and_regenerate() {
 /// element put one file's name next to another file's change counts in every multi-file view. The
 /// same subscribe seeds the breadcrumb, the diagnostic counts and the language-server health, all of
 /// which were being asked of the view's *own* document — a generated patch, which has none of them.
+/// The dirty dot is view-wide: an unsaved edit in one element is still reported while the cursor is
+/// in another, so unsaved work in a hunk you have scrolled past cannot go unnoticed.
+///
+/// The flag deliberately excludes the *focused* element — the client knows that one first-hand from
+/// its own revisions, and asking the server for it would go stale on save, which pushes
+/// `buffer/state` rather than a new window.
+#[tokio::test]
+async fn an_unsaved_edit_in_one_element_is_reported_while_another_is_focused() {
+    use aether_protocol::input::{InputText, InputTextParams};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "one.rs", "fn a() {}\n");
+    commit_file(&repo, "two.rs", "fn b() {}\n");
+    std::fs::write(root.join("one.rs"), "fn a() {}\nfn ADDED() {}\n").unwrap();
+    std::fs::write(root.join("two.rs"), "fn B2() {}\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+
+    async fn subscribe_at(ws: &mut Ws, buffer_id: u64, line: u32) -> ViewportSubscribeResult {
+        send_request::<ViewportSubscribe>(
+            ws,
+            &ViewportSubscribeParams {
+                buffer_id: aether_protocol::ViewId(buffer_id),
+                cols: 120,
+                rows: 60,
+                overscan_rows: 0,
+                scroll: ScrollPosition {
+                    logical_line: ViewLine(line),
+                    sub_row: 0.0,
+                },
+                wrap: WrapMode::None,
+                continuation_marker_width: 0,
+                tab_width: 4,
+                diff_view: false,
+            },
+        )
+        .await
+    }
+
+    let top = subscribe_at(&mut ws, patch.buffer_id, 0).await;
+    let last_line = top.window.view_line_count.saturating_sub(1);
+    assert!(
+        !top.window.other_elements_dirty,
+        "nothing has been edited yet"
+    );
+    let first = top.focus.expect("a composed view says which element").buffer;
+
+    // Type into the first element's file. It is now dirty, and it is the focused one.
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        &InputTextParams {
+            buffer_id: first.buffer_id,
+            text: "// ".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    let still_top = subscribe_at(&mut ws, patch.buffer_id, 0).await;
+    assert!(
+        !still_top.window.other_elements_dirty,
+        "the dirty file is the focused element, which this flag deliberately excludes — the \
+         client covers that half from its own revisions"
+    );
+
+    // Move to the other end of the view: focus lands in the second element, and the first is now
+    // one of the *others*.
+    let bottom = subscribe_at(&mut ws, patch.buffer_id, last_line).await;
+    let focused = bottom
+        .focus
+        .as_ref()
+        .expect("a composed view says which element")
+        .buffer
+        .buffer_id;
+    assert_ne!(
+        focused, first.buffer_id,
+        "the fixture only means anything if the two ends are different files"
+    );
+    assert!(
+        bottom.window.other_elements_dirty,
+        "one.rs has unsaved edits and the cursor is in two.rs — the dot must still show"
+    );
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn the_git_cluster_follows_the_focused_element() {
     let dir = tempfile::tempdir().unwrap();
@@ -4263,6 +4366,7 @@ async fn opening_a_commit_from_a_files_history_lands_on_that_file() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             buffer_id: Some(file.buffer_id),
             ..view_params(PickerKind::GitLogFile)
         },
@@ -7483,6 +7587,102 @@ async fn scrolling_to_the_end_of_a_patch_still_shows_content() {
     drop(server);
 }
 
+/// The scroll limit must *reach* the view's end, not merely stay inside it.
+///
+/// The other half of `scrolling_to_the_end_of_a_patch_still_shows_content`, and the half a clamp
+/// could never provide. The limit used to be a whole-buffer answer about the primary element's
+/// document, `.min()`ed into range — so it was always legal and sometimes short, leaving content
+/// below the last position the client was allowed to scroll to. "In range" and "right" are
+/// different assertions, and only this one fails when the answer comes from the wrong space.
+#[tokio::test]
+async fn the_scroll_limit_reaches_the_last_line_of_a_patch() {
+    const ROWS: u32 = 10;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (1..=60).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    let edited = base
+        .replace("fn f10() {}", "fn A() {}")
+        .replace("fn f30() {}", "fn B() {}")
+        .replace("fn f50() {}", "fn C() {}");
+    commit_file(&repo, "a.rs", &edited);
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head },
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: ROWS,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    assert!(
+        sub.window.view_line_count > ROWS,
+        "the patch must be taller than one screen for the limit to mean anything"
+    );
+
+    // Scroll as far as the client is permitted to.
+    let end: ViewportWindowResult = send_request::<ViewportScroll>(
+        &mut ws,
+        &ViewportScrollParams {
+            viewport_id: sub.viewport_id,
+            scroll: ScrollPosition {
+                logical_line: sub.window.max_scroll_view_line,
+                sub_row: 0.0,
+            },
+        },
+    )
+    .await;
+
+    assert_eq!(
+        end.window.last_view_line_exclusive,
+        ViewLine(end.window.view_line_count),
+        "at the scroll limit the window must reach the view's last line — it stopped at {} of {}",
+        end.window.last_view_line_exclusive,
+        end.window.view_line_count
+    );
+    // And in rows, which is what the limit is actually computed in: the final visual row of the
+    // view has to be on screen once you are there.
+    assert!(
+        end.window.first_visual_row.get() + ROWS >= end.window.total_visual_rows,
+        "the last visual row is still below the screen: top row {}, {} rows of viewport, {} total",
+        end.window.first_visual_row,
+        ROWS,
+        end.window.total_visual_rows
+    );
+
+    drop(server);
+}
+
 /// Rendering a bound patch near its end must not index a file with a view coordinate.
 ///
 /// Regression (server panic, `Attempt to index past end of Rope`): the view-level diff maths ran
@@ -7640,6 +7840,193 @@ async fn walking_down_a_freshly_opened_commit_patch_does_not_panic() {
         )
         .await;
     }
+
+    drop(server);
+}
+
+/// `N c` in a patch refuses a count the view cannot honour, as it already did in a file.
+///
+/// One key, two count semantics, depending on which kind of view it was pressed in: the patch path
+/// clamped to the last change while `git_navigate_hunk` over an ordinary buffer took the `n`th or
+/// answered `moved: false`. The count names *which* change — with two left there is no fifth, and
+/// landing on the last one instead is the clamp this work exists to delete.
+#[tokio::test]
+async fn a_counted_change_step_past_the_last_change_refuses() {
+    use aether_protocol::viewport::{
+        FocusStep, ViewportFocusElementResult, ViewportNavigateChange, ViewportNavigateChangeParams,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let mut lines: Vec<String> = (0..40).map(|n| format!("fn line{n}() {{}}")).collect();
+    commit_file(&repo, "a.rs", &format!("{}\n", lines.join("\n")));
+    // Exactly two changes, far enough apart to be two hunks.
+    lines[8] = "fn FIRST() {}".into();
+    lines[32] = "fn SECOND() {}".into();
+    std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    async fn step(
+        ws: &mut Ws,
+        viewport_id: aether_protocol::ViewportId,
+        count: Option<u32>,
+    ) -> ViewportFocusElementResult {
+        send_request::<ViewportNavigateChange>(
+            ws,
+            &ViewportNavigateChangeParams {
+                viewport_id,
+                direction: FocusStep::Next,
+                count,
+            },
+        )
+        .await
+    }
+
+    // One step lands on the first change; the fixture needs a real second one beyond it.
+    let first = step(&mut ws, sub.viewport_id, None).await;
+    let at_first = (first.element, first.buffer.cursor.position.line);
+    let second = step(&mut ws, sub.viewport_id, None).await;
+    assert_ne!(
+        (second.element, second.buffer.cursor.position.line),
+        at_first,
+        "the fixture must have two distinct changes for a count to overrun"
+    );
+
+    // Back to the first, then ask for a fifth change. There are two.
+    let back: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
+        &mut ws,
+        &ViewportNavigateChangeParams {
+            viewport_id: sub.viewport_id,
+            direction: FocusStep::Previous,
+            count: None,
+        },
+    )
+    .await;
+    let before = (back.element, back.buffer.cursor.position.line);
+    let overrun = step(&mut ws, sub.viewport_id, Some(5)).await;
+    assert_eq!(
+        (overrun.element, overrun.buffer.cursor.position.line),
+        before,
+        "a count the view cannot honour must not move at all — clamping to the last change is the \
+         behaviour a file's `5c` already refused"
+    );
+
+    drop(server);
+}
+
+/// Staging with the cursor **inside an element** goes down the ordinary road, not the patch's.
+///
+/// This is the path the user actually takes — focus lands in a hunk, so the buffer under the cursor
+/// is the real file — and it is the one the fallback in `resolve_patch_apply_target` must never
+/// claim. It cannot, structurally: a file buffer has no `generated`, so the resolver answers
+/// `NotAPatch` and the apply runs against the file's own baseline with no patch coordinates
+/// anywhere. Structurally true and previously untested, which is the combination worth a test —
+/// the four tests that *do* cover the fallback all address the patch buffer directly.
+#[tokio::test]
+async fn staging_from_inside_an_element_never_touches_the_patch_index() {
+    use aether_protocol::viewport::{
+        FocusTarget, ViewportFocusElement, ViewportFocusElementParams, ViewportFocusElementResult,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (0..40).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    let edited = base.replace("fn line20() {}", "fn CHANGED() {}");
+    std::fs::write(root.join("a.rs"), &edited).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(patch.buffer_id),
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    // Focus the hunk: the buffer under the cursor becomes the working file itself.
+    let focused: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
+        &mut ws,
+        &ViewportFocusElementParams {
+            viewport_id: sub.viewport_id,
+            target: FocusTarget::Element { element: 0 },
+        },
+    )
+    .await;
+    let file_buffer = focused.buffer.buffer_id;
+    assert_ne!(
+        file_buffer, patch.buffer_id,
+        "the element must window the real file, or this exercises the fallback after all"
+    );
+    assert!(
+        !focused.buffer.read_only,
+        "and that file is editable, unlike the patch"
+    );
+
+    // Focus seats the cursor on the element's *first* line, which is a context line — a hunk
+    // carries git's three lines of context either side. Move onto the change itself.
+    set_cursor(&mut ws, file_buffer, 20, 0).await;
+
+    // Stage through the *file's* buffer, in file line numbers throughout.
+    let r = apply_hunk(&mut ws, file_buffer, HunkAction::Stage).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert_eq!(
+        index_text(&root, "a.rs").as_deref(),
+        Some(edited.as_str()),
+        "the change is in the index, staged through the file rather than through patch line numbers"
+    );
 
     drop(server);
 }

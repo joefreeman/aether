@@ -40,6 +40,9 @@ pub fn build_view(s: &Session) -> Value {
         // What this view *is*, as distinct from the buffer being edited — see `ViewState::view_id`.
         // `viewport/subscribe` addresses this one.
         "view_id": s.view.view_id,
+        // What to call the view in the status bar and the document title — the view's own label,
+        // which focus does not move. See `ViewState::view_label`.
+        "view_label": s.view.view_label,
         // Which element holds the cursor: "is this line loaded?" is a per-element question.
         "focused_element": s.view.focused_element,
         "buffer": buffer(s),
@@ -563,6 +566,7 @@ mod tests {
             children: vec![aether_protocol::ui::Element::text("a.rs", vec![])],
         };
         let w = Window {
+            other_elements_dirty: false,
             first_view_line: ViewLine(0),
             last_view_line_exclusive: ViewLine(4),
             view_line_count: 4,

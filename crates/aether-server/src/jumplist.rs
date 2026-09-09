@@ -622,9 +622,10 @@ fn group_key(g: &Option<GroupHeader>) -> Option<GroupKey> {
 /// - Pathless buffer not in the list: the first (forward) / last (backward) entry overall —
 ///   entering the list from outside, always a move.
 ///
-/// A `count` past the boundary clamps to the last/first entry (still a move); only a bare step
-/// that can't advance at all yields `None`. `entries` must be non-empty (a captured list always
-/// is).
+/// A `count` the list cannot honour yields `None` — the same all-or-nothing rule every counted
+/// motion follows. It used to clamp to the last/first entry, which is what made `5]` then `5[` lose
+/// your place: the first clamped to the end, and the second counted five back from *there* rather
+/// than returning to where you started. `entries` must be non-empty (a captured list always is).
 pub fn step_index(
     entries: &[JumplistEntry],
     direction: Direction,
@@ -638,10 +639,10 @@ pub fn step_index(
         Direction::Backward => step_backward(entries, current, edge)?,
     };
     let extra = count.saturating_sub(1) as usize;
-    Some(match direction {
-        Direction::Forward => (first + extra).min(len - 1),
-        Direction::Backward => first.saturating_sub(extra),
-    })
+    match direction {
+        Direction::Forward => (first + extra < len).then_some(first + extra),
+        Direction::Backward => first.checked_sub(extra),
+    }
 }
 
 /// The outcome of a `CurrentFile`-scoped step ([`step_in_file`]): an in-file target, the file's
@@ -656,7 +657,8 @@ pub enum InFileStep {
 /// Resolve one `}` / `{`: step within the current buffer's own entries only (`}` = forward,
 /// `{` = backward), never falling through to another file. `current` is the buffer's identity;
 /// `edge` is the cursor selection's outer edge in the step direction, so the entry the cursor
-/// sits on is skipped. A `count` past the file's first/last entry clamps to it. Returns:
+/// sits on is skipped. A `count` past the file's first/last entry **refuses** (`AtEnd`), as
+/// [`step_index`] does and for the same reason. Returns:
 /// - [`InFileStep::Moved`] with the list index of the target,
 /// - [`InFileStep::AtEnd`] when the file has entries but none lie past the cursor that way,
 /// - [`InFileStep::NoneInFile`] when the buffer has no *positioned* entries — nothing captured
@@ -688,7 +690,10 @@ pub fn step_in_file(
             else {
                 return InFileStep::AtEnd;
             };
-            InFileStep::Moved(in_file[(pos + extra).min(in_file.len() - 1)].0)
+            match in_file.get(pos + extra) {
+                Some((idx, _)) => InFileStep::Moved(*idx),
+                None => InFileStep::AtEnd,
+            }
         }
         Direction::Backward => {
             let Some(pos) = in_file
@@ -697,7 +702,10 @@ pub fn step_in_file(
             else {
                 return InFileStep::AtEnd;
             };
-            InFileStep::Moved(in_file[pos.saturating_sub(extra)].0)
+            match pos.checked_sub(extra) {
+                Some(i) => InFileStep::Moved(in_file[i].0),
+                None => InFileStep::AtEnd,
+            }
         }
     }
 }
@@ -1144,10 +1152,10 @@ mod tests {
             step_index(&e, Direction::Backward, Location::File("/a"), pos(0, 0), 1),
             None
         );
-        // And a count still advances and clamps.
+        // And a count still advances, but one the list cannot honour refuses.
         assert_eq!(
             step_index(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 9),
-            Some(2)
+            None
         );
     }
 
@@ -1204,16 +1212,18 @@ mod tests {
     }
 
     #[test]
-    fn step_count_advances_and_clamps() {
+    fn step_count_advances_or_refuses() {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0), entry("/b", 2, 0)];
         assert_eq!(
             step_index(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 2),
             Some(1)
         );
-        // Count past the end clamps to the last entry (no wrap) — still a move.
+        // A count past the end **refuses**. It used to clamp to the last entry and call that a
+        // move, which is precisely how `5]` followed by `5[` lost your place: the first landed at
+        // the end, and the second counted five back from there instead of returning.
         assert_eq!(
             step_index(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 4),
-            Some(2)
+            None
         );
         assert_eq!(
             step_index(&e, Direction::Backward, Location::File("/b"), pos(2, 0), 2),
@@ -1280,22 +1290,21 @@ mod tests {
     }
 
     #[test]
-    fn step_in_file_count_clamps_within_the_file() {
+    fn step_in_file_count_refuses_past_the_files_ends() {
         let e = vec![entry("/a", 1, 0), entry("/a", 5, 0), entry("/a", 9, 0)];
-        // Forward 2 from the top → the second entry (first-past-edge, then one more); a larger
-        // count clamps to the last.
+        // Forward 2 from the top → the second entry (first-past-edge, then one more); a count
+        // the file cannot honour refuses, as the cross-file step does.
         assert_eq!(
             step_in_file(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 2),
             InFileStep::Moved(1)
         );
         assert_eq!(
             step_in_file(&e, Direction::Forward, Location::File("/a"), pos(0, 0), 9),
-            InFileStep::Moved(2)
+            InFileStep::AtEnd
         );
-        // Backward 9 from the last clamps to the first.
         assert_eq!(
             step_in_file(&e, Direction::Backward, Location::File("/a"), pos(9, 0), 9),
-            InFileStep::Moved(0)
+            InFileStep::AtEnd
         );
     }
 

@@ -363,6 +363,22 @@ pub struct Window {
     /// a repo. Rides the window so it updates live on edits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_status: Option<GitBufferStatus>,
+    /// Whether any buffer this view windows **other than the focused element's** has unsaved
+    /// changes. Always `false` for an ordinary view, which has nothing else.
+    ///
+    /// Deliberately excludes the focused element, and that is what makes it correct between
+    /// renders. The client already knows the focused buffer's dirtiness first-hand and instantly
+    /// (it holds `revision` and `saved_revision`), so the status dot is
+    /// `focused_is_dirty || other_elements_dirty` — typing shows immediately, and saving clears it
+    /// immediately, neither waiting for a re-render. An *inclusive* flag would go stale on exactly
+    /// that save: a save pushes `buffer/state`, not a new window, so a window computed before it
+    /// would still be claiming the view was dirty.
+    ///
+    /// Edits can only land in the focused element (the cursor is there), so the remaining staleness
+    /// is another client editing one of this view's other files — which no channel corrects today
+    /// either.
+    #[serde(default)]
+    pub other_elements_dirty: bool,
     /// What the view is composed of. A single [`Element::Editor`] for an ordinary buffer; chrome
     /// and hunks interleaved for a generated patch. Use [`Element::lines`] where the structure is
     /// irrelevant and every rendered line is what's wanted.
@@ -439,7 +455,7 @@ pub struct ViewportSubscribeResult {
 
 /// The buffer-level state a client needs to start showing a buffer, beyond the rendered window —
 /// see [`ViewportSubscribeResult::buffer_status`].
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BufferStatusSnapshot {
     /// File changed on disk while the buffer was dirty (the watcher couldn't silently reload).
     #[serde(default)]
@@ -556,6 +572,17 @@ pub struct ViewportFocusElementResult {
     /// text. It is deliberately the same shape an open returns, so the client rebinds through the
     /// path it already has.
     pub buffer: crate::buffer::BufferOpenResult,
+    /// The same buffer-level snapshot [`ViewportSubscribe`] seeds, for the buffer focus just landed
+    /// in — breadcrumb, diagnostic counts, language-server health, external-change flags.
+    ///
+    /// Carried here for the same reason it is carried there: every field is a fact about the buffer
+    /// under the cursor, and crossing an element changes which buffer that is. Without it a client
+    /// can only go on showing the element it *left*, because the pushes that would correct it
+    /// (`lsp/symbol_path_changed`, `lsp/diagnostics_changed`) are keyed to a buffer and only fire on
+    /// a change — so a `Tab` between two files' hunks left the breadcrumb, the counts and the
+    /// server glyph describing the previous file until something unrelated moved.
+    #[serde(default)]
+    pub buffer_status: BufferStatusSnapshot,
 }
 
 // ---- viewport/navigate_change -------------------------------------------------------------------
@@ -688,6 +715,11 @@ pub struct ViewportLinesChangedParams {
     /// Recomputed buffer-level Git status (branch + staged/unstaged counts). `None` outside a repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_status: Option<GitBufferStatus>,
+    /// Recomputed [`Window::other_elements_dirty`] — an edit in one element can be the first thing
+    /// that makes a *neighbouring* element's file dirty from the next element's point of view, so
+    /// the flag has to move with edits the way `git_status` does.
+    #[serde(default)]
+    pub other_elements_dirty: bool,
     /// The authoritative cursor for the receiving client after the change, decorated like an RPC
     /// response (`match_bracket`, `jumplist_position`). Lets the client adopt server-side cursor
     /// moves that have no request in flight — e.g. the clamp a watcher reload applies when the

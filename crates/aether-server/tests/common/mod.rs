@@ -355,6 +355,7 @@ pub async fn await_response<M: RpcMethod>(ws: &mut Ws, id: u64) -> M::Result {
 /// omitting it is refused rather than falling back to the workspace.
 pub fn view_params_on(kind: PickerKind, buffer_id: u64) -> PickerViewParams {
     PickerViewParams {
+            view_id: None,
         buffer_id: Some(buffer_id),
         ..view_params(kind)
     }
@@ -362,6 +363,7 @@ pub fn view_params_on(kind: PickerKind, buffer_id: u64) -> PickerViewParams {
 
 pub fn view_params(kind: PickerKind) -> PickerViewParams {
     PickerViewParams {
+            view_id: None,
         kind,
         reset: PickerReset::All,
         offset: 0,
@@ -662,6 +664,7 @@ pub async fn expand_file_group(
     let window = send_request::<PickerView>(
         ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             ..view_params(kind)
         },
@@ -694,6 +697,7 @@ pub async fn expand_file_group(
     let view = send_request::<PickerView>(
         ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             ..view_params(kind)
         },

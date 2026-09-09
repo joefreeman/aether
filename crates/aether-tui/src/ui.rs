@@ -10382,6 +10382,7 @@ mod painter_tests {
             children: vec![UiElement::text(text, Vec::new())],
         };
         let window = aether_protocol::viewport::Window {
+                other_elements_dirty: false,
             first_view_line: ViewLine(0),
             last_view_line_exclusive: ViewLine(7),
             view_line_count: 7,
@@ -10458,6 +10459,7 @@ mod painter_tests {
             children: vec![UiElement::text(text, Vec::new())],
         };
         let window = aether_protocol::viewport::Window {
+                other_elements_dirty: false,
             first_view_line: ViewLine(0),
             last_view_line_exclusive: ViewLine(2),
             view_line_count: 2,
@@ -10526,6 +10528,7 @@ mod painter_tests {
         };
         // Both files show lines 10 and 11 — the collision that made one cursor into two.
         let window = aether_protocol::viewport::Window {
+                other_elements_dirty: false,
             first_view_line: ViewLine(0),
             last_view_line_exclusive: ViewLine(4),
             view_line_count: 4,
@@ -10616,6 +10619,7 @@ mod painter_tests {
         let a: Vec<LogicalLineRender> = (16..20).map(|n| line(n, &format!("a{n}"))).collect();
         let b: Vec<LogicalLineRender> = (0..3).map(|n| line(n, &format!("b{n}"))).collect();
         let window = aether_protocol::viewport::Window {
+                other_elements_dirty: false,
             first_view_line: ViewLine(0),
             last_view_line_exclusive: ViewLine(7),
             view_line_count: 7,

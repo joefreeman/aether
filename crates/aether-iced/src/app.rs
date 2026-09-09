@@ -725,7 +725,7 @@ impl App {
 
     /// `[workspace] file` — mirrors the web client's page title and the TUI's terminal title.
     pub fn title(&self) -> String {
-        crate::labels::window_title(&self.session.workspace, &self.session.view.buffer.label)
+        crate::labels::window_title(&self.session.workspace, &self.session.view.view_label)
     }
 
     /// Keyboard, modifier and resize events for *every* window, each tagged with the window it
@@ -4395,7 +4395,8 @@ impl App {
         // Segment-elide long labels to roughly half the bar so the filename survives (the
         // web's `truncatePath`; chars approximate px since the bar is sans).
         let budget = ((self.view_size.width * 0.5 / ui.char_width()) as usize).max(12);
-        let label = crate::labels::truncate_path(&self.session.view.buffer.label, budget);
+        // The view's label, not the focused element's — see `ViewState::view_label`.
+        let label = crate::labels::truncate_path(&self.session.view.view_label, budget);
         used += label.chars().count();
         let name = text(label)
             .wrapping(iced::widget::text::Wrapping::None)
@@ -4576,7 +4577,7 @@ impl App {
         // `CRUMB_SEPARATOR`, and glyph-plus-two-gaps is deliberately tuned to land at about that
         // width, so the estimate it already makes is the right one.
         let parts = aether_client::labels::truncate_symbol_path_parts(
-            &self.session.view.symbol_path,
+            &self.session.view.breadcrumb(),
             crumb_budget_cols(self.chrome_width(), &ui, used + right_used),
         );
         if let Some((innermost, ancestors)) = parts.split_last() {
@@ -6657,7 +6658,15 @@ fn session_state_color(s: &Session) -> Option<iced::Color> {
     if s.view.externally_modified {
         return Some(p.state_changed);
     }
-    if s.view.buffer.revision != s.view.buffer.saved_revision {
+    // The focused buffer's own compare *or* the view's other elements — unsaved edits in a hunk
+    // scrolled past were invisible while the dot only asked the buffer under the cursor. Local
+    // first, so typing and saving register without waiting for a re-render.
+    if s.view.buffer.revision != s.view.buffer.saved_revision
+        || s.view
+            .window
+            .as_ref()
+            .is_some_and(|w| w.other_elements_dirty)
+    {
         return Some(p.state_unsaved);
     }
     None

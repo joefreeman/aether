@@ -341,6 +341,11 @@ export interface BufferWindow {
   max_line_width: number;
   /** Buffer-level Git status (branch + staged/unstaged counts) for the status bar; absent outside a repo. */
   git_status?: GitBufferStatus;
+  /** Any buffer this view windows *other than* the focused element's has unsaved changes — the
+   *  view-wide half of the status dot. Excludes the focused element deliberately: the client knows
+   *  that one first-hand and instantly, so the dot is `focused dirty || this`, which stays right
+   *  across a save (a save pushes buffer/state, not a new window). Always false for one element. */
+  other_elements_dirty?: boolean;
   /** What the view is composed of. Use `nodeLines` where the structure is irrelevant. */
   root: ViewNode;
 }

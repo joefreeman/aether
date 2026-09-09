@@ -2004,7 +2004,9 @@ impl Shell {
             m.insert(s.view.buffer.buffer_id, s.view.diagnostics);
             m
         };
-        st.symbol_path = s.view.symbol_path.clone();
+        // The view-root-to-cursor path, which in a composed view leads with the file — see
+        // `ViewState::breadcrumb`.
+        st.symbol_path = s.view.breadcrumb();
 
         st.editor = editor;
         st.read = read;
@@ -2527,6 +2529,11 @@ impl Shell {
             click_streak: 0,
             revision: s.view.buffer.revision,
             saved_revision: s.view.buffer.saved_revision,
+            other_elements_dirty: s
+                .view
+                .window
+                .as_ref()
+                .is_some_and(|w| w.other_elements_dirty),
             externally_modified: s.view.externally_modified,
             externally_deleted: s.view.externally_deleted,
             pending_count: s.view.count.unwrap_or(0),
@@ -2563,7 +2570,9 @@ impl Shell {
             transient: s.view.buffer.transient,
             tethered: s.tethered(),
             file_path: s.view.buffer.path.clone(),
-            file_label: s.view.buffer.label.clone(),
+            // The view's label, not the focused element's: in a composed view the file slot is the
+            // view (`Working changes — repo`), and the file the cursor is in rides the breadcrumb.
+            file_label: s.view.view_label.clone(),
             language: s.view.buffer.language.clone(),
             lsp_server: s.view.buffer.lsp_server.clone(),
         }
@@ -3436,6 +3445,7 @@ mod scroll_tests {
         }
         let total: u32 = elements.iter().map(|e| e.2 + 1).sum();
         Window {
+                other_elements_dirty: false,
             first_view_line: ViewLine(0),
             last_view_line_exclusive: ViewLine(total),
             view_line_count: elements.iter().map(|e| e.2).sum(),

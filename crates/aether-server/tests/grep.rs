@@ -12,6 +12,7 @@ async fn picker_grep_finds_matches_and_select_returns_file_at() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -117,6 +118,7 @@ async fn picker_grep_from_selection_seeds_query_and_searches() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             from_selection: true,
             reset: PickerReset::Keep,
             limit: 30,
@@ -174,6 +176,7 @@ async fn picker_grep_from_selection_empty_is_unseeded() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             from_selection: true,
             reset: PickerReset::Keep,
             limit: 30,
@@ -200,6 +203,7 @@ async fn picker_grep_query_initial_push_keeps_the_window() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -253,6 +257,7 @@ async fn picker_grep_short_query_yields_empty_result() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -290,6 +295,7 @@ async fn picker_grep_keeps_hits_across_a_keep_scoped_re_view() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -317,6 +323,7 @@ async fn picker_grep_keeps_hits_across_a_keep_scoped_re_view() {
     let resume = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             limit: 30,
             ..view_params(PickerKind::Grep)
@@ -343,6 +350,7 @@ async fn closing_a_picker_clears_it_and_moves_the_generation() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -375,6 +383,7 @@ async fn closing_a_picker_clears_it_and_moves_the_generation() {
     let after: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             limit: 30,
             ..view_params(PickerKind::Grep)
@@ -480,6 +489,7 @@ async fn grep_fresh_open_installs_seeded_filters_over_the_wipe() {
     let reopen: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             filters: Some(seed.clone()),
             ..view_params(PickerKind::Grep)
         },
@@ -505,6 +515,7 @@ async fn picker_grep_treats_query_as_regex() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -544,6 +555,7 @@ async fn picker_grep_caches_completed_query() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -595,6 +607,7 @@ async fn setup_grep_with_needle_query() -> (aether_server::ServerHandle, Ws) {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -806,7 +819,9 @@ async fn jumplist_step_takes_a_count() {
     .await;
     let target = target.moved().expect("captured list steps");
     assert_eq!((target.index, target.total), (3, 3));
-    // A count past the end clamps to the last entry (no wrap) — still a move.
+    // A count the list cannot honour **refuses** — no wrap, and no clamp either. `5]` landing on
+    // the last entry is what made `5]` then `5[` lose your place, since the return trip counted
+    // back from wherever the clamp had put you.
     let target: JumplistStepResult = send_request::<JumplistStep>(
         &mut ws,
         &JumplistStepParams {
@@ -818,7 +833,10 @@ async fn jumplist_step_takes_a_count() {
         },
     )
     .await;
-    assert_eq!(target.moved().expect("clamps to the last entry").index, 3);
+    assert!(
+        target.moved().is_none(),
+        "a count past the last entry must not move at all"
+    );
 
     drop(server);
 }
@@ -1065,6 +1083,7 @@ async fn a_capture_survives_switching_away_and_back() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -1266,6 +1285,7 @@ async fn changing_the_list_tells_other_clients_with_the_picker_open() {
     let refreshed: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws2,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::Jumplist)
         },
@@ -1287,6 +1307,7 @@ async fn changing_the_list_tells_other_clients_with_the_picker_open() {
     let refreshed: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws2,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::Jumplist)
         },
@@ -1358,6 +1379,7 @@ async fn the_changed_notification_skips_the_actor_and_other_contexts() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -1515,6 +1537,7 @@ async fn jumplist_captured_from_the_files_picker_is_flat_and_steps_by_file() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Files)
         },
@@ -1535,6 +1558,7 @@ async fn jumplist_captured_from_the_files_picker_is_flat_and_steps_by_file() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Jumplist)
         },
@@ -1606,6 +1630,7 @@ async fn jumplist_step_to_a_captured_file_restores_its_last_cursor() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Files)
         },
@@ -1674,6 +1699,7 @@ async fn jumplist_captured_from_the_buffers_picker_includes_scratch_buffers() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Buffers)
         },
@@ -1742,6 +1768,7 @@ async fn grep_ignores_center_on_cursor() {
     let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             limit: 30,
             center_on_cursor: Some(buffer_id),
@@ -1846,6 +1873,7 @@ async fn jumplist_capture_from_git_changes_picker() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::GitChanges)
         },
@@ -1929,6 +1957,7 @@ async fn jumplist_picker_lists_filters_and_recaptures() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Jumplist)
         },
@@ -2110,6 +2139,7 @@ async fn jumplist_picker_path_filters_narrow_and_recapture_bakes_them_in() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Jumplist)
         },
@@ -2147,6 +2177,7 @@ async fn jumplist_picker_path_filters_narrow_and_recapture_bakes_them_in() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             limit: 30,
             ..view_params(PickerKind::Jumplist)
@@ -2192,6 +2223,7 @@ async fn jumplist_picker_path_filters_narrow_and_recapture_bakes_them_in() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Jumplist)
         },
@@ -2218,6 +2250,7 @@ async fn jumplist_picker_centers_on_the_cursor_nearest_entry() {
     // first entry → nearest at-or-after is #1.
     set_point_cursor(&mut ws, buffer_id, LogicalPosition { line: 1, col: 0 }).await;
     let view_params = |center: Option<u64>| PickerViewParams {
+            view_id: None,
         limit: 30,
         center_on_cursor: center,
         ..view_params(PickerKind::Jumplist)
@@ -2267,6 +2300,7 @@ async fn jumplist_picker_opens_empty_without_a_capture() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Jumplist)
         },
@@ -2351,6 +2385,7 @@ async fn workspace_switch_wipes_the_captured_results() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },

@@ -1919,6 +1919,7 @@ fn directory_list_result_skips_none_parent() {
 fn viewport_lines_changed_params_cursor_shape() {
     let base = ViewportLinesChangedParams {
         buffer: 7,
+        other_elements_dirty: false,
         viewport_id: 7,
         revision: 42,
         range: LogicalLineRange {
@@ -3777,6 +3778,7 @@ fn keybinding_entry_haystack_composes_in_display_order() {
 fn picker_view_params_keybindings_serialized_and_skipped_when_none() {
     use aether_protocol::picker::{KeybindingEntry, PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
+            view_id: None,
         from_selection: false,
         kind: PickerKind::Keybindings,
         reset: PickerReset::All,
@@ -3804,6 +3806,7 @@ fn picker_view_params_keybindings_serialized_and_skipped_when_none() {
 
     // Absent on the wire when None (resume/scroll re-views), and deserializes back to None.
     let p = PickerViewParams {
+            view_id: None,
         keybindings: None,
         ..p
     };
@@ -4065,6 +4068,7 @@ fn collapsible_kinds_are_pinned() {
 fn picker_view_params_omit_center_on_when_none() {
     use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
+            view_id: None,
         from_selection: false,
         kind: PickerKind::Files,
         reset: PickerReset::All,
@@ -4202,6 +4206,7 @@ fn picker_view_params_from_selection_serialized() {
     use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     // `Space Alt-/`: grep-for-selection rides `from_selection` + the active buffer id.
     let p = PickerViewParams {
+            view_id: None,
         from_selection: true,
         kind: PickerKind::Grep,
         reset: PickerReset::Keep,
@@ -4227,6 +4232,7 @@ fn picker_view_params_from_selection_serialized() {
 fn picker_view_params_center_on_serialized() {
     use aether_protocol::picker::{PickerItem, PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
+            view_id: None,
         from_selection: false,
         kind: PickerKind::Files,
         reset: PickerReset::Keep,
@@ -4605,6 +4611,7 @@ fn picker_item_dir_entry_carries_git_status() {
 fn picker_view_params_directory_path_skipped_when_none() {
     use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
+            view_id: None,
         from_selection: false,
         kind: PickerKind::Explorer,
         reset: PickerReset::Keep,
@@ -4629,6 +4636,7 @@ fn picker_view_params_directory_path_skipped_when_none() {
 fn picker_view_params_directory_path_serialized() {
     use aether_protocol::picker::{PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
+            view_id: None,
         from_selection: false,
         kind: PickerKind::Explorer,
         reset: PickerReset::All,
@@ -5838,6 +5846,7 @@ fn round_trips<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) {
 fn sample_window() -> aether_protocol::viewport::Window {
     use aether_protocol::viewport::{Highlight, Segment, Window, WrappedRow};
     Window {
+            other_elements_dirty: false,
         first_view_line: ViewLine(4),
         last_view_line_exclusive: ViewLine(6),
         view_line_count: 120,
@@ -6081,6 +6090,7 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
 
     let ts = include_str!("../../../web/src/protocol.ts");
     let window = Window {
+            other_elements_dirty: false,
         first_view_line: ViewLine(0),
         last_view_line_exclusive: ViewLine(1),
         view_line_count: 1,
@@ -6136,6 +6146,7 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
 fn a_composed_views_subscribe_carries_the_focus_it_resolved() {
     use aether_protocol::viewport::{ViewportFocusElementResult, ViewportSubscribeResult, Window};
     let window = || Window {
+            other_elements_dirty: false,
         first_view_line: ViewLine(0),
         last_view_line_exclusive: ViewLine(1),
         view_line_count: 1,
@@ -6188,6 +6199,7 @@ fn a_composed_views_subscribe_carries_the_focus_it_resolved() {
                 read_only: false,
                 is_patch: false,
             },
+            buffer_status: Default::default(),
         }),
     };
     let v = to_value(&composed).unwrap();

@@ -601,6 +601,10 @@ pub struct EditorState {
     /// Revision at the most recent successful save. `dirty` is derived as
     /// `revision != saved_revision`.
     pub saved_revision: u64,
+    /// Any *other* element of this view has unsaved changes — the view-wide half of the dirty dot,
+    /// which the focused buffer's own revisions cannot answer. Mirrors
+    /// `Window::other_elements_dirty`; always false for an ordinary view.
+    pub other_elements_dirty: bool,
     /// Set when the server's file-watcher detected a disk change while this buffer was dirty
     /// (clean buffers reload silently). The user must `Ctrl-s` (and confirm overwrite) or
     /// `buffer/reload` to clear it. Updated from `BufferState` notifications.
@@ -680,6 +684,7 @@ pub enum BufferStatusKind {
 #[cfg(test)]
 pub(crate) fn test_editor_state() -> EditorState {
     EditorState {
+            other_elements_dirty: false,
         root: aether_protocol::viewport::Element::Editor {
             element: 0,
             buffer: 0,
@@ -798,7 +803,11 @@ impl AppState {
             Some(BufferStatusKind::ExternallyDeleted)
         } else if ed.externally_modified {
             Some(BufferStatusKind::ExternallyModified)
-        } else if ed.revision != ed.saved_revision {
+        } else if ed.revision != ed.saved_revision || ed.other_elements_dirty {
+            // The focused buffer's own compare *or* the view's other elements: unsaved edits in a
+            // hunk scrolled past used to be invisible, because the dot only ever asked the buffer
+            // under the cursor. The local compare comes first so typing and saving show instantly,
+            // without waiting for a re-render — see `Window::other_elements_dirty`.
             Some(BufferStatusKind::Unsaved)
         } else {
             None
@@ -1289,6 +1298,7 @@ mod tests {
     /// The rest is filled with sensible defaults.
     fn stub_editor_state(label: &str) -> EditorState {
         EditorState {
+                other_elements_dirty: false,
             root: aether_protocol::viewport::Element::Editor {
                 element: 0,
                 buffer: 0,

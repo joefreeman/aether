@@ -754,7 +754,9 @@ pub async fn apply_edit_reporting(
     // prechecks that a number exists, so this is `Some` in practice; a stale `None` is caught by
     // the no-op guard below.
     let number_edit = match &edit {
-        EditKind::AdjustNumber { delta, scan } => resolve_number_edit(buf, &cursor, *delta, *scan),
+        EditKind::AdjustNumber { delta, scan } => {
+            resolve_number_edit(&scope, &cursor, *delta, *scan)
+        }
         _ => None,
     };
 
@@ -1515,6 +1517,7 @@ pub fn build_lines_changed_notif(
         view_line_count: window.view_line_count,
         max_scroll_view_line: window.max_scroll_view_line,
         git_status: window.git_status,
+        other_elements_dirty: window.other_elements_dirty,
         cursor,
     };
     Notification {

@@ -174,7 +174,7 @@ impl WasmSession {
     /// see `.status-crumb-sep` in theme.css.
     pub fn symbol_path_parts(&self, max_chars: u32) -> Vec<String> {
         aether_client::labels::truncate_symbol_path_parts(
-            &self.inner.view.symbol_path,
+            &self.inner.view.breadcrumb(),
             max_chars as usize,
         )
     }

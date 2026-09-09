@@ -722,9 +722,7 @@ impl ServerState {
             return layout
                 .iter()
                 .map(|l| ElementLayout {
-                    buffer_id: l.buffer_id,
-                    start_line: l.start_line,
-                    end_line_exclusive: l.end_line_exclusive,
+                    extent: l.extent.clone(),
                     chrome_above: l.chrome_above.clone(),
                     decorations: l.decorations.clone(),
                 })
@@ -737,10 +735,10 @@ impl ServerState {
                 .elements
                 .iter()
                 .map(|e| ElementLayout {
-                    buffer_id: None,
+                    extent: ElementExtent::OwnDocument {
+                        lines: e.start_line..e.end_line,
+                    },
                     decorations: None,
-                    start_line: e.start_line,
-                    end_line_exclusive: e.end_line,
                     chrome_above: std::sync::Arc::new(
                         g.decorations
                             .chrome
@@ -751,10 +749,10 @@ impl ServerState {
                 })
                 .collect(),
             _ => vec![ElementLayout {
-                buffer_id: None,
+                extent: ElementExtent::OwnDocument {
+                    lines: 0..doc.text.len_lines() as u32,
+                },
                 decorations: None,
-                start_line: 0,
-                end_line_exclusive: doc.text.len_lines() as u32,
                 chrome_above: std::sync::Arc::new(Vec::new()),
             }],
         }
@@ -778,25 +776,28 @@ impl ServerState {
     /// the rebuild a save/stage/commit performs.
     pub fn shift_element_extents(&mut self, buffer_id: BufferId, shift: LineShift) {
         let siblings = self.doc_siblings(buffer_id);
-        let moved = |start: &mut u32, end: &mut u32| {
-            if shift.at < *start {
-                *start = start.saturating_add_signed(shift.delta);
-                *end = end.saturating_add_signed(shift.delta);
-            } else if shift.at < *end {
-                *end = end.saturating_add_signed(shift.delta);
-            }
-        };
         for layout in self.view_layouts.values_mut() {
             for element in layout {
-                if element.buffer_id.is_some_and(|id| siblings.contains(&id)) {
-                    moved(&mut element.start_line, &mut element.end_line_exclusive);
+                // `bound_to`, not "whichever buffer this resolves to": an `OwnDocument` extent
+                // indexes the view's *generated* document, which no edit reaches — a patch is
+                // read-only — so its lines never move even when the file it was rendered from does.
+                // Asking the extent rather than a nullable id is what says so out loud.
+                if element.extent.bound_to().is_some_and(|id| siblings.contains(&id)) {
+                    element.extent.shift(shift.at, shift.delta);
                 }
             }
         }
         for vp in self.viewports.values_mut() {
             for element in &mut vp.elements {
                 if siblings.contains(&element.buffer_id) {
-                    moved(&mut element.start_line, &mut element.end_line_exclusive);
+                    if shift.at < element.start_line {
+                        element.start_line = element.start_line.saturating_add_signed(shift.delta);
+                        element.end_line_exclusive =
+                            element.end_line_exclusive.saturating_add_signed(shift.delta);
+                    } else if shift.at < element.end_line_exclusive {
+                        element.end_line_exclusive =
+                            element.end_line_exclusive.saturating_add_signed(shift.delta);
+                    }
                 }
             }
         }
@@ -1501,7 +1502,7 @@ impl ServerState {
         // `git/show` rebuilds the bindings.
         self.view_layouts.remove(&id);
         self.view_layouts
-            .retain(|_, layout| !layout.iter().any(|e| e.buffer_id == Some(id)));
+            .retain(|_, layout| !layout.iter().any(|e| e.extent.bound_to() == Some(id)));
         self.viewports.retain(|_, v| !v.binds(id));
         self.cursors.retain(|(_, b), _| *b != id);
         self.motion_history.retain(|(_, b), _| *b != id);
@@ -3059,33 +3060,97 @@ pub struct ElementDecorations {
     pub emphasis: std::collections::HashMap<u32, Vec<aether_protocol::viewport::EmphasisRange>>,
 }
 
+/// Which buffer an element's lines are lines *of*, and which lines they are.
+///
+/// The two variants were once one nullable id beside a bare `u32` pair, and the pair meant different
+/// things depending on the id: **file** lines while it was `Some`, lines of the **generated patch**
+/// once it was `None`. Nothing named that, and the one loop walking both kinds
+/// ([`ServerState::shift_element_extents`]) was correct only because its filter happened to skip the
+/// unbound ones. Naming it is what stops the next reader — or the next repair — reinterpreting one
+/// as the other, which would be a silently wrong window rather than a crash.
+#[derive(Debug, Clone)]
+pub enum ElementExtent {
+    /// Lines of `buffer`: a hunk's window onto the real file it came from.
+    Bound {
+        buffer: BufferId,
+        lines: std::ops::Range<u32>,
+    },
+    /// Lines of the **view's own** document, for content with no file to point at — a deleted
+    /// file's text, a binary swap, a mode change — and for every element of a view no driver has
+    /// built.
+    ///
+    /// The buffer is unnamed rather than unknown: a layout is built *before* the view's own buffer
+    /// is opened, so there is no id to record yet. [`Self::buffer`] is the one place it is supplied.
+    OwnDocument { lines: std::ops::Range<u32> },
+}
+
+impl ElementExtent {
+    /// The lines themselves, whichever buffer they belong to.
+    pub fn lines(&self) -> std::ops::Range<u32> {
+        match self {
+            Self::Bound { lines, .. } | Self::OwnDocument { lines } => lines.clone(),
+        }
+    }
+
+    /// The buffer these lines index, given the view they belong to. **The only place an
+    /// `OwnDocument` extent acquires an id**, which is what keeps the two kinds from being confused
+    /// at any of the sites that merely want "which buffer".
+    pub fn buffer(&self, view_buffer: BufferId) -> BufferId {
+        match self {
+            Self::Bound { buffer, .. } => *buffer,
+            Self::OwnDocument { .. } => view_buffer,
+        }
+    }
+
+    /// The buffer this element is bound to, if it is bound to one — for the callers that must treat
+    /// "windows a real file" differently from "windows the view's own text", rather than merely
+    /// needing an id.
+    pub fn bound_to(&self) -> Option<BufferId> {
+        match self {
+            Self::Bound { buffer, .. } => Some(*buffer),
+            Self::OwnDocument { .. } => None,
+        }
+    }
+
+    /// Slide or stretch the extent for an edit that changed a line count. See
+    /// [`ServerState::shift_element_extents`] for the three cases.
+    fn shift(&mut self, at: u32, delta: i32) {
+        let lines = match self {
+            Self::Bound { lines, .. } | Self::OwnDocument { lines } => lines,
+        };
+        if at < lines.start {
+            lines.start = lines.start.saturating_add_signed(delta);
+            lines.end = lines.end.saturating_add_signed(delta);
+        } else if at < lines.end {
+            lines.end = lines.end.saturating_add_signed(delta);
+        }
+    }
+}
+
 /// How a view divides into elements: each one's extent, the chrome introducing it, and — once a
-/// driver builds them — which buffer it windows and what the view says about its lines.
-#[derive(Default)]
+/// driver builds them — what the view says about its lines.
 pub struct ElementLayout {
-    /// The buffer this element windows, or `None` for the view's own — which is every element of
-    /// every view a driver hasn't built.
-    pub buffer_id: Option<BufferId>,
-    pub start_line: u32,
-    pub end_line_exclusive: u32,
+    pub extent: ElementExtent,
     pub chrome_above: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
     pub decorations: Option<std::sync::Arc<ElementDecorations>>,
 }
 
 impl ElementLayout {
-    /// Bind this element, falling back to the view's buffer where it names none.
+    /// Bind this element against the view it belongs to — the point at which an `OwnDocument`
+    /// extent is told which buffer it is a slice of.
     pub fn bind(
         &self,
         view_buffer: BufferId,
         cols: u32,
         continuation_marker_width: u32,
     ) -> ElementBinding {
+        let lines = self.extent.lines();
         ElementBinding {
-            buffer_id: self.buffer_id.unwrap_or(view_buffer),
+            buffer_id: self.extent.buffer(view_buffer),
             cols,
             continuation_marker_width,
-            start_line: self.start_line,
-            end_line_exclusive: self.end_line_exclusive,
+            start_line: lines.start,
+            end_line_exclusive: lines.end,
             decorations: self.decorations.clone(),
             chrome_above: self.chrome_above.clone(),
         }
@@ -3141,6 +3206,42 @@ struct ElementSpan {
     view_start: ViewLine,
     buffer_start: u32,
     lines: u32,
+}
+
+/// A range of **buffer** lines that is already bounded by its buffer's live length.
+///
+/// Only [`ViewLayout`] can make one, and that is the entire point. The render helpers that take it
+/// used to take a bare `(start, end_exclusive)` pair and re-clamp defensively, because nothing in
+/// the type said whether the caller had already done it — and one caller genuinely had not, passing
+/// an element's raw extents straight from the diff. The clamp now happens once, at
+/// [`ViewLayout::of`], and a helper that receives this needs no opinion about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferRange {
+    start: u32,
+    end_exclusive: u32,
+}
+
+impl BufferRange {
+    pub fn start(&self) -> u32 {
+        self.start
+    }
+
+    pub fn end_exclusive(&self) -> u32 {
+        self.end_exclusive
+    }
+
+    pub fn len(&self) -> u32 {
+        self.end_exclusive.saturating_sub(self.start)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.end_exclusive <= self.start
+    }
+
+    /// The lines themselves, for walking one at a time.
+    pub fn lines(&self) -> std::ops::Range<u32> {
+        self.start..self.end_exclusive
+    }
 }
 
 impl ViewLayout {
@@ -3199,7 +3300,7 @@ impl ViewLayout {
         element: aether_protocol::viewport::FieldId,
         first: ViewLine,
         last_excl: ViewLine,
-    ) -> Option<(u32, u32)> {
+    ) -> Option<BufferRange> {
         let s = self.spans.get(element as usize)?;
         let view_end = s.view_start.saturating_add(s.lines);
         let lo = first.max(s.view_start);
@@ -3207,13 +3308,31 @@ impl ViewLayout {
         if lo >= hi {
             return None;
         }
-        let start = s.buffer_start + s.view_start.distance_to(lo);
-        let end = s.buffer_start + s.view_start.distance_to(hi);
-        Some((start, end))
+        Some(BufferRange {
+            start: s.buffer_start + s.view_start.distance_to(lo),
+            end_exclusive: s.buffer_start + s.view_start.distance_to(hi),
+        })
+    }
+
+    /// The whole of `element`'s window into its buffer, in view order or not — what its *height* is
+    /// measured over, as distinct from [`Self::intersect`]'s "the part currently on screen".
+    ///
+    /// Empty for an element that has fallen off the end of a buffer that shrank under it.
+    pub fn element_range(&self, element: aether_protocol::viewport::FieldId) -> BufferRange {
+        self.spans
+            .get(element as usize)
+            .map(|s| BufferRange {
+                start: s.buffer_start,
+                end_exclusive: s.buffer_start.saturating_add(s.lines),
+            })
+            .unwrap_or(BufferRange {
+                start: 0,
+                end_exclusive: 0,
+            })
     }
 
     /// The view line at which `element`'s buffer line `line` sits — the inverse of
-    /// [`Self::resolve`]. `None` when the line is outside the element's extent.
+    /// [`Self::intersect`]. `None` when the line is outside the element's extent.
     pub fn to_view(
         &self,
         element: aether_protocol::viewport::FieldId,
@@ -3326,7 +3445,9 @@ mod view_layout_tests {
     fn a_view_line_resolves_into_the_element_that_owns_it() {
         let layout = ViewLayout::of(&two_hunks(), |_| 100);
         assert_eq!(
-            layout.intersect(1, ViewLine(4), ViewLine(5)),
+            layout
+                .intersect(1, ViewLine(4), ViewLine(5))
+                .map(|r| (r.start(), r.end_exclusive())),
             Some((11, 12))
         );
         assert_eq!(layout.to_view(1, 11), Some(ViewLine(4)));
@@ -3368,28 +3489,18 @@ mod view_layout_tests {
             decorations: None,
             chrome_above: Default::default(),
         };
+        let bound = |buffer, lines: std::ops::Range<u32>| ElementLayout {
+            extent: ElementExtent::Bound { buffer, lines },
+            chrome_above: Default::default(),
+            decorations: None,
+        };
         let view = file(3, "patch\n");
         s.set_view_layout(
             view,
             vec![
-                ElementLayout {
-                    buffer_id: Some(a),
-                    start_line: 10,
-                    end_line_exclusive: 14,
-                    ..Default::default()
-                },
-                ElementLayout {
-                    buffer_id: Some(a),
-                    start_line: 30,
-                    end_line_exclusive: 34,
-                    ..Default::default()
-                },
-                ElementLayout {
-                    buffer_id: Some(b),
-                    start_line: 10,
-                    end_line_exclusive: 14,
-                    ..Default::default()
-                },
+                bound(a, 10..14),
+                bound(a, 30..34),
+                bound(b, 10..14),
             ],
         );
         let vp = Viewport {
@@ -3422,7 +3533,7 @@ mod view_layout_tests {
         assert_eq!(
             layout
                 .iter()
-                .map(|l| (l.start_line, l.end_line_exclusive))
+                .map(|l| { let r = l.extent.lines(); (r.start, r.end) })
                 .collect::<Vec<_>>(),
             vec![(10, 16), (32, 36), (10, 14)]
         );
@@ -3456,7 +3567,9 @@ mod view_layout_tests {
             "3 from the first, 1 from the second"
         );
         assert_eq!(
-            layout.intersect(1, ViewLine(3), ViewLine(6)),
+            layout
+                .intersect(1, ViewLine(3), ViewLine(6))
+                .map(|r| (r.start(), r.end_exclusive())),
             Some((10, 11))
         );
         // And a file gone entirely from under an element contributes no lines at all.

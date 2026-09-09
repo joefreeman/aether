@@ -774,9 +774,9 @@ pub fn layout_over_files(
                 .unwrap_or_default(),
         );
         let generated_slice = || crate::state::ElementLayout {
-            buffer_id: None,
-            start_line: span.start_line,
-            end_line_exclusive: span.end_line,
+            extent: crate::state::ElementExtent::OwnDocument {
+                lines: span.start_line..span.end_line,
+            },
             chrome_above: chrome_above.clone(),
             decorations: None,
         };
@@ -868,10 +868,15 @@ pub fn layout_over_files(
                 .or_insert((DiffMarker::Deleted, stage_at(line)));
         }
 
+        // File lines, and 1-based from libgit2 — the `- 1` is the only place that conversion
+        // happens, and the extent says which buffer they are lines of so nothing downstream has to
+        // guess.
+        let first = region.new_start.saturating_sub(1);
         layout.push(crate::state::ElementLayout {
-            buffer_id: Some(buffer_id),
-            start_line: region.new_start.saturating_sub(1),
-            end_line_exclusive: region.new_start.saturating_sub(1) + region.new_lines,
+            extent: crate::state::ElementExtent::Bound {
+                buffer: buffer_id,
+                lines: first..first + region.new_lines,
+            },
             chrome_above,
             decorations: Some(std::sync::Arc::new(decorations)),
         });

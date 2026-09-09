@@ -135,36 +135,32 @@ pub async fn viewport_subscribe(
         pushes.extend(refresh_lsp_server_pickers(&mut s));
     }
 
+    // What the subscriber can't work out for itself: which element holds the cursor, and the buffer
+    // it windows. Only said when it differs from what was subscribed to — a composed view — because
+    // that is the case where a client holding the subscribed buffer holds the wrong one.
+    //
+    // Ahead of the status snapshot because it *seats the cursor* inside the element, and the
+    // breadcrumb is taken from wherever the cursor ends up. Built the other way round, a composed
+    // view's first breadcrumb described the position the cursor was seated away from.
+    let focus = focus_answer(&mut s, client_id, viewport_id)?;
     // Snapshot the buffer-level status the client can't derive from the window: external-change
     // flags, diagnostic counts, and language-server health. These otherwise only reach a client via
     // change-notifications (`buffer/state`, `lsp/diagnostics_changed`, `lsp/status_changed`), so a
     // viewport that subscribes *after* the relevant change already happened would show stale state
     // until the next change. Returning it in the response (vs a follow-up push) keeps it atomic with
     // the window and free of any ordering race against the client's editor switch.
-    // Record what we're about to answer with as the last-sent breadcrumb, so the follow loop's
-    // first push after this is a real change rather than a duplicate of the seed.
     //
-    // Every field here is a fact about the buffer under the cursor, so all of them ask
-    // `focus_buffer` rather than the view's own document. For an ordinary view the two are the same
-    // id. For a composed one the view's document is a generated patch: it has no outline, no
-    // diagnostics, no language server and no on-disk state, so asking it answered empty for all
-    // four — a blank breadcrumb and zeroed diagnostic counts on every `Space g w`, until the cursor
-    // moved and the follow loop pushed the real ones.
-    let symbol_path = symbol_path_for(&s, client_id, focus_buffer);
-    s.symbol_path_sent
-        .insert((client_id, focus_buffer), symbol_path.clone());
-    let buf = s.doc_of(focus_buffer);
-    let buffer_status = BufferStatusSnapshot {
-        externally_modified: buf.externally_modified,
-        externally_deleted: buf.externally_deleted,
-        diagnostics: diagnostic_counts(buffer_diagnostics(&s, focus_buffer)),
-        lsp_status: s.lsp.status_for_buffer(focus_buffer),
-        symbol_path,
+    // Every field is a fact about the buffer under the cursor, so all of them ask `focus_buffer`
+    // rather than the view's own document. For an ordinary view the two are the same id. For a
+    // composed one the view's document is a generated patch: it has no outline, no diagnostics, no
+    // language server and no on-disk state, so asking it answered empty for all four — a blank
+    // breadcrumb and zeroed diagnostic counts on every `Space g w`, until the cursor moved and the
+    // follow loop pushed the real ones. A composed view has already computed exactly this snapshot
+    // inside `focus`, so reuse it rather than paying for the outline walk twice.
+    let buffer_status = match &focus {
+        Some(f) => f.buffer_status.clone(),
+        None => buffer_status_for(&mut s, client_id, focus_buffer),
     };
-    // What the subscriber can't work out for itself: which element holds the cursor, and the buffer
-    // it windows. Only said when it differs from what was subscribed to — a composed view — because
-    // that is the case where a client holding the subscribed buffer holds the wrong one.
-    let focus = focus_answer(&mut s, client_id, viewport_id)?;
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -291,6 +287,54 @@ fn seat_cursor_in_element(
 /// cursor nothing draws. It keeps a cursor already inside, so re-subscribing (a resize, a wrap
 /// toggle) doesn't move it — and cursors are per `(client, buffer)`, so a needless move would also
 /// yank an ordinary view of the same file.
+/// Whether any element **other than** `focused` windows a buffer with unsaved changes — the
+/// view-wide half of the status bar's dirty dot. See [`Window::other_elements_dirty`] for why the
+/// focused element is excluded rather than counted.
+///
+/// Distinct buffers only in spirit: two elements over the same file answer the same way, which is
+/// right — one dirty document makes the view dirty however many hunks of it are on screen.
+fn other_elements_dirty(
+    s: &ServerState,
+    elements: &[crate::state::ElementBinding],
+    focused: aether_protocol::viewport::FieldId,
+) -> bool {
+    let focused_buffer = elements.get(focused as usize).map(|e| e.buffer_id);
+    elements
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| *i != focused as usize && Some(e.buffer_id) != focused_buffer)
+        .any(|(_, e)| s.try_doc_of(e.buffer_id).is_some_and(|d| d.dirty))
+}
+
+/// The buffer-level status for `buffer_id`: everything the status bar shows that the window itself
+/// cannot say — external-change flags, diagnostic counts, language-server health, and the
+/// breadcrumb.
+///
+/// One definition, because every caller wants it for the same reason and about the same thing: the
+/// buffer *under the cursor*. Subscribing seeds it; focusing another element re-seeds it, since
+/// crossing an element crosses into another buffer and all four facts change at once. Building it
+/// in two places is how the focus path came to answer only half of it.
+///
+/// Records the breadcrumb as last-sent, so the follow loop's next push is a real change rather than
+/// a duplicate of this seed — which is why it needs `&mut`.
+fn buffer_status_for(
+    s: &mut ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+) -> BufferStatusSnapshot {
+    let symbol_path = symbol_path_for(s, client_id, buffer_id);
+    s.symbol_path_sent
+        .insert((client_id, buffer_id), symbol_path.clone());
+    let buf = s.doc_of(buffer_id);
+    BufferStatusSnapshot {
+        externally_modified: buf.externally_modified,
+        externally_deleted: buf.externally_deleted,
+        diagnostics: diagnostic_counts(buffer_diagnostics(s, buffer_id)),
+        lsp_status: s.lsp.status_for_buffer(buffer_id),
+        symbol_path,
+    }
+}
+
 fn focus_answer(
     s: &mut ServerState,
     client_id: ClientId,
@@ -308,6 +352,9 @@ fn focus_answer(
         aether_protocol::viewport::ViewportFocusElementResult {
             element,
             buffer: describe_buffer(s, binding.buffer_id, cursor)?,
+            // After the seating above, never before it: seating is what decides where the cursor
+            // is, and the breadcrumb is taken from the cursor.
+            buffer_status: buffer_status_for(s, client_id, binding.buffer_id),
         },
     ))
 }
@@ -352,6 +399,7 @@ pub async fn viewport_focus_element(
     let result = aether_protocol::viewport::ViewportFocusElementResult {
         element: focused,
         buffer: describe_buffer(&s, buffer_id, cursor)?,
+        buffer_status: buffer_status_for(&mut s, client_id, buffer_id),
     };
     drop(s);
     for (sender, notif) in pushes {
@@ -435,19 +483,25 @@ pub async fn viewport_navigate_change(
     // Strictly past the cursor in either direction, so landing on a change and pressing again
     // moves off it rather than finding itself. A count steps that many changes, not that many
     // lines.
+    //
+    // A count that the view cannot honour **refuses**, exactly as `c`/`Alt-c` over an ordinary
+    // buffer already did (`git_navigate_hunk` takes the `n`th or answers `moved: false`). These are
+    // the same two keys, and clamping here gave them two different meanings depending on which kind
+    // of view they were pressed in: `5c` with three changes left jumped to the last one in a patch
+    // and did nothing in a file. The count names *which* change; there isn't a fifth.
     let count = params.count.unwrap_or(1).max(1) as usize;
     let last = anchors.len().saturating_sub(1);
     let target = match params.direction {
-        FocusStep::Next => match anchors.iter().position(|&a| a > (focused, from)) {
-            Some(i) => (i + count - 1).min(last),
-            None => last, // already at or past the final change: stay
-        },
-        FocusStep::Previous => match anchors.iter().rposition(|&a| a < (focused, from)) {
-            Some(i) => i.saturating_sub(count - 1),
-            None => 0,
-        },
+        FocusStep::Next => anchors
+            .iter()
+            .position(|&a| a > (focused, from))
+            .and_then(|i| (i + count - 1 <= last).then_some(i + count - 1)),
+        FocusStep::Previous => anchors
+            .iter()
+            .rposition(|&a| a < (focused, from))
+            .and_then(|i| i.checked_sub(count - 1)),
     };
-    let Some(&(element, line)) = anchors.get(target) else {
+    let Some(&(element, line)) = target.and_then(|t| anchors.get(t)) else {
         // Nothing to step to: report where we are rather than erroring, so a held key is quiet.
         let cursor = s
             .cursors
@@ -457,6 +511,7 @@ pub async fn viewport_navigate_change(
         return Ok(aether_protocol::viewport::ViewportFocusElementResult {
             element: focused,
             buffer: crate::handlers::describe_buffer(&s, here, cursor)?,
+            buffer_status: buffer_status_for(&mut s, client_id, here),
         });
     };
 
@@ -479,6 +534,7 @@ pub async fn viewport_navigate_change(
     let result = aether_protocol::viewport::ViewportFocusElementResult {
         element,
         buffer: crate::handlers::describe_buffer(&s, buffer_id, cursor)?,
+        buffer_status: buffer_status_for(&mut s, client_id, buffer_id),
     };
     drop(s);
     for (sender, notif) in pushes {
@@ -898,48 +954,6 @@ pub fn recompute_diff_hunks_if_viewed(s: &mut ServerState, buffer_id: BufferId) 
 /// staged and an unstaged layer would stack at one anchor (a region modified, staged, then
 /// modified again), only the unstaged rows are kept — what's shown deleted is exactly what a
 /// revert would restore, and HEAD's text resurfaces once the top layer is staged or reverted.
-/// Every virtual row above each line, from whichever producer this buffer has.
-///
-/// The two are mutually exclusive by construction: the inline diff view's phantom deleted rows
-/// need a Git baseline to diff against, and a generated patch has none of its own. They merge here
-/// rather than at the render site because **the scroll arithmetic needs the same answer** — a
-/// chrome row occupies a screen row exactly as a phantom one does, so leaving it out of the extent
-/// makes the scrollbar short, puts the last lines out of reach, and lets the cursor sit below the
-/// scrollable area.
-fn extra_rows_by_line(
-    buf: &Document,
-    diff_view: bool,
-    hunks: &[crate::git::DiffHunk],
-    intraline: Option<&IntralineEmphasis>,
-) -> HashMap<u32, u32> {
-    if let Some(generated) = buf.generated.as_ref() {
-        let mut map: HashMap<u32, u32> = generated
-            .decorations
-            .chrome
-            .iter()
-            .enumerate()
-            .filter(|(_, rows)| !rows.is_empty())
-            .map(|(i, rows)| (i as u32, rows.len() as u32))
-            .collect();
-        // The closing rule renders *below* the last line, but for the scroll arithmetic a row is a
-        // row — it occupies one either way, and leaving it out would put the bottom of the patch
-        // out of reach exactly as the chrome rows once did.
-        if !generated.decorations.trailing_chrome.is_empty() {
-            *map.entry(buf.line_count().saturating_sub(1)).or_default() +=
-                generated.decorations.trailing_chrome.len() as u32;
-        }
-        return map;
-    }
-    if diff_view {
-        deleted_rows_by_anchor(hunks, buf.line_count(), intraline)
-            .into_iter()
-            .map(|(line, rows)| (line, rows.len() as u32))
-            .collect()
-    } else {
-        HashMap::new()
-    }
-}
-
 fn deleted_rows_by_anchor(
     hunks: &[crate::git::DiffHunk],
     line_count: u32,
@@ -1294,48 +1308,6 @@ pub fn buffer_git_status(s: &ServerState, buffer_id: BufferId) -> Option<GitBuff
     })
 }
 
-/// Find the largest `scroll_view_line` such that the buffer's last visual row sits at the
-/// bottom of the viewport. Walks logical lines from the end backward, accumulating their visual
-/// row counts under the current wrap settings until we have `viewport_rows` rows. Diff-view
-/// phantom rows (`deleted_rows`) count as occupied rows so the bottom of a diff still scrolls into
-fn compute_max_scroll(
-    buf: &Document,
-    viewport_rows: u32,
-    cols: u32,
-    wrap: aether_protocol::viewport::WrapMode,
-    marker_width: u32,
-    tab_width: u32,
-    extra_rows: &HashMap<u32, u32>,
-) -> u32 {
-    let line_count = buf.line_count();
-    if viewport_rows == 0 || line_count == 0 {
-        return 0;
-    }
-    let no_wrap = matches!(wrap, aether_protocol::viewport::WrapMode::None);
-    if no_wrap && extra_rows.is_empty() {
-        return line_count.saturating_sub(viewport_rows);
-    }
-    let mut rows_remaining = viewport_rows;
-    for line_idx in (0..line_count).rev() {
-        let virtual_n = extra_rows.get(&line_idx).copied().unwrap_or(0);
-        let real_n = if no_wrap {
-            1
-        } else {
-            let mut text: String = buf.text.line(line_idx as usize).chunks().collect();
-            if text.ends_with('\n') {
-                text.pop();
-            }
-            wrap::compute_rows(&text, cols, marker_width, tab_width).len() as u32
-        };
-        let n = real_n + virtual_n;
-        if n >= rows_remaining {
-            return line_idx;
-        }
-        rows_remaining -= n;
-    }
-    0
-}
-
 /// Number of real visual rows for one logical line (1 under no-wrap, else the wrapped count).
 fn line_visual_rows(
     buf: &Document,
@@ -1360,11 +1332,13 @@ fn line_visual_rows(
 /// Shipped on every [`Element::Editor`] so a client can lay out and scroll a view from the tree alone,
 /// without a round trip per scroll. Phantom rows count: they occupy a row on screen, and a client
 /// that summed only lines would place everything below them too high.
-#[allow(clippy::too_many_arguments)]
+/// Takes a [`BufferRange`] rather than two `u32`s, so it cannot be handed lines the buffer does not
+/// have. It used to re-clamp its own end, which read as belt-and-braces and was not: one caller
+/// passed an element's raw extents from the diff, so a hunk whose file had since shrunk reported a
+/// height measured over lines that were no longer there.
 fn element_visual_rows(
     buf: &Document,
-    start: u32,
-    end_excl: u32,
+    range: BufferRange,
     cols: u32,
     wrap: aether_protocol::viewport::WrapMode,
     marker_width: u32,
@@ -1372,11 +1346,10 @@ fn element_visual_rows(
     extra_rows: &HashMap<u32, u32>,
 ) -> u32 {
     let no_wrap = matches!(wrap, aether_protocol::viewport::WrapMode::None);
-    let end_excl = end_excl.min(buf.line_count());
     if no_wrap && extra_rows.is_empty() {
-        return end_excl.saturating_sub(start);
+        return range.len();
     }
-    (start..end_excl).fold(0u32, |total, i| {
+    range.lines().fold(0u32, |total, i| {
         total.saturating_add(
             line_visual_rows(buf, i, no_wrap, cols, marker_width, tab_width)
                 + extra_rows.get(&i).copied().unwrap_or(0),
@@ -1406,8 +1379,9 @@ fn compute_max_line_width(buf: &Document, tab_width: u32) -> u32 {
 /// stopping at `to_excl` (clamped to the last line in range).
 ///
 /// Ranged rather than whole-buffer because an element windows a slice of its file: rows are counted
-/// from the element's own first line, not the document's. A whole-buffer view passes
-/// `0..buf.line_count()` and gets exactly what it always did.
+/// from the element's own first line, not the document's. A whole-buffer view passes the element's
+/// whole range and gets exactly what it always did. The range is a [`BufferRange`] for the reason
+/// [`element_visual_rows`]'s is.
 #[allow(clippy::too_many_arguments)]
 pub fn logical_line_at_visual_row(
     buf: &Document,
@@ -1416,12 +1390,11 @@ pub fn logical_line_at_visual_row(
     marker_width: u32,
     tab_width: u32,
     extra_rows: &HashMap<u32, u32>,
-    from: u32,
-    to_excl: u32,
+    range: BufferRange,
     target_row: u32,
 ) -> u32 {
-    let to_excl = to_excl.min(buf.line_count());
-    if from >= to_excl {
+    let (from, to_excl) = (range.start(), range.end_exclusive());
+    if range.is_empty() {
         return from;
     }
     let last = to_excl - 1;
@@ -1430,7 +1403,7 @@ pub fn logical_line_at_visual_row(
         return from.saturating_add(target_row).min(last);
     }
     let mut acc = 0u32;
-    for i in from..to_excl {
+    for i in range.lines() {
         let virtual_n = extra_rows.get(&i).copied().unwrap_or(0);
         let n = line_visual_rows(buf, i, no_wrap, cols, marker_width, tab_width) + virtual_n;
         if acc + n > target_row {
@@ -1514,13 +1487,12 @@ fn view_line_at_visual_row(
         }
         remaining -= chrome;
         let doc = s.doc_of(binding.buffer_id);
-        let (from, to) = layout
+        let range = layout
             .intersect(element, view_start, view_end)
-            .unwrap_or((layout.buffer_start(element), layout.buffer_start(element)));
+            .unwrap_or_else(|| layout.element_range(element));
         let height = element_visual_rows(
             doc,
-            from,
-            to,
+            range,
             binding.cols,
             geom.wrap,
             binding.continuation_marker_width,
@@ -1535,8 +1507,7 @@ fn view_line_at_visual_row(
                 binding.continuation_marker_width,
                 geom.tab_width,
                 extra_rows,
-                from,
-                to,
+                range,
                 remaining,
             );
             return layout.to_view(element, line).unwrap_or(view_start);
@@ -1836,16 +1807,8 @@ pub fn render_window(
         .then(|| layout.intersect(0, first, last_excl))
         .flatten()
     {
-        Some((from, to)) => intraline_for_window(hunks, buf, from, to),
+        Some(r) => intraline_for_window(hunks, buf, r.start(), r.end_exclusive()),
         None => IntralineEmphasis::default(),
-    };
-    // Two maps, because the tree split what used to be one: the scroll arithmetic wants a *count*
-    // of extra rows per line (chrome and phantoms alike occupy one), while element heights want
-    // only the rows the element itself owns. Chrome is not per-line at all — it is a tree sibling.
-    let extra_rows = if bound {
-        HashMap::new()
-    } else {
-        extra_rows_by_line(buf, diff_view, hunks, Some(&intraline))
     };
     // Per **element**, because that is how the rows themselves are decided: `render_element_lines`
     // takes an element's phantom rows from the *view's* decorations when it has them, and only an
@@ -1871,12 +1834,12 @@ pub fn render_window(
         let element = idx as aether_protocol::viewport::FieldId;
         let in_view = layout.intersect(element, first, last_excl);
         let lines = match in_view {
-            Some((from, to)) => render_element_lines(
+            Some(r) => render_element_lines(
                 s,
                 client_id,
                 binding,
-                from,
-                to,
+                r.start(),
+                r.end_exclusive(),
                 wrap,
                 tab_width,
                 diff_view,
@@ -1893,10 +1856,11 @@ pub fn render_window(
             element,
             buffer: binding.buffer_id,
             opens_in_view,
+            // The element's *whole* height, from the layout's clamped range rather than the raw
+            // extents: the diff's account of a hunk can outlive the lines it described.
             rows: element_visual_rows(
                 s.doc_of(binding.buffer_id),
-                binding.start_line,
-                binding.end_line_exclusive,
+                layout.element_range(element),
                 binding.cols,
                 wrap,
                 binding.continuation_marker_width,
@@ -1905,7 +1869,7 @@ pub fn render_window(
             ),
             chrome_above: binding.chrome_above.clone(),
             first_buffer_line: in_view
-                .map(|(from, _)| from)
+                .map(|r| r.start())
                 .unwrap_or_else(|| layout.buffer_start(element)),
             lines,
         });
@@ -1939,15 +1903,17 @@ pub fn render_window(
         first_view_line: first,
         last_view_line_exclusive: last_excl,
         view_line_count,
-        // Bounded by the *view*, not the document behind it: telling a client it may scroll to a
-        // line the view does not have is what let the scroll run off the end and blank the screen.
+        // Counted in the *view's* rows, not the document's behind it: telling a client it may
+        // scroll to a line the view does not have is what let the scroll run off the end and blank
+        // the screen.
         max_scroll_view_line: max_scroll_view_line(
             s,
             elements,
             &layout,
+            total_visual_rows,
             viewport_rows,
             geom,
-            &extra_rows,
+            &phantom_rows,
         ),
         total_visual_rows,
         first_visual_row: rows_above(s, elements, &layout, &rendered, first, geom, &phantom_rows),
@@ -1959,6 +1925,7 @@ pub fn render_window(
                 .get(focused as usize)
                 .map_or(primary.buffer_id, |e| e.buffer_id),
         ),
+        other_elements_dirty: other_elements_dirty(s, elements, focused),
         // The closing rule is in the tree only when the window reaches the view's end — the same
         // rule an element's own chrome follows: a row belongs to the window when its *place* does.
         // It still counts toward the view's height above, because it still occupies a row.
@@ -2045,11 +2012,10 @@ fn rows_above(
             continue;
         }
         // The window opens inside this one: only its lines above `first`.
-        if let Some((from, to)) = layout.intersect(element, ViewLine::ZERO, first) {
+        if let Some(range) = layout.intersect(element, ViewLine::ZERO, first) {
             rows = rows.saturating_add(element_visual_rows(
                 s.doc_of(binding.buffer_id),
-                from,
-                to,
+                range,
                 binding.cols,
                 geom.wrap,
                 binding.continuation_marker_width,
@@ -2065,32 +2031,79 @@ fn rows_above(
 /// The highest view line a scroll may legally land on: the one that puts the view's last visual row
 /// at the bottom of the viewport.
 ///
-/// Whole-buffer answer for a single-element view (where `compute_max_scroll` walks the document's
-/// wrapped rows), and bounded by the view's own length in every case — telling a client it may
-/// scroll to a line the view has not got is what let the scroll run off the end and blank the
-/// screen about three-quarters of the way down a bound patch.
+/// Answered in the **view's** own rows: the line holding the visual row `viewport_rows` up from the
+/// end is exactly the line that puts the last row at the bottom.
+///
+/// This used to ask the *primary element's document* for a whole-buffer answer and then `.min()` the
+/// result into range. For a bound patch that number is a line count from the generated document — a
+/// space none of the elements windows — and the clamp was the only thing standing between it and the
+/// screen. It was load-bearing, and what it was hiding was the blank view about three-quarters of
+/// the way down a patch: the clamp made the answer *in range* without making it *right*, so the
+/// scroll still stopped short of content that existed.
+///
+/// Walking the view instead makes it right by construction, and for a one-element view it reproduces
+/// the old whole-buffer answer line for line — the view *is* the buffer there.
 fn max_scroll_view_line(
     s: &ServerState,
     elements: &[ElementBinding],
     layout: &ViewLayout,
+    total_visual_rows: u32,
     viewport_rows: u32,
     geom: wrap::WrapGeometry,
-    extra_rows: &HashMap<u32, u32>,
+    phantom_rows: &[HashMap<u32, u32>],
 ) -> ViewLine {
-    let last = ViewLine::last_of(layout.line_count());
-    let Some(primary) = elements.first() else {
-        return last;
-    };
-    let whole_buffer = compute_max_scroll(
-        s.doc_of(primary.buffer_id),
-        viewport_rows,
-        geom.cols,
-        geom.wrap,
-        geom.marker_width,
-        geom.tab_width,
-        extra_rows,
-    );
-    ViewLine(whole_buffer).min(last)
+    // No viewport to fill: nothing may be scrolled past, so the top is the only legal position.
+    if viewport_rows == 0 {
+        return ViewLine::ZERO;
+    }
+    // Rows that must end up above the window for the last one to be on screen.
+    let target = total_visual_rows.saturating_sub(viewport_rows);
+    let no_wrap = matches!(geom.wrap, aether_protocol::viewport::WrapMode::None);
+
+    // The **first** line with at least `target` rows above it, not the line *at* row `target`.
+    //
+    // The two differ, and only by chrome. Scroll positions are view lines, but a line's rows above
+    // it jump by the whole of its element's chrome — so for a patch there is simply no scroll
+    // position that puts row `target` at the top. Asking "which line holds that row" floors to the
+    // element's first line, one whole chrome block too high, and the last rows of the view stay
+    // unreachable: the limit is legal, the content below it is not on screen, and the symptom is
+    // the same short scroll the old whole-buffer answer gave. Rounding *up* costs at most a screen
+    // of blank below the final line and reaches everything.
+    let mut rows = 0u32;
+    for (idx, binding) in elements.iter().enumerate() {
+        let element = idx as aether_protocol::viewport::FieldId;
+        let Some((start, _)) = layout.span_of(element) else {
+            break;
+        };
+        // An element's own chrome is drawn *inside* a window that opens on its first line, so it
+        // is not "above" that line — matching `rows_above`, whose answer this must invert.
+        if rows >= target {
+            return start;
+        }
+        rows = rows.saturating_add(binding.chrome_above.len() as u32);
+        let doc = s.doc_of(binding.buffer_id);
+        let mut line = start;
+        for i in layout.element_range(element).lines() {
+            // The first line was tested *above*, against the pre-chrome total — its own chrome is
+            // drawn inside the window rather than above it. Testing it again here would compare it
+            // against a figure `rows_above` never reports for it, and answer a line too early.
+            if line != start && rows >= target {
+                return line;
+            }
+            rows = rows.saturating_add(
+                line_visual_rows(
+                    doc,
+                    i,
+                    no_wrap,
+                    binding.cols,
+                    binding.continuation_marker_width,
+                    geom.tab_width,
+                ) + phantom_rows[idx].get(&i).copied().unwrap_or(0),
+            );
+            line = line.saturating_add(1);
+        }
+    }
+    ViewLine::last_of(layout.line_count())
 }
 
 /// The buffer a viewport is a *view of* — the patch's generated document, not the focused element's

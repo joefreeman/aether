@@ -245,9 +245,11 @@ pub async fn input_unsurround(
             .copied()
             .unwrap_or_default();
         let has_pair = if line {
+            // A line's own delimiters are its first and last characters, so they are inside the
+            // field whenever the line is — no scope test to make.
             line_has_enclosing_pair(buf, cursor.position.line as usize)
         } else {
-            has_enclosing_pair(buf, &cursor)
+            has_enclosing_pair(&s.motion_scope(client_id, params.buffer_id)?, &cursor)
         };
         if !has_pair {
             let revision = buf.revision;
@@ -1367,11 +1369,12 @@ pub async fn input_dedent(
 /// under the block). Either way the operand must be a strictly valid integer. Shared by the no-op
 /// precheck in `adjust_number` and the edit itself in `apply_edit`.
 pub fn resolve_number_edit(
-    buf: &Document,
+    scope: &crate::cursor::Scope<'_>,
     cursor: &CursorState,
     delta: i64,
     scan: bool,
 ) -> Option<(usize, usize, u32, String)> {
+    let buf = scope.doc();
     let (sc, ec) = if scan {
         // Insert mode: there's no selection, so infer the number by scanning the line. Outward
         // scanning is safe here precisely because there's no selection edge to respect.
@@ -1400,6 +1403,17 @@ pub fn resolve_number_edit(
         // out, so the adjustment can never invert by sweeping up a sign.
         current_selection_char_range(buf, cursor)
     };
+    // Bounded by the field, not the document. There is no live escape today — the insert-mode scan
+    // is line-bounded and the normal-mode operand is the selection, whose anchor `cursor_move` now
+    // clamps — but both of those are facts about the *callers*, and this took a `Document`, so
+    // nothing here said so. A `Scope` is the same move `resolve_block_edit` and
+    // `resolve_transform_case` already made: the check cannot be forgotten because it cannot be
+    // skipped.
+    let field = scope.byte_range();
+    let (sb, eb) = (buf.text.char_to_byte(sc), buf.text.char_to_byte(ec));
+    if sb < field.start || eb > field.end {
+        return None;
+    }
     let selected: String = buf.text.slice(sc..ec).chars().collect();
     crate::number::adjust_exact(&selected, delta)
         .map(|text| (sc, ec, motion::char_to_pos(buf, sc).line, text))
@@ -1426,7 +1440,9 @@ pub async fn input_adjust_number(
             .get(&(client_id, params.buffer_id))
             .copied()
             .unwrap_or_default();
-        if resolve_number_edit(buf, &cursor, delta, scan).is_none() {
+        if resolve_number_edit(&s.motion_scope(client_id, params.buffer_id)?, &cursor, delta, scan)
+            .is_none()
+        {
             let revision = buf.revision;
             let cursor = wrap_for_response(&s, client_id, params.buffer_id, cursor);
             return Ok(EditResult {

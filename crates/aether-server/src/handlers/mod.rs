@@ -13,9 +13,9 @@ use crate::grep;
 use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
-    BlameCache, Buffer, DeferredToken, Document, DocumentId, EditKindTag, ElementBinding,
-    LineEnding, NavEntry, SearchEntry, ServerState, SharedState, SneakCandidate, SneakEntry,
-    ViewLayout, Viewport,
+    BlameCache, Buffer, BufferRange, DeferredToken, Document, DocumentId, EditKindTag,
+    ElementBinding, LineEnding, NavEntry, SearchEntry, ServerState, SharedState, SneakCandidate,
+    SneakEntry, ViewLayout, Viewport,
 };
 use crate::surround;
 use crate::wrap;

@@ -36,14 +36,6 @@ pub fn resolve_block_edit(
         // and so returns before `bounded` below — it needs its own check, and this is the op the
         // census ranked second: `Ctrl-Alt-j` swapping the cursor's paragraph with one outside the
         // hunk.
-        // The paragraph move skips the markdown parse (it is blank-line geometry, any file type)
-        // and so returns before `bounded` below — it needs its own check, and this is the op the
-        // census ranked second: `Ctrl-Alt-j` swapping the cursor's paragraph with one outside the
-        // hunk.
-        // The paragraph move skips the markdown parse (it is blank-line geometry, any file type)
-        // and so returns before `bounded` below — it needs its own check, and this is the op the
-        // census ranked second: `Ctrl-Alt-j` swapping the cursor's paragraph with one outside the
-        // hunk.
         let field = scope.byte_range();
         return md::resolve_move_paragraph(&text, min, max, *down)
             .and_then(|e| {

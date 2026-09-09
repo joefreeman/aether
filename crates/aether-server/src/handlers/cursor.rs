@@ -169,17 +169,6 @@ pub async fn cursor_move(
     //
     // One line, but it is the widest hole in the scope model: `q` was one key that could reach
     // outside the element; the anchor is all of them at once.
-
-    // Clamped to the field, and this is the *only* place it can be.
-    //
-    // Every motion above resolves its head against the scope, but the anchor is carried through
-    // untouched — so once focus has moved, or an edit has shrunk the element under it, a
-    // `Shift`-motion produces a selection whose far end sits outside the window. Nothing downstream
-    // re-checks it: `set_cursor` and `wrap_for_response` both take the pair as given, and then every
-    // selection-operand edit — copy, cut, change, comment — acts on that range.
-    //
-    // One line, but it is the widest hole in the scope model: `q` was one key that could reach
-    // outside the element; the anchor is all of them at once.
     let new_anchor = scope.clamp(new_anchor);
 
     let new_state = CursorState {
@@ -548,8 +537,19 @@ async fn cursor_undo_once(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
 
+    // A restored position is *absolute*, and the history is keyed by buffer rather than by field —
+    // so with two hunks of one file in a view, the entries of the hunk you are not in are sitting in
+    // the same list. Restoring one moves the cursor outside the focused element, where nothing draws
+    // it. `z` is a target motion under the scope rules, so it refuses rather than clamping, and the
+    // entry stays put: `Tab` back and the same `z` works.
+    let field = {
+        let scope = s.motion_scope(client_id, params.buffer_id)?;
+        (scope.first_line(), scope.last_line())
+    };
+    let honours = |p: &CursorState| p.position.line >= field.0 && p.position.line <= field.1;
+
     let history = s.motion_history.entry(key).or_default();
-    if history.undo.is_empty() {
+    if history.undo.back().is_none_or(|p| !honours(p)) {
         return Ok(CursorUndoResult {
             applied: false,
             cursor: current,
@@ -608,8 +608,15 @@ async fn cursor_redo_once(
     let key = (client_id, params.buffer_id);
     let current = s.cursors.get(&key).copied().unwrap_or_default();
 
+    // Same rule as undo: an entry the focused element cannot honour is refused, not clamped.
+    let field = {
+        let scope = s.motion_scope(client_id, params.buffer_id)?;
+        (scope.first_line(), scope.last_line())
+    };
+    let honours = |p: &CursorState| p.position.line >= field.0 && p.position.line <= field.1;
+
     let history = s.motion_history.entry(key).or_default();
-    if history.redo.is_empty() {
+    if history.redo.last().is_none_or(|p| !honours(p)) {
         return Ok(CursorUndoResult {
             applied: false,
             cursor: current,
@@ -725,9 +732,6 @@ async fn cursor_expand_once(
     let new_last_char = new_end_char_excl.saturating_sub(1).max(new_start_char);
     let anchor = motion::char_to_pos(buf, new_start_char);
     let position = motion::char_to_pos(buf, new_last_char);
-    // The enclosing node reaches outside the field: there is nowhere to expand *to* that the view
-    // shows, so refuse rather than selecting text off-screen. Returning `current` unchanged is
-    // also what the caller's stall check reads as "stop".
     // The enclosing node reaches outside the field: there is nowhere to expand *to* that the view
     // shows, so refuse rather than selecting text off-screen. Returning `current` unchanged is
     // also what the caller's stall check reads as "stop".
@@ -864,9 +868,23 @@ pub fn resolve_transform_case(
 /// Whether the single chars immediately outside each end of the selection form a known delimiter
 /// pair — the precondition unsurround strips on. `current_selection_char_range` gives the
 /// selection as `[sc, ec)`, so the hugging chars are at `sc - 1` and `ec`; both must exist.
-pub fn has_enclosing_pair(buf: &Document, cursor: &CursorState) -> bool {
+pub fn has_enclosing_pair(scope: &crate::cursor::Scope<'_>, cursor: &CursorState) -> bool {
+    let buf = scope.doc();
     let (sc, ec) = current_selection_char_range(buf, cursor);
     if sc < 1 || ec >= buf.text.len_chars() {
+        return false;
+    }
+    // The delimiters sit *outside* the selection, which makes them the two characters this verb can
+    // reach past the field — and it deletes them. Bounded by the scope rather than the document:
+    // with the selection at the very start of a hunk, `sc - 1` is the last character of the line
+    // above it, outside the window, and `Ctrl-Alt-s` would have removed a character the user could
+    // not see. A `Scope` rather than a `Document`, so the check cannot be skipped by a future
+    // caller — the same move `resolve_block_edit` made.
+    let (open, close) = (
+        motion::char_to_pos(buf, sc - 1),
+        motion::char_to_pos(buf, ec),
+    );
+    if !scope.contains(open) || !scope.contains(close) {
         return false;
     }
     surround::matching_pair(buf.text.char(sc - 1), buf.text.char(ec))
@@ -920,4 +938,69 @@ pub async fn current_edit_result(
         revision,
         cursor,
     })
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use aether_protocol::LogicalPosition;
+
+    fn doc_of(text: &str) -> Document {
+        let mut d = Document::scratch(crate::state::DocumentId(1), None);
+        d.text = ropey::Rope::from_str(text);
+        d
+    }
+
+    fn cursor_at(anchor: (u32, u32), position: (u32, u32)) -> CursorState {
+        CursorState {
+            anchor: LogicalPosition {
+                line: anchor.0,
+                col: anchor.1,
+            },
+            position: LogicalPosition {
+                line: position.0,
+                col: position.1,
+            },
+            match_bracket: None,
+            jumplist_position: None,
+        }
+    }
+
+    /// `Ctrl-Alt-s` deletes the two characters *around* the selection, which makes them the only
+    /// thing it can reach outside the field — and it reaches by exactly one character, which is why
+    /// this went unnoticed.
+    ///
+    /// The opening delimiter can never escape: it shares a line with the selection's first
+    /// character, so it is in the field whenever that is. The **closing** one can, when a selection
+    /// ends on a line's newline — then the character after it is the first of the *next* line, which
+    /// the field may not contain.
+    #[test]
+    fn unsurround_will_not_take_a_delimiter_from_outside_the_field() {
+        // Line 0 opens the pair, line 1 closes it. A field of line 0 alone has the `(` but not `)`.
+        let doc = doc_of("(abc\n)def\n");
+        let field = crate::cursor::Scope::windowed(&doc, 0, 1);
+        let whole = crate::cursor::Scope::whole(&doc);
+        // Selection `abc` plus the newline: the char after it is line 1's `)`.
+        let selection = cursor_at((0, 1), (0, 4));
+
+        assert!(
+            has_enclosing_pair(&whole, &selection),
+            "the fixture must have a genuine pair to strip, or this proves nothing"
+        );
+        assert!(
+            !has_enclosing_pair(&field, &selection),
+            "the closing delimiter is on line 1, outside the field — stripping it would delete a \
+             character the user cannot see"
+        );
+    }
+
+    /// The guard must not refuse a pair that is genuinely inside the field, or `Ctrl-Alt-s` stops
+    /// working in every patch view.
+    #[test]
+    fn unsurround_still_strips_a_pair_inside_the_field() {
+        let doc = doc_of("xx\n(abc)\nyy\n");
+        let field = crate::cursor::Scope::windowed(&doc, 1, 2);
+        // `abc`, with its own `(` and `)` on the same line.
+        assert!(has_enclosing_pair(&field, &cursor_at((1, 1), (1, 3))));
+    }
 }

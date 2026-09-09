@@ -2674,11 +2674,12 @@ impl Session {
                         let root = self.workspace_paths.get(path_index as usize);
                         self.view.buffer.path =
                             root.map(|r| format!("{}/{rel}", r.trim_end_matches('/')));
-                        self.view.buffer.label = crate::labels::root_relative_display(
+                        let label = crate::labels::root_relative_display(
                             &self.workspace_paths,
                             path_index,
                             &rel,
                         );
+                        self.view.relabel_focused(label);
                         format!("Saved as {rel} (rev {})", result.revision)
                     }
                     None => format!("Saved (rev {})", result.revision),
@@ -3290,7 +3291,24 @@ impl Session {
         let moved = r.element != self.view.focused_element;
         self.view.focused_element = r.element;
         self.view.buffer = buffer_info(r.buffer, &self.workspace_paths);
+        // The four buffer-level facts move with focus, because they are facts about the buffer the
+        // cursor is in. Left out, they kept describing the element focus had just left: the pushes
+        // that would correct them are keyed to a buffer and only fire on a *change*, so a `Tab`
+        // between two files' hunks showed the previous file's breadcrumb, diagnostic counts and
+        // language-server glyph until something unrelated happened to move.
+        self.adopt_buffer_status(r.buffer_status);
         moved
+    }
+
+    /// Install a buffer-level status snapshot. Shared by subscribe and focus because it is the same
+    /// snapshot about the same thing — the buffer under the cursor — and the two drifting apart is
+    /// what left focus updating only half of it.
+    fn adopt_buffer_status(&mut self, status: aether_protocol::viewport::BufferStatusSnapshot) {
+        self.view.diagnostics = status.diagnostics;
+        self.view.lsp = status.lsp_status;
+        self.view.symbol_path = status.symbol_path;
+        self.view.externally_modified = status.externally_modified;
+        self.view.externally_deleted = status.externally_deleted;
     }
 
     /// Focus the element a click landed in, if it isn't already focused.
@@ -3357,11 +3375,7 @@ impl Session {
     /// the same struct. Shells must never write these fields directly.
     pub fn adopt_subscribe(&mut self, res: ViewportSubscribeResult) {
         self.view.viewport_id = Some(res.viewport_id);
-        self.view.diagnostics = res.buffer_status.diagnostics;
-        self.view.lsp = res.buffer_status.lsp_status;
-        self.view.symbol_path = res.buffer_status.symbol_path;
-        self.view.externally_modified = res.buffer_status.externally_modified;
-        self.view.externally_deleted = res.buffer_status.externally_deleted;
+        self.adopt_buffer_status(res.buffer_status);
         self.view.window = Some(res.window);
         // A composed view acts on the buffer its focused element windows, not on the buffer it was
         // opened as: a patch's elements window real files while the view's own document is the
@@ -3964,6 +3978,15 @@ impl Session {
                             | PickerKind::GitBaseline
                     ))
                 .then_some(buffer_id),
+                // The **listing** kinds also get the view, so they answer for everything it shows
+                // rather than for the hunk the cursor is in. Only these two: the other kinds that
+                // take a buffer want the focused one (a repo to resolve, a path, a selection to
+                // slice), and handing them a view id would answer a different question.
+                view_id: matches!(
+                    kind,
+                    PickerKind::Diagnostics | PickerKind::GitChangesFile
+                )
+                .then_some(self.view.view_id),
                 from_selection,
                 filters: seed_filters,
                 // The binding tables live here in the client core, so a fresh Keybindings open
@@ -4100,6 +4123,7 @@ impl Session {
         ));
         fx = fx.and(self.request::<PickerView>(
             PickerViewParams {
+                    view_id: None,
                 kind: PickerKind::Explorer,
                 reset: PickerReset::Keep,
                 offset: 0,
@@ -4203,6 +4227,7 @@ impl Session {
 
         self.request::<PickerView>(
             PickerViewParams {
+                    view_id: None,
                 kind,
                 reset: PickerReset::Keep,
                 offset,
@@ -4654,6 +4679,7 @@ impl Session {
 
                 Effects::one(Effect::PickerScrollReset).and(self.request::<PickerView>(
                     PickerViewParams {
+                            view_id: None,
                         kind: PickerKind::Explorer,
                         reset: PickerReset::Keep,
                         offset: 0,
@@ -6392,6 +6418,7 @@ impl Session {
                     first_visual_row: p.first_visual_row,
                     max_line_width: p.max_line_width,
                     git_status: p.git_status,
+                    other_elements_dirty: p.other_elements_dirty,
                     root: p.root,
                 });
                 // An in-window edit is also a change signal for the reading view.
@@ -6446,8 +6473,9 @@ impl Session {
                 // (and a legacy server omitting `path` never clobbers our label).
                 if let Some(new_path) = p.path {
                     if self.view.buffer.path.as_deref() != Some(new_path.as_str()) {
-                        self.view.buffer.label =
+                        let label =
                             super::session::label_for_path(&new_path, &self.workspace_paths);
+                        self.view.relabel_focused(label);
                         self.view.buffer.path = Some(new_path);
                     }
                 }
@@ -9608,10 +9636,25 @@ impl Session {
                 )
             }
             A::CloseBuffer => {
-                if self.view.buffer.revision != self.view.buffer.saved_revision {
+                // The whole **view**, not just the element under the cursor. A composed view holds
+                // several documents, and asking only about the focused one meant closing a
+                // working-changes view with unsaved edits in a hunk you had scrolled past went
+                // through without a word. (Nothing was lost — those files are separate buffers and
+                // stay open — but "close without asking" is not what the prompt is for.) The
+                // second term is the flag the status dot uses, so the prompt and the dot cannot
+                // disagree about whether the view is dirty.
+                let dirty = self.view.buffer.revision != self.view.buffer.saved_revision
+                    || self
+                        .view
+                        .window
+                        .as_ref()
+                        .is_some_and(|w| w.other_elements_dirty);
+                if dirty {
                     self.prompt = Some(Prompt::Confirm {
                         kind: ConfirmKind::DiscardOnClose {
-                            label: self.view.buffer.label.clone(),
+                            // The view's name: in a composed view the dirty document may not be
+                            // the focused one, so naming that file would point at the wrong thing.
+                            label: self.view.view_label.clone(),
                         },
                         action: ConfirmAction::CloseDiscard,
                     });

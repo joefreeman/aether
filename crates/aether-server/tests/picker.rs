@@ -13,6 +13,7 @@ async fn picker_view_returns_all_candidates_on_empty_query() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Files)
         },
@@ -72,6 +73,7 @@ async fn picker_query_restarts_the_window_at_the_top() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             offset: 2,
             limit: 2,
             ..view_params(PickerKind::Files)
@@ -125,6 +127,7 @@ fn keybindings_view_params(
     rows: Option<Vec<aether_protocol::picker::KeybindingEntry>>,
 ) -> PickerViewParams {
     PickerViewParams {
+            view_id: None,
         reset,
         limit: 30,
         keybindings: rows,
@@ -400,6 +403,7 @@ async fn git_changes_picker_lists_hunks_grouped_by_file() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::GitChanges)
         },
@@ -516,6 +520,7 @@ async fn git_changes_picker_collapses_untracked_directories() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::GitChanges)
         },
@@ -564,6 +569,7 @@ async fn git_changes_picker_hide_untracked() {
         let view = send_request::<PickerView>(
             ws,
             &PickerViewParams {
+                    view_id: None,
                 filters,
                 limit: 30,
                 ..view_params(PickerKind::GitChanges)
@@ -632,6 +638,7 @@ async fn git_changes_picker_reflects_unsaved_buffer_edits() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::GitChanges)
         },
@@ -706,6 +713,7 @@ async fn git_changes_file_is_locked_to_its_buffer() {
     .await;
 
     let view = |kind, buffer_id| PickerViewParams {
+            view_id: None,
         buffer_id,
         limit: 30,
         ..view_params(kind)
@@ -764,6 +772,7 @@ async fn changes_pickers_reopen_clean_and_rebuild_their_hunks() {
 
     let (server, mut ws, buffer_id) = setup_git_apply(&dir_path, "reopen-proj", "a.rs").await;
     let view = |kind, buffer_id| PickerViewParams {
+            view_id: None,
         buffer_id,
         limit: 30,
         ..view_params(kind)
@@ -838,6 +847,7 @@ async fn git_changes_picker_centers_on_the_cursor_hunk() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             center_on_cursor: Some(buffer_id),
             ..view_params(PickerKind::GitChanges)
@@ -892,6 +902,7 @@ async fn picker_set_group_expands_and_collapses_groups_independently() {
     let opened = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::GitChanges)
         },
@@ -998,6 +1009,7 @@ async fn picker_set_group_expands_and_collapses_groups_independently() {
     let after = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::GitChanges)
@@ -1056,6 +1068,7 @@ async fn picker_toggle_all_opens_then_closes_every_group() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -1086,6 +1099,7 @@ async fn picker_toggle_all_opens_then_closes_every_group() {
         send_request::<PickerView>(
             ws,
             &PickerViewParams {
+                    view_id: None,
                 limit: 30,
                 reset: PickerReset::Keep,
                 ..view_params(PickerKind::Grep)
@@ -1143,6 +1157,7 @@ async fn expansion_accumulates_across_spills_and_survives_a_requery() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -1179,6 +1194,7 @@ async fn expansion_accumulates_across_spills_and_survives_a_requery() {
     let after_spill = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::Grep)
@@ -1239,6 +1255,7 @@ async fn collapsible_window_mid_group_repeats_the_expanded_span() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -1274,6 +1291,7 @@ async fn collapsible_window_mid_group_repeats_the_expanded_span() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             offset: 3,
             limit: 4,
@@ -1318,6 +1336,7 @@ async fn jumplist_capture_includes_collapsed_hidden_hits() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -1387,6 +1406,7 @@ async fn git_changes_picker_query_greps_diff_content() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::GitChanges)
         },
@@ -1462,6 +1482,7 @@ async fn git_changes_picker_select_jumps_to_the_matched_line() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::GitChanges)
         },
@@ -1557,6 +1578,7 @@ async fn git_changes_keep_view_preserves_query_within_one_open() {
 
     // Open (fresh), search "marker", then hide.
     let open = |reset| PickerViewParams {
+            view_id: None,
         reset,
         limit: 30,
         ..view_params(PickerKind::GitChanges)
@@ -1613,6 +1635,7 @@ async fn git_changes_picker_query_is_a_regex() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::GitChanges)
         },
@@ -1687,6 +1710,7 @@ async fn git_changes_picker_filters_by_directory() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             filters: Some(PickerFilters {
                 directories: vec![ScopedPath {
                     path_index: 0,
@@ -1755,6 +1779,7 @@ async fn git_changes_picker_filters_by_exact_file() {
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             filters: Some(PickerFilters {
                 directories: vec![ScopedPath {
                     path_index: 0,
@@ -1788,6 +1813,7 @@ async fn picker_query_ranks_matches_and_carries_indices() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Files)
         },
@@ -1835,6 +1861,7 @@ async fn picker_select_returns_absolute_path() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Files)
         },
@@ -1891,6 +1918,7 @@ async fn picker_keep_view_centers_on_a_named_item() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Files)
         },
@@ -1914,6 +1942,7 @@ async fn picker_keep_view_centers_on_a_named_item() {
     let resume = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             limit: 30,
             center_on: Some(PickerItem::File {
@@ -1944,6 +1973,7 @@ async fn picker_reset_wipes_persisted_query() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Files)
         },
@@ -1973,6 +2003,7 @@ async fn picker_reset_wipes_persisted_query() {
     let reopened = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Files)
         },
@@ -2041,6 +2072,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Buffers)
         },
@@ -2110,6 +2142,7 @@ async fn buffers_picker_select_returns_buffer_id() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Buffers)
         },
@@ -2214,6 +2247,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Buffers)
         },
@@ -2325,6 +2359,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Buffers)
         },
@@ -2411,6 +2446,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Buffers)
         },
@@ -2513,6 +2549,7 @@ async fn buffers_picker_pushes_on_save() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Buffers)
         },
@@ -2582,6 +2619,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Buffers)
         },
@@ -2663,6 +2701,7 @@ async fn buffers_picker_mru_is_per_workspace_across_clients() {
     let _ = send_request::<PickerView>(
         &mut ws_b,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Buffers)
         },
@@ -2727,6 +2766,7 @@ async fn picker_explorer_default_lists_workspace_root() {
     let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Explorer)
         },
@@ -2768,6 +2808,7 @@ async fn picker_explorer_navigate_into_subdirectory() {
     let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             directory_path: Some(target.display().to_string()),
             ..view_params(PickerKind::Explorer)
@@ -2804,6 +2845,7 @@ async fn picker_explorer_query_filters_by_prefix() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Explorer)
         },
@@ -2856,6 +2898,7 @@ async fn picker_explorer_query_rejects_non_prefix_substring() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Explorer)
         },
@@ -2909,6 +2952,7 @@ async fn setup_peek_workspace() -> (aether_server::ServerHandle, Ws, std::path::
     let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Explorer)
         },
@@ -3103,6 +3147,7 @@ async fn picker_explorer_peek_survives_refetch_and_keeps_anchor() {
     let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             limit: 30,
             ..view_params(PickerKind::Explorer)
@@ -3137,6 +3182,7 @@ async fn picker_explorer_empty_query_restores_full_listing() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Explorer)
         },
@@ -3190,6 +3236,7 @@ async fn picker_explorer_query_is_smartcase() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Explorer)
         },
@@ -3244,6 +3291,7 @@ async fn picker_explorer_select_file_returns_absolute_path() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             directory_path: Some(target.display().to_string()),
             ..view_params(PickerKind::Explorer)
@@ -3285,6 +3333,7 @@ async fn picker_explorer_select_directory_errors() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Explorer)
         },
@@ -3320,6 +3369,7 @@ async fn picker_explorer_rejects_path_outside_workspace() {
     let err = send_request_expect_err::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             directory_path: Some("/etc".into()),
             ..view_params(PickerKind::Explorer)
@@ -3663,6 +3713,7 @@ async fn picker_explorer_resumes_last_directory() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             directory_path: Some(target.display().to_string()),
             ..view_params(PickerKind::Explorer)
@@ -3682,6 +3733,7 @@ async fn picker_explorer_resumes_last_directory() {
     let view2: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             limit: 30,
             ..view_params(PickerKind::Explorer)
@@ -3755,6 +3807,7 @@ async fn picker_explorer_tags_entries_with_git_status() {
     let _view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Explorer)
         },
@@ -3849,6 +3902,7 @@ async fn picker_grep_invalid_regex_yields_no_hits() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             ..view_params(PickerKind::Grep)
         },
@@ -4358,6 +4412,7 @@ async fn grep_keep_view_echoes_filters_and_all_wipes_them() {
     let resume: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::Grep)
         },
@@ -4397,6 +4452,7 @@ async fn grep_view_with_filters_replaces_and_drops_stale_hits() {
     let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             filters: Some(scoped.clone()),
             reset: PickerReset::Keep,
             ..view_params(PickerKind::Grep)
@@ -4756,6 +4812,7 @@ async fn explorer_filters_hide_and_changed_only() {
         let _ = send_request::<PickerView>(
             ws,
             &PickerViewParams {
+                    view_id: None,
                 filters,
                 reset: PickerReset::Keep,
                 ..view_params(PickerKind::Explorer)

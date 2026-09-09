@@ -462,6 +462,9 @@ interface CoreView {
   /** What this view *is* — what `viewport/subscribe` and `buffer/close` address. Distinct from
    *  `buffer`, which is the buffer currently being edited; a patch is one view over many files. */
   view_id: number;
+  /** What to call the view in the status bar and the tab title. The view's own label, which focus
+   *  does not move — `buffer.label` is the focused element's file and changes on every `Tab`. */
+  view_label: string;
   /** Which editor element holds the cursor — see `grid::line_is_loaded`. */
   focused_element: number;
   buffer: {
@@ -612,7 +615,13 @@ function bufferStateColor(v: CoreView): string | null {
   const light = v.theme === "light";
   if (v.externally_deleted) return "#bf616a"; // state-deleted (NORD11 in both themes)
   if (v.externally_modified) return light ? "#ab5f38" : "#d08770"; // state-changed
-  if (v.buffer.revision !== v.buffer.saved_revision) return light ? "#5e81ac" : "#81a1c1"; // state-unsaved
+  // Focused buffer's own compare, or any other element of the view — unsaved edits in a hunk
+  // scrolled past were invisible while this only asked the buffer under the cursor.
+  if (
+    v.buffer.revision !== v.buffer.saved_revision ||
+    v.window?.other_elements_dirty === true
+  )
+    return light ? "#5e81ac" : "#81a1c1"; // state-unsaved
   return null;
 }
 
@@ -5044,7 +5053,7 @@ export class Shell {
       charBudget(this.statusEl.clientWidth * 0.5, `${barStyle.fontSize} ${barStyle.fontFamily}`) -
         [...proj].length,
     );
-    name.textContent = truncatePath(v.buffer.label, undefined, labelBudget).display;
+    name.textContent = truncatePath(v.view_label, undefined, labelBudget).display;
     used += [...name.textContent].length;
     fileGroup.append(name);
     left.append(fileGroup);
@@ -5235,8 +5244,8 @@ export class Shell {
     // would make the browser display the raw URL. The label is segment-elided to the same fixed cap
     // as the native titles (aether-client's TITLE_LABEL_MAX) so an external file's absolute path
     // doesn't overflow the tab title.
-    const titleLabel = v.buffer.label
-      ? truncatePath(v.buffer.label, undefined, TITLE_LABEL_MAX).display
+    const titleLabel = v.view_label
+      ? truncatePath(v.view_label, undefined, TITLE_LABEL_MAX).display
       : "";
     document.title = showsWorkspaceChrome(v.workspace)
       ? titleLabel

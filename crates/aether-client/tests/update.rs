@@ -213,6 +213,7 @@ fn goto_line_from_end_counts_up_from_the_bottom() {
     // The client needs the buffer's line count (carried on the window) to count from the bottom.
     let mut s = session();
     s.view.window = Some(Window {
+            other_elements_dirty: false,
         first_view_line: ViewLine(0),
         last_view_line_exclusive: ViewLine(40),
         view_line_count: 100,
@@ -2828,6 +2829,7 @@ fn diff_toggle_toast_is_grouped() {
     // updates one toast instead of stacking on/off pairs.
     let mut s = session();
     let window = Window {
+            other_elements_dirty: false,
         first_view_line: ViewLine(0),
         last_view_line_exclusive: ViewLine(0),
         view_line_count: 0,
@@ -6373,6 +6375,7 @@ fn abandoning_a_stopped_operation_confirms_and_names_it() {
     use aether_protocol::viewport::Window;
 
     let window = |operation| Window {
+            other_elements_dirty: false,
         first_view_line: ViewLine(0),
         last_view_line_exclusive: ViewLine(1),
         view_line_count: 1,
@@ -12720,6 +12723,7 @@ fn subscribe_over(
         buffer_status: Default::default(),
         focus,
         window: Window {
+                other_elements_dirty: false,
             first_view_line: ViewLine(0),
             last_view_line_exclusive: ViewLine(3),
             view_line_count: 3,
@@ -12771,6 +12775,7 @@ fn focus_on(
             read_only: false,
             is_patch: false,
         },
+        buffer_status: Default::default(),
     }
 }
 
@@ -12801,6 +12806,86 @@ fn subscribing_to_a_composed_view_binds_to_its_elements_buffer() {
     assert_ne!(
         view_buffer, 9,
         "the fixture is only meaningful if they differ"
+    );
+}
+
+/// `Tab` carries the new element's buffer-level status with it — breadcrumb, diagnostic counts,
+/// language-server health, external-change flags.
+///
+/// All four are facts about the buffer the cursor is in, and crossing an element crosses into
+/// another buffer. The reply used to carry only the element and its buffer, so the status bar went
+/// on describing the hunk you had just left: the pushes that would have corrected it
+/// (`lsp/symbol_path_changed`, `lsp/diagnostics_changed`) are keyed to a buffer *and* only fire on a
+/// change, so nothing arrived until something unrelated moved. Raw JSON deliberately — this is the
+/// wire shape, and a rename that breaks it should fail here rather than in the status bar.
+#[test]
+fn focusing_another_element_adopts_its_buffer_status() {
+    let mut s = session();
+    s.adopt_subscribe(subscribe_over(9, Some(focus_on(0, 9, 17))));
+    // Element 0's status, as a subscribe would have left it.
+    s.view.symbol_path = vec![aether_protocol::lsp::SymbolCrumb {
+        name: "fn left_behind".into(),
+        kind: aether_protocol::picker::SymbolKind::Function,
+    }];
+    s.view.diagnostics = aether_protocol::lsp::DiagnosticCounts {
+        errors: 7,
+        ..Default::default()
+    };
+
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None, ROWS);
+    let token = fx
+        .0
+        .iter()
+        .find_map(|e| match e {
+            Effect::Request { token, method, .. } if *method == "view/focus_element" => {
+                Some(*token)
+            }
+            _ => None,
+        })
+        .expect("Tab focuses the next element");
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "element": 1,
+            "buffer": {
+                "buffer_id": 11,
+                "language": null,
+                "line_count": 40,
+                "byte_count": 400,
+                "revision": 1,
+                "saved_revision": 1,
+                "path": "/repo/b.rs",
+                "cursor": {
+                    "position": {"line": 3, "col": 0},
+                    "anchor": {"line": 3, "col": 0},
+                },
+                "transient": false,
+                "read_only": false,
+                "is_patch": false,
+            },
+            "buffer_status": {
+                "externally_modified": true,
+                "externally_deleted": false,
+                "diagnostics": {"errors": 1, "warnings": 2, "infos": 0, "hints": 0},
+                "symbol_path": [{"name": "fn arrived", "kind": "function"}],
+            },
+        })),
+    );
+
+    assert_eq!(s.view.buffer.buffer_id, 11, "focus crossed into b.rs");
+    assert_eq!(
+        s.view.symbol_path.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        ["fn arrived"],
+        "the breadcrumb is the new element's, not the one Tab left"
+    );
+    assert_eq!(
+        (s.view.diagnostics.errors, s.view.diagnostics.warnings),
+        (1, 2),
+        "and so are the diagnostic counts"
+    );
+    assert!(
+        s.view.externally_modified,
+        "and the external-change flags, which are per file too"
     );
 }
 
@@ -12889,4 +12974,43 @@ fn a_press_in_the_focused_element_only_sets_the_cursor() {
             .collect::<Vec<_>>(),
         vec!["element/set"]
     );
+}
+
+/// `Space x` on a composed view asks about the **view**, not the element under the cursor.
+///
+/// A working-changes view holds several documents. Guarding on the focused one meant closing it with
+/// unsaved edits in a hunk you had scrolled past went through without a word — nothing was lost
+/// (those files are separate buffers and stay open), but a confirm that only sometimes appears is
+/// worse than one that always does. The second term is the same flag the status dot reads, so the
+/// prompt and the dot cannot disagree about whether the view is dirty.
+#[test]
+fn closing_a_composed_view_asks_about_unsaved_edits_in_any_element() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    let mut s = session();
+    s.adopt_subscribe(subscribe_over(9, Some(focus_on(0, 9, 17))));
+    // The focused element is clean...
+    s.view.buffer.revision = 1;
+    s.view.buffer.saved_revision = 1;
+    // ...but another element of the same view is not.
+    if let Some(w) = s.view.window.as_mut() {
+        w.other_elements_dirty = true;
+    }
+
+    //  — close is a leader chord; bare  selects a line.
+    s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()), ROWS);
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()), ROWS);
+    assert!(
+        find_request(&fx, "buffer/close").is_none(),
+        "a dirty view must stage a confirm rather than closing straight away"
+    );
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::DiscardOnClose { label },
+            ..
+        }) => assert_eq!(
+            label, &s.view.view_label,
+            "the prompt names the view — the dirty document may not be the focused one"
+        ),
+        other => panic!("expected a discard-on-close confirm, got {other:?}"),
+    }
 }

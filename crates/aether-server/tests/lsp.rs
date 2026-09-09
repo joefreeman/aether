@@ -366,6 +366,7 @@ async fn wait_for_buffer_diagnostic(
         let view: PickerViewResult = send_request::<PickerView>(
             ws,
             &PickerViewParams {
+                    view_id: None,
                 buffer_id: Some(buffer_id),
                 ..view_params(PickerKind::Diagnostics)
             },
@@ -395,6 +396,7 @@ async fn wait_for_buffer_diag_present(ws: &mut Ws, buffer_id: u64, want: bool) {
         let view: PickerViewResult = send_request::<PickerView>(
             ws,
             &PickerViewParams {
+                    view_id: None,
                 buffer_id: Some(buffer_id),
                 ..view_params(PickerKind::Diagnostics)
             },
@@ -519,6 +521,7 @@ async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
         let view = send_request::<PickerView>(
             ws,
             &PickerViewParams {
+                    view_id: None,
                 reset: PickerReset::Keep,
                 ..view_params(PickerKind::WorkspaceSymbols)
             },
@@ -545,6 +548,7 @@ async fn workspace_symbol_rows(ws: &mut Ws, query: &str) -> Vec<PickerItem> {
                 let view = send_request::<PickerView>(
                     ws,
                     &PickerViewParams {
+                            view_id: None,
                         reset: PickerReset::Keep,
                         ..view_params(PickerKind::WorkspaceSymbols)
                     },
@@ -802,6 +806,7 @@ async fn poll_symbol_view(ws: &mut Ws, done: impl Fn(&[PickerItem]) -> bool) -> 
         let view = send_request::<PickerView>(
             ws,
             &PickerViewParams {
+                    view_id: None,
                 reset: PickerReset::Keep,
                 ..view_params(PickerKind::WorkspaceSymbols)
             },
@@ -949,6 +954,7 @@ async fn workspace_symbol_dir_scope_prunes_the_fanout_and_filter_changes_reuse_i
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::WorkspaceSymbols)
         },
@@ -962,6 +968,7 @@ async fn workspace_symbol_dir_scope_prunes_the_fanout_and_filter_changes_reuse_i
     let view = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::WorkspaceSymbols)
         },
@@ -1183,6 +1190,7 @@ async fn workspace_symbols_capture_to_the_jumplist() {
     let items = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             reset: PickerReset::Keep,
             ..view_params(PickerKind::WorkspaceSymbols)
         },
@@ -1341,6 +1349,7 @@ async fn workspace_symbol_groups_stay_contiguous_and_step_to_every_file() {
     .await;
 
     let view = |reset| PickerViewParams {
+            view_id: None,
         reset,
         ..view_params(PickerKind::WorkspaceSymbols)
     };
@@ -2163,6 +2172,7 @@ async fn references_picker_lists_all_uses() {
             let view = send_request::<PickerView>(
                 &mut ws,
                 &PickerViewParams {
+                        view_id: None,
                     limit: 30,
                     buffer_id: Some(buffer_id),
                     ..view_params(PickerKind::References)
@@ -2302,6 +2312,7 @@ async fn references_picker_waits_out_a_starting_server() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             buffer_id: Some(buffer_id),
             ..view_params(PickerKind::References)
@@ -2376,6 +2387,7 @@ async fn document_symbols_picker_fills_and_centers_deep() {
     let _ = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
+                view_id: None,
             limit: 30,
             buffer_id: Some(buffer_id),
             ..view_params(PickerKind::DocumentSymbols)
@@ -3579,5 +3591,102 @@ async fn navigate_diagnostic_refuses_one_outside_the_focused_hunk() {
         scoped.cursor.position.line, 20,
         "and the cursor stays put rather than sliding to the element's edge"
     );
+    drop(server);
+}
+
+/// `Space d` in a working-changes view lists diagnostics for **everything the view shows**.
+///
+/// Listings are view-wide: the plain/Alt pair already means "here" vs "the workspace", and once
+/// "here" is the view, a composed one answers for every file being reviewed rather than for the
+/// hunk the cursor happens to be in. An ordinary view is a fan-out over a set of one, so nothing
+/// changes there — which is the property that makes this safe to define at view level.
+#[tokio::test]
+async fn the_diagnostics_picker_covers_every_file_a_view_shows() {
+    use aether_protocol::picker::{
+        PickerItem, PickerKind, PickerView, PickerViewParams, PickerViewResult,
+    };
+    use aether_server::{DummyDiagnostic, DummyLspConfig, DummyRange};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    for name in ["one.rs", "two.rs"] {
+        commit_file(&repo, name, "fn a() {}\nfn b() {}\nfn c() {}\n");
+        std::fs::write(root.join(name), "fn CHANGED() {}\nfn b() {}\nfn c() {}\n").unwrap();
+    }
+
+    // The dummy answers for every document it opens, so each windowed file gets one diagnostic —
+    // which is exactly what makes the count the assertion.
+    let dummy = DummyLspConfig {
+        diagnostics: vec![DummyDiagnostic {
+            range: DummyRange::on(0, 3, 10),
+            severity: 1,
+            message: "dummy problem".into(),
+        }],
+        ..Default::default()
+    };
+    let server = aether_server::spawn_for_test_with_lsp(
+        "viewdiag",
+        vec![root.clone()],
+        vec![("rust".into(), dummy)],
+    )
+    .await
+    .unwrap();
+    let mut ws = Ws::connect(&server).await;
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "viewdiag".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    let patch = show_buffer(
+        &mut ws,
+        &aether_protocol::git::GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: aether_protocol::git::ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let view_id = aether_protocol::ViewId(patch.buffer_id);
+
+    // Poll: the two files' servers publish asynchronously.
+    let mut view_wide = 0usize;
+    for _ in 0..100u64 {
+        let view: PickerViewResult = send_request::<PickerView>(
+            &mut ws,
+            &PickerViewParams {
+                view_id: Some(view_id),
+                buffer_id: Some(patch.buffer_id),
+                ..view_params(PickerKind::Diagnostics)
+            },
+        )
+        .await;
+        view_wide = view
+            .update
+            .map(|u| {
+                u.items()
+                    .iter()
+                    .filter(|it| matches!(it, PickerItem::Diagnostic { message, .. } if message == "dummy problem"))
+                    .count()
+            })
+            .unwrap_or(0);
+        if view_wide >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        view_wide >= 2,
+        "the view shows two files, each with a diagnostic — `Space d` must list both, got \
+         {view_wide}"
+    );
+
     drop(server);
 }

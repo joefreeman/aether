@@ -1246,6 +1246,21 @@ pub struct PickerViewParams {
     /// Also carries the active buffer for [`PickerViewParams::from_selection`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_id: Option<BufferId>,
+    /// The **view** the listing kinds list for, when it differs from [`Self::buffer_id`].
+    ///
+    /// Listings go view-wide: `Space d` and `Space c` in a composed view answer for everything the
+    /// view is showing, not just the hunk the cursor happens to be in. `buffer_id` cannot say that —
+    /// it is the focused element's buffer, and in a working-changes view that is one file of many.
+    ///
+    /// Carried *beside* `buffer_id` rather than replacing it, because the other kinds that take a
+    /// buffer want the focused one: `GitBranches` and `GitLog` resolve a repo from it, `GitLogFile`
+    /// takes a path, and a from-selection grep slices that buffer's selection. Sending one id for
+    /// two questions is what made this ambiguous in the first place.
+    ///
+    /// `None` from a client that doesn't send it, and for an ordinary view, where the view *is* the
+    /// buffer and the fan-out would be over a set of one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<crate::ViewId>,
     /// Grep only (`Space Alt-/`): derive the initial query from `buffer_id`'s selection — the
     /// grep equivalent of `Alt-/`. The server slices the selection text, installs it as the
     /// query (literally, like the rest of grep), and kicks off the search in this same call;

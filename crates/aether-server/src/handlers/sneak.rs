@@ -501,6 +501,7 @@ pub fn collect_viewport_refresh(
             view_line_count: window.view_line_count,
             max_scroll_view_line: window.max_scroll_view_line,
             git_status: window.git_status,
+            other_elements_dirty: window.other_elements_dirty,
             cursor: lines_changed_cursor(s, vp),
         };
         pushes.push((

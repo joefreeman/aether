@@ -2,6 +2,37 @@
 
 use super::*;
 
+/// Every buffer a **view** shows, in view order, each named once.
+///
+/// The set a listing kind fans out over. For an ordinary view it is `[focused]` and the fan-out is
+/// a loop of one — which is the whole point of defining these at view level: a one-element view
+/// keeps behaving exactly as it did, so a regression can only be a regression in composed views.
+///
+/// Falls back to `[focused]` when the client sent no view id, which covers an older client and the
+/// re-view calls that carry no ids at all. Duplicates are dropped: two hunks of one file are two
+/// elements over one buffer, and its diagnostics should be listed once.
+fn view_element_buffers(
+    s: &ServerState,
+    view_id: Option<aether_protocol::ViewId>,
+    focused: BufferId,
+) -> Vec<BufferId> {
+    let Some(view) = view_id else {
+        return vec![focused];
+    };
+    let view_buffer = view.presenting_buffer();
+    let mut out: Vec<BufferId> = Vec::new();
+    for layout in s.element_layout_of(view_buffer) {
+        let id = layout.extent.buffer(view_buffer);
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    if out.is_empty() {
+        out.push(focused);
+    }
+    out
+}
+
 /// Build the buffer-picker candidate list for `client_id`: every buffer belonging to the
 /// client's active workspace, MRU first, then any workspace buffers the client hasn't touched yet
 /// (e.g. opened by another client of the same workspace) in buffer-id order. `(scratch N)`
@@ -1438,12 +1469,17 @@ pub async fn picker_view(
             picker_state::PickerCandidates::Workspaces(workspace_candidates(&s, &names))
         }
         PickerKind::Diagnostics => match params.buffer_id {
-            // Fresh open: build from the buffer's current diagnostics.
+            // Fresh open: build from the current diagnostics of everything the **view** shows.
+            // For an ordinary view that is one buffer and nothing changes; for a working-changes
+            // view it is every file being reviewed, which is what "here" means once "here" is a
+            // view rather than a buffer.
             Some(buffer_id) => {
                 let s = state.lock().await;
-                picker_state::PickerCandidates::Diagnostics(build_diagnostic_candidates(
-                    &s, buffer_id,
-                ))
+                let mut out = Vec::new();
+                for id in view_element_buffers(&s, params.view_id, buffer_id) {
+                    out.extend(build_diagnostic_candidates(&s, id));
+                }
+                picker_state::PickerCandidates::Diagnostics(out)
             }
             // Resume / scroll re-view: an empty placeholder; `preserve_existing` keeps the snapshot.
             None => picker_state::PickerCandidates::Diagnostics(Vec::new()),
@@ -1552,13 +1588,19 @@ pub async fn picker_view(
             // keeps the snapshot.
             // A patch buffer answers the same question with its own hunks — it *is* a set of
             // changes, just one spanning several files rather than one file's working tree.
-            let patch_rows = match params.buffer_id {
-                Some(buffer_id) => {
+            //
+            // Asked of the **view**, not the focused element. This arm existed already and was
+            // almost unreachable: the client sent the focused element's buffer, which in a
+            // working-changes view is one of the *files*, so `Space c` there listed that file's
+            // hunks and called it "here". The view's own document is the patch, and its changes are
+            // the whole review — which is the view-wide answer, from rows that already existed.
+            let patch_rows = match params.view_id.map(|v| v.presenting_buffer()) {
+                Some(view_buffer) => {
                     let s = state.lock().await;
-                    s.try_doc_of(buffer_id).and_then(|d| {
+                    s.try_doc_of(view_buffer).and_then(|d| {
                         d.generated
                             .as_ref()
-                            .map(|g| build_patch_change_candidates(buffer_id, g, &d.text))
+                            .map(|g| build_patch_change_candidates(view_buffer, g, &d.text))
                     })
                 }
                 None => None,

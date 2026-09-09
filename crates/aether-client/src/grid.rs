@@ -984,6 +984,7 @@ mod tests {
     fn window(first_logical: u32, first_visual: u32, lines: Vec<LogicalLineRender>) -> Window {
         let last = first_logical + lines.len() as u32;
         Window {
+                other_elements_dirty: false,
             first_view_line: ViewLine(first_logical),
             last_view_line_exclusive: ViewLine(last),
             view_line_count: 100,
@@ -1332,6 +1333,7 @@ mod tests {
         let lines: Vec<LogicalLineRender> =
             (16..20).map(|i| line(i, vec![row(0, 0, "x")])).collect();
         let window = Window {
+                other_elements_dirty: false,
             first_view_line: ViewLine(0),
             last_view_line_exclusive: ViewLine(4),
             view_line_count: 4,

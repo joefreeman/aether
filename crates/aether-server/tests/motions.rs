@@ -7698,3 +7698,135 @@ async fn moving_a_paragraph_cannot_reach_outside_the_hunk() {
     );
     drop(server);
 }
+
+/// `z` must not teleport between two hunks of the same file.
+///
+/// Motion history is keyed `(client, buffer)`, deliberately — two views of one file share a cursor
+/// so reader↔editor toggling is lossless. The cost is that two *elements* over one file share it
+/// too, so the positions of the hunk you are not in sit in the same list. Restoring one puts the
+/// cursor outside the focused element, where nothing draws it: the screen does not move and the next
+/// motion starts from somewhere invisible.
+///
+/// `z` is a target motion, so it refuses rather than clamping, and refusing leaves the entry in
+/// place — `Tab` back and the same `z` works.
+#[tokio::test]
+async fn motion_undo_refuses_a_position_in_another_hunk() {
+    use aether_protocol::cursor::{CursorUndo, CursorUndoParams};
+    use aether_protocol::viewport::{FocusStep, FocusTarget, ViewportFocusElement,
+        ViewportFocusElementParams, ViewportFocusElementResult};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let mut lines: Vec<String> = (0..40).map(|n| format!("fn line{n}() {{}}")).collect();
+    let committed = format!("{}\n", lines.join("\n"));
+    commit_file(&repo, "a.rs", &committed);
+    // Two changes far enough apart that git makes them two hunks of the *same* file.
+    lines[8] = "fn FIRST() {}".into();
+    lines[32] = "fn SECOND() {}".into();
+    std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: BufferOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            buffer_id: aether_protocol::ViewId(opened.buffer_id),
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                logical_line: ViewLine(0),
+                sub_row: 0.0,
+            },
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    async fn focus(
+        ws: &mut Ws,
+        viewport_id: aether_protocol::ViewportId,
+        target: FocusTarget,
+    ) -> ViewportFocusElementResult {
+        send_request::<ViewportFocusElement>(
+            ws,
+            &ViewportFocusElementParams {
+                viewport_id,
+                target,
+            },
+        )
+        .await
+    }
+
+    // Land in the first hunk and move about, so the history fills with its lines.
+    let first = focus(&mut ws, sub.viewport_id, FocusTarget::Element { element: 0 }).await;
+    let buffer_id = first.buffer.buffer_id;
+    let mut in_first = first.buffer.cursor.position;
+    for _ in 0..2 {
+        let st: CursorState = send_request::<CursorMove>(
+            &mut ws,
+            &CursorMoveParams {
+                buffer_id,
+                motion: Motion::LogicalLine {
+                    direction: Direction::Forward,
+                    count: 1,
+                    preserve_col: false,
+                },
+                extend_selection: false,
+            },
+        )
+        .await;
+        in_first = st.position;
+    }
+
+    // Step to the second hunk. Both window the same file, so they share the history above.
+    let second = focus(
+        &mut ws,
+        sub.viewport_id,
+        FocusTarget::Step {
+            direction: FocusStep::Next,
+        },
+    )
+    .await;
+    assert_eq!(
+        second.buffer.buffer_id, buffer_id,
+        "both hunks must window the same file, or the histories are not shared and this proves nothing"
+    );
+    let landed = second.buffer.cursor.position;
+    assert!(
+        landed.line > in_first.line + 1,
+        "the two hunks must be far apart: first at {in_first:?}, second at {landed:?}"
+    );
+
+    let undone: aether_protocol::cursor::CursorUndoResult = send_request::<CursorUndo>(
+        &mut ws,
+        &CursorUndoParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+
+    assert!(
+        !undone.applied,
+        "the history's next entry is in the other hunk — `z` must refuse it"
+    );
+    assert_eq!(
+        undone.cursor.position, landed,
+        "and refusing means the cursor does not move at all"
+    );
+    drop(server);
+}

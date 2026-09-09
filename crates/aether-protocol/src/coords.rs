@@ -36,8 +36,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// Only meaningful against the view it came from. It is not a line of any buffer, and for a view of
 /// several elements it usually is not even close to one — element 3's first view line might be 40
-/// while the file it windows calls that same line 7. Resolve it with
-/// [`crate::viewport::ViewLayout::resolve`].
+/// while the file it windows calls that same line 7. Resolve it server-side with
+/// `ViewLayout::intersect` (a view-line range to an element's buffer-line range) or
+/// `ViewLayout::element_at` (a single view line to the element holding it).
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]

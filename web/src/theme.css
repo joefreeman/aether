@@ -283,7 +283,7 @@ html, body, #app {
 }
 
 /* Source Serif 4 (OFL, see fonts/OFL-SourceSerif4.txt): the reading view's body face
-   (docs/markdown-view.md §2.8). Regular/Italic for prose, Semibold (600) for headings, Bold for
+   Regular/Italic for prose, Semibold (600) for headings, Bold for
    strong runs — all bundled so reading looks the same on every machine. */
 @font-face {
   font-family: "Source Serif 4";
@@ -523,7 +523,7 @@ html, body, #app {
   color: var(--fg-bright);
 }
 
-/* The hint corner (docs/hints.md): a quiet top-right "Hint: …" chip, sentence dim with the
+/* The hint corner: a quiet top-right "Hint: …" chip, sentence dim with the
    key label emphasized. Deliberately subtler than a toast (no shadow, no animation): ambient
    chrome, not a notification. Plain inline flow — the sentence is text nodes around a key span. */
 #hint-corner {
@@ -1210,7 +1210,7 @@ html, body, #app {
   min-width: 0;
   padding: 0;
 }
-/* Filter chips, left of the query (docs/picker-filters.md). Selection is virtual (focus stays
+/* Filter chips, left of the query. Selection is virtual (focus stays
    on the input); the inverted chip is the focus indicator. Exclude globs (leading !) tint red. */
 .picker-chips {
   display: flex;
@@ -1491,7 +1491,7 @@ a.picker-row:not(.selected):hover .picker-main {
    below). Must stay equal to shell.ts's GROUP_GAP_PX: the shell adds the same pixels to the
    spacer height and window offset so the virtual scroll stays honest. */
 .picker-section:not(:last-child) { margin-bottom: 6px; }
-/* Collapsible kinds (docs/picker-groups.md): headers are real, selectable window rows — restore
+/* Collapsible kinds: headers are real, selectable window rows — restore
    the flex row layout (the derived headers are block + ellipsis), pointer cursor, no
    inter-section gap (headers are uniform rows, so the geometry carries no gap pixels), and the
    selection band must win over the header backdrop (the base header rule sets nord1 later in
@@ -1503,7 +1503,7 @@ a.picker-row:not(.selected):hover .picker-main {
   gap: 6px;
   cursor: pointer;
   /* Not bold (unlike the derived section headers): the item indent under the header carries
-     the hierarchy; NORD8 alone marks the row as chrome (docs/picker-groups.md §9.2). */
+     the hierarchy; NORD8 alone marks the row as chrome. */
   font-weight: normal;
 }
 .picker-list.collapsible .picker-row.picker-group-header .picker-main {
@@ -1511,7 +1511,7 @@ a.picker-row:not(.selected):hover .picker-main {
   text-overflow: ellipsis;
 }
 /* Fixed-width mark cell so the header text starts at a known x — the item indent below lines
-   item text up under it (docs/picker-groups.md §9). */
+   item text up under it. */
 .picker-list.collapsible .picker-row.picker-group-header .picker-group-mark { flex: 0 0 auto; width: 1em; }
 /* Two-level hierarchy: item rows indent under their group header's text — the mark cell + the
    header's 6px flex gap past the row's base 12px padding. Headers start flush. */
@@ -1856,7 +1856,7 @@ a.picker-row:not(.selected):hover .picker-main {
 .md-read li.md-task.md-focus::before {
   left: calc(-0.3em - 0.9rem);
 }
-/* A loose item's children are reading stops of their own (docs/markdown-view.md §12.6), so each
+/* A loose item's children are reading stops of their own, so each
    carries its own bar — but that bar can't ride the shared gutter: the space belongs to the
    item's marker, and at -0.9rem the bar paints straight over the bullet (measured: the browser
    leaves ~14px between bullet and text at the reading size, and the bar is 3 of them). The
@@ -1900,7 +1900,7 @@ a.picker-row:not(.selected):hover .picker-main {
 .md-read blockquote li.md-task.md-focus::before {
   left: calc(-0.3em - 0.6rem);
 }
-/* The extended block selection (docs/markdown-view.md §12): the editor's selection shade over
+/* The extended block selection: the editor's selection shade over
    every selected block — same node list as the focus bar, so inline spans never paint. The
    core suppresses the target pill while a selection is extended. */
 .md-read :where(p, h1, h2, h3, h4, h5, h6, li, blockquote, .md-codeblock, .md-table-outer,
