@@ -70,6 +70,17 @@ at the cursor.
 | `}`/`{` | Next/previous jumplist entry in this file |
 | `Tab`/`Shift-Tab` | Focus the next/previous editor element (a patch's hunks) |
 
+### Scrolling
+
+These move the view, not the cursor, and work the same in the reading view.
+
+| Key | Action |
+| --- | --- |
+| `PageUp`/`PageDown` | Scroll a page up/down |
+| `Alt-↑`/`Alt-↓` | Scroll half a page up/down |
+| `↑`/`↓` | Scroll one line up/down |
+| `←`/`→` | Scroll one column left/right (in the reading view, the focused code block) |
+
 ### Selection & history (normal mode)
 
 | Key | Action |
@@ -107,6 +118,7 @@ identical in both.
 | --- | --- | --- |
 | `Ctrl-e` | Change selection | Change line |
 | `Ctrl-d` | Delete selection | Delete line |
+| `Delete` | Delete selection | Delete character at cursor |
 | `Ctrl-c` | Copy selection | Copy line |
 | `Ctrl-x` | Cut selection | Cut line |
 | `Ctrl-Alt-x` | Cut selection and insert | — |

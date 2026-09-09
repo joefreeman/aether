@@ -1436,6 +1436,167 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('t'), Exact(Mods::ALT), A::GitStashPush { staged: true }, "Git", "Stash staged changes"),
 ];
 
+/// README ↔ keymap parity.
+///
+/// The README's keybinding tables are the only user-facing record of the keymap, and nothing but
+/// this module has ever checked them against it — the tables drifted at 0.4.0 prep and were swept
+/// by hand. Both directions are checked, because the two failures look nothing alike: a binding
+/// that changes chord leaves a *stale* README row, while a new binding leaves a *missing* one.
+#[cfg(test)]
+mod readme_parity {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    const README: &str = include_str!("../../../README.md");
+
+    /// Chords the README lists that are deliberately not `Binding`s. Each needs a reason, because
+    /// the cheap way to make this test pass is to add a line here.
+    const README_ONLY: &[(&str, &str)] = &[
+        // Shift is not a binding: it is read separately as "extend" (`ModPattern::IgnoreShift`),
+        // so `Shift-j` is the `j` binding with a modifier the table never sees.
+        ("Shift-j", "Shift means extend; read outside the table"),
+        ("Shift-k", "Shift means extend; read outside the table"),
+    ];
+
+    /// Bindings deliberately absent from the README: aliases and internals already carry `group:
+    /// ""`, so anything here is a binding that *is* user-facing but documented in prose instead.
+    const KEYMAP_ONLY: &[(&str, &str)] = &[];
+
+    /// Backticked spans in the `## Keybindings` section, split by where they sit.
+    ///
+    /// The two halves answer different questions and are deliberately not one set:
+    ///
+    /// - **`rows`** — the first cell of each table row. A row *asserts* that a chord is bound, so
+    ///   it can go stale, and that is the strict direction.
+    /// - **`prose`** — the paragraphs between the tables, which document real bindings the tables
+    ///   do not itemise (insert-mode word motions, the search-prompt toggles). They document
+    ///   without asserting a table shape, so they count as coverage but are never checked for
+    ///   staleness — a prose backtick is as likely to be a filename as a chord.
+    ///
+    /// Table *descriptions* are in neither: the jumplist row cites `Ctrl-j` as a cross-reference,
+    /// not as a claim that `Ctrl-j` is bound here.
+    fn readme_chords() -> (BTreeSet<String>, BTreeSet<String>) {
+        let (mut rows, mut prose) = (BTreeSet::new(), BTreeSet::new());
+        let mut in_keybindings = false;
+        for line in README.lines() {
+            if let Some(h) = line.strip_prefix("## ") {
+                in_keybindings = h.trim() == "Keybindings";
+                continue;
+            }
+            if !in_keybindings {
+                continue;
+            }
+            // Header (`| Key | Action |`) and separator (`| --- |`) rows carry no backticks, so
+            // they contribute nothing and need no special case.
+            let (text, sink) = if line.starts_with('|') {
+                (
+                    line.trim_start_matches('|').split('|').next().unwrap_or(""),
+                    &mut rows,
+                )
+            } else {
+                (line, &mut prose)
+            };
+            for span in text.split('`').skip(1).step_by(2) {
+                let chord = span.trim();
+                if !chord.is_empty() {
+                    sink.insert(chord.to_string());
+                }
+            }
+        }
+        (rows, prose)
+    }
+
+    /// Every chord the keymap binds and expects to be documented. `group: ""` marks a binding as
+    /// hidden from the help overlay — an alias or an internal — so it is not README material
+    /// either, and the two lists stay in agreement about what is user-facing.
+    fn keymap_chords() -> BTreeSet<String> {
+        all()
+            .filter(|b| !b.group.is_empty())
+            // `awaits_key` appends a `␣` placeholder for the overlay; the README writes the chord
+            // and explains the extra keystroke in prose.
+            .map(|b| b.key_label().trim_end_matches(" ␣").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_readme_row_is_bound() {
+        let bound = keymap_chords();
+        let allowed: BTreeSet<&str> = README_ONLY.iter().map(|(c, _)| *c).collect();
+        let stale: Vec<String> = readme_chords()
+            .0
+            .into_iter()
+            .filter(|c| !bound.contains(c) && !allowed.contains(c.as_str()))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "README rows document chords the keymap does not bind (stale rows, or a chord that \
+             moved): {stale:?}"
+        );
+    }
+
+    #[test]
+    fn every_binding_is_in_the_readme() {
+        let (rows, prose) = readme_chords();
+        let allowed: BTreeSet<&str> = KEYMAP_ONLY.iter().map(|(c, _)| *c).collect();
+        let undocumented: Vec<String> = keymap_chords()
+            .into_iter()
+            .filter(|c| {
+                !rows.contains(c) && !prose.contains(c) && !allowed.contains(c.as_str())
+            })
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "keymap binds chords the README does not document (add a row, or `group: \"\"` if the \
+             binding is an alias): {undocumented:?}"
+        );
+    }
+
+    /// The allowlists are the failure mode of this test, so they get their own guard: an entry
+    /// that no longer applies must be deleted rather than left to rot.
+    #[test]
+    fn the_allowlists_are_still_needed() {
+        let bound = keymap_chords();
+        let (rows, prose) = readme_chords();
+        let documented: BTreeSet<&String> = rows.iter().chain(prose.iter()).collect();
+        for (chord, why) in README_ONLY {
+            assert!(
+                documented.contains(&chord.to_string()),
+                "`{chord}` is allowlisted as README-only ({why}) but the README no longer lists it"
+            );
+            assert!(
+                !bound.contains(*chord),
+                "`{chord}` is allowlisted as README-only ({why}) but it is now a real binding"
+            );
+        }
+        for (chord, why) in KEYMAP_ONLY {
+            assert!(
+                bound.contains(*chord),
+                "`{chord}` is allowlisted as keymap-only ({why}) but nothing binds it"
+            );
+            assert!(
+                !documented.contains(&chord.to_string()),
+                "`{chord}` is allowlisted as keymap-only ({why}) but the README now documents it"
+            );
+        }
+    }
+
+    /// Guards the parser, not the keymap: a README restructure that stops the table rows being
+    /// found would make both directions pass vacuously.
+    #[test]
+    fn the_readme_parse_is_not_vacuous() {
+        let chords = readme_chords().0;
+        assert!(
+            chords.len() > 100,
+            "expected the README's keybinding tables to yield >100 chords, got {} — the parser \
+             has probably lost the tables",
+            chords.len()
+        );
+        for expected in ["h", "Alt-j", "Ctrl-Alt-z", "Space f", "Space g s", "Enter"] {
+            assert!(chords.contains(expected), "parser missed `{expected}`");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
