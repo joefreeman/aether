@@ -725,6 +725,12 @@ pub struct RootCandidate {
 }
 
 impl PickerCandidates {
+    /// Whether the set holds no candidates — which for several kinds is how a re-view says "no
+    /// rebuild" rather than "no results". See `handlers::picker::re_view_build`.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn len(&self) -> usize {
         match self {
             PickerCandidates::Files { files, .. } => files.len(),

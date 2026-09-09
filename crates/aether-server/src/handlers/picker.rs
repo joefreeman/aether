@@ -2,36 +2,6 @@
 
 use super::*;
 
-/// Every buffer a **view** shows, in view order, each named once.
-///
-/// The set a listing kind fans out over. For an ordinary view it is `[focused]` and the fan-out is
-/// a loop of one — which is the whole point of defining these at view level: a one-element view
-/// keeps behaving exactly as it did, so a regression can only be a regression in composed views.
-///
-/// Falls back to `[focused]` when the client sent no view id, which covers an older client and the
-/// re-view calls that carry no ids at all. Duplicates are dropped: two hunks of one file are two
-/// elements over one buffer, and its diagnostics should be listed once.
-fn view_element_buffers(
-    s: &ServerState,
-    view_id: Option<aether_protocol::ViewId>,
-    focused: BufferId,
-) -> Vec<BufferId> {
-    let Some(view) = view_id else {
-        return vec![focused];
-    };
-    let view_buffer = view.presenting_buffer();
-    let mut out: Vec<BufferId> = Vec::new();
-    for layout in s.element_layout_of(view_buffer) {
-        let id = layout.extent.buffer(view_buffer);
-        if !out.contains(&id) {
-            out.push(id);
-        }
-    }
-    if out.is_empty() {
-        out.push(focused);
-    }
-    out
-}
 
 /// Build the buffer-picker candidate list for `client_id`: every buffer belonging to the
 /// client's active workspace, MRU first, then any workspace buffers the client hasn't touched yet
@@ -1447,6 +1417,63 @@ struct CursorCentering {
     outline_index: Option<usize>,
 }
 
+/// What a **re-view** produces for a picker kind, and so whether it may replace what the picker
+/// already holds.
+///
+/// A re-view is a scroll refetch, a hide/re-attach, an Explorer step — anything that is not a fresh
+/// open, which removes the slot outright and never reaches this decision.
+///
+/// **Keyed on the kind, and exhaustively.** It used to be decided by matching the *pair* of
+/// candidate variants, old against new, with an implicit fallthrough to "replace". That is a
+/// partial map wearing a total one's clothes: an unlisted pair meant "discard the snapshot" with
+/// nothing to notice. It bit a patch outline, which lives under `DocumentSymbols` as `GitChanges`
+/// candidates and comes back from a re-view as the *symbols* placeholder — a pair nobody had
+/// written down, so the list emptied itself the moment a scroll refetched it. Here a new kind
+/// cannot be forgotten; the compiler asks.
+enum ReViewBuild {
+    /// The builder answers a re-view with an empty placeholder, so the snapshot taken on open is
+    /// the only real data there is. The majority.
+    Placeholder,
+    /// The builder re-snapshots on every view — directory contents change, the buffer list changes,
+    /// the jumplist is rebuilt from the live captured list. Take the new set.
+    Rebuild,
+    /// Files: the workspace index hands back the same `Arc` until it refreshes, so pointer identity
+    /// decides.
+    IndexSnapshot,
+    /// Keybindings: the *client* ships the rows — all of them on a fresh open, none on a re-view —
+    /// so emptiness is the signal and the kind alone cannot say.
+    ClientSupplied,
+}
+
+fn re_view_build(kind: PickerKind) -> ReViewBuild {
+    match kind {
+        PickerKind::Files => ReViewBuild::IndexSnapshot,
+        PickerKind::Keybindings => ReViewBuild::ClientSupplied,
+        // Snapshot-on-open kinds: an LSP round-trip, a repo walk, a grep, a working-tree diff.
+        // Re-running any of them mid-scroll would shuffle rows under the cursor even when it
+        // succeeded, which is the reason the placeholder exists.
+        PickerKind::Grep
+        | PickerKind::Diagnostics
+        | PickerKind::DiagnosticsWorkspace
+        | PickerKind::References
+        | PickerKind::DocumentSymbols
+        | PickerKind::WorkspaceSymbols
+        | PickerKind::GitChanges
+        | PickerKind::GitChangesFile
+        | PickerKind::GitBranches
+        | PickerKind::GitLog
+        | PickerKind::GitLogFile
+        | PickerKind::GitStash
+        | PickerKind::GitBaseline => ReViewBuild::Placeholder,
+        // Cheap and live: re-reading them is the point, and a stale list would be the bug.
+        PickerKind::Buffers
+        | PickerKind::Explorer
+        | PickerKind::Workspaces
+        | PickerKind::LspServers
+        | PickerKind::Jumplist => ReViewBuild::Rebuild,
+    }
+}
+
 pub async fn picker_view(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -1553,7 +1580,7 @@ pub async fn picker_view(
             Some(buffer_id) => {
                 let s = state.lock().await;
                 let mut out = Vec::new();
-                for id in view_element_buffers(&s, params.view_id, buffer_id) {
+                for id in crate::handlers::viewport::view_element_buffers(&s, params.view_id, buffer_id) {
                     out.extend(build_diagnostic_candidates(&s, id));
                 }
                 picker_state::PickerCandidates::Diagnostics(out)
@@ -2041,92 +2068,21 @@ pub async fn picker_view(
             // (the caller passed an empty placeholder). Discard them only on `reset`, which was
             // handled by the `pickers.remove(&key)` call above. Explorer: fresh listing every call
             // (directory contents may have changed), so always re-bind and rerank.
-            let preserve_existing = match (&p.candidates, &candidates) {
-                (
-                    picker_state::PickerCandidates::Files { files: a, .. },
-                    picker_state::PickerCandidates::Files { files: b, .. },
-                ) => Arc::ptr_eq(a, b),
-                (
-                    picker_state::PickerCandidates::Grep(_),
-                    picker_state::PickerCandidates::Grep(_),
-                ) => true,
-                // Diagnostics: keep the snapshot taken on open across scroll/resume re-views (the
-                // re-view sends an empty placeholder), like Grep.
-                (
-                    picker_state::PickerCandidates::Diagnostics(_),
-                    picker_state::PickerCandidates::Diagnostics(_),
-                ) => true,
-                // References: keep the one-shot LSP snapshot across scroll/resume re-views (the
-                // re-view sends an empty placeholder), like Diagnostics and Grep.
-                (
-                    picker_state::PickerCandidates::References(_),
-                    picker_state::PickerCandidates::References(_),
-                ) => true,
-                // DocumentSymbols: keep the one-shot LSP snapshot across scroll/resume re-views, like
-                // References and Diagnostics.
-                (
-                    picker_state::PickerCandidates::Symbols(_),
-                    picker_state::PickerCandidates::Symbols(_),
-                ) => true,
-                // ...and keep a **patch outline** across them too. It lives under the same kind but
-                // as `GitChanges` candidates, and a scroll re-view carries no `view_id` to rebuild
-                // it from — so it arrives as the *symbols* placeholder and the variant pair stops
-                // matching. The placeholder means "no rebuild", never "the outline is empty":
-                // treating it as the latter wiped the list the moment a scroll refetch fired, which
-                // is what stepping onto the last row does.
-                //
-                // (That this is decided by enumerating variant *pairs* is the fragile part — an
-                // unlisted combination silently means "replace". The rule it is groping towards is
-                // that a re-view never replaces a snapshot, only a fresh open does.)
-                (
-                    picker_state::PickerCandidates::GitChanges(_),
-                    picker_state::PickerCandidates::Symbols(placeholder),
-                ) if params.kind == PickerKind::DocumentSymbols && placeholder.is_empty() => true,
-                // WorkspaceSymbols: the accumulated fan-out results *are* the search, like Grep's —
-                // a scroll/resume re-view must not wipe what the servers have answered so far. A
-                // genuinely new search comes from `picker/query`, which clears them itself.
-                (
-                    picker_state::PickerCandidates::WorkspaceSymbols(_),
-                    picker_state::PickerCandidates::WorkspaceSymbols(_),
-                ) => true,
-                // Both changes pickers: a fresh open snapshots (the roots' working trees, or the
-                // locked buffer's hunks) and rebuilds; a scroll/resume re-view sends an empty
-                // placeholder and keeps that snapshot. Keeping it is what stops a page-down
-                // re-walking every working tree — and, worse, letting the rows change underneath
-                // a scroll.
-                (
-                    picker_state::PickerCandidates::GitChanges(_),
-                    picker_state::PickerCandidates::GitChanges(new),
-                ) => new.is_empty(),
-                // Keybindings: a fresh open ships the rows and rebuilds; a scroll/resume re-view
-                // ships none — keep the previously-shipped set, like GitChangesFile.
-                (
-                    picker_state::PickerCandidates::Keybindings(_),
-                    picker_state::PickerCandidates::Keybindings(new),
-                ) => new.is_empty(),
-                // GitBranches: a fresh open resolves the repo and lists it; a re-view builds the
-                // empty placeholder above, and keeping the snapshot is what stops a scroll from
-                // re-resolving (or re-walking) the repo mid-list.
-                (
-                    picker_state::PickerCandidates::GitBranches(_),
-                    picker_state::PickerCandidates::GitBranches(new),
-                ) => new.is_empty(),
-                // The log: a fresh open walks and rebuilds; a re-view sends the empty placeholder
-                // and keeps the snapshot, so a page-down neither re-walks history nor risks
-                // shuffling rows mid-scroll.
-                (
-                    picker_state::PickerCandidates::GitLog(_),
-                    picker_state::PickerCandidates::GitLog(new),
-                ) => new.is_empty(),
-                (
-                    picker_state::PickerCandidates::GitStash(_),
-                    picker_state::PickerCandidates::GitStash(new),
-                ) => new.is_empty(),
-                (
-                    picker_state::PickerCandidates::GitBaseline(_),
-                    picker_state::PickerCandidates::GitBaseline(new),
-                ) => new.is_empty(),
-                _ => false,
+            let preserve_existing = match re_view_build(params.kind) {
+                // The workspace index hands back the same `Arc` until it refreshes, so pointer
+                // identity *is* "nothing new to show".
+                ReViewBuild::IndexSnapshot => matches!(
+                    (&p.candidates, &candidates),
+                    (
+                        picker_state::PickerCandidates::Files { files: a, .. },
+                        picker_state::PickerCandidates::Files { files: b, .. },
+                    ) if Arc::ptr_eq(a, b)
+                ),
+                ReViewBuild::Placeholder => true,
+                ReViewBuild::Rebuild => false,
+                // The rows came from the client: it ships them on a fresh open and none on a
+                // re-view, so emptiness is the signal rather than the kind.
+                ReViewBuild::ClientSupplied => candidates.is_empty(),
             };
             if !preserve_existing {
                 p.candidates = candidates;
