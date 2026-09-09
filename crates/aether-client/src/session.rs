@@ -15,7 +15,7 @@ use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus, Symb
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::SearchSummary;
 use aether_protocol::settings::{MarkdownWidth, ThemeMode};
-use aether_protocol::view::ViewOpenResult;
+use aether_protocol::view::{BufferDescription, ViewOpenResult};
 use aether_protocol::viewport::{DiagnosticSeverity, ScrollPosition, Window, WrapMode};
 use aether_protocol::workspace::{WorkspaceInfo, WorkspaceProject};
 use aether_protocol::ViewId;
@@ -78,9 +78,6 @@ pub fn boot_backoff(attempt: u32) -> std::time::Duration {
 #[derive(Clone, Debug)]
 pub struct BufferInfo {
     pub buffer_id: BufferId,
-    /// The view the open that produced this presented — see
-    /// [`aether_protocol::view::ViewOpenResult::view_id`].
-    pub view_id: ViewId,
     pub label: String,
     /// Canonical absolute path on disk; `None` for scratch buffers.
     pub path: Option<String>,
@@ -1023,9 +1020,15 @@ impl ViewState {
     /// something that no longer exists, silently. Focus moving *within* a multi-buffer view is the
     /// only thing that changes one without the other, and it goes through the focus path.
     pub fn rebind(&mut self, open: ViewOpenResult, roots: &[String]) {
-        let transient = open.transient;
-        let buffer = buffer_info(open, roots);
-        self.view_id = buffer.view_id;
+        let ViewOpenResult {
+            view_id,
+            scroll,
+            transient,
+            buffer,
+        } = open;
+        let mut buffer = buffer_info(buffer, roots);
+        buffer.scroll = scroll;
+        self.view_id = view_id;
         self.view_buffer = buffer.buffer_id;
         self.view_transient = transient;
         self.view_label = buffer.label.clone();
@@ -1073,11 +1076,17 @@ impl ViewState {
     /// its id, whether it is kept — are read off the wire, so nothing can build a view around a
     /// buffer and leave them behind: every open goes through here or [`Self::rebind`].
     pub fn from_open(open: ViewOpenResult, roots: &[String]) -> Self {
-        let transient = open.transient;
-        let buffer = buffer_info(open, roots);
+        let ViewOpenResult {
+            view_id,
+            scroll,
+            transient,
+            buffer,
+        } = open;
+        let mut buffer = buffer_info(buffer, roots);
+        buffer.scroll = scroll;
         Self {
             // A view opens on its own buffer; focus moves it off only in a multi-buffer view.
-            view_id: buffer.view_id,
+            view_id,
             view_buffer: buffer.buffer_id,
             view_transient: transient,
             view_label: buffer.label.clone(),
@@ -1814,22 +1823,24 @@ impl Session {
             },
             // The sentinel open: buffer 0, which the server never assigns, and nothing else.
             ViewOpenResult {
-                buffer_id: Default::default(),
                 view_id: Default::default(),
-                language: Default::default(),
-                line_count: Default::default(),
-                byte_count: Default::default(),
-                revision: Default::default(),
-                saved_revision: Default::default(),
-                path: Default::default(),
-                scratch_number: Default::default(),
-                cursor: Default::default(),
                 scroll: Default::default(),
-                lsp_server: Default::default(),
                 transient: Default::default(),
-                title: Default::default(),
-                read_only: Default::default(),
-                is_patch: Default::default(),
+                buffer: BufferDescription {
+                    buffer_id: Default::default(),
+                    language: Default::default(),
+                    line_count: Default::default(),
+                    byte_count: Default::default(),
+                    revision: Default::default(),
+                    saved_revision: Default::default(),
+                    path: Default::default(),
+                    scratch_number: Default::default(),
+                    cursor: Default::default(),
+                    lsp_server: Default::default(),
+                    title: Default::default(),
+                    read_only: Default::default(),
+                    is_patch: Default::default(),
+                },
             },
         )
     }
@@ -1875,7 +1886,9 @@ pub fn label_for_path(path: &str, roots: &[String]) -> String {
     }
 }
 
-pub fn buffer_info(open: ViewOpenResult, roots: &[String]) -> BufferInfo {
+/// A description's buffer facts as the client holds them. The scroll is the view's, not the
+/// buffer's: a description carries none, and the view state sets it from the open.
+pub fn buffer_info(open: BufferDescription, roots: &[String]) -> BufferInfo {
     // A virtual buffer (a revision materialised by `git/show`) is pathless but named: the server
     // supplies the title, since only it knows what revision this is.
     let label = match (&open.path, &open.title, open.scratch_number) {
@@ -1886,14 +1899,13 @@ pub fn buffer_info(open: ViewOpenResult, roots: &[String]) -> BufferInfo {
     };
     BufferInfo {
         buffer_id: open.buffer_id,
-        view_id: open.view_id,
         label,
         path: open.path,
         language: open.language,
         revision: open.revision,
         saved_revision: open.saved_revision,
         cursor: open.cursor,
-        scroll: open.scroll,
+        scroll: None,
         lsp_server: open.lsp_server,
         read_only: open.read_only,
         is_patch: open.is_patch,

@@ -971,22 +971,24 @@ async fn open_restored_scratch(
         .map(|a| motion::clamp_position(&doc, a));
     let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
     let mut result = ViewOpenResult {
-        buffer_id: id,
         view_id: ViewId::default(), // minted below, once the buffer exists
-        language: doc.language.clone(),
-        line_count: doc.line_count(),
-        byte_count: doc.byte_count(),
-        revision: doc.revision,
-        saved_revision: doc.saved_revision(),
-        path: None,
-        scratch_number: Some(number),
-        cursor,
-        scroll: None,     // a fresh buffer has no view to have been scrolled in
-        lsp_server: None, // scratch buffers are never language-server-backed
-        transient: false, // the view's, read below once it exists
-        title: None,
-        read_only: false,
-        is_patch: false,
+        scroll: None,               // a fresh buffer has no view to have been scrolled in
+        transient: false,           // the view's, read below once it exists
+        buffer: BufferDescription {
+            buffer_id: id,
+            language: doc.language.clone(),
+            line_count: doc.line_count(),
+            byte_count: doc.byte_count(),
+            revision: doc.revision,
+            saved_revision: doc.saved_revision(),
+            path: None,
+            scratch_number: Some(number),
+            cursor,
+            lsp_server: None, // scratch buffers are never language-server-backed
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
     };
     s.documents.insert(doc_id, doc);
     s.buffers.insert(id, buf);
@@ -1030,15 +1032,14 @@ pub fn describe_buffer(
     s: &ServerState,
     buffer_id: BufferId,
     cursor: CursorState,
-) -> Result<ViewOpenResult, RpcError> {
+) -> Result<aether_protocol::view::BufferDescription, RpcError> {
     let buffer = s
         .buffers
         .get(&buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let doc = s.doc_of(buffer_id);
-    Ok(ViewOpenResult {
+    Ok(aether_protocol::view::BufferDescription {
         buffer_id,
-        view_id: s.view_presenting(buffer_id).unwrap_or_default(),
         language: doc.language.clone(),
         line_count: doc.line_count(),
         byte_count: doc.byte_count(),
@@ -1047,13 +1048,7 @@ pub fn describe_buffer(
         path: doc.canonical_path.as_ref().map(|p| p.display().to_string()),
         scratch_number: buffer.scratch_number,
         cursor,
-        // No remembered scroll: the caller is moving *inside* a view that is already scrolled, so
-        // restoring a per-buffer position here would fight the scroll the user can see.
-        scroll: None,
         lsp_server: buffer_lsp_server_ref(s, buffer_id),
-        transient: s
-            .view_presenting(buffer_id)
-            .is_some_and(|v| s.view(v).transient),
         title: doc.virtual_source.as_ref().map(|v| v.title.clone()),
         read_only: doc.read_only(),
         is_patch: doc.generated.is_some(),
@@ -1704,7 +1699,13 @@ pub async fn git_follow_patch_line(
     };
     set_cursor(&mut s, (client_id, opened.buffer_id), cursor);
     Ok(GitFollowPatchLineResult {
-        opened: Some(ViewOpenResult { cursor, ..opened }),
+        opened: Some(ViewOpenResult {
+            buffer: BufferDescription {
+                cursor,
+                ..opened.buffer
+            },
+            ..opened
+        }),
     })
 }
 
@@ -1781,24 +1782,26 @@ async fn open_generated_buffer(
         })
         .unwrap_or_default();
     let mut result = ViewOpenResult {
-        buffer_id: id,
         view_id: ViewId::default(), // minted below, once the buffer exists
-        language: doc.language.clone(),
-        line_count: doc.line_count(),
-        byte_count: doc.byte_count(),
-        revision: doc.revision,
-        saved_revision: doc.saved_revision(),
-        path: None,
-        scratch_number: None,
-        cursor: focused,
         scroll: None,
-        lsp_server: None, // no file on disk for a server to have an opinion about
-        transient: true,  // a materialised revision opens as a preview, kept with `Space k`
-        title: Some(content.title),
-        read_only: true,
-        // A commit's diff, not a file at a revision — both are read-only, only the first has a
-        // patch index for `Enter` to follow through.
-        is_patch: doc.generated.is_some(),
+        transient: true, // a materialised revision opens as a preview, kept with `Space k`
+        buffer: BufferDescription {
+            buffer_id: id,
+            language: doc.language.clone(),
+            line_count: doc.line_count(),
+            byte_count: doc.byte_count(),
+            revision: doc.revision,
+            saved_revision: doc.saved_revision(),
+            path: None,
+            scratch_number: None,
+            cursor: focused,
+            lsp_server: None, // no file on disk for a server to have an opinion about
+            title: Some(content.title),
+            read_only: true,
+            // A commit's diff, not a file at a revision — both are read-only, only the first has a
+            // patch index for `Enter` to follow through.
+            is_patch: doc.generated.is_some(),
+        },
     };
     s.documents.insert(doc_id, doc);
     s.buffers.insert(id, buf);
@@ -2008,22 +2011,24 @@ async fn view_open_inner(
         let scroll = open_scroll(&s, client_id, view_id, params.jump_to);
         let mut pushes = pin_view_if_requested(&mut s, view_id, params.transient);
         let result = ViewOpenResult {
-            buffer_id,
             view_id,
-            language,
-            line_count,
-            byte_count,
-            revision,
-            saved_revision,
-            path,
-            scratch_number,
-            cursor,
             scroll,
-            lsp_server: buffer_lsp_server_ref(&s, buffer_id),
             transient: s.view(view_id).transient,
-            title: virtual_title,
-            read_only,
-            is_patch,
+            buffer: BufferDescription {
+                buffer_id,
+                language,
+                line_count,
+                byte_count,
+                revision,
+                saved_revision,
+                path,
+                scratch_number,
+                cursor,
+                lsp_server: buffer_lsp_server_ref(&s, buffer_id),
+                title: virtual_title,
+                read_only,
+                is_patch,
+            },
         };
         if intent == OpenIntent::Navigate {
             s.touch_mru(buffer_id);
@@ -2074,22 +2079,24 @@ async fn view_open_inner(
                 let cursor =
                     resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
                 let mut result = ViewOpenResult {
-                    buffer_id: id,
                     view_id: ViewId::default(), // minted below, once the buffer exists
-                    language: doc.language.clone(),
-                    line_count: doc.line_count(),
-                    byte_count: doc.byte_count(),
-                    revision: 0,
-                    saved_revision: doc.saved_revision(),
-                    path: None,
-                    scratch_number: Some(scratch_number),
-                    cursor,
                     scroll: None, // a fresh buffer has no view to have been scrolled in
-                    lsp_server: None, // scratch buffers are never language-server-backed
                     transient: false, // the view's, read below once it exists
-                    title: None,
-                    read_only: false,
-                    is_patch: false,
+                    buffer: BufferDescription {
+                        buffer_id: id,
+                        language: doc.language.clone(),
+                        line_count: doc.line_count(),
+                        byte_count: doc.byte_count(),
+                        revision: 0,
+                        saved_revision: doc.saved_revision(),
+                        path: None,
+                        scratch_number: Some(scratch_number),
+                        cursor,
+                        lsp_server: None, // scratch buffers are never language-server-backed
+                        title: None,
+                        read_only: false,
+                        is_patch: false,
+                    },
                 };
                 s.documents.insert(doc_id, doc);
                 s.buffers.insert(id, buf);
@@ -2193,22 +2200,24 @@ async fn view_open_inner(
             let scroll = open_scroll(&s, client_id, view_id, params.jump_to);
             let mut pushes = pin_view_if_requested(&mut s, view_id, params.transient);
             let result = ViewOpenResult {
-                buffer_id: existing,
                 view_id,
-                language,
-                line_count,
-                byte_count,
-                revision,
-                saved_revision,
-                path: Some(canonical.display().to_string()),
-                scratch_number: None,
-                cursor,
                 scroll,
-                lsp_server: buffer_lsp_server_ref(&s, existing),
                 transient: s.view(view_id).transient,
-                title: None,
-                read_only: false,
-                is_patch: false,
+                buffer: BufferDescription {
+                    buffer_id: existing,
+                    language,
+                    line_count,
+                    byte_count,
+                    revision,
+                    saved_revision,
+                    path: Some(canonical.display().to_string()),
+                    scratch_number: None,
+                    cursor,
+                    lsp_server: buffer_lsp_server_ref(&s, existing),
+                    title: None,
+                    read_only: false,
+                    is_patch: false,
+                },
             };
             s.touch_mru(existing);
             pushes.extend(refresh_view_pickers(&mut s));
@@ -2422,22 +2431,24 @@ async fn view_open_inner(
     let doc = s.doc_of(id);
     let scroll = open_scroll(&s, client_id, view_id, params.jump_to);
     let result = ViewOpenResult {
-        buffer_id: id,
         view_id,
-        language: doc.language.clone(),
-        line_count: doc.line_count(),
-        byte_count: doc.byte_count(),
-        revision: doc.revision,
-        saved_revision: doc.saved_revision(),
-        path: Some(canonical.display().to_string()),
-        scratch_number: None,
-        cursor,
         scroll,
-        lsp_server: buffer_lsp_server_ref(&s, id),
         transient: s.view(view_id).transient,
-        title: None,
-        read_only: false,
-        is_patch: false,
+        buffer: BufferDescription {
+            buffer_id: id,
+            language: doc.language.clone(),
+            line_count: doc.line_count(),
+            byte_count: doc.byte_count(),
+            revision: doc.revision,
+            saved_revision: doc.saved_revision(),
+            path: Some(canonical.display().to_string()),
+            scratch_number: None,
+            cursor,
+            lsp_server: buffer_lsp_server_ref(&s, id),
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
     };
     let mut pushes = match intent {
         OpenIntent::Navigate => {

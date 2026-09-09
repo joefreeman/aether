@@ -3797,9 +3797,8 @@ mod scroll_tests {
             buffer_status: Default::default(),
             focus: aether_protocol::viewport::ViewportFocusElementResult {
                 element: 0,
-                buffer: aether_protocol::view::ViewOpenResult {
+                buffer: aether_protocol::view::BufferDescription {
                     buffer_id: 7,
-                    view_id: aether_protocol::ViewId(7),
                     language: None,
                     line_count: 20,
                     byte_count: 200,
@@ -3808,9 +3807,7 @@ mod scroll_tests {
                     path: Some("/repo/a.rs".into()),
                     scratch_number: None,
                     cursor: Default::default(),
-                    scroll: None,
                     lsp_server: None,
-                    transient: false,
                     title: None,
                     read_only: false,
                     is_patch: false,

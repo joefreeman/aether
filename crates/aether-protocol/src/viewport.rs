@@ -652,9 +652,10 @@ pub struct ViewportFocusElementResult {
     /// The *whole* description rather than an id, because crossing into another buffer changes what
     /// the view is showing: its path, its label, whether it is read-only, which revision it is at.
     /// A client given only an id would have to keep the old buffer's label beside the new one's
-    /// text. It is deliberately the same shape an open returns, so the client rebinds through the
-    /// path it already has.
-    pub buffer: crate::view::ViewOpenResult,
+    /// text. It is deliberately the buffer half of what an open returns, so the client rebinds
+    /// through the path it already has — and only that half: an element's file is not a view, so
+    /// there is no view id, scroll or keep flag to describe.
+    pub buffer: crate::view::BufferDescription,
     /// The same buffer-level snapshot [`ViewportSubscribe`] seeds, for the buffer focus just landed
     /// in — breadcrumb, diagnostic counts, language-server health, external-change flags.
     ///

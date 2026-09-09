@@ -712,11 +712,16 @@ pub fn next_view_for_client(s: &ServerState, client_id: ClientId) -> Option<View
         .as_deref()
         .and_then(|name| s.mru_view(name))
         .or_else(|| {
+            // A live view the MRU does not list — one restored kept beside a file the session
+            // materialised, say — by recency, so the choice is the one the MRU would have made.
             workspace_name.as_deref().and_then(|name| {
-                s.buffer_workspaces
+                s.views
                     .iter()
-                    .filter(|(_, pname)| pname.as_str() == name)
-                    .find_map(|(id, _)| s.view_presenting(*id))
+                    .filter(|(_, v)| {
+                        s.buffer_workspaces.get(&v.presenting).map(String::as_str) == Some(name)
+                    })
+                    .max_by_key(|(_, v)| v.last_used)
+                    .map(|(id, _)| *id)
             })
         })
         .or_else(|| {

@@ -1432,6 +1432,7 @@ async fn the_rebinding_client_lands_on_the_file_it_was_viewing() {
     let path = bound
         .opened
         .expect("a bind with open_last lands somewhere")
+        .buffer
         .path
         .expect("…on a file, not a scratch");
     assert!(
@@ -1479,7 +1480,7 @@ async fn a_file_absent_from_the_target_branch_cannot_follow() {
     // Whatever it landed on, it is not a path outside the tree we just entered. Landing on the old
     // checkout's copy would be the worst outcome: the same-looking file, edited in the tree you
     // just left.
-    if let Some(path) = bound.opened.and_then(|o| o.path) {
+    if let Some(path) = bound.opened.and_then(|o| o.buffer.path) {
         assert!(
             path.starts_with(&wt.path),
             "landed outside the tree we switched into: {path}"
@@ -1606,7 +1607,7 @@ async fn each_context_keeps_its_own_buffers() {
     assert_eq!(bound.workspace.paths[0], wt.path);
     let in_tree = bound
         .opened
-        .and_then(|o| o.path)
+        .and_then(|o| o.buffer.path)
         .expect("the file you were on follows you in");
     assert!(
         in_tree.starts_with(&wt.path),
@@ -1625,7 +1626,10 @@ async fn each_context_keeps_its_own_buffers() {
         back.workspace.worktrees.is_empty(),
         "and the context is the base again"
     );
-    let landed = back.opened.and_then(|o| o.path).expect("landed on a file");
+    let landed = back
+        .opened
+        .and_then(|o| o.buffer.path)
+        .expect("landed on a file");
     assert!(
         landed.starts_with(repo_root.to_string_lossy().as_ref()),
         "back on the checkout's copy: {landed}"
@@ -1740,6 +1744,7 @@ async fn the_rebinding_client_lands_on_the_same_file_on_the_new_tree() {
     .await;
     let landed = bound.opened.expect("a bind with open_last lands somewhere");
     let path = landed
+        .buffer
         .path
         .expect("…and it should be a file, not a scratch");
     assert!(

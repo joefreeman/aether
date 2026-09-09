@@ -43,7 +43,7 @@ use aether_protocol::sneak::{
     SneakUpdateResult,
 };
 use aether_protocol::ui::{Element, RailJoin};
-use aether_protocol::view::{ViewOpen, ViewOpenParams, ViewOpenResult};
+use aether_protocol::view::{BufferDescription, ViewOpen, ViewOpenParams, ViewOpenResult};
 use aether_protocol::viewport::ViewportLinesChanged;
 use aether_protocol::viewport::{
     BaselineRow, BufferStatusSnapshot, ChromeKind, DiagnosticSeverity, DiagnosticSpan, DiffMarker,
@@ -1709,24 +1709,26 @@ fn input_adjust_number_methods() {
 fn buffer_open_result_shape() {
     let v = to_value(ViewOpenResult {
         transient: false,
-        buffer_id: 42,
         view_id: aether_protocol::ViewId(42),
-        language: Some("rust".into()),
-        line_count: 100,
-        byte_count: 1234,
-        revision: 0,
-        saved_revision: 0,
-        path: None,
-        scratch_number: Some(3),
-        cursor: Default::default(),
         scroll: None,
-        lsp_server: Some(aether_protocol::lsp::LspServerRef {
-            language: "rust".into(),
-            workspace_root: "/proj".into(),
-        }),
-        title: None,
-        read_only: false,
-        is_patch: false,
+        buffer: BufferDescription {
+            buffer_id: 42,
+            language: Some("rust".into()),
+            line_count: 100,
+            byte_count: 1234,
+            revision: 0,
+            saved_revision: 0,
+            path: None,
+            scratch_number: Some(3),
+            cursor: Default::default(),
+            lsp_server: Some(aether_protocol::lsp::LspServerRef {
+                language: "rust".into(),
+                workspace_root: "/proj".into(),
+            }),
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
     })
     .unwrap();
     assert_eq!(v["buffer_id"], 42);
@@ -1747,21 +1749,23 @@ fn buffer_open_result_shape() {
 fn buffer_open_result_reports_its_view() {
     let v = to_value(ViewOpenResult {
         transient: false,
-        buffer_id: 42,
         view_id: aether_protocol::ViewId(7),
-        language: None,
-        line_count: 1,
-        byte_count: 0,
-        revision: 0,
-        saved_revision: 0,
-        path: None,
-        scratch_number: None,
-        cursor: Default::default(),
         scroll: None,
-        lsp_server: None,
-        title: None,
-        read_only: false,
-        is_patch: false,
+        buffer: BufferDescription {
+            buffer_id: 42,
+            language: None,
+            line_count: 1,
+            byte_count: 0,
+            revision: 0,
+            saved_revision: 0,
+            path: None,
+            scratch_number: None,
+            cursor: Default::default(),
+            lsp_server: None,
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
     })
     .unwrap();
     assert_eq!(v["view_id"], 7);
@@ -1809,25 +1813,27 @@ fn buffer_open_result_restored_scroll() {
     use aether_protocol::viewport::ScrollPosition;
     let v = to_value(ViewOpenResult {
         transient: false,
-        buffer_id: 42,
         view_id: aether_protocol::ViewId(42),
-        language: None,
-        line_count: 1,
-        byte_count: 0,
-        revision: 0,
-        saved_revision: 0,
-        path: None,
-        scratch_number: None,
-        cursor: Default::default(),
         scroll: Some(ScrollPosition {
             element: 2,
             line: 7,
             sub_row: 0.5,
         }),
-        lsp_server: None,
-        title: None,
-        read_only: false,
-        is_patch: false,
+        buffer: BufferDescription {
+            buffer_id: 42,
+            language: None,
+            line_count: 1,
+            byte_count: 0,
+            revision: 0,
+            saved_revision: 0,
+            path: None,
+            scratch_number: None,
+            cursor: Default::default(),
+            lsp_server: None,
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
     })
     .unwrap();
     // Content, not a row: the element the viewport's top was in, the line of that element's
@@ -2851,7 +2857,7 @@ fn git_show_target_shape() {
 #[test]
 fn follow_patch_line_shape() {
     use aether_protocol::git::{GitFollowPatchLineParams, GitFollowPatchLineResult};
-    use aether_protocol::view::ViewOpenResult;
+    use aether_protocol::view::{BufferDescription, ViewOpenResult};
 
     let v = to_value(GitFollowPatchLineParams { buffer_id: 7 }).unwrap();
     assert_eq!(v, json!({ "buffer_id": 7 }), "the cursor stays server-side");
@@ -2866,22 +2872,24 @@ fn follow_patch_line_shape() {
     // `is_patch` distinguishes a commit's diff from a file at a revision — both read-only, only
     // the first has an index for `Enter` to follow through. Omitted when false, like `read_only`.
     let revision_buffer = |is_patch: bool| ViewOpenResult {
-        buffer_id: 3,
         view_id: aether_protocol::ViewId(3),
-        language: None,
-        line_count: 1,
-        byte_count: 0,
-        revision: 0,
-        saved_revision: 0,
-        path: None,
-        scratch_number: None,
-        cursor: Default::default(),
         scroll: None,
-        lsp_server: None,
         transient: true,
-        title: Some("abc1234:src/a.rs".into()),
-        read_only: true,
-        is_patch,
+        buffer: BufferDescription {
+            buffer_id: 3,
+            language: None,
+            line_count: 1,
+            byte_count: 0,
+            revision: 0,
+            saved_revision: 0,
+            path: None,
+            scratch_number: None,
+            cursor: Default::default(),
+            lsp_server: None,
+            title: Some("abc1234:src/a.rs".into()),
+            read_only: true,
+            is_patch,
+        },
     };
     let v = to_value(revision_buffer(false)).unwrap();
     assert_eq!(v["read_only"], true);
@@ -6474,9 +6482,8 @@ fn every_subscribe_carries_the_focus_it_resolved() {
 
     let focus_on = |element: u32| ViewportFocusElementResult {
         element,
-        buffer: aether_protocol::view::ViewOpenResult {
+        buffer: aether_protocol::view::BufferDescription {
             buffer_id: 9,
-            view_id: aether_protocol::ViewId(9),
             language: None,
             line_count: 40,
             byte_count: 400,
@@ -6485,9 +6492,7 @@ fn every_subscribe_carries_the_focus_it_resolved() {
             path: Some("/repo/a.rs".into()),
             scratch_number: None,
             cursor: Default::default(),
-            scroll: None,
             lsp_server: None,
-            transient: false,
             title: None,
             read_only: false,
             is_patch: false,

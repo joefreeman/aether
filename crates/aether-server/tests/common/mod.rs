@@ -96,8 +96,8 @@ pub use aether_protocol::sneak::{
     SneakUpdateResult,
 };
 pub use aether_protocol::view::{
-    ViewClose, ViewCloseParams, ViewCloseResult, ViewClosed, ViewClosedParams, ViewOpen,
-    ViewOpenParams, ViewOpenResult, ViewSetTransient, ViewSetTransientParams,
+    BufferDescription, ViewClose, ViewCloseParams, ViewCloseResult, ViewClosed, ViewClosedParams,
+    ViewOpen, ViewOpenParams, ViewOpenResult, ViewSetTransient, ViewSetTransientParams,
     ViewSetTransientResult, ViewState, ViewStateParams,
 };
 pub use aether_protocol::viewport::Element;

@@ -96,8 +96,8 @@ use aether_protocol::sneak::{
     SneakCancelParams, SneakSelectParams, SneakTarget, SneakUpdateParams, SneakUpdateResult,
 };
 use aether_protocol::view::{
-    ViewCloseParams, ViewClosed, ViewClosedParams, ViewOpenParams, ViewOpenResult,
-    ViewSetTransientParams, ViewSetTransientResult, ViewState, ViewStateParams,
+    BufferDescription, ViewCloseParams, ViewClosed, ViewClosedParams, ViewOpenParams,
+    ViewOpenResult, ViewSetTransientParams, ViewSetTransientResult, ViewState, ViewStateParams,
 };
 use aether_protocol::viewport::{
     BaselineRow, BufferStatusSnapshot, ConflictLine, DiagnosticSpan, DiffMarker, DiffStage,

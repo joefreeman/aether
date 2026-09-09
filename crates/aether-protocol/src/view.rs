@@ -93,15 +93,13 @@ pub struct ViewOpenParams {
     pub record_nav_from: Option<BufferId>,
 }
 
+/// The buffer half of what an open answers with — everything about the text a view shows, and
+/// nothing about the view. What a focus move within a composed view describes on its own
+/// ([`crate::viewport::ViewportFocusElementResult::buffer`]): the element's file has all of this
+/// and, as an element, no view of its own to speak of.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ViewOpenResult {
+pub struct BufferDescription {
     pub buffer_id: BufferId,
-    /// The view this open presented — what the client subscribes to, switches between and closes.
-    /// The buffer's most recently used view, or the one this open created (see
-    /// [`ViewOpenParams::kind`]). Where a result describes a buffer rather than an open — a
-    /// focus move within a composed view — the buffer's most recently used view.
-    #[serde(default)]
-    pub view_id: crate::ViewId,
     pub language: Option<String>,
     pub line_count: u32,
     pub byte_count: u64,
@@ -121,22 +119,11 @@ pub struct ViewOpenResult {
     /// the client hasn't touched yet; the prior position for a buffer the client is reopening.
     #[serde(default)]
     pub cursor: CursorState,
-    /// Last scroll position recorded for this `(client, buffer)` on a prior viewport subscription
-    /// for this buffer, so reopen restores the prior view. `None` when the client has never had a
-    /// viewport on the buffer, or when this open carried a `jump_to` (grep nav, goto-definition,
-    /// nav history) — the jump moves the cursor, so the saved scroll predates it and would frame
-    /// the wrong region. On `None` the client frames the open cursor (centring on it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scroll: Option<ScrollPosition>,
     /// The language server backing this buffer, when one is configured for its language and a
     /// workspace root was found. `None` otherwise. Lets the client show *this buffer's* server
     /// health (servers are keyed by `(language, workspace_root)`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp_server: Option<crate::lsp::LspServerRef>,
-    /// True while the **presented view** is transient (auto-closes once hidden — see
-    /// [`ViewOpenParams::transient`]). Promotion mid-session is pushed via `view/state`.
-    #[serde(default)]
-    pub transient: bool,
     /// Display name for a **virtual** buffer — one with no path and no scratch number, whose
     /// content the server materialised from a revision (`git/show`: a commit's diff, or a file as
     /// of some commit). Rendered verbatim by the client, which otherwise labels a pathless buffer
@@ -157,6 +144,44 @@ pub struct ViewOpenResult {
     /// the language server. Everything else about a patch is server-side.
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_patch: bool,
+}
+
+/// What an open presented: the view, and the buffer it shows. The buffer's fields are flattened
+/// onto the wire, so a `view/open` result is the one flat object it always was, and reached through
+/// `Deref` here, so `open.buffer_id` is the buffer's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewOpenResult {
+    /// The view this open presented — what the client subscribes to, switches between and closes.
+    /// The buffer's most recently used view, or the one this open created (see
+    /// [`ViewOpenParams::kind`]).
+    #[serde(default)]
+    pub view_id: crate::ViewId,
+    /// Last scroll position recorded for this `(client, buffer)` on a prior viewport subscription
+    /// for this buffer, so reopen restores the prior view. `None` when the client has never had a
+    /// viewport on the buffer, or when this open carried a `jump_to` (grep nav, goto-definition,
+    /// nav history) — the jump moves the cursor, so the saved scroll predates it and would frame
+    /// the wrong region. On `None` the client frames the open cursor (centring on it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll: Option<ScrollPosition>,
+    /// True while the **presented view** is transient (auto-closes once hidden — see
+    /// [`ViewOpenParams::transient`]). Promotion mid-session is pushed via `view/state`.
+    #[serde(default)]
+    pub transient: bool,
+    #[serde(flatten)]
+    pub buffer: BufferDescription,
+}
+
+impl std::ops::Deref for ViewOpenResult {
+    type Target = BufferDescription;
+    fn deref(&self) -> &Self::Target {
+        &self.buffer
+    }
+}
+
+impl std::ops::DerefMut for ViewOpenResult {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer
+    }
 }
 
 // ---- view/close -------------------------------------------------------------------------------

@@ -342,22 +342,24 @@ fn a_gone_jumplist_entry_toasts_instead_of_opening_the_file() {
             total: 4,
             skipped: 3,
             opened: Some(Box::new(aether_protocol::view::ViewOpenResult {
-                buffer_id: 9,
                 view_id: aether_protocol::ViewId(9),
-                language: None,
-                line_count: 40,
-                byte_count: 400,
-                revision: 1,
-                saved_revision: 1,
-                path: None,
-                scratch_number: None,
-                cursor: Default::default(),
                 scroll: None,
-                lsp_server: None,
                 transient: true,
-                title: Some("Working changes".into()),
-                read_only: true,
-                is_patch: true,
+                buffer: aether_protocol::view::BufferDescription {
+                    buffer_id: 9,
+                    language: None,
+                    line_count: 40,
+                    byte_count: 400,
+                    revision: 1,
+                    saved_revision: 1,
+                    path: None,
+                    scratch_number: None,
+                    cursor: Default::default(),
+                    lsp_server: None,
+                    title: Some("Working changes".into()),
+                    read_only: true,
+                    is_patch: true,
+                },
             })),
         }),
         aether_protocol::cursor::Direction::Forward,
@@ -3273,11 +3275,11 @@ fn space_alt_c_opens_the_buffer_locked_changes_picker() {
 #[test]
 fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
     use aether_client::session::buffer_info;
-    use aether_protocol::view::ViewOpenResult;
+    use aether_protocol::view::BufferDescription;
 
     let roots = vec!["/p".to_string()];
     let info = buffer_info(
-        serde_json::from_value::<ViewOpenResult>(json!({
+        serde_json::from_value::<BufferDescription>(json!({
             "buffer_id": 7,
             "language": null,
             "line_count": 3,
@@ -4184,7 +4186,7 @@ fn jumplist_step_adopts_the_opened_entry() {
     use aether_client::update::Event;
     use aether_protocol::cursor::{Direction, JumplistPosition};
     use aether_protocol::jumplist::{JumplistStepResult, JumplistStepTarget};
-    use aether_protocol::view::ViewOpenResult;
+    use aether_protocol::view::{BufferDescription, ViewOpenResult};
     use aether_protocol::LogicalPosition;
 
     let mut s = session();
@@ -4198,22 +4200,24 @@ fn jumplist_step_adopts_the_opened_entry() {
         ..Default::default()
     };
     let open = ViewOpenResult {
-        buffer_id: 7,
         view_id: aether_protocol::ViewId(7),
-        language: None,
-        line_count: 20,
-        byte_count: 100,
-        revision: 0,
-        saved_revision: 0,
-        path: Some("/proj/b.rs".into()),
-        scratch_number: None,
-        cursor,
         scroll: None,
-        lsp_server: None,
         transient: true,
-        title: None,
-        read_only: false,
-        is_patch: false,
+        buffer: BufferDescription {
+            buffer_id: 7,
+            language: None,
+            line_count: 20,
+            byte_count: 100,
+            revision: 0,
+            saved_revision: 0,
+            path: Some("/proj/b.rs".into()),
+            scratch_number: None,
+            cursor,
+            lsp_server: None,
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
     };
     let _ = s.on_event(Event::JumplistStepped(
         Ok(JumplistStepResult::Moved(Box::new(JumplistStepTarget {
@@ -5911,7 +5915,7 @@ fn buffers_picker_close_closes_in_place() {
 fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
     use aether_client::update::Event;
     use aether_protocol::picker::{BufferDirtyState, PickerItem, PickerKind};
-    use aether_protocol::view::ViewOpenResult;
+    use aether_protocol::view::{BufferDescription, ViewOpenResult};
 
     fn buf(buffer_id: u64, display: &str) -> PickerItem {
         PickerItem::View {
@@ -5959,22 +5963,24 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
     // When the successor switch resolves, the editor rebinds to it *and the picker stays open* — a
     // switch no longer tears the picker down (see `adopt_switch`); the pick path owns that.
     let successor = ViewOpenResult {
-        buffer_id: 7,
         view_id: aether_protocol::ViewId(7),
-        language: None,
-        line_count: 1,
-        byte_count: 0,
-        revision: 0,
-        saved_revision: 0,
-        path: Some("/proj/other.rs".into()),
-        scratch_number: None,
-        cursor: Default::default(),
         scroll: None,
-        lsp_server: None,
         transient: false,
-        title: None,
-        read_only: false,
-        is_patch: false,
+        buffer: BufferDescription {
+            buffer_id: 7,
+            language: None,
+            line_count: 1,
+            byte_count: 0,
+            revision: 0,
+            saved_revision: 0,
+            path: Some("/proj/other.rs".into()),
+            scratch_number: None,
+            cursor: Default::default(),
+            lsp_server: None,
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
     };
     let _ = s.on_event(Event::Switched(Ok(successor)));
     assert_eq!(
@@ -8083,22 +8089,24 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
             }],
         },
         aether_protocol::view::ViewOpenResult {
-            buffer_id: 1,
             view_id: aether_protocol::ViewId(1),
-            language: None,
-            line_count: 1,
-            byte_count: 0,
-            revision: 0,
-            saved_revision: 0,
-            path: Some("/a/a.rs".into()),
-            scratch_number: None,
-            cursor: aether_protocol::cursor::CursorState::default(),
             scroll: None,
-            lsp_server: None,
             transient: false,
-            title: None,
-            read_only: false,
-            is_patch: false,
+            buffer: aether_protocol::view::BufferDescription {
+                buffer_id: 1,
+                language: None,
+                line_count: 1,
+                byte_count: 0,
+                revision: 0,
+                saved_revision: 0,
+                path: Some("/a/a.rs".into()),
+                scratch_number: None,
+                cursor: aether_protocol::cursor::CursorState::default(),
+                lsp_server: None,
+                title: None,
+                read_only: false,
+                is_patch: false,
+            },
         },
     );
     assert_eq!(s.workspace_projects.len(), 1);
@@ -9542,7 +9550,7 @@ fn persisted_workspace_close_keeps_open_next_scratch() {
 fn open_path_prompt_submits_via_open_path_rpc() {
     use aether_client::path_editor::PathEditor;
     use aether_client::session::Prompt;
-    use aether_protocol::view::ViewOpenResult;
+    use aether_protocol::view::{BufferDescription, ViewOpenResult};
     use aether_protocol::workspace::{WorkspaceActivateResult, WorkspaceInfo};
 
     let mut s = session();
@@ -9565,22 +9573,24 @@ fn open_path_prompt_submits_via_open_path_rpc() {
 
     // The result lands like a switch: adopt the (resolved) workspace + opened buffer.
     let opened = ViewOpenResult {
-        buffer_id: 9,
         view_id: aether_protocol::ViewId(9),
-        language: None,
-        line_count: 1,
-        byte_count: 0,
-        revision: 0,
-        saved_revision: 0,
-        path: Some("/etc/hosts".into()),
-        scratch_number: None,
-        cursor: Default::default(),
         scroll: None,
-        lsp_server: None,
         transient: false,
-        title: None,
-        read_only: false,
-        is_patch: false,
+        buffer: BufferDescription {
+            buffer_id: 9,
+            language: None,
+            line_count: 1,
+            byte_count: 0,
+            revision: 0,
+            saved_revision: 0,
+            path: Some("/etc/hosts".into()),
+            scratch_number: None,
+            cursor: Default::default(),
+            lsp_server: None,
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
     };
     let result = serde_json::to_value(WorkspaceActivateResult {
         workspace: WorkspaceInfo {
@@ -9903,22 +9913,24 @@ fn hint_session() -> Session {
             projects: Vec::new(),
         },
         aether_protocol::view::ViewOpenResult {
-            buffer_id: 1,
             view_id: aether_protocol::ViewId(1),
-            language: None,
-            line_count: 1,
-            byte_count: 0,
-            revision: 0,
-            saved_revision: 0,
-            path: Some("/tmp/w/a.rs".into()),
-            scratch_number: None,
-            cursor: aether_protocol::cursor::CursorState::default(),
             scroll: None,
-            lsp_server: None,
             transient: false,
-            title: None,
-            read_only: false,
-            is_patch: false,
+            buffer: aether_protocol::view::BufferDescription {
+                buffer_id: 1,
+                language: None,
+                line_count: 1,
+                byte_count: 0,
+                revision: 0,
+                saved_revision: 0,
+                path: Some("/tmp/w/a.rs".into()),
+                scratch_number: None,
+                cursor: aether_protocol::cursor::CursorState::default(),
+                lsp_server: None,
+                title: None,
+                read_only: false,
+                is_patch: false,
+            },
         },
     )
 }
@@ -12196,26 +12208,28 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
     use aether_client::update::Event;
     use aether_protocol::cursor::Direction;
     use aether_protocol::jumplist::{JumplistStepResult, JumplistStepScope, JumplistStepTarget};
-    use aether_protocol::view::ViewOpenResult;
+    use aether_protocol::view::{BufferDescription, ViewOpenResult};
     use aether_protocol::LogicalPosition;
 
     let opened = |buffer_id: u64, path: &str| ViewOpenResult {
-        buffer_id,
         view_id: aether_protocol::ViewId(buffer_id),
-        language: Some("markdown".into()),
-        line_count: 5,
-        byte_count: 40,
-        revision: 0,
-        saved_revision: 0,
-        path: Some(path.into()),
-        scratch_number: None,
-        cursor: Default::default(),
         scroll: None,
-        lsp_server: None,
         transient: true,
-        title: None,
-        read_only: false,
-        is_patch: false,
+        buffer: BufferDescription {
+            buffer_id,
+            language: Some("markdown".into()),
+            line_count: 5,
+            byte_count: 40,
+            revision: 0,
+            saved_revision: 0,
+            path: Some(path.into()),
+            scratch_number: None,
+            cursor: Default::default(),
+            lsp_server: None,
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
     };
     let step = |position: Option<LogicalPosition>, buffer_id: u64, path: &str| {
         Event::JumplistStepped(
@@ -13184,9 +13198,8 @@ fn focus_on(
 ) -> aether_protocol::viewport::ViewportFocusElementResult {
     aether_protocol::viewport::ViewportFocusElementResult {
         element,
-        buffer: aether_protocol::view::ViewOpenResult {
+        buffer: aether_protocol::view::BufferDescription {
             buffer_id,
-            view_id: aether_protocol::ViewId(buffer_id),
             cursor: aether_protocol::cursor::CursorState {
                 position: aether_protocol::LogicalPosition { line, col: 0 },
                 anchor: aether_protocol::LogicalPosition { line, col: 0 },
@@ -13200,9 +13213,7 @@ fn focus_on(
             saved_revision: 1,
             path: Some("/repo/a.rs".into()),
             scratch_number: None,
-            scroll: None,
             lsp_server: None,
-            transient: false,
             title: None,
             read_only: false,
             is_patch: false,

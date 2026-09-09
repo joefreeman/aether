@@ -414,7 +414,9 @@ pub enum Message {
     /// Reply errors keep their [`crate::connection::RpcError`] shape so the arms can branch on
     /// server codes (`WindowUpdate` swallows `VIEWPORT_NOT_FOUND` as fetch-races-resubscribe
     /// churn, mirroring the TUI).
-    Subscribed(Result<ViewportSubscribeResult, crate::connection::RpcError>),
+    Subscribed(Box<ViewportSubscribeResult>),
+    /// The subscribe was refused, or the stream ended under it (see [`Message::Subscribed`]).
+    SubscribeFailed(crate::connection::RpcError),
     WindowUpdate(Result<ViewportWindowResult, crate::connection::RpcError>),
     /// A window fetched to chase the **cursor**: the answer an owed reveal is waiting for. Its own
     /// message because only this reply can prove a cursor unplaceable — window replies don't answer
@@ -423,8 +425,10 @@ pub enum Message {
     CursorWindowUpdate(Result<ViewportWindowResult, crate::connection::RpcError>),
 
     /// A core event: forwarded to `Session::on_event`, whose effects the shell executes. Grows a
-    /// subsystem at a time as update logic migrates into core.
-    Core(CoreEvent),
+    /// subsystem at a time as update logic migrates into core. Boxed: an event can carry a whole
+    /// open result, and every other message would otherwise be sized for it — build one with
+    /// [`Message::core`].
+    Core(Box<CoreEvent>),
     /// Keyboard modifier state changed — stashed in `App::modifiers` for click-time reads (Ctrl-click).
     ModifiersChanged(keyboard::Modifiers),
     /// The window was resized — stashed in `App::window_size` for chrome that spans it.
@@ -440,6 +444,13 @@ pub enum Message {
     Inbound(Option<Inbound>),
     /// A reconnect attempt resolved (the backoff sleep rides inside the attempt task).
     Reconnected(Result<Box<Reestablished>, ReconnectError>),
+}
+
+impl Message {
+    /// A core event as a message — see [`Message::Core`].
+    pub fn core(ev: CoreEvent) -> Self {
+        Message::Core(Box::new(ev))
+    }
 }
 
 /// What to do with a stream-mode RPC reply — registered under the request id at send time
@@ -1076,7 +1087,8 @@ impl App {
                 self.run_core(fx)
             }
 
-            Message::Subscribed(Ok(res)) => {
+            Message::Subscribed(res) => {
+                let res = *res;
                 // This reply is the live subscribe — a superseded one would have been
                 // deregistered — so the slot is free.
                 self.pending_subscribe = None;
@@ -1124,7 +1136,7 @@ impl App {
                 // Diff view rides the subscribe params, so there's nothing to re-apply here.
                 self.run_core(read_fx)
             }
-            Message::Subscribed(Err(e)) => {
+            Message::SubscribeFailed(e) => {
                 self.pending_subscribe = None;
                 // While not Connected the only source of this message is the stream-end drain
                 // (a server-sent error can only arrive on a live stream, processed while still
@@ -1193,12 +1205,13 @@ impl App {
             // Ctrl-click on a picker row opens it in a new window — the mouse sibling of Ctrl-Enter.
             // `mouse_area::on_press` carries no modifiers, so we consult the tracked `self.modifiers`;
             // a plain click falls through to the generic arm below (normal open in this window).
-            Message::Core(CoreEvent::PickerClicked(abs)) if self.modifiers.control() => {
-                let fx = self.session.picker_click_new_window(abs);
-                self.run_core(fx)
-            }
             Message::Core(ev) => {
-                let fx = self.session.on_event(ev);
+                let fx = match *ev {
+                    CoreEvent::PickerClicked(abs) if self.modifiers.control() => {
+                        self.session.picker_click_new_window(abs)
+                    }
+                    ev => self.session.on_event(ev),
+                };
                 self.run_core(fx)
             }
 
@@ -2235,7 +2248,12 @@ impl App {
                 tab_width: TAB_WIDTH,
                 diff_view: self.session.diff_view,
             },
-            Message::Subscribed,
+            // Boxed: the window is by far the largest thing a message carries, and every other
+            // message paid for it in size.
+            |r| match r {
+                Ok(res) => Message::Subscribed(Box::new(res)),
+                Err(e) => Message::SubscribeFailed(e),
+            },
         );
         self.pending_subscribe = Some(id);
         Task::none()
@@ -2388,7 +2406,7 @@ impl App {
     }
 
     fn read_clipboard(&self, kind: PasteKind) -> Task<Message> {
-        iced::clipboard::read().map(move |t| Message::Core(CoreEvent::ClipboardRead(kind, t)))
+        iced::clipboard::read().map(move |t| Message::core(CoreEvent::ClipboardRead(kind, t)))
     }
 
     /// A typed stream-mode RPC: the request goes out now (`send` is synchronous, keeping wire
@@ -2874,11 +2892,11 @@ impl App {
                     p,
                 ))
                 .map(|m| match m {
-                    PickerMsg::Click(abs) => Message::Core(CoreEvent::PickerClicked(abs)),
+                    PickerMsg::Click(abs) => Message::core(CoreEvent::PickerClicked(abs)),
                     PickerMsg::Scrolled(y) => Message::PickerScrolled(y),
                     PickerMsg::Hovered(abs) => Message::PickerHovered(Some(abs)),
                     PickerMsg::Unhovered(abs) => Message::PickerUnhovered(abs),
-                    PickerMsg::ChipClicked(i) => Message::Core(CoreEvent::PickerChipClicked(i)),
+                    PickerMsg::ChipClicked(i) => Message::core(CoreEvent::PickerChipClicked(i)),
                     PickerMsg::Query(q) => Message::OverlayInput(OverlayField::PickerQuery, q),
                     PickerMsg::EditorRoot(s) => Message::OverlayInput(OverlayField::ChipRoot, s),
                     PickerMsg::EditorPath(s) => Message::OverlayInput(OverlayField::ChipPath, s),
@@ -3137,10 +3155,10 @@ impl App {
             // joins the `Message`-typed tree (the input fields already produce `Message`).
             let delete = Element::from(delete).map(|m| match m {
                 WorkspaceSettingsMsg::RemoveRoot(i) => {
-                    Message::Core(CoreEvent::WorkspaceSettingsRemoveRoot(i))
+                    Message::core(CoreEvent::WorkspaceSettingsRemoveRoot(i))
                 }
                 WorkspaceSettingsMsg::RemoveProject(i) => {
-                    Message::Core(CoreEvent::WorkspaceSettingsRemoveProject(i))
+                    Message::core(CoreEvent::WorkspaceSettingsRemoveProject(i))
                 }
             });
             // Selection tints just the path text (web/terminal parity), so the background hugs the
@@ -3235,10 +3253,10 @@ impl App {
                     .on_press(WorkspaceSettingsMsg::RemoveProject(i));
             let delete = Element::from(delete).map(|m| match m {
                 WorkspaceSettingsMsg::RemoveRoot(i) => {
-                    Message::Core(CoreEvent::WorkspaceSettingsRemoveRoot(i))
+                    Message::core(CoreEvent::WorkspaceSettingsRemoveRoot(i))
                 }
                 WorkspaceSettingsMsg::RemoveProject(i) => {
-                    Message::Core(CoreEvent::WorkspaceSettingsRemoveProject(i))
+                    Message::core(CoreEvent::WorkspaceSettingsRemoveProject(i))
                 }
             });
             let path = container(
@@ -3529,12 +3547,12 @@ impl App {
                         ..iced::widget::button::Style::default()
                     })
                     .on_press(i);
-                    Element::from(btn).map(|idx| Message::Core(CoreEvent::AppSettingToggle(idx)))
+                    Element::from(btn).map(|idx| Message::core(CoreEvent::AppSettingToggle(idx)))
                 };
                 let control: Element<'_, Message> = match r.control {
                     AppSettingControl::Toggle(on) => iced::widget::checkbox(on)
                         .size(ui.control())
-                        .on_toggle(move |_| Message::Core(CoreEvent::AppSettingToggle(i)))
+                        .on_toggle(move |_| Message::core(CoreEvent::AppSettingToggle(i)))
                         .into(),
                     AppSettingControl::Value(v) => pill(v.to_string()),
                     AppSettingControl::Choice(label) => pill(label.to_string()),
@@ -3782,8 +3800,8 @@ impl App {
                     .on_press(msg),
             )
             .map(|m| match m {
-                PromptMsg::Accept => Message::Core(CoreEvent::PromptAccept),
-                PromptMsg::Cancel => Message::Core(CoreEvent::PromptCancel),
+                PromptMsg::Accept => Message::core(CoreEvent::PromptAccept),
+                PromptMsg::Cancel => Message::core(CoreEvent::PromptCancel),
             })
         };
         let body: Element<'_, Message> = match prompt {
