@@ -251,8 +251,9 @@ pub struct ViewCloseParams {
     /// others (a file's reader beside its editor) closes alone, and the buffer stays; the last
     /// view of a buffer closes the buffer with it. A dormant row's reserved view forgets the row.
     pub view_id: crate::ViewId,
-    /// Also open the next view (the MRU successor, or a fresh scratch when none remain) and
-    /// return it in `opened` — the close-then-attach client chain folded into one round-trip.
+    /// Also open the view the close lands on — where a history step back would have gone, or the
+    /// MRU successor when the trail has nothing to say, or a fresh scratch when none remain — and
+    /// return it in `opened`: the close-then-attach client chain folded into one round-trip.
     #[serde(default)]
     pub open_next: bool,
 }
@@ -260,11 +261,14 @@ pub struct ViewCloseParams {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ViewCloseResult {
     /// The next-most-recently-used view in this workspace after the close. `None` when no views
-    /// remain — the client should open a fresh scratch.
+    /// remain — the client should open a fresh scratch. Always the MRU answer, whatever `opened`
+    /// resolved to: this is what "anything left in this workspace?" is asked with (the ephemeral
+    /// close, which leaves the context when nothing remains).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_view_id: Option<crate::ViewId>,
-    /// With `open_next`: the view the client should now show, fully opened (the MRU
-    /// successor or a fresh scratch).
+    /// With `open_next`: the view the client should now show, fully opened — the landing the
+    /// closing client's own navigation history names, with its cursor restored, else the MRU
+    /// successor or a fresh scratch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened: Option<ViewOpenResult>,
 }
@@ -273,12 +277,14 @@ pub struct ViewCloseResult {
 
 /// Pushed to a client when a view it currently presents is closed by *another* client (a plain
 /// `view/close`, or a path/workspace deletion that tore the buffer down). The receiving client
-/// switches to `next_view_id` (its MRU top after the close), or opens a fresh scratch when `None`
-/// — the same convention as [`ViewCloseResult`]. Sent to clients with a viewport on the buffer
-/// *and* to clients whose active workspace holds it in its MRU without viewing it — the latter is
-/// what lets a tethered client, including the `ae --web` waiter, exit on a close it didn't witness;
-/// non-matching pushes are ignored client-side, so the broad audience is safe. The client that
-/// initiated the close learns the outcome from its RPC result instead.
+/// switches to `next_path` or `next_view_id` — where its *own* history says, when the close was a
+/// plain one and the trail can be named in this payload, else its MRU top — or opens a fresh
+/// scratch when both are `None`, the same convention as [`ViewCloseResult`]. Sent to clients with
+/// a viewport on the buffer *and* to clients whose active workspace holds it in its MRU without
+/// viewing it — the latter is what lets a tethered client, including the `ae --web` waiter, exit
+/// on a close it didn't witness; non-matching pushes are ignored client-side, so the broad
+/// audience is safe. The client that initiated the close learns the outcome from its RPC result
+/// instead.
 pub struct ViewClosed;
 impl NotificationMethod for ViewClosed {
     const NAME: &'static str = "view/closed";

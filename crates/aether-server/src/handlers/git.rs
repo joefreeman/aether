@@ -1067,7 +1067,12 @@ pub async fn rebind_loaded_workspace(
     let mut pushes = workspace_changed_pushes(&s, workspace_id, client_id);
     pushes.extend(refresh_view_pickers(&mut s));
     pushes.extend(refresh_lsp_server_pickers(&mut s));
-    pushes.extend(buffer_closed_pushes_with(&s, &affected, &successor));
+    pushes.extend(buffer_closed_pushes_with(
+        &s,
+        &affected,
+        &successor,
+        &Default::default(),
+    ));
     let watcher = s.watcher.clone();
     drop(s);
 

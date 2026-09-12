@@ -7515,6 +7515,8 @@ async fn nav_back_onto_a_since_cleaned_working_changes_view_says_why() {
         },
     )
     .await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(patch.buffer_id)).await;
     let content: BufferContentResult = send_request::<BufferContent>(
         &mut ws,
         &BufferContentParams {
@@ -7535,15 +7537,22 @@ async fn nav_back_onto_a_since_cleaned_working_changes_view_says_why() {
     .await;
     let file = followed.opened.expect("Enter opened the file").buffer_id;
 
-    // The transient patch closes behind the open, as it does the moment it's hidden for real.
-    let _: ViewCloseResult = send_request::<ViewClose>(
+    // Looking at the file hides the patch, and the transient patch closes behind it — collected,
+    // not closed by name. An explicit close would strike the patch from the trail (a close is a
+    // "not this"), and there would be nothing left to step back onto at all.
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(file)).await;
+    let gone = send_request_expect_err::<BufferContent>(
         &mut ws,
-        &ViewCloseParams {
-            view_id: patch.view_id,
-            open_next: false,
+        &BufferContentParams {
+            buffer_id: patch.buffer_id,
         },
     )
     .await;
+    assert!(
+        gone.contains("unknown buffer_id"),
+        "the hidden preview was collected: {gone}"
+    );
 
     // The tree goes clean under us, so the recorded origin no longer exists to go back to.
     commit_file(&repo, "a.rs", "one\ntwo\n");

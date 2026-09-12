@@ -4005,7 +4005,8 @@ impl Session {
         });
     }
 
-    /// Close the buffer, then attach to the server-indicated next MRU buffer (or a fresh scratch).
+    /// Close the buffer, then attach to the view the server hands back — where this client's own
+    /// navigation history says to go, or its next MRU buffer, or a fresh scratch.
     /// Closing the [tether](Session::tether) instead exits the client — no successor needed. In an
     /// *ephemeral* context, never replace it with a scratch — an empty ephemeral workspace is
     /// pointless — so we close without `open_next` and either attach to a remaining sibling buffer
@@ -7989,9 +7990,9 @@ impl Session {
     }
 
     /// Fire `view/close` for a buffer chosen in the picker. `open_next` is set only when the
-    /// closed buffer is the editor's active one — then the server attaches the viewport to the next
-    /// MRU buffer (or a fresh scratch) and we adopt it; closing a background buffer leaves the editor
-    /// untouched. Either way the picker stays open and re-lists from the server's refresh push (the
+    /// closed buffer is the editor's active one — then the server answers with the view to land on
+    /// (a history step back, else the MRU successor, else a fresh scratch) and we adopt it;
+    /// closing a background buffer leaves the editor untouched. Either way the picker stays open and re-lists from the server's refresh push (the
     /// switch doesn't tear it down — see [`Self::adopt_switch`]). Closing the
     /// [tether](Session::tether) — active or backgrounded — exits the client instead, like every
     /// other close path.

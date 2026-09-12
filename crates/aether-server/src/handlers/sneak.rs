@@ -699,6 +699,10 @@ pub fn byte_to_logical(buf: &Document, byte_idx: usize) -> aether_protocol::Logi
 /// you back onto a restored file rather than a blank scratch. Shared by `view/close` and the
 /// deletion paths so the requesting client and any other clients that were viewing the buffer
 /// resolve their next buffer identically.
+///
+/// A plain close asks the closing client's own navigation history first and reaches this only when
+/// that trail has nothing to say (see `view_close`). This stays the answer to "is anything left in
+/// this workspace?" — a question about the workspace, not about where anyone has been.
 pub fn next_view_for_client(s: &ServerState, client_id: ClientId) -> Option<ViewId> {
     let workspace_name = s.active_workspace(client_id).map(|p| p.id.clone());
     workspace_name
@@ -860,7 +864,7 @@ pub fn workspace_changed_pushes(
 /// telling each which buffer to switch to. Call AFTER teardown so each next-buffer reflects the
 /// settled MRU. Clients that have since disconnected are skipped.
 pub fn buffer_closed_pushes(s: &ServerState, affected: &[AffectedByClose]) -> PendingPushes {
-    buffer_closed_pushes_with(s, affected, &Default::default())
+    buffer_closed_pushes_with(s, affected, &Default::default(), &Default::default())
 }
 
 /// `path` as a root index + root-relative path in the client's active workspace, when it is inside
@@ -881,7 +885,8 @@ fn workspace_location_of(
     })
 }
 
-/// [`buffer_closed_pushes`], with a per-buffer successor override given as a **path**.
+/// [`buffer_closed_pushes`], with a per-buffer successor override given as a **path** and a
+/// per-client landing taken from that client's own navigation history.
 ///
 /// A worktree rebind closes each buffer and reopens it at the same *relative* path on the new tree,
 /// so it knows something the generic rule can't: which file replaces which. Handed back as a path
@@ -890,10 +895,17 @@ fn workspace_location_of(
 /// file materialises the entry under a different id, leaving whoever opens second asking for one
 /// that no longer exists. `view/open` on a path already open returns the existing buffer, so both
 /// clients converge whichever order they arrive in.
+///
+/// A `landing` is the step back the receiving client's own trail would have taken (a plain close —
+/// see `view_close`). The server cannot navigate on another client's behalf, so the push carries
+/// what it can express: the view while it is still live, else the entry's path. An entry that is
+/// only a virtual key names nothing this payload has a field for, so it falls through to the MRU
+/// rule — as does a client with no trail.
 pub fn buffer_closed_pushes_with(
     s: &ServerState,
     affected: &[AffectedByClose],
     successor: &std::collections::HashMap<BufferId, std::path::PathBuf>,
+    landings: &std::collections::HashMap<ClientId, crate::state::NavEntry>,
 ) -> PendingPushes {
     affected
         .iter()
@@ -904,16 +916,27 @@ pub fn buffer_closed_pushes_with(
                  buffer_id,
              }| {
                 let session = s.clients.get(&client_id)?;
+                let landing = landings.get(&client_id);
+                let landing_view = landing
+                    .map(|e| e.view_id)
+                    .filter(|id| s.views.contains_key(id));
+                let landing_path = landing.filter(|_| landing_view.is_none()).and_then(|e| {
+                    Some(aether_protocol::buffer::BufferLocation {
+                        path_index: e.path_index?,
+                        relative_path: e.relative_path.clone()?,
+                    })
+                });
                 let next_path = successor
                     .get(&buffer_id)
-                    .and_then(|path| workspace_location_of(s, client_id, path));
+                    .and_then(|path| workspace_location_of(s, client_id, path))
+                    .or(landing_path);
                 let params = ViewClosedParams {
                     view_id,
                     buffer_id: Some(buffer_id),
                     // Only as the fallback: a path wins when there is one.
                     next_view_id: next_path
                         .is_none()
-                        .then(|| next_view_for_client(s, client_id))
+                        .then(|| landing_view.or_else(|| next_view_for_client(s, client_id)))
                         .flatten(),
                     next_path,
                 };

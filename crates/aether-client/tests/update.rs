@@ -9350,6 +9350,80 @@ fn ephemeral_close_with_sibling_attaches_instead_of_leaving() {
     assert_eq!(params["view_id"], json!(5), "present the remaining view");
 }
 
+/// `Space x` asks for the landing in the same round-trip (`open_next`), and what comes back is
+/// adopted as a **navigation**: the client lands on the successor with the cursor the result
+/// carries and resubscribes so the shell frames it.
+///
+/// The server resolves that successor from this client's history now, so the result carries a
+/// position and not merely a view to attach to — a close that dropped the cursor on the floor
+/// would land you at the top of the file you stepped back to.
+#[test]
+fn space_x_lands_on_the_successor_the_close_hands_back() {
+    use aether_protocol::cursor::CursorState;
+    use aether_protocol::view::{BufferDescription, ViewOpenResult};
+    use aether_protocol::LogicalPosition;
+
+    let mut s = session();
+    s.workspace = "proj".into();
+    s.view.view_id = ViewId(7);
+    s.view.view_buffer = 7;
+    s.view.buffer.buffer_id = 7;
+
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('x'), Mods::NONE, Some("x".into()));
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "view/close");
+    assert_eq!(params["view_id"], json!(7), "the view being closed");
+    assert_eq!(
+        params["open_next"],
+        json!(true),
+        "Space x wants the landing back with the close"
+    );
+
+    let cursor = CursorState {
+        position: LogicalPosition { line: 12, col: 4 },
+        anchor: LogicalPosition { line: 12, col: 4 },
+        match_bracket: None,
+        jumplist_position: None,
+    };
+    let landing = ViewOpenResult {
+        view_id: ViewId(3),
+        scroll: None,
+        transient: false,
+        read: false,
+        buffer: BufferDescription {
+            buffer_id: 3,
+            language: None,
+            line_count: 40,
+            byte_count: 0,
+            revision: 0,
+            saved_revision: 0,
+            path: Some("/proj/came_from.rs".into()),
+            scratch_number: None,
+            cursor,
+            lsp_server: None,
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
+    };
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({ "next_view_id": 3, "opened": serde_json::to_value(&landing).unwrap() })),
+    );
+    assert_eq!(s.view.buffer.buffer_id, 3, "landed on the successor");
+    assert_eq!(s.view.view_id, ViewId(3));
+    assert_eq!(
+        s.view.buffer.cursor.position,
+        LogicalPosition { line: 12, col: 4 },
+        "with the cursor the server restored"
+    );
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
+        "and a resubscribe, which is what frames it"
+    );
+}
+
 // ---- the tether --------------------------------------------------------------
 
 /// Closing a *composed* view that merely happens to be focused on the tethered file closes the

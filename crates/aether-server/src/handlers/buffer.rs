@@ -9,6 +9,15 @@ use super::*;
 ///
 /// Closes are unconditional from the server's point of view — the client is expected to ask
 /// for confirmation if the buffer is dirty.
+///
+/// **A close is a move as well as a teardown.** With `open_next`, where it lands is where a
+/// history step back would have gone: the closed document is struck from both of this client's
+/// stacks ([`prune_closed`] — a close is an explicit "not this", and no `Backspace` may walk into
+/// what you just closed), then the back stack is popped for the landing, then the forward stack
+/// once back is empty (after stepping back and closing, the place you came from is the natural
+/// landing), and only a trail with nothing to say falls through to the MRU successor. Nothing is
+/// pushed the other way — the closed view is gone, not left. Every other client the close *moves*
+/// gets the same rule applied to its own trail, as far as the `view/closed` push can name it.
 pub async fn view_close(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
@@ -110,6 +119,13 @@ pub async fn view_close(
     // Any *other* client viewing this buffer is about to have it pulled out from under it — capture
     // them before teardown drops their viewports, so we can tell them to switch (see below).
     let affected = clients_affected_by_close(&s, &[buffer_id], client_id);
+    // The clients this close actually *moves*: the ones whose own window is presenting the view
+    // going away. The rest of `affected` — a tether, a review windowing the file — keeps its
+    // window and ignores the push, so its trail is struck of the closed document but never
+    // stepped. Captured before teardown, which drops the viewports it reads.
+    let displaced = displaced_clients(&s, buffer_id, client_id);
+    // Every way a trail can name what is closing, read while the document is still there.
+    let closed = ClosedDoc::of(&s, buffer_id);
     // Remember the owning workspace before teardown drops the association, so we can retire an
     // ephemeral workspace once it loses its last buffer.
     let owning_workspace = s.workspace_for_buffer(buffer_id).map(str::to_string);
@@ -144,6 +160,11 @@ pub async fn view_close(
             .retain(|_, v| !(v.client_id == client_id && presenting.contains(&v.view_id)));
         let mut pushes = collect_after_close(&mut s, &left_behind);
         let next_view_id = next_view_for_client(&s, client_id);
+        prune_closed(&mut s, client_id, &closed);
+        let landing = params
+            .open_next
+            .then(|| history_landing(&mut s, client_id))
+            .flatten();
         pushes.extend(collect_view_state_pushes(&s, &demoted));
         pushes.extend(refresh_view_pickers(&mut s));
         drop(s);
@@ -155,7 +176,7 @@ pub async fn view_close(
             "buffer closed by name; kept for the view windowing it"
         );
         let opened = if params.open_next {
-            Some(view_open(state, ctx, successor_params(next_view_id)).await?)
+            Some(land_after_close(state, ctx, landing, next_view_id).await?)
         } else {
             None
         };
@@ -202,6 +223,18 @@ pub async fn view_close(
     // cleanup, or — if that's empty — any remaining buffer in the workspace. The client uses this
     // to attach without an extra RPC round-trip.
     let next_view_id = next_view_for_client(&s, client_id);
+    // Where this client's own trail says to go, resolved *after* the teardown so an entry whose
+    // buffer the close collected — a preview you had come from — reopens by path or by key like
+    // any other step. Pruned either way: with no successor to open there is nothing to resolve,
+    // but the closed document must still leave the trail.
+    prune_closed(&mut s, client_id, &closed);
+    let landing = params
+        .open_next
+        .then(|| history_landing(&mut s, client_id))
+        .flatten();
+    // The same rule for every client the close moves. The server cannot navigate on their behalf,
+    // so their landing rides the push as whatever it can name (see `buffer_closed_pushes_with`).
+    let landings = displaced_landings(&mut s, &affected, &displaced, &closed);
     // Closing changed the workspace's open set — the session must stop restoring the closed file.
     // Dirtied here, after the close, rather than in the MRU drops the teardown goes through: those
     // are also the hide collector's, and the collector must never write.
@@ -214,8 +247,14 @@ pub async fn view_close(
     if retired_ephemeral {
         pushes.extend(refresh_workspace_pickers(&mut s));
     }
-    // Tell the other clients their active buffer vanished (each switches to its own next buffer).
-    pushes.extend(buffer_closed_pushes(&s, &affected));
+    // Tell the other clients their active buffer vanished (each switches to where its own trail
+    // says, or to its next buffer).
+    pushes.extend(buffer_closed_pushes_with(
+        &s,
+        &affected,
+        &Default::default(),
+        &landings,
+    ));
     // If closing this buffer shut its language server down, refresh any open "LSP servers"
     // picker so the now-gone server drops out of the list.
     if stopped_server.is_some() {
@@ -229,7 +268,7 @@ pub async fn view_close(
     // Composite post-step: present the client's next view (or a placeholder) in the same
     // round-trip.
     let opened = if params.open_next {
-        Some(view_open(state, ctx, successor_params(next_view_id)).await?)
+        Some(land_after_close(state, ctx, landing, next_view_id).await?)
     } else {
         None
     };
@@ -237,6 +276,78 @@ pub async fn view_close(
         next_view_id,
         opened,
     })
+}
+
+/// Where a close puts the client that asked for it: the step back its history would have taken —
+/// presented through [`navigate_to`], so the cursor and the element come back with it and a
+/// since-closed review regenerates from its key — and, when the trail has nothing to say, the
+/// successor rule ([`successor_params`]).
+///
+/// A landing that refuses (a working-changes view whose tree has gone clean, a file deleted from
+/// under its entry) falls through to the successor rather than failing the close. The buffer is
+/// already gone by the time this runs, so an error here would leave the client with nothing to
+/// show — which is not the answer to "where you were is no longer there". A *step* still refuses
+/// and says why: there the client has somewhere to stay.
+async fn land_after_close(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    landing: Option<NavEntry>,
+    next_view_id: Option<ViewId>,
+) -> Result<ViewOpenResult, RpcError> {
+    if let Some(entry) = landing {
+        match navigate_to(state, ctx, entry).await {
+            Ok(opened) => return Ok(opened),
+            Err(e) => tracing::debug!(
+                error = %e.message,
+                "close landing could not be presented; falling back to the successor"
+            ),
+        }
+    }
+    view_open(state, ctx, successor_params(next_view_id)).await
+}
+
+/// The other clients whose own window a close of `buffer_id` empties — the ones presenting one of
+/// its views. Read before teardown, which drops exactly these viewports.
+fn displaced_clients(s: &ServerState, buffer_id: BufferId, except: ClientId) -> Vec<ClientId> {
+    let presenting = s.views_presenting(buffer_id);
+    let mut out: Vec<ClientId> = Vec::new();
+    for vp in s.viewports.values() {
+        if vp.client_id != except
+            && presenting.contains(&vp.view_id)
+            && !out.contains(&vp.client_id)
+        {
+            out.push(vp.client_id);
+        }
+    }
+    out
+}
+
+/// Apply the close rule to every other client the close reached: strike the closed document from
+/// its trail, and — for the ones it actually moves — take the step back that trail says. The
+/// entries answered are what the `view/closed` push then names.
+fn displaced_landings(
+    s: &mut ServerState,
+    affected: &[AffectedByClose],
+    displaced: &[ClientId],
+    closed: &ClosedDoc,
+) -> HashMap<ClientId, NavEntry> {
+    let mut clients: Vec<ClientId> = Vec::new();
+    for a in affected {
+        if !clients.contains(&a.client_id) {
+            clients.push(a.client_id);
+        }
+    }
+    let mut landings = HashMap::new();
+    for client_id in clients {
+        prune_closed(s, client_id, closed);
+        if !displaced.contains(&client_id) {
+            continue;
+        }
+        if let Some(entry) = history_landing(s, client_id) {
+            landings.insert(client_id, entry);
+        }
+    }
+    landings
 }
 
 /// The open a close hands on to: the next view when there is one, else a placeholder — a scratch
