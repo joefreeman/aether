@@ -732,7 +732,8 @@ pub struct WorkspaceSession {
     /// The views that were open in this workspace, most-recently-used first. On re-activation
     /// they're restored as *dormant* rows (listed in the view picker, loaded lazily). Files carry
     /// their canonical path; dirty scratches carry their per-workspace number (their content is
-    /// restored from the matching backup). Clean scratches and transient previews are omitted.
+    /// restored from the matching backup). Clean scratches are omitted; previews are not — each
+    /// entry carries whether it was one, so exiting in a diff comes back to it.
     /// `buffers` in files written before views were the unit.
     #[serde(default, alias = "buffers")]
     pub views: Vec<SessionView>,
@@ -874,69 +875,130 @@ impl WorkspaceSession {
 }
 
 /// One view a workspace's session records — a row of the view picker when the workspace comes
-/// back, and what selecting that row opens. Only kept views get here. Internally tagged, and the
-/// tag **is the kind of view**: a file as its `editor` or its `reader` (a file you kept both of is
-/// two entries), a `scratch` (a dirty one, whose content survives as a backup, keyed by its
-/// per-workspace number), or a `virtual` view materialised from a repository — the working
-/// changes, a commit's patch, a file at a revision — by its `VirtualSource::key`.
+/// back, and what selecting that row opens. Every variant carries how the view was presented
+/// (`read`, `transient`), so a restored row comes back as it was left. Internally tagged: a `file`
+/// (with how it was last shown — read as the rendered document, or edited as source), a `scratch`
+/// (a dirty one, whose content survives as a backup, keyed by its per-workspace number), a
+/// `virtual` view materialised from a repository — the working changes, a commit's patch, a file
+/// at a revision — by its `VirtualSource::key`, a `shell` or an `agent` by number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionView {
-    Editor {
+    File {
         path: PathBuf,
+        /// The file was being **read** — shown as the rendered document — when last recorded, so
+        /// its row materialises reading. Off the wire when false, the common case.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        read: bool,
+        /// The view was a **preview** — a peek that closes itself once nothing shows it. Recorded
+        /// so exiting in one comes back to it; honoured only for the landing view, so every other
+        /// preview in the list is dropped at activation. Off the wire when false, the common case.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        transient: bool,
+        /// A session written while a file's reader was a view of its own tagged the entry with
+        /// the view it was (`view: "reader"`); read as the mode it named
+        /// ([`WorkspaceSessions::normalise`]), never written.
+        #[doc(hidden)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<LegacyViewKind>,
     },
-    Reader {
-        path: PathBuf,
-    },
+    /// A session written while a file's editor and its reader were two views: an `editor` entry.
+    /// Read as a file shown as source; never written.
+    #[doc(hidden)]
+    Editor { path: PathBuf },
+    /// Likewise a `reader` entry: read as a file being read; never written.
+    #[doc(hidden)]
+    Reader { path: PathBuf },
     Scratch {
         number: u32,
+        /// See [`SessionView::File::transient`]. A dirty scratch is never a preview — the first
+        /// edit promotes it — so this is false in practice; it is here for uniformity.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        transient: bool,
     },
     /// Stable across restarts because a repo id is its canonical workdir. Nothing of the content is
     /// stored: it regenerates from the repo, and a revision that has been rewritten away since
-    /// simply doesn't come back. A revision opens as a preview, so one has to have been kept with
-    /// `Space k` to be here.
+    /// simply doesn't come back. A revision opens as a preview: a kept one is recorded kept, and
+    /// a preview is recorded as one so that exiting in a diff comes back to it.
     Virtual {
         key: String,
+        /// See [`SessionView::File::transient`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        transient: bool,
     },
     /// A shell, by its per-workspace number. Its transcript, runs, directory and assignments
     /// survive as a snapshot in the backups directory, keyed the same way; an entry with no
     /// snapshot to restore from is dropped at activation, as a scratch's is.
     Shell {
         number: u32,
+        /// See [`SessionView::File::transient`]. A shell is never a preview — one would close
+        /// itself the moment you looked at a file, taking a running build with it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        transient: bool,
     },
     /// An agent conversation, by its per-workspace number. Its content survives as a snapshot in
     /// the backups directory, keyed the same way; an entry with no snapshot is dropped at
     /// activation exactly as a shell's is.
     Agent {
         number: u32,
-    },
-    /// A session written before the tag was the view's kind: a file with an optional `view`. Read
-    /// as the editor or reader it named ([`WorkspaceSessions::normalise`]); never written.
-    #[doc(hidden)]
-    File {
-        path: PathBuf,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        view: Option<aether_protocol::ui::ViewKind>,
+        /// See [`SessionView::File::transient`]. Never a preview, for a shell's reason.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        transient: bool,
     },
 }
 
+/// What a `file` entry's `view` tag named while a file's reader was a view of its own. Kept only
+/// so those sessions still read; nothing writes it.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyViewKind {
+    Editor,
+    Reader,
+}
+
 impl SessionView {
-    /// A file, as `kind` of view of it.
-    pub fn file(path: PathBuf, kind: aether_protocol::ui::ViewKind) -> Self {
-        match kind {
-            aether_protocol::ui::ViewKind::Editor => SessionView::Editor { path },
-            aether_protocol::ui::ViewKind::Reader => SessionView::Reader { path },
+    /// A file, as it was last shown: read (`true`) or edited, and kept or a preview.
+    pub fn file(path: PathBuf, read: bool, transient: bool) -> Self {
+        SessionView::File {
+            path,
+            read,
+            transient,
+            view: None,
         }
     }
 
-    /// The file and the kind of view of it this entry is, for a file entry — a legacy `file` entry
-    /// read as what it named, the editor when it named nothing.
-    pub fn file_view(&self) -> Option<(&Path, aether_protocol::ui::ViewKind)> {
-        use aether_protocol::ui::ViewKind;
+    /// Whether this entry was a **preview** when it was recorded — a peek that closes itself once
+    /// nothing shows it. Honoured only for the landing view: every other preview in a restored
+    /// list is dropped once the landing is decided.
+    pub fn transient(&self) -> bool {
         match self {
-            SessionView::Editor { path } => Some((path, ViewKind::Editor)),
-            SessionView::Reader { path } => Some((path, ViewKind::Reader)),
-            SessionView::File { path, view } => Some((path, view.unwrap_or(ViewKind::Editor))),
+            SessionView::File { transient, .. }
+            | SessionView::Scratch { transient, .. }
+            | SessionView::Virtual { transient, .. }
+            | SessionView::Shell { transient, .. }
+            | SessionView::Agent { transient, .. } => *transient,
+            // Written before a preview could be recorded at all, so it named a kept view.
+            SessionView::Editor { .. } | SessionView::Reader { .. } => false,
+        }
+    }
+
+    /// The file and whether it was being read, for a file entry — a legacy `editor`, `reader` or
+    /// tagged `file` entry read as what it named.
+    pub fn file_view(&self) -> Option<(&Path, bool)> {
+        match self {
+            SessionView::File {
+                path, read, view, ..
+            } => Some((
+                path,
+                match view {
+                    Some(LegacyViewKind::Reader) => true,
+                    Some(LegacyViewKind::Editor) => false,
+                    None => *read,
+                },
+            )),
+            SessionView::Editor { path } => Some((path, false)),
+            SessionView::Reader { path } => Some((path, true)),
             SessionView::Scratch { .. }
             | SessionView::Virtual { .. }
             | SessionView::Shell { .. }
@@ -944,14 +1006,16 @@ impl SessionView {
         }
     }
 
-    /// This entry as the session writes it: a legacy `file` entry becomes the editor or reader it
-    /// named; everything else is itself.
+    /// This entry as the session writes it: a legacy file entry — `editor`, `reader`, or a `file`
+    /// tagged with a `view` — becomes the file entry with the mode it named; everything else is
+    /// itself.
     fn normalised(self) -> Self {
-        match self {
-            SessionView::File { path, view } => {
-                SessionView::file(path, view.unwrap_or(aether_protocol::ui::ViewKind::Editor))
+        match self.file_view() {
+            Some((path, read)) => {
+                let (path, transient) = (path.to_path_buf(), self.transient());
+                SessionView::file(path, read, transient)
             }
-            other => other,
+            None => self,
         }
     }
 }
@@ -995,9 +1059,10 @@ pub fn load_workspace_sessions_at(path: &Path) -> anyhow::Result<WorkspaceSessio
 }
 
 impl WorkspaceSessions {
-    /// Read a file written before the tag was the view's kind as one written now: every legacy
-    /// `file` entry becomes the `editor` or `reader` it named, so nothing after the load meets
-    /// one, and the next write is in the current shape.
+    /// Read a file written while a file's reader was a view of its own as one written now: every
+    /// legacy `editor`, `reader` or `view`-tagged `file` entry becomes the file entry with the
+    /// mode it named, so nothing after the load meets one, and the next write is in the current
+    /// shape.
     pub fn normalise(&mut self) {
         for session in self.workspaces.values_mut() {
             session.views = std::mem::take(&mut session.views)
@@ -1791,13 +1856,22 @@ mod tests {
                 contexts: Vec::new(),
                 last_activated_at: 1000,
                 views: vec![
-                    SessionView::Editor {
+                    SessionView::File {
+                        read: false,
+                        transient: false,
+                        view: None,
                         path: PathBuf::from("/work/a.rs"),
                     },
-                    SessionView::Editor {
+                    SessionView::File {
+                        read: false,
+                        transient: true,
+                        view: None,
                         path: PathBuf::from("/work/b.rs"),
                     },
-                    SessionView::Scratch { number: 2 },
+                    SessionView::Scratch {
+                        number: 2,
+                        transient: false,
+                    },
                 ],
             },
         );
@@ -1811,6 +1885,59 @@ mod tests {
         );
         write_workspace_sessions_at(&path, &sessions).unwrap();
         assert_eq!(load_workspace_sessions_at(&path).unwrap(), sessions);
+    }
+
+    /// A session written while a file's reader was a view of its own — `editor` and `reader`
+    /// entries, or a `file` tagged with the view it was — reads as the file entry with the mode
+    /// it named, and is written back in the current shape.
+    #[test]
+    fn legacy_file_entries_read_as_the_mode_they_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        std::fs::write(
+            &path,
+            r#"{"workspaces":{"p":{"last_activated_at":1,"views":[
+                {"kind":"reader","path":"/p/a.md"},
+                {"kind":"editor","path":"/p/b.md"},
+                {"kind":"file","path":"/p/c.md","view":"reader"},
+                {"kind":"file","path":"/p/d.md","view":"editor"},
+                {"kind":"file","path":"/p/e.md"},
+                {"kind":"file","path":"/p/f.md","read":true},
+                {"kind":"file","path":"/p/g.md","transient":true}
+            ]}}}"#,
+        )
+        .unwrap();
+        let loaded = load_workspace_sessions_at(&path).unwrap();
+        assert_eq!(
+            loaded.workspaces["p"].views,
+            vec![
+                SessionView::file(PathBuf::from("/p/a.md"), true, false),
+                SessionView::file(PathBuf::from("/p/b.md"), false, false),
+                SessionView::file(PathBuf::from("/p/c.md"), true, false),
+                SessionView::file(PathBuf::from("/p/d.md"), false, false),
+                SessionView::file(PathBuf::from("/p/e.md"), false, false),
+                SessionView::file(PathBuf::from("/p/f.md"), true, false),
+                // A preview survives normalisation as one.
+                SessionView::file(PathBuf::from("/p/g.md"), false, true),
+            ]
+        );
+        // Written back: one shape, `read` only when true, no `view` tag.
+        write_workspace_sessions_at(&path, &loaded).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("\"view\""),
+            "the legacy tag is never written: {raw}"
+        );
+        assert!(!raw.contains("\"reader\"") && !raw.contains("\"editor\""));
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let views = json["workspaces"]["p"]["views"].as_array().unwrap();
+        assert_eq!(views[0]["read"], serde_json::json!(true));
+        assert!(views[1].get("read").is_none(), "false is off the wire");
+        assert!(
+            views[0].get("transient").is_none(),
+            "a kept view carries no transient flag: {raw}"
+        );
+        assert_eq!(views[6]["transient"], serde_json::json!(true));
     }
 
     #[test]

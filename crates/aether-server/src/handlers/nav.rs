@@ -30,9 +30,12 @@ fn buffer_path_ref(
     (None, None)
 }
 
-/// The client's current location as a nav entry: the cursor it holds on `buffer_id` plus a
-/// reopenable path ref. The buffer is supplied by the client (not inferred from a viewport, since
-/// clients may hold several). `None` if that buffer no longer exists.
+/// The client's current location as a nav entry: the **view** it is in, the cursor in it, and a
+/// reopenable handle. `buffer_id` is the buffer the client names — its current one, which inside
+/// a composed view is the buffer under the cursor rather than the view's own — and the entry is
+/// the view's whichever it was: a step taken from inside a commit's patch names the hunk's file at
+/// the revision, and an entry made of *that* stepped back onto the file, not the patch. `None` if
+/// the buffer no longer exists.
 pub fn nav_entry_for(
     s: &ServerState,
     client_id: ClientId,
@@ -41,15 +44,18 @@ pub fn nav_entry_for(
     if !s.buffers.contains_key(&buffer_id) {
         return None;
     }
+    // A buffer with no view yet records as one nothing names, which a step back then reopens by
+    // path — a view id is never `0`, so the entry cannot mistake a later view for its own.
+    let view_id =
+        crate::handlers::viewport::client_view_of(s, client_id, buffer_id).unwrap_or_default();
+    // The view's own buffer is the entry's identity: what the path fields and the virtual key
+    // name, and what a step back re-presents.
+    let buffer_id = s.try_presenting_buffer(view_id).unwrap_or(buffer_id);
     let (path_index, relative_path) = buffer_path_ref(s, client_id, buffer_id);
     let virtual_key = s
         .try_doc_of(buffer_id)
         .and_then(|d| d.virtual_source.as_ref())
         .map(|v| v.target.key());
-    // A buffer with no view yet records as one nothing names, which a step back then reopens by
-    // path — a view id is never `0`, so the entry cannot mistake a later view for its own.
-    let view_id =
-        crate::handlers::viewport::client_view_of(s, client_id, buffer_id).unwrap_or_default();
     // Where the cursor *is*, which in a composed view is not this buffer. The viewport already
     // tracks which element holds it — the same field an edit, a search and an undo act through —
     // so the location is that element and the cursor of the buffer it windows.
@@ -73,6 +79,7 @@ pub fn nav_entry_for(
         virtual_key,
         element,
         cursor,
+        read: Some(s.read_mode(client_id, buffer_id)),
     })
 }
 
@@ -127,6 +134,8 @@ pub async fn materialise_virtual_key(
         target: what,
         // A reopen restores its own cursor; focusing a file would fight that.
         focus_path: None,
+        // A history step is not a jump to record.
+        record_nav_from: None,
     };
     let shown = match git_show(state, ctx, params).await {
         Ok(shown) => shown,
@@ -184,7 +193,9 @@ async fn navigate_to(
         transient: Some(true),
         record_nav_from: None,
         element: None,
-        kind: None,
+        // The mode you were in, not whatever the file has been shown as since: a preview that
+        // closed behind you took the file's memory with it, and the setting would then decide.
+        read: entry.read,
     };
     let mut result = view_open(state, ctx, open_params).await?;
 
@@ -273,10 +284,17 @@ async fn nav_step_dir(
             });
             let Some(entry) = popped else { break };
             // A file entry can always be reopened, and so can a revision (it regenerates from its
-            // key); a scratch entry only if it's still open.
+            // key); a scratch, a shell or an agent only while it's still open — their keys name
+            // nothing that can be regenerated (`materialise_virtual_key`), so a key alone is not
+            // a way back. Asked of the target, not of the key's presence: judged by the key, a
+            // closed shell was "resolvable" and the step fell through to an open with nothing to
+            // open.
+            let regenerates = entry.virtual_key.as_deref().is_some_and(|key| {
+                crate::state::VirtualTarget::parse_key(key).is_some_and(|t| t.repo_id().is_some())
+            });
             let resolvable = entry.path_index.is_some()
                 || entry.relative_path.is_some()
-                || entry.virtual_key.is_some()
+                || regenerates
                 || s.buffers.contains_key(&entry.buffer_id);
             if resolvable {
                 chosen = Some(entry);
@@ -333,6 +351,9 @@ pub async fn nav_goto(
         // is not in that payload, so this restores the cursor and lets the client frame itself.
         element: None,
         cursor: params.cursor,
+        // The web owns its stacks and says what it recorded; nothing recorded leaves the mode to
+        // the server's memory, as an ordinary open does.
+        read: params.read,
     };
     Ok(NavStepResult {
         target: Some(navigate_to(state, ctx, entry).await?),

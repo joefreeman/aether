@@ -76,4 +76,9 @@ pub struct NavGotoParams {
     /// The cursor/selection to restore (anchor + position). Clamped to the buffer's current
     /// bounds server-side. `match_bracket`/`jumplist_position` are recomputed and may be omitted.
     pub cursor: CursorState,
+    /// Whether the entry was captured while **reading** a markdown file, so stepping back lands
+    /// in that mode rather than whatever the file has since been shown as. Omitted (or `None`)
+    /// leaves the mode to the server's memory, as an ordinary open does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<bool>,
 }

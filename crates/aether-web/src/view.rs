@@ -417,6 +417,12 @@ fn confirm_kind(k: &ConfirmKind) -> Value {
         ConfirmKind::RecreateDeleted => json!({ "kind": "recreate_deleted" }),
         ConfirmKind::DiscardOnReload => json!({ "kind": "discard_reload" }),
         ConfirmKind::DiscardOnClose { label } => json!({ "kind": "discard_close", "label": label }),
+        ConfirmKind::CloseRunningShell { title } => {
+            json!({ "kind": "close_running_shell", "title": title })
+        }
+        ConfirmKind::CloseBusyAgent { title } => {
+            json!({ "kind": "close_busy_agent", "title": title })
+        }
         ConfirmKind::Delete { noun, name } => {
             json!({ "kind": "delete", "noun": noun, "name": name })
         }
@@ -485,7 +491,7 @@ fn pending(p: &Pending) -> Value {
         // The git sub-leader is a leader with a prefix already typed; the shell only tests for a
         // non-null `pending` to pick the awaiting-key cursor, so this needs no TS counterpart.
         Pending::LeaderGit => json!({ "kind": "leader", "prefix": "g" }),
-        Pending::LeaderAgent => json!({ "kind": "leader", "prefix": "n" }),
+        Pending::LeaderView => json!({ "kind": "leader", "prefix": "v" }),
         Pending::Find {
             dir,
             till,

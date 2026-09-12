@@ -144,11 +144,11 @@ pub enum KeyContext {
     /// mirroring `Space d`'s diagnostics) and `Space m` (blame at the cursor, the third reveal next
     /// to `Tab` and `Space n`).
     LeaderGit,
-    /// The `Space n` sub-leader: everything to do with an agent conversation. A second sub-leader
-    /// rather than `Alt`-variants on the leader because a conversation has more verbs than one key
-    /// row can hold — opening, stopping, and answering a permission request both ways — and
-    /// because answering must never be one key away from a typo.
-    LeaderAgent,
+    /// The `Space v` sub-leader: the verbs of the **view** you are in — stop what it is running,
+    /// and answer what an agent is asking. A second sub-leader rather than `Alt`-variants on the
+    /// leader because answering must never be one key away from a typo, and because the leader's
+    /// twenty-six letters were spent.
+    LeaderView,
     Global,
 }
 
@@ -318,8 +318,8 @@ pub enum Action {
     /// `Space g` — arm the git sub-leader ([`KeyContext::LeaderGit`]): the next keystroke names a
     /// git operation. Like the leader itself, an unbound key just cancels.
     BeginGitLeader,
-    /// `Space n` — arm the agent sub-leader ([`KeyContext::LeaderAgent`]).
-    BeginAgentLeader,
+    /// `Space v` — arm the view sub-leader ([`KeyContext::LeaderView`]).
+    BeginViewLeader,
 
     // ---- edits ----
     Backspace,
@@ -437,23 +437,18 @@ pub enum Action {
     /// Copy the active buffer's absolute (canonical) path to the system clipboard.
     CopyAbsolutePath,
     NewScratch,
-    /// `Space b` — a shell you can type into. When the view in front of you is already a shell,
-    /// a **new** one; otherwise the idle shell the server picks, or a fresh one when every shell
-    /// is busy. The client only reports which of the two it is asking for; the choosing is the
-    /// server's, which is where the shells and their states live.
+    /// `Space Alt-t` — a **new** shell. Always creates: `Space t` lists the ones you have, so the
+    /// open key has one meaning.
     ShellOpen,
-    /// `Space Alt-b` — stop the focused shell's run, killing its whole process group. Toasts when
-    /// the view is not a shell, or when nothing is running. Same shape as `Space g x`.
-    ShellCancel,
-    /// `Space n n` — an agent you can type at. When the view in front of you is already an agent
-    /// view, a **new** conversation; otherwise the idle one the server picks, or a fresh one when
-    /// every conversation is busy. The client reports only which of the two it is asking for; the
-    /// choosing is the server's, which is where the conversations live.
+    /// `Space Alt-a` — a **new** agent conversation, with the first agent found on `PATH`. Always
+    /// creates, for the reason [`Action::ShellOpen`] does.
     AgentOpen,
-    /// `Space n c` — stop the focused conversation's turn. Toasts when the view is not an agent
-    /// view, or when nothing is running.
-    AgentCancel,
-    /// `Space n a` / `Space n d` — answer the pending permission request with the agent's first
+    /// `Space v c` — stop whatever the focused view is running: a shell's command, an agent's turn.
+    /// **Total** — the server decides what the view is, and a view running nothing answers so,
+    /// which is the one toast this can produce ("Nothing is running here"). Same shape as
+    /// `Space g x`.
+    Interrupt,
+    /// `Space v a` / `Space v d` — answer the pending permission request with the agent's first
     /// allowing or rejecting option. The wording is the agent's; this only says which way.
     AgentAnswer {
         allow: bool,
@@ -595,7 +590,7 @@ pub enum Action {
 
     // ---- git (popovers) ----
     /// `Space m` — blame details for the cursor's line. Stays on the leader (not `Space g`) as the
-    /// third cursor-local *reveal*, beside `Space t` (hover) and `Space n` (diagnostic at cursor).
+    /// third cursor-local *reveal*, beside `Space n` (hover) and `Space Alt-n` (diagnostic at cursor).
     ShowCommitInfo,
 
     // ---- pickers ----
@@ -796,7 +791,7 @@ impl Binding {
         match self.ctx {
             KeyContext::Leader => s.push_str("Space "),
             KeyContext::LeaderGit => s.push_str("Space g "),
-            KeyContext::LeaderAgent => s.push_str("Space n "),
+            KeyContext::LeaderView => s.push_str("Space v "),
             _ => {}
         }
         let m = self.mods.display_mods();
@@ -846,7 +841,7 @@ pub fn all() -> impl Iterator<Item = &'static Binding> {
         KeyContext::Read,
         KeyContext::Leader,
         KeyContext::LeaderGit,
-        KeyContext::LeaderAgent,
+        KeyContext::LeaderView,
     ]
     .into_iter()
     .flat_map(|cx| table(cx).iter())
@@ -862,7 +857,7 @@ pub fn table(ctx: KeyContext) -> &'static [Binding] {
         KeyContext::Read => READ,
         KeyContext::Leader => LEADER,
         KeyContext::LeaderGit => LEADER_GIT,
-        KeyContext::LeaderAgent => LEADER_AGENT,
+        KeyContext::LeaderView => LEADER_VIEW,
         KeyContext::Global => GLOBAL,
     }
 }
@@ -915,7 +910,7 @@ pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
         ("Read", KeyContext::Read),
         ("Application", KeyContext::Leader),
         ("Application", KeyContext::LeaderGit),
-        ("Application", KeyContext::LeaderAgent),
+        ("Application", KeyContext::LeaderView),
     ];
     // One bucket per group, filled in scan order; reordered to GROUP_ORDER just before flattening.
     // A Vec scan beats a map: ~15 groups, built once per open.
@@ -925,7 +920,7 @@ pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
             if !b.group.is_empty()
                 && !matches!(
                     b.action,
-                    Action::BeginLeader | Action::BeginGitLeader | Action::BeginAgentLeader
+                    Action::BeginLeader | Action::BeginGitLeader | Action::BeginViewLeader
                 )
             {
                 let entry = aether_protocol::picker::KeybindingEntry {
@@ -982,7 +977,7 @@ pub fn hover_action(code: KeyCode, mods: Mods) -> Option<HoverAction> {
 
 use Action as A;
 use KeyContext::{
-    Global as G, Insert as I, Leader as L, LeaderAgent as LA, LeaderGit as LG, Normal as N,
+    Global as G, Insert as I, Leader as L, LeaderGit as LG, LeaderView as LV, Normal as N,
     Read as R,
 };
 use ModPattern::{Any, Exact, IgnoreShift};
@@ -1370,8 +1365,14 @@ static READ: &[Binding] = &[
 static LEADER: &[Binding] = &[
     bind!(L, ch('f'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Files), "Files", "Find files"),
     bind!(L, ch('f'), Exact(Mods::ALT), A::OpenFilesInFileDir, "Files", "Find files in this file's directory"),
-    bind!(L, ch('v'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Views), "Files", "Switch view"),
-    bind!(L, ch('a'), Exact(Mods::NONE), A::NewScratch, "Files", "New scratch"),
+    // The three view-listing pickers share one rule with their `Alt` siblings: plain **lists** what
+    // you have, `Alt` **makes** a new one. `b` buffers, `t` shells (terminals), `a` agents.
+    bind!(L, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Buffers), "Files", "Switch buffer"),
+    bind!(L, ch('b'), Exact(Mods::ALT), A::NewScratch, "Files", "New scratch"),
+    bind!(L, ch('t'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Shells), "App", "Switch shell"),
+    bind!(L, ch('t'), Exact(Mods::ALT), A::ShellOpen, "App", "New shell (run a command)"),
+    bind!(L, ch('a'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Agents), "Agent", "Switch agent conversation"),
+    bind!(L, ch('a'), Exact(Mods::ALT), A::AgentOpen, "Agent", "New agent conversation"),
     // `g` is the git sub-leader's prefix, so grep moved to `/` (and its selection-seeded sibling to
     // `Alt-/`) — the workspace-scoped echo of Normal's `/` and `Alt-/`. `Space Alt-g` is left
     // unbound on purpose: `g` should read as "git" with no exception to remember.
@@ -1385,20 +1386,20 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::DiagnosticsWorkspace), "Code", "Workspace diagnostics"),
     bind!(L, ch('j'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Jumplist), "Navigation", "Jumplist"),
     bind!(L, ch('j'), Exact(Mods::ALT), A::ClearJumplist, "Navigation", "Clear jumplist"),
-    // The cursor-reveals sit together: `t` type & docs, `n` diagnostic, `m` blame. Hover used to be
-    // `Tab` — the odd one out of the three — and moved here to free `Tab`/`Shift-Tab` for moving
-    // between the editors of a multi-element view. Bare letters are motions; a reveal is not one.
+    // The cursor-reveals sit together: `n` type & docs, `Alt-n` diagnostic, `m` blame. Hover used to
+    // be `Tab` — the odd one out of the three — and moved to the leader to free `Tab`/`Shift-Tab`
+    // for moving between the editors of a multi-element view. Bare letters are motions; a reveal is
+    // not one.
     //
-    // `t` was left free after `Space g c` took over committing, so a stale reflex would land on
-    // nothing. Spent deliberately: a hover popover is an inert landing, the same argument that let
-    // the keybindings picker reclaim `y`.
+    // The trio sat on `t`/`Alt-t`/`m` until the three view pickers took the whole `a`/`b`/`t` row;
+    // `n` came free at the same moment, when the agent sub-leader moved to `Space v`.
     //
     // One binding covers the reading view too — `A::Hover` resolves to the focused link's target
     // there — because "what is this thing?" is the same question either way.
-    bind!(L, ch('t'), Exact(Mods::NONE), A::Hover, "Code", "Hover: type & docs, or link target"),
-    bind!(L, ch('t'), Exact(Mods::ALT), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
-    bind!(L, ch('n'), Exact(Mods::NONE), A::BeginAgentLeader, "Leader", "Agent sub-leader chord"),
+    bind!(L, ch('n'), Exact(Mods::NONE), A::Hover, "Code", "Hover: type & docs, or link target"),
+    bind!(L, ch('n'), Exact(Mods::ALT), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
     bind!(L, ch('m'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
+    bind!(L, ch('v'), Exact(Mods::NONE), A::BeginViewLeader, "Leader", "View sub-leader chord"),
     bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
     bind!(L, ch('r'), Exact(Mods::NONE), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
     bind!(L, ch('o'), Exact(Mods::NONE), A::OpenPicker(PickerKind::DocumentSymbols), "Code", "Document symbols"),
@@ -1424,7 +1425,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('w'), Exact(Mods::ALT), A::OpenPath, "App", "Open file by absolute path"),
     bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
-    bind!(L, ch('k'), Exact(Mods::NONE), A::ToggleKeep, "App", "Keep view (toggle transient)"),
+    bind!(L, ch('k'), Exact(Mods::NONE), A::ToggleKeep, "App", "Keep this document (in a review, the file under the cursor)"),
     bind!(L, ch('k'), Exact(Mods::ALT), A::Reload, "App", "Reload from disk"),
     bind!(L, ch('p'), Exact(Mods::NONE), A::CopyRelativePath, "App", "Copy relative path"),
     bind!(L, ch('p'), Exact(Mods::ALT), A::CopyAbsolutePath, "App", "Copy absolute path"),
@@ -1440,10 +1441,6 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('i'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitBaseline), "Git", "Diff against…"),
     bind!(L, ch('h'), Exact(Mods::NONE), A::DismissHint, "App", "Dismiss the current hint"),
     bind!(L, ch('h'), Exact(Mods::ALT), A::ToggleHints, "App", "Toggle hints on/off"),
-    // The plain/Alt pair names one verb twice, as everywhere else: `b` gives you a shell, `Alt-b`
-    // stops what it is running. `b` was the only free letter under the leader.
-    bind!(L, ch('b'), Exact(Mods::NONE), A::ShellOpen, "App", "Shell (run a command)"),
-    bind!(L, ch('b'), Exact(Mods::ALT), A::ShellCancel, "App", "Stop the shell's running command"),
 ];
 
 /// The `Space g` sub-leader: git operations on the repo. Same plain/Alt sibling convention as the
@@ -1471,18 +1468,24 @@ static LEADER: &[Binding] = &[
 /// git in it: while the baseline is the saved file, `r` reverts a hunk to *disk*, i.e. discards its
 /// unsaved edits. Staging and unstaging are refused there (and under a pinned revision) — see
 /// `ApplyHunkStatus::NotAgainstHead`.
-/// The `Space n` sub-leader: an agent conversation's verbs.
+/// The `Space v` sub-leader: the verbs of the **view** you are in.
 ///
-/// `a` and `d` answer the pending permission request the agent is blocked on — allow and decline.
+/// `c` stops whatever it is running — one key for a shell's command and an agent's turn, because
+/// the client cannot tell the two apart and does not need to (see [`Action::Interrupt`]).
+///
+/// `a` and `d` answer the pending permission request an agent is blocked on — allow and decline.
 /// Two keys rather than one toggle for the reason staging and unstaging are two: an answer cannot
 /// be taken back, so pressing the same key twice must never mean the opposite of the first press.
-/// The *wording* of the options is always the agent's own; these only say which way.
+/// The *wording* of the options is always the agent's own; these only say which way. They stay
+/// chords rather than a modal prompt because answering usually means scrolling the transcript
+/// first, which an overlay would block.
+///
+/// `Esc` is deliberately unbound here, as in every leader table: it cancels the pending chord.
 #[rustfmt::skip]
-static LEADER_AGENT: &[Binding] = &[
-    bind!(LA, ch('n'), Exact(Mods::NONE), A::AgentOpen, "Agent", "Agent conversation (prompt an agent)"),
-    bind!(LA, ch('c'), Exact(Mods::NONE), A::AgentCancel, "Agent", "Stop the agent's current turn"),
-    bind!(LA, ch('a'), Exact(Mods::NONE), A::AgentAnswer { allow: true }, "Agent", "Allow what the agent is asking to do"),
-    bind!(LA, ch('d'), Exact(Mods::NONE), A::AgentAnswer { allow: false }, "Agent", "Decline what the agent is asking to do"),
+static LEADER_VIEW: &[Binding] = &[
+    bind!(LV, ch('c'), Exact(Mods::NONE), A::Interrupt, "Agent", "Stop what this view is running"),
+    bind!(LV, ch('a'), Exact(Mods::NONE), A::AgentAnswer { allow: true }, "Agent", "Allow what the agent is asking to do"),
+    bind!(LV, ch('d'), Exact(Mods::NONE), A::AgentAnswer { allow: false }, "Agent", "Decline what the agent is asking to do"),
 ];
 
 #[rustfmt::skip]
@@ -1741,7 +1744,7 @@ mod tests {
             .all(|e| e.keys.starts_with("Space ")));
         // Hover is a leader chord, and one binding serves both source and the reading view.
         assert!(entries.iter().any(|e| e.mode == "Application"
-            && e.keys == "Space t"
+            && e.keys == "Space n"
             && e.desc == "Hover: type & docs, or link target"));
         // The flat list dedupes the shared Ctrl-editing keys: each (mode, keys, desc) row —
         // the picker item identity — appears exactly once.
@@ -1899,12 +1902,12 @@ mod tests {
     }
 
     #[test]
-    fn reveal_bindings_are_space_t_alt_t_m() {
+    fn reveal_bindings_are_space_n_alt_n_m() {
         // All three cursor-reveals are leader chords. Hover was a bare `Tab` until `Tab` was needed
         // for moving between a multi-element view's editors — and a bare letter is a motion here,
         // so the leader is where a reveal belongs anyway.
         assert!(matches!(
-            lookup(KeyContext::Leader, ch('t'), Mods::NONE).map(|b| b.action),
+            lookup(KeyContext::Leader, ch('n'), Mods::NONE).map(|b| b.action),
             Some(Action::Hover)
         ));
         // `Tab` was reserved for element focus when hover moved off it; that reservation is now
@@ -1920,18 +1923,17 @@ mod tests {
         // Read still answers neither: block editing has its own navigation, and a reader is one
         // element until the markdown ladder gives it more.
         assert!(lookup(KeyContext::Read, KeyCode::Tab, Mods::NONE).is_none());
-        // Diagnostic-at-cursor and blame live on the Space leader (`Alt-t` / `m`); `Space j` is
-        // the jumplist picker. The diagnostic moved from `n` to `Alt-t` when `Space n` became the
-        // agent sub-leader, which pairs it with `Space t` (hover): both answer "tell me about what
-        // is under the cursor", plain for types and docs, Alt for what is wrong with it.
+        // Diagnostic-at-cursor and blame live on the Space leader (`Alt-n` / `m`); `Space j` is
+        // the jumplist picker. The pair moved from `t`/`Alt-t` to `n`/`Alt-n` when the three view
+        // pickers took `a`/`b`/`t`; plain answers "what is this", Alt "what is wrong with it".
         assert!(matches!(
-            lookup(KeyContext::Leader, ch('t'), Mods::ALT).map(|b| b.action),
+            lookup(KeyContext::Leader, ch('n'), Mods::ALT).map(|b| b.action),
             Some(Action::ShowDiagnostic)
         ));
-        // `Space n` is now a prefix and reveals nothing by itself.
+        // `Space t` is now the shells picker, not a reveal.
         assert!(matches!(
-            lookup(KeyContext::Leader, ch('n'), Mods::NONE).map(|b| b.action),
-            Some(Action::BeginAgentLeader)
+            lookup(KeyContext::Leader, ch('t'), Mods::NONE).map(|b| b.action),
+            Some(Action::OpenPicker(PickerKind::Shells))
         ));
         assert!(matches!(
             lookup(KeyContext::Leader, ch('j'), Mods::NONE).map(|b| b.action),
@@ -2098,14 +2100,13 @@ mod tests {
         assert!(git(ch('j'), Mods::NONE).is_none());
 
         // The old single-key homes stay free — a stale reflex does nothing rather than something
-        // else. `t`, `u` and now `Alt-t` are the exceptions, spent on hover, the reader toggle and
-        // the diagnostic reveal: **inert landings**, the same argument that let the keybindings
-        // picker reclaim `y` below. `Alt-t` was the old git commit, so a stale reflex now reveals
-        // the diagnostic under the cursor — a read-only reveal that changes nothing, which is the
-        // whole test. It moved here from `Space n` when that became the agent sub-leader.
+        // else. `t`, `u` and `Alt-t` are the exceptions, spent on the shells picker, the reader
+        // toggle and a new shell: **inert landings**, the same argument that let the keybindings
+        // picker reclaim `y` below. `Alt-t` was the old git commit, and opening a shell writes
+        // nothing — it hands you a prompt, which is where a stale reflex stops.
         assert!(matches!(
             lookup(KeyContext::Leader, ch('t'), Mods::ALT).map(|b| b.action),
-            Some(Action::ShowDiagnostic)
+            Some(Action::ShellOpen)
         ));
         // `y` (once branches) has since been reclaimed by the keybindings picker. Acceptable
         // because the landing is inert: a stale reflex opens a searchable list of every binding,

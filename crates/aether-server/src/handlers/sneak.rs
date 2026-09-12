@@ -615,16 +615,9 @@ pub fn pin_view_if_requested(
     view_id: ViewId,
     transient: Option<bool>,
 ) -> PendingPushes {
-    if transient != Some(false) {
+    if transient != Some(false) || !s.set_view_transient(view_id, false) {
         return Vec::new();
     }
-    let Some(view) = s.views.get_mut(&view_id) else {
-        return Vec::new();
-    };
-    if !view.transient {
-        return Vec::new();
-    }
-    view.transient = false;
     collect_view_state_pushes(s, &[view_id])
 }
 
@@ -803,50 +796,6 @@ pub struct AffectedByClose {
     pub client_id: ClientId,
     pub view_id: ViewId,
     pub buffer_id: BufferId,
-}
-
-/// The clients, other than `except`, with a viewport presenting `view_id` — who has to be told
-/// when that one view closes while its buffer stays (a file's reader closed beside its editor).
-/// Capture BEFORE the close, which drops those viewports.
-pub fn clients_presenting_view(
-    s: &ServerState,
-    view_id: ViewId,
-    except: ClientId,
-) -> Vec<ClientId> {
-    let mut out: Vec<ClientId> = s
-        .viewports
-        .values()
-        .filter(|vp| vp.client_id != except && vp.view_id == view_id)
-        .map(|vp| vp.client_id)
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
-/// The `view/closed` pushes for a view that closed while its buffer stayed: each client lands on
-/// its own next view. Call AFTER the close so the successor reflects the settled MRU.
-pub fn view_closed_pushes(s: &ServerState, view_id: ViewId, clients: &[ClientId]) -> PendingPushes {
-    clients
-        .iter()
-        .filter_map(|&client_id| {
-            let session = s.clients.get(&client_id)?;
-            let params = ViewClosedParams {
-                view_id,
-                buffer_id: None,
-                next_view_id: next_view_for_client(s, client_id),
-                next_path: None,
-            };
-            Some((
-                session.outbound.clone(),
-                Notification {
-                    jsonrpc: JsonRpc,
-                    method: ViewClosed::NAME.into(),
-                    params: serde_json::to_value(params).unwrap_or(serde_json::Value::Null),
-                },
-            ))
-        })
-        .collect()
 }
 
 /// `workspace/changed` for every *other* client standing in `workspace_id`, carrying the shape it

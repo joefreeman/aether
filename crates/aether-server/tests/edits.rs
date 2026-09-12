@@ -4887,7 +4887,11 @@ async fn workspace_session_persisted_on_activate_and_open() {
     let canonical = std::fs::canonicalize(root.join("a.rs")).unwrap();
     let buffers = p["views"].as_array().unwrap();
     assert_eq!(buffers.len(), 1, "one buffer recorded: {raw}");
-    assert_eq!(buffers[0]["kind"], "editor");
+    assert_eq!(buffers[0]["kind"], "file");
+    assert!(
+        buffers[0].get("read").is_none(),
+        "a file shown as source records no mode: {raw}"
+    );
     assert_eq!(
         buffers[0]["path"].as_str().unwrap(),
         canonical.display().to_string(),
@@ -4921,11 +4925,13 @@ async fn buffer_close_unknown_id_errors() {
     drop(server);
 }
 
-/// A transient preview (the default file-picker open) is NOT persisted; pressing `Space k` to keep
-/// it (`view/set_transient` false) promotes it to a permanent working view and persists it. This
-/// is the keep→persist path — without the persist hook, kept buffers never reach the session file.
+/// A transient preview (the default file-picker open) is persisted **as a preview** — it is where
+/// the window is, and exiting in one comes back to it — and pressing `Space k` to keep it
+/// (`view/set_transient` false) rewrites the entry without the flag. This is the keep→persist
+/// path; without it, a keep would sit in memory with the file still calling the view a preview,
+/// and the next activation would drop the row for being one.
 #[tokio::test]
-async fn keeping_a_transient_buffer_persists_it() {
+async fn keeping_a_transient_buffer_persists_it_as_kept() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     std::fs::write(root.join("a.rs"), "fn main() {}\n").unwrap();
@@ -4961,27 +4967,35 @@ async fn keeping_a_transient_buffer_persists_it() {
     .await;
     assert!(open.transient, "opened as a transient preview");
 
-    let buffers_in_session = |raw: &str| -> Vec<String> {
+    let buffers_in_session = |raw: &str| -> Vec<(String, bool)> {
         let json: serde_json::Value = serde_json::from_str(raw).unwrap();
         json["workspaces"]["p"]["views"]
             .as_array()
             .map(|a| {
                 a.iter()
-                    .map(|v| v["path"].as_str().unwrap().to_string())
+                    .map(|v| {
+                        (
+                            v["path"].as_str().unwrap().to_string(),
+                            v["transient"].as_bool().unwrap_or(false),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default()
     };
 
-    // A transient preview is excluded from the persisted set. Absence can't be polled for, so wait
-    // on a positive signal first — the file existing at all — and only then assert the negative.
-    let raw = eventually("the session file to exist", || {
-        std::fs::read_to_string(&sessions_path).ok()
+    let canonical = std::fs::canonicalize(root.join("a.rs")).unwrap();
+    // The preview reaches the session file, marked as one.
+    let raw = eventually("the preview to reach the session file", || {
+        std::fs::read_to_string(&sessions_path)
+            .ok()
+            .filter(|raw| !buffers_in_session(raw).is_empty())
     })
     .await;
-    assert!(
-        buffers_in_session(&raw).is_empty(),
-        "transient preview must not be persisted: {raw}"
+    assert_eq!(
+        buffers_in_session(&raw),
+        vec![(canonical.display().to_string(), true)],
+        "a preview persists as a preview: {raw}"
     );
 
     // Keep it (Space k) → promote to permanent.
@@ -4994,18 +5008,17 @@ async fn keeping_a_transient_buffer_persists_it() {
     )
     .await;
 
-    // Now it's part of the working set and the session lists it.
+    // Now it's part of the working set and the session lists it without the preview flag.
     let raw = eventually("the kept buffer to reach the session file", || {
         std::fs::read_to_string(&sessions_path)
             .ok()
-            .filter(|raw| !buffers_in_session(raw).is_empty())
+            .filter(|raw| buffers_in_session(raw).iter().any(|(_, t)| !t))
     })
     .await;
-    let canonical = std::fs::canonicalize(root.join("a.rs")).unwrap();
     assert_eq!(
         buffers_in_session(&raw),
-        vec![canonical.display().to_string()],
-        "keeping the buffer persists it: {raw}"
+        vec![(canonical.display().to_string(), false)],
+        "keeping the buffer persists it as kept: {raw}"
     );
 
     drop(server);

@@ -1343,6 +1343,7 @@ async fn git_log_rows_carry_what_git_show_needs() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: hash.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -1490,6 +1491,7 @@ async fn git_log_centres_on_the_commit_the_active_buffer_shows() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: first.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -2126,6 +2128,7 @@ async fn stash_picker_centres_on_the_entry_being_viewed() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: older.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;

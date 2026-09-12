@@ -1374,6 +1374,13 @@ pub struct GitShowParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_id: Option<BufferId>,
     pub target: ShowTarget,
+    /// Record the jump origin — the buffer of the view the client is leaving — onto this client's
+    /// nav history before showing, exactly as [`crate::view::ViewOpenParams::record_nav_from`]
+    /// does for an open: a commit chosen from the log, a stash previewed, the working changes
+    /// asked for, are all places `Backspace` should return from. Left unset by a reopen that is
+    /// itself a history step, and by a follow that has already recorded where it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_nav_from: Option<BufferId>,
     /// Land the cursor on this repo-relative file's first change within the generated patch.
     /// Meaningful only on the diff targets — a single file has nothing to choose between.
     ///

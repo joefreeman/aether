@@ -1698,7 +1698,7 @@ async fn jumplist_captured_from_the_buffers_picker_includes_scratch_buffers() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -1707,11 +1707,10 @@ async fn jumplist_captured_from_the_buffers_picker_includes_scratch_buffers() {
     let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
         &mut ws,
         &JumplistCaptureParams {
-            kind: PickerKind::Views,
-            item: PickerItem::View {
+            kind: PickerKind::Buffers,
+            item: PickerItem::Buffer {
                 buffer_id: main,
                 view_id: view_of(main),
-                view_kind: None,
                 display: "src/main.rs".into(),
                 status: Default::default(),
                 match_indices: vec![],

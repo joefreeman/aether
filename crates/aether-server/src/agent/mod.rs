@@ -184,13 +184,13 @@ pub struct PendingPermission {
 }
 
 impl PendingPermission {
-    /// The option `Space n a` answers with: the first that allows. `None` when the agent offered
+    /// The option `Space v a` answers with: the first that allows. `None` when the agent offered
     /// no allowing option, in which case there is nothing to accept.
     pub fn accept(&self) -> Option<&PermissionOption> {
         self.options.iter().find(|o| o.kind.allows())
     }
 
-    /// The option `Space n d` answers with: the first that rejects.
+    /// The option `Space v d` answers with: the first that rejects.
     pub fn reject(&self) -> Option<&PermissionOption> {
         self.options.iter().find(|o| o.kind.rejects())
     }

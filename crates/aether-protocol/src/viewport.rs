@@ -9,7 +9,7 @@ use crate::search::SearchMatchRange;
 use crate::sneak::SneakTarget;
 // The element vocabulary lives in `ui`; re-exported here because a view's tree is what
 // `viewport` messages carry, and that is where callers look for it.
-pub use crate::ui::{Element, FieldId, SourceLines, ViewKind};
+pub use crate::ui::{Element, FieldId, SourceLines};
 use crate::{Revision, ViewportId};
 use serde::{Deserialize, Serialize};
 

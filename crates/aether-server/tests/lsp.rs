@@ -3557,6 +3557,7 @@ async fn a_composed_views_status_snapshot_describes_the_focused_file() {
             buffer_id: None,
             target: aether_protocol::git::ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -3669,6 +3670,7 @@ async fn navigate_diagnostic_refuses_one_outside_the_focused_hunk() {
             buffer_id: None,
             target: aether_protocol::git::ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -3763,6 +3765,7 @@ async fn the_diagnostics_picker_covers_every_file_a_view_shows() {
             buffer_id: None,
             target: aether_protocol::git::ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;

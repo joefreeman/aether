@@ -1903,6 +1903,7 @@ fn input_adjust_number_methods() {
 fn buffer_open_result_shape() {
     let v = to_value(ViewOpenResult {
         transient: false,
+        read: false,
         view_id: aether_protocol::ViewId(42),
         scroll: None,
         buffer: BufferDescription {
@@ -1943,6 +1944,7 @@ fn buffer_open_result_shape() {
 fn buffer_open_result_reports_its_view() {
     let v = to_value(ViewOpenResult {
         transient: false,
+        read: false,
         view_id: aether_protocol::ViewId(7),
         scroll: None,
         buffer: BufferDescription {
@@ -1975,7 +1977,7 @@ fn buffer_open_result_reports_its_view() {
 /// view for a markdown file. All off the wire unless asked — and there is no `buffer_id`: the
 /// wire names views.
 #[test]
-fn view_open_params_carry_a_view_an_element_and_a_kind() {
+fn view_open_params_carry_a_view_an_element_and_a_read_flag() {
     let plain = ViewOpenParams {
         path_index: Some(0),
         relative_path: Some("a.md".into()),
@@ -1984,22 +1986,91 @@ fn view_open_params_carry_a_view_an_element_and_a_kind() {
     let v = to_value(&plain).unwrap();
     assert!(v.get("view_id").is_none());
     assert!(v.get("element").is_none());
-    assert!(v.get("kind").is_none());
+    assert!(v.get("read").is_none());
+    assert!(v.get("kind").is_none(), "a view has no kind any more");
     assert!(v.get("buffer_id").is_none());
     let asked = ViewOpenParams {
         view_id: Some(aether_protocol::ViewId(9)),
         element: Some(2),
-        kind: Some(aether_protocol::ui::ViewKind::Reader),
+        read: Some(true),
         ..Default::default()
     };
     let v = to_value(&asked).unwrap();
     assert_eq!(v["view_id"], 9);
     assert_eq!(v["element"], 2);
-    assert_eq!(v["kind"], "reader");
-    let back: ViewOpenParams = from_value(json!({"kind": "editor"})).unwrap();
-    assert_eq!(back.kind, Some(aether_protocol::ui::ViewKind::Editor));
+    assert_eq!(v["read"], true);
+    let back: ViewOpenParams = from_value(json!({"read": false})).unwrap();
+    assert_eq!(back.read, Some(false));
     assert_eq!(back.view_id, None);
     assert_eq!(back.element, None);
+}
+
+/// `view/set_read` — the `Space u` toggle: a view and a mode in, the mode out.
+#[test]
+fn view_set_read_shape() {
+    use aether_protocol::view::{ViewSetRead, ViewSetReadParams, ViewSetReadResult};
+    assert_eq!(
+        <ViewSetRead as aether_protocol::envelope::RpcMethod>::NAME,
+        "view/set_read"
+    );
+    let p = to_value(ViewSetReadParams {
+        view_id: aether_protocol::ViewId(4),
+        read: true,
+    })
+    .unwrap();
+    assert_eq!(p, json!({"view_id": 4, "read": true}));
+    let parsed: ViewSetReadParams = from_value(json!({"view_id": 9, "read": false})).unwrap();
+    assert_eq!(parsed.view_id, aether_protocol::ViewId(9));
+    assert!(!parsed.read);
+    let r = to_value(ViewSetReadResult { read: true }).unwrap();
+    assert_eq!(r, json!({"read": true}));
+}
+
+/// An open reports whether this client is reading the file: off the wire when it is not (every
+/// non-markdown open), and a result from before the flag existed reads as not reading.
+#[test]
+fn buffer_open_result_reports_reading() {
+    let reading = ViewOpenResult {
+        transient: false,
+        read: true,
+        view_id: aether_protocol::ViewId(7),
+        scroll: None,
+        buffer: BufferDescription {
+            buffer_id: 7,
+            language: Some("markdown".into()),
+            line_count: 1,
+            byte_count: 2,
+            revision: 0,
+            saved_revision: 0,
+            path: None,
+            scratch_number: None,
+            cursor: Default::default(),
+            lsp_server: None,
+            title: None,
+            read_only: false,
+            is_patch: false,
+        },
+    };
+    let v = to_value(&reading).unwrap();
+    assert_eq!(v["read"], true);
+    let editing = ViewOpenResult {
+        read: false,
+        ..reading
+    };
+    let v = to_value(&editing).unwrap();
+    assert!(v.get("read").is_none(), "off the wire when not reading");
+    let back: ViewOpenResult = from_value(v).unwrap();
+    assert!(!back.read);
+    // The browser hand-mirrors the result; `tsc` cannot see a Rust rename.
+    let ts = include_str!("../../../web/src/protocol.ts");
+    assert!(
+        ts.contains("read?: boolean"),
+        "web/src/protocol.ts must declare the open result's `read`"
+    );
+    assert!(
+        !ts.contains("view_kind"),
+        "a view has no kind any more; the mirror must not still declare one"
+    );
 }
 
 #[test]
@@ -2007,6 +2078,7 @@ fn buffer_open_result_restored_scroll() {
     use aether_protocol::viewport::ScrollPosition;
     let v = to_value(ViewOpenResult {
         transient: false,
+        read: false,
         view_id: aether_protocol::ViewId(42),
         scroll: Some(ScrollPosition {
             element: 2,
@@ -3010,12 +3082,23 @@ fn git_show_target_shape() {
         buffer_id: Some(4),
         target: ShowTarget::WorkingChanges,
         focus_path: None,
+        record_nav_from: None,
     })
     .unwrap();
     assert_eq!(
         v,
         json!({ "buffer_id": 4, "target": { "kind": "working_changes" } })
     );
+    // The jump origin rides only when there is one, as it does on `view/open`.
+    let v = to_value(GitShowParams {
+        repo_id: Some("/r".into()),
+        buffer_id: None,
+        target: ShowTarget::Commit { rev: "abc".into() },
+        focus_path: None,
+        record_nav_from: Some(9),
+    })
+    .unwrap();
+    assert_eq!(v["record_nav_from"], json!(9));
 
     // A clean working tree materialises nothing, and says so by omission — same shape (and same
     // reason) as `git/follow_patch_line` finding nothing to follow.
@@ -3069,6 +3152,7 @@ fn follow_patch_line_shape() {
         view_id: aether_protocol::ViewId(3),
         scroll: None,
         transient: true,
+        read: false,
         buffer: BufferDescription {
             buffer_id: 3,
             language: None,
@@ -3105,6 +3189,7 @@ fn nav_goto_params_shape() {
     let p = NavGotoParams {
         virtual_key: None,
         view_id: None,
+        read: None,
         path_index: Some(0),
         relative_path: Some("src/main.rs".into()),
         cursor: CursorState {
@@ -4376,7 +4461,7 @@ fn only_grep_maps_to_an_input_history_list() {
     assert_eq!(PickerKind::Grep.history_kind(), Some(HistoryKind::Grep));
     for kind in [
         PickerKind::Files,
-        PickerKind::Views,
+        PickerKind::Buffers,
         PickerKind::Explorer,
         PickerKind::GitChanges,
         PickerKind::Workspaces,
@@ -4599,10 +4684,9 @@ fn picker_select_result_is_tagged() {
 #[test]
 fn picker_item_buffer_is_tagged() {
     use aether_protocol::picker::{BufferDirtyState, PickerItem};
-    let item = PickerItem::View {
+    let item = PickerItem::Buffer {
         buffer_id: 7,
         view_id: aether_protocol::ViewId(7),
-        view_kind: None,
         display: "src/main.rs".into(),
         status: BufferDirtyState::ExternallyModified,
         path_index: Some(0),
@@ -4614,7 +4698,7 @@ fn picker_item_buffer_is_tagged() {
     assert_eq!(
         v,
         json!({
-            "kind": "view",
+            "kind": "buffer",
             "buffer_id": 7,
             "view_id": 7,
             "display": "src/main.rs",
@@ -4628,10 +4712,9 @@ fn picker_item_buffer_is_tagged() {
 
     // Scratch buffer: no path → both fields skipped; clean status → `status` skipped too;
     // permanent → `transient` skipped (the common case).
-    let scratch = PickerItem::View {
+    let scratch = PickerItem::Buffer {
         buffer_id: 9,
         view_id: aether_protocol::ViewId(9),
-        view_kind: None,
         display: "(scratch 1)".into(),
         status: BufferDirtyState::Clean,
         path_index: None,
@@ -4656,7 +4739,7 @@ fn picker_item_buffer_is_tagged() {
 
     // A clean status absent on the wire deserializes back to `Clean` (serde default).
     let back: PickerItem = from_value(json!({
-        "kind": "view", "buffer_id": 9, "view_id": 9, "display": "(scratch 1)"
+        "kind": "buffer", "buffer_id": 9, "view_id": 9, "display": "(scratch 1)"
     }))
     .unwrap();
     assert_eq!(back, scratch);
@@ -4682,10 +4765,202 @@ fn picker_select_result_view_is_tagged() {
     );
 }
 
+/// The three view-listing kinds' wire spellings. `web/src/protocol.ts` hand-mirrors them, so a
+/// rename here is a rename there — and `views` is *gone*, not an alias: a stale client asking for
+/// it gets a dispatch error rather than a list of the wrong thing.
 #[test]
-fn picker_kind_buffers_is_snake_case() {
+fn the_three_view_listing_kinds_are_snake_case() {
     use aether_protocol::picker::PickerKind;
-    assert_eq!(to_value(PickerKind::Views).unwrap(), json!("views"));
+    assert_eq!(to_value(PickerKind::Buffers).unwrap(), json!("buffers"));
+    assert_eq!(to_value(PickerKind::Shells).unwrap(), json!("shells"));
+    assert_eq!(to_value(PickerKind::Agents).unwrap(), json!("agents"));
+    assert_eq!(
+        from_value::<PickerKind>(json!("buffers")).unwrap(),
+        PickerKind::Buffers
+    );
+    assert!(from_value::<PickerKind>(json!("views")).is_err());
+
+    // Only the buffers picker's rows are jump targets. A shell or a conversation is somewhere you
+    // go back to, not a place in a file — `]`/`[` over a captured set of them would step nothing.
+    assert!(PickerKind::Buffers.captures_to_jumplist());
+    assert!(!PickerKind::Shells.captures_to_jumplist());
+    assert!(!PickerKind::Agents.captures_to_jumplist());
+    // And none of the three centres on the cursor: "where you are" is row 0 by recency.
+    assert!(!PickerKind::Buffers.centers_on_cursor());
+    assert!(!PickerKind::Shells.centers_on_cursor());
+    assert!(!PickerKind::Agents.centers_on_cursor());
+
+    // The browser shell mirrors the strings by hand, so `tsc` cannot see this rename.
+    let ts = include_str!("../../../web/src/protocol.ts");
+    for needle in [
+        "\"buffers\"",
+        "\"shells\"",
+        "\"agents\"",
+        "kind: \"shell\"",
+        "kind: \"agent\"",
+    ] {
+        assert!(
+            ts.contains(needle),
+            "web/src/protocol.ts must declare `{needle}`"
+        );
+    }
+    assert!(
+        !ts.contains("\"views\""),
+        "web/src/protocol.ts still declares the retired `views` kind"
+    );
+}
+
+/// A shell row carries its name, where it is, what it last ran, and how that went — with every
+/// quiet field skipped, so the common row (an idle shell that has run nothing) is three keys.
+#[test]
+fn picker_item_shell_is_tagged() {
+    use aether_protocol::picker::PickerItem;
+    let running = PickerItem::Shell {
+        view_id: aether_protocol::ViewId(12),
+        title: "Shell 2".into(),
+        cwd: "~/proj".into(),
+        last_command: Some("cargo test".into()),
+        running: true,
+        exit: Some(0),
+        elapsed_ms: Some(3200),
+        dormant: false,
+        match_indices: vec![0, 6],
+    };
+    assert_eq!(
+        to_value(&running).unwrap(),
+        json!({
+            "kind": "shell",
+            "view_id": 12,
+            "title": "Shell 2",
+            "cwd": "~/proj",
+            "last_command": "cargo test",
+            "running": true,
+            "exit": 0,
+            "elapsed_ms": 3200,
+            "match_indices": [0, 6],
+        })
+    );
+
+    let fresh = PickerItem::Shell {
+        view_id: aether_protocol::ViewId(13),
+        title: "Shell 3".into(),
+        cwd: "~".into(),
+        last_command: None,
+        running: false,
+        exit: None,
+        elapsed_ms: None,
+        dormant: false,
+        match_indices: vec![],
+    };
+    let v = to_value(&fresh).unwrap();
+    for quiet in ["last_command", "running", "exit", "elapsed_ms", "dormant"] {
+        assert!(v.get(quiet).is_none(), "a fresh shell omits {quiet}: {v}");
+    }
+    // …and the quiet fields default back on the way in.
+    let back: PickerItem = from_value(json!({
+        "kind": "shell", "view_id": 13, "title": "Shell 3", "cwd": "~"
+    }))
+    .unwrap();
+    assert_eq!(back, fresh);
+}
+
+/// An agent row carries its name, which agent is behind it, what it is doing, and the last thing
+/// said to it. The state is a tagged enum so `thinking` can name the tool call it is working on.
+#[test]
+fn picker_item_agent_is_tagged() {
+    use aether_protocol::picker::{AgentRowState, PickerItem};
+    let asking = PickerItem::Agent {
+        view_id: aether_protocol::ViewId(20),
+        title: "Agent 1".into(),
+        agent: "Claude Code".into(),
+        state: AgentRowState::AwaitingPermission,
+        last_prompt: Some("fix the wrap bug".into()),
+        dormant: false,
+        match_indices: vec![0],
+    };
+    assert_eq!(
+        to_value(&asking).unwrap(),
+        json!({
+            "kind": "agent",
+            "view_id": 20,
+            "title": "Agent 1",
+            "agent": "Claude Code",
+            "state": { "state": "awaiting_permission" },
+            "last_prompt": "fix the wrap bug",
+            "match_indices": [0],
+        })
+    );
+
+    let thinking = PickerItem::Agent {
+        view_id: aether_protocol::ViewId(21),
+        title: "Agent 2".into(),
+        agent: "Codex".into(),
+        state: AgentRowState::Thinking {
+            activity: Some("Reading src/lib.rs".into()),
+        },
+        last_prompt: None,
+        dormant: false,
+        match_indices: vec![],
+    };
+    let v = to_value(&thinking).unwrap();
+    assert_eq!(
+        v["state"],
+        json!({ "state": "thinking", "activity": "Reading src/lib.rs" })
+    );
+    assert!(v.get("last_prompt").is_none());
+
+    // A dormant row: restored from disk with no subprocess behind it.
+    let dormant = PickerItem::Agent {
+        view_id: aether_protocol::ViewId(22),
+        title: "Agent 3".into(),
+        agent: String::new(),
+        state: AgentRowState::Disconnected,
+        last_prompt: None,
+        dormant: true,
+        match_indices: vec![],
+    };
+    let dv = to_value(&dormant).unwrap();
+    assert_eq!(dv["state"], json!({ "state": "disconnected" }));
+    assert_eq!(dv["dormant"], json!(true));
+
+    // Idle is the default, so an absent state reads back as idle.
+    let back: PickerItem = from_value(json!({
+        "kind": "agent", "view_id": 23, "title": "Agent 4", "agent": "Codex"
+    }))
+    .unwrap();
+    let PickerItem::Agent { state, .. } = &back else {
+        panic!("expected an agent row");
+    };
+    assert_eq!(*state, AgentRowState::Idle);
+}
+
+/// `view/interrupt` names a view and answers whether anything stopped — the total counterpart of
+/// `view/submit_input`, and the one answer the client's "Nothing is running here" is built on.
+#[test]
+fn view_interrupt_shape() {
+    use aether_protocol::view::{ViewInterrupt, ViewInterruptParams, ViewInterruptResult};
+    assert_eq!(ViewInterrupt::NAME, "view/interrupt");
+    // Stopping a run edits no document; declaring otherwise would have a read-only client decline
+    // the key locally. A `const` block, like the rest of the `MUTATES_TEXT` pins.
+    const {
+        assert!(
+            !ViewInterrupt::MUTATES_TEXT,
+            "a view's read-only document must not make `Space v c` a local no-op"
+        )
+    };
+    let p = to_value(ViewInterruptParams {
+        view_id: aether_protocol::ViewId(9),
+    })
+    .unwrap();
+    assert_eq!(p, json!({ "view_id": 9 }));
+    assert_eq!(
+        to_value(ViewInterruptResult { interrupted: true }).unwrap(),
+        json!({ "interrupted": true })
+    );
+    assert_eq!(
+        to_value(ViewInterruptResult::default()).unwrap(),
+        json!({ "interrupted": false })
+    );
 }
 
 #[test]
@@ -6865,26 +7140,26 @@ fn an_editor_says_when_it_is_a_shells_input() {
     );
 }
 
-/// `shell/open` asks one question and answers with an open plus the element to type into.
+/// `shell/open` asks *nothing* and answers with an open plus the element to type into.
+///
+/// The `new` flag is gone with the reuse heuristic: the key always mints a shell, and returning to
+/// one you have is the shells picker. An old client's `{"new": true}` still parses — the params are
+/// an empty struct, and serde ignores what it does not know — so a stale build asking for a new
+/// shell gets exactly that.
 #[test]
 fn shell_open_shape() {
     use aether_protocol::shell::{ShellOpen, ShellOpenParams, ShellOpenResult};
     assert_eq!(ShellOpen::NAME, "shell/open");
-    // The ordinary press sends nothing: "a shell you can type into" is the default.
-    let v = to_value(ShellOpenParams { new: false }).unwrap();
-    assert_eq!(v, json!({ "new": false }));
-    assert!(!from_value::<ShellOpenParams>(json!({})).unwrap().new);
-    assert!(
-        from_value::<ShellOpenParams>(json!({"new": true}))
-            .unwrap()
-            .new
-    );
+    assert_eq!(to_value(ShellOpenParams {}).unwrap(), json!({}));
+    from_value::<ShellOpenParams>(json!({})).unwrap();
+    from_value::<ShellOpenParams>(json!({"new": true})).unwrap();
 
     let result = ShellOpenResult {
         opened: ViewOpenResult {
             view_id: aether_protocol::ViewId(4),
             scroll: None,
             transient: false,
+            read: false,
             buffer: BufferDescription {
                 buffer_id: 3,
                 language: None,
@@ -7073,20 +7348,19 @@ const _: () = assert!(!aether_protocol::view::ViewFollowLine::MUTATES_TEXT);
 /// exist because the client cannot tell a shell from an agent view — the window marks an input by
 /// role and carries no kind — and the server can.
 #[test]
-fn the_agent_wire_says_where_you_were_not_what_you_are_looking_at() {
+fn the_agent_wire_says_which_agent_not_what_you_are_looking_at() {
     use aether_protocol::agent::*;
 
-    // Absent, not `false`: there is no default "make a new one", only "I was nowhere in
-    // particular", and the server's rule reads the same either way.
+    // Nothing at all in the ordinary case: the open always creates, and `agent: None` means the
+    // first one found on `PATH`. `from_view` went with the reuse heuristic it decided.
     let anywhere = to_value(AgentOpenParams::default()).unwrap();
     assert_eq!(anywhere, json!({}));
 
-    let from_a_view = to_value(AgentOpenParams {
-        from_view: Some(aether_protocol::ViewId(7)),
+    let named = to_value(AgentOpenParams {
         agent: Some("claude".into()),
     })
     .unwrap();
-    assert_eq!(from_a_view, json!({ "from_view": 7, "agent": "claude" }));
+    assert_eq!(named, json!({ "agent": "claude" }));
 
     // The answer is a direction, not one of the agent's option ids: the agent supplies the
     // wording, the server picks the option of the asked-for kind, and a key can never come to

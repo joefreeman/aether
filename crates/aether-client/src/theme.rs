@@ -602,6 +602,18 @@ impl Theme {
         }
     }
 
+    /// The colour of a shells / agents picker row's status badge. One table, so a run's `✓` and a
+    /// turn's `●` read the same in all three shells.
+    pub fn row_badge(&self, tone: crate::labels::RowBadgeTone) -> Rgb {
+        use crate::labels::RowBadgeTone as T;
+        match tone {
+            T::Running => self.info,
+            T::Ok => self.ok,
+            T::Bad => self.error,
+            T::Muted => self.fg_faint,
+        }
+    }
+
     /// Status-bullet colour for a git file status: green for new, yellow for modified, red for
     /// removed/conflict. `None` for ignored entries — they carry no bullet (ignored is dimmed
     /// via its text colour instead).

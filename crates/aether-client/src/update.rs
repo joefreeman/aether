@@ -130,7 +130,8 @@ use aether_protocol::sneak::{
 use aether_protocol::syntax::{SyntaxHighlightSnippet, SyntaxHighlightSnippetParams};
 use aether_protocol::view::{
     ViewClose, ViewCloseParams, ViewClosed, ViewClosedParams, ViewOpen, ViewOpenParams,
-    ViewOpenResult, ViewSetTransient, ViewSetTransientParams, ViewStateParams,
+    ViewOpenResult, ViewSetRead, ViewSetReadParams, ViewSetTransient, ViewSetTransientParams,
+    ViewStateParams,
 };
 use aether_protocol::viewport::{
     DiagnosticSeverity, Element, FocusStep, FocusTarget, NavigateGrain, ViewSave, ViewSaveParams,
@@ -206,19 +207,22 @@ pub enum Event {
     /// `Enter` in a composed view resolved (or didn't) to the file the line under the cursor
     /// named — a patch line's blob, a shell line's `path:line:col`.
     LineFollowed(Result<aether_protocol::view::ViewFollowLineResult, String>),
-    /// `Space b` answered with the shell to show and which of its elements to type into.
+    /// `Space Alt-t` answered with the shell to show and which of its elements to type into.
     ShellOpened(Result<aether_protocol::shell::ShellOpenResult, RpcError>),
     /// A submit landed, or was refused — the refusal is the interesting half, since it names the
     /// command in the way and the typed text is deliberately still there.
     InputSubmitted(Result<aether_protocol::view::ViewSubmitInputResult, RpcError>),
     AgentOpened(Result<aether_protocol::agent::AgentOpenResult, RpcError>),
     AgentAnswered(Result<aether_protocol::agent::AgentRespondResult, RpcError>),
-    AgentCancelled(Result<aether_protocol::agent::AgentCancelResult, String>),
-    /// `Space Alt-b` answered. Nothing to do either way: the finish arrives as a push.
-    ShellCancelled(Result<aether_protocol::shell::ShellCancelResult, String>),
-    /// `view/open` for the current buffer's other view (`Space u`, an edit transition out of
-    /// the reader) resolved: adopt the sibling, or report the failure.
-    SiblingOpened(Result<ViewOpenResult, String>),
+    /// `Space v c` answered. `interrupted: false` is the whole of what the client knows about
+    /// "nothing was running" — for a file, an idle shell and an idle conversation alike — and is
+    /// what the toast is built on. A stop that *did* land says nothing: the finish arrives as a
+    /// push.
+    Interrupted(Result<aether_protocol::view::ViewInterruptResult, RpcError>),
+    /// `view/set_read` (`Space u`, an edit transition out of the reader) resolved: the mode is
+    /// flipped server-side, so re-subscribe and adopt whatever window comes back — or report the
+    /// failure.
+    ReadSet(Result<aether_protocol::view::ViewSetReadResult, String>),
     /// A `syntax/highlight_snippet` result for one fenced code block of the reading view, keyed
     /// by the fence's span start at `(buffer, revision)` parse time — stale results are dropped.
     ReadHighlights {
@@ -413,10 +417,25 @@ pub enum Event {
         noun: &'static str,
         result: Result<PathDeleteResult, String>,
     },
-    /// `view/set_transient` (the `Space k` keep toggle) resolved. The bool is the view's new
-    /// transient flag; the toast confirms it (`view_transient` itself rides the `view/state`
-    /// push). Errors surface as an error toast.
-    KeepToggled(Result<bool, String>),
+    /// `view/set_transient` (the `Space k` keep toggle) resolved. `result` is the view's transient
+    /// flag as the server left it and the toast confirms it (`view_transient` itself also rides
+    /// the `view/state` push); errors surface as an error toast.
+    ///
+    /// `requested` is what this client asked for. Only a document's own view can be kept or
+    /// released — a composed one (a patch, a shell, a conversation) keeps the flag it was created
+    /// with — and the server says so by answering the *actual* flag rather than failing, so the
+    /// difference between the two is the refusal and has to be carried to the reply to be noticed.
+    ///
+    /// `focused` names the document the keep addressed when it was **not** the view's own: `Space
+    /// k` inside a review keeps the file under the cursor, and the server redirects the request to
+    /// that file's own view. The reply then says nothing about the review's flag, so it must not
+    /// move it — and the toast names the file. `None` for the ordinary toggle, whose subject is
+    /// the view itself.
+    KeepToggled {
+        requested: bool,
+        focused: Option<String>,
+        result: Result<bool, String>,
+    },
     /// `directory/create` (Explorer "+ Create … name/") resolved: navigate into the new directory.
     DirCreated(Result<DirectoryCreateResult, String>),
     /// Workspace switch resolved: the activated workspace + the buffer to land on.
@@ -764,7 +783,7 @@ impl Session {
                     // was — the transition is the *edit's* to make, not the keypress's.
                     self.read_exit_for_edit();
                     self.view.mode = Mode::Insert;
-                    fx = fx.and(self.open_sibling(aether_protocol::ui::ViewKind::Editor));
+                    fx = fx.and(self.set_read(false));
                 } else if let Some(reason) = r.reason {
                     fx = fx.and(Effects::toast_grouped(
                         reason,
@@ -812,8 +831,8 @@ impl Session {
             }
 
             Event::Switched(Ok(open)) => self.adopt_open(open),
-            Event::SiblingOpened(Ok(open)) => self.adopt_sibling(open),
-            Event::SiblingOpened(Err(e)) => self.open_failed(e),
+            Event::ReadSet(Ok(_)) => self.adopt_read_flip(),
+            Event::ReadSet(Err(e)) => Effects::error_detail("Couldn't switch view", e),
 
             // Worded for the working tree because that is the only target that can answer nothing:
             // a commit or a file at a revision always materialises, and one that can't be
@@ -828,7 +847,7 @@ impl Session {
             // metadata block or the message — nothing to follow, and deliberately silent: `Enter`
             // is a common key and a toast for pressing it on the subject line would be noise.
             // The shell is now on screen; the caret goes into its input, in Insert, so
-            // `Space b`, type, `Enter` reads like a REPL. The focused element is set before the
+            // `Space Alt-t`, type, `Enter` reads like a REPL. The focused element is set before the
             // resubscribe so the server is told which element to focus rather than being asked to
             // guess from a scroll the client may not have adopted yet.
             // The same landing a shell gets: adopt, focus the input, and start typing. Both are
@@ -901,8 +920,11 @@ impl Session {
                 self.pending_shell_submit = None;
                 Effects::error_detail("Couldn't run that", e.message)
             }
-            Event::ShellCancelled(_) => Effects::none(),
-            Event::AgentCancelled(_) => Effects::none(),
+            Event::Interrupted(Ok(r)) if !r.interrupted => {
+                Effects::toast("Nothing is running here", ToastKind::Info)
+            }
+            Event::Interrupted(Ok(_)) => Effects::none(),
+            Event::Interrupted(Err(e)) => Effects::error_detail("Couldn't stop it", e.message),
             // Same landing as any other switch, and the same silence when the line leads nowhere:
             // `Enter` is a common key, and being told off for pressing it on a line of output
             // would be noise.
@@ -2699,15 +2721,49 @@ impl Session {
                     fx
                 }
             },
-            Event::KeepToggled(result) => match result {
+            Event::KeepToggled {
+                requested,
+                focused,
+                result,
+            } => match result {
                 Err(e) => Effects::error_detail("Keep failed", e),
                 // Grouped: toggling keep/release updates one toast rather than stacking a pair.
                 Ok(transient) => {
+                    if let Some(label) = focused {
+                        // A keep aimed at the document under the cursor in a review. The review's
+                        // own flag did not move and must not be written here — it is still the
+                        // preview it was, and it closes when you leave it exactly as before.
+                        if transient {
+                            return Effects::toast_grouped_detail(
+                                "Only a document can be kept",
+                                "A patch, a shell and a conversation are the view itself, not \
+                                 something you opened",
+                                ToastKind::Warning,
+                                "transient",
+                            );
+                        }
+                        return Effects::toast_grouped(
+                            format!("Kept {label}"),
+                            ToastKind::Success,
+                            "transient",
+                        );
+                    }
                     // The reply is about the *view's* document. For an ordinary view that is also
                     // the focused buffer and the `buffer/state` push updates it too; for a composed
                     // one the push is about a document the client is not tracking, so this is the
                     // only thing that moves the flag.
                     self.view.view_transient = transient;
+                    if transient != requested {
+                        // The server left the flag alone: this view is not a document. Say why,
+                        // in the same group, so the refusal replaces a stale "View kept".
+                        return Effects::toast_grouped_detail(
+                            "Only a document can be kept",
+                            "A patch, a shell and a conversation are the view itself, not \
+                             something you opened",
+                            ToastKind::Warning,
+                            "transient",
+                        );
+                    }
                     Effects::toast_grouped(
                         if transient {
                             "View released"
@@ -3373,14 +3429,28 @@ impl Session {
     /// target into view the same way; genuine buffer switches (close, new-scratch, workspace change)
     /// always land on a different `buffer_id`, so routing them here is just a switch.
     pub fn adopt_navigation(&mut self, open: ViewOpenResult) -> Effects {
-        if open.buffer_id != self.view.buffer.buffer_id {
+        // A different buffer is a switch, and so is a different **view** of the buffer the cursor
+        // is already in: inside a review the focused element windows a real file, so `Enter`
+        // opening that file as its own view answers with the buffer we are "in" already. Judged
+        // by buffer alone it read as a move within the review, and the window never changed. A
+        // view id is never `0` — an open that names none is one the server left to us.
+        let other_view = open.view_id != ViewId::default() && open.view_id != self.view.view_id;
+        if open.buffer_id != self.view.buffer.buffer_id || other_view {
             return self.adopt_switch(open);
         }
-        // The same file through its *other* view — the picker's editor row chosen while the
-        // reader is on screen — is the sibling, not a move within this one: the window has to
-        // change even though the buffer, and the cursor in it, do not.
-        if open.view_id != self.view.view_id {
-            return self.adopt_sibling(open);
+        // The same file in the *other* mode — a history step back into the document you were
+        // reading, an `#anchor` followed into the file you are editing — is not a move within
+        // this window: the buffer, and the cursor in it, are the same, but the window has to
+        // change. Rebind (the cursor the open carries is the one to keep) and re-subscribe; the
+        // window then says what this is ([`Self::sync_read_presentation`]).
+        if open.read != self.view.read.is_some() {
+            let sneak_fx = self.cancel_sneak_on(self.view.buffer.buffer_id);
+            self.view.rebind(open, &self.workspace_paths);
+            self.view.read = None;
+            if self.view.mode == Mode::Read {
+                self.view.mode = Mode::Normal;
+            }
+            return sneak_fx.and(Effects::one(Effect::Resubscribe));
         }
         if self.pending_read_anchor.is_some() && self.view.read.is_some() {
             // `[x](./this-file.md#section)`: the target is the document already on
@@ -3440,50 +3510,30 @@ impl Session {
         }
     }
 
-    /// Ask for the current view's sibling — its file's editor, or its reader. Named as this view
-    /// plus the other kind: the server finds its buffer's view of that kind or makes one and
-    /// answers with it; [`Self::adopt_sibling`] takes it up. The content anchor captured first is
-    /// what keeps the same lines on screen across the re-presentation — always, not only when the
-    /// sibling has no remembered scroll of its own (see [`Self::adopt_sibling`]).
-    fn open_sibling(&mut self, kind: aether_protocol::ui::ViewKind) -> Effects {
-        Effects::one(Effect::SaveContentAnchor).and(self.request_str::<ViewOpen>(
-            ViewOpenParams {
-                view_id: Some(self.view.view_id),
-                kind: Some(kind),
-                ..Default::default()
+    /// Ask the server to flip how this client sees the current file — read it as the rendered
+    /// document, or edit its source — and [`Self::adopt_read_flip`] takes up the answer. The mode
+    /// is the server's (it composes the window, so it has to know before the first frame), and
+    /// it is this client's alone: another window on the same file is not touched. The content
+    /// anchor captured first is what keeps the same lines on screen across the re-presentation —
+    /// always, exactly as a wrap toggle does it.
+    fn set_read(&mut self, read: bool) -> Effects {
+        Effects::one(Effect::SaveContentAnchor).and(self.request_str::<ViewSetRead>(
+            ViewSetReadParams {
+                view_id: self.view.view_id,
+                read,
             },
-            Event::SiblingOpened,
+            Event::ReadSet,
         ))
     }
 
-    /// Adopt the sibling view an [`Self::open_sibling`] answered with: the same buffer, another
-    /// view of it. Not a switch — the cursor is the buffer's and shared by both views, and a mode
-    /// an edit transition set stays set — and not a same-buffer move either, which would keep the
-    /// window: the view is new, so the shell re-subscribes, **where the content anchor says**. The
-    /// reading view, if this was one, goes: the new window decides whether the sibling is.
-    ///
-    /// The sibling's own remembered scroll used to win whenever it had one, and that is what made
-    /// `Space u` unreliable: only the *first* switch to a view carried your place, and every one
-    /// after it landed wherever that view had last been subscribed — in practice the top, since a
-    /// view's remembered scroll is written by a subscribe or a fetch and neither happens while you
-    /// scroll a view you are already in, so landing at the top re-recorded the top. Coming back to
-    /// where a view was is a coherent idea for opening one afresh; it is not one for a pair that
-    /// shares a cursor, where "where that view was" and "where you are" are answers to different
-    /// questions and only the second is the one being asked.
-    fn adopt_sibling(&mut self, open: ViewOpenResult) -> Effects {
-        if open.buffer_id != self.view.buffer.buffer_id {
-            return self.adopt_switch(open);
-        }
+    /// The server flipped the mode: re-subscribe, **where the content anchor says**, and let the
+    /// window decide what this is now — a prose element puts the session in the reading view, an
+    /// editor takes it down ([`Self::sync_read_presentation`]). Not a switch: the view, the buffer
+    /// and the cursor are all the same, and a mode an edit transition set stays set. The reading
+    /// view, if this was one, goes now rather than at the window: the caller that flipped for an
+    /// edit has already dropped it, and one flipping into reading has nothing to drop.
+    fn adopt_read_flip(&mut self) -> Effects {
         let sneak_fx = self.cancel_sneak_on(self.view.buffer.buffer_id);
-        // The whole rebind, not the fields a sibling happens to differ in. Copying its id and
-        // scroll off the open one by one left the kept flag behind: the status bar said the
-        // editor was kept because the reader had been, the picker said it was not, and the first
-        // `Space k` "released" a view that was never kept.
-        self.view.rebind(open, &self.workspace_paths);
-        self.view.read = None;
-        if self.view.mode == Mode::Read {
-            self.view.mode = Mode::Normal;
-        }
         sneak_fx.and(Effects::one(Effect::Resubscribe))
     }
 
@@ -3974,6 +4024,18 @@ impl Session {
         }
     }
 
+    /// What closing the **current** view would put at risk — the `Space x` side of
+    /// [`close_confirm_for`]. `shell_runs` / `agent_turns` are keyed by view id and hold only
+    /// views of that kind, so asking them is also asking what kind of view this is.
+    fn closing_current_view(&self) -> Closing {
+        Closing {
+            label: self.view.view_label.clone(),
+            unsaved: self.view.unsaved(),
+            running_shell: self.shell_runs.contains_key(&self.view.view_id),
+            busy_agent: self.agent_turns.contains_key(&self.view.view_id),
+        }
+    }
+
     pub fn close_view(&mut self) -> Effects {
         // Closing the prepared message *is* the commit — the `$EDITOR` contract, where git reads
         // the file once the editor exits and aborts if the message came back empty. So this fires
@@ -4144,14 +4206,14 @@ impl Session {
         self.open_path_as(path, jump_to, jump_to_anchor, None)
     }
 
-    /// [`Self::open_path_at`] asking for a kind of view — the reader, for a followed `#anchor`,
+    /// [`Self::open_path_at`] asking to read or to edit — to read, for a followed `#anchor`,
     /// which only a rendered document can land.
     fn open_path_as(
         &mut self,
         path: String,
         jump_to: Option<LogicalPosition>,
         jump_to_anchor: Option<LogicalPosition>,
-        kind: Option<aether_protocol::ui::ViewKind>,
+        read: Option<bool>,
     ) -> Effects {
         // Any fresh open invalidates a not-yet-landed cross-file anchor (`read_follow_link`
         // re-arms after this call for its own open).
@@ -4173,8 +4235,8 @@ impl Session {
                 // A jump-shaped open (a grep hit, a reference) is a working context: the server
                 // lands a `jump_to` in the editor even when the target is markdown — unless the
                 // reader of that file is what's on screen, where the jump stays on the page.
-                // `kind` is for the one route with its own opinion, a followed `#anchor`.
-                kind,
+                // `read` is for the one route with its own opinion, a followed `#anchor`.
+                read,
                 ..Default::default()
             },
             Event::Switched,
@@ -4453,10 +4515,9 @@ impl Session {
         // Explorer: the active buffer's filename, so the listing lands on the current file.
         // LspServers: the active buffer's own language server (key is `language` + `workspace_root`).
         let center_on = center_on_override.or(match kind {
-            PickerKind::Views => Some(PickerItem::View {
+            PickerKind::Buffers => Some(PickerItem::Buffer {
                 buffer_id: self.view.view_buffer,
                 view_id: self.view.view_id,
-                view_kind: None,
                 display: String::new(),
                 status: Default::default(),
                 path_index: None,
@@ -5650,7 +5711,7 @@ impl Session {
                 },
             }),
             // A file-backed buffer opens by path, like a Files row.
-            PickerItem::View {
+            PickerItem::Buffer {
                 path_index: Some(pi),
                 relative_path: Some(rel),
                 ..
@@ -5664,7 +5725,7 @@ impl Session {
             }),
             // A scratch (no path) re-opens by view id against the shared daemon — but only when the
             // workspace is CLI-addressable (the new `ae` must activate it before the open).
-            PickerItem::View { view_id, .. } => here.map(|ws| WindowTarget {
+            PickerItem::Buffer { view_id, .. } => here.map(|ws| WindowTarget {
                 workspace: Some(ws),
                 worktrees: mine,
                 open: WindowOpen::View(*view_id),
@@ -5795,6 +5856,7 @@ impl Session {
                     buffer_id: None,
                     target: aether_protocol::git::ShowTarget::Commit { rev: oid.clone() },
                     focus_path: None, // a stash is about no file in particular
+                    record_nav_from: Some(self.view.view_buffer),
                 };
                 let hide = self.close_picker();
                 return hide
@@ -5828,11 +5890,14 @@ impl Session {
                 //
                 // From a *file's* history the row also names that file, and the cursor lands on its
                 // changes — you asked about one path, not about everything the commit touched.
+                // `record_nav_from` is the view being left — its own buffer, as `Enter` in a
+                // review records the review — so `Backspace` from the diff returns here.
                 let params = aether_protocol::git::GitShowParams {
                     repo_id: Some(repo_id.clone()),
                     buffer_id: None,
                     target: aether_protocol::git::ShowTarget::Commit { rev: hash.clone() },
                     focus_path: path.clone(),
+                    record_nav_from: Some(self.view.view_buffer),
                 };
                 let hide = self.close_picker();
                 return hide
@@ -6297,7 +6362,15 @@ impl Session {
                 });
                 return Effects::none();
             }
-            KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Views => {
+            // All three view-listing pickers: the row names a view, and `Ctrl-d` closes it.
+            KeyCode::Char('d')
+                if mods.ctrl
+                    && !mods.alt
+                    && matches!(
+                        p.kind,
+                        PickerKind::Buffers | PickerKind::Shells | PickerKind::Agents
+                    ) =>
+            {
                 let fx = self.observe_picker_cmd(PickerCmd::CloseView);
                 return fx.and(self.picker_close_view());
             }
@@ -7842,33 +7915,69 @@ impl Session {
         Effects::none()
     }
 
-    /// `Ctrl-d` in the view picker: close the highlighted view without opening it. A view whose
-    /// text is unsaved goes through a discard confirm first (mirroring the editor's own close);
-    /// clean and externally-changed ones (no in-buffer edits to lose) close straight away. The
-    /// picker stays open and re-lists from the server's `picker/update` push.
+    /// `Ctrl-d` in any of the three view-listing pickers: close the highlighted row without
+    /// opening it. What needs asking first goes through [`close_confirm_for`] — the same gate
+    /// `Space x` uses, so the picker and the editor can never disagree about what is worth a
+    /// prompt. The picker stays open and re-lists from the server's `picker/update` push.
     pub fn picker_close_view(&mut self) -> Effects {
         let Some(p) = &self.picker else {
             return Effects::none();
         };
-        if p.kind != PickerKind::Views {
-            return Effects::none();
-        }
-        let Some(PickerItem::View {
-            buffer_id,
-            view_id,
-            status,
-            display,
-            ..
-        }) = p.selected_item()
-        else {
+        let Some(item) = p.selected_item() else {
             return Effects::none();
         };
-        let (buffer_id, view_id) = (*buffer_id, *view_id);
-        if matches!(status, BufferDirtyState::Unsaved) {
-            self.prompt = Some(Prompt::Confirm {
-                kind: ConfirmKind::DiscardOnClose {
+        let (buffer_id, view_id, closing) = match item {
+            PickerItem::Buffer {
+                buffer_id,
+                view_id,
+                status,
+                display,
+                ..
+            } => (
+                Some(*buffer_id),
+                *view_id,
+                Closing {
                     label: display.clone(),
+                    unsaved: matches!(status, BufferDirtyState::Unsaved),
+                    running_shell: false,
+                    busy_agent: false,
                 },
+            ),
+            PickerItem::Shell {
+                view_id,
+                title,
+                running,
+                ..
+            } => (
+                None,
+                *view_id,
+                Closing {
+                    label: title.clone(),
+                    unsaved: false,
+                    running_shell: *running,
+                    busy_agent: false,
+                },
+            ),
+            PickerItem::Agent {
+                view_id,
+                title,
+                state,
+                ..
+            } => (
+                None,
+                *view_id,
+                Closing {
+                    label: title.clone(),
+                    unsaved: false,
+                    running_shell: false,
+                    busy_agent: agent_state_is_busy(state),
+                },
+            ),
+            _ => return Effects::none(),
+        };
+        if let Some(kind) = close_confirm_for(&closing) {
+            self.prompt = Some(Prompt::Confirm {
+                kind,
                 action: ConfirmAction::ClosePickerView { buffer_id, view_id },
             });
             return Effects::none();
@@ -7883,10 +7992,10 @@ impl Session {
     /// switch doesn't tear it down — see [`Self::adopt_switch`]). Closing the
     /// [tether](Session::tether) — active or backgrounded — exits the client instead, like every
     /// other close path.
-    fn close_picker_view(&mut self, buffer_id: BufferId, view_id: ViewId) -> Effects {
-        // The row names its view — the one closing addresses — and its buffer, which is what the
-        // tether is.
-        if self.tether == Some(buffer_id) {
+    fn close_picker_view(&mut self, buffer_id: Option<BufferId>, view_id: ViewId) -> Effects {
+        // The row names its view — the one closing addresses — and, for a buffer row, its buffer,
+        // which is what the tether is. A shell or a conversation carries none and can never be it.
+        if buffer_id.is_some() && self.tether == buffer_id {
             return self.request_str::<ViewClose>(
                 ViewCloseParams {
                     view_id,
@@ -9562,9 +9671,9 @@ impl Session {
                 // An unbound key (or Esc) cancels the chord, exactly like the leader.
                 return Effects::none();
             }
-            Pending::LeaderAgent => {
+            Pending::LeaderView => {
                 self.view.pending = Pending::None;
-                if let Some(b) = lookup(KeyContext::LeaderAgent, code, mods) {
+                if let Some(b) = lookup(KeyContext::LeaderView, code, mods) {
                     return self.run_action(b.action, 1, false, mods.shift);
                 }
                 return Effects::none();
@@ -10107,8 +10216,8 @@ impl Session {
                 self.view.pending = Pending::LeaderGit;
                 Effects::none()
             }
-            A::BeginAgentLeader => {
-                self.view.pending = Pending::LeaderAgent;
+            A::BeginViewLeader => {
+                self.view.pending = Pending::LeaderView;
                 Effects::none()
             }
 
@@ -10301,10 +10410,46 @@ impl Session {
                         |r| Event::TetherReleased(r.map(|res| res.transient)),
                     );
                 }
-                // Keeps the **view**, not the file the cursor is in. A working-changes view is a
-                // transient view over permanent files: toggling the focused element pinned a file
-                // that was never going anywhere and left the view to close itself on the next
-                // thing opened. For an ordinary view the two ids are the same and nothing changes.
+                // A shell or a conversation *is* the view: its transcript and its input are
+                // fields of it, not documents anyone opened, so there is nothing here to keep.
+                // The client can tell — a window with an input element is one of those two — and
+                // a round trip would only bring the same answer back. The server refuses it as
+                // well; this is the reply, not the rule.
+                if self.shell_input().is_some() {
+                    return Effects::toast_grouped_detail(
+                        "Only a document can be kept",
+                        "A patch, a shell and a conversation are the view itself, not something \
+                         you opened",
+                        ToastKind::Warning,
+                        "transient",
+                    );
+                }
+                // Inside a **review** — a composed view with no input, so a patch or the working
+                // changes — the key keeps the document under the cursor. The review itself keeps
+                // the flag it was created with, and what is worth outliving it is the file you
+                // are reading: kept, it becomes a buffers-picker row of its own. Always a keep,
+                // never a release: from in here the file's own state is not visible, so a toggle
+                // would be a coin flip. Keeping can lose nothing, so the unsaved guard below does
+                // not apply either.
+                if self.view.buffer.buffer_id != self.view.view_buffer {
+                    let view_id = self.view.view_id;
+                    let label = self.view.buffer.label.clone();
+                    return self.request_str::<ViewSetTransient>(
+                        ViewSetTransientParams {
+                            view_id,
+                            transient: false,
+                        },
+                        move |r| Event::KeepToggled {
+                            requested: false,
+                            focused: Some(label.clone()),
+                            result: r.map(|res| res.transient),
+                        },
+                    );
+                }
+                // Otherwise the **view**, not the file the cursor is in. For an ordinary view the
+                // two ids are the same anyway. Whether the view may change at all is the server's
+                // answer — it keeps the flag for a view that is not a document, and the echo is
+                // what tells us (`Event::KeepToggled`).
                 let target = !self.view.view_transient;
                 // Refuse to make a view with unsaved edits transient — it would auto-close (and
                 // discard them) once hidden. View-wide: *any* of its documents being dirty counts,
@@ -10318,7 +10463,11 @@ impl Session {
                         view_id: self.view.view_id,
                         transient: target,
                     },
-                    |r| Event::KeepToggled(r.map(|res| res.transient)),
+                    move |r| Event::KeepToggled {
+                        requested: target,
+                        focused: None,
+                        result: r.map(|res| res.transient),
+                    },
                 )
             }
             A::CopyRelativePath => self.copy_buffer_path(false),
@@ -10343,13 +10492,13 @@ impl Session {
                 // stay open — but "close without asking" is not what the prompt is for.) The
                 // second term is the flag the status dot uses, so the prompt and the dot cannot
                 // disagree about whether the view is dirty.
-                if self.view.unsaved() {
+                // Through the same gate the pickers' `Ctrl-d` uses, so "what is worth asking
+                // about" is decided once. The view's name, not the focused document's: in a
+                // composed view the dirty document may not be the focused one, so naming that
+                // file would point at the wrong thing.
+                if let Some(kind) = close_confirm_for(&self.closing_current_view()) {
                     self.prompt = Some(Prompt::Confirm {
-                        kind: ConfirmKind::DiscardOnClose {
-                            // The view's name: in a composed view the dirty document may not be
-                            // the focused one, so naming that file would point at the wrong thing.
-                            label: self.view.view_label.clone(),
-                        },
+                        kind,
                         action: ConfirmAction::CloseDiscard,
                     });
                     return Effects::none();
@@ -10471,6 +10620,7 @@ impl Session {
                     buffer_id: Some(self.view.buffer.buffer_id),
                     target: aether_protocol::git::ShowTarget::WorkingChanges,
                     focus_path: None,
+                    record_nav_from: Some(self.view.view_buffer),
                 },
                 Event::Shown,
             ),
@@ -10512,28 +10662,12 @@ impl Session {
                 None => Effects::none(),
             },
 
-            // The shell you can type into. Which one that is, is the server's to decide — it
-            // holds the shells and knows which are busy; the client only says whether the view in
-            // front of it is already a shell, since a `Space b` there means "another one".
-            // Where the key was pressed is all the client says: whether that view is already a
-            // conversation — and so whether this means "another one" — is the server's to know.
+            // Always a new conversation: returning to one you have is `Space a`, the agents
+            // picker. `agent: None` takes the first agent found on `PATH` — there is no type
+            // choice yet.
             A::AgentOpen => self.request::<aether_protocol::agent::AgentOpen>(
-                aether_protocol::agent::AgentOpenParams {
-                    from_view: Some(self.view.view_id),
-                    agent: None,
-                },
+                aether_protocol::agent::AgentOpenParams { agent: None },
                 Event::AgentOpened,
-            ),
-            // Cancelling names the *view*, exactly as `Space Alt-b` does for a shell: the
-            // conversation in front of you is the one you meant.
-            A::AgentCancel if !self.agent_turns.contains_key(&self.view.view_id) => {
-                Effects::toast("Nothing is running here", ToastKind::Info)
-            }
-            A::AgentCancel => self.request_str::<aether_protocol::agent::AgentCancel>(
-                aether_protocol::agent::AgentCancelParams {
-                    view_id: self.view.view_id,
-                },
-                Event::AgentCancelled,
             ),
             A::AgentAnswer { allow } => self.request::<aether_protocol::agent::AgentRespond>(
                 aether_protocol::agent::AgentRespondParams {
@@ -10548,26 +10682,23 @@ impl Session {
                 },
                 Event::AgentAnswered,
             ),
+            // Always a new shell: returning to one you have is `Space t`, the shells picker.
             A::ShellOpen => self.request::<aether_protocol::shell::ShellOpen>(
-                aether_protocol::shell::ShellOpenParams {
-                    new: self.shell_input().is_some(),
-                },
+                aether_protocol::shell::ShellOpenParams {},
                 Event::ShellOpened,
             ),
-            // Cancelling names the *view*, exactly as `Space g x` names the repo: the shell in
-            // front of you is the one you meant, and a shell you are not looking at is not
-            // something `Space Alt-b` should reach into.
-            A::ShellCancel if self.shell_input().is_none() => {
-                Effects::toast("Not a shell", ToastKind::Info)
-            }
-            A::ShellCancel if !self.shell_runs.contains_key(&self.view.view_id) => {
-                Effects::toast("Nothing is running here", ToastKind::Info)
-            }
-            A::ShellCancel => self.request_str::<aether_protocol::shell::ShellCancel>(
-                aether_protocol::shell::ShellCancelParams {
+            // Stopping names the *view*, exactly as `Space g x` names the repo: the thing in front
+            // of you is the one you meant, and something you are not looking at is not what
+            // `Space v c` should reach into.
+            //
+            // One action for both kinds, and no client-side guess about which kind this is: the
+            // server answers `interrupted: false` for a view running nothing — a file, an idle
+            // shell, an idle conversation alike — and that one answer produces the one toast.
+            A::Interrupt => self.request::<aether_protocol::view::ViewInterrupt>(
+                aether_protocol::view::ViewInterruptParams {
                     view_id: self.view.view_id,
                 },
-                Event::ShellCancelled,
+                Event::Interrupted,
             ),
             // Reached from Normal-mode `Enter` (`Activate`) with the input focused. The guard is
             // kept so that nothing can submit from anywhere else, whatever dispatches it.
@@ -10810,10 +10941,9 @@ impl Session {
             // Frame the reading position first — the block's row is still known — so the anchor
             // then captured has the cursor on screen, and the editor opens showing it: what
             // leaving the reader always did.
-            return Effects::one(Effect::RevealCursor(RevealStyle::Jump))
-                .and(self.open_sibling(aether_protocol::ui::ViewKind::Editor));
+            return Effects::one(Effect::RevealCursor(RevealStyle::Jump)).and(self.set_read(false));
         }
-        self.open_sibling(aether_protocol::ui::ViewKind::Reader)
+        self.set_read(true)
     }
 
     /// Step the reading focus (`j`/`k`, `Tab`, `o` — the predicate picks the element class) and
@@ -10952,8 +11082,8 @@ impl Session {
     }
 
     /// Leave the reading view for the editor, locally and at once — the caller sets the
-    /// destination mode, and asks for the editor's view with [`Self::open_sibling`], or the next
-    /// pushed window would bring the reading view straight back.
+    /// destination mode, and asks for the source with [`Self::set_read`], or the next pushed
+    /// window would bring the reading view straight back.
     fn read_exit_for_edit(&mut self) {
         self.view.read = None;
         if self.view.mode == Mode::Read {
@@ -10975,7 +11105,7 @@ impl Session {
         let point = self.view.read.is_some() && self.view.buffer.cursor.is_point();
         self.read_exit_for_edit();
         self.view.mode = Mode::Insert;
-        let fx = self.open_sibling(aether_protocol::ui::ViewKind::Editor);
+        let fx = self.set_read(false);
         fx.and(if point {
             // The block's edge is the server's to find: the append point walks back over the
             // block's own trailing blank lines, and that needs the block's text.
@@ -11009,7 +11139,7 @@ impl Session {
         let buffer_id = self.view.buffer.buffer_id;
         // The content range is the server's: its end is the block's last content char, which means
         // looking at the block's text. Requests are ordered, so the change lands on this selection.
-        self.open_sibling(aether_protocol::ui::ViewKind::Editor)
+        self.set_read(false)
             .and(self.request_str::<ElementBlockContent>(
                 BufferOnlyParams { buffer_id },
                 Event::CursorMsg,
@@ -11459,13 +11589,11 @@ impl Session {
         };
         match self.read_resolve_path(path_part) {
             Some(path) => {
-                // An anchor asks for the reader outright: only a rendered document can land a
-                // heading slug, whatever the file was last shown as. Set *after* the open —
+                // An anchor asks to read outright: only a rendered document can land a heading
+                // slug, whatever the file was last shown as. Set *after* the open —
                 // `open_path_as` clears any stale anchor at entry.
-                let kind = fragment
-                    .is_some()
-                    .then_some(aether_protocol::ui::ViewKind::Reader);
-                let fx = self.open_path_as(path, None, None, kind);
+                let read = fragment.is_some().then_some(true);
+                let fx = self.open_path_as(path, None, None, read);
                 self.pending_read_anchor = fragment;
                 fx
             }
@@ -12023,6 +12151,52 @@ fn lsp_readiness_message(readiness: LspReadiness) -> Option<(&'static str, &'sta
     }
 }
 
+/// What closing one view would put at risk. Filled from the current view (`Space x`) or from a
+/// picker row (`Ctrl-d`), so both sides ask [`close_confirm_for`] the same question.
+pub struct Closing {
+    /// The view's name, as the prompt says it.
+    pub label: String,
+    /// Text that would be lost.
+    pub unsaved: bool,
+    /// A shell command is in flight; closing the view kills its process group.
+    pub running_shell: bool,
+    /// An agent turn is in flight — including one blocked on a permission request, which has not
+    /// finished either.
+    pub busy_agent: bool,
+}
+
+/// The confirmation closing this view needs, or `None` to close it straight away.
+///
+/// One gate for both close paths. Three things are worth stopping for and they are mutually
+/// exclusive in practice — a shell and a conversation hold no unsaved text of their own — but the
+/// order is fixed anyway so the answer never depends on which caller asked: unsaved text first,
+/// since that is the one thing the editor cannot get back.
+pub fn close_confirm_for(c: &Closing) -> Option<ConfirmKind> {
+    if c.unsaved {
+        return Some(ConfirmKind::DiscardOnClose {
+            label: c.label.clone(),
+        });
+    }
+    if c.running_shell {
+        return Some(ConfirmKind::CloseRunningShell {
+            title: c.label.clone(),
+        });
+    }
+    if c.busy_agent {
+        return Some(ConfirmKind::CloseBusyAgent {
+            title: c.label.clone(),
+        });
+    }
+    None
+}
+
+/// Whether an agents-picker row's badge means "a turn is in flight". Awaiting a permission answer
+/// counts: the turn is blocked, not over, and closing the view abandons it.
+pub fn agent_state_is_busy(state: &aether_protocol::picker::AgentRowState) -> bool {
+    use aether_protocol::picker::AgentRowState as S;
+    matches!(state, S::Thinking { .. } | S::AwaitingPermission)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12076,10 +12250,10 @@ mod tests {
         }
     }
 
-    /// A link anchor decides the open: `[x](./other.md#section)` asks for the reader outright,
-    /// whatever the file was last shown as, because a heading slug only resolves against the
-    /// rendered document — landing in the editor would silently drop it. A plain link asks for
-    /// nothing and takes the server's answer.
+    /// A link anchor decides the open: `[x](./other.md#section)` asks to read outright, whatever
+    /// the file was last shown as, because a heading slug only resolves against the rendered
+    /// document — landing in the editor would silently drop it. A plain link asks for nothing and
+    /// takes the server's answer.
     #[test]
     fn a_followed_anchor_asks_for_the_reader() {
         let mut s = reading_session();
@@ -12093,7 +12267,7 @@ mod tests {
                     _ => None,
                 })
                 .expect("the link target opens");
-        assert_eq!(open["kind"], serde_json::json!("reader"));
+        assert_eq!(open["read"], serde_json::json!(true));
         assert_eq!(s.pending_read_anchor.as_deref(), Some("section-two"));
 
         let mut s = reading_session();
@@ -12107,7 +12281,7 @@ mod tests {
                     _ => None,
                 })
                 .expect("the link target opens");
-        assert!(open.get("kind").is_none(), "no anchor, no opinion");
+        assert!(open.get("read").is_none(), "no anchor, no opinion");
 
         // A switch to a non-markdown target drops a pending anchor: nothing could land it.
         let mut s = reading_session();
@@ -12462,11 +12636,10 @@ mod tests {
     fn picker_item_target_reopens_a_scratch_buffer_by_id() {
         assert_eq!(
             target_of(
-                PickerKind::Views,
-                PickerItem::View {
+                PickerKind::Buffers,
+                PickerItem::Buffer {
                     buffer_id: 7,
                     view_id: ViewId(7),
-                    view_kind: None,
                     display: "(scratch 1)".into(),
                     status: aether_protocol::picker::BufferDirtyState::default(),
                     path_index: None,

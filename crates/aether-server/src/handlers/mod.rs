@@ -82,10 +82,10 @@ use aether_protocol::lsp::{
 use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
 use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
 use aether_protocol::picker::{
-    BufferDirtyState, GroupHeader, MatchOptions, PickerGroupAction, PickerHideParams, PickerItem,
-    PickerKind, PickerQueryParams, PickerReset, PickerSelectParams, PickerSelectResult,
-    PickerSetGroupParams, PickerSetGroupResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
-    PickerViewResult,
+    AgentRowState, BufferDirtyState, GroupHeader, MatchOptions, PickerGroupAction,
+    PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerReset, PickerSelectParams,
+    PickerSelectResult, PickerSetGroupParams, PickerSetGroupResult, PickerUpdate,
+    PickerUpdateParams, PickerViewParams, PickerViewResult,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavResult, SearchSetParams, SearchSetResult,
@@ -97,7 +97,8 @@ use aether_protocol::sneak::{
 };
 use aether_protocol::view::{
     BufferDescription, ViewCloseParams, ViewClosed, ViewClosedParams, ViewOpenParams,
-    ViewOpenResult, ViewSetTransientParams, ViewSetTransientResult, ViewState, ViewStateParams,
+    ViewOpenResult, ViewSetReadParams, ViewSetReadResult, ViewSetTransientParams,
+    ViewSetTransientResult, ViewState, ViewStateParams,
 };
 use aether_protocol::viewport::{
     BaselineRow, BufferStatusSnapshot, ConflictLine, DiagnosticSpan, DiffMarker, DiffStage,

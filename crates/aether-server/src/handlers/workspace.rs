@@ -395,12 +395,13 @@ pub async fn activate_context(
                 let sources = restore_dormant_sources(entries, &context, s.backups_path.as_deref());
                 let dormant: Vec<crate::state::DormantView> = sources
                     .into_iter()
-                    .map(|(source, kind)| {
+                    .map(|(source, shown)| {
                         let id = s.allocate_buffer_id();
                         crate::state::DormantView {
                             id,
                             view: s.allocate_view_id(),
-                            kind,
+                            read: shown.read,
+                            transient: shown.transient,
                             source,
                         }
                     })
@@ -468,7 +469,18 @@ pub async fn activate_context(
         }
     }
 
-    let last_view_id = landing_view_id(&s, &context);
+    // Transience is honoured for the **landing** and nowhere else. Two windows leave two previews
+    // in the session and only the front one is where you left off; a launch that lands elsewhere
+    // (a tethered `ae file.rs`, or `open_last: false`) must not leave one behind at all, because a
+    // dormant row is re-written on every persist and an unopened preview would never die. So: the
+    // landing survives only when this activation is about to open it, and everything else
+    // transient goes now, before the stamped write below records the list.
+    let landing = params
+        .open_last
+        .then(|| landing_view_id(&s, &context))
+        .flatten();
+    s.drop_transient_dormant(&context, landing);
+    let last_view_id = landing.or_else(|| landing_view_id(&s, &context));
 
     tracing::info!(
         %client_id,
@@ -581,12 +593,41 @@ fn landing_view_id(s: &ServerState, context: &str) -> Option<ViewId> {
         .or_else(|| s.first_dormant_view(context))
 }
 
+/// Drain [`ServerState::sessions_dirty`], writing each named workspace's session file.
+///
+/// **Called once at the end of every request dispatch** ([`crate::connection`]), after the handler
+/// has released the state lock. That is what makes persistence structural rather than a call the
+/// next handler has to remember: a handler says *what changed* by marking its workspace dirty, and
+/// exactly one write happens per request however many things it changed. Nothing marks dirty
+/// outside a request, so an idle server writes nothing.
+pub async fn flush_dirty_sessions(state: &SharedState) {
+    let dirty = {
+        let mut s = state.lock().await;
+        if s.sessions_dirty.is_empty() {
+            return;
+        }
+        let mut names: Vec<String> = std::mem::take(&mut s.sessions_dirty).into_iter().collect();
+        // Deterministic order, so a request that touched two workspaces writes them the same way
+        // every run — the file is one document and the tests read it back.
+        names.sort_unstable();
+        names
+    };
+    for name in dirty {
+        persist_workspace_session(state, &name, false).await;
+    }
+}
+
 /// Persist `workspace_name`'s session — the canonical paths of its open (and still-dormant) buffers,
 /// most-recently-used first, and optionally a fresh `last_activated_at` stamp — to the session file
 /// ([`crate::config::WorkspaceSessions`]). Best-effort: a no-op when sessions aren't persisted
 /// (`sessions_path` unset) or the workspace is ephemeral, and it logs rather than fails on I/O error.
 /// Buffer paths are gathered under the lock; the read-modify-write of the file happens after it's
 /// released.
+///
+/// [`flush_dirty_sessions`]'s worker, and the only writer. Whatever it writes is by definition no
+/// longer pending, so it clears this workspace from [`ServerState::sessions_dirty`] itself — which
+/// is also what keeps activation's stamped write from being immediately followed by an identical
+/// unstamped one.
 pub async fn persist_workspace_session(
     state: &SharedState,
     workspace_name: &str,
@@ -598,7 +639,8 @@ pub async fn persist_workspace_session(
     // and no torn file. The session file is tiny, so the blocking I/O held under the lock is
     // sub-millisecond, and persists are human-paced (open / switch / save / close / activate).
     // No `.await` between here and the write, so the guard is never yielded mid-critical-section.
-    let s = state.lock().await;
+    let mut s = state.lock().await;
+    s.sessions_dirty.remove(workspace_name);
     let Some(path) = s.sessions_path.clone() else {
         return;
     };
@@ -634,6 +676,9 @@ pub async fn persist_workspace_session(
 /// `entries` and the backups root (`None` when backups are disabled). Pure except for filesystem
 /// existence checks, so it's unit-testable against a tempdir.
 ///
+/// Each source comes back with the presentation its entry recorded — read or source, kept or a
+/// preview — which is what materialising the row restores.
+///
 /// - A **file** is restored while it still exists on disk, or while it has a backup (a file deleted
 ///   externally with unsaved content still comes back, flagged externally-deleted at materialize).
 /// - A **scratch** is restored only if its unsaved content survives as a backup — first from its
@@ -647,22 +692,35 @@ fn restore_dormant_sources(
     backups_root: Option<&std::path::Path>,
 ) -> Vec<(
     crate::state::DormantSource,
-    Option<aether_protocol::ui::ViewKind>,
+    crate::state::DormantPresentation,
 )> {
     use crate::config::SessionView;
-    use crate::state::DormantSource;
-    let mut sources: Vec<(DormantSource, Option<aether_protocol::ui::ViewKind>)> = entries
+    use crate::state::{DormantPresentation, DormantSource};
+    // How a restored row was shown: the entry's own presentation for the kinds that have one, and
+    // the default (source, kept) for the kinds that don't.
+    let shown = |read: bool, entry: &SessionView| DormantPresentation {
+        read,
+        transient: entry.transient(),
+    };
+    // One row per file, the most recent entry's mode: a session written while a file's reader was
+    // a view of its own holds an entry per view, and the file has one row now.
+    let mut seen_files: std::collections::HashSet<std::path::PathBuf> = Default::default();
+    let mut sources: Vec<(DormantSource, DormantPresentation)> = entries
         .iter()
+        .filter(|entry| match entry.file_view() {
+            Some((path, _)) => seen_files.insert(path.to_path_buf()),
+            None => true,
+        })
         .filter_map(|entry| match entry {
-            SessionView::Editor { .. } | SessionView::Reader { .. } | SessionView::File { .. } => {
-                let (path, kind) = entry.file_view()?;
+            SessionView::File { .. } | SessionView::Editor { .. } | SessionView::Reader { .. } => {
+                let (path, read) = entry.file_view()?;
                 let has_backup = backups_root.is_some_and(|root| {
                     crate::backup::exists(&crate::backup::file_backup_path(root, path))
                 });
                 (path.exists() || has_backup)
-                    .then(|| (DormantSource::File(path.to_path_buf()), Some(kind)))
+                    .then(|| (DormantSource::File(path.to_path_buf()), shown(read, entry)))
             }
-            SessionView::Scratch { number } => {
+            SessionView::Scratch { number, .. } => {
                 let has_backup = backups_root.is_some_and(|root| {
                     crate::backup::exists(&crate::backup::scratch_backup_path(
                         root,
@@ -670,15 +728,29 @@ fn restore_dormant_sources(
                         *number,
                     ))
                 });
-                has_backup.then_some((DormantSource::Scratch { number: *number }, None))
+                has_backup.then_some((
+                    DormantSource::Scratch { number: *number },
+                    shown(false, entry),
+                ))
             }
             // Nothing on disk to check for: a revision is regenerated from the repo on first view,
             // and one that no longer resolves reports itself then rather than being probed here.
-            SessionView::Virtual { key } => {
-                Some((DormantSource::Virtual { key: key.clone() }, None))
-            }
+            //
+            // Only a file at a revision is a document, and only a document can be kept. A session
+            // written before that rule may hold a kept commit or working-changes entry; restore it
+            // as a preview whatever it recorded, so it is honoured as the landing and dropped
+            // otherwise. Left kept it would be a row no picker lists and no collector reaches,
+            // re-written on every persist for ever.
+            SessionView::Virtual { key, .. } => Some((
+                DormantSource::Virtual { key: key.clone() },
+                DormantPresentation {
+                    read: false,
+                    transient: entry.transient()
+                        || crate::state::VirtualTarget::key_is_composed(key),
+                },
+            )),
             // A shell comes back only from its snapshot, as a scratch does from its backup.
-            SessionView::Shell { number } => {
+            SessionView::Shell { number, .. } => {
                 let has_snapshot = backups_root.is_some_and(|root| {
                     crate::backup::exists(&crate::backup::shell_backup_path(
                         root,
@@ -686,10 +758,13 @@ fn restore_dormant_sources(
                         *number,
                     ))
                 });
-                has_snapshot.then_some((DormantSource::Shell { number: *number }, None))
+                has_snapshot.then_some((
+                    DormantSource::Shell { number: *number },
+                    shown(false, entry),
+                ))
             }
             // As a shell: only from its snapshot, and an entry without one is dropped.
-            SessionView::Agent { number } => {
+            SessionView::Agent { number, .. } => {
                 let has_snapshot = backups_root.is_some_and(|root| {
                     crate::backup::exists(&crate::backup::agent_backup_path(
                         root,
@@ -697,7 +772,10 @@ fn restore_dormant_sources(
                         *number,
                     ))
                 });
-                has_snapshot.then_some((DormantSource::Agent { number: *number }, None))
+                has_snapshot.then_some((
+                    DormantSource::Agent { number: *number },
+                    shown(false, entry),
+                ))
             }
         })
         .collect();
@@ -719,11 +797,12 @@ fn restore_dormant_sources(
                 .filter(|n| !known.contains(n))
                 .collect();
             recovered.sort_unstable();
-            sources.extend(
-                recovered
-                    .into_iter()
-                    .map(|number| (DormantSource::Scratch { number }, None)),
-            );
+            sources.extend(recovered.into_iter().map(|number| {
+                (
+                    DormantSource::Scratch { number },
+                    DormantPresentation::default(),
+                )
+            }));
         }
         // Shell snapshots the session did not name — written by a server that never got to
         // record its session — come back too, after everything the session did name.
@@ -739,11 +818,12 @@ fn restore_dormant_sources(
             .filter(|n| !known_shells.contains(n))
             .collect();
         recovered.sort_unstable();
-        sources.extend(
-            recovered
-                .into_iter()
-                .map(|number| (DormantSource::Shell { number }, None)),
-        );
+        sources.extend(recovered.into_iter().map(|number| {
+            (
+                DormantSource::Shell { number },
+                DormantPresentation::default(),
+            )
+        }));
 
         // The same rescue for conversations: a snapshot on disk that no session entry mentions is
         // one the session file lost (a crash between the snapshot flush and the session write), and
@@ -760,11 +840,12 @@ fn restore_dormant_sources(
             .filter(|n| !known_agents.contains(n))
             .collect();
         recovered.sort_unstable();
-        sources.extend(
-            recovered
-                .into_iter()
-                .map(|number| (DormantSource::Agent { number }, None)),
-        );
+        sources.extend(recovered.into_iter().map(|number| {
+            (
+                DormantSource::Agent { number },
+                DormantPresentation::default(),
+            )
+        }));
     }
     sources
 }
@@ -2421,17 +2502,17 @@ mod restore_tests {
         crate::backup::write(&crate::backup::scratch_backup_path(&backups, "p", 5), "s5").unwrap();
 
         let entries = vec![
-            SessionView::Editor {
-                path: present.clone(),
+            SessionView::file(present.clone(), false, false),
+            SessionView::file(deleted_with_backup.clone(), false, false),
+            SessionView::file(deleted_no_backup.clone(), false, false),
+            SessionView::Scratch {
+                number: 1,
+                transient: false,
             },
-            SessionView::Editor {
-                path: deleted_with_backup.clone(),
+            SessionView::Scratch {
+                number: 2,
+                transient: false,
             },
-            SessionView::Editor {
-                path: deleted_no_backup.clone(),
-            },
-            SessionView::Scratch { number: 1 },
-            SessionView::Scratch { number: 2 },
         ];
 
         let sources: Vec<DormantSource> = restore_dormant_sources(&entries, "p", Some(&backups))
@@ -2460,8 +2541,14 @@ mod restore_tests {
         crate::backup::write(&crate::backup::shell_backup_path(&backups, "p", 1), "{}").unwrap();
         crate::backup::write(&crate::backup::shell_backup_path(&backups, "p", 4), "{}").unwrap();
         let entries = vec![
-            SessionView::Shell { number: 1 },
-            SessionView::Shell { number: 2 },
+            SessionView::Shell {
+                number: 1,
+                transient: false,
+            },
+            SessionView::Shell {
+                number: 2,
+                transient: false,
+            },
         ];
         let sources: Vec<DormantSource> = restore_dormant_sources(&entries, "p", Some(&backups))
             .into_iter()
@@ -2478,7 +2565,7 @@ mod restore_tests {
         assert!(restore_dormant_sources(&entries, "p", None).is_empty());
     }
 
-    /// A kept revision comes back unconditionally: there is nothing on disk to probe for, because
+    /// A recorded revision comes back unconditionally: there is nothing on disk to probe for, because
     /// its content is regenerated from the repo on first view. A commit that has been rebased away
     /// since reports itself then — when `git/show` can say what went wrong — rather than being
     /// silently dropped here, where the only honest message would be "something didn't restore".
@@ -2486,27 +2573,65 @@ mod restore_tests {
     fn restore_dormant_sources_keeps_revisions() {
         let entries = vec![
             SessionView::Virtual {
-                key: "/repo@abc1234".into(),
+                key: "/repo@abc1234:src/a.rs".into(),
+                transient: false,
             },
             SessionView::Virtual {
-                key: "/repo@abc1234:src/a.rs".into(),
+                key: "/repo@abc1234:src/b.rs".into(),
+                transient: true,
             },
         ];
-        // No backups dir at all: a revision doesn't need one, unlike a scratch.
-        let sources: Vec<DormantSource> = restore_dormant_sources(&entries, "p", None)
-            .into_iter()
-            .map(|(source, _)| source)
-            .collect();
+        // No backups dir at all: a revision doesn't need one, unlike a scratch. A file at a
+        // revision is a document, so it comes back exactly as it was recorded — kept, or as the
+        // preview a window was left in.
         assert_eq!(
-            sources,
+            restore_dormant_sources(&entries, "p", None),
             vec![
-                DormantSource::Virtual {
-                    key: "/repo@abc1234".into()
-                },
-                DormantSource::Virtual {
-                    key: "/repo@abc1234:src/a.rs".into()
-                },
+                (
+                    DormantSource::Virtual {
+                        key: "/repo@abc1234:src/a.rs".into()
+                    },
+                    crate::state::DormantPresentation::default()
+                ),
+                (
+                    DormantSource::Virtual {
+                        key: "/repo@abc1234:src/b.rs".into()
+                    },
+                    crate::state::DormantPresentation {
+                        read: false,
+                        transient: true
+                    }
+                ),
             ]
+        );
+    }
+
+    /// A commit's patch and the working changes are not documents, so they cannot be kept — but a
+    /// `sessions.json` written before that rule may say one was. Such an entry restores as a
+    /// **preview** whatever it recorded: honoured as the landing, dropped otherwise. Left kept it
+    /// would be a dormant row no picker lists and no collector reaches, re-written for ever.
+    #[test]
+    fn a_legacy_kept_commit_entry_restores_as_a_preview() {
+        let entries = vec![
+            SessionView::Virtual {
+                key: "/repo@abc1234".into(),
+                transient: false,
+            },
+            SessionView::Virtual {
+                key: "/repo#worktree".into(),
+                transient: false,
+            },
+            // Not a target any more — a key that no longer parses names nothing, so it is no more
+            // a document than a commit is.
+            SessionView::Virtual {
+                key: "nonsense".into(),
+                transient: false,
+            },
+        ];
+        let restored = restore_dormant_sources(&entries, "p", None);
+        assert!(
+            restored.iter().all(|(_, shown)| shown.transient),
+            "every non-document revision comes back as a preview: {restored:?}"
         );
     }
 
@@ -2518,19 +2643,18 @@ mod restore_tests {
         let present = dir.path().join("a.rs");
         std::fs::write(&present, "x\n").unwrap();
         let entries = vec![
-            SessionView::Editor {
-                path: present.clone(),
+            SessionView::file(present.clone(), false, false),
+            SessionView::file(dir.path().join("missing.rs"), false, false),
+            SessionView::Scratch {
+                number: 1,
+                transient: false,
             },
-            SessionView::Editor {
-                path: dir.path().join("missing.rs"),
-            },
-            SessionView::Scratch { number: 1 },
         ];
         assert_eq!(
             restore_dormant_sources(&entries, "p", None),
             vec![(
                 DormantSource::File(present),
-                Some(aether_protocol::ui::ViewKind::Editor)
+                crate::state::DormantPresentation::default()
             )]
         );
     }

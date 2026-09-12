@@ -7508,6 +7508,13 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::RecreateDeleted => "File removed on disk — recreate".into(),
         ConfirmKind::DiscardOnReload => "Discard local changes and reload".into(),
         ConfirmKind::DiscardOnClose { label } => format!("Discard unsaved changes in {label}"),
+        // Closing kills the process group, so this asks about what stops rather than what is lost.
+        ConfirmKind::CloseRunningShell { title } => {
+            format!("{title} is still running a command — close it and stop it")
+        }
+        ConfirmKind::CloseBusyAgent { title } => {
+            format!("{title} is still working — close it and stop the turn")
+        }
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
         ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),

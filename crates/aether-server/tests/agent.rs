@@ -61,18 +61,10 @@ async fn setup(
     (server, ws, dir, transcript)
 }
 
-/// Open a conversation. `from` is the view the key was pressed in, which is what decides between
-/// "the one I can type at" and "another one" — the server applies the rule, since only it knows
-/// what a view is.
-async fn open_agent(ws: &mut Ws, from: Option<aether_protocol::ViewId>) -> AgentOpenResult {
-    send_request::<AgentOpen>(
-        ws,
-        &AgentOpenParams {
-            from_view: from,
-            agent: None,
-        },
-    )
-    .await
+/// Open a conversation. Always a new one: `agent/open` takes no "reuse" question any more —
+/// returning to a conversation you have is the agents picker's job.
+async fn open_agent(ws: &mut Ws) -> AgentOpenResult {
+    send_request::<AgentOpen>(ws, &AgentOpenParams { agent: None }).await
 }
 
 /// The buffer the view's input element windows, found by its **role** rather than by the index the
@@ -179,7 +171,7 @@ async fn blocks(
 #[tokio::test]
 async fn open_lands_the_caret_in_the_input() {
     let (server, mut ws, _dir, _t) = setup(Script::default()).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
 
     // The open reports which element is the input, and the scroll it hands back names the same
     // one — a client that simply obeys the scroll lands in the right place.
@@ -194,25 +186,12 @@ async fn open_lands_the_caret_in_the_input() {
     assert_eq!(view.elements.len(), 1);
 }
 
-#[tokio::test]
-async fn a_second_open_reuses_the_idle_conversation() {
-    let (server, mut ws, _dir, _t) = setup(Script::default()).await;
-    let first = open_agent(&mut ws, None).await;
-    // Pressed from somewhere that is not a conversation: the idle one comes back.
-    let again = open_agent(&mut ws, None).await;
-    assert_eq!(
-        first.opened.view_id, again.opened.view_id,
-        "`Space n n` minted a second conversation instead of returning to the idle one"
-    );
-    let _ = server;
-}
-
 // ---- prompting ---------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn prompting_reads_and_clears_the_input() {
     let (server, mut ws, _dir, transcript) = setup(Script::default()).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
 
     type_prompt(&mut ws, input, "  hello agent  ").await;
@@ -238,7 +217,7 @@ async fn prompting_reads_and_clears_the_input() {
 #[tokio::test]
 async fn an_empty_prompt_is_a_no_op_not_an_error() {
     let (server, mut ws, _dir, transcript) = setup(Script::default()).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "   \n  ").await;
 
@@ -271,7 +250,7 @@ async fn message_chunks_with_one_id_become_one_block() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let blocks = blocks(&server, &open).await;
@@ -302,7 +281,7 @@ async fn chunks_without_an_id_append_to_the_open_block() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let blocks = blocks(&server, &open).await;
@@ -328,7 +307,7 @@ async fn a_thought_and_a_message_are_different_blocks() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let kinds: Vec<_> = blocks(&server, &open)
@@ -359,7 +338,7 @@ async fn a_tool_call_update_merges_rather_than_replacing() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let blocks = blocks(&server, &open).await;
@@ -394,7 +373,7 @@ async fn a_tool_call_grows_after_a_later_block_exists() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let blocks = blocks(&server, &open).await;
@@ -432,7 +411,7 @@ async fn a_diff_renders_as_a_patch() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let blocks = blocks(&server, &open).await;
@@ -464,7 +443,7 @@ async fn a_new_file_diff_says_so() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let s = server.state.lock().await;
@@ -506,7 +485,7 @@ async fn a_permission_request_blocks_the_turn_until_it_is_answered() {
         ..Script::default()
     };
     let (server, mut ws, _dir, transcript) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "go").await;
     let _: AgentPromptResult = send_request::<AgentPrompt>(
@@ -577,7 +556,7 @@ async fn answering_twice_answers_once() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "go").await;
     let _: AgentPromptResult = send_request::<AgentPrompt>(
@@ -681,7 +660,7 @@ async fn the_agent_reads_unsaved_buffer_text() {
     )
     .await;
 
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "read it").await;
 
     let read = transcript.lock().unwrap().reads.first().cloned();
@@ -744,7 +723,7 @@ async fn an_agent_write_lands_in_the_open_buffer_and_is_undoable() {
     )
     .await;
 
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "write it").await;
 
     assert_eq!(transcript.lock().unwrap().writes, vec![Ok(())]);
@@ -785,7 +764,7 @@ async fn block_documents_are_internal() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let s = server.state.lock().await;
@@ -808,10 +787,14 @@ async fn block_documents_are_internal() {
     }
 }
 
+/// `agent/open` **always creates** — from anywhere, an idle conversation included.
+///
+/// It used to hand back the idle one, a rule that existed only because there was no way to *list*
+/// the conversations: the same key opened a new one or an old one depending on state the user
+/// could not see. `Space a` is that list now, so `Space Alt-a` has exactly one meaning and the
+/// `from_view` parameter the rule was decided from is gone.
 #[tokio::test]
-async fn opening_from_inside_a_conversation_mints_the_next_one() {
-    // The rule the client cannot apply: whether `Space n n` means "the one I can type at" or
-    // "another one" depends on what the view you pressed it in *is*, and only the server knows.
+async fn every_open_mints_the_next_conversation() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let mut server = spawn_for_test("agent-proj", vec![root]).await.unwrap();
@@ -838,12 +821,12 @@ async fn opening_from_inside_a_conversation_mints_the_next_one() {
     )
     .await;
 
-    let first = open_agent(&mut ws, None).await;
-    // Pressed from inside that conversation: a second one, numbered after it.
-    let second = open_agent(&mut ws, Some(first.opened.view_id)).await;
+    let first = open_agent(&mut ws).await;
+    // A second open: a second conversation, numbered after the first.
+    let second = open_agent(&mut ws).await;
     assert_ne!(
         first.opened.view_id, second.opened.view_id,
-        "opening from inside a conversation returned the same one"
+        "the second open returned the same conversation"
     );
 
     let titles = {
@@ -870,7 +853,7 @@ async fn a_second_prompt_during_a_turn_is_refused_and_keeps_the_text() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "first").await;
     let _: AgentPromptResult = send_request::<AgentPrompt>(
@@ -940,7 +923,7 @@ async fn cancelling_ends_the_turn_and_answers_the_open_question() {
         ..Script::default()
     };
     let (server, mut ws, _dir, transcript) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "go").await;
     let _: AgentPromptResult = send_request::<AgentPrompt>(
@@ -990,6 +973,166 @@ async fn cancelling_ends_the_turn_and_answers_the_open_question() {
     assert!(!c.is_running());
 }
 
+/// A permission request re-pushes the open agents picker with `awaiting permission` on the row.
+///
+/// The badge changes whether or not a turn is in flight, so it goes out on its own rather than
+/// through the turn-state push — and answering it puts the row back to `thinking`. Recency
+/// ordering means the row re-paints where it is.
+#[tokio::test]
+async fn a_permission_request_repushes_the_agents_picker() {
+    use aether_protocol::picker::{
+        AgentRowState, PickerItem, PickerKind, PickerUpdate, PickerUpdateParams, PickerView,
+    };
+    let script = Script {
+        steps: vec![Step::Ask {
+            id: "t1",
+            options: ALLOW_OR_REJECT,
+        }],
+        ..Script::default()
+    };
+    let (server, mut ws, _dir, _t) = setup(script).await;
+    let open = open_agent(&mut ws).await;
+
+    // The resting row: connected, nothing in flight.
+    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Agents)).await;
+    let rows = view.update.and_then(|u| u.items).expect("a window");
+    let PickerItem::Agent { state, title, .. } = &rows[0] else {
+        panic!("an agent row");
+    };
+    assert_eq!(*state, AgentRowState::Idle);
+    assert_eq!(title, "Agent 1");
+
+    let input = input_buffer_of(&server, &open).await;
+    type_prompt(&mut ws, input, "go").await;
+    let _: AgentPromptResult = send_request::<AgentPrompt>(
+        &mut ws,
+        &AgentPromptParams {
+            view_id: open.opened.view_id,
+        },
+    )
+    .await;
+
+    let mut saw_thinking = false;
+    loop {
+        let update: PickerUpdateParams =
+            expect_notification_within::<PickerUpdate>(&mut ws, std::time::Duration::from_secs(10))
+                .await;
+        if update.kind != PickerKind::Agents {
+            continue;
+        }
+        let Some(PickerItem::Agent {
+            state, last_prompt, ..
+        }) = update.items().first().cloned()
+        else {
+            continue;
+        };
+        match state {
+            AgentRowState::Thinking { .. } => saw_thinking = true,
+            AgentRowState::AwaitingPermission => {
+                assert_eq!(
+                    last_prompt.as_deref(),
+                    Some("go"),
+                    "the row carries the last thing said to it"
+                );
+                break;
+            }
+            other => panic!("unexpected row state {other:?}"),
+        }
+    }
+    assert!(
+        saw_thinking,
+        "the turn starting pushed a `thinking` row first"
+    );
+
+    // Answering puts it back to working.
+    let _ = send_request::<AgentRespond>(
+        &mut ws,
+        &AgentRespondParams {
+            view_id: open.opened.view_id,
+            block: None,
+            answer: aether_protocol::agent::Answer::Allow,
+        },
+    )
+    .await;
+    loop {
+        let update: PickerUpdateParams =
+            expect_notification_within::<PickerUpdate>(&mut ws, std::time::Duration::from_secs(10))
+                .await;
+        if update.kind != PickerKind::Agents {
+            continue;
+        }
+        let Some(PickerItem::Agent { state, .. }) = update.items().first().cloned() else {
+            continue;
+        };
+        if !matches!(state, AgentRowState::AwaitingPermission) {
+            break;
+        }
+    }
+    wait_for_idle(&server, open.opened.view_id).await;
+}
+
+/// `view/interrupt` — `Space v c` — stops a turn without naming an agent.
+///
+/// The same key stops a shell's run; the client cannot tell the two apart and does not need to.
+/// A conversation with nothing in flight answers `interrupted: false`, which is what produces the
+/// client's one "Nothing is running here".
+#[tokio::test]
+async fn view_interrupt_stops_a_turn() {
+    use aether_protocol::view::{ViewInterrupt, ViewInterruptParams, ViewInterruptResult};
+    let script = Script {
+        steps: vec![Step::Ask {
+            id: "t1",
+            options: ALLOW_OR_REJECT,
+        }],
+        ..Script::default()
+    };
+    let (server, mut ws, _dir, _t) = setup(script).await;
+    let open = open_agent(&mut ws).await;
+
+    // Idle: nothing to stop, and not an error.
+    let idle: ViewInterruptResult = send_request::<ViewInterrupt>(
+        &mut ws,
+        &ViewInterruptParams {
+            view_id: open.opened.view_id,
+        },
+    )
+    .await;
+    assert!(!idle.interrupted);
+
+    let input = input_buffer_of(&server, &open).await;
+    type_prompt(&mut ws, input, "go").await;
+    let _: AgentPromptResult = send_request::<AgentPrompt>(
+        &mut ws,
+        &AgentPromptParams {
+            view_id: open.opened.view_id,
+        },
+    )
+    .await;
+    loop {
+        let s = server.state.lock().await;
+        let running = s
+            .try_presenting_buffer(open.opened.view_id)
+            .and_then(|b| s.try_doc_of(b))
+            .and_then(|d| d.conversation())
+            .is_some_and(|c| c.is_running());
+        if running {
+            break;
+        }
+        drop(s);
+        tokio::task::yield_now().await;
+    }
+
+    let stopped: ViewInterruptResult = send_request::<ViewInterrupt>(
+        &mut ws,
+        &ViewInterruptParams {
+            view_id: open.opened.view_id,
+        },
+    )
+    .await;
+    assert!(stopped.interrupted);
+    wait_for_idle(&server, open.opened.view_id).await;
+}
+
 #[tokio::test]
 async fn prose_is_bare_and_the_machinery_is_boxed() {
     // What you typed and what the agent said back carry no box; a tool call does, because it is a
@@ -1009,7 +1152,7 @@ async fn prose_is_bare_and_the_machinery_is_boxed() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "fix it").await;
 
     let s = server.state.lock().await;
@@ -1063,14 +1206,7 @@ async fn a_test_server_with_no_dummy_launches_nothing() {
     )
     .await;
 
-    let refused = send_request_result::<AgentOpen>(
-        &mut ws,
-        &AgentOpenParams {
-            from_view: None,
-            agent: None,
-        },
-    )
-    .await;
+    let refused = send_request_result::<AgentOpen>(&mut ws, &AgentOpenParams { agent: None }).await;
     let err = refused.expect_err("a test server launched an agent");
     assert_eq!(
         err.get("code").and_then(|c| c.as_i64()),
@@ -1112,7 +1248,7 @@ async fn an_idle_conversation_burns_no_cpu() {
     let (server, mut ws, _dir, _t) = setup(Script::default()).await;
     let baseline = cpu_over(1000).await;
 
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     // Let the handshake settle, so what we measure is the resting state.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let burnt = cpu_over(1000).await;
@@ -1184,7 +1320,7 @@ async fn the_agents_reply_is_prose_on_the_wire() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let s = server.state.lock().await;
@@ -1285,7 +1421,7 @@ async fn a_plan_keeps_each_entrys_state() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "plan it").await;
 
     let blocks = blocks(&server, &open).await;
@@ -1321,7 +1457,7 @@ async fn a_tool_calls_box_is_named_by_the_agent_not_by_us() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "test it").await;
 
     let s = server.state.lock().await;
@@ -1366,7 +1502,7 @@ async fn a_block_has_no_trailing_blank_line() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws, None).await;
+    let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "a prompt").await;
 
     let s = server.state.lock().await;
@@ -1443,7 +1579,7 @@ async fn a_conversation_survives_a_server_restart() {
         }
         let mut ws = Ws::connect(&server).await;
         activate_p(&mut ws).await;
-        let open = open_agent(&mut ws, None).await;
+        let open = open_agent(&mut ws).await;
         prompt_and_wait(&mut ws, &server, &open, "why are semicolons dropped?").await;
         let input = input_buffer_of(&server, &open).await;
         type_prompt(&mut ws, input, "typed ahead").await;
@@ -1558,4 +1694,38 @@ async fn activate_p(ws: &mut Ws) {
         },
     )
     .await;
+}
+
+/// **`Space k` cannot arm a conversation to close itself**, for the reason a shell cannot: an
+/// agent view is composed and created kept, so `view/set_transient { transient: true }` answers the
+/// flag as it stands (`false`) instead of changing it.
+#[tokio::test]
+async fn an_agent_view_cannot_be_made_transient() {
+    use aether_protocol::view::{ViewSetTransient, ViewSetTransientParams, ViewSetTransientResult};
+    let (server, mut ws, _dir, _t) = setup(Script::default()).await;
+    let agent = open_agent(&mut ws).await;
+
+    let answered: ViewSetTransientResult = send_request::<ViewSetTransient>(
+        &mut ws,
+        &ViewSetTransientParams {
+            view_id: agent.opened.view_id,
+            transient: true,
+        },
+    )
+    .await;
+    assert!(
+        !answered.transient,
+        "the answer is the actual flag: a conversation stays kept"
+    );
+    assert!(
+        !server
+            .state
+            .lock()
+            .await
+            .view(agent.opened.view_id)
+            .transient,
+        "and nothing moved server-side"
+    );
+
+    drop(server);
 }

@@ -808,6 +808,10 @@ export interface ViewOpenResult {
   lsp_server?: LspServerRef | null;
   /** True while the buffer is transient (auto-closes once hidden). */
   transient?: boolean;
+  /** True when this client is reading the file as the rendered document — its window will carry
+   *  one prose element rather than lines. Absent means false; a client's own presentation mode
+   *  of a markdown file, flipped with `view/set_read`. */
+  read?: boolean;
 }
 
 // ---- LSP status (embedded in the View + picker rows) --------------------------------------------
@@ -895,7 +899,9 @@ export interface GitBlameLineResult {
 
 export type PickerKind =
   | "files"
-  | "views"
+  | "buffers"
+  | "shells"
+  | "agents"
   | "grep"
   | "git_changes"
   | "git_changes_file"
@@ -923,11 +929,48 @@ export type SymbolKind =
   | "number" | "boolean" | "array" | "object" | "key" | "null" | "enum_member" | "struct"
   | "event" | "operator" | "type_parameter" | "unknown";
 
+/** Mirrors aether-protocol::picker::AgentRowState (serde tag = "state", snake_case). A badge on
+ *  the agents-picker row, never a sort key. */
+export type AgentRowState =
+  | { state: "idle" }
+  | { state: "thinking"; activity?: string }
+  | { state: "awaiting_permission" }
+  | { state: "disconnected" };
+
 /** Mirrors aether-protocol::picker::PickerItem (serde tag = "kind", snake_case). `match_indices`
  *  are code-point offsets into the row's display string, covered by the fuzzy match. */
 export type PickerItem =
   | { kind: "file"; path_index: number; relative_path: string; match_indices?: number[]; git_status?: GitStatus }
-  | { kind: "view"; buffer_id: BufferId; view_id: number; view_kind?: "editor" | "reader"; display: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[]; transient?: boolean }
+  | { kind: "buffer"; buffer_id: BufferId; view_id: number; display: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[]; transient?: boolean }
+  /** A shell view. `match_indices` are code-point offsets into the composed haystack
+   *  `"{title}  {cwd}  {last_command}"` (empty parts elided, two spaces between the rest) — the
+   *  server's `shell_haystack`, mirrored by `rowMatchSegments`. `cwd` arrives already shortened
+   *  to `~/…`; `exit`/`elapsed_ms` describe the last *finished* run, so they survive a new one
+   *  starting. */
+  | {
+      kind: "shell";
+      view_id: number;
+      title: string;
+      cwd: string;
+      last_command?: string;
+      running?: boolean;
+      exit?: number;
+      elapsed_ms?: number;
+      dormant?: boolean;
+      match_indices?: number[];
+    }
+  /** An agent conversation. Haystack is `"{title}  {agent}  {last_prompt}"`, composed like the
+   *  shell row's. */
+  | {
+      kind: "agent";
+      view_id: number;
+      title: string;
+      agent: string;
+      state?: AgentRowState;
+      last_prompt?: string;
+      dormant?: boolean;
+      match_indices?: number[];
+    }
   | {
       kind: "grep_hit";
       path_index: number;

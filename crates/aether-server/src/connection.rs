@@ -51,8 +51,8 @@ use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::shell::{ShellCancel, ShellOpen, ShellRun};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::syntax::SyntaxHighlightSnippet;
-use aether_protocol::view::ViewSubmitInput;
-use aether_protocol::view::{ViewClose, ViewFollowLine, ViewOpen, ViewSetTransient};
+use aether_protocol::view::{ViewClose, ViewFollowLine, ViewOpen, ViewSetRead, ViewSetTransient};
+use aether_protocol::view::{ViewInterrupt, ViewSubmitInput};
 use aether_protocol::viewport::{
     ViewSave, ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportSetWrap,
     ViewportSubscribe, ViewportWindow, ViewportWindowAtCursor,
@@ -308,8 +308,9 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
             .flat_map(|v| v.shown_buffers(s.view_of(v)))
             .collect();
         s.drop_viewports_for_client(client_id);
-        let (closed, _stopped, _closed_views) = s.close_orphaned_transients(viewed);
+        let (closed, _stopped) = s.close_orphaned_transients(viewed);
         s.drop_cursors_for_client(client_id);
+        s.drop_read_for_client(client_id);
         s.drop_motion_history_for_client(client_id);
         s.drop_virtual_col_for_client(client_id);
         s.drop_searches_for_client(client_id);
@@ -406,6 +407,13 @@ async fn process_request(
 
     let result = dispatch(state, ctx, &method, params).await;
 
+    // One session write per request, after the handler has released the lock. Handlers say *what*
+    // changed (`ServerState::sessions_dirty`) rather than each remembering to persist, so a method
+    // nobody thought about — `git/show` opening a diff, say — records itself for free, and a
+    // request that changed several things still writes once. Before the reply, so a client that
+    // reads the file the moment it sees the response sees the write.
+    handlers::flush_dirty_sessions(state).await;
+
     let envelope = match result {
         Ok(value) => serde_json::to_string(&Response {
             jsonrpc: JsonRpc,
@@ -490,6 +498,7 @@ async fn dispatch(
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
         BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),
         ViewSetTransient::NAME => run!(ViewSetTransient, handlers::view_set_transient),
+        ViewSetRead::NAME => run!(ViewSetRead, handlers::view_set_read),
         ViewClose::NAME => run!(ViewClose, handlers::view_close),
         BufferContent::NAME => run!(BufferContent, handlers::buffer_content),
         SyntaxHighlightSnippet::NAME => {
@@ -602,6 +611,7 @@ async fn dispatch(
         ShellRun::NAME => run!(ShellRun, handlers::shell_run),
         ShellCancel::NAME => run!(ShellCancel, handlers::shell_cancel),
         ViewSubmitInput::NAME => run!(ViewSubmitInput, handlers::view_submit_input),
+        ViewInterrupt::NAME => run!(ViewInterrupt, handlers::view_interrupt),
         AgentOpen::NAME => run!(AgentOpen, handlers::agent_open),
         AgentPrompt::NAME => run!(AgentPrompt, handlers::agent_prompt),
         AgentCancel::NAME => run!(AgentCancel, handlers::agent_cancel),

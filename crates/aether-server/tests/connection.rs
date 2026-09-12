@@ -399,6 +399,93 @@ async fn buffer_open_jump_drops_saved_scroll() {
     drop(server);
 }
 
+/// A saved scroll frames the cursor it was recorded with. Move the cursor while the view is hidden
+/// — the cursor is per `(client, buffer)`, so a review's element windowing the same buffer moves
+/// it, and so does `cursor/set` — and the old scroll would frame the wrong region, stranding the
+/// cursor off screen exactly as a stale scroll did for a jump. The server forgets it and the client
+/// frames the cursor; an unmoved cursor still gets its scroll back.
+#[tokio::test]
+async fn a_cursor_moved_while_hidden_drops_the_saved_scroll() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut content = String::new();
+    for i in 0..60 {
+        content.push_str(&format!("line {i}\n"));
+    }
+    std::fs::write(dir.path().join("a.txt"), &content).unwrap();
+    std::fs::write(dir.path().join("b.txt"), "other\n").unwrap();
+
+    let server = spawn_for_test("hidden-move-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let mut ws = Ws::connect(&server).await;
+    let _act: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "hidden-move-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open = |relative_path: &str| ViewOpenParams {
+        path_index: Some(0),
+        relative_path: Some(relative_path.into()),
+        ..Default::default()
+    };
+    let sub_params = |view_id| ViewportSubscribeParams {
+        view_id,
+        cols: 80,
+        rows: 10,
+        overscan_rows: 0,
+        scroll: ScrollPosition::default(),
+        focus: None,
+        wrap: WrapMode::None,
+        continuation_marker_width: 0,
+        tab_width: 4,
+        diff_view: false,
+    };
+
+    let a: ViewOpenResult = send_request::<ViewOpen>(&mut ws, &open("a.txt")).await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &sub_params(view_of(a.buffer_id))).await;
+    let _ = window_from_row(&mut ws, sub.viewport_id, 20, 10).await;
+
+    // Hidden behind another file with its cursor untouched: the scroll comes back.
+    let b: ViewOpenResult = send_request::<ViewOpen>(&mut ws, &open("b.txt")).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &sub_params(view_of(b.buffer_id))).await;
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(&mut ws, &open("a.txt")).await;
+    assert_eq!(
+        reopen.scroll.map(|s| s.line),
+        Some(20),
+        "an unmoved cursor gets its scroll back"
+    );
+
+    // Hidden again, and this time its cursor is moved from under it.
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &sub_params(view_of(b.buffer_id))).await;
+    let moved = LogicalPosition { line: 50, col: 0 };
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        &CursorSetParams {
+            buffer_id: a.buffer_id,
+            position: moved,
+            anchor: moved,
+            granularity: Granularity::Char,
+        },
+    )
+    .await;
+    let reopen: ViewOpenResult = send_request::<ViewOpen>(&mut ws, &open("a.txt")).await;
+    assert_eq!(reopen.cursor.position, moved);
+    assert!(
+        reopen.scroll.is_none(),
+        "a scroll recorded for a cursor that has since moved is not restored, got {:?}",
+        reopen.scroll
+    );
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn buffer_open_isolates_scroll_per_client() {
     // Two clients on the same buffer should see independent restored scroll positions.

@@ -50,30 +50,6 @@ pub async fn view_close(
         }
         shown
     };
-    // One view of several — a file's reader beside its editor — closes alone: the buffer, its text
-    // and its other views stay, so there is nothing unsaved to ask about. Only a buffer's last
-    // view is a buffer close. Whoever else was presenting the view loses their viewport with it,
-    // and is told — the same push a buffer close sends, with no buffer in it.
-    let presenting = clients_presenting_view(&s, params.view_id, client_id);
-    if s.close_view(params.view_id) {
-        let mut pushes = collect_after_close(&mut s, &left_behind);
-        let next_view_id = next_view_for_client(&s, client_id);
-        pushes.extend(refresh_view_pickers(&mut s));
-        pushes.extend(view_closed_pushes(&s, params.view_id, &presenting));
-        drop(s);
-        for (sender, notif) in pushes {
-            let _ = sender.send(notif).await;
-        }
-        let opened = if params.open_next {
-            Some(view_open(state, ctx, successor_params(next_view_id)).await?)
-        } else {
-            None
-        };
-        return Ok(aether_protocol::view::ViewCloseResult {
-            next_view_id,
-            opened,
-        });
-    }
     if !s.buffers.contains_key(&buffer_id) {
         // Not a live buffer — but the view picker also lists *dormant* rows (session-restored,
         // not yet loaded), and `Ctrl-d` on one of those should drop it from the list just like
@@ -110,12 +86,14 @@ pub async fn view_close(
                         ),
                     }
                 }
+                // The dormant list changed, so the session must stop restoring this row; the
+                // flush at the end of the request writes it.
+                s.dirty_session(&workspace);
                 let pushes = refresh_view_pickers(&mut s);
                 drop(s);
                 for (sender, notif) in pushes {
                     let _ = sender.send(notif).await;
                 }
-                persist_workspace_session(state, &workspace, false).await;
                 let next_view_id = {
                     let s = state.lock().await;
                     next_view_for_client(&s, client_id)
@@ -154,13 +132,13 @@ pub async fn view_close(
         let demoted: Vec<ViewId> = s
             .views_presenting(buffer_id)
             .into_iter()
-            .filter(|view_id| {
-                s.views
-                    .get_mut(view_id)
-                    .is_some_and(|view| !std::mem::replace(&mut view.transient, true))
-            })
+            .filter(|view_id| s.set_view_transient(*view_id, true))
             .collect();
         s.drop_buffer_from_mru(buffer_id);
+        // The close itself is the user action the collector's drops are not: dirty here, after it.
+        if let Some(workspace) = &owning_workspace {
+            s.dirty_session(workspace);
+        }
         let presenting = s.views_presenting(buffer_id);
         s.viewports
             .retain(|_, v| !(v.client_id == client_id && presenting.contains(&v.view_id)));
@@ -181,9 +159,6 @@ pub async fn view_close(
         } else {
             None
         };
-        if let Some(workspace) = &owning_workspace {
-            persist_workspace_session(state, workspace, false).await;
-        }
         return Ok(aether_protocol::view::ViewCloseResult {
             next_view_id,
             opened,
@@ -227,6 +202,12 @@ pub async fn view_close(
     // cleanup, or — if that's empty — any remaining buffer in the workspace. The client uses this
     // to attach without an extra RPC round-trip.
     let next_view_id = next_view_for_client(&s, client_id);
+    // Closing changed the workspace's open set — the session must stop restoring the closed file.
+    // Dirtied here, after the close, rather than in the MRU drops the teardown goes through: those
+    // are also the hide collector's, and the collector must never write.
+    if let Some(workspace) = &owning_workspace {
+        s.dirty_session(workspace);
+    }
     let mut pushes = collected;
     pushes.extend(refresh_view_pickers(&mut s));
     // A retired ephemeral workspace drops out of any open switcher.
@@ -252,11 +233,6 @@ pub async fn view_close(
     } else {
         None
     };
-    // Closing changed the workspace's open-buffer set — refresh its persisted session so the closed
-    // file isn't restored next time. No-op for an ephemeral (or already-retired) workspace.
-    if let Some(workspace) = &owning_workspace {
-        persist_workspace_session(state, workspace, false).await;
-    }
     Ok(aether_protocol::view::ViewCloseResult {
         next_view_id,
         opened,
@@ -277,9 +253,9 @@ fn successor_params(next_view_id: Option<ViewId>) -> ViewOpenParams {
 /// Collect what a close left hidden and transient among `left_behind`
 /// ([`ServerState::close_orphaned_transients`]), with the picker refreshes that owes.
 fn collect_after_close(s: &mut ServerState, left_behind: &[BufferId]) -> PendingPushes {
-    let (closed, stopped, closed_views) = s.close_orphaned_transients(left_behind.iter().copied());
+    let (closed, stopped) = s.close_orphaned_transients(left_behind.iter().copied());
     let mut pushes = Vec::new();
-    if !closed.is_empty() || !closed_views.is_empty() {
+    if !closed.is_empty() {
         for &id in &closed {
             tracing::debug!(
                 buffer_id = id,
@@ -695,6 +671,9 @@ pub async fn buffer_save(
         // Saving is a keep-this signal: promote the views the save came from (the first edit
         // normally got there already; this covers a clean-buffer save-as).
         let promoted = s.promote_views_of(params.buffer_id);
+        // A save is a change to what the session should say even when nothing was promoted: a
+        // scratch that has just been saved-as stops being a `scratch` entry and becomes its file.
+        s.dirty_session_for_buffer(params.buffer_id);
         if let Some(doc) = s.try_doc_of_mut(params.buffer_id) {
             doc.backed_up_revision = None;
         }
@@ -719,17 +698,6 @@ pub async fn buffer_save(
     }
     for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
-    }
-
-    // A save promotes the buffer to permanent (above) and is the clearest "this buffer matters"
-    // signal — refresh the persisted session so an edit→save→quit reliably restores the file, even
-    // though its transient open didn't persist it. Best-effort, named-workspaces-only.
-    let workspace = {
-        let s = state.lock().await;
-        s.workspace_for_buffer(params.buffer_id).map(str::to_string)
-    };
-    if let Some(workspace) = workspace {
-        persist_workspace_session(state, &workspace, false).await;
     }
 
     Ok(BufferSaveResult {
@@ -778,44 +746,104 @@ pub async fn buffer_reload(
     Ok(result)
 }
 
+/// The view `Space k` actually addresses for `client_id`, when that is **not** the view it was
+/// asked of.
+///
+/// Inside a review — a commit's patch, the working changes — the thing worth keeping is the
+/// document under the cursor, not the review: its elements window real files, each opened bound
+/// and as a preview with a plain view of its own, and keeping one of those is what makes it a
+/// buffers-picker row that outlives the review. The review itself is composed and keeps the flag
+/// it was created with, so addressing it is a no-op the user has no use for.
+///
+/// `None` — keep the named view — when it is a document's own view already, when this client has
+/// no viewport on it (nothing says where the cursor is), when the cursor is in the view's own
+/// generated text (a patch's metadata block: there is no windowed document there), or when the
+/// focused document is **internal**: a shell's input and an agent's blocks are fields of the view
+/// rather than something the user opened, so there is nothing to keep.
+fn keep_target(s: &ServerState, client_id: ClientId, view_id: ViewId) -> Option<ViewId> {
+    let view = s.try_view(view_id)?;
+    if !view.is_composed() {
+        return None;
+    }
+    // The same lookup a follow and a nav capture do: the client's viewport on the view knows
+    // which element holds its cursor, and that element's buffer is where the cursor is.
+    let focused = s
+        .viewports
+        .values()
+        .find(|vp| vp.client_id == client_id && vp.view_id == view_id)
+        .map(|vp| s.focused_buffer(vp))?;
+    if focused == view.presenting || s.try_doc_of(focused).is_none_or(|d| d.internal) {
+        return None;
+    }
+    s.view_presenting(focused)
+}
+
 /// Set a view's transient flag explicitly — the `Space k` "keep" toggle. Unlike `view/open`'s
-/// promote-only intent, this flips the flag either way. Applied unconditionally: the client owns
-/// the "don't mark a view with unsaved edits transient" policy (auto-close would discard them), the
-/// same way `view/close` leaves the discard decision to the client. Pushes `view/state` so every
-/// client presenting the view updates, and refreshes open view pickers so the italic transient
-/// label tracks it.
+/// promote-only intent, this flips the flag either way. The client owns the "don't mark a view
+/// with unsaved edits transient" policy (auto-close would discard them), the same way
+/// `view/close` leaves the discard decision to the client. Pushes `view/state` so every client
+/// presenting the view updates, and refreshes open view pickers so the italic transient label
+/// tracks it.
+///
+/// Only a document's own view can be kept or released ([`ServerState::set_view_transient`]): a
+/// composed view keeps the flag it was created with. That is not an error — the answer is the
+/// view's **actual** flag, read back after the write, and a client whose echo differs from what it
+/// asked says so.
+///
+/// **Inside a review the key keeps the document under the cursor** ([`keep_target`]). Redirected,
+/// only a *keep* is honoured: a release asked from inside a review is a no-op, because the file's
+/// own state is not visible from there and a toggle would be a coin flip. The answer is the
+/// target's actual flag either way, so the same echo rule tells the client which it got.
 pub async fn view_set_transient(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: ViewSetTransientParams,
 ) -> Result<ViewSetTransientResult, RpcError> {
-    let _ = ctx;
+    let client_id = ctx.client_id;
     let mut s = state.lock().await;
-    let view = s
-        .views
-        .get_mut(&params.view_id)
-        .ok_or_else(|| RpcError::view_not_found(params.view_id))?;
-    view.transient = params.transient;
-    let buffer_id = view.presenting;
-    let mut pushes = collect_view_state_pushes(&s, &[params.view_id]);
+    if !s.views.contains_key(&params.view_id) {
+        return Err(RpcError::view_not_found(params.view_id));
+    }
+    let redirected = keep_target(&s, client_id, params.view_id);
+    let target = redirected.unwrap_or(params.view_id);
+    // Through the one setter, which is also what marks the session dirty: keeping (or unkeeping)
+    // changes what the session should say about this view, and the flush at the end of the
+    // request writes it.
+    if redirected.is_none() || !params.transient {
+        s.set_view_transient(target, params.transient);
+    }
+    let transient = s.view(target).transient;
+    // The target's viewers hear the flag; the picker rebuild is total, so a file that just became
+    // a row is listed whether or not it is the view the request named.
+    let mut pushes = collect_view_state_pushes(&s, &[target]);
     pushes.extend(refresh_view_pickers(&mut s));
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    // Keeping/unkeeping changes whether this buffer is part of the persisted working set (the
-    // session lists kept buffers only) — refresh it. `Space k` is the explicit "this matters"
-    // signal, with no later save/switch to rely on, so it must persist here directly.
-    let workspace = {
-        let s = state.lock().await;
-        s.workspace_for_buffer(buffer_id).map(str::to_string)
-    };
-    if let Some(workspace) = workspace {
-        persist_workspace_session(state, &workspace, false).await;
+    Ok(ViewSetTransientResult { transient })
+}
+
+/// `view/set_read` — flip how this client sees a markdown file: the `Space u` toggle. The mode
+/// is the client's, and the file remembers it as its last showing; the client re-subscribes and
+/// the window comes back as prose or as lines accordingly. The session records how each file was
+/// last shown; `set_read_mode` marks it dirty and the flush at the end of this request writes it.
+pub async fn view_set_read(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: ViewSetReadParams,
+) -> Result<ViewSetReadResult, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    let buffer_id = s
+        .try_presenting_buffer(params.view_id)
+        .ok_or_else(|| RpcError::view_not_found(params.view_id))?;
+    if !s.set_read_mode(client_id, buffer_id, params.read) {
+        return Err(RpcError::invalid_params(
+            "only a markdown file presented on its own can be read",
+        ));
     }
-    Ok(ViewSetTransientResult {
-        transient: params.transient,
-    })
+    Ok(ViewSetReadResult { read: params.read })
 }
 
 /// Re-read a buffer from disk inside the lock, returning the RPC result and the pushes the
@@ -902,39 +930,33 @@ pub async fn view_open(
 ) -> Result<ViewOpenResult, RpcError> {
     // Composite pre-step: record the jump origin onto this client's nav history — `nav/record`
     // folded in, so result-style opens are one round-trip.
-    if let Some(from) = params.record_nav_from {
-        let mut s = state.lock().await;
-        if let Some(entry) = nav_entry_for(&s, ctx.client_id, from) {
-            s.nav_history
-                .entry(ctx.client_id)
-                .or_default()
-                .record(entry);
-        }
-    }
-    let result = view_open_inner(state, ctx, params, OpenIntent::Navigate).await?;
-    // Refresh the persisted session for this buffer's workspace: the open changed either its
-    // membership (a new file) or its MRU order (a switch), both of which a restart restores from.
-    // Skip transient opens — previews never enter the persisted set (see `session_buffer_paths`),
-    // so persisting on every grep/picker peek would just rewrite identical content. Best-effort and
-    // named-workspaces-only (the helper guards); a no-op when sessions aren't persisted.
-    if !result.transient {
-        let workspace = {
-            let s = state.lock().await;
-            s.workspace_for_buffer(result.buffer_id).map(str::to_string)
-        };
-        if let Some(workspace) = workspace {
-            persist_workspace_session(state, &workspace, false).await;
-        }
-    }
-    Ok(result)
+    record_nav_origin(state, ctx.client_id, params.record_nav_from).await;
+    // No persist here: the open's `touch_mru_view` marked the workspace's session dirty — for a
+    // preview too, since a preview is now where you left off — and the flush at the end of the
+    // request writes it once, however many opens the request made.
+    view_open_inner(state, ctx, params, OpenIntent::Navigate).await
 }
 
 /// The scroll position to seed a freshly-opened viewport with. A `jump_to` open (grep
 /// navigation, goto-definition, nav history) deliberately moves the cursor elsewhere, so the
 /// scroll the client last recorded for this buffer predates the jump and would frame the wrong
 /// region — returning `None` lets the client centre on the jumped cursor with a single subscribe.
+/// The `record_nav_from` pre-step every navigating method shares: the origin the client is leaving,
+/// as a nav entry, onto its history — so `Backspace` returns there. `None` records nothing. One
+/// definition, because a method that navigates without it (a commit shown from the log, once)
+/// leaves `Backspace` stepping to wherever was recorded before.
+pub async fn record_nav_origin(state: &SharedState, client_id: ClientId, from: Option<BufferId>) {
+    let Some(from) = from else {
+        return;
+    };
+    let mut s = state.lock().await;
+    if let Some(entry) = nav_entry_for(&s, client_id, from) {
+        s.nav_history.entry(client_id).or_default().record(entry);
+    }
+}
+
 /// A plain (re)open with no jump restores the saved scroll, so reopening a file lands where you
-/// left it.
+/// left it — while the cursor is still where that scroll left it ([`ServerState::restorable_scroll`]).
 fn open_scroll(
     s: &ServerState,
     client_id: Option<ClientId>,
@@ -944,38 +966,42 @@ fn open_scroll(
     if jump_to.is_some() {
         return None;
     }
-    client_id.and_then(|c| s.last_scroll.get(&(c, view)).copied())
+    client_id.and_then(|c| s.restorable_scroll(c, view))
 }
 
-/// The view an open of `buffer_id` presents — see [`ServerState::open_view_as`]: the kind the
-/// caller asked for; else, for a `jump_to`, the reader the client has the file on screen in when
-/// it does (a jump inside the document being read — its outline, a reference, a grep hit — stays
-/// on the page) and otherwise the editor (a `line:col` means nothing over a rendered document the
-/// client isn't on); else the file's most recently used view. Every open reports it, and every
-/// open decides it here.
+/// The view an open of `buffer_id` presents — see [`ServerState::open_view`] — and the mode the
+/// opening client sees it in. Every open reports the mode, and every open decides it here: the
+/// mode the caller asked for; else, for a `jump_to`, reading when the client has the file on
+/// screen and is reading it (a jump inside the document being read — its outline, a reference, a
+/// grep hit — stays on the page) and otherwise the editor (a `line:col` means nothing over a
+/// rendered document the client isn't on); else the client's own mode, materialised from what the
+/// file was last shown as ([`ServerState::land_read`]).
 fn presented_view(
     s: &mut ServerState,
     client_id: Option<ClientId>,
     buffer_id: BufferId,
     params: &ViewOpenParams,
 ) -> ViewId {
-    use aether_protocol::ui::ViewKind;
+    let view_id = s.open_view(buffer_id, params.transient);
+    let Some(client) = client_id else {
+        return view_id;
+    };
     let jumped = params.jump_to.is_some().then(|| {
-        let reading = client_id.is_some_and(|c| {
-            s.viewports.values().any(|vp| {
-                let view = s.view_of(vp);
-                vp.client_id == c
-                    && view.presenting == buffer_id
-                    && view.kind() == Some(ViewKind::Reader)
-            })
-        });
-        if reading {
-            ViewKind::Reader
-        } else {
-            ViewKind::Editor
-        }
+        let on_screen = s
+            .viewports
+            .values()
+            .any(|vp| vp.client_id == client && s.view_of(vp).presenting == buffer_id);
+        on_screen && s.read_mode(client, buffer_id)
     });
-    s.open_view_as(buffer_id, params.kind.or(jumped), params.transient)
+    match params.read.or(jumped) {
+        Some(read) => {
+            s.set_read_mode(client, buffer_id, read);
+        }
+        None => {
+            s.land_read(client, buffer_id);
+        }
+    }
+    view_id
 }
 
 /// Materialize a dormant *scratch* buffer (selected by id from the picker, or landed on at activate):
@@ -1015,6 +1041,7 @@ async fn open_restored_scratch(
         view_id: ViewId::default(), // minted below, once the buffer exists
         scroll: None,               // a fresh buffer has no view to have been scrolled in
         transient: false,           // the view's, read below once it exists
+        read: false,                // a scratch has no reader
         buffer: BufferDescription {
             buffer_id: id,
             language: doc.language.clone(),
@@ -1340,6 +1367,9 @@ pub async fn git_show(
         baseline: None,
     };
     let client_id = ctx.client_id;
+    // The same pre-step `view/open` takes: where the client is leaving from, so `Backspace` from
+    // the diff returns there rather than to whatever was recorded before it.
+    record_nav_origin(state, client_id, params.record_nav_from).await;
     let (target, workspace, sibling_repos) = {
         let s = state.lock().await;
         let repo_id = match &params.repo_id {
@@ -1708,6 +1738,7 @@ pub async fn git_follow_patch_line(
                     buffer_id: None,
                     target: aether_protocol::git::ShowTarget::File { rev, path },
                     focus_path: None,
+                    record_nav_from: None,
                 },
             )
             .await?;
@@ -1841,6 +1872,7 @@ async fn open_generated_buffer(
         view_id: ViewId::default(), // minted below, once the buffer exists
         scroll: None,
         transient: true, // a materialised revision opens as a preview, kept with `Space k`
+        read: false,     // generated content has no reader; a patch is its own presentation
         buffer: BufferDescription {
             buffer_id: id,
             language: doc.language.clone(),
@@ -1861,7 +1893,7 @@ async fn open_generated_buffer(
     };
     s.documents.insert(doc_id, doc);
     s.buffers.insert(id, buf);
-    result.view_id = s.open_view_as(id, None, Some(true));
+    result.view_id = s.open_view(id, Some(true));
     if let Some(status) = repo_status {
         s.virtual_git_status.insert(id, status);
     }
@@ -1931,41 +1963,34 @@ async fn view_open_inner(
         s.active_workspace_or_err(ctx.client_id)?.id.clone()
     };
 
-    // A view named outright — a picker row, the view a close hands on to, the one `Space u` is
-    // leaving — is its buffer and a kind: the kind asked for, else the view's own. The open below
-    // finds the view again by them (a buffer has at most one view per kind), or makes the sibling.
-    // A dormant row's reserved view is its reserved buffer, which the by-buffer path materialises.
+    // A view named outright — a picker row, the view a close hands on to, the one a history step
+    // recorded — is its buffer: the open below finds the buffer's one view again. A dormant row's
+    // reserved view is its reserved buffer, which the by-buffer path materialises.
     let (attach, params) = match params.view_id {
         Some(view) => {
             let s = state.lock().await;
-            let (buffer_id, kind) = match (s.try_presenting_buffer(view), params.element) {
-                // The file one of the view's elements windows, as its own view — of no kind the
-                // view's own says anything about.
-                (Some(_), Some(element)) => (
-                    s.try_view(view)
-                        .and_then(|v| v.elements.get(element as usize))
-                        .map(|b| b.buffer_id)
-                        .ok_or_else(|| {
-                            RpcError::invalid_params(format!(
-                                "view {} has no element {element}",
-                                view.get()
-                            ))
-                        })?,
-                    None,
-                ),
-                (Some(buffer_id), None) => (buffer_id, s.try_view(view).and_then(|v| v.kind())),
-                (None, _) => (
-                    s.dormant_buffer_of_view(&active_workspace_name, view)
-                        .ok_or_else(|| RpcError::view_not_found(view))?,
-                    None,
-                ),
+            let buffer_id = match (s.try_presenting_buffer(view), params.element) {
+                // The file one of the view's elements windows, as its own view.
+                (Some(_), Some(element)) => s
+                    .try_view(view)
+                    .and_then(|v| v.elements.get(element as usize))
+                    .map(|b| b.buffer_id)
+                    .ok_or_else(|| {
+                        RpcError::invalid_params(format!(
+                            "view {} has no element {element}",
+                            view.get()
+                        ))
+                    })?,
+                (Some(buffer_id), None) => buffer_id,
+                (None, _) => s
+                    .dormant_buffer_of_view(&active_workspace_name, view)
+                    .ok_or_else(|| RpcError::view_not_found(view))?,
             };
             (
                 Some(buffer_id),
                 ViewOpenParams {
                     view_id: None,
                     element: None,
-                    kind: params.kind.or(kind),
                     ..params
                 },
             )
@@ -1988,15 +2013,17 @@ async fn view_open_inner(
                 s.take_dormant(&active_workspace_name, buffer_id)
             }
         };
-        let dormant_kind = dormant.as_ref().and_then(|d| d.kind);
+        let dormant_read = dormant.as_ref().map(|d| d.read);
+        let dormant_transient = dormant.as_ref().map(|d| d.transient);
         match dormant.map(|d| d.source) {
             // A file re-dispatches as an absolute-path open, which loads the file and attaches
-            // git/LSP exactly like a fresh open — and picks up any backup via recover-on-open. As
-            // the kind the row stood for: a kept reader's row opens the reader.
+            // git/LSP exactly like a fresh open — and picks up any backup via recover-on-open. In
+            // the mode the row recorded: a file you were reading opens read, unless the caller
+            // has an opinion of its own.
             Some(crate::state::DormantSource::File(path)) => {
                 let materialize = ViewOpenParams {
                     absolute_path: Some(path.display().to_string()),
-                    kind: dormant_kind.or(params.kind),
+                    read: params.read.or(dormant_read),
                     ..params
                 };
                 return Box::pin(view_open_inner(
@@ -2020,16 +2047,20 @@ async fn view_open_inner(
                     Some(opened) => opened?,
                     None => return Err(RpcError::buffer_not_found(buffer_id)),
                 };
-                // A revision opens as a preview when asked for. This one was kept, or it would
-                // not have been in the session to come back from — so it comes back kept.
+                // A revision opens as a preview. This one comes back as its row recorded it: a
+                // revision you kept with `Space k` comes back kept, one you were merely looking
+                // at when you left comes back a preview and closes as soon as you move on.
                 let pushes = {
                     let mut s = state.lock().await;
-                    pin_view_if_requested(&mut s, opened.view_id, Some(false))
+                    let pin = dormant_transient == Some(false) || params.transient == Some(false);
+                    let pushes =
+                        pin_view_if_requested(&mut s, opened.view_id, pin.then_some(false));
+                    opened.transient = s.view(opened.view_id).transient;
+                    pushes
                 };
                 for (sender, notif) in pushes {
                     let _ = sender.send(notif).await;
                 }
-                opened.transient = false;
                 return Ok(opened);
             }
             // A shell comes back from its snapshot: the transcript and its runs, where it was,
@@ -2084,6 +2115,7 @@ async fn view_open_inner(
             view_id,
             scroll,
             transient: s.view(view_id).transient,
+            read: client_id.is_some_and(|c| s.read_mode(c, buffer_id)),
             buffer: BufferDescription {
                 buffer_id,
                 language,
@@ -2152,6 +2184,7 @@ async fn view_open_inner(
                     view_id: ViewId::default(), // minted below, once the buffer exists
                     scroll: None, // a fresh buffer has no view to have been scrolled in
                     transient: false, // the view's, read below once it exists
+                    read: false,  // a scratch has no reader
                     buffer: BufferDescription {
                         buffer_id: id,
                         language: doc.language.clone(),
@@ -2273,6 +2306,7 @@ async fn view_open_inner(
                 view_id,
                 scroll,
                 transient: s.view(view_id).transient,
+                read: client_id.is_some_and(|c| s.read_mode(c, existing)),
                 buffer: BufferDescription {
                     buffer_id: existing,
                     language,
@@ -2433,7 +2467,7 @@ async fn view_open_inner(
     // file without ever touching its reserved id — without this they'd leave the dormant twin behind,
     // which the picker only papers over by hiding, and a later close would un-hide. No-op when no
     // dormant entry matches.
-    let dormant_kinds = s.promote_dormant(&active_workspace_name, &canonical);
+    let dormant_reads = s.promote_dormant(&active_workspace_name, &canonical);
     if let Some((git_baseline, git_unstaged, git_both)) = git {
         s.git_baseline.insert(id, git_baseline);
         // Mask rather than recompute: the two diffs were run off the lock (the point of doing them
@@ -2506,15 +2540,17 @@ async fn view_open_inner(
         Some(c) => wrap_for_response(&s, c, id, cursor),
         None => cursor,
     };
+    // What its dormant row stood for — kept, and remembered as it was last shown — before the
+    // landing below reads that memory.
+    s.restore_dormant_views(id, dormant_reads);
     let view_id = presented_view(&mut s, client_id, id, &params);
-    // The views its dormant rows stood for — a kept reader beside the editor — come back kept.
-    s.restore_dormant_views(id, dormant_kinds);
     let doc = s.doc_of(id);
     let scroll = open_scroll(&s, client_id, view_id, params.jump_to);
     let result = ViewOpenResult {
         view_id,
         scroll,
         transient: s.view(view_id).transient,
+        read: client_id.is_some_and(|c| s.read_mode(c, id)),
         buffer: BufferDescription {
             buffer_id: id,
             language: doc.language.clone(),
@@ -2813,13 +2849,15 @@ mod next_buffer_tests {
             crate::state::DormantView {
                 id: d1,
                 view: ViewId(d1),
-                kind: None,
+                read: false,
+                transient: false,
                 source: crate::state::DormantSource::File(std::path::PathBuf::from("/p/a.rs")),
             },
             crate::state::DormantView {
                 id: d2,
                 view: ViewId(d2),
-                kind: None,
+                read: false,
+                transient: false,
                 source: crate::state::DormantSource::File(std::path::PathBuf::from("/p/b.rs")),
             },
         ];
@@ -2831,7 +2869,7 @@ mod next_buffer_tests {
             Document::new_at_path(d, std::path::PathBuf::from("/p/live.rs"), None)
         });
         st.buffer_workspaces.insert(live, "p".to_string());
-        let live_view = st.open_view(live);
+        let live_view = st.open_view(live, None);
         st.touch_mru(live);
         assert_eq!(next_view_for_client(&st, client_id), Some(live_view));
     }

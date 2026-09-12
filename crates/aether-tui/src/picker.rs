@@ -886,7 +886,10 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             path_index: *path_index,
             relative_path: relative_path.as_str(),
         },
-        PickerItem::View { view_id, .. } => ItemKey::View(*view_id),
+        // One key for the three view-listing kinds: a row is identified by the view it names.
+        PickerItem::Buffer { view_id, .. }
+        | PickerItem::Shell { view_id, .. }
+        | PickerItem::Agent { view_id, .. } => ItemKey::View(*view_id),
         PickerItem::GrepHit {
             path_index,
             relative_path,

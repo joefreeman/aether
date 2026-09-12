@@ -2921,14 +2921,13 @@ fn picker_item_spans(
     // Buffer rows get a leading dim `{label}: ` prefix for multi-root workspaces, matching the
     // status bar / title and the other clients. `display` (the match haystack) is the bare
     // relative path, so the highlight lands only on the path, not the prefix.
-    if let PickerItem::View {
+    if let PickerItem::Buffer {
         buffer_id,
         display,
         status,
         path_index,
         match_indices,
         transient,
-        view_kind,
         ..
     } = item
     {
@@ -2939,8 +2938,47 @@ fn picker_item_spans(
             *status,
             *transient,
             tether == Some(*buffer_id),
-            *view_kind,
             root_labels,
+            highlighted,
+            max_width,
+        );
+    }
+    if let PickerItem::Shell {
+        title,
+        cwd,
+        last_command,
+        running,
+        exit,
+        elapsed_ms,
+        dormant,
+        match_indices,
+        ..
+    } = item
+    {
+        return composed_row_spans(
+            [title, cwd, last_command.as_deref().unwrap_or("")],
+            match_indices,
+            aether_client::labels::shell_row_badge(*running, *exit, *elapsed_ms, *dormant),
+            *dormant,
+            highlighted,
+            max_width,
+        );
+    }
+    if let PickerItem::Agent {
+        title,
+        agent,
+        state,
+        last_prompt,
+        dormant,
+        match_indices,
+        ..
+    } = item
+    {
+        return composed_row_spans(
+            [title, agent, last_prompt.as_deref().unwrap_or("")],
+            match_indices,
+            aether_client::labels::agent_row_badge(state, *dormant),
+            *dormant,
             highlighted,
             max_width,
         );
@@ -3194,7 +3232,9 @@ fn picker_item_spans(
                 false,
             )
         }
-        PickerItem::View { .. }
+        PickerItem::Buffer { .. }
+        | PickerItem::Shell { .. }
+        | PickerItem::Agent { .. }
         | PickerItem::File { .. }
         | PickerItem::GrepHit { .. }
         | PickerItem::JumplistEntry { .. }
@@ -3450,7 +3490,6 @@ fn buffer_item_spans(
     status: BufferDirtyState,
     transient: bool,
     tethered: bool,
-    view_kind: Option<aether_protocol::ui::ViewKind>,
     root_labels: &[String],
     highlighted: bool,
     max_width: usize,
@@ -3483,15 +3522,9 @@ fn buffer_item_spans(
     // The tether mark: a dim ` *` after the path, before the root label — matching the status bar.
     // Upright even on a slanted transient row.
     let tether_mark = if tethered { " *" } else { "" };
-    // The kind badge: a file's reader row says so, dim, after the path; its editor row is the
-    // plain one, as every other file's is.
-    let badge = match view_kind {
-        Some(aether_protocol::ui::ViewKind::Reader) => "  reader",
-        _ => "",
-    };
 
-    // Reserve the dot region (` • ` = 3 cols) plus the tether mark, the badge and the suffix from
-    // the path's truncation budget.
+    // Reserve the dot region (` • ` = 3 cols) plus the tether mark and the suffix from the path's
+    // truncation budget.
     let dot_w = if buffer_dirty_dot_color(status).is_some() {
         3
     } else {
@@ -3500,7 +3533,6 @@ fn buffer_item_spans(
     let path_budget = max_width
         .saturating_sub(dot_w)
         .saturating_sub(tether_mark.width())
-        .saturating_sub(badge.width())
         .saturating_sub(suffix.width());
     let (path, indices) = truncate_path_with_indices(display, match_indices, path_budget);
 
@@ -3508,9 +3540,6 @@ fn buffer_item_spans(
     push_styled_with_match_indices(&mut spans, &path, &indices, base, match_style);
     if !tether_mark.is_empty() {
         spans.push(Span::styled(tether_mark.to_string(), label_style));
-    }
-    if !badge.is_empty() {
-        spans.push(Span::styled(badge.to_string(), label_style));
     }
     if !suffix.is_empty() {
         spans.push(Span::styled(suffix, label_style));
@@ -3526,6 +3555,102 @@ fn buffer_item_spans(
         spans.push(Span::styled(" ".to_string(), base));
     }
     spans
+}
+
+/// A shells / agents picker row: `Shell 2   ~/proj   cargo test` with a right-aligned status
+/// badge. The three parts are the row's composed haystack in order (see
+/// `aether_client::picker::row_match_segments`), so the fuzzy highlight lands on whichever of them
+/// the query hit; the first is the row's name in the base style, the other two dim, and an empty
+/// part contributes nothing (no stray separator).
+///
+/// The badge floats flush right like the buffers picker's dirty dot, and is dropped entirely when
+/// the row would have no space left for it — a name is worth more than a status.
+fn composed_row_spans(
+    parts: [&str; 3],
+    match_indices: &[u32],
+    badge: Option<(String, aether_client::labels::RowBadgeTone)>,
+    dormant: bool,
+    highlighted: bool,
+    max_width: usize,
+) -> Vec<Span<'static>> {
+    let bg = picker_row_bg(highlighted);
+    // A dormant row loses its foreground brightness — "present but not loaded", the same treatment
+    // a dormant workspace row gets.
+    let fg = if dormant { th().fg_faint } else { th().fg };
+    let base = Style::default().fg(c(fg)).bg(bg);
+    let match_style = base
+        .fg(c(th().match_highlight))
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
+
+    let seg = aether_client::picker::row_match_segments(parts, match_indices);
+    let badge_w = badge
+        .as_ref()
+        .map(|(t, _)| t.width() + 2)
+        .unwrap_or_default();
+    // Two spaces between parts, matching the haystack's own join.
+    let text_budget = max_width.saturating_sub(badge_w);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let styles = [(base, match_style), (dim, match_style), (dim, match_style)];
+    let indices = [&seg.first, &seg.second, &seg.third];
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if used > 0 {
+            if used + 2 >= text_budget {
+                break;
+            }
+            spans.push(Span::styled("  ".to_string(), dim));
+            used += 2;
+        }
+        let room = text_budget.saturating_sub(used);
+        if room == 0 {
+            break;
+        }
+        let (text, kept) = truncate_with_indices(part, indices[i], room);
+        used += text.width();
+        let (b, m) = styles[i];
+        push_styled_with_match_indices(&mut spans, &text, &kept, b, m);
+    }
+
+    if let Some((text, tone)) = badge {
+        let pad = max_width.saturating_sub(used + text.width()).max(1);
+        spans.push(Span::styled(" ".repeat(pad), base));
+        spans.push(Span::styled(text, base.fg(c(th().row_badge(tone)))));
+    }
+    spans
+}
+
+/// Cut `text` to `budget` display columns, keeping the match indices that survive. A plain
+/// character truncation — unlike a path there is no separator structure worth eliding around.
+fn truncate_with_indices(text: &str, indices: &[u32], budget: usize) -> (String, Vec<u32>) {
+    if text.width() <= budget {
+        return (text.to_string(), indices.to_vec());
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    // One column for the ellipsis.
+    let room = budget.saturating_sub(1);
+    let mut kept_chars = 0u32;
+    for ch in text.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > room {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+        kept_chars += 1;
+    }
+    out.push('\u{2026}');
+    let kept = indices
+        .iter()
+        .copied()
+        .filter(|i| *i < kept_chars)
+        .collect();
+    (out, kept)
 }
 
 /// Root row in the Explorer's Roots mode. Renders the disambiguated label as a single span;
@@ -9492,6 +9617,139 @@ mod tests {
         );
     }
 
+    /// A shells-picker row: the name, then the directory and last command dim, then the badge
+    /// flush right. The three parts are the composed haystack in order, so the fuzzy highlight
+    /// splits across them.
+    #[test]
+    fn shell_row_lays_out_name_then_fields_then_badge() {
+        let row = |over: fn(&mut PickerItem)| {
+            let mut item = PickerItem::Shell {
+                view_id: aether_protocol::ViewId(12),
+                title: "Shell 2".into(),
+                cwd: "~/proj".into(),
+                last_command: Some("cargo test".into()),
+                running: false,
+                exit: None,
+                elapsed_ms: None,
+                dormant: false,
+                match_indices: vec![],
+            };
+            over(&mut item);
+            item
+        };
+
+        let running = row(|i| {
+            if let PickerItem::Shell { running, .. } = i {
+                *running = true;
+            }
+        });
+        let spans = picker_item_spans(&running, &[], None, false, 60);
+        let text = spans_text(&spans);
+        assert!(
+            text.starts_with("Shell 2  ~/proj  cargo test"),
+            "name, directory, command in that order: {text:?}"
+        );
+        assert!(
+            text.ends_with("● running"),
+            "the badge floats right: {text:?}"
+        );
+        assert_eq!(spans_total_width(&spans), 60, "the row fills its width");
+
+        // A finished run reports its outcome and duration instead.
+        let done = row(|i| {
+            if let PickerItem::Shell {
+                exit, elapsed_ms, ..
+            } = i
+            {
+                *exit = Some(101);
+                *elapsed_ms = Some(1200);
+            }
+        });
+        let text = spans_text(&picker_item_spans(&done, &[], None, false, 60));
+        assert!(text.ends_with("✗ 101  1.2s"), "{text:?}");
+
+        // A shell that has run nothing carries no badge and no command.
+        let fresh = row(|i| {
+            if let PickerItem::Shell { last_command, .. } = i {
+                *last_command = None;
+            }
+        });
+        let text = spans_text(&picker_item_spans(&fresh, &[], None, false, 60));
+        assert_eq!(text.trim_end(), "Shell 2  ~/proj", "{text:?}");
+    }
+
+    /// The haystack's match offsets split across the row's three parts, and an offset landing on a
+    /// separator highlights nothing.
+    #[test]
+    fn shell_row_splits_the_haystack_highlight() {
+        // "Shell 2  ~/proj  cargo test": 0..6 name, 9..14 cwd, 17..26 command.
+        let item = PickerItem::Shell {
+            view_id: aether_protocol::ViewId(12),
+            title: "Shell 2".into(),
+            cwd: "~/proj".into(),
+            last_command: Some("cargo test".into()),
+            running: false,
+            exit: None,
+            elapsed_ms: None,
+            dormant: false,
+            match_indices: vec![0, 7, 9, 17],
+        };
+        let spans = picker_item_spans(&item, &[], None, false, 60);
+        let hl: String = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(c(th().match_highlight)))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            hl, "S~c",
+            "index 7 is a separator space and highlights nothing"
+        );
+    }
+
+    /// An agents-picker row wears the shell row's shape with a conversation's fields, and a
+    /// dormant one greys out and drops its badge.
+    #[test]
+    fn agent_row_lays_out_name_agent_prompt_and_badge() {
+        use aether_protocol::picker::AgentRowState;
+        let asking = PickerItem::Agent {
+            view_id: aether_protocol::ViewId(20),
+            title: "Agent 1".into(),
+            agent: "Claude Code".into(),
+            state: AgentRowState::AwaitingPermission,
+            last_prompt: Some("fix the wrap bug".into()),
+            dormant: false,
+            match_indices: vec![],
+        };
+        let text = spans_text(&picker_item_spans(&asking, &[], None, false, 70));
+        assert!(
+            text.starts_with("Agent 1  Claude Code  fix the wrap bug"),
+            "{text:?}"
+        );
+        assert!(text.ends_with("● awaiting permission"), "{text:?}");
+
+        // Idle says nothing — "ready" is the resting state.
+        let mut idle = asking.clone();
+        if let PickerItem::Agent { state, .. } = &mut idle {
+            *state = AgentRowState::Idle;
+        }
+        let text = spans_text(&picker_item_spans(&idle, &[], None, false, 70));
+        assert_eq!(text.trim_end(), "Agent 1  Claude Code  fix the wrap bug");
+
+        // A dormant row: no badge, no agent name it has not read, and greyed text.
+        let dormant = PickerItem::Agent {
+            view_id: aether_protocol::ViewId(21),
+            title: "Agent 2".into(),
+            agent: String::new(),
+            state: AgentRowState::Disconnected,
+            last_prompt: None,
+            dormant: true,
+            match_indices: vec![],
+        };
+        let spans = picker_item_spans(&dormant, &[], None, false, 70);
+        assert_eq!(spans_text(&spans).trim_end(), "Agent 2");
+        assert_eq!(spans[0].style.fg, Some(c(th().fg_faint)));
+    }
+
     #[test]
     fn grep_hit_truncates_long_preview_keeping_line_number() {
         let preview = "a very long line of code that cannot possibly fit in the row";
@@ -9653,10 +9911,9 @@ mod tests {
     /// (closing that row exits the client); other rows are unmarked.
     #[test]
     fn buffers_picker_marks_the_tethered_row() {
-        let item = |id: u64| PickerItem::View {
+        let item = |id: u64| PickerItem::Buffer {
             buffer_id: id,
             view_id: aether_protocol::ViewId(id),
-            view_kind: None,
             display: "notes.md".into(),
             status: aether_protocol::picker::BufferDirtyState::Clean,
             path_index: None,

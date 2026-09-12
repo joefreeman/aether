@@ -2070,7 +2070,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -2079,7 +2079,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         .items()
         .iter()
         .map(|i| {
-            let PickerItem::View { display, .. } = i else {
+            let PickerItem::Buffer { display, .. } = i else {
                 panic!("expected Buffer, got {i:?}")
             };
             display.as_str()
@@ -2093,7 +2093,7 @@ async fn buffers_picker_orders_by_mru_with_current_first() {
         .items()
         .iter()
         .map(|i| {
-            let PickerItem::View {
+            let PickerItem::Buffer {
                 path_index,
                 relative_path,
                 ..
@@ -2139,7 +2139,7 @@ async fn buffers_picker_select_returns_buffer_id() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -2148,7 +2148,7 @@ async fn buffers_picker_select_returns_buffer_id() {
     let result: PickerSelectResult = send_request::<PickerSelect>(
         &mut ws,
         &PickerSelectParams {
-            kind: PickerKind::Views,
+            kind: PickerKind::Buffers,
             item,
         },
     )
@@ -2241,7 +2241,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -2255,7 +2255,7 @@ async fn buffers_picker_renders_scratch_placeholder() {
         update
             .items()
             .iter()
-            .any(|i| matches!(i, PickerItem::View { display, .. } if display == &expected)),
+            .any(|i| matches!(i, PickerItem::Buffer { display, .. } if display == &expected)),
         "expected display {expected:?} in items: {:?}",
         update.items(),
     );
@@ -2353,13 +2353,13 @@ async fn buffers_picker_pushes_on_dirty_transition() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
     let initial: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
     let initial_status = match initial.items().first().unwrap() {
-        PickerItem::View { status, .. } => *status,
+        PickerItem::Buffer { status, .. } => *status,
         other => panic!("expected Buffer, got {other:?}"),
     };
     assert_eq!(initial_status, BufferDirtyState::Clean);
@@ -2383,7 +2383,7 @@ async fn buffers_picker_pushes_on_dirty_transition() {
         .items()
         .iter()
         .find_map(|i| match i {
-            PickerItem::View {
+            PickerItem::Buffer {
                 buffer_id, status, ..
             } if *buffer_id == opened.buffer_id => Some(*status),
             _ => None,
@@ -2441,7 +2441,7 @@ async fn buffers_picker_no_push_on_subsequent_edits() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -2545,12 +2545,12 @@ async fn buffers_picker_pushes_on_save() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
     let dirty_view: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let saw_dirty = dirty_view.items().iter().any(|i| matches!(i, PickerItem::View { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Unsaved));
+    let saw_dirty = dirty_view.items().iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Unsaved));
     assert!(saw_dirty, "main.rs should be dirty after the edit");
 
     let _: BufferSaveResult = send_request::<BufferSave>(
@@ -2564,7 +2564,7 @@ async fn buffers_picker_pushes_on_save() {
     )
     .await;
     let clean: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
-    let saw_clean = clean.items().iter().any(|i| matches!(i, PickerItem::View { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Clean));
+    let saw_clean = clean.items().iter().any(|i| matches!(i, PickerItem::Buffer { buffer_id, status, .. } if *buffer_id == opened.buffer_id && *status == BufferDirtyState::Clean));
     assert!(
         saw_clean,
         "save should flip dirty back off and re-push the picker"
@@ -2613,7 +2613,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -2622,7 +2622,7 @@ async fn buffer_open_scratch_each_time_creates_a_new_buffer() {
         .items()
         .iter()
         .filter_map(|i| match i {
-            PickerItem::View { buffer_id, .. } => Some(*buffer_id),
+            PickerItem::Buffer { buffer_id, .. } => Some(*buffer_id),
             _ => None,
         })
         .collect();
@@ -2693,7 +2693,7 @@ async fn buffers_picker_mru_is_per_workspace_across_clients() {
         &PickerViewParams {
             view_id: None,
             limit: 30,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -2702,7 +2702,7 @@ async fn buffers_picker_mru_is_per_workspace_across_clients() {
         .items()
         .iter()
         .map(|i| {
-            let PickerItem::View { buffer_id, .. } = i else {
+            let PickerItem::Buffer { buffer_id, .. } = i else {
                 panic!("expected Buffer, got {i:?}")
             };
             *buffer_id
@@ -4884,6 +4884,436 @@ async fn explorer_filters_hide_and_changed_only() {
         entry_names(&update),
         vec!["changed.rs"],
         "changed + tracked-only"
+    );
+
+    drop(server);
+}
+
+// ---- the three view-listing pickers ---------------------------------------------------------------
+
+/// A workspace with a file open, a shell, and a conversation — one of each thing a view can be.
+///
+/// The dummy agent is installed behind the launcher seam, as `tests/agent.rs` does: no `npx`, no
+/// network, nothing billable.
+async fn setup_three_kinds() -> (aether_server::ServerHandle, Ws, aether_protocol::ViewId) {
+    use aether_server::agent::dummy::{self, Script};
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut server = spawn_for_test("kinds-proj", vec![root]).await.unwrap();
+    server.keep_alive(dir);
+
+    let slot = Mutex::new(Some(dummy::start(Script::default()).transport));
+    {
+        let mut s = server.state.lock().await;
+        s.agent_launcher = aether_server::state::AgentLauncher::Dummy(Arc::new(move || {
+            slot.lock()
+                .expect("dummy slot")
+                .take()
+                .expect("one conversation per test")
+        }));
+    }
+
+    let mut ws = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "kinds-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let file: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let _ = send_request::<aether_protocol::shell::ShellOpen>(
+        &mut ws,
+        &aether_protocol::shell::ShellOpenParams {},
+    )
+    .await;
+    let _ = send_request::<aether_protocol::agent::AgentOpen>(
+        &mut ws,
+        &aether_protocol::agent::AgentOpenParams { agent: None },
+    )
+    .await;
+    (server, ws, view_of(file.buffer_id))
+}
+
+/// The rows of one view-listing picker, as its own kind names them.
+async fn rows_of(ws: &mut Ws, kind: PickerKind) -> Vec<PickerItem> {
+    let view = send_request::<PickerView>(ws, &view_params(kind)).await;
+    view.update
+        .and_then(|u| u.items)
+        .expect("a view-listing picker answers with its window")
+}
+
+fn names(items: &[PickerItem]) -> Vec<String> {
+    items
+        .iter()
+        .map(|i| match i {
+            PickerItem::Buffer { display, .. } => display.clone(),
+            PickerItem::Shell { title, .. } => title.clone(),
+            PickerItem::Agent { title, .. } => title.clone(),
+            other => panic!("expected a view-listing row, got {other:?}"),
+        })
+        .collect()
+}
+
+/// **Each picker lists only its own kind.** One MRU walk behind three lists, split by what the
+/// view presents: a shell's transcript and a conversation name themselves through their
+/// `VirtualTarget`, and everything else — a file, a scratch, a revision — is a buffer.
+#[tokio::test]
+async fn each_view_listing_picker_lists_only_its_own_kind() {
+    let (server, mut ws, _file_view) = setup_three_kinds().await;
+
+    let buffers = rows_of(&mut ws, PickerKind::Buffers).await;
+    assert_eq!(names(&buffers), vec!["a.txt"], "no shell, no conversation");
+    assert!(buffers
+        .iter()
+        .all(|i| matches!(i, PickerItem::Buffer { .. })));
+
+    let shells = rows_of(&mut ws, PickerKind::Shells).await;
+    assert_eq!(names(&shells), vec!["Shell 1"]);
+    assert!(shells.iter().all(|i| matches!(i, PickerItem::Shell { .. })));
+
+    let agents = rows_of(&mut ws, PickerKind::Agents).await;
+    assert_eq!(names(&agents), vec!["Agent 1"]);
+    assert!(agents.iter().all(|i| matches!(i, PickerItem::Agent { .. })));
+
+    drop(server);
+}
+
+/// A shell's row says where it is, what it last ran, and which agent is behind a conversation —
+/// the fields the fuzzy haystack is composed from.
+#[tokio::test]
+async fn shell_and_agent_rows_carry_their_own_fields() {
+    let (server, mut ws, _file_view) = setup_three_kinds().await;
+
+    let shells = rows_of(&mut ws, PickerKind::Shells).await;
+    let PickerItem::Shell {
+        cwd,
+        last_command,
+        running,
+        dormant,
+        ..
+    } = &shells[0]
+    else {
+        panic!("a shell row");
+    };
+    assert!(!cwd.is_empty(), "the row says where the next command runs");
+    assert_eq!(*last_command, None, "nothing has been run in it yet");
+    assert!(!running);
+    assert!(!dormant);
+
+    let agents = rows_of(&mut ws, PickerKind::Agents).await;
+    let PickerItem::Agent {
+        agent,
+        last_prompt,
+        dormant,
+        ..
+    } = &agents[0]
+    else {
+        panic!("an agent row");
+    };
+    assert!(!agent.is_empty(), "the row names the agent behind it");
+    assert_eq!(*last_prompt, None, "nothing has been said to it yet");
+    assert!(!dormant);
+
+    drop(server);
+}
+
+/// **Recency, per picker.** Each list is the one workspace MRU filtered to its kind, so opening a
+/// second shell puts it at the top and going back to the first swaps them — and none of that
+/// touches the buffers list.
+#[tokio::test]
+async fn the_shells_picker_is_ordered_by_recency() {
+    use aether_protocol::shell::{ShellOpen, ShellOpenParams};
+    let (server, mut ws, file_view) = setup_three_kinds().await;
+    let second = send_request::<ShellOpen>(&mut ws, &ShellOpenParams {}).await;
+
+    assert_eq!(
+        names(&rows_of(&mut ws, PickerKind::Shells).await),
+        vec!["Shell 2", "Shell 1"],
+        "the one you just opened leads"
+    );
+
+    // Go back to the first, then to the file: the shells list reorders, the buffers list does not.
+    let first_view = {
+        let s = server.state.lock().await;
+        let e = s.workspaces.get("kinds-proj").expect("the workspace");
+        e.mru_views
+            .iter()
+            .copied()
+            .find(|v| {
+                s.try_view(*v)
+                    .and_then(|view| s.try_doc_of(view.presenting))
+                    .and_then(|d| d.transcript())
+                    .is_some_and(|t| t.title == "Shell 1")
+            })
+            .expect("Shell 1 is in the MRU")
+    };
+    assert_ne!(first_view, second.opened.view_id);
+    let _: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(first_view),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(file_view),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        names(&rows_of(&mut ws, PickerKind::Shells).await),
+        vec!["Shell 1", "Shell 2"],
+        "the file you looked at after does not appear, but the reorder stands"
+    );
+    assert_eq!(
+        names(&rows_of(&mut ws, PickerKind::Buffers).await),
+        vec!["a.txt"]
+    );
+
+    drop(server);
+}
+
+/// `Ctrl-j` captures the buffers picker into the jumplist, and captures nothing from the other two.
+///
+/// A shell or a conversation is somewhere you go back to, not a place in a file: a captured set of
+/// them would be a list `]`/`[` could not step. The client's own gate is
+/// `PickerKind::captures_to_jumplist` (pinned in `roundtrip.rs`); this is the server refusing to
+/// build entries even if one asked.
+#[tokio::test]
+async fn jumplist_capture_takes_buffers_and_refuses_shells_and_agents() {
+    let (server, mut ws, _file_view) = setup_three_kinds().await;
+
+    let buffers = rows_of(&mut ws, PickerKind::Buffers).await;
+    let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+        &mut ws,
+        &JumplistCaptureParams {
+            kind: PickerKind::Buffers,
+            item: buffers[0].clone(),
+        },
+    )
+    .await;
+    assert_eq!(captured.expect("the buffers picker captures").total, 1);
+
+    for kind in [PickerKind::Shells, PickerKind::Agents] {
+        let rows = rows_of(&mut ws, kind).await;
+        let captured: Option<JumplistCaptureResult> = send_request::<JumplistCapture>(
+            &mut ws,
+            &JumplistCaptureParams {
+                kind,
+                item: rows[0].clone(),
+            },
+        )
+        .await;
+        assert!(
+            captured.is_none(),
+            "{kind:?} rows are not jump targets, so nothing is captured"
+        );
+    }
+
+    drop(server);
+}
+
+// ---- only a document's own view is a buffers row ---------------------------------------------
+
+/// A repo with two committed files, one of them changed in the working tree, a workspace over it,
+/// and one file open by name. Returns the repo root and HEAD.
+async fn setup_git_workspace() -> (aether_server::ServerHandle, Ws, std::path::PathBuf, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn one() {}\n");
+    commit_file(&repo, "b.rs", "fn two() {}\n");
+    std::fs::write(root.join("a.rs"), "fn CHANGED() {}\n").unwrap();
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let mut server = spawn_for_test("git-rows-proj", vec![root.clone()])
+        .await
+        .unwrap();
+    server.keep_alive(dir);
+    let mut ws = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "git-rows-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let _: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("b.rs", None)).await;
+    (server, ws, root, head)
+}
+
+fn show(root: &std::path::Path, target: ShowTarget) -> GitShowParams {
+    GitShowParams {
+        repo_id: Some(root.to_string_lossy().into_owned()),
+        buffer_id: None,
+        target,
+        focus_path: None,
+        record_nav_from: None,
+    }
+}
+
+/// **A commit's patch and the working changes are not buffers.** Their document is generated to be
+/// the view — what you read in one lives in the files its hunks window — so neither is a row while
+/// it is on screen. A **file at a revision** is the opposite: a genuine read-only document you
+/// named, listed by its title.
+#[tokio::test]
+async fn a_patch_is_not_a_buffers_row_but_a_file_at_a_revision_is() {
+    let (server, mut ws, root, head) = setup_git_workspace().await;
+
+    let commit = show_buffer(
+        &mut ws,
+        &show(&root, ShowTarget::Commit { rev: head.clone() }),
+    )
+    .await;
+    let changes = show_buffer(&mut ws, &show(&root, ShowTarget::WorkingChanges)).await;
+    let at_rev = show_buffer(
+        &mut ws,
+        &show(
+            &root,
+            ShowTarget::File {
+                rev: head.clone(),
+                path: "b.rs".into(),
+            },
+        ),
+    )
+    .await;
+
+    let rows = names(&rows_of(&mut ws, PickerKind::Buffers).await);
+    assert!(
+        rows.contains(&at_rev.title.clone().expect("titled")),
+        "the file at a revision is a row: {rows:?}"
+    );
+    assert!(
+        !rows.contains(&commit.title.clone().expect("titled")),
+        "the commit's patch is not: {rows:?}"
+    );
+    assert!(
+        !rows.contains(&changes.title.clone().expect("titled")),
+        "nor are the working changes: {rows:?}"
+    );
+    assert!(
+        rows.contains(&"b.rs".to_string()),
+        "the file itself: {rows:?}"
+    );
+
+    drop(server);
+}
+
+/// From inside a working-changes view, `Space b` still answers with the buffers you have — the
+/// review is filtered out, so **row 0 is the most recent plain buffer** rather than the view you
+/// are in, and selecting it switches to it.
+#[tokio::test]
+async fn from_a_working_changes_view_the_buffers_picker_leads_with_the_mru_buffer() {
+    let (server, mut ws, root, _head) = setup_git_workspace().await;
+    let changes = show_buffer(&mut ws, &show(&root, ShowTarget::WorkingChanges)).await;
+
+    let rows = rows_of(&mut ws, PickerKind::Buffers).await;
+    assert_eq!(
+        names(&rows),
+        vec!["b.rs"],
+        "the review is not a row, so the MRU buffer leads"
+    );
+
+    let selected: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        &PickerSelectParams {
+            kind: PickerKind::Buffers,
+            item: rows[0].clone(),
+        },
+    )
+    .await;
+    let PickerSelectResult::View { view_id } = selected else {
+        panic!("a buffers row selects a view: {selected:?}");
+    };
+    assert_ne!(view_id, changes.view_id, "it switches off the review");
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(view_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        opened
+            .buffer
+            .path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("b.rs")),
+        "and lands on the file: {:?}",
+        opened.buffer.path
+    );
+
+    drop(server);
+}
+
+/// A **dormant** row has no view to inspect, so its list is decided from what it would materialise
+/// as: a file at a revision is a buffers row; a commit and the working changes never are, however
+/// the session recorded them.
+#[tokio::test]
+async fn a_dormant_commit_key_is_never_a_buffers_row() {
+    use aether_server::state::{DormantSource, DormantView};
+
+    let (server, mut ws, root, head) = setup_git_workspace().await;
+    let repo_id = root.to_string_lossy().into_owned();
+    let short: String = head.chars().take(7).collect();
+    {
+        let mut s = server.state.lock().await;
+        let rows = &mut s
+            .workspaces
+            .get_mut("git-rows-proj")
+            .expect("the workspace")
+            .dormant_views;
+        for (n, key) in [
+            format!("{repo_id}@{head}"),
+            format!("{repo_id}#worktree"),
+            format!("{repo_id}@{head}:a.rs"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rows.push(DormantView {
+                id: 9000 + n as u64,
+                view: ViewId(9100 + n as u64),
+                read: false,
+                transient: false,
+                source: DormantSource::Virtual { key },
+            });
+        }
+    }
+
+    let rows = names(&rows_of(&mut ws, PickerKind::Buffers).await);
+    assert!(
+        rows.contains(&format!("{short}:a.rs")),
+        "the dormant file at a revision is a row: {rows:?}"
+    );
+    assert!(
+        !rows.contains(&short),
+        "the dormant commit is not: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r == "Working changes"),
+        "nor are the dormant working changes: {rows:?}"
     );
 
     drop(server);

@@ -38,27 +38,9 @@ pub async fn agent_open(
 ) -> Result<AgentOpenResult, RpcError> {
     let client_id = ctx.client_id;
 
-    // Pressing the key *inside* an agent view means "another one"; anywhere else it means "the one
-    // I can type at". Decided here because only the server knows what `from_view` is.
-    let from_agent_view = {
-        let s = state.lock().await;
-        params.from_view.is_some_and(|v| {
-            s.try_presenting_buffer(v)
-                .and_then(|b| s.try_doc_of(b))
-                .and_then(|d| d.conversation())
-                .is_some()
-        })
-    };
-    if !from_agent_view {
-        let existing = {
-            let s = state.lock().await;
-            idle_conversation(&s, client_id)
-        };
-        if let Some(view_buffer) = existing {
-            return present(state, ctx, view_buffer).await;
-        }
-    }
-
+    // Always a new one. Returning to a conversation you already have is the agents picker's job
+    // (`Space a`) — a list you can see, unlike the "focused idle, else MRU idle, else new"
+    // heuristic this replaced.
     let spec = resolve_agent(params.agent.as_deref())?;
     let view_buffer = mint_conversation(state, client_id, spec, None).await?;
     // A fresh conversation connects at once: you opened it to talk to something.
@@ -152,7 +134,7 @@ async fn mint_conversation(
         s.buffer_workspaces.insert(view_buffer, workspace.clone());
         // Not transient: a conversation is somewhere you are working, and a transient one would
         // close itself the moment you looked at a file, taking a running turn with it.
-        s.open_view(view_buffer);
+        s.open_view(view_buffer, None);
         s.touch_mru(view_buffer);
         view_buffer
     };
@@ -178,13 +160,7 @@ async fn mint_conversation(
     }
     // Recorded in the session at once, as every other open is — and as a shell is: the snapshot is
     // what brings the conversation back, and the session entry is what says there is one to bring.
-    let workspace = {
-        let s = state.lock().await;
-        s.buffer_workspaces.get(&view_buffer).cloned()
-    };
-    if let Some(workspace) = workspace {
-        persist_workspace_session(state, &workspace, false).await;
-    }
+    // The `touch_mru` above marked it dirty; the flush at the end of the request writes it.
     Ok(view_buffer)
 }
 
@@ -326,30 +302,6 @@ async fn present(
     Ok(AgentOpenResult { opened, input })
 }
 
-/// The conversation `Space n n` lands in when it is not making a new one: the focused one if it is
-/// idle, else the workspace's most recently used idle one.
-fn idle_conversation(s: &ServerState, client_id: ClientId) -> Option<BufferId> {
-    let workspace = s.active_workspace(client_id).map(|w| w.id.clone())?;
-    let mut candidates: Vec<(u64, BufferId)> = s
-        .buffer_workspaces
-        .iter()
-        .filter(|(_, w)| **w == workspace)
-        .filter_map(|(id, _)| {
-            let c = s.try_doc_of(*id)?.conversation()?;
-            (!c.is_running()).then(|| {
-                (
-                    s.view_presenting(*id)
-                        .and_then(|v| s.try_view(v))
-                        .map_or(0, |v| v.last_used),
-                    *id,
-                )
-            })
-        })
-        .collect();
-    candidates.sort_by_key(|(used, _)| std::cmp::Reverse(*used));
-    candidates.first().map(|(_, id)| *id)
-}
-
 fn next_agent_number(s: &ServerState, workspace: &str) -> u32 {
     let used: std::collections::HashSet<u32> = s
         .buffer_workspaces
@@ -397,7 +349,7 @@ pub async fn agent_prompt(
         if c.is_running() {
             return Err(RpcError::new(
                 ErrorCode::AGENT_BUSY,
-                format!("{} is working — Space n c stops it", c.title),
+                format!("{} is working — Space v c stops it", c.title),
             ));
         }
 
@@ -576,6 +528,8 @@ pub async fn agent_respond(
     };
 
     refresh(state, view_buffer).await;
+    // The question is gone, so the row goes back to `thinking`.
+    push_agent_rows(state).await;
     Ok(AgentRespondResult { answered })
 }
 
@@ -869,6 +823,10 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
                 c.generation += 1;
             }
             refresh(state, view_buffer).await;
+            // The badge becomes `awaiting permission` whether or not a turn is in flight, so the
+            // rows go out here rather than through `push_turn_state`, which says nothing when the
+            // conversation has no turn.
+            push_agent_rows(state).await;
             push_turn_state(state, view_buffer, view_id).await;
         }
 
@@ -1234,12 +1192,29 @@ async fn push_turn_state(state: &SharedState, view_buffer: BufferId, view_id: Vi
     }
 }
 
-/// Push `agent/turn_changed` to every connected client.
+/// Re-push every open agents picker: a row's badge has changed (a permission raised or answered,
+/// a turn started or ended). Ordering is by recency, so the row re-paints where it is.
+async fn push_agent_rows(state: &SharedState) {
+    let pushes = {
+        let mut s = state.lock().await;
+        refresh_agent_pickers(&mut s)
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+}
+
+/// Push `agent/turn_changed` to every connected client, and re-push every open agents picker.
 ///
 /// Every client, like `git/operation_changed` and `shell/run_changed`: a conversation belongs to
 /// the workspace rather than to whoever pressed `Enter`, and a client with the view open wants the
 /// indicator whether or not it started the turn.
+///
+/// The picker re-push rides here for the reason it rides `push_run_changed`: this is the funnel a
+/// turn transition passes through, and the row's badge is what changed. Permission raised and
+/// answered push separately ([`push_agent_rows`]) — the agent is blocked, so no turn state moves.
 async fn push_turn_changed(state: &SharedState, view_id: ViewId, turn: Option<TurnState>) {
+    push_agent_rows(state).await;
     let params = AgentTurnChangedParams { view_id, turn };
     let value = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
     let pushes: PendingPushes = {

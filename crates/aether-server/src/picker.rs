@@ -11,9 +11,9 @@ use crate::workspace_index::CachedFile;
 use aether_protocol::cursor::Direction;
 use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{
-    BranchCheckout, BufferDirtyState, CaseMode, GroupHeader, GroupRunRows, GroupSpan,
-    KeybindingEntry, MatchOptions, PickerFilters, PickerItem, PickerKind, PickerSelectResult,
-    PickerUpdateParams,
+    AgentRowState, BranchCheckout, BufferDirtyState, CaseMode, GroupHeader, GroupRunRows,
+    GroupSpan, KeybindingEntry, MatchOptions, PickerFilters, PickerItem, PickerKind,
+    PickerSelectResult, PickerUpdateParams,
 };
 use aether_protocol::viewport::{DiagnosticSeverity, DiffStage};
 use aether_protocol::{BufferId, LogicalPosition};
@@ -25,13 +25,10 @@ use std::sync::Arc;
 /// `ServerState.buffers` + per-client MRU. The buffer set changes often enough that we don't
 /// pin an `Arc` snapshot like the file picker does — just rebuild.
 #[derive(Debug, Clone)]
-pub struct ViewCandidate {
+pub struct BufferCandidate {
     pub buffer_id: BufferId,
-    /// The row's view: what selecting the row presents and what closing it closes. A file's
-    /// editor and its reader are two rows sharing `buffer_id`.
+    /// The row's view: what selecting the row presents and what closing it closes.
     pub view_id: aether_protocol::ViewId,
-    /// Which kind of view the row is — the badge. `None` for a driver's view and a dormant row.
-    pub view_kind: Option<aether_protocol::ui::ViewKind>,
     /// Display string used for both rendering and fuzzy matching. Workspace-relative for
     /// file-backed buffers; `(scratch N)` for scratch buffers.
     pub display: String,
@@ -46,6 +43,36 @@ pub struct ViewCandidate {
     pub abs_path: Option<String>,
     /// Buffer is transient (auto-closes once hidden) — the row renders in italics.
     pub transient: bool,
+}
+
+/// One shells-picker candidate. Rebuilt on every view and on every run transition, like the
+/// buffers picker — a shell's row is mostly *status*, and a stale badge is the bug.
+#[derive(Debug, Clone)]
+pub struct ShellCandidate {
+    pub view_id: aether_protocol::ViewId,
+    pub title: String,
+    pub cwd: String,
+    pub last_command: Option<String>,
+    pub running: bool,
+    pub exit: Option<i32>,
+    pub elapsed_ms: Option<u64>,
+    pub dormant: bool,
+    /// `"{title}  {cwd}  {last_command}"`, empty parts elided — see [`PickerItem::Shell`], where
+    /// the composition is a wire contract because `match_indices` index it.
+    pub haystack: String,
+}
+
+/// One agents-picker candidate. Rebuilt like [`ShellCandidate`], and for the same reason.
+#[derive(Debug, Clone)]
+pub struct AgentCandidate {
+    pub view_id: aether_protocol::ViewId,
+    pub title: String,
+    pub agent: String,
+    pub state: AgentRowState,
+    pub last_prompt: Option<String>,
+    pub dormant: bool,
+    /// `"{title}  {agent}  {last_prompt}"`, empty parts elided — see [`PickerItem::Agent`].
+    pub haystack: String,
 }
 
 /// One workspace-picker candidate. Built fresh per `picker/view` from
@@ -665,7 +692,11 @@ pub enum PickerCandidates {
         git_status: Arc<Vec<Option<aether_protocol::git::GitStatus>>>,
     },
     /// Open buffers in MRU order (most-recent first). Cheap to rebuild — small N, no I/O.
-    Views(Vec<ViewCandidate>),
+    Buffers(Vec<BufferCandidate>),
+    /// The workspace's shells, MRU first then dormant. Rebuilt like [`Self::Buffers`].
+    Shells(Vec<ShellCandidate>),
+    /// The workspace's agent conversations, MRU first then dormant. Rebuilt like [`Self::Buffers`].
+    Agents(Vec<AgentCandidate>),
     /// Grep matches in walker + line order. Grows as the streaming search runs; rerank is a
     /// no-op (the query is the search, so the candidate set already *is* the match set).
     Grep(Vec<GrepHitCandidate>),
@@ -746,7 +777,9 @@ impl PickerCandidates {
     pub fn len(&self) -> usize {
         match self {
             PickerCandidates::Files { files, .. } => files.len(),
-            PickerCandidates::Views(v) => v.len(),
+            PickerCandidates::Buffers(v) => v.len(),
+            PickerCandidates::Shells(v) => v.len(),
+            PickerCandidates::Agents(v) => v.len(),
             PickerCandidates::Grep(v) => v.len(),
             PickerCandidates::Explorer(e) => e.entries.len(),
             PickerCandidates::ExplorerRoots(v) => v.len(),
@@ -775,7 +808,9 @@ impl PickerCandidates {
                 *files = Default::default();
                 *git_status = Default::default();
             }
-            PickerCandidates::Views(v) => v.clear(),
+            PickerCandidates::Buffers(v) => v.clear(),
+            PickerCandidates::Shells(v) => v.clear(),
+            PickerCandidates::Agents(v) => v.clear(),
             PickerCandidates::Grep(v) => v.clear(),
             PickerCandidates::Explorer(e) => e.entries.clear(),
             PickerCandidates::ExplorerRoots(v) => v.clear(),
@@ -798,7 +833,9 @@ impl PickerCandidates {
     pub fn kind(&self) -> PickerKind {
         match self {
             PickerCandidates::Files { .. } => PickerKind::Files,
-            PickerCandidates::Views(_) => PickerKind::Views,
+            PickerCandidates::Buffers(_) => PickerKind::Buffers,
+            PickerCandidates::Shells(_) => PickerKind::Shells,
+            PickerCandidates::Agents(_) => PickerKind::Agents,
             PickerCandidates::Grep(_) => PickerKind::Grep,
             PickerCandidates::Explorer(_) => PickerKind::Explorer,
             PickerCandidates::ExplorerRoots(_) => PickerKind::Explorer,
@@ -827,7 +864,11 @@ impl PickerCandidates {
     pub fn display_at(&self, idx: usize) -> &str {
         match self {
             PickerCandidates::Files { files, .. } => &files[idx].relative_path,
-            PickerCandidates::Views(v) => &v[idx].display,
+            PickerCandidates::Buffers(v) => &v[idx].display,
+            // The composed haystack, not the title: a shell is found by its directory or by the
+            // command it last ran as readily as by "Shell 2". Same for a conversation.
+            PickerCandidates::Shells(v) => &v[idx].haystack,
+            PickerCandidates::Agents(v) => &v[idx].haystack,
             PickerCandidates::Grep(v) => &v[idx].preview,
             PickerCandidates::Explorer(e) => &e.entries[idx].name,
             PickerCandidates::ExplorerRoots(v) => &v[idx].basename,
@@ -867,18 +908,43 @@ impl PickerCandidates {
                 match_indices,
                 git_status: git_status.get(idx).copied().flatten(),
             },
-            PickerCandidates::Views(v) => {
+            PickerCandidates::Buffers(v) => {
                 let c = &v[idx];
-                PickerItem::View {
+                PickerItem::Buffer {
                     buffer_id: c.buffer_id,
                     view_id: c.view_id,
-                    view_kind: c.view_kind,
                     display: c.display.clone(),
                     status: c.status,
                     path_index: c.path.as_ref().map(|(i, _)| *i),
                     relative_path: c.path.as_ref().map(|(_, r)| r.clone()),
                     match_indices,
                     transient: c.transient,
+                }
+            }
+            PickerCandidates::Shells(v) => {
+                let c = &v[idx];
+                PickerItem::Shell {
+                    view_id: c.view_id,
+                    title: c.title.clone(),
+                    cwd: c.cwd.clone(),
+                    last_command: c.last_command.clone(),
+                    running: c.running,
+                    exit: c.exit,
+                    elapsed_ms: c.elapsed_ms,
+                    dormant: c.dormant,
+                    match_indices,
+                }
+            }
+            PickerCandidates::Agents(v) => {
+                let c = &v[idx];
+                PickerItem::Agent {
+                    view_id: c.view_id,
+                    title: c.title.clone(),
+                    agent: c.agent.clone(),
+                    state: c.state.clone(),
+                    last_prompt: c.last_prompt.clone(),
+                    dormant: c.dormant,
+                    match_indices,
                 }
             }
             PickerCandidates::Grep(v) => {
@@ -1096,7 +1162,13 @@ impl PickerCandidates {
             ) => files
                 .iter()
                 .position(|c| c.path_index == *path_index && c.relative_path == *relative_path),
-            (PickerCandidates::Views(v), PickerItem::View { view_id, .. }) => {
+            (PickerCandidates::Buffers(v), PickerItem::Buffer { view_id, .. }) => {
+                v.iter().position(|c| c.view_id == *view_id)
+            }
+            (PickerCandidates::Shells(v), PickerItem::Shell { view_id, .. }) => {
+                v.iter().position(|c| c.view_id == *view_id)
+            }
+            (PickerCandidates::Agents(v), PickerItem::Agent { view_id, .. }) => {
                 v.iter().position(|c| c.view_id == *view_id)
             }
             (
@@ -1223,7 +1295,9 @@ impl PickerCandidates {
     pub fn match_strategy(&self) -> MatchStrategy {
         match self {
             PickerCandidates::Files { .. }
-            | PickerCandidates::Views(_)
+            | PickerCandidates::Buffers(_)
+            | PickerCandidates::Shells(_)
+            | PickerCandidates::Agents(_)
             | PickerCandidates::Workspaces(_)
             | PickerCandidates::Diagnostics(_)
             | PickerCandidates::LspServers(_)
@@ -1259,7 +1333,15 @@ impl PickerCandidates {
             PickerCandidates::Files { files, .. } => Some(PickerSelectResult::File {
                 path: files[idx].abs.clone(),
             }),
-            PickerCandidates::Views(v) => Some(PickerSelectResult::View {
+            PickerCandidates::Buffers(v) => Some(PickerSelectResult::View {
+                view_id: v[idx].view_id,
+            }),
+            // One result variant for all three: presenting a row is the same act whatever kind of
+            // thing the row names.
+            PickerCandidates::Shells(v) => Some(PickerSelectResult::View {
+                view_id: v[idx].view_id,
+            }),
+            PickerCandidates::Agents(v) => Some(PickerSelectResult::View {
                 view_id: v[idx].view_id,
             }),
             PickerCandidates::Grep(v) => {

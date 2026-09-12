@@ -1149,6 +1149,68 @@ fn glyph_cell<'a>(
 
 /// Right-aligned dim metadata (line numbers, ranges, paths). Never wraps — rows are exactly one
 /// display row tall, so a wrapped second line would spill into the row below.
+/// A shells / agents picker row: the name, then two dim fields, then a right-aligned status badge.
+///
+/// The three parts are the row's composed haystack in order (see
+/// `aether_client::picker::row_match_segments`), so the fuzzy highlight lands in whichever of them
+/// the query hit. An empty part is skipped — it contributes no separator to the haystack either.
+fn composed_row<'a>(
+    parts: [&'a str; 3],
+    match_indices: &'a [u32],
+    badge: Option<(String, aether_client::labels::RowBadgeTone)>,
+    dormant: bool,
+    hovered: bool,
+    ui: theme::Ui,
+    p: &'static theme::Palette,
+) -> Element<'a, PickerMsg> {
+    let seg = aether_client::picker::row_match_segments(parts, match_indices);
+    // A dormant row is "present but not loaded" — greyed, as the buffers picker greys one.
+    let name = if dormant { p.fg_faint } else { p.fg };
+    let colours = [name, p.fg_dim, p.fg_dim];
+    let indices = [seg.first, seg.second, seg.third];
+    let mut r = row![].spacing(8).align_y(iced::Alignment::Center);
+    for ((part, colour), idx) in parts.iter().zip(colours).zip(indices) {
+        if part.is_empty() {
+            continue;
+        }
+        r = r.push(highlighted_owned(
+            (*part).to_string(),
+            idx,
+            colour,
+            SANS,
+            hovered,
+            ui,
+            p,
+        ));
+    }
+    r = r.push(iced::widget::Space::new().width(Length::Fill));
+    if let Some((label, tone)) = badge {
+        r = r.push(
+            text(label)
+                .size(ui.small())
+                .font(SANS)
+                .color(badge_color(p, tone))
+                .wrapping(iced::widget::text::Wrapping::None),
+        );
+    }
+    r.into()
+}
+
+/// The GUI's shade for a row badge's tone — the [`aether_client::theme::Theme::row_badge`] table,
+/// read off this shell's own palette so light and dark both land.
+fn badge_color(
+    p: &'static theme::Palette,
+    tone: aether_client::labels::RowBadgeTone,
+) -> iced::Color {
+    use aether_client::labels::RowBadgeTone as T;
+    match tone {
+        T::Running => p.info,
+        T::Ok => p.ok,
+        T::Bad => p.error,
+        T::Muted => p.fg_faint,
+    }
+}
+
 fn meta<'a>(s: String, ui: theme::Ui, p: &'static theme::Palette) -> Element<'a, PickerMsg> {
     text(s)
         .size(ui.small())
@@ -1323,14 +1385,13 @@ fn render_item<'a>(
             }
             r.into()
         }
-        PickerItem::View {
+        PickerItem::Buffer {
             buffer_id,
             display,
             status,
             path_index,
             match_indices,
             transient,
-            view_kind,
             ..
         } => {
             let mut r = row![highlighted(
@@ -1351,11 +1412,6 @@ fn render_item<'a>(
                 // the historic NORD3_BRIGHTER).
                 r = r.push(text("*").size(ui.body()).font(SANS).color(p.fg_muted));
             }
-            // The kind badge: a file's reader row says so, dim, after the path; its editor row
-            // is the plain one, as every other file's is.
-            if *view_kind == Some(aether_protocol::ui::ViewKind::Reader) {
-                r = r.push(text("reader").size(ui.body()).font(SANS).color(p.fg_dim));
-            }
             // Multi-root workspaces: the root's label, dim, after the name — same placement as the
             // Files picker. `path_index` is `None` for scratch/external buffers, so those show none.
             if let Some(label) = path_index.and_then(|i| root_label(roots, i)) {
@@ -1374,6 +1430,42 @@ fn render_item<'a>(
             }
             r.into()
         }
+        PickerItem::Shell {
+            title,
+            cwd,
+            last_command,
+            running,
+            exit,
+            elapsed_ms,
+            dormant,
+            match_indices,
+            ..
+        } => composed_row(
+            [title, cwd, last_command.as_deref().unwrap_or("")],
+            match_indices,
+            aether_client::labels::shell_row_badge(*running, *exit, *elapsed_ms, *dormant),
+            *dormant,
+            hovered,
+            ui,
+            p,
+        ),
+        PickerItem::Agent {
+            title,
+            agent,
+            state,
+            last_prompt,
+            dormant,
+            match_indices,
+            ..
+        } => composed_row(
+            [title, agent, last_prompt.as_deref().unwrap_or("")],
+            match_indices,
+            aether_client::labels::agent_row_badge(state, *dormant),
+            *dormant,
+            hovered,
+            ui,
+            p,
+        ),
         PickerItem::GrepHit {
             line,
             preview,
@@ -2176,6 +2268,46 @@ mod tests {
             explorer_peek_missing: false,
         }));
         s
+    }
+
+    /// The GUI's badge shades are the core's [`aether_client::theme::Theme::row_badge`] table, not
+    /// a second opinion — in both themes. Rich text is invisible to the headless snapshot tests, so
+    /// this is where a GUI row's colours are pinned; the *words* are pinned once in the core
+    /// (`labels::shell_row_badge`) and the layout in the terminal painter.
+    #[test]
+    fn row_badge_shades_come_from_the_core_table() {
+        use aether_client::labels::RowBadgeTone;
+        use aether_client::theme::Theme;
+        use aether_protocol::settings::ThemeMode;
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let p = theme::palette(mode);
+            let t = Theme::of(mode);
+            for tone in [
+                RowBadgeTone::Running,
+                RowBadgeTone::Ok,
+                RowBadgeTone::Bad,
+                RowBadgeTone::Muted,
+            ] {
+                assert_eq!(
+                    badge_color(p, tone),
+                    {
+                        let rgb = t.row_badge(tone);
+                        iced::Color::from_rgb8(rgb.r, rgb.g, rgb.b)
+                    },
+                    "{tone:?} in {mode:?}"
+                );
+            }
+        }
+        // The four are genuinely four: a running run must not read as a failed one.
+        let p = theme::palette(ThemeMode::Dark);
+        assert_ne!(
+            badge_color(p, RowBadgeTone::Ok),
+            badge_color(p, RowBadgeTone::Bad)
+        );
+        assert_ne!(
+            badge_color(p, RowBadgeTone::Running),
+            badge_color(p, RowBadgeTone::Muted)
+        );
     }
 
     /// A list shorter than the viewport shrinks to fit it, so the panel doesn't reserve blank rows

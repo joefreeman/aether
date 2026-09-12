@@ -155,7 +155,7 @@ impl RpcError {
     pub fn shell_busy(title: &str, command: &str) -> Self {
         Self::new(
             ErrorCode::SHELL_BUSY,
-            format!("{title} is running {command} — Space Alt-b stops it"),
+            format!("{title} is running {command} — Space v c stops it"),
         )
     }
 

@@ -859,12 +859,12 @@ async fn open_buffers_follow_the_switch_and_unsaved_ones_stay_behind() {
     // the other tree, and is still open (and still dirty) at its own path when you unbind.
     let back = bind(&mut ws, std::path::Path::new(&wt.path), "").await;
     assert_eq!(back.workspace.name, "p");
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Views)).await;
+    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Buffers)).await;
     let update = view.update.expect("the view carries its initial window");
     assert!(
         update.items().iter().any(|i| matches!(
             i,
-            PickerItem::View { buffer_id, status, .. }
+            PickerItem::Buffer { buffer_id, status, .. }
                 if *buffer_id == dirty.buffer_id && *status == BufferDirtyState::Unsaved
         )),
         "the unsaved buffer is still open in the context it stayed in, still unsaved"

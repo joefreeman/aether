@@ -1764,6 +1764,7 @@ async fn every_captured_outline_entry_lands_in_the_review() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -1962,17 +1963,17 @@ async fn every_captured_outline_entry_lands_in_the_review() {
     drop(server);
 }
 
-/// The same walk through a review **kept** (`Space k`) while hidden — the shape that failed.
+/// The same walk through a review **hidden and brought back**, one of its files kept — the shape
+/// that failed.
 ///
-/// Hiding closes the review's transient element buffers but not the review, and every rebuild in
-/// between binds only the files with a buffer open. Brought back, the review windowed generated
-/// text for the files you were not in, described those hunks in patch coordinates, and the jump
-/// to any of them — captured as a file line — found nothing and opened the file in an editor.
-/// Which files were bound changed with what you had open, so the same list landed differently
-/// press to press. Now a re-presented view is bound in full, and the lookup does not depend on
-/// binding anyway.
+/// Hiding closes the review's transient element buffers, and every rebuild in between binds only
+/// the files with a buffer open. Brought back, the review windowed generated text for the files
+/// you were not in, described those hunks in patch coordinates, and the jump to any of them —
+/// captured as a file line — found nothing and opened the file in an editor. Which files were
+/// bound changed with what you had open, so the same list landed differently press to press. Now
+/// a re-presented view is bound in full, and the lookup does not depend on binding anyway.
 #[tokio::test]
-async fn a_kept_review_brought_back_still_lands_every_entry() {
+async fn a_review_hidden_and_brought_back_still_lands_every_entry() {
     use aether_protocol::jumplist::{
         JumplistCapture, JumplistCaptureParams, JumplistStep, JumplistStepParams,
         JumplistStepResult, JumplistStepScope,
@@ -2004,6 +2005,7 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -2048,8 +2050,9 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
     .expect("captures");
     assert_eq!(captured.total, 4);
 
-    // Keep the review (`Space k`), so hiding it does not close it — only its transient element
-    // buffers go.
+    // `Space k` with the cursor in a hunk keeps the **file** under it — the review itself is
+    // composed and stays the preview it was. So one of the files the walk visits survives the
+    // hide below and the rest do not, which is the uneven binding this test is about.
     let _: aether_protocol::view::ViewSetTransientResult =
         send_request::<aether_protocol::view::ViewSetTransient>(
             &mut ws,
@@ -2234,8 +2237,9 @@ async fn a_kept_review_brought_back_still_lands_every_entry() {
 /// A seat in an element that windows the generated text lands on the **patch row** of the file
 /// line — the lookup translates, rather than setting a file line as a cursor in the patch.
 ///
-/// Reached without a re-presentation, which would bind the element: the review is subscribed to
-/// directly while a rebuild has left one of its files unbound.
+/// Reached without a re-presentation, which would bind the element: one of the review's files is
+/// closed by name while nothing presents the review, which tears the buffer down and re-derives
+/// the layout without it, and the review is then subscribed to directly.
 #[tokio::test]
 async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
     use aether_protocol::jumplist::{
@@ -2259,6 +2263,16 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
         .unwrap();
     }
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    // Opened by name first, so the review binds *this* buffer and the close below can name it.
+    let aaa: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            path_index: Some(0),
+            relative_path: Some("src/aaa.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
     let patch = show_buffer(
         &mut ws,
         &GitShowParams {
@@ -2266,6 +2280,7 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -2287,7 +2302,21 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
         )
         .await
     }
-    let _: ViewportSubscribeResult = subscribe(&mut ws, patch.buffer_id).await;
+    // Close aaa.rs by name while **nothing presents the review**: with no viewport on it the
+    // close is a real teardown rather than a hand-over, and `close_buffer` re-derives every
+    // surviving layout that windowed the buffer — so the review's two aaa.rs hunks come back
+    // windowing its own generated text.
+    let _: ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: aaa.view_id,
+            open_next: false,
+        },
+    )
+    .await;
+    settled(&server).await;
+    // Onto the review — no open, so nothing rebinds it.
+    let sub: ViewportSubscribeResult = subscribe(&mut ws, patch.buffer_id).await;
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
@@ -2314,45 +2343,6 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
     )
     .await
     .expect("captures");
-    let _: aether_protocol::view::ViewSetTransientResult =
-        send_request::<aether_protocol::view::ViewSetTransient>(
-            &mut ws,
-            &aether_protocol::view::ViewSetTransientParams {
-                view_id: patch.view_id,
-                transient: false,
-            },
-        )
-        .await;
-    // Away to top.rs: aaa.rs's element buffer closes with the review hidden.
-    let away: ViewOpenResult = send_request::<ViewOpen>(
-        &mut ws,
-        &ViewOpenParams {
-            transient: None,
-            path_index: Some(0),
-            relative_path: Some("top.rs".into()),
-            language: None,
-            create_if_missing: false,
-            jump_to: None,
-            ..Default::default()
-        },
-    )
-    .await;
-    let _: ViewportSubscribeResult = subscribe(&mut ws, away.buffer_id).await;
-    // A change on disk and the watcher's refresh: the review rebuilds with aaa.rs unbound.
-    let mut text = std::fs::read_to_string(root.join("top.rs")).unwrap();
-    text.push_str("fn tail() {}\n");
-    std::fs::write(root.join("top.rs"), text).unwrap();
-    let _: aether_protocol::git::GitRefreshResult =
-        send_request::<aether_protocol::git::GitRefresh>(
-            &mut ws,
-            &aether_protocol::git::GitRefreshParams {
-                repo_id: root.to_string_lossy().into_owned(),
-            },
-        )
-        .await;
-    settled(&server).await;
-    // Straight back onto the review — no open, so nothing rebinds it.
-    let sub: ViewportSubscribeResult = subscribe(&mut ws, patch.buffer_id).await;
     let unbound = sub
         .window
         .root
@@ -2442,6 +2432,7 @@ async fn a_reverted_change_is_stepped_over_not_opened_as_a_file() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -2886,6 +2877,7 @@ async fn git_show_opens_a_commit_as_a_read_only_virtual_buffer() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -2993,6 +2985,7 @@ async fn a_read_only_buffer_refuses_every_mutating_method() {
                 path: "a.rs".into(),
             },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -3290,6 +3283,7 @@ async fn git_show_reuses_the_buffer_for_the_same_revision() {
         buffer_id: None,
         target: ShowTarget::Commit { rev: head.clone() },
         focus_path: None,
+        record_nav_from: None,
     };
     let opened: ViewOpenResult = show_buffer(&mut ws, &params()).await;
     let again: ViewOpenResult = show_buffer(&mut ws, &params()).await;
@@ -3303,6 +3297,7 @@ async fn git_show_reuses_the_buffer_for_the_same_revision() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: first.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -3340,6 +3335,7 @@ async fn git_show_with_a_path_yields_that_file_at_the_revision() {
                 path: "src/main.rs".into(),
             },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -3375,6 +3371,7 @@ async fn git_show_with_a_path_yields_that_file_at_the_revision() {
                 path: "nope.rs".into(),
             },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -3383,11 +3380,17 @@ async fn git_show_with_a_path_yields_that_file_at_the_revision() {
     drop(server);
 }
 
-/// A virtual buffer is listed like any other buffer — by its title, not as "(scratch N)" — but it
-/// never reaches the session file: it opens transient, and it has neither a path nor a scratch
-/// number to be keyed by. Restoring last Tuesday's commit diff is not a session.
+/// A **file at a revision** is listed like any other buffer — by its title (`abc1234:a.rs`), not
+/// as "(scratch N)". It is a genuine read-only document: content you named and can name again, so
+/// it is a buffers row. It is keyed in the session by its revision rather than by a path or a
+/// scratch number; whether it comes back as a listed row or only as the landing is
+/// `tests/session.rs`'s subject.
+///
+/// A **commit's patch** is the other half of the rule and is deliberately absent: its text is
+/// generated to be the view, what you read in it lives in the files its hunks window, and you
+/// reach it again through history rather than by name.
 #[tokio::test]
-async fn git_show_buffers_are_titled_in_the_picker_and_absent_from_the_session() {
+async fn git_show_buffers_are_titled_in_the_picker() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
@@ -3401,36 +3404,352 @@ async fn git_show_buffers_are_titled_in_the_picker_and_absent_from_the_session()
         .to_string();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: ViewOpenResult = show_buffer(
+    let commit: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let commit_title = commit.title.clone().expect("titled");
+    let opened: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::File {
+                rev: head.clone(),
+                path: "a.rs".into(),
+            },
+            focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
     let title = opened.title.clone().expect("titled");
 
-    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Views)).await;
+    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Buffers)).await;
     let displays: Vec<String> = view
         .update
         .expect("window")
         .items()
         .iter()
         .filter_map(|i| match i {
-            PickerItem::View { display, .. } => Some(display.clone()),
+            PickerItem::Buffer { display, .. } => Some(display.clone()),
             _ => None,
         })
         .collect();
     assert!(
         displays.contains(&title),
-        "the view picker names the revision, got {displays:?}"
+        "the buffers picker names the file at that revision, got {displays:?}"
+    );
+    assert!(
+        !displays.contains(&commit_title),
+        "but not the commit's patch, which is a view and not a buffer: {displays:?}"
     );
     assert!(
         !displays.iter().any(|d| d.starts_with("(scratch")),
         "and doesn't call it a scratch: {displays:?}"
+    );
+
+    drop(server);
+}
+
+// ---- `Space k` inside a review ------------------------------------------------------------
+
+/// Subscribe params for a whole review, wide and tall enough to hold these fixtures.
+fn review_sub_params(view_id: aether_protocol::ViewId) -> ViewportSubscribeParams {
+    ViewportSubscribeParams {
+        view_id,
+        cols: 120,
+        rows: 40,
+        overscan_rows: 0,
+        scroll: ScrollPosition::default(),
+        focus: None,
+        wrap: WrapMode::None,
+        continuation_marker_width: 0,
+        tab_width: 4,
+        diff_view: false,
+    }
+}
+
+/// The first element of a review's window windowing a **file** (with that file's buffer), and the
+/// first windowing the review's own generated text. Which of the two the cursor is in is what
+/// `Space k` turns on.
+fn bound_and_own_elements(
+    window: &aether_protocol::viewport::Window,
+    view_buffer: u64,
+) -> (Option<(u32, u64)>, Option<u32>) {
+    use aether_protocol::viewport::Element as E;
+    let (mut bound, mut own) = (None, None);
+    for node in window.root.editors() {
+        let E::Editor {
+            element, buffer, ..
+        } = node
+        else {
+            continue;
+        };
+        if *buffer == view_buffer {
+            own.get_or_insert(*element);
+        } else {
+            bound.get_or_insert((*element, *buffer));
+        }
+    }
+    (bound, own)
+}
+
+/// The buffers picker's rows as `(buffer_id, display, transient)` — a kept document is a row that
+/// is not italic.
+async fn buffer_rows(ws: &mut Ws) -> Vec<(u64, String, bool)> {
+    send_request::<PickerView>(ws, &view_params(PickerKind::Buffers))
+        .await
+        .update
+        .expect("a buffers picker window")
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Buffer {
+                buffer_id,
+                display,
+                transient,
+                ..
+            } => Some((*buffer_id, display.clone(), *transient)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `view/set_transient`, answering the flag the server left the target on.
+async fn set_transient(ws: &mut Ws, view_id: aether_protocol::ViewId, transient: bool) -> bool {
+    send_request::<aether_protocol::view::ViewSetTransient>(
+        ws,
+        &aether_protocol::view::ViewSetTransientParams { view_id, transient },
+    )
+    .await
+    .transient
+}
+
+/// `Space k` with the cursor in a hunk of the working changes keeps **that file**, not the review.
+///
+/// The review is composed: it keeps the flag it was created with, so aiming the key at it does
+/// nothing anyone wants. What is worth outliving it is the file being read — kept, its own view
+/// becomes a buffers-picker row that survives leaving the review. The answer is the file's flag,
+/// and the review is left the preview it was: it still closes when hidden.
+///
+/// And it never toggles. A second press asking for a *release* is a no-op, because from inside
+/// the review the file's own state is not visible and a toggle would be a coin flip.
+#[tokio::test]
+async fn space_k_in_working_changes_keeps_the_file_under_the_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\ntwo\nthree\n");
+    commit_file(&repo, "other.rs", "nothing\n");
+    std::fs::write(root.join("a.rs"), "one\nTWO\nthree\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let review = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &review_sub_params(review.view_id)).await;
+    let (bound, _) = bound_and_own_elements(&sub.window, review.buffer_id);
+    let (element, file_buffer) = bound.expect("the review windows a.rs");
+    let landed = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &aether_protocol::viewport::ViewportFocusElementParams {
+            viewport_id: sub.viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element },
+        },
+    )
+    .await;
+    assert_eq!(
+        landed.buffer.buffer_id, file_buffer,
+        "the cursor is in the file the hunk windows"
+    );
+
+    assert!(
+        !set_transient(&mut ws, review.view_id, false).await,
+        "the answer is the file's flag: kept"
+    );
+    let rows = buffer_rows(&mut ws).await;
+    assert!(
+        rows.iter()
+            .any(|(b, d, transient)| *b == file_buffer && d.ends_with("a.rs") && !transient),
+        "a.rs is a buffers-picker row and not a preview: {rows:?}"
+    );
+    assert!(
+        server.state.lock().await.view(review.view_id).transient,
+        "the review is the preview it was — the keep said nothing about it"
+    );
+
+    // Asking for a release from in here changes nothing: the file stays kept and the answer still
+    // reports its flag.
+    assert!(
+        !set_transient(&mut ws, review.view_id, true).await,
+        "a release asked from inside a review is a no-op"
+    );
+    let rows = buffer_rows(&mut ws).await;
+    assert!(
+        rows.iter()
+            .any(|(b, _, transient)| *b == file_buffer && !transient),
+        "a.rs is still kept: {rows:?}"
+    );
+
+    // And the review still closes when hidden, taking nothing kept with it.
+    let away: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            path_index: Some(0),
+            relative_path: Some("other.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &review_sub_params(away.view_id)).await;
+    settled(&server).await;
+    {
+        let s = server.state.lock().await;
+        assert!(
+            s.try_view(review.view_id).is_none(),
+            "the review closed itself once nothing showed it"
+        );
+        assert!(
+            s.buffers.contains_key(&file_buffer),
+            "and a.rs outlived it, which is what keeping it was for"
+        );
+    }
+
+    drop(server);
+}
+
+/// The same key in a **commit's patch**: the cursor is in the file at that revision, so that is
+/// what is kept — a titled, non-italic buffers-picker row.
+#[tokio::test]
+async fn space_k_in_a_commit_patch_keeps_the_file_at_that_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\ntwo\nthree\n");
+    commit_file(&repo, "a.rs", "one\nTWO\nthree\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head },
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &review_sub_params(patch.view_id)).await;
+    let (bound, _) = bound_and_own_elements(&sub.window, patch.buffer_id);
+    let (element, file_buffer) = bound.expect("the patch windows a.rs at that revision");
+    let _ = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &aether_protocol::viewport::ViewportFocusElementParams {
+            viewport_id: sub.viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element },
+        },
+    )
+    .await;
+
+    assert!(
+        !set_transient(&mut ws, patch.view_id, false).await,
+        "the answer is the revision's flag: kept"
+    );
+    let rows = buffer_rows(&mut ws).await;
+    assert!(
+        rows.iter()
+            .any(|(b, d, transient)| *b == file_buffer && d.contains("a.rs") && !transient),
+        "the file at that revision is a titled row and not a preview: {rows:?}"
+    );
+    assert!(
+        server.state.lock().await.view(patch.view_id).transient,
+        "the patch is the preview it was"
+    );
+
+    drop(server);
+}
+
+/// On the patch's **metadata block** there is no windowed document to redirect to — the focused
+/// buffer is the patch's own generated text — so the key addresses the view and is refused
+/// exactly as before: the answer is the flag as it stands.
+#[tokio::test]
+async fn space_k_on_a_patchs_own_text_is_refused_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\ntwo\nthree\n");
+    commit_file(&repo, "a.rs", "one\nTWO\nthree\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head },
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &review_sub_params(patch.view_id)).await;
+    let (_, own) = bound_and_own_elements(&sub.window, patch.buffer_id);
+    let element = own.expect("the patch's caption is an element of its own document");
+    let landed = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &aether_protocol::viewport::ViewportFocusElementParams {
+            viewport_id: sub.viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element },
+        },
+    )
+    .await;
+    assert_eq!(
+        landed.buffer.buffer_id, patch.buffer_id,
+        "the cursor is in the patch's own text"
+    );
+
+    assert!(
+        set_transient(&mut ws, patch.view_id, false).await,
+        "the answer is the view's actual flag: a composed view cannot be kept"
+    );
+    assert!(
+        server.state.lock().await.view(patch.view_id).transient,
+        "and nothing moved"
     );
 
     drop(server);
@@ -3465,6 +3784,7 @@ async fn git_show_decorates_the_patch_it_generates() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -3617,6 +3937,7 @@ async fn patch_chrome_counts_toward_the_scroll_extent() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -3704,6 +4025,7 @@ async fn hunk_navigation_steps_a_patchs_own_changes() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -3857,6 +4179,7 @@ async fn changes_picker_in_a_patch_lists_its_hunks_grouped_by_file() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -3993,6 +4316,7 @@ async fn changes_picker_in_a_patch_centres_on_the_cursors_change() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -4157,6 +4481,7 @@ async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
             rev: rev.to_string(),
         },
         focus_path: None,
+        record_nav_from: None,
     };
     let patch: ViewOpenResult = show_buffer(&mut ws, &show(&head)).await;
     let patch_buffer = patch.buffer_id;
@@ -4262,14 +4587,17 @@ async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
     drop(server);
 }
 
-/// A *kept* diff is part of the session; a glanced-at one isn't.
+/// A diff is part of the session, recorded as what it is — and a commit's patch is always a
+/// preview. `Space k` on one is refused: the reply is the view's *actual* flag, still `true`, and
+/// the session entry keeps saying preview. A preview comes back only as the landing
+/// (`tests/session.rs`), which is exactly what "exit in a diff, come back to it" needs.
 ///
-/// The transient rule is the whole gate. A revision opens transient, so it takes `Space k` to
-/// persist one — a diff you skimmed from the log picker is a preview, a diff you pinned is
-/// somewhere you were working. It restores by key rather than by content: nothing of the patch is
-/// written to the session file, it regenerates from the repo.
+/// A **file at a revision** is the other half: a genuine read-only document, so it keeps.
+///
+/// Both restore **by key**, never by content: nothing of the patch reaches the session file, it
+/// regenerates from the repo.
 #[tokio::test]
-async fn a_kept_diff_is_session_restorable_and_a_previewed_one_is_not() {
+async fn a_diff_is_recorded_by_key_as_a_preview_or_as_kept() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
@@ -4308,29 +4636,38 @@ async fn a_kept_diff_is_session_restorable_and_a_previewed_one_is_not() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
     assert!(opened.transient, "a revision opens as a preview");
 
-    // Force a session write while it's still a preview, by opening a file permanently.
-    let _: ViewOpenResult = send_request::<ViewOpen>(
-        &mut ws,
-        &ViewOpenParams {
-            path_index: Some(0),
-            relative_path: Some("a.rs".into()),
-            ..Default::default()
-        },
-    )
-    .await;
-    let session = std::fs::read_to_string(&sessions_path).unwrap_or_default();
-    assert!(
-        !session.contains(&head),
-        "a previewed diff stays out of the session: {session}"
+    let entry = |raw: &str| -> serde_json::Value {
+        let json: serde_json::Value = serde_json::from_str(raw).unwrap();
+        json["workspaces"]["p"]["views"]
+            .as_array()
+            .and_then(|a| a.iter().find(|v| v["kind"] == "virtual").cloned())
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let session = std::fs::read_to_string(&sessions_path).unwrap();
+    assert_eq!(
+        entry(&session)["transient"],
+        serde_json::json!(true),
+        "a previewed diff is recorded as a preview: {session}"
     );
 
-    // `Space k` keeps it — and persists directly, since there's no later save to rely on.
-    let _: ViewSetTransientResult = send_request::<ViewSetTransient>(
+    assert!(
+        session.contains(&format!("{}@{head}", root.to_string_lossy())),
+        "recorded by key, not by content: {session}"
+    );
+    assert!(
+        !session.contains("fn one"),
+        "and none of the patch text is written: {session}"
+    );
+
+    // `Space k` on it is refused: the patch is the view, not a document. The reply is the flag as
+    // the server left it, and the session entry still says preview.
+    let kept: ViewSetTransientResult = send_request::<ViewSetTransient>(
         &mut ws,
         &ViewSetTransientParams {
             view_id: opened.view_id,
@@ -4338,14 +4675,56 @@ async fn a_kept_diff_is_session_restorable_and_a_previewed_one_is_not() {
         },
     )
     .await;
-    let session = std::fs::read_to_string(&sessions_path).unwrap();
     assert!(
-        session.contains(&format!("{}@{head}", root.to_string_lossy())),
-        "a kept diff is recorded by key, not by content: {session}"
+        kept.transient,
+        "the answer is the actual flag, not what was asked for"
     );
+    let session = std::fs::read_to_string(&sessions_path).unwrap();
+    assert_eq!(
+        entry(&session)["transient"],
+        serde_json::json!(true),
+        "still a preview: {session}"
+    );
+
+    // A file at a revision is a document, so the same key keeps it.
+    let file: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::File {
+                rev: head.clone(),
+                path: "a.rs".into(),
+            },
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let kept: ViewSetTransientResult = send_request::<ViewSetTransient>(
+        &mut ws,
+        &ViewSetTransientParams {
+            view_id: file.view_id,
+            transient: false,
+        },
+    )
+    .await;
+    assert!(!kept.transient, "a file at a revision keeps");
+    let session = std::fs::read_to_string(&sessions_path).unwrap();
+    let file_entry = {
+        let json: serde_json::Value = serde_json::from_str(&session).unwrap();
+        json["workspaces"]["p"]["views"]
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .find(|v| v["key"].as_str().is_some_and(|k| k.ends_with(":a.rs")))
+                    .cloned()
+            })
+            .expect("the file at a revision is recorded")
+    };
     assert!(
-        !session.contains("fn one"),
-        "and none of the patch text is written: {session}"
+        file_entry.get("transient").is_none(),
+        "and is recorded kept: {session}"
     );
 
     drop(server);
@@ -4381,6 +4760,7 @@ async fn a_file_at_a_revision_blames_at_that_revision() {
                 path: "a.rs".into(),
             },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -4446,6 +4826,7 @@ async fn working_changes_compose_staged_and_unstaged_and_regenerate() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -4485,6 +4866,7 @@ async fn working_changes_compose_staged_and_unstaged_and_regenerate() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -4544,6 +4926,7 @@ async fn an_unsaved_edit_in_one_element_is_reported_while_another_is_focused() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -4636,6 +5019,7 @@ async fn the_git_cluster_follows_the_focused_element() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -4745,6 +5129,7 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -4808,12 +5193,13 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
         content.text
     );
 
-    // But it is no longer anything opened *by name*: the view picker lists the view alone.
+    // But it is no longer anything opened *by name*: the buffers picker has nothing left to list
+    // — the file is an element of the review now, and the review is not a buffer.
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
             limit: 50,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -4823,16 +5209,16 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
             u.items()
                 .iter()
                 .filter_map(|i| match i {
-                    PickerItem::View { buffer_id, .. } => Some(*buffer_id),
+                    PickerItem::Buffer { buffer_id, .. } => Some(*buffer_id),
                     _ => None,
                 })
                 .collect()
         })
         .unwrap_or_default();
-    assert_eq!(
-        rows,
-        vec![patch.buffer_id],
-        "the closed file is an element of the review now, not a view of its own"
+    assert!(
+        rows.is_empty(),
+        "the closed file is an element of the review now, not a view of its own — and the \
+         review is not a row either: {rows:?}"
     );
 
     // And leaving the review collects it, as it collects every element buffer.
@@ -4861,18 +5247,19 @@ async fn closing_a_file_a_review_windows_hands_it_to_the_review() {
     drop(server);
 }
 
-/// A session comes back as it was kept. Every entry in it was a kept view, so every row it
-/// restores reads as kept and materialises kept — a revision included, though a revision opens as
-/// a preview when *asked for*. The working changes are named as the live view names them, not by
-/// their key. And a review materialised from the session binds its files without losing the
-/// views the session kept of them: a file's kind-less entry is its editor, and it comes back kept
-/// beside the kept reader rather than vanishing into the review's preview of the file.
+/// A session comes back as it was left, each entry as what it is: the kept file is a kept row,
+/// and the review and the commit — which cannot be kept, being views rather than documents — come
+/// back as previews, honoured for the landing and dropped otherwise.
+///
+/// So landing back in the review is what "exit in a diff" means, and the review materialised from
+/// the session binds its files without losing the views the session kept of them: `README.md`
+/// comes back kept and listed rather than vanishing into the review's preview of the file. The
+/// review and the commit are never buffers-picker rows, live or dormant.
 #[tokio::test]
-async fn a_kept_review_and_revision_come_back_kept() {
+async fn a_kept_file_and_a_restored_review_land_together() {
     use aether_protocol::picker::{
         PickerItem, PickerKind, PickerUpdate, PickerUpdateParams, PickerView, PickerViewParams,
     };
-    use aether_protocol::ui::ViewKind;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
@@ -4882,36 +5269,24 @@ async fn a_kept_review_and_revision_come_back_kept() {
     let store = tempfile::tempdir().unwrap();
     let sessions_path = store.path().join("sessions.json");
     let repo_id = root.to_string_lossy().into_owned();
-    async fn activate(ws: &mut Ws) {
-        let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+    async fn activate(ws: &mut Ws, open_last: bool) -> WorkspaceActivateResult {
+        send_request::<WorkspaceActivate>(
             ws,
             &WorkspaceActivateParams {
                 worktrees: None,
                 name: "p".into(),
-                open_last: false,
+                open_last,
             },
         )
-        .await;
+        .await
     }
-    async fn keep(ws: &mut Ws, view_id: aether_protocol::ViewId) {
-        let _ = send_request::<aether_protocol::view::ViewSetTransient>(
-            ws,
-            &aether_protocol::view::ViewSetTransientParams {
-                view_id,
-                transient: false,
-            },
-        )
-        .await;
-    }
-    async fn picker_rows(
-        ws: &mut Ws,
-    ) -> Vec<(String, Option<ViewKind>, bool, aether_protocol::ViewId)> {
+    async fn picker_rows(ws: &mut Ws) -> Vec<(String, bool, aether_protocol::ViewId)> {
         let _ = send_request::<PickerView>(
             ws,
             &PickerViewParams {
                 view_id: None,
                 limit: 30,
-                ..view_params(PickerKind::Views)
+                ..view_params(PickerKind::Buffers)
             },
         )
         .await;
@@ -4920,19 +5295,20 @@ async fn a_kept_review_and_revision_come_back_kept() {
             .items()
             .iter()
             .filter_map(|i| match i {
-                PickerItem::View {
+                PickerItem::Buffer {
                     display,
-                    view_kind,
                     transient,
                     view_id,
                     ..
-                } => Some((display.clone(), *view_kind, *transient, *view_id)),
+                } => Some((display.clone(), *transient, *view_id)),
                 _ => None,
             })
             .collect()
     }
 
-    // First life: the reader and its editor, the working changes and a commit — all kept.
+    // First life: the file (read, then flipped to source) is kept by simply being opened; the
+    // commit and then the working changes are shown, and both are previews — a composed view
+    // cannot be anything else.
     let server = aether_server::spawn_for_test_multi_with_sessions(
         vec![("p".into(), vec![root.clone()])],
         Some(sessions_path.clone()),
@@ -4940,30 +5316,18 @@ async fn a_kept_review_and_revision_come_back_kept() {
     .await
     .unwrap();
     let mut ws = Ws::connect(&server).await;
-    activate(&mut ws).await;
-    let reader: ViewOpenResult =
+    activate(&mut ws, false).await;
+    let readme: ViewOpenResult =
         send_request::<ViewOpen>(&mut ws, &file_open_params("README.md", None)).await;
-    let editor: ViewOpenResult = send_request::<ViewOpen>(
+    assert!(readme.read, "read, by the setting");
+    let _ = send_request::<aether_protocol::view::ViewSetRead>(
         &mut ws,
-        &ViewOpenParams {
-            view_id: Some(reader.view_id),
-            kind: Some(ViewKind::Editor),
-            ..Default::default()
+        &aether_protocol::view::ViewSetReadParams {
+            view_id: readme.view_id,
+            read: false,
         },
     )
     .await;
-    keep(&mut ws, editor.view_id).await;
-    let changes: ViewOpenResult = show_buffer(
-        &mut ws,
-        &GitShowParams {
-            repo_id: Some(repo_id.clone()),
-            buffer_id: None,
-            target: ShowTarget::WorkingChanges,
-            focus_path: None,
-        },
-    )
-    .await;
-    keep(&mut ws, changes.view_id).await;
     let commit: ViewOpenResult = show_buffer(
         &mut ws,
         &GitShowParams {
@@ -4971,26 +5335,40 @@ async fn a_kept_review_and_revision_come_back_kept() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
-    keep(&mut ws, commit.view_id).await;
+    assert!(commit.transient, "a commit's patch is a preview");
+    let changes: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    assert!(changes.transient, "and so is the working changes");
     let entries = |raw: &str| -> usize {
         let json: serde_json::Value = serde_json::from_str(raw).unwrap();
         json["workspaces"]["p"]["views"]
             .as_array()
             .map_or(0, |a| a.len())
     };
-    eventually("all four kept views to reach the session file", || {
+    eventually("all three views to reach the session file", || {
         std::fs::read_to_string(&sessions_path)
             .ok()
-            .filter(|raw| entries(raw) == 4)
+            .filter(|raw| entries(raw) == 3)
     })
     .await;
     drop(ws);
     drop(server);
 
-    // Second life: cold-loaded from the workspace config, the four come back as dormant rows.
+    // Second life: cold-loaded from the workspace config, landing where the window was left —
+    // in the review.
     let configs = store.path().join("workspaces");
     std::fs::create_dir_all(&configs).unwrap();
     std::fs::write(
@@ -5004,95 +5382,41 @@ async fn a_kept_review_and_revision_come_back_kept() {
             .unwrap();
     server.state.lock().await.workspaces_dir = Some(configs);
     let mut ws = Ws::connect(&server).await;
-    activate(&mut ws).await;
-    let rows = picker_rows(&mut ws).await;
-    let short: String = head.chars().take(7).collect();
-    assert_eq!(rows.len(), 4, "four dormant rows: {rows:?}");
-    assert!(
-        rows.iter().all(|r| !r.2),
-        "every restored row was kept, and reads as kept: {rows:?}"
-    );
-    let named: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
-    assert!(
-        named.contains(&"Working changes"),
-        "the working changes are named as the live view is, not by their key: {named:?}"
-    );
-    assert!(
-        named.contains(&short.as_str()),
-        "the commit by its hash: {named:?}"
-    );
-    assert_eq!(
-        named.iter().filter(|n| **n == "README.md").count(),
-        2,
-        "the file's editor and reader: {named:?}"
-    );
-    let changes_row = rows
-        .iter()
-        .find(|r| r.0 == "Working changes")
-        .map(|r| r.3)
-        .unwrap();
+    let landed = activate(&mut ws, true)
+        .await
+        .opened
+        .expect("open_last lands somewhere");
+    assert!(landed.is_patch, "back in the review it was left in");
+    assert!(landed.transient, "still a preview: a review is never kept");
 
-    // Materialising the review keeps it, as it was — and binding the file it windows brings that
-    // file's kept views back live, both of them.
-    let restored: ViewOpenResult = send_request::<ViewOpen>(
+    // The review materialised and bound the file it windows — and the file's own kept view is
+    // still a row, once. The review itself is not a row, and the commit's preview row went with
+    // the landing decision.
+    let short: String = head.chars().take(7).collect();
+    let rows = picker_rows(&mut ws).await;
+    let named: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(named, vec!["README.md"], "the file alone: {rows:?}");
+    assert!(!rows[0].1, "and still kept: {rows:?}");
+    assert!(
+        !named.contains(&"Working changes"),
+        "the review is a view, not a buffer: {named:?}"
+    );
+    assert!(
+        !named.contains(&short.as_str()),
+        "nor is the commit's patch: {named:?}"
+    );
+
+    let readme_open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
         &ViewOpenParams {
-            view_id: Some(changes_row),
+            view_id: Some(rows[0].2),
             ..Default::default()
         },
     )
     .await;
     assert!(
-        !restored.transient,
-        "kept in the session, kept when it comes back"
-    );
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
-        &mut ws,
-        &ViewportSubscribeParams {
-            view_id: restored.view_id,
-            cols: 80,
-            rows: 24,
-            overscan_rows: 0,
-            scroll: ScrollPosition {
-                element: 0,
-                line: 0,
-                sub_row: 0.0,
-            },
-            focus: None,
-            wrap: WrapMode::None,
-            continuation_marker_width: 0,
-            tab_width: 4,
-            diff_view: false,
-        },
-    )
-    .await;
-    let rows = picker_rows(&mut ws).await;
-    let readme: Vec<(Option<ViewKind>, bool)> = rows
-        .iter()
-        .filter(|r| r.0 == "README.md")
-        .map(|r| (r.1, r.2))
-        .collect();
-    assert_eq!(
-        readme.len(),
-        2,
-        "the file's editor and reader are still both listed: {rows:?}"
-    );
-    assert!(
-        readme.iter().all(|(_, transient)| !transient),
-        "and both still kept: {rows:?}"
-    );
-    assert!(
-        readme.iter().any(|(k, _)| *k == Some(ViewKind::Editor))
-            && readme.iter().any(|(k, _)| *k == Some(ViewKind::Reader)),
-        "one of each kind: {rows:?}"
-    );
-    assert!(
-        rows.iter().any(|r| r.0 == short && !r.2),
-        "the commit's row is still there, kept: {rows:?}"
-    );
-    assert!(
-        rows.iter().any(|r| r.0 == "Working changes" && !r.2),
-        "the review's row, kept: {rows:?}"
+        !readme_open.read,
+        "as it was last shown before the restart: source"
     );
     drop(server);
 }
@@ -5115,6 +5439,7 @@ async fn closing_a_review_collects_the_files_it_windowed() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -5184,6 +5509,7 @@ async fn opening_a_views_element_presents_the_file_it_windows() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -5289,6 +5615,7 @@ async fn working_changes_mark_staged_blocks_apart_from_unstaged() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -5360,6 +5687,7 @@ async fn staging_from_the_working_changes_view_moves_the_block_into_the_index() 
         buffer_id: None,
         target: ShowTarget::WorkingChanges,
         focus_path: None,
+        record_nav_from: None,
     };
     let opened: ViewOpenResult = show_buffer(&mut ws, &show).await;
     let buffer_id = opened.buffer_id;
@@ -5506,6 +5834,7 @@ async fn staging_pushes_the_rebuilt_patch_as_clean() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -5649,6 +5978,7 @@ async fn blame_follow_pushes_a_label_in_a_file_at_a_revision() {
                 path: "a.rs".into(),
             },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -5755,6 +6085,7 @@ async fn opening_a_commit_from_a_files_history_lands_on_that_file() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head },
             focus_path: row,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6161,6 +6492,7 @@ async fn working_changes_on_a_clean_tree_opens_no_buffer() {
         buffer_id: None,
         target: ShowTarget::WorkingChanges,
         focus_path: None,
+        record_nav_from: None,
     };
     let shown = send_request::<GitShow>(&mut ws, &show).await;
     assert!(shown.opened.is_none(), "nothing to show, so nothing opened");
@@ -6190,6 +6522,7 @@ async fn an_open_working_changes_view_drains_when_the_tree_goes_clean() {
         buffer_id: None,
         target: ShowTarget::WorkingChanges,
         focus_path: None,
+        record_nav_from: None,
     };
     let opened = show_buffer(&mut ws, &show).await;
     let buffer_id = opened.buffer_id;
@@ -6285,6 +6618,7 @@ async fn an_external_write_rebuilds_an_open_working_changes_view() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6335,6 +6669,7 @@ async fn an_external_stage_retags_an_open_working_changes_view() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6399,6 +6734,7 @@ async fn saving_a_buffer_rebuilds_an_open_working_changes_view() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6454,6 +6790,7 @@ async fn staging_a_file_buffer_retags_a_working_changes_view_open_elsewhere() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6500,6 +6837,7 @@ async fn committing_drains_an_open_working_changes_view_in_place() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6549,6 +6887,7 @@ async fn a_rebuild_keeps_the_cursor_on_the_line_it_was_reading() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6628,6 +6967,7 @@ async fn the_working_changes_view_follows_a_pinned_baseline() {
         buffer_id: None,
         target: ShowTarget::WorkingChanges,
         focus_path: None,
+        record_nav_from: None,
     };
     let patch = show_buffer(&mut ws, &show).await;
     let text = patch_text(&mut ws, patch.buffer_id).await;
@@ -6708,6 +7048,7 @@ async fn a_pinned_baseline_leaves_the_view_with_no_staged_layer() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6755,6 +7096,7 @@ async fn the_saved_baseline_leaves_the_working_changes_view_with_nothing_to_show
         buffer_id: None,
         target: ShowTarget::WorkingChanges,
         focus_path: None,
+        record_nav_from: None,
     };
     let patch = show_buffer(&mut ws, &show).await;
     assert!(patch_text(&mut ws, patch.buffer_id).await.contains("two"));
@@ -6798,6 +7140,7 @@ async fn an_empty_answer_carries_the_baseline_that_made_it_empty() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6822,6 +7165,7 @@ async fn an_empty_answer_carries_the_baseline_that_made_it_empty() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6848,6 +7192,7 @@ async fn an_empty_pinned_baseline_says_which_revision_it_found_nothing_since() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6885,6 +7230,7 @@ async fn the_working_changes_view_shows_its_branch_and_opens_on_the_diff() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6973,6 +7319,7 @@ async fn two_repos_get_distinct_working_changes_titles() {
                 buffer_id: None,
                 target: ShowTarget::WorkingChanges,
                 focus_path: None,
+                record_nav_from: None,
             },
         )
         .await;
@@ -7001,6 +7348,7 @@ async fn a_deletion_stages_and_unstages_from_the_working_changes_view() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7083,6 +7431,7 @@ async fn patch_view_refusals_do_not_claim_there_is_no_repo() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7128,6 +7477,7 @@ async fn patch_view_refusals_do_not_claim_there_is_no_repo() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7162,6 +7512,7 @@ async fn nav_back_onto_a_since_cleaned_working_changes_view_says_why() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7264,6 +7615,7 @@ async fn stepping_back_into_the_working_changes_view_returns_to_the_hunk_you_lef
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7371,6 +7723,7 @@ async fn enter_in_the_working_changes_view_opens_the_real_file() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7463,6 +7816,7 @@ async fn a_large_files_deferred_baseline_does_not_refuse_the_stage() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7594,6 +7948,7 @@ async fn repo_resolution_survives_a_large_files_deferred_baseline() {
             buffer_id: Some(opened.buffer_id),
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7639,6 +7994,7 @@ async fn patch_element_ids_survive_a_scroll() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7733,6 +8089,7 @@ async fn patch_editors_report_their_buffer_and_full_height() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7861,6 +8218,7 @@ async fn scrolled_out_elements_keep_their_place_in_the_tree() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7973,6 +8331,7 @@ async fn focus_steps_between_a_patchs_elements_and_stops_at_the_ends() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -8085,6 +8444,7 @@ async fn enter_on_a_patch_leads_to_the_working_file() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -8185,6 +8545,7 @@ async fn a_deleted_files_hunk_still_renders_from_the_generated_patch() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -8263,6 +8624,7 @@ async fn a_patch_collapses_its_removals_when_the_diff_is_off() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -8384,6 +8746,7 @@ async fn toggling_the_diff_on_an_open_patch_view_adds_and_removes_its_phantoms()
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -8490,6 +8853,7 @@ async fn toggling_the_diff_keeps_a_scrolled_patch_view_where_it_was() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -8598,6 +8962,7 @@ async fn typing_in_a_working_changes_hunk_edits_the_file() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -8702,6 +9067,7 @@ async fn staging_through_a_focused_element_stages_that_files_block() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -8808,6 +9174,7 @@ async fn a_hunk_grows_when_you_type_a_line_into_it() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -8915,6 +9282,7 @@ async fn moving_past_a_hunks_end_stays_within_the_view() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9027,6 +9395,7 @@ async fn scrolling_to_the_end_of_a_patch_still_shows_content() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9111,6 +9480,7 @@ async fn the_scroll_limit_reaches_the_last_line_of_a_patch() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9196,6 +9566,7 @@ async fn rendering_a_bound_patch_near_its_end_does_not_panic() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9272,6 +9643,7 @@ async fn walking_down_a_freshly_opened_commit_patch_does_not_panic() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9346,6 +9718,7 @@ async fn a_counted_change_step_past_the_last_change_refuses() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9452,6 +9825,7 @@ async fn staging_from_inside_an_element_never_touches_the_patch_index() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9511,12 +9885,13 @@ async fn staging_from_inside_an_element_never_touches_the_patch_index() {
     drop(server);
 }
 
-/// Opening working changes does not turn every changed file into a row in `Space v`.
+/// Opening working changes adds **nothing** to the buffers picker — neither the files it windows
+/// nor the view itself.
 ///
-/// The view picker switches between **views**. A file a composed view happens to window is an
-/// *element* of one, not a view of its own — it was never opened by name and switching to it is not
-/// what the key is for. `Space g w` on a busy tree used to add a row per changed file, and they
-/// stayed after the view was gone, because the binds also opened permanent.
+/// A file a composed view happens to window is an *element* of one, not something opened by name:
+/// `Space g w` on a busy tree used to add a row per changed file, and they stayed after the view
+/// was gone, because the binds also opened permanent. And the review is not a buffer either — its
+/// document is generated to be the view, and you reach it again by `Space g w`, not by name.
 #[tokio::test]
 async fn opening_working_changes_does_not_list_its_files_as_buffers() {
     use aether_protocol::picker::{
@@ -9532,13 +9907,14 @@ async fn opening_working_changes_does_not_list_its_files_as_buffers() {
     }
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let patch = show_buffer(
+    let _patch = show_buffer(
         &mut ws,
         &GitShowParams {
             repo_id: Some(root.to_string_lossy().into_owned()),
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9547,7 +9923,7 @@ async fn opening_working_changes_does_not_list_its_files_as_buffers() {
         &mut ws,
         &PickerViewParams {
             limit: 50,
-            ..view_params(PickerKind::Views)
+            ..view_params(PickerKind::Buffers)
         },
     )
     .await;
@@ -9557,7 +9933,7 @@ async fn opening_working_changes_does_not_list_its_files_as_buffers() {
             u.items()
                 .iter()
                 .filter_map(|i| match i {
-                    PickerItem::View {
+                    PickerItem::Buffer {
                         buffer_id, display, ..
                     } => Some((*buffer_id, display.clone())),
                     _ => None,
@@ -9566,10 +9942,9 @@ async fn opening_working_changes_does_not_list_its_files_as_buffers() {
         })
         .unwrap_or_default();
 
-    assert_eq!(
-        rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        vec![patch.buffer_id],
-        "the view is a row; the three files it windows are not — got {rows:?}"
+    assert!(
+        rows.is_empty(),
+        "neither the three files the review windows nor the review itself — got {rows:?}"
     );
 
     drop(server);
@@ -9600,6 +9975,7 @@ async fn leaving_a_composed_view_collects_the_patch_and_its_elements() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9716,6 +10092,7 @@ async fn the_outline_of_a_patch_is_its_changes_grouped_by_file() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9816,6 +10193,7 @@ async fn scrolling_the_patch_outline_keeps_its_rows() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -9915,6 +10293,7 @@ async fn each_outline_row_selects_its_own_hunk_top() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -10097,6 +10476,7 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -10380,6 +10760,7 @@ async fn a_patch_jumplist_steps_from_another_editor() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -10593,6 +10974,7 @@ async fn saving_a_composed_view_writes_every_file_it_windows() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -10750,6 +11132,7 @@ async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
             buffer_id: None,
             target: ShowTarget::Commit { rev: head.clone() },
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -10945,6 +11328,7 @@ async fn the_outline_the_motion_and_the_breadcrumb_agree() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -11103,6 +11487,7 @@ async fn the_outline_opens_on_the_change_the_cursor_is_in() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -11248,6 +11633,7 @@ async fn stepping_the_outline_of_a_patch_visits_each_change() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -11382,6 +11768,7 @@ async fn a_lines_changed_push_names_the_focused_elements_buffer() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -11475,6 +11862,7 @@ async fn change_stepping_reaches_a_deleted_file_beside_a_bound_one() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -11568,6 +11956,7 @@ async fn restaging_rebinds_a_view_whose_hunks_all_window_files() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -11684,6 +12073,7 @@ async fn stepping_from_an_unbound_element_reads_the_cursors_place_in_the_view() 
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -11855,6 +12245,401 @@ async fn stepping_from_an_unbound_element_reads_the_cursors_place_in_the_view() 
         ),
         "the picker centres on a.rs's entry: {:?}",
         jl.effective_center_on
+    );
+
+    drop(server);
+}
+
+/// `Enter` out of the working changes, `Backspace` back, a few lines down, `Enter` again: the file
+/// opens where the cursor **is**. Its own view was hidden while the review's element moved the
+/// cursor — the cursor is per `(client, buffer)`, and the two share it — so the scroll its view
+/// remembered framed the old place, and restoring it left the cursor off screen. A moved cursor
+/// forgets the scroll; the client frames the cursor.
+#[tokio::test]
+async fn re_entering_a_file_from_the_working_changes_frames_the_moved_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let original: String = (0..60).map(|i| format!("line {i}\n")).collect();
+    commit_file(&repo, "a.rs", &original);
+    let changed = original
+        .replace("line 5\n", "LINE 5\n")
+        .replace("line 40\n", "LINE 40\n");
+    std::fs::write(root.join("a.rs"), &changed).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let review = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &review_sub_params(review.view_id)).await;
+    let (bound, _) = bound_and_own_elements(&sub.window, review.buffer_id);
+    let (element, file_buffer) = bound.expect("the review windows a.rs");
+    let focus = |viewport_id, element| aether_protocol::viewport::ViewportFocusElementParams {
+        viewport_id,
+        target: aether_protocol::viewport::FocusTarget::Element { element },
+    };
+    let _ = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &focus(sub.viewport_id, element),
+    )
+    .await;
+    // `Enter`: the file as its own view, shown ten rows tall from its top. Recorded onto the
+    // history as the client does, so `Backspace` has somewhere to go.
+    let entered: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(review.view_id),
+            element: Some(element),
+            record_nav_from: Some(review.buffer_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(entered.buffer_id, file_buffer);
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            rows: 10,
+            ..review_sub_params(entered.view_id)
+        },
+    )
+    .await;
+
+    // `Backspace`: the review was a preview and closed once hidden, so the step back regenerates
+    // it — a new view over the same files — and puts the cursor back in the hunk.
+    let back: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        &NavStepParams {
+            buffer_id: file_buffer,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
+    let review = back.target.expect("a step back to the working changes");
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &review_sub_params(review.view_id)).await;
+    let (bound, _) = bound_and_own_elements(&sub.window, review.buffer_id);
+    let (element, again_buffer) = bound.expect("the regenerated review windows a.rs");
+    assert_eq!(
+        again_buffer, file_buffer,
+        "the same file buffer, bound again"
+    );
+    let _ = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &focus(sub.viewport_id, element),
+    )
+    .await;
+
+    // Down to the second hunk (`Tab`): the next element over the same file, which seats the
+    // cursor on its first line — in the file's buffer, through the review.
+    let landed = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &aether_protocol::viewport::ViewportFocusElementParams {
+            viewport_id: sub.viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Step {
+                direction: aether_protocol::viewport::FocusStep::Next,
+            },
+        },
+    )
+    .await;
+    assert_eq!(landed.buffer.buffer_id, file_buffer, "still a.rs");
+    let moved_to = landed.buffer.cursor.position.line;
+    assert!(
+        moved_to > 30,
+        "the second hunk, well below the first: line {moved_to}"
+    );
+    let element = landed.element;
+
+    let enter = ViewOpenParams {
+        view_id: Some(review.view_id),
+        element: Some(element),
+        ..Default::default()
+    };
+    // `Enter` again.
+    let again: ViewOpenResult = send_request::<ViewOpen>(&mut ws, &enter).await;
+    assert_eq!(again.buffer_id, file_buffer);
+    assert_eq!(
+        again.cursor.position.line, moved_to,
+        "the cursor is where the review moved it"
+    );
+    assert!(
+        again.scroll.is_none(),
+        "the scroll its view remembered framed the old cursor and is not restored: {:?}",
+        again.scroll
+    );
+
+    drop(server);
+}
+
+/// From the working changes, `Enter` into a file, a commit from the log, `Backspace`: the **file**,
+/// not the working changes. `git/show` never recorded where it was asked from, so the diff's
+/// `Backspace` stepped to whatever the history held before it — the review the `Enter` had
+/// recorded. It records now, through the same pre-step as `view/open`; a second step back is the
+/// review, regenerated.
+#[tokio::test]
+async fn back_from_a_commit_shown_over_a_file_returns_to_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\ntwo\nthree\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    std::fs::write(root.join("a.rs"), "one\nTWO\nthree\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let repo_id = root.to_string_lossy().into_owned();
+    let review = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &review_sub_params(review.view_id)).await;
+    let (bound, _) = bound_and_own_elements(&sub.window, review.buffer_id);
+    let (element, file_buffer) = bound.expect("the review windows a.rs");
+    let _ = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &aether_protocol::viewport::ViewportFocusElementParams {
+            viewport_id: sub.viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element },
+        },
+    )
+    .await;
+
+    // `Enter`: the file, recording the review.
+    let entered: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(review.view_id),
+            element: Some(element),
+            record_nav_from: Some(review.buffer_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(entered.buffer_id, file_buffer);
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &review_sub_params(entered.view_id)).await;
+
+    // A commit from the log, recording the file.
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(repo_id),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head },
+            focus_path: None,
+            record_nav_from: Some(file_buffer),
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &review_sub_params(patch.view_id)).await;
+
+    // `Backspace`: the file.
+    let back: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        &NavStepParams {
+            buffer_id: patch.buffer_id,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
+    let returned = back.target.expect("a step back from the commit");
+    // By path: the file's own view was a preview that closed once the commit hid it, so the step
+    // back reopens the path — under whatever id it gets — rather than presenting a live view.
+    assert_eq!(
+        returned.path.as_deref(),
+        Some(root.join("a.rs").to_string_lossy().as_ref()),
+        "back from the commit is the file it was shown over, not the review before it"
+    );
+    let file_buffer = returned.buffer_id;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &review_sub_params(returned.view_id)).await;
+
+    // `Backspace` again: the working changes, regenerated from their key.
+    let back: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        &NavStepParams {
+            buffer_id: file_buffer,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
+    let returned = back.target.expect("a step back from the file");
+    assert_eq!(
+        returned.title.as_deref(),
+        Some("Working changes"),
+        "and the step before that is the review"
+    );
+
+    drop(server);
+}
+
+/// Back and forward **through** a commit's patch. The patch is a preview that closed when the file
+/// entered from it hid it, so each step onto it regenerates it from its key — and each must present
+/// it, seated in the hunk the cursor was in, with rows on screen. Stepping past it in either
+/// direction must land on what was on the other side.
+#[tokio::test]
+async fn history_steps_through_a_regenerated_commit_patch_in_both_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\ntwo\nthree\n");
+    commit_file(&repo, "a.rs", "one\nTWO\nthree\n");
+    let head = repo
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let repo_id = root.to_string_lossy().into_owned();
+    let sub_to = |view_id| review_sub_params(view_id);
+
+    // A file, then the commit from the log over it.
+    let file: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            path_index: Some(0),
+            relative_path: Some("b.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &sub_to(file.view_id)).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(repo_id.clone()),
+            buffer_id: None,
+            target: ShowTarget::Commit { rev: head.clone() },
+            focus_path: None,
+            record_nav_from: Some(file.buffer_id),
+        },
+    )
+    .await;
+    let short: String = head.chars().take(7).collect();
+    let sub: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &sub_to(patch.view_id)).await;
+    let (bound, _) = bound_and_own_elements(&sub.window, patch.buffer_id);
+    let (element, blob) = bound.expect("the patch windows a.rs at the revision");
+    let _ = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &aether_protocol::viewport::ViewportFocusElementParams {
+            viewport_id: sub.viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element },
+        },
+    )
+    .await;
+
+    // `Enter` on the hunk: the file at that revision as its own view; the patch closes behind it.
+    let entered: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(patch.view_id),
+            element: Some(element),
+            record_nav_from: Some(patch.buffer_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(entered.buffer_id, blob);
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &sub_to(entered.view_id)).await;
+
+    // Presents `target` as the client would: subscribe with the scroll it carries, and say what is
+    // on screen.
+    async fn shown(ws: &mut Ws, target: &ViewOpenResult) -> (String, usize) {
+        let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+            ws,
+            &ViewportSubscribeParams {
+                scroll: target.scroll.unwrap_or_default(),
+                ..review_sub_params(target.view_id)
+            },
+        )
+        .await;
+        let lines: usize = sub
+            .window
+            .root
+            .editors()
+            .iter()
+            .filter_map(|e| match e {
+                aether_protocol::viewport::Element::Editor { lines, .. } => Some(lines.len()),
+                _ => None,
+            })
+            .sum();
+        (target.title.clone().unwrap_or_default(), lines)
+    }
+    let step = |buffer_id, direction| NavStepParams {
+        buffer_id,
+        direction,
+    };
+
+    // Back: the patch, regenerated and on screen.
+    let back: NavStepResult =
+        send_request::<NavStep>(&mut ws, &step(blob, Direction::Backward)).await;
+    let patch_again = back.target.expect("a step back onto the patch");
+    assert!(patch_again.is_patch, "a patch: {patch_again:?}");
+    let (title, lines) = shown(&mut ws, &patch_again).await;
+    assert!(title.starts_with(&short), "the commit, by hash: {title}");
+    assert!(lines > 0, "with rows on screen");
+
+    // Back again: the file it was shown over. The step names the buffer the cursor is in — the
+    // hunk's file at the revision, as the client sends it — not the patch's own document.
+    let back: NavStepResult =
+        send_request::<NavStep>(&mut ws, &step(blob, Direction::Backward)).await;
+    let file_again = back.target.expect("a step back onto the file");
+    assert_eq!(file_again.buffer_id, file.buffer_id, "b.rs, still open");
+    let _ = shown(&mut ws, &file_again).await;
+
+    // Forward: the patch once more, regenerated once more.
+    let fwd: NavStepResult =
+        send_request::<NavStep>(&mut ws, &step(file.buffer_id, Direction::Forward)).await;
+    let patch_third = fwd.target.expect("a step forward onto the patch");
+    assert!(patch_third.is_patch, "a patch: {patch_third:?}");
+    let (title, lines) = shown(&mut ws, &patch_third).await;
+    assert!(title.starts_with(&short), "the commit again: {title}");
+    assert!(lines > 0, "with rows on screen");
+
+    // Forward again: the file at the revision. Named from inside the patch as before.
+    let fwd: NavStepResult =
+        send_request::<NavStep>(&mut ws, &step(blob, Direction::Forward)).await;
+    let blob_again = fwd
+        .target
+        .expect("a step forward onto the file at the revision");
+    assert!(blob_again.read_only, "history is read-only");
+    assert!(
+        blob_again
+            .title
+            .as_deref()
+            .is_some_and(|t| t.ends_with("a.rs")),
+        "a.rs at the revision: {:?}",
+        blob_again.title
     );
 
     drop(server);

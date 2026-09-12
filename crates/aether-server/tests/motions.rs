@@ -2713,8 +2713,8 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
         },
     )
     .await;
-    // As the **editor**: this is about the source's highlighting, and a markdown file's default
-    // view is the reader, whose element carries the parse instead of any lines to highlight.
+    // As **source**: this is about the source's highlighting, and a markdown file is read by
+    // default, its element carrying the parse instead of any lines to highlight.
     let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
         &ViewOpenParams {
@@ -2724,7 +2724,7 @@ async fn viewport_highlights_rust_inside_markdown_fence() {
             language: None,
             create_if_missing: false,
             jump_to: None,
-            kind: Some(aether_protocol::ui::ViewKind::Editor),
+            read: Some(false),
             ..Default::default()
         },
     )
@@ -6237,6 +6237,7 @@ async fn hunk_view(
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6568,6 +6569,7 @@ async fn moving_focus_rescopes_the_active_search() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6767,6 +6769,7 @@ async fn subscribing_to_a_patch_reports_the_element_the_cursor_is_in() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -6843,6 +6846,7 @@ async fn a_patch_opened_on_a_file_focuses_that_files_element() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: Some("d.rs".into()),
+            record_nav_from: None,
         },
     )
     .await;
@@ -6931,6 +6935,7 @@ async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7030,6 +7035,7 @@ async fn a_views_reported_height_is_the_rows_it_ships() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7144,6 +7150,7 @@ async fn every_scrollable_row_comes_back_in_its_window() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7222,6 +7229,7 @@ async fn the_clients_scroll_loop_reaches_the_bottom() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7323,6 +7331,7 @@ async fn a_patch_ends_with_its_closing_rule() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7871,6 +7880,7 @@ async fn extending_a_selection_cannot_anchor_outside_the_element() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -7979,6 +7989,7 @@ async fn moving_a_paragraph_cannot_reach_outside_the_hunk() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;
@@ -8082,6 +8093,7 @@ async fn motion_undo_refuses_a_position_in_another_hunk() {
             buffer_id: None,
             target: ShowTarget::WorkingChanges,
             focus_path: None,
+            record_nav_from: None,
         },
     )
     .await;

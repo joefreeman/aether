@@ -2,42 +2,93 @@
 
 use super::*;
 
-/// Build the buffer-picker candidate list for `client_id`: every buffer belonging to the
-/// client's active workspace, MRU first, then any workspace buffers the client hasn't touched yet
-/// (e.g. opened by another client of the same workspace) in buffer-id order. `(scratch N)`
-/// placeholder display for buffers without a path. Returns an empty list if the client has no
-/// active workspace (the picker shouldn't be reachable without one, but the lookup stays defensive).
-fn build_view_candidates(s: &ServerState, client_id: ClientId) -> Vec<picker_state::ViewCandidate> {
+/// Which of the three per-kind pickers a view or a dormant row belongs to, or `None` for one that
+/// belongs to no picker at all.
+///
+/// One classification, consulted by all three builders, so a thing can never be in two lists: a
+/// shell's transcript and an agent's conversation name themselves through their
+/// [`crate::state::VirtualTarget`], and a **buffer** is a document's own view — a file, a scratch,
+/// or a file as of a revision.
+///
+/// A commit's patch and the working changes are deliberately in no list. Their text is generated
+/// to *be* the view and what you read in them lives in the buffers their elements window, so they
+/// are not something the user opened by name; you reach them again by git command, the log picker
+/// or history. The test is structural ([`crate::state::View::is_composed`]) and names no git target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    Buffer,
+    Shell,
+    Agent,
+}
+
+impl RowKind {
+    /// A live view's list, by what it presents and how it is composed.
+    fn of_view(view: &crate::state::View, doc: &Document) -> Option<RowKind> {
+        match doc.virtual_source.as_ref().map(|v| &v.target) {
+            Some(crate::state::VirtualTarget::Shell { .. }) => Some(RowKind::Shell),
+            Some(crate::state::VirtualTarget::Agent { .. }) => Some(RowKind::Agent),
+            _ => (!view.is_composed()).then_some(RowKind::Buffer),
+        }
+    }
+
+    /// A dormant row's list. There is no view to inspect, so it is decided from what the row would
+    /// materialise as: a file and a scratch are documents; a virtual key is a buffer only when it
+    /// names a **document** — a file at a revision, never a commit or the working changes.
+    fn of_dormant(source: &crate::state::DormantSource) -> Option<RowKind> {
+        match source {
+            crate::state::DormantSource::Shell { .. } => Some(RowKind::Shell),
+            crate::state::DormantSource::Agent { .. } => Some(RowKind::Agent),
+            crate::state::DormantSource::File(_) | crate::state::DormantSource::Scratch { .. } => {
+                Some(RowKind::Buffer)
+            }
+            crate::state::DormantSource::Virtual { key } => {
+                (!crate::state::VirtualTarget::key_is_composed(key)).then_some(RowKind::Buffer)
+            }
+        }
+    }
+}
+
+/// The views and dormant rows of `client_id`'s active workspace that belong in `kind`'s picker, in
+/// the order every one of the three lists them: **MRU first**, then the kept-but-unvisited
+/// leftovers by id, then the session's dormant rows.
+///
+/// One walk shared by the three builders. Recency is the only ordering — status is a badge, so a
+/// run starting or a turn ending re-paints a row and never moves it.
+fn picker_rows(
+    s: &ServerState,
+    client_id: ClientId,
+    kind: RowKind,
+) -> (Vec<ViewId>, Vec<&crate::state::DormantView>) {
     let Some(workspace) = s.active_workspace(client_id) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let workspace_name = workspace.id.clone();
-    let roots = workspace.paths.clone();
     let belongs =
         |id: &BufferId| s.buffer_workspaces.get(id).map(|s| s.as_str()) == Some(&workspace_name);
+    // A field of a view is not a view: a shell's input has no row of its own, and a row that
+    // opened one would present half a shell. See `Document::internal`.
+    let listable = |view: &crate::state::View| -> Option<RowKind> {
+        let id = view.presenting;
+        if !belongs(&id) {
+            return None;
+        }
+        let doc = s.try_doc_of(id)?;
+        if doc.internal || !s.buffers.contains_key(&id) {
+            return None;
+        }
+        RowKind::of_view(view, doc)
+    };
 
-    let mut out: Vec<picker_state::ViewCandidate> = Vec::with_capacity(s.views.len());
+    let mut views = Vec::new();
     let mut seen: std::collections::HashSet<ViewId> = std::collections::HashSet::new();
-
-    // One row per **view**, most recently used first: a file's editor and its reader are two
-    // rows, and the one you used last is nearer the top.
     for &view_id in &workspace.mru_views {
         let Some(view) = s.try_view(view_id) else {
             continue;
         };
-        let id = view.presenting;
-        if !belongs(&id) {
+        if listable(view) != Some(kind) {
             continue;
         }
-        let (Some(buf), Some(doc)) = (s.buffers.get(&id), s.try_doc_of(id)) else {
-            continue;
-        };
-        // A field of a view is not a view: a shell's input has no row of its own, and a row that
-        // opened one would present half a shell. See `Document::internal`.
-        if doc.internal {
-            continue;
-        }
-        out.push(buffer_candidate(buf, doc, view_id, view, &roots));
+        views.push(view_id);
         seen.insert(view_id);
     }
     // Views nothing has landed on yet — a file bound into a review and then kept — sorted by id
@@ -46,13 +97,50 @@ fn build_view_candidates(s: &ServerState, client_id: ClientId) -> Vec<picker_sta
     let mut leftovers: Vec<ViewId> = s
         .views
         .iter()
-        .filter(|(view_id, view)| belongs(&view.presenting) && !seen.contains(view_id))
-        .filter(|(_, view)| !s.try_doc_of(view.presenting).is_some_and(|d| d.internal))
+        .filter(|(view_id, view)| !seen.contains(view_id) && listable(view) == Some(kind))
         .filter(|(_, view)| !view.transient)
         .map(|(view_id, _)| *view_id)
         .collect();
     leftovers.sort_unstable();
-    for view_id in leftovers {
+    views.extend(leftovers);
+
+    let live_paths: std::collections::HashSet<&std::path::Path> = s
+        .buffers
+        .iter()
+        .filter(|(id, _)| belongs(id))
+        .filter_map(|(_, b)| s.documents.get(&b.document)?.canonical_path.as_deref())
+        .collect();
+    let dormant: Vec<&crate::state::DormantView> = workspace
+        .dormant_views
+        .iter()
+        .filter(|d| RowKind::of_dormant(&d.source) == Some(kind))
+        // A dormant *file* whose path is already open as a live buffer shouldn't double-show; a
+        // dormant scratch (no path) can never collide, so it always shows.
+        .filter(|d| d.path().is_none_or(|p| !live_paths.contains(p)))
+        .collect();
+    (views, dormant)
+}
+
+/// Build the buffers-picker candidate list for `client_id`: every *buffer* of the client's active
+/// workspace — a file, a scratch, or a file as of a revision — most-recently-used first, then the
+/// kept-but-unvisited ones, then the session's dormant rows. `(scratch N)` placeholder display for
+/// buffers without a path. Empty when the client has no active workspace (the picker shouldn't be
+/// reachable without one, but the lookup stays defensive).
+///
+/// Shells and conversations are deliberately absent: they have pickers of their own, whose rows
+/// answer questions a path cannot. So are a commit's patch and the working changes, which are not
+/// buffers at all — see [`RowKind`].
+fn build_buffer_candidates(
+    s: &ServerState,
+    client_id: ClientId,
+) -> Vec<picker_state::BufferCandidate> {
+    let Some(workspace) = s.active_workspace(client_id) else {
+        return Vec::new();
+    };
+    let roots = workspace.paths.clone();
+    let (views, dormant) = picker_rows(s, client_id, RowKind::Buffer);
+    let mut out = Vec::with_capacity(views.len() + dormant.len());
+    for view_id in views {
         let view = &s.views[&view_id];
         let id = view.presenting;
         out.push(buffer_candidate(
@@ -63,20 +151,167 @@ fn build_view_candidates(s: &ServerState, client_id: ClientId) -> Vec<picker_sta
             &roots,
         ));
     }
-    let live_paths: std::collections::HashSet<&std::path::Path> = s
-        .buffers
-        .iter()
-        .filter(|(id, _)| belongs(id))
-        .filter_map(|(_, b)| s.documents.get(&b.document)?.canonical_path.as_deref())
-        .collect();
-    for d in &workspace.dormant_views {
-        // A dormant *file* whose path is already open as a live buffer shouldn't double-show; a
-        // dormant scratch (no path) can never collide, so it always shows.
-        if d.path().is_none_or(|p| !live_paths.contains(p)) {
-            out.push(dormant_candidate(d, &roots));
-        }
+    for d in dormant {
+        out.push(dormant_candidate(d, &roots));
     }
     out
+}
+
+/// Build the shells-picker candidate list: one row per shell view, live or dormant.
+///
+/// Row data comes off the [`crate::shell::Transcript`] — its title, where the next command would
+/// run, and how the last one went.
+fn build_shell_candidates(
+    s: &ServerState,
+    client_id: ClientId,
+) -> Vec<picker_state::ShellCandidate> {
+    let (views, dormant) = picker_rows(s, client_id, RowKind::Shell);
+    let mut out = Vec::with_capacity(views.len() + dormant.len());
+    for view_id in views {
+        let Some(t) = s
+            .try_view(view_id)
+            .and_then(|v| s.try_doc_of(v.presenting))
+            .and_then(|d| d.transcript())
+        else {
+            continue;
+        };
+        // The last *finished* run: while one is in flight, the badge says so and these two still
+        // describe the run before it, which is what you were looking for when you opened the list.
+        let finished = t.runs.iter().rev().find(|r| !r.is_running());
+        // Shortened `$HOME` → `~`, the shell view's own [`crate::shell::display_path`]: the row and
+        // the run box must not disagree about how a directory is written, and the haystack has to
+        // hold the string the row shows or the fuzzy highlight would land off the text.
+        let cwd = crate::shell::display_path(&t.cwd);
+        let last_command = t.runs.last().map(|r| r.command.clone());
+        out.push(picker_state::ShellCandidate {
+            view_id,
+            haystack: shell_haystack(&t.title, &cwd, last_command.as_deref()),
+            title: t.title.clone(),
+            cwd,
+            last_command,
+            running: t.active().is_some(),
+            exit: finished.and_then(|r| match r.status {
+                aether_protocol::shell::RunStatus::Exited { code } => Some(code),
+                _ => None,
+            }),
+            elapsed_ms: finished.and_then(|r| r.elapsed_ms),
+            dormant: false,
+        });
+    }
+    for d in dormant {
+        let crate::state::DormantSource::Shell { number } = &d.source else {
+            continue;
+        };
+        // A dormant shell's snapshot holds its directory and its runs, and reading it is a disk hit
+        // per row — so a row that has not been opened says its name and nothing else. Selecting it
+        // materialises the shell, and the refresh that follows fills the row in.
+        let title = format!("Shell {number}");
+        out.push(picker_state::ShellCandidate {
+            view_id: d.view,
+            haystack: shell_haystack(&title, "", None),
+            title,
+            cwd: String::new(),
+            last_command: None,
+            running: false,
+            exit: None,
+            elapsed_ms: None,
+            dormant: true,
+        });
+    }
+    out
+}
+
+/// Build the agents-picker candidate list: one row per conversation, live or dormant.
+///
+/// Row data comes off the [`crate::agent::Conversation`] — which agent is behind it, whether a turn
+/// is in flight, whether it is blocked on a permission request, and the last thing the user said.
+fn build_agent_candidates(
+    s: &ServerState,
+    client_id: ClientId,
+) -> Vec<picker_state::AgentCandidate> {
+    let (views, dormant) = picker_rows(s, client_id, RowKind::Agent);
+    let mut out = Vec::with_capacity(views.len() + dormant.len());
+    for view_id in views {
+        let Some(c) = s
+            .try_view(view_id)
+            .and_then(|v| s.try_doc_of(v.presenting))
+            .and_then(|d| d.conversation())
+        else {
+            continue;
+        };
+        // Blocked beats running: a turn waiting on an answer is not making progress, and saying
+        // "thinking" about one would hide the only row that needs the user.
+        let state = if c.pending_permission().is_some() {
+            AgentRowState::AwaitingPermission
+        } else if let Some(turn) = &c.turn {
+            AgentRowState::Thinking {
+                activity: turn.activity.clone(),
+            }
+        } else if c.handle.is_none() {
+            AgentRowState::Disconnected
+        } else {
+            AgentRowState::Idle
+        };
+        let last_prompt = c
+            .blocks
+            .iter()
+            .rev()
+            .find(|b| matches!(b.kind, crate::agent::BlockKind::UserMessage))
+            .and_then(|b| s.try_doc_of(b.buffer))
+            .map(|d| d.text.to_string())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        out.push(picker_state::AgentCandidate {
+            view_id,
+            haystack: agent_haystack(&c.title, c.agent.name, last_prompt.as_deref()),
+            title: c.title.clone(),
+            agent: c.agent.name.to_string(),
+            state,
+            last_prompt,
+            dormant: false,
+        });
+    }
+    for d in dormant {
+        let crate::state::DormantSource::Agent { number } = &d.source else {
+            continue;
+        };
+        // As with a dormant shell: the snapshot holds the agent's name and its blocks, and reading
+        // one per row is a disk hit the list does not need. There is certainly no subprocess.
+        let title = format!("Agent {number}");
+        out.push(picker_state::AgentCandidate {
+            view_id: d.view,
+            haystack: agent_haystack(&title, "", None),
+            title,
+            agent: String::new(),
+            state: AgentRowState::Disconnected,
+            last_prompt: None,
+            dormant: true,
+        });
+    }
+    out
+}
+
+/// The shells picker's fuzzy haystack: `"{title}  {cwd}  {last_command}"`, empty parts elided.
+///
+/// A **wire contract** — `PickerItem::Shell::match_indices` are char offsets into this string, so a
+/// shell rendering the three fields apart splits the offsets by the same joins. Two spaces between
+/// the parts, so a query cannot fuzzily bridge two of them on a single space.
+fn shell_haystack(title: &str, cwd: &str, last_command: Option<&str>) -> String {
+    join_haystack([title, cwd, last_command.unwrap_or("")])
+}
+
+/// The agents picker's fuzzy haystack: `"{title}  {agent}  {last_prompt}"`, empty parts elided.
+/// A wire contract for the reason [`shell_haystack`] is.
+fn agent_haystack(title: &str, agent: &str, last_prompt: Option<&str>) -> String {
+    join_haystack([title, agent, last_prompt.unwrap_or("")])
+}
+
+fn join_haystack(parts: [&str; 3]) -> String {
+    parts
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// Picker candidate for a dormant (session-restored, not-yet-loaded) buffer: it carries the
@@ -87,7 +322,7 @@ fn build_view_candidates(s: &ServerState, client_id: ClientId) -> Vec<picker_sta
 fn dormant_candidate(
     d: &crate::state::DormantView,
     roots: &[std::path::PathBuf],
-) -> picker_state::ViewCandidate {
+) -> picker_state::BufferCandidate {
     let (display, path) = match &d.source {
         crate::state::DormantSource::File(p) => (
             crate::workspace_index::workspace_relative_display(p, roots)
@@ -97,10 +332,11 @@ fn dormant_candidate(
         crate::state::DormantSource::Scratch { number } => (format!("(scratch {number})"), None),
         crate::state::DormantSource::Shell { number } => (format!("Shell {number}"), None),
         crate::state::DormantSource::Agent { number } => (format!("Agent {number}"), None),
-        // Named as the live view names itself, as far as the key allows: the working changes are
-        // `Working changes`, a revision its short hash (`abc1234`, `abc1234:src/a.rs`) — the
-        // subject is generated with the content, which a dormant entry hasn't paid for yet. A key
-        // that doesn't parse is shown as it is.
+        // Named as the live view names itself, as far as the key allows: a revision is its short
+        // hash and path (`abc1234:src/a.rs`) — the subject is generated with the content, which a
+        // dormant entry hasn't paid for yet. Only a file at a revision reaches here (`RowKind::
+        // of_dormant`); the other shapes stay written out so the naming is total rather than
+        // leaning on the filter above.
         crate::state::DormantSource::Virtual { key } => (
             match crate::state::VirtualTarget::parse_key(key).and_then(|t| t.what().cloned()) {
                 Some(aether_protocol::git::ShowTarget::WorkingChanges) => "Working changes".into(),
@@ -130,10 +366,9 @@ fn dormant_candidate(
         | crate::state::DormantSource::Agent { .. } => BufferDirtyState::Clean,
         crate::state::DormantSource::Scratch { .. } => BufferDirtyState::Unsaved,
     };
-    picker_state::ViewCandidate {
+    picker_state::BufferCandidate {
         buffer_id: d.id,
         view_id: d.view,
-        view_kind: d.kind,
         display,
         status,
         path,
@@ -156,7 +391,7 @@ fn buffer_candidate(
     view_id: ViewId,
     view: &crate::state::View,
     roots: &[std::path::PathBuf],
-) -> picker_state::ViewCandidate {
+) -> picker_state::BufferCandidate {
     let display = match (doc.canonical_path.as_deref(), &doc.virtual_source) {
         (Some(p), _) => crate::workspace_index::workspace_relative_display(p, roots)
             .unwrap_or_else(|| p.display().to_string()),
@@ -174,7 +409,7 @@ fn buffer_candidate(
         .canonical_path
         .as_deref()
         .and_then(|p| crate::workspace_index::workspace_relative_parts(p, roots));
-    picker_state::ViewCandidate {
+    picker_state::BufferCandidate {
         buffer_id: buf.id,
         view_id,
         display,
@@ -185,7 +420,6 @@ fn buffer_candidate(
             .as_deref()
             .map(|p| p.to_string_lossy().into_owned()),
         transient: view.transient,
-        view_kind: view.kind(),
     }
 }
 
@@ -310,30 +544,59 @@ pub(crate) fn refresh_git_ref_pickers(s: &mut ServerState, kind: PickerKind) -> 
     pushes
 }
 
-/// Rebuild candidates for every subscribed `Views` picker, re-rank under the existing query,
-/// and collect the resulting `picker/update` pushes. Caller sends them after dropping the lock.
-/// Cheap when no picker is open: a HashMap scan over `pickers` and an early return.
+/// Rebuild and re-push **all three** view-listing pickers — buffers, shells, agents.
+///
+/// What the ordinary "something about the open set changed" call sites want: a view closing, a
+/// workspace activating or a file being renamed can touch any of the three lists, and asking which
+/// at each of twenty call sites is how a list goes stale. Cheap when nothing is open: a HashMap
+/// scan per kind and an early return.
+///
+/// The two places that know exactly which list moved call the per-kind function instead — a run
+/// starting or finishing ([`refresh_shell_pickers`]) and an agent event
+/// ([`refresh_agent_pickers`]) — because those fire often and touch one list each.
 pub(crate) fn refresh_view_pickers(s: &mut ServerState) -> PendingPushes {
-    // Collect client_ids with a *subscribed* view picker. Skip the rest — they may still
+    let mut pushes = refresh_kind_pickers(s, PickerKind::Buffers);
+    pushes.extend(refresh_kind_pickers(s, PickerKind::Shells));
+    pushes.extend(refresh_kind_pickers(s, PickerKind::Agents));
+    pushes
+}
+
+/// Rebuild and re-push every subscribed shells picker — a run started, finished or was cancelled,
+/// which changes a badge and never an order.
+pub(crate) fn refresh_shell_pickers(s: &mut ServerState) -> PendingPushes {
+    refresh_kind_pickers(s, PickerKind::Shells)
+}
+
+/// Rebuild and re-push every subscribed agents picker — a turn started or ended, a permission was
+/// raised or answered, or a handle was dropped.
+pub(crate) fn refresh_agent_pickers(s: &mut ServerState) -> PendingPushes {
+    refresh_kind_pickers(s, PickerKind::Agents)
+}
+
+/// Rebuild candidates for every subscribed picker of one view-listing `kind`, re-rank under the
+/// existing query, and collect the resulting `picker/update` pushes. Caller sends them after
+/// dropping the lock.
+fn refresh_kind_pickers(s: &mut ServerState, kind: PickerKind) -> PendingPushes {
+    // Collect client_ids with a *subscribed* picker of this kind. Skip the rest — they may still
     // have persisted state from a prior session, but they're not waiting for pushes.
     let client_ids: Vec<ClientId> = s
         .pickers
         .iter()
-        .filter_map(|((c, k), p)| (*k == PickerKind::Views && p.subscribed.is_some()).then_some(*c))
+        .filter_map(|((c, k), p)| (*k == kind && p.subscribed.is_some()).then_some(*c))
         .collect();
     let mut pushes = Vec::new();
     for client_id in client_ids {
-        let new_candidates = build_view_candidates(s, client_id);
+        let new_candidates = build_view_candidates(s, client_id, kind);
         let ServerState {
             pickers,
             matcher,
             clients,
             ..
         } = &mut *s;
-        let Some(picker) = pickers.get_mut(&(client_id, PickerKind::Views)) else {
+        let Some(picker) = pickers.get_mut(&(client_id, kind)) else {
             continue;
         };
-        picker.candidates = picker_state::PickerCandidates::Views(new_candidates);
+        picker.candidates = new_candidates;
         picker.rerank(matcher);
         if let Some(window) = picker.subscribed.as_mut() {
             let total = picker.ranked.len() as u32;
@@ -350,6 +613,24 @@ pub(crate) fn refresh_view_pickers(s: &mut ServerState) -> PendingPushes {
         pushes.push((sender, picker_update_notif(update)));
     }
     pushes
+}
+
+/// The candidate set for one of the three view-listing kinds. Panics-free for any other kind: it
+/// answers an empty buffers list, which no caller asks for.
+fn build_view_candidates(
+    s: &ServerState,
+    client_id: ClientId,
+    kind: PickerKind,
+) -> picker_state::PickerCandidates {
+    match kind {
+        PickerKind::Shells => {
+            picker_state::PickerCandidates::Shells(build_shell_candidates(s, client_id))
+        }
+        PickerKind::Agents => {
+            picker_state::PickerCandidates::Agents(build_agent_candidates(s, client_id))
+        }
+        _ => picker_state::PickerCandidates::Buffers(build_buffer_candidates(s, client_id)),
+    }
 }
 
 /// Rebuild and re-push every subscribed `Workspaces` picker. Called after a workspace is created,
@@ -1504,7 +1785,9 @@ fn re_view_build(kind: PickerKind) -> ReViewBuild {
         | PickerKind::GitStash
         | PickerKind::GitBaseline => ReViewBuild::Placeholder,
         // Cheap and live: re-reading them is the point, and a stale list would be the bug.
-        PickerKind::Views
+        PickerKind::Buffers
+        | PickerKind::Shells
+        | PickerKind::Agents
         | PickerKind::Explorer
         | PickerKind::Workspaces
         | PickerKind::LspServers
@@ -1560,9 +1843,9 @@ pub async fn picker_view(
             let git_status = std::sync::Arc::new(build_file_git_status(&files, &roots));
             picker_state::PickerCandidates::Files { files, git_status }
         }
-        PickerKind::Views => {
+        PickerKind::Buffers | PickerKind::Shells | PickerKind::Agents => {
             let s = state.lock().await;
-            picker_state::PickerCandidates::Views(build_view_candidates(&s, client_id))
+            build_view_candidates(&s, client_id, params.kind)
         }
         PickerKind::Grep => picker_state::PickerCandidates::Grep(Vec::new()),
         PickerKind::Explorer => {

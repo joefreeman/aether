@@ -43,6 +43,7 @@ import { truncatePath, charBudget } from "./paths";
 import { rootLabels } from "./labels";
 import { renderHoverDoc, mdToPlain, type MdBlock } from "./markdown";
 import type {
+  AgentRowState,
   ViewOpenResult,
   BufferWindow,
   ViewNode,
@@ -275,6 +276,8 @@ type ConfirmKind =
   | { kind: "recreate_deleted" }
   | { kind: "discard_reload" }
   | { kind: "discard_close"; label: string }
+  | { kind: "close_running_shell"; title: string }
+  | { kind: "close_busy_agent"; title: string }
   | { kind: "delete"; noun: string; name: string }
   | { kind: "remove_root"; path: string }
   | { kind: "remove_project"; path: string }
@@ -320,6 +323,12 @@ function confirmMessage(c: ConfirmKind): string {
       return "Discard local changes and reload?";
     case "discard_close":
       return `Discard unsaved changes in ${c.label}?`;
+    // Closing kills the process group / abandons the turn, so these ask about what stops rather
+    // than what is lost. Matching the native shells' wording.
+    case "close_running_shell":
+      return `${c.title} is still running a command — close it and stop it?`;
+    case "close_busy_agent":
+      return `${c.title} is still working — close it and stop the turn?`;
     case "delete":
       return `Delete ${c.noun} "${c.name}"?`;
     case "remove_root":
@@ -824,9 +833,108 @@ function commitRefParts(refs: CommitRef[]): { text: string; cls: string }[] {
   return out;
 }
 
+/** A shell / agent row's `match_indices` split per rendered field. The wire indices are code-point
+ *  offsets into the composed haystack (`"{title}  {cwd}  {last_command}"` and its agent twin, empty
+ *  parts elided, two spaces between the rest — the server's `shell_haystack` / `agent_haystack`).
+ *  Mirrors the Rust core's `picker::row_match_segments`, which the wasm boundary can't call. */
+export function rowMatchSegments(
+  parts: [string, string, string],
+  matchIndices?: number[],
+): { first: number[]; second: number[]; third: number[] } {
+  const spans: ([number, number] | null)[] = [null, null, null];
+  let at = 0;
+  parts.forEach((part, i) => {
+    const len = [...part].length;
+    if (len === 0) return;
+    if (at > 0) at += 2; // the separator between two emitted parts
+    spans[i] = [at, len];
+    at += len;
+  });
+  const out = { first: [] as number[], second: [] as number[], third: [] as number[] };
+  const sinks = [out.first, out.second, out.third];
+  for (const idx of matchIndices ?? []) {
+    for (let i = 0; i < 3; i++) {
+      const span = spans[i];
+      if (!span) continue;
+      if (idx >= span[0] && idx < span[0] + span[1]) {
+        sinks[i].push(idx - span[0]);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/** The dim tail of a composed row: the second and third haystack parts, joined as the haystack
+ *  joins them. `undefined` when both are empty (a shell that has run nothing in a directory the
+ *  server could not name). */
+export function composedTail(parts: [string, string, string]): string | undefined {
+  const tail = [parts[1], parts[2]].filter((p) => p.length > 0);
+  return tail.length ? tail.join("  ") : undefined;
+}
+
+/** The tail's match offsets: the second part's as they are, the third's shifted past it. */
+export function composedTailMatches(
+  parts: [string, string, string],
+  seg: { second: number[]; third: number[] },
+): number[] | undefined {
+  const secondLen = [...parts[1]].length;
+  const offset = secondLen > 0 ? secondLen + 2 : 0;
+  const out = [...seg.second, ...seg.third.map((i) => i + offset)];
+  return out.length ? out : undefined;
+}
+
+/** A run's duration as a row shows it. Mirrors the core's `labels::format_elapsed`. */
+export function formatElapsed(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const secs = ms / 1000;
+  if (secs < 60) return `${secs.toFixed(1)}s`;
+  const total = Math.floor(ms / 1000);
+  return `${Math.floor(total / 60)}m${String(total % 60).padStart(2, "0")}s`;
+}
+
+/** The shells row's status badge. Mirrors the core's `labels::shell_row_badge` — same words, same
+ *  tones, so the three shells read alike. */
+export function shellRowBadge(item: {
+  running?: boolean;
+  exit?: number;
+  elapsed_ms?: number;
+  dormant?: boolean;
+}): { text: string; cls: string } | undefined {
+  if (item.dormant) return undefined;
+  if (item.running) return { text: "● running", cls: "picker-badge-running" };
+  const took = item.elapsed_ms == null ? "" : `  ${formatElapsed(item.elapsed_ms)}`;
+  if (item.exit === 0) return { text: `✓ 0${took}`, cls: "picker-badge-ok" };
+  if (item.exit != null) return { text: `✗ ${item.exit}${took}`, cls: "picker-badge-bad" };
+  // Ended with no exit code: killed, or stopped for producing too much.
+  if (took) return { text: `stopped${took}`, cls: "picker-badge-muted" };
+  return undefined;
+}
+
+/** The agents row's status badge. Mirrors the core's `labels::agent_row_badge`. */
+export function agentRowBadge(item: {
+  state?: AgentRowState;
+  dormant?: boolean;
+}): { text: string; cls: string } | undefined {
+  if (item.dormant) return undefined;
+  switch (item.state?.state ?? "idle") {
+    case "idle":
+      return undefined;
+    case "thinking":
+      return {
+        text: `● ${(item.state as { activity?: string }).activity ?? "thinking"}`,
+        cls: "picker-badge-running",
+      };
+    case "awaiting_permission":
+      return { text: "● awaiting permission", cls: "picker-badge-bad" };
+    default:
+      return { text: "not connected", cls: "picker-badge-muted" };
+  }
+}
+
 /** Distil a `PickerItem` to its row display. `labels` is the disambiguated per-root label set
  *  (`rootLabels`, "" for single-root); `budget` is the char allowance for paths (segment-elided). */
-function describePickerItem(
+export function describePickerItem(
   item: PickerItem,
   workspacePaths: string[],
   labels: string[],
@@ -848,22 +956,50 @@ function describePickerItem(
         bulletStatus: item.git_status,
       };
     }
-    case "view": {
+    case "buffer": {
       // Multi-root: the dim, disambiguated root label after the name — same placement as the Files
       // picker. `display` is the bare relative path (the match haystack), so highlights land on the
       // path, not the label. `path_index` is absent for scratch/external buffers → no suffix.
       const root =
         labels.length > 1 && item.path_index != null ? labels[item.path_index] : undefined;
-      // The kind badge: a file's reader row says so, dim, after the path; its editor row is the
-      // plain one, as every other file's is.
-      const badge = item.view_kind === "reader" ? "reader" : undefined;
-      const suffix = [badge, root].filter(Boolean).join("  ") || undefined;
+      const suffix = root || undefined;
       return {
         primary: item.display,
         matches: item.match_indices,
         suffix,
         italic: item.transient,
         dirty: item.status && item.status !== "clean" ? item.status : undefined,
+      };
+    }
+    case "shell": {
+      // `Shell 2   ~/proj   cargo test        ● running`. The name leads, its two dim fields
+      // follow, and the badge floats right — the same shape the terminal and GUI paint. The three
+      // parts are the composed haystack in order, so the fuzzy highlight is split across them.
+      const parts: [string, string, string] = [item.title, item.cwd, item.last_command ?? ""];
+      const seg = rowMatchSegments(parts, item.match_indices);
+      const badge = shellRowBadge(item);
+      return {
+        primary: item.title,
+        matches: seg.first,
+        suffix: composedTail(parts),
+        suffixMatches: composedTailMatches(parts, seg),
+        ...(badge ? { metaParts: [badge] } : {}),
+        dim: item.dormant || undefined,
+      };
+    }
+    case "agent": {
+      // `Agent 1   Claude Code   fix the wrap bug…      ● awaiting permission` — the shell row's
+      // shape with the conversation's fields.
+      const parts: [string, string, string] = [item.title, item.agent, item.last_prompt ?? ""];
+      const seg = rowMatchSegments(parts, item.match_indices);
+      const badge = agentRowBadge(item);
+      return {
+        primary: item.title,
+        matches: seg.first,
+        suffix: composedTail(parts),
+        suffixMatches: composedTailMatches(parts, seg),
+        ...(badge ? { metaParts: [badge] } : {}),
+        dim: item.dormant || undefined,
       };
     }
     case "grep_hit": {
@@ -1916,8 +2052,7 @@ export class Shell {
         // was last shown, landing a `#line:col` link in the editor. (Only honored for a
         // URL-directed open — on a fallback landing the param describes a view we didn't open.)
         const urlAs = directed ? sp.get("as") : null;
-        const kind =
-          urlAs === "reader" ? { kind: "reader" } : urlAs === "editor" ? { kind: "editor" } : {};
+        const kind = urlAs === "reader" ? { read: true } : urlAs === "editor" ? { read: false } : {};
         if (urlFile) {
           try {
             open = await this.client.rpc<ViewOpenResult>("view/open", {
@@ -4593,7 +4728,7 @@ export class Shell {
         return fromPath(item.path_index, item.relative_path);
       case "grep_hit":
         return fromPath(item.path_index, item.relative_path, `#${item.line + 1}:${item.col + 1}`);
-      case "view": {
+      case "buffer": {
         if (item.path_index != null && item.relative_path != null) {
           return fromPath(item.path_index, item.relative_path);
         }

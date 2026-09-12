@@ -25,10 +25,24 @@ use serde::{Deserialize, Serialize};
 pub enum PickerKind {
     /// Workspace files, fuzzy-matched on path.
     Files,
-    /// Open views, ordered by most-recently-used — a file's editor and its reader are two rows —
-    /// then the kept ones, then the session's dormant rows. The current view sits at position 0
-    /// and selecting it is a no-op switch.
-    Views,
+    /// The workspace's **buffers**, ordered by most-recently-used — then the kept-but-unvisited
+    /// ones, then the session's dormant rows. The current view sits at position 0 and selecting it
+    /// is a no-op switch.
+    ///
+    /// A buffer is *a thing you reached on purpose that is not a shell and not an agent*: files,
+    /// scratches, and the read-only git views (a commit's patch, a file at a revision, the working
+    /// changes). Shells and conversations have pickers of their own ([`Self::Shells`],
+    /// [`Self::Agents`]) because their rows answer different questions — what is running, and how
+    /// it went. One row per buffer: how a client is reading a markdown file is that client's
+    /// presentation of it, not a row.
+    Buffers,
+    /// The workspace's shell views, most-recently-used first, then its dormant (session-restored,
+    /// not-yet-loaded) ones. Rows are [`PickerItem::Shell`]; status is a badge, never a sort key,
+    /// so a run starting or finishing re-paints a row and never reorders the list.
+    Shells,
+    /// The workspace's agent conversations, ordered exactly as [`Self::Shells`] is. Rows are
+    /// [`PickerItem::Agent`].
+    Agents,
     /// Workspace-wide content search. Each candidate is a single match on a single line; the query
     /// *is* the search (no fuzzy filtering on a pre-built candidate set), so query changes throw
     /// out the prior candidates and start a fresh scan. Each open starts a *fresh* search: query,
@@ -340,16 +354,18 @@ impl PickerKind {
     }
 
     /// Whether `jumplist/capture` (picker `Ctrl-j`) applies — the position-shaped kinds, whose rows
-    /// are jump targets *into* a file, plus the file-shaped [`Self::Files`] and [`Self::Views`],
+    /// are jump targets *into* a file, plus the file-shaped [`Self::Files`] and [`Self::Buffers`],
     /// whose rows are whole targets with no position (they capture as position-less entries and
     /// open where the cursor last sat). Excludes the non-jump kinds (Explorer, Workspaces,
-    /// LspServers, Keybindings). Includes [`Self::Jumplist`] itself: capturing there replaces the
-    /// list with the picker's currently-filtered subset — iterative narrowing.
+    /// LspServers, Keybindings) — and [`Self::Shells`] / [`Self::Agents`], whose rows are not
+    /// places in a file at all: a transcript row is a session you return to, and a captured set of
+    /// them would be a jumplist you cannot step. Includes [`Self::Jumplist`] itself: capturing
+    /// there replaces the list with the picker's currently-filtered subset — iterative narrowing.
     pub fn captures_to_jumplist(self) -> bool {
         matches!(
             self,
             PickerKind::Files
-                | PickerKind::Views
+                | PickerKind::Buffers
                 | PickerKind::Grep
                 | PickerKind::Diagnostics
                 | PickerKind::DiagnosticsWorkspace
@@ -362,7 +378,7 @@ impl PickerKind {
 
     /// Whether a jumplist captured *from* this kind carries group headers. The position-shaped
     /// sources group by file (or keep their section labels); the file-shaped ones
-    /// ([`Self::Files`], [`Self::Views`]) have exactly one entry per target, so a per-file
+    /// ([`Self::Files`], [`Self::Buffers`]) have exactly one entry per target, so a per-file
     /// header would just repeat its own row — they capture ungrouped and the Jumplist picker
     /// renders them flat ([`PickerViewResult::collapsible`]). Grouping is all-or-nothing per
     /// capture: that uniformity is what keeps the collapsible row space's "every row is keyed"
@@ -371,7 +387,7 @@ impl PickerKind {
     /// [`Self::Jumplist`] isn't listed — a re-capture inherits whatever the entries already
     /// carry rather than consulting this.
     pub fn groups_in_jumplist(self) -> bool {
-        self.captures_to_jumplist() && !matches!(self, PickerKind::Files | PickerKind::Views)
+        self.captures_to_jumplist() && !matches!(self, PickerKind::Files | PickerKind::Buffers)
     }
 }
 
@@ -504,6 +520,28 @@ impl SymbolKind {
     }
 }
 
+/// What an agent conversation is doing, as the agents picker paints it. A badge, never a sort key
+/// — the list is ordered by recency, so a turn starting re-paints a row rather than moving it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AgentRowState {
+    /// Connected with nothing in flight — ready for a prompt.
+    #[default]
+    Idle,
+    /// A turn is running. `activity` is the title of the tool call it is working through, when it
+    /// has said; `None` while it is thinking with no tool named.
+    Thinking {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity: Option<String>,
+    },
+    /// Blocked on us: the agent has asked permission and the turn cannot proceed until it is
+    /// answered (`Space v a` / `Space v d`).
+    AwaitingPermission,
+    /// No agent behind the conversation — restored from disk and not yet reconnected (an agent is
+    /// a subprocess, and one starts on the first prompt), or one whose process has gone.
+    Disconnected,
+}
+
 /// A pickable item. Tagged enum so different pickers can carry the data they need; match-index
 /// highlighting rides in `match_indices` (char positions within the display string).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,21 +564,16 @@ pub enum PickerItem {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         git_status: Option<GitStatus>,
     },
-    /// An open (or dormant) view. Identity is `view_id`; `buffer_id` is what it shows — stable
+    /// An open (or dormant) buffer. Identity is `view_id`; `buffer_id` is what it shows — stable
     /// across rename / Save-As, where the `display` string would change. `status` is captured at
     /// row-build time and may go stale between pushes (an active picker re-pushes on status
-    /// transitions).
-    View {
+    /// transitions). One row per buffer: how a client is reading a markdown file is that client's
+    /// presentation of it, not a view of its own, so nothing about it rides here.
+    Buffer {
         buffer_id: BufferId,
-        /// The row's **view**: what selecting the row presents and what closing it closes. A
-        /// file's editor and its reader are two rows, sharing `buffer_id`.
+        /// The row's **view**: what selecting the row presents and what closing it closes.
         #[serde(default)]
         view_id: crate::ViewId,
-        /// Which kind of view the row is, for the badge that tells a file's reader from its
-        /// editor. Absent for a view a driver built, and for a dormant row, whose kind nothing
-        /// knows until it is opened.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        view_kind: Option<crate::ui::ViewKind>,
         /// What the row renders: workspace-relative path for file-backed buffers, `(scratch N)`
         /// for scratch buffers. Also the haystack the matcher scores against.
         display: String,
@@ -562,6 +595,74 @@ pub enum PickerItem {
         /// Captured at row-build time, like `status`; an active picker re-pushes on changes.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         transient: bool,
+    },
+    /// One shell view, live or dormant. Identity is `view_id`.
+    ///
+    /// The fuzzy haystack is `"{title}  {cwd}  {last_command}"` (the empty parts elided) — that
+    /// composition is a **wire contract**: the server scores against it and `match_indices` are
+    /// char offsets into it, so a shell rendering the three fields separately must split the
+    /// offsets the same way the server joined them.
+    ///
+    /// Status is a badge, never a sort key: `running` / `exit` / `elapsed_ms` describe the last
+    /// run and change under an open picker without moving the row.
+    Shell {
+        /// The row's view: what selecting the row presents and what closing it closes.
+        view_id: crate::ViewId,
+        /// `Shell N` — the shell's own name, and the head of the haystack.
+        title: String,
+        /// Where the next command would run, already shortened to `~/...` when it is under the
+        /// user's home — the same string the run boxes inside the shell wear. Shortened
+        /// server-side rather than per shell: the server is the one that knows the home directory
+        /// (the browser client does not), and the haystack must hold the same string the row shows
+        /// or the fuzzy highlight would land off the text. Empty for a dormant row, whose directory
+        /// is in a snapshot nothing has read yet.
+        cwd: String,
+        /// The last command this shell ran, or `None` for one that has run nothing yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_command: Option<String>,
+        /// A run is in flight. Then `exit` and `elapsed_ms` are the *previous* run's, if any —
+        /// which is why they are three fields and not one status enum.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        running: bool,
+        /// The last finished run's exit code. `None` for a shell that has finished no run, and
+        /// for one killed or truncated rather than exited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit: Option<i32>,
+        /// How long the last finished run took.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
+        /// A session-restored shell nothing has opened yet: its transcript is on disk and the row
+        /// materialises it on select. It has no live run, so `running` is always false here.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dormant: bool,
+        /// Char offsets into the composed haystack described above.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One agent conversation, live or dormant. Identity is `view_id`.
+    ///
+    /// The fuzzy haystack is `"{title}  {agent}  {last_prompt}"` (the empty parts elided) — a
+    /// **wire contract**, exactly as [`Self::Shell`]'s is.
+    Agent {
+        /// The row's view: what selecting the row presents and what closing it closes.
+        view_id: crate::ViewId,
+        /// `Agent N` — the conversation's own name, and the head of the haystack.
+        title: String,
+        /// The agent behind it, by its display name (`Claude Code`), not its id.
+        agent: String,
+        /// What it is doing, as a badge.
+        #[serde(default)]
+        state: AgentRowState,
+        /// The last thing the user said to it, or `None` for a conversation with nothing in it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_prompt: Option<String>,
+        /// A session-restored conversation nothing has opened yet: a record on disk with no
+        /// subprocess behind it. Its state is always [`AgentRowState::Disconnected`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dormant: bool,
+        /// Char offsets into the composed haystack described above.
+        #[serde(default)]
+        match_indices: Vec<u32>,
     },
     /// One match found by the grep picker. Identity is `(path_index, relative_path, line, col)`.
     /// One row per match (a line with N matches produces N hits) — keeps `match_indices` a flat
@@ -1423,8 +1524,9 @@ pub struct PickerSelectParams {
 }
 
 /// Per-kind action result. For `Files`, the canonical absolute path the client should open
-/// (via `view/open`). For `Views`, the `view_id` the client should present (via
-/// `view/open { view_id }`). For `Grep`, the canonical absolute path plus the position to
+/// (via `view/open`). For `Buffers` / `Shells` / `Agents`, the `view_id` the client should present
+/// (via `view/open { view_id }`) — one variant serves all three, because presenting a row is the
+/// same act whatever the row is. For `Grep`, the canonical absolute path plus the position to
 /// jump to (client opens via `view/open { jump_to }`). The picker handler doesn't perform the
 /// switch itself — that's the client's job, same as the file browser flow.
 #[derive(Debug, Serialize, Deserialize)]

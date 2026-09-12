@@ -1583,6 +1583,13 @@ a.picker-row:not(.selected):hover .picker-main {
 /* Divergence counts on branch rows, in the frost blue the status bar gives them — they annotate the
    branch, not the commit line, so they must not read as more dim metadata. */
 .picker-meta-accent { color: var(--accent-alt); }
+/* Shells / agents row status badges. One tone table with the native shells'
+   `Theme::row_badge`: running is informational, a finished run's outcome is ok/error, and anything
+   at rest is faint. */
+.picker-badge-running { color: var(--info); }
+.picker-badge-ok { color: var(--ok); }
+.picker-badge-bad { color: var(--error); }
+.picker-badge-muted { color: var(--fg-faint); }
 /* Right-aligned buffer-state dot (buffer + workspace rows): `margin-left: auto` pushes it to the
    far edge. Colours match the editor status bar / favicon; the dot itself is the shared
    `.buffer-status-dot` circle, so size parity with the status bar holds by construction. */

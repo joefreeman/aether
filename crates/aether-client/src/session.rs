@@ -732,6 +732,14 @@ pub enum ConfirmKind {
     DiscardOnReload,
     /// Closing a buffer with unsaved changes. `label` is the buffer's display label.
     DiscardOnClose { label: String },
+    /// Closing a shell with a command still running. Closing the view kills the process group, so
+    /// this is the same class of question as discarding unsaved text: something that is happening
+    /// stops happening. `title` is the shell's name (`Shell 2`).
+    CloseRunningShell { title: String },
+    /// Closing an agent conversation with a turn still in flight — including one blocked on a
+    /// permission request, which is a turn that has not finished either. `title` is the
+    /// conversation's name (`Agent 1`).
+    CloseBusyAgent { title: String },
     /// Trashing a file/directory from the Files/Explorer picker. `noun` is "file"/"directory".
     Delete { noun: &'static str, name: String },
     /// Removing a root from the workspace-settings overlay.
@@ -809,7 +817,9 @@ pub enum ConfirmAction {
     /// picker selection may have moved by the time the confirm resolves. The picker stays open and
     /// re-lists from the server's `picker/update` push.
     ClosePickerView {
-        buffer_id: BufferId,
+        /// The row's buffer, for the tether check. `None` for a shell or an agent row, neither of
+        /// which can be the tether (that is always a file the caller handed us).
+        buffer_id: Option<BufferId>,
         view_id: ViewId,
     },
     /// Trash a file/directory from the Files/Explorer picker (`path/delete`). `noun` is
@@ -880,8 +890,10 @@ pub enum Pending {
     /// (`crates/aether-client/src/keymap.rs`). Its own variant rather than a flag on `Leader` so
     /// the shells can say *which* chord is in flight; the awaiting-key cursor treats both alike.
     LeaderGit,
-    /// `Space n` pressed: the next keystroke is looked up in [`crate::keymap::KeyContext::LeaderAgent`]
-    LeaderAgent,
+    /// `Space v` pressed: the next keystroke is looked up in
+    /// [`crate::keymap::KeyContext::LeaderView`] — the verbs of the view you are in (stop what it
+    /// is running, answer what an agent is asking).
+    LeaderView,
     Find {
         dir: Direction,
         till: bool,
@@ -1038,6 +1050,8 @@ impl ViewState {
             view_id,
             scroll,
             transient,
+            // How the window will present the file is the window's to say (`sync_read_presentation`).
+            read: _,
             buffer,
         } = open;
         let mut buffer = buffer_info(buffer, roots);
@@ -1124,6 +1138,8 @@ impl ViewState {
             view_id,
             scroll,
             transient,
+            // How the window will present the file is the window's to say (`sync_read_presentation`).
+            read: _,
             buffer,
         } = open;
         let mut buffer = buffer_info(buffer, roots);
@@ -1250,11 +1266,11 @@ pub struct Session {
     /// A map rather than one slot, because a workspace can have several shells and several of them
     /// can be building at once: the indicator names the *focused* shell's command when it is
     /// running and counts the others when they are not, which is a question only the whole set can
-    /// answer. Keyed by view id, so `Space Alt-b` knows which one it is stopping.
+    /// answer. Keyed by view id, so `Space v c` knows which one it is stopping.
     pub shell_runs: std::collections::HashMap<ViewId, aether_protocol::shell::RunState>,
     /// The turn each agent conversation is running, pushed by `agent/turn_changed` and rendered in
     /// the same status-bar slot as the shell's. A map for the same reason that one is: a workspace
-    /// can hold several conversations and more than one can be working at once, and `Space n c`
+    /// can hold several conversations and more than one can be working at once, and `Space v c`
     /// needs to know which it is stopping.
     pub agent_turns: std::collections::HashMap<ViewId, aether_protocol::agent::TurnState>,
     /// The line a `shell/run` in flight was sent with. Recorded into the shell history only once
@@ -1915,6 +1931,7 @@ impl Session {
                 view_id: Default::default(),
                 scroll: Default::default(),
                 transient: Default::default(),
+                read: Default::default(),
                 buffer: BufferDescription {
                     buffer_id: Default::default(),
                     language: Default::default(),

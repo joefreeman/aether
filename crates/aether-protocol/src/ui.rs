@@ -260,21 +260,6 @@ impl ElementRole {
     }
 }
 
-/// The two views a client can ask for over one file: its source in the editor, or the document
-/// its source describes, laid out by the client and read at block grain.
-///
-/// What an open *asks for* (`view/open { kind }`), and what a view then is for its whole life:
-/// a file's editor and its reader are two views, each with its own scroll, sharing the cursor.
-/// A driver's view — a patch — is neither and ignores the request. Which kind a view is shows in
-/// its window as the element's [`LayoutOwner`]. A client that has no opinion sends nothing and
-/// gets the file's most recently used view, or the app setting's kind for a file with none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ViewKind {
-    Editor,
-    Reader,
-}
-
 impl Element {
     pub fn column(children: Vec<Element>) -> Element {
         Element::Column {

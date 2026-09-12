@@ -441,7 +441,9 @@ pub fn picker_placeholder(kind: Option<PickerKind>) -> &'static str {
     };
     match kind {
         PickerKind::Files => "Find files…",
-        PickerKind::Views => "Switch view…",
+        PickerKind::Buffers => "Switch buffer…",
+        PickerKind::Shells => "Switch shell…",
+        PickerKind::Agents => "Switch agent…",
         PickerKind::Grep => "Grep workspace…",
         PickerKind::Explorer => "Explore files…",
         PickerKind::Workspaces => "Select workspace…",
@@ -555,6 +557,89 @@ pub fn format_blame_at(now_unix_secs: i64, b: &aether_protocol::git::BlameInfo) 
     }
 }
 
+/// How a shells / agents picker row's badge should read — the colour is each shell's choice, the
+/// meaning is shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowBadgeTone {
+    /// Something is happening right now.
+    Running,
+    /// It finished and it worked.
+    Ok,
+    /// It finished and it did not.
+    Bad,
+    /// Nothing is happening, and that is not news.
+    Muted,
+}
+
+/// The shells picker row's status badge: `● running`, `✓ 0  3.2s`, `✗ 101  1.2s`, `stopped  1.2s`.
+/// `None` for a shell that has run nothing, and for a dormant row (whose transcript is on disk and
+/// whose runs are therefore all in the past — the row's own dimming says "not loaded").
+///
+/// No live duration on a running row: the picker re-pushes on transitions, not on a timer, so a
+/// counter drawn here would freeze at whatever second the run started.
+pub fn shell_row_badge(
+    running: bool,
+    exit: Option<i32>,
+    elapsed_ms: Option<u64>,
+    dormant: bool,
+) -> Option<(String, RowBadgeTone)> {
+    if dormant {
+        return None;
+    }
+    if running {
+        return Some(("● running".into(), RowBadgeTone::Running));
+    }
+    let took = elapsed_ms.map(|ms| format!("  {}", format_elapsed(ms)));
+    match (exit, took) {
+        (Some(0), took) => Some((format!("✓ 0{}", took.unwrap_or_default()), RowBadgeTone::Ok)),
+        (Some(code), took) => Some((
+            format!("✗ {code}{}", took.unwrap_or_default()),
+            RowBadgeTone::Bad,
+        )),
+        // No exit code and yet it ended: killed, or stopped for producing too much. Both end with
+        // the process group killed, which is what "stopped" says without claiming an outcome.
+        (None, Some(took)) => Some((format!("stopped{took}"), RowBadgeTone::Muted)),
+        (None, None) => None,
+    }
+}
+
+/// The agents picker row's status badge. `None` for an idle conversation and for a dormant row —
+/// "ready" is the resting state and does not need saying.
+pub fn agent_row_badge(
+    state: &aether_protocol::picker::AgentRowState,
+    dormant: bool,
+) -> Option<(String, RowBadgeTone)> {
+    use aether_protocol::picker::AgentRowState as S;
+    if dormant {
+        return None;
+    }
+    match state {
+        S::Idle => None,
+        // The agent's own words for what it is doing, when it has said any.
+        S::Thinking { activity } => Some((
+            format!("● {}", activity.as_deref().unwrap_or("thinking")),
+            RowBadgeTone::Running,
+        )),
+        S::AwaitingPermission => Some(("● awaiting permission".into(), RowBadgeTone::Bad)),
+        S::Disconnected => Some(("not connected".into(), RowBadgeTone::Muted)),
+    }
+}
+
+/// A run's duration, as a row shows it: `840ms`, `3.2s`, `1m04s`. The spelling the shell view's own
+/// run boxes already use (`aether-server`'s `shell::format_elapsed`), so the box and the row cannot
+/// disagree about how long the same run took.
+pub fn format_elapsed(ms: u64) -> String {
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    let secs = ms as f64 / 1000.0;
+    if secs < 60.0 {
+        return format!("{secs:.1}s");
+    }
+    let total = ms / 1000;
+    format!("{}m{:02}s", total / 60, total % 60)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +740,80 @@ mod tests {
         assert!(format_blame(&committed).starts_with("Ada · "));
     }
 
+    /// The shells row's badge — one table, read by all three shells, so `✓ 0  3.2s` reads the
+    /// same in the terminal, the GUI and the browser.
+    #[test]
+    fn a_shells_row_badge_reports_the_last_run() {
+        assert_eq!(
+            shell_row_badge(true, None, None, false),
+            Some(("● running".into(), RowBadgeTone::Running))
+        );
+        // While a run is going, the previous run's outcome is still on the row's other fields —
+        // the badge is what changes.
+        assert_eq!(
+            shell_row_badge(true, Some(0), Some(3200), false),
+            Some(("● running".into(), RowBadgeTone::Running))
+        );
+        assert_eq!(
+            shell_row_badge(false, Some(0), Some(3200), false),
+            Some(("✓ 0  3.2s".into(), RowBadgeTone::Ok))
+        );
+        assert_eq!(
+            shell_row_badge(false, Some(101), Some(1200), false),
+            Some(("✗ 101  1.2s".into(), RowBadgeTone::Bad))
+        );
+        // Killed or truncated: it ended, but with no exit code to report.
+        assert_eq!(
+            shell_row_badge(false, None, Some(1200), false),
+            Some(("stopped  1.2s".into(), RowBadgeTone::Muted))
+        );
+        // A shell that has run nothing, and a dormant row, wear none at all.
+        assert_eq!(shell_row_badge(false, None, None, false), None);
+        assert_eq!(shell_row_badge(false, Some(0), Some(10), true), None);
+    }
+
+    /// The agents row's badge. Idle says nothing — "ready" is the resting state — and a blocked
+    /// conversation is the one that has to stand out.
+    #[test]
+    fn an_agents_row_badge_reports_what_it_is_doing() {
+        use aether_protocol::picker::AgentRowState as S;
+        assert_eq!(agent_row_badge(&S::Idle, false), None);
+        assert_eq!(
+            agent_row_badge(&S::Thinking { activity: None }, false),
+            Some(("● thinking".into(), RowBadgeTone::Running))
+        );
+        assert_eq!(
+            agent_row_badge(
+                &S::Thinking {
+                    activity: Some("Reading src/lib.rs".into())
+                },
+                false
+            ),
+            Some(("● Reading src/lib.rs".into(), RowBadgeTone::Running))
+        );
+        assert_eq!(
+            agent_row_badge(&S::AwaitingPermission, false),
+            Some(("● awaiting permission".into(), RowBadgeTone::Bad))
+        );
+        assert_eq!(
+            agent_row_badge(&S::Disconnected, false),
+            Some(("not connected".into(), RowBadgeTone::Muted))
+        );
+        // A dormant row is dimmed rather than badged: there is no process to describe.
+        assert_eq!(agent_row_badge(&S::Disconnected, true), None);
+    }
+
+    #[test]
+    fn elapsed_reads_as_quick_slow_or_very_slow() {
+        assert_eq!(format_elapsed(0), "0ms");
+        assert_eq!(format_elapsed(840), "840ms");
+        assert_eq!(format_elapsed(999), "999ms");
+        assert_eq!(format_elapsed(1000), "1.0s");
+        assert_eq!(format_elapsed(3249), "3.2s");
+        assert_eq!(format_elapsed(64000), "1m04s");
+        assert_eq!(format_elapsed(3_601_000), "60m01s");
+    }
+
     /// One table, read by every shell. The `match` is exhaustive so a new kind can't slip through
     /// without a prompt; this pins the house style and the no-kind fallback.
     #[test]
@@ -663,7 +822,9 @@ mod tests {
         assert_eq!(picker_placeholder(None), "Search…");
         for kind in [
             Files,
-            Views,
+            Buffers,
+            Shells,
+            Agents,
             Grep,
             Explorer,
             Workspaces,

@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 /// How long a cancelled group gets to exit on `SIGTERM` before `SIGKILL`. Long enough for a
-/// shell to run a trap and for git to unlink a lock file; short enough that `Space Alt-b` feels
+/// shell to run a trap and for git to unlink a lock file; short enough that `Space v c` feels
 /// like it worked.
 const KILL_GRACE: Duration = Duration::from_millis(300);
 

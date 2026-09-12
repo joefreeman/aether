@@ -40,6 +40,7 @@ pub async fn viewport_subscribe(
         marker_width: params.continuation_marker_width,
         tab_width: params.tab_width,
     };
+    let reading = s.reads(client_id, params.view_id);
     let (focused, loaded, anchor) = {
         let view = s.view(params.view_id);
         let last = view.elements.len().saturating_sub(1) as aether_protocol::viewport::FieldId;
@@ -52,7 +53,7 @@ pub async fn viewport_subscribe(
         let layout = s.layout_of(&view.elements);
         let binding = &view.elements[anchor_element as usize];
         let range = layout.element_range(anchor_element);
-        let (geom, phantoms) = element_geometry(&s, binding, geom, params.diff_view);
+        let (geom, phantoms) = element_geometry(&s, binding, geom, params.diff_view, reading);
         let doc = s.doc_of(binding.buffer_id);
         let line = params.scroll.line.clamp(
             range.start(),
@@ -64,7 +65,7 @@ pub async fn viewport_subscribe(
         // `whole_if_client_laid_out`.
         let from_row = element_rows_before(doc, geom, &phantoms, range, line)
             .saturating_sub(params.overscan_rows);
-        let slice = whole_if_client_laid_out(binding, range, || {
+        let slice = whole_if_client_laid_out(binding, reading, range, || {
             slice_from(
                 doc,
                 geom,
@@ -114,7 +115,7 @@ pub async fn viewport_subscribe(
     // client's sticky setting. Hunks are seeded on open (`load_baseline`) and kept fresh per edit,
     // so they're accurate here without the recompute `git_set_diff_view` does.
     let window = render_viewport(&s, viewport_id, SneakLabels::Shown);
-    s.last_scroll.insert((client_id, params.view_id), anchor);
+    s.remember_scroll(client_id, params.view_id, viewport_id, anchor);
     tracing::debug!(%client_id, viewport_id, buffer_id, element = anchor.element, line = anchor.line, "viewport subscribed");
 
     // One logical viewport per client: a new subscribe supersedes the client's previous
@@ -131,6 +132,9 @@ pub async fn viewport_subscribe(
         let mut buffers: Vec<BufferId> = Vec::new();
         for id in stale {
             if let Some(v) = s.viewports.remove(&id) {
+                // Hidden: its view's scroll memory takes the cursor as it stands, which is what an
+                // open of that view later checks before restoring the scroll.
+                s.stamp_hidden_cursor(&v);
                 // Everything that viewport was showing, not just the element under its cursor. A
                 // composed view keeps its own document *and* a buffer per element alive; naming
                 // only the focused one meant navigating away from working changes left the patch
@@ -151,14 +155,21 @@ pub async fn viewport_subscribe(
         }
         buffers
     };
-    let (closed, stopped_servers, closed_views) = s.close_orphaned_transients(left_buffers);
+    // Read before the collect: a closed buffer has already lost its workspace association.
+    let leaving_workspace = s.active_workspace(client_id).map(|w| w.id.clone());
+    let (closed, stopped_servers) = s.close_orphaned_transients(left_buffers);
     let mut pushes = Vec::new();
-    if !closed.is_empty() || !closed_views.is_empty() {
+    if !closed.is_empty() {
         for &id in &closed {
             tracing::debug!(buffer_id = id, "transient buffer closed (hidden)");
         }
-        for view in &closed_views {
-            tracing::debug!(%view, "transient view closed (hidden)");
+        // Moving on is a user action, so the session may be brought up to date here — unlike the
+        // collector's other two callers (disconnect, workspace-leave), which run with nobody
+        // asking and must leave the preview they close standing in the file. This subscribe is the
+        // request that actually collects the preview you navigated away from: the `view/open`
+        // before it wrote a list that still named it, because nothing had hidden it yet.
+        if let Some(workspace) = &leaving_workspace {
+            s.dirty_session(workspace);
         }
         pushes.extend(refresh_view_pickers(&mut s));
     }
@@ -1160,6 +1171,7 @@ pub async fn viewport_window(
     let loaded = {
         let vp = &s.viewports[&params.viewport_id];
         let view = s.view_of(vp);
+        let reading = s.reads(vp.client_id, vp.view_id);
         let layout = s.layout_of(&view.elements);
         let geom = vp.wrap_geometry();
         let mut loaded: Vec<Option<std::ops::Range<u32>>> = vec![None; view.elements.len()];
@@ -1168,8 +1180,8 @@ pub async fn viewport_window(
                 continue;
             };
             let range = layout.element_range(req.element);
-            let (geom, phantoms) = element_geometry(&s, binding, geom, vp.diff_view);
-            let slice = whole_if_client_laid_out(binding, range, || {
+            let (geom, phantoms) = element_geometry(&s, binding, geom, vp.diff_view, reading);
+            let slice = whole_if_client_laid_out(binding, reading, range, || {
                 slice_from(
                     s.doc_of(binding.buffer_id),
                     geom,
@@ -1190,7 +1202,7 @@ pub async fn viewport_window(
     vp.anchor = params.anchor;
     let view_id = vp.view_id;
     // Where the client is, as content, so a reopen of this view restores it.
-    s.last_scroll.insert((client_id, view_id), params.anchor);
+    s.remember_scroll(client_id, view_id, params.viewport_id, params.anchor);
     let window = render_viewport(&s, params.viewport_id, SneakLabels::Shown);
     Ok(ViewportWindowResult { window })
 }
@@ -1230,6 +1242,7 @@ pub async fn viewport_window_at_cursor(
     let (loaded, anchor) = {
         let vp = &s.viewports[&params.viewport_id];
         let view = s.view_of(vp);
+        let reading = s.reads(vp.client_id, vp.view_id);
         let layout = s.layout_of(&view.elements);
         let geom = vp.wrap_geometry();
         let element = vp
@@ -1242,7 +1255,7 @@ pub async fn viewport_window_at_cursor(
             .get(&(client_id, binding.buffer_id))
             .copied()
             .unwrap_or_default();
-        let (geom, phantoms) = element_geometry(&s, binding, geom, vp.diff_view);
+        let (geom, phantoms) = element_geometry(&s, binding, geom, vp.diff_view, reading);
         let doc = s.doc_of(binding.buffer_id);
         // Clamped into the element: its extent is a claim about the buffer that a rebuild between
         // the ask and the answer could have outrun.
@@ -1252,7 +1265,7 @@ pub async fn viewport_window_at_cursor(
         );
         let from_row = element_rows_before(doc, geom, &phantoms, range, line)
             .saturating_sub(vp.rows / 3 + vp.overscan_rows);
-        let slice = whole_if_client_laid_out(binding, range, || {
+        let slice = whole_if_client_laid_out(binding, reading, range, || {
             slice_from(
                 doc,
                 geom,
@@ -1277,7 +1290,7 @@ pub async fn viewport_window_at_cursor(
     vp.loaded = loaded;
     vp.anchor = anchor;
     let view_id = vp.view_id;
-    s.last_scroll.insert((client_id, view_id), anchor);
+    s.remember_scroll(client_id, view_id, params.viewport_id, anchor);
     let window = render_viewport(&s, params.viewport_id, SneakLabels::Shown);
     Ok(ViewportWindowResult { window })
 }
@@ -1355,6 +1368,7 @@ fn reseat_orphaned_slices(s: &mut ServerState, buffer_id: BufferId) {
     for id in ids {
         let vp = &s.viewports[&id];
         let elements = &s.view_of(vp).elements;
+        let reading = s.reads(vp.client_id, vp.view_id);
         let layout = s.layout_of(elements);
         let want = vp.rows + 2 * vp.overscan_rows;
         let reseat: Vec<(usize, std::ops::Range<u32>)> = elements
@@ -1374,7 +1388,7 @@ fn reseat_orphaned_slices(s: &mut ServerState, buffer_id: BufferId) {
                 let last_screen = end.saturating_sub(want).max(range.start())..end;
                 Some((
                     idx,
-                    whole_if_client_laid_out(binding, range, || last_screen),
+                    whole_if_client_laid_out(binding, reading, range, || last_screen),
                 ))
             })
             .collect();
@@ -2192,6 +2206,11 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         vp.focused,
         vp.diff_view,
     );
+    // Whether this client is *reading* the view — a markdown file it asked to see as the rendered
+    // document. A fact about the client, not the view: the same element goes out as prose here
+    // and as lines to a client editing it, which is why it is read off the viewport's client and
+    // not off the binding.
+    let reading = s.reads(client_id, vp.view_id);
     let geom = vp.wrap_geometry();
     // Each element's lines as the buffer has them now — the clamp that keeps a stale extent, or a
     // stale loaded slice, from indexing past the end of a rope.
@@ -2216,7 +2235,7 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
     // already reached it, so the bottom of the screen went blank.
     let geometry: Vec<(wrap::WrapGeometry, HashMap<u32, u32>)> = elements
         .iter()
-        .map(|binding| element_geometry(s, binding, geom, diff_view))
+        .map(|binding| element_geometry(s, binding, geom, diff_view, reading))
         .collect();
 
     // Render each element's loaded slice, if it has one. An element with nothing loaded contributes
@@ -2238,8 +2257,9 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         let (geom, phantom_rows) = &geometry[idx];
         let geom = *geom;
         // Prose ships its parse and nothing else: rendering its lines as well would wrap, highlight
-        // and diff text no shell will ever paint, on every frame of a conversation.
-        let prose = binding.prose.then(|| element_prose(doc, range));
+        // and diff text no shell will ever paint, on every frame of a conversation. An element is
+        // prose by construction (an agent's reply) or because this client reads the file.
+        let prose = (binding.prose || reading).then(|| element_prose(doc, range));
         let (first_row, first_buffer_line, lines) = match loaded.filter(|_| prose.is_none()) {
             Some(r) => (
                 element_rows_before(doc, geom, phantom_rows, range, r.start()),
@@ -2324,14 +2344,18 @@ fn element_prose(doc: &Document, range: BufferRange) -> (Vec<aether_markdown::Bl
 /// row is a line and nothing the server could add to the count would survive the client's
 /// measure. Every path that counts an element's rows — the subscribe, a window request, a cursor
 /// window, the render — takes its geometry from here, so no path can wrap what another sent whole.
+///
+/// `reading` is the viewport's client reading the view ([`ServerState::reads`]): its one element
+/// then goes out as prose, which the client lays out, whatever the binding says.
 fn element_geometry(
     s: &ServerState,
     binding: &ElementBinding,
     geom: wrap::WrapGeometry,
     diff_view: bool,
+    reading: bool,
 ) -> (wrap::WrapGeometry, HashMap<u32, u32>) {
     let geom = inset(geom, binding.edges);
-    match binding.laid_out_by {
+    match layout_owner(binding, reading) {
         aether_protocol::ui::LayoutOwner::Server => {
             (geom, element_phantom_rows(s, binding, diff_view))
         }
@@ -2342,6 +2366,16 @@ fn element_geometry(
             },
             HashMap::new(),
         ),
+    }
+}
+
+/// Who lays `binding` out for a viewport whose client is (or is not) reading the view: the client,
+/// when the element is prose — by construction, or because the client reads it.
+fn layout_owner(binding: &ElementBinding, reading: bool) -> aether_protocol::ui::LayoutOwner {
+    if reading {
+        aether_protocol::ui::LayoutOwner::Client
+    } else {
+        binding.laid_out_by
     }
 }
 
@@ -2377,10 +2411,11 @@ fn inset(geom: wrap::WrapGeometry, edges: aether_protocol::ui::Edges) -> wrap::W
 /// push, reseat and re-render of the element whole too.
 fn whole_if_client_laid_out(
     binding: &ElementBinding,
+    reading: bool,
     range: BufferRange,
     screen: impl FnOnce() -> std::ops::Range<u32>,
 ) -> std::ops::Range<u32> {
-    match binding.laid_out_by {
+    match layout_owner(binding, reading) {
         aether_protocol::ui::LayoutOwner::Client => range.lines(),
         aether_protocol::ui::LayoutOwner::Server => screen(),
     }

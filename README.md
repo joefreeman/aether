@@ -13,7 +13,7 @@ A modal text editor with a client–server architecture for Linux and macOS. Nat
 - LSP support (diagnostics, hover, go-to-definition, references, document/workspace symbols, formatting)
 - Git integration (gutter, inline diff, blame, hunk staging, remotes, commit, branch switching, worktrees, history, stashes)
 - Markdown reader mode
-- Fuzzy pickers (files, views, symbols, diagnostics, git changes), workspace grep
+- Fuzzy pickers (files, buffers, shells, agents, symbols, diagnostics, git changes), workspace grep
 - File explorer, cross-file jump history, workspace switching
 - Native, terminal and web clients with consistent keymaps and behaviour
 
@@ -41,8 +41,9 @@ Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to ea
 
 Type `Space y` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
 `Shift-w`); a leading **count** repeats a motion (e.g. `3w`). `Space` is the leader for
-app/file/code commands, `Space g` the sub-leader for git operations, `Space n` the sub-leader for
-talking to a coding agent, and `Space t` reveals hover info at the cursor.
+app/file/code commands, `Space g` the sub-leader for git operations, `Space v` the sub-leader for
+the verbs of the view you are in (stop what it is running, answer an agent), and `Space n` reveals
+hover info at the cursor.
 
 ### Motions (normal mode)
 
@@ -154,9 +155,9 @@ both following the file's own indent style. `Alt-←`/`Alt-→` move by word, an
 
 `Space u` renders the current Markdown file — headings, tables, images, links and highlighted
 code fences — as a read-only view with its own keys. The reading position *is* the cursor, so
-toggling back lands where you were reading. A file's editor and its reader are two views, each
-keeping its own scroll position; opening the file lands in whichever you used last, and the
-`markdown_read` setting (`Space ,`) decides for a file with neither open.
+toggling back lands where you were reading. Reading is how *this window* sees the file: another
+window on the same file is not affected. Opening a file lands in whichever way it was last shown,
+and the `markdown_read` setting (`Space ,`) decides for a file nobody has shown yet.
 
 `o`/`Alt-o` step the document outline — the same outline the breadcrumb and `Space o` show, which
 comes from the language server. Heading navigation therefore needs a Markdown language server
@@ -172,7 +173,7 @@ configured; the rest of the reading view works without one.
 | `z`/`Alt-z` | Undo/redo the reading-position move |
 | `Enter` | Follow the link, open the image, jump to the footnote, or toggle a task's checkbox |
 | `Ctrl-Enter` | Follow a relative link in a new window |
-| `Space t` | Show the link's or image's target |
+| `Space n` | Show the link's or image's target |
 | `x`/`Alt-x`, `Shift-j`/`Shift-k` | Select blocks — as in the editor, plain `x` walks and Shift extends |
 | `r`/`Alt-r` | Reverse the selection / orient it forward |
 | `%`/`,` | Select every block / collapse the selection to the cursor's block |
@@ -194,21 +195,21 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | Chord | Action |
 | --- | --- |
 | `Space f`/`Space Alt-f` | Find files / in this file's directory |
-| `Space v`/`Space a` | Switch view / new scratch |
+| `Space b`/`Space Alt-b` | Switch buffer / new scratch |
+| `Space t`/`Space Alt-t` | Switch shell / a new shell to run a command in |
+| `Space a`/`Space Alt-a` | Switch agent conversation / a new one |
 | `Space /`/`Space Alt-/` | Grep workspace / for current selection |
 | `Space e`/`Space Alt-e` | File explorer / at workspace root |
 | `Space w`/`Space Alt-w` | Switch workspace / open file by absolute path |
 | `Space j`/`Space Alt-j` | Jumplist (`Ctrl-j` in any picker captures its results into it) / clear it |
 | `Space p`/`Space Alt-p` | Copy relative/absolute path |
 | `Space s`/`Space Alt-s` | Save / save as |
-| `Space k`/`Space Alt-k` | Keep view (toggle transient) / reload from disk |
+| `Space k`/`Space Alt-k` | Keep this document — in a review, the file under the cursor / reload from disk |
 | `Space x`/`Space Alt-x` | Close view / save and close it |
 | `Space z`/`Space Alt-z` | Open another window / copy this view's web URL |
 | `Space ,`/`Space .` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
-| `Space b`/`Space Alt-b` | A shell you can type into (a new one when you are in one already) / stop what it is running |
-| `Space n n` | A conversation with a coding agent (a new one when you are in one already) |
-| `Space n c` | Stop what the agent is doing |
-| `Space n a`/`Space n d` | Allow / decline what the agent is asking to do |
+| `Space v c` | Stop what this view is running — a shell's command, an agent's turn |
+| `Space v a`/`Space v d` | Allow / decline what the agent is asking to do |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save and quit |
 | `Space y`/`Space ?` | Show keyboard shortcuts / about this build |
@@ -245,11 +246,11 @@ scopes — plain takes the change under the cursor (or the selected lines), Alt 
 
 | Chord | Action |
 | --- | --- |
-| `Space t` | Hover (type & docs, or a link's target) |
+| `Space n` | Hover (type & docs, or a link's target) |
 | `Enter` | Follow what's under the cursor: the definition — or, in a patch or a shell's output, the file that line names. In a shell's input, run the command |
 | `Space r` | Go to references |
 | `d`/`Alt-d` | Next/previous diagnostic |
-| `Space Alt-t` | Diagnostic at cursor |
+| `Space Alt-n` | Diagnostic at cursor |
 | `Space d`/`Space Alt-d` | Diagnostics: this file / workspace |
 | `Space o`/`Space Alt-o` | Document / workspace symbols |
 | `Space l` | LSP servers (status, restart) |

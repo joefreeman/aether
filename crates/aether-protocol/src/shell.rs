@@ -22,12 +22,13 @@ pub type RunId = u64;
 
 // ---- shell/open --------------------------------------------------------------------------------
 
-/// Present a shell — `Space b`.
+/// Mint a shell — `Space Alt-t`.
 ///
-/// With `new: false` this is "a shell you can type into": the focused shell if it is idle, else
-/// the workspace's most recently used idle shell, else a new one. The client sends `new: true`
-/// when the view it is already looking at *is* a shell, which is what makes a second `Space b`
-/// mint "Shell 2" rather than bouncing off the one in front of you.
+/// **Always creates.** "New" is the explicit half of the pair: `Space t` opens the shells picker,
+/// which is how you get back to one you already have. The old "focused idle shell, else the MRU
+/// idle one, else a new one" heuristic went with the picker — it existed because there was no way
+/// to *list* the shells, and it made the same key mean two different things depending on state the
+/// user could not see.
 pub struct ShellOpen;
 impl RpcMethod for ShellOpen {
     const NAME: &'static str = "shell/open";
@@ -36,11 +37,7 @@ impl RpcMethod for ShellOpen {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ShellOpenParams {
-    /// Mint a shell whatever idle ones exist. See [`ShellOpen`].
-    #[serde(default)]
-    pub new: bool,
-}
+pub struct ShellOpenParams {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellOpenResult {
@@ -92,7 +89,7 @@ pub struct ShellRunResult {
 
 // ---- shell/cancel ------------------------------------------------------------------------------
 
-/// Stop the shell's running command — `Space Alt-b`. Kills the whole process group, so a
+/// Stop the shell's running command — reached by `Space v c` through [`crate::view::ViewInterrupt`]. Kills the whole process group, so a
 /// `cargo build` goes with the `sh` that started it.
 pub struct ShellCancel;
 impl RpcMethod for ShellCancel {

@@ -373,7 +373,7 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
         // (the entry survives the view closing, and the dir/glob chips can speak about it), and
         // opening by path re-attaches the same document anyway. Only the pathless ones — scratch
         // views — need the view id, which is how this picker's own `select` identifies them.
-        PickerCandidates::Views(v) => ranked_entries(picker, |ci| {
+        PickerCandidates::Buffers(v) => ranked_entries(picker, |ci| {
             let c = &v[ci];
             let target = match &c.abs_path {
                 Some(abs) => JumplistTarget::File {
@@ -1166,23 +1166,21 @@ mod tests {
     /// scopeable, survives the buffer closing), a scratch one by buffer id.
     #[test]
     fn capture_splits_buffers_into_file_and_buffer_targets() {
-        use crate::picker::{make_matcher, PickerCandidates, PickerState, ViewCandidate};
+        use crate::picker::{make_matcher, BufferCandidate, PickerCandidates, PickerState};
         use aether_protocol::picker::BufferDirtyState;
-        let picker = PickerState::new(PickerCandidates::Views(vec![
-            ViewCandidate {
+        let picker = PickerState::new(PickerCandidates::Buffers(vec![
+            BufferCandidate {
                 buffer_id: 4,
                 view_id: aether_protocol::ViewId(4),
-                view_kind: None,
                 display: "src/a.rs".into(),
                 status: BufferDirtyState::Clean,
                 path: Some((0, "src/a.rs".into())),
                 abs_path: Some("/w/src/a.rs".into()),
                 transient: false,
             },
-            ViewCandidate {
+            BufferCandidate {
                 buffer_id: 9,
                 view_id: aether_protocol::ViewId(9),
-                view_kind: None,
                 display: "(scratch 1)".into(),
                 status: BufferDirtyState::Unsaved,
                 path: None,

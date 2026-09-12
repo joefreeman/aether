@@ -1012,7 +1012,7 @@ impl PickerState {
 #[derive(PartialEq)]
 pub enum ItemKey<'a> {
     File(u32, &'a str),
-    /// A view: a file's editor and its reader are two rows.
+    /// A view — a buffers, shells or agents row alike.
     View(aether_protocol::ViewId),
     Grep(u32, &'a str, u32, u32),
     GitChange(u32, &'a str, u32),
@@ -1088,6 +1088,59 @@ pub fn keybinding_match_segments(
     out
 }
 
+/// A shell or agent row's `match_indices` split per rendered field.
+///
+/// The wire indices are char offsets into the row's composed haystack
+/// (`"{title}  {cwd}  {last_command}"` for a shell, `"{title}  {agent}  {last_prompt}"` for a
+/// conversation — see [`aether_protocol::picker::PickerItem::Shell`], where the composition is a
+/// wire contract). Each field here is the subset falling inside that part, rebased to the part's
+/// own chars; indices landing on the two-space separators are dropped, since the shells render no
+/// separator to highlight.
+#[derive(Debug, Default, PartialEq)]
+pub struct RowSegments {
+    pub first: Vec<u32>,
+    pub second: Vec<u32>,
+    pub third: Vec<u32>,
+}
+
+/// Split a composed row haystack's `match_indices` into per-part lists ([`RowSegments`]).
+///
+/// The single source of the offsets for the shells and agents pickers — keep in lockstep with the
+/// server's `shell_haystack` / `agent_haystack`, whose join this reproduces: empty parts are
+/// elided entirely (they contribute no separator), and two spaces sit between the rest.
+pub fn row_match_segments(parts: [&str; 3], match_indices: &[u32]) -> RowSegments {
+    // Where each non-empty part starts in the haystack, and how long it is.
+    let mut spans: [Option<(u32, u32)>; 3] = [None; 3];
+    let mut at = 0u32;
+    for (i, part) in parts.iter().enumerate() {
+        let len = part.chars().count() as u32;
+        if len == 0 {
+            continue;
+        }
+        if at > 0 {
+            at += 2; // the separator between two emitted parts
+        }
+        spans[i] = Some((at, len));
+        at += len;
+    }
+    let mut out = RowSegments::default();
+    for &idx in match_indices {
+        for (i, span) in spans.iter().enumerate() {
+            let Some((start, len)) = *span else { continue };
+            if (start..start + len).contains(&idx) {
+                let rebased = idx - start;
+                match i {
+                    0 => out.first.push(rebased),
+                    1 => out.second.push(rebased),
+                    _ => out.third.push(rebased),
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Split an Explorer path-query into `(path_part, filter_part)` at the last `/`, mirroring the
 /// server's `explorer_query_split`. The path part (no trailing slash) is the peek directory under
 /// the anchor; the filter part prefix-matches its entries. No `/` → the whole query is the filter.
@@ -1105,7 +1158,11 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             relative_path,
             ..
         } => ItemKey::File(*path_index, relative_path),
-        PickerItem::View { view_id, .. } => ItemKey::View(*view_id),
+        // One key for the three view-listing kinds: a row is identified by the view it names,
+        // whether that view is a buffer, a shell or a conversation.
+        PickerItem::Buffer { view_id, .. }
+        | PickerItem::Shell { view_id, .. }
+        | PickerItem::Agent { view_id, .. } => ItemKey::View(*view_id),
         PickerItem::GrepHit {
             path_index,
             relative_path,
@@ -1243,6 +1300,38 @@ mod tests {
         assert_eq!(frame_run(10.0 * row_h, 150.0, start, end), Some(start));
     }
     use aether_protocol::git::GitStatus;
+
+    /// The shells / agents row split: the offsets are into the *composed* haystack, so a hit in
+    /// the second or third field has to come back rebased onto that field's own chars.
+    #[test]
+    fn row_match_segments_rebase_across_the_three_fields() {
+        // "Shell 2  ~/proj  cargo test": 0..6 name, 9..14 cwd, 17..26 command.
+        let parts = ["Shell 2", "~/proj", "cargo test"];
+        let seg = row_match_segments(parts, &[0, 9, 17, 26]);
+        assert_eq!(seg.first, vec![0]);
+        assert_eq!(seg.second, vec![0]);
+        assert_eq!(seg.third, vec![0, 9]);
+        // The two separator spaces belong to nothing and highlight nothing.
+        assert_eq!(
+            row_match_segments(parts, &[7, 8, 15, 16]),
+            RowSegments::default()
+        );
+    }
+
+    /// An empty field is elided **with its separator**, exactly as the server's join does — so the
+    /// field after it starts two chars earlier than a naive layout would put it.
+    #[test]
+    fn row_match_segments_elide_an_empty_field() {
+        // "Shell 3  cargo test": the cwd is missing, so the command starts at 9, not 11.
+        let seg = row_match_segments(["Shell 3", "", "cargo test"], &[9]);
+        assert_eq!(seg.second, Vec::<u32>::new());
+        assert_eq!(seg.third, vec![0]);
+        // A lone first field: nothing after it, and an index past its end lands nowhere.
+        let seg = row_match_segments(["Agent 2", "", ""], &[0, 7]);
+        assert_eq!(seg.first, vec![0]);
+        assert_eq!(seg.second, Vec::<u32>::new());
+        assert_eq!(seg.third, Vec::<u32>::new());
+    }
 
     #[test]
     fn keybinding_match_segments_rebase_and_drop_separators() {
@@ -1455,7 +1544,7 @@ mod tests {
         s.generation = 2;
         assert!(!s.apply_update(update(PickerKind::Files, 1, 0, 9, 9)));
         assert!(!s.apply_update(update(PickerKind::Files, 2, 50, 9, 9)));
-        assert!(!s.apply_update(update(PickerKind::Views, 2, 0, 9, 9)));
+        assert!(!s.apply_update(update(PickerKind::Buffers, 2, 0, 9, 9)));
         assert_eq!(s.items.len(), 5);
     }
 

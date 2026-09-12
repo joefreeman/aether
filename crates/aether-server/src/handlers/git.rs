@@ -1008,8 +1008,10 @@ pub async fn rebind_loaded_workspace(
             crate::state::DormantView {
                 id,
                 view: s.allocate_view_id(),
-                // A file that followed a worktree switch comes back as its editor.
-                kind: None,
+                // A file that followed a worktree switch comes back as source, and kept: it was
+                // open in the tree you left, not peeked at.
+                read: false,
+                transient: false,
                 source: crate::state::DormantSource::File(path),
             }
         })

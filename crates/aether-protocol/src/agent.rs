@@ -22,13 +22,12 @@ pub type BlockId = u64;
 
 // ---- agent/open --------------------------------------------------------------------------------
 
-/// Present an agent view — `Space n n`.
+/// Mint an agent conversation — `Space Alt-a`.
 ///
-/// "An agent you can type at": the focused conversation if it is idle, else the workspace's most
-/// recently used idle one, else a new one — except that pressing this *inside* an agent view mints
-/// the next one, which is what makes a second `Space n n` give you "Agent 2" rather than bouncing
-/// off the one in front of you. The same rule [`crate::shell::ShellOpen`] applies, decided from
-/// [`AgentOpenParams::from_view`] because only the server knows what a view is.
+/// **Always creates**, exactly as [`crate::shell::ShellOpen`] does and for the same reason: the
+/// agents picker (`Space a`) is how you return to a conversation you already have, so the open key
+/// has one meaning. The "focused idle conversation, else the MRU idle one" heuristic and the
+/// `from_view` field it was decided from are both gone.
 pub struct AgentOpen;
 impl RpcMethod for AgentOpen {
     const NAME: &'static str = "agent/open";
@@ -38,14 +37,6 @@ impl RpcMethod for AgentOpen {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentOpenParams {
-    /// The view the user pressed the key in, if any.
-    ///
-    /// **Not a `new: bool`**, because deciding that would mean the client knowing whether the view
-    /// it is looking at is an agent view — and it deliberately cannot: the window marks an input
-    /// element by role and carries no view kind. So the client says where it was and the server,
-    /// which knows what that view is, applies the rule.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_view: Option<ViewId>,
     /// Which agent to launch, by the id of a row in the server's table. `None` takes the first
     /// that resolves on `PATH` — which is the whole of the choice for a machine with one agent
     /// installed, and the reason this is not a required parameter.
@@ -101,7 +92,7 @@ pub struct AgentPromptResult {
 
 // ---- agent/cancel ------------------------------------------------------------------------------
 
-/// Stop the conversation's running turn — `Space n c`. The agent is asked to stop; unfinished tool
+/// Stop the conversation's running turn — reached by `Space v c` through [`crate::view::ViewInterrupt`]. The agent is asked to stop; unfinished tool
 /// calls are marked cancelled and any pending permission request is answered `cancelled`, which is
 /// what the protocol requires of a client that cancels.
 pub struct AgentCancel;
@@ -126,7 +117,7 @@ pub struct AgentCancelResult {
 
 // ---- agent/respond -----------------------------------------------------------------------------
 
-/// Answer a tool call's pending permission request — `Space n a` / `Space n d`, or `Enter` on the
+/// Answer a tool call's pending permission request — `Space v a` / `Space v d`, or `Enter` on the
 /// block in Normal mode.
 ///
 /// The options are the agent's, not ours: it supplies their ids and labels, and this returns one
@@ -264,7 +255,7 @@ pub struct PermissionOption {
     /// The agent's own wording. A shell paints this; it never invents its own.
     pub label: String,
     /// Whether this option allows or rejects, so a shell can style the two differently and bind
-    /// `Space n a` / `Space n d` to the right ones without parsing labels.
+    /// `Space v a` / `Space v d` to the right ones without parsing labels.
     pub kind: PermissionKind,
 }
 

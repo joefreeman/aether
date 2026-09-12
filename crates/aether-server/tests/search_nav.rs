@@ -1184,6 +1184,7 @@ async fn nav_goto_reopens_by_path() {
         &mut ws,
         &NavGotoParams {
             virtual_key: None,
+            read: None,
             view_id: Some(view_of(buf_a)), // stale on purpose
             path_index: Some(0),
             relative_path: Some("a.txt".into()),

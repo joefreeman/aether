@@ -56,21 +56,23 @@ fn the_request(fx: &Effects) -> (u64, &'static str, serde_json::Value) {
     req
 }
 
-/// The single `Effect::Request` in `fx` other than a `view/open` — what an edit transition out
-/// of the reading view sends beside its ask for the editor's view.
+/// The single `Effect::Request` in `fx` other than a `view/set_read` — what an edit transition
+/// out of the reading view sends beside its ask to see the source.
 fn the_request_beside_open(fx: &Effects) -> (u64, &'static str, serde_json::Value) {
     let mut reqs = fx.0.iter().filter_map(|e| match e {
         Effect::Request {
             token,
             method,
             params,
-        } if *method != "view/open" => Some((*token, *method, params.clone())),
+        } if *method != "view/set_read" => Some((*token, *method, params.clone())),
         _ => None,
     });
-    let req = reqs.next().expect("an Effect::Request beside the open");
+    let req = reqs
+        .next()
+        .expect("an Effect::Request beside the mode flip");
     assert!(
         reqs.next().is_none(),
-        "exactly one request beside the open expected"
+        "exactly one request beside the mode flip expected"
     );
     req
 }
@@ -344,6 +346,7 @@ fn a_gone_jumplist_entry_toasts_instead_of_opening_the_file() {
                 view_id: aether_protocol::ViewId(9),
                 scroll: None,
                 transient: true,
+                read: false,
                 buffer: aether_protocol::view::BufferDescription {
                     buffer_id: 9,
                     language: None,
@@ -1032,7 +1035,7 @@ fn view_state_push_moves_only_the_presented_view() {
         })
     };
 
-    // The sibling view of the same file being kept says nothing about this one.
+    // Another window's keep of the same file says nothing about this one.
     let _ = s.on_event(push(8, false));
     assert!(s.view.view_transient, "another view's flag is not ours");
 
@@ -1897,10 +1900,10 @@ fn buffers_picker_centers_on_the_active_buffer() {
     s.view.view_id = ViewId(7);
     s.view.view_buffer = 7;
     s.view.buffer.buffer_id = 7;
-    let fx = s.open_picker(PickerKind::Views, None, None, false, None);
+    let fx = s.open_picker(PickerKind::Buffers, None, None, false, None);
     let params = find_request(&fx, "picker/view").expect("view picker opens via picker/view");
     // The view is anchored on the active buffer (matched by buffer_id), so it opens selected.
-    assert_eq!(params["center_on"]["kind"], "view");
+    assert_eq!(params["center_on"]["kind"], "buffer");
     assert_eq!(params["center_on"]["buffer_id"], 7);
 }
 
@@ -1916,9 +1919,9 @@ fn buffers_picker_centers_on_the_view_not_the_focused_element() {
     s.view.view_id = ViewId(10);
     s.view.view_buffer = 10;
     s.view.buffer.buffer_id = 7;
-    let fx = s.open_picker(PickerKind::Views, None, None, false, None);
+    let fx = s.open_picker(PickerKind::Buffers, None, None, false, None);
     let params = find_request(&fx, "picker/view").expect("view picker opens via picker/view");
-    assert_eq!(params["center_on"]["kind"], "view");
+    assert_eq!(params["center_on"]["kind"], "buffer");
     assert_eq!(
         params["center_on"]["buffer_id"], 10,
         "the patch's row, not the hunk's file"
@@ -3383,6 +3386,30 @@ fn enter_on_a_log_row_shows_the_commit() {
     assert!(params["target"].get("path").is_none());
     // The picker closes onto the diff, like the branch picker's checkout.
     assert!(find_request(&fx, "picker/hide").is_some());
+    // And the view being left is recorded, so `Backspace` from the diff returns here — the
+    // view's own buffer, as `Enter` in a review records the review.
+    assert_eq!(
+        params["record_nav_from"],
+        json!(s.view.view_buffer),
+        "a commit shown from the log is a jump with an origin"
+    );
+}
+
+/// `Space g w` is a jump too: the working changes opened over a file record that file, so
+/// `Backspace` from the review returns to it. Recorded once, as the view's own buffer — from a
+/// review over the same file it would be the review.
+#[test]
+fn space_g_w_records_where_it_was_asked_from() {
+    let mut s = session();
+    s.view.view_id = ViewId(7);
+    s.view.view_buffer = 7;
+    s.view.buffer.buffer_id = 7;
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'g');
+    let fx = key(&mut s, 'w');
+    let params = find_request(&fx, "git/show").expect("Space g w shows the working changes");
+    assert_eq!(params["target"]["kind"], json!("working_changes"));
+    assert_eq!(params["record_nav_from"], json!(7));
 }
 
 /// The stash picker's row actions: Enter previews the entry (a stash is a commit, so it goes
@@ -4049,7 +4076,7 @@ fn a_jumplist_change_elsewhere_re_views_an_open_jumplist_picker() {
 
     // A different picker open, or none at all: nothing to refresh, no traffic.
     let _ = s.close_picker();
-    let _ = s.open_picker(PickerKind::Views, None, None, false, None);
+    let _ = s.open_picker(PickerKind::Buffers, None, None, false, None);
     assert!(no_request(&s.on_event(changed())));
     let _ = s.close_picker();
     assert!(no_request(&s.on_event(changed())));
@@ -4228,6 +4255,7 @@ fn jumplist_step_adopts_the_opened_entry() {
         view_id: aether_protocol::ViewId(7),
         scroll: None,
         transient: true,
+        read: false,
         buffer: BufferDescription {
             buffer_id: 7,
             language: None,
@@ -4625,7 +4653,7 @@ fn every_picker_open_resets_the_scroll() {
         PickerKind::Grep,
         PickerKind::GitChanges,
         PickerKind::GitChangesFile,
-        PickerKind::Views,
+        PickerKind::Buffers,
     ] {
         let mut s = session();
         let fx = s.open_picker(kind, None, None, false, None);
@@ -5854,10 +5882,9 @@ fn buffers_picker_close_closes_in_place() {
     use aether_protocol::picker::{BufferDirtyState, PickerItem, PickerKind};
 
     fn buf(buffer_id: u64, display: &str, status: BufferDirtyState) -> PickerItem {
-        PickerItem::View {
+        PickerItem::Buffer {
             buffer_id,
             view_id: aether_protocol::ViewId(buffer_id),
-            view_kind: None,
             display: display.into(),
             status,
             path_index: None,
@@ -5869,7 +5896,7 @@ fn buffers_picker_close_closes_in_place() {
 
     let mut s = session();
     // The active editor buffer is id 0 (placeholder default).
-    let _ = s.open_picker(PickerKind::Views, None, None, false, None);
+    let _ = s.open_picker(PickerKind::Buffers, None, None, false, None);
     {
         let p = s.picker.as_mut().unwrap();
         p.items = vec![
@@ -5943,10 +5970,9 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
     use aether_protocol::view::{BufferDescription, ViewOpenResult};
 
     fn buf(buffer_id: u64, display: &str) -> PickerItem {
-        PickerItem::View {
+        PickerItem::Buffer {
             buffer_id,
             view_id: aether_protocol::ViewId(buffer_id),
-            view_kind: None,
             display: display.into(),
             status: BufferDirtyState::Clean,
             path_index: None,
@@ -5958,7 +5984,7 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
 
     let mut s = session();
     // The active editor buffer is id 0 (placeholder default).
-    let _ = s.open_picker(PickerKind::Views, None, None, false, None);
+    let _ = s.open_picker(PickerKind::Buffers, None, None, false, None);
     {
         let p = s.picker.as_mut().unwrap();
         p.items = vec![buf(0, "active.rs"), buf(7, "other.rs")];
@@ -5991,6 +6017,7 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
         view_id: aether_protocol::ViewId(7),
         scroll: None,
         transient: false,
+        read: false,
         buffer: BufferDescription {
             buffer_id: 7,
             language: None,
@@ -6209,11 +6236,11 @@ fn insert_home_end_move_to_the_line_ends() {
 }
 
 #[test]
-fn space_t_triggers_hover() {
+fn space_n_triggers_hover() {
     let mut s = session();
-    // Tab fires Hover directly — no leader chord.
+    // The hover reveal is a leader chord; it moved from `t` to `n` when the shells picker took `t`.
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, None);
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "lsp/hover");
 }
@@ -6235,13 +6262,13 @@ fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
     // A ready server with no content for the cursor → the genuine "nothing here" message.
     let mut s = session();
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let token = the_request(&s.on_key(KeyCode::Char('t'), Mods::NONE, None)).0;
+    let token = the_request(&s.on_key(KeyCode::Char('n'), Mods::NONE, None)).0;
     let fx = s.on_rpc_result(token, Ok(json!({ "contents": null, "readiness": "ready" })));
     assert_eq!(info_toast(&fx).as_deref(), Some("No hover info"));
 
     // A server still starting → say so, not "No hover info".
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let token = the_request(&s.on_key(KeyCode::Char('t'), Mods::NONE, None)).0;
+    let token = the_request(&s.on_key(KeyCode::Char('n'), Mods::NONE, None)).0;
     let fx = s.on_rpc_result(
         token,
         Ok(json!({ "contents": null, "readiness": "starting" })),
@@ -6253,7 +6280,7 @@ fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
 
     // A crashed/stopped server → "unavailable".
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let token = the_request(&s.on_key(KeyCode::Char('t'), Mods::NONE, None)).0;
+    let token = the_request(&s.on_key(KeyCode::Char('n'), Mods::NONE, None)).0;
     let fx = s.on_rpc_result(
         token,
         Ok(json!({ "contents": null, "readiness": "unavailable" })),
@@ -6265,14 +6292,13 @@ fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
 }
 
 #[test]
-fn space_alt_t_shows_diagnostic_at_cursor() {
-    // Space Alt-t → diagnostic at cursor. It moved here from `Space n` when that became the agent
-    // sub-leader, pairing it with `Space t` (hover). With no diagnostics loaded it reports "none"
-    // via a toast (resolved locally — no RPC), which still proves the chord reaches
-    // `show_diagnostic`.
+fn space_alt_n_shows_diagnostic_at_cursor() {
+    // Space Alt-n → diagnostic at cursor, paired with `Space n` (hover). With no diagnostics loaded
+    // it reports "none" via a toast (resolved locally — no RPC), which still proves the chord
+    // reaches `show_diagnostic`.
     let mut s = session();
     let _ = key(&mut s, ' '); // leader
-    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, Some("t".to_string()));
+    let fx = s.on_key(KeyCode::Char('n'), Mods::ALT, Some("n".to_string()));
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -6281,7 +6307,7 @@ fn space_alt_t_shows_diagnostic_at_cursor() {
                 ..
             }
         )),
-        "Space Alt-t with no diagnostics toasts an info message"
+        "Space Alt-n with no diagnostics toasts an info message"
     );
 }
 
@@ -7290,26 +7316,26 @@ fn space_k_toggles_keep_and_guards_unsaved() {
     assert_eq!(params["transient"], json!(false));
 }
 
-/// Keep is per **view**, and `Space u` lands in the sibling's own state: a kept editor's reader
-/// sibling opens as a preview, and the client says so — status bar and `Space k` alike. Reading
-/// the flag off the view being left kept the bar saying kept while the picker said not, and the
-/// first `Space k` "released" a view that was never kept.
+/// Keep is per **view**, and `Space u` changes how the view is seen, not the view: a kept file
+/// read is still kept, and `Space k` addresses the same view before and after the flip.
 #[test]
-fn space_v_adopts_the_siblings_own_keep_state() {
+fn space_u_leaves_the_views_keep_state_alone() {
     let mut s = md_session();
-    s.view.view_transient = false; // the editor is kept
+    s.view.view_transient = true; // a preview
+    let view = s.view.view_id;
     let fx = leader(&mut s, 'u');
-    let token = the_sibling_request(&s, &fx, "reader");
-    let mut answer = sibling_open(&s, 900);
-    answer["transient"] = json!(true);
-    let _ = s.on_rpc_result(token, Ok(answer));
-    assert_eq!(s.view.view_id, ViewId(900));
-    assert!(s.view.view_transient, "the sibling's own state: a preview");
+    let token = the_read_request(&s, &fx, true);
+    let _ = s.on_rpc_result(token, Ok(read_set(true)));
+    assert_eq!(s.view.view_id, view, "the same view");
+    assert!(
+        s.view.view_transient,
+        "still a preview: reading is not a keep"
+    );
 
-    // `Space k` now keeps it — it was never kept — and says so.
+    // `Space k` keeps it — the view, whichever way it is being seen — and says so.
     let fx = leader(&mut s, 'k');
     let params = find_request(&fx, "view/set_transient").expect("Space k toggles the view");
-    assert_eq!(params["view_id"], json!(900));
+    assert_eq!(params["view_id"], json!(view.get()));
     assert_eq!(params["transient"], json!(false), "kept, not released");
     let (token, _, _) = the_request(&fx);
     let fx = s.on_rpc_result(token, Ok(json!({ "transient": false })));
@@ -7321,31 +7347,113 @@ fn space_v_adopts_the_siblings_own_keep_state() {
     assert!(!s.view.view_transient);
 }
 
-/// `Space k` keeps the **view**, not the file the cursor happens to be in.
+/// `Space k` inside a **review** keeps the document under the cursor, and never toggles.
 ///
-/// A working-changes view is a transient view over permanent files. Toggling the focused element
-/// pinned a file that was never going anywhere and left the view as transient as before — it still
-/// closed itself on the next thing opened, which is the one thing `Space k` exists to prevent.
+/// A commit's patch and the working changes are composed views over real files, each windowed by
+/// a preview of its own. The review keeps the flag it was created with, so addressing it does
+/// nothing a user wants; what is worth outliving it is the file being read. So the request is a
+/// keep even though the view is a preview, the answer names the file, and the **review's** flag
+/// is left exactly where it was — it is still the preview that closes when you leave it.
 #[test]
-fn space_k_on_a_composed_view_keeps_the_view() {
+fn space_k_in_a_review_keeps_the_document_under_the_cursor() {
     let mut s = session();
     // A composed view: its identity is the patch, the cursor is in one of the files it windows.
     s.view.view_id = ViewId(9);
     s.view.view_buffer = 9;
     s.view.view_transient = true;
     s.view.buffer.buffer_id = 42;
+    s.view.buffer.label = "a.rs".into();
     s.view.buffer.revision = 1;
     s.view.buffer.saved_revision = 1;
 
     let _ = key(&mut s, ' ');
     let fx = s.on_key(KeyCode::Char('k'), Mods::NONE, Some("k".into()));
-    let params = find_request(&fx, "view/set_transient").expect("Space k toggles the view");
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "view/set_transient");
     assert_eq!(
         params["view_id"],
         json!(9),
-        "addresses the view, not the focused element's buffer"
+        "the view id is the handle; the server resolves the focused document behind it"
     );
-    assert_eq!(params["transient"], json!(false), "pins the view permanent");
+    assert_eq!(
+        params["transient"],
+        json!(false),
+        "a keep, though the view itself is transient — never a toggle"
+    );
+
+    // The server kept the file and answers its flag.
+    let fx = s.on_rpc_result(token, Ok(json!({ "transient": false })));
+    let toasts = toast_messages(&fx);
+    assert!(
+        toasts.iter().any(|t| t.starts_with("Kept a.rs")),
+        "the toast names the document that was kept: {toasts:?}"
+    );
+    assert!(
+        s.view.view_transient,
+        "the review is as transient as it was: the reply said nothing about it"
+    );
+}
+
+/// A shell and a conversation *are* the view — the client can tell (their window has an input
+/// element), so `Space k` says so on the spot rather than paying a round trip to be told the
+/// same. The server refuses it too; this is the reply, not the rule.
+#[test]
+fn space_k_in_a_shell_refuses_without_asking() {
+    for focused in [0, 1] {
+        let mut s = shell_session(focused);
+        let fx = leader(&mut s, 'k');
+        assert!(
+            no_request(&fx),
+            "focused element {focused}: nothing is sent"
+        );
+        let toasts = toast_messages(&fx);
+        assert!(
+            toasts
+                .iter()
+                .any(|t| t.starts_with("Only a document can be kept")),
+            "focused element {focused}: it says why: {toasts:?}"
+        );
+    }
+}
+
+/// Only a document can be kept. A composed view — a patch, a shell, a conversation — keeps the
+/// flag it was created with, and the server says so by answering the **actual** flag rather than
+/// failing. The echo differing from what was asked is the refusal: the client says why, and the
+/// keep state stays where the server left it.
+#[test]
+fn space_k_toasts_when_the_server_keeps_the_flag() {
+    let mut s = session();
+    s.view.view_id = ViewId(9);
+    s.view.view_buffer = 9;
+    // A patch: a preview, and staying one.
+    s.view.view_transient = true;
+    // The cursor is in the patch's own generated text — its metadata block — so there is no
+    // windowed document to redirect to and the request is about the view.
+    s.view.buffer.buffer_id = 9;
+    s.view.buffer.revision = 1;
+    s.view.buffer.saved_revision = 1;
+
+    let fx = leader(&mut s, 'k');
+    let (token, _, params) = the_request(&fx);
+    assert_eq!(params["transient"], json!(false), "it still asks");
+
+    // The server answers with the flag unchanged.
+    let fx = s.on_rpc_result(token, Ok(json!({ "transient": true })));
+    assert!(
+        s.view.view_transient,
+        "the keep state is the server's answer, not the request"
+    );
+    let toasts = toast_messages(&fx);
+    assert!(
+        toasts
+            .iter()
+            .any(|t| t.starts_with("Only a document can be kept")),
+        "the refusal is explained: {toasts:?}"
+    );
+    assert!(
+        !toasts.iter().any(|t| t.contains("View kept")),
+        "and never claims it worked: {toasts:?}"
+    );
 }
 
 /// The unsaved guard is **view-wide**: closing a view drops every document it windows, so a dirty
@@ -8120,6 +8228,7 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
             view_id: aether_protocol::ViewId(1),
             scroll: None,
             transient: false,
+            read: false,
             buffer: aether_protocol::view::BufferDescription {
                 buffer_id: 1,
                 language: None,
@@ -9604,6 +9713,7 @@ fn open_path_prompt_submits_via_open_path_rpc() {
         view_id: aether_protocol::ViewId(9),
         scroll: None,
         transient: false,
+        read: false,
         buffer: BufferDescription {
             buffer_id: 9,
             language: None,
@@ -9944,6 +10054,7 @@ fn hint_session() -> Session {
             view_id: aether_protocol::ViewId(1),
             scroll: None,
             transient: false,
+            read: false,
             buffer: aether_protocol::view::BufferDescription {
                 buffer_id: 1,
                 language: None,
@@ -10909,22 +11020,14 @@ fn adopt_reader_window(s: &mut Session, text: &str) -> Effects {
     s.adopt_subscribe(reader_subscribe(id, text))
 }
 
-/// The server's answer to an open of the session's own buffer as another view: the same buffer,
-/// view `view`.
-fn sibling_open(s: &Session, view: u64) -> serde_json::Value {
-    json!({
-        "buffer_id": s.view.view_buffer,
-        "view_id": view,
-        "language": s.view.buffer.language,
-        "line_count": 5, "byte_count": 40,
-        "revision": s.view.buffer.revision, "saved_revision": s.view.buffer.saved_revision,
-        "path": s.view.buffer.path,
-    })
+/// The server's answer to a `view/set_read`: the mode it now has this client in.
+fn read_set(read: bool) -> serde_json::Value {
+    json!({ "read": read })
 }
 
-/// The `view/open` a `Space u` (or an edit transition) sends: naming the session's own view,
-/// asking for `kind`. Returns its token.
-fn the_sibling_request(s: &Session, fx: &Effects, kind: &str) -> u64 {
+/// The `view/set_read` a `Space u` (or an edit transition) sends: naming the session's own view,
+/// asking to read (`true`) or to edit. Returns its token.
+fn the_read_request(s: &Session, fx: &Effects, read: bool) -> u64 {
     let (token, _, params) = all_requests(fx)
         .into_iter()
         .zip(fx.0.iter().filter_map(|e| match e {
@@ -10932,63 +11035,31 @@ fn the_sibling_request(s: &Session, fx: &Effects, kind: &str) -> u64 {
             _ => None,
         }))
         .map(|((m, p), t)| (t, m, p))
-        .find(|(_, m, _)| *m == "view/open")
-        .expect("a view/open for the sibling view");
+        .find(|(_, m, _)| *m == "view/set_read")
+        .expect("a view/set_read for the session's view");
     assert_eq!(params["view_id"], json!(s.view.view_id.get()));
     assert!(
         params.get("buffer_id").is_none(),
         "the wire names views, never buffers"
     );
-    assert_eq!(params["kind"], json!(kind));
+    assert_eq!(params["read"], json!(read));
     token
 }
 
-/// `Space u` on the session's markdown buffer — which asks the server for the buffer's reader
-/// view, adopts the sibling it answers with (view 900), and re-subscribes — and the window the
-/// subscribe answers with, over `text`. Returns the window adoption's effects.
+/// `Space u` on the session's markdown buffer — which asks the server to flip this client's mode
+/// to reading and re-subscribes once it has — and the window the subscribe answers with, over
+/// `text`. Returns the window adoption's effects.
 fn enter_reader(s: &mut Session, text: &str) -> Effects {
+    let view = s.view.view_id;
     let fx = leader(s, 'u');
-    let token = the_sibling_request(s, &fx, "reader");
-    let answer = sibling_open(s, 900);
-    let fx = s.on_rpc_result(token, Ok(answer));
+    let token = the_read_request(s, &fx, true);
+    let fx = s.on_rpc_result(token, Ok(read_set(true)));
     assert!(
         fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
-        "the sibling is a new view: re-subscribe"
+        "the mode flipped: re-subscribe"
     );
-    assert_eq!(s.view.view_id, ViewId(900));
+    assert_eq!(s.view.view_id, view, "the same view");
     adopt_reader_window(s, text)
-}
-
-/// The picker's editor row for the file whose reader is on screen presents the editor: the same
-/// buffer through another view is the sibling, adopted like `Space u`'s — the window changes —
-/// not a move within the view already showing, which kept the reader up.
-#[test]
-fn selecting_the_editor_row_from_the_reader_presents_the_editor() {
-    use aether_client::session::Mode;
-    use aether_client::update::Event;
-    use aether_protocol::picker::PickerSelectResult;
-    let mut s = read_session();
-    assert_eq!(s.view.mode, Mode::Read);
-    assert_eq!(s.view.view_id, ViewId(900));
-    let fx = s.on_event(Event::PickerSelected {
-        result: Ok(PickerSelectResult::View {
-            view_id: ViewId(901),
-        }),
-    });
-    let (token, method, params) = the_request(&fx);
-    assert_eq!(method, "view/open");
-    assert_eq!(params["view_id"], json!(901));
-    let fx = s.on_rpc_result(token, Ok(sibling_open(&s, 901)));
-    assert!(
-        fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
-        "another view of the same file is a new window"
-    );
-    assert_eq!(s.view.view_id, ViewId(901));
-    assert_ne!(
-        s.view.mode,
-        Mode::Read,
-        "the window decides the view; the reader is down until it says otherwise"
-    );
 }
 
 /// A canned reading-view setup: `Space u` on a markdown buffer, the reader's window adopted.
@@ -11018,21 +11089,25 @@ fn blockless_read_session(text: &str) -> Session {
 }
 
 #[test]
-fn space_v_asks_for_the_reader_and_its_window_delivers_it() {
+fn space_u_asks_to_read_and_the_window_delivers_it() {
     use aether_client::session::Mode;
     let mut s = md_session();
+    let view = s.view.view_id;
     let fx = leader(&mut s, 'u');
-    // The ask: a content anchor so the same lines stay on screen when the sibling has no scroll
-    // of its own, then the open of this buffer as its reader. Nothing else is fetched — the
-    // sibling's window carries the document.
+    // The ask: a content anchor so the same lines stay on screen across the re-presentation,
+    // then the flip of this client's mode. Nothing else is fetched — the re-subscribe's window
+    // carries the document.
     assert!(fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)));
-    let token = the_sibling_request(&s, &fx, "reader");
+    let token = the_read_request(&s, &fx, true);
     assert_eq!(all_requests(&fx).len(), 1);
     assert_eq!(s.view.mode, Mode::Normal, "until the window says otherwise");
     assert!(s.view.read.is_none());
-    let fx = s.on_rpc_result(token, Ok(sibling_open(&s, 900)));
+    let fx = s.on_rpc_result(token, Ok(read_set(true)));
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
-    assert_eq!(s.view.view_id, ViewId(900), "the sibling's view");
+    assert_eq!(
+        s.view.view_id, view,
+        "the same view: reading is a mode, not a view"
+    );
     assert_eq!(
         s.view.buffer.buffer_id, s.view.view_buffer,
         "the same buffer"
@@ -11049,56 +11124,34 @@ fn space_v_asks_for_the_reader_and_its_window_delivers_it() {
     assert_eq!(read.elements.len(), 4);
 }
 
-/// `Space u` carries **where you are**, not where the sibling view was last left.
-///
-/// The sibling's own remembered scroll used to win whenever it had one, which made the switch
-/// unreliable in the way that is hardest to notice: the *first* switch to a view carried your
-/// place, and every one after it landed wherever that view had last been subscribed. A view's
-/// remembered scroll is only written by a subscribe or a fetch — never while you scroll a view you
-/// are already in — so that was usually the top, and landing there recorded the top again.
-///
-/// The two views share one cursor, which is what settles it: "where that view was" and "where you
-/// are" are answers to different questions, and the switch is asking the second.
+/// `Space u` carries **where you are**: the content anchor the shell captures for the flip is
+/// what the re-subscribe frames, and nothing the server answers with moves it — the view, its
+/// scroll memory and its cursor are all the same view's.
 #[test]
-fn a_sibling_switch_keeps_your_place_over_the_siblings_remembered_scroll() {
+fn a_mode_flip_keeps_your_place() {
     use aether_protocol::coords::VisualRow;
-    use aether_protocol::viewport::ScrollPosition;
     let mut s = md_session();
     let _ = adopt_reader_window(&mut s, "# Title\n\nFirst para.\n\nSecond para.\n");
 
-    // The switch: the shell captures the anchor for where the reader is, then asks for the editor.
+    // The flip: the shell captures the anchor for where the reader is, then asks for source.
     let fx = leader(&mut s, 'u');
     assert!(fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)));
     s.capture_scroll_anchor(VisualRow(0), 20, &Default::default());
     let anchored = s
         .relayout_anchor_position()
-        .expect("an anchor for the switch");
-    let token = the_sibling_request(&s, &fx, "editor");
-
-    // The editor answers with a scroll of its own — it has been shown before.
-    let mut open = sibling_open(&s, 900);
-    open["scroll"] = json!({"element": 0, "line": 40, "sub_row": 0.0});
-    let _ = s.on_rpc_result(token, Ok(open));
-
+        .expect("an anchor for the flip");
+    let token = the_read_request(&s, &fx, false);
+    let fx = s.on_rpc_result(token, Ok(read_set(false)));
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
     assert_eq!(
         s.relayout_anchor_position(),
         Some(anchored),
-        "the sibling's remembered scroll threw away the place the switch was carrying"
-    );
-    // The remembered scroll is still recorded — it is the fallback for a view opened with no
-    // anchor at all, and only that.
-    assert_eq!(
-        s.view.buffer.scroll,
-        Some(ScrollPosition {
-            element: 0,
-            line: 40,
-            sub_row: 0.0
-        })
+        "the place the flip was carrying is what the re-subscribe frames"
     );
 }
 
 #[test]
-fn space_v_on_non_markdown_toasts_and_stays_normal() {
+fn space_u_on_non_markdown_toasts_and_stays_normal() {
     use aether_client::session::Mode;
     let mut s = session(); // language: None
     let fx = leader(&mut s, 'u');
@@ -11333,21 +11386,21 @@ fn read_h_deselects_back_to_the_block() {
 }
 
 #[test]
-fn space_t_shows_the_focused_target_without_following() {
+fn space_n_shows_the_focused_target_without_following() {
     use aether_client::session::HoverText;
     let mut s = read_session();
     // On a plain block: quiet no-op.
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, None);
     assert!(
         fx.0.is_empty(),
-        "Tab on a non-interactive block does nothing"
+        "Space n on a non-interactive block does nothing"
     );
     // On a focused link: the URL in the hover popover (whose own keys then apply — Ctrl-c
     // copies it via `keymap::hover_action`), no open, no cursor move.
     focus_the_link(&mut s);
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, None);
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -11617,7 +11670,7 @@ fn read_ctrl_e_asks_for_the_content_range_then_changes_it() {
     assert!(s.view.read.is_none());
     let reqs: Vec<_> = all_requests(&fx)
         .into_iter()
-        .filter(|(m, _)| *m != "view/open") // the editor view asked for, first
+        .filter(|(m, _)| *m != "view/set_read") // the source asked for, first
         .collect();
     assert_eq!(reqs.len(), 2, "content range then change: {reqs:?}");
     assert_eq!(reqs[0].0, "element/block_content");
@@ -11659,7 +11712,7 @@ fn read_ctrl_o_opens_a_block_via_the_server_then_enters_insert() {
         "the landing needs no correcting move"
     );
     assert!(
-        all_requests(&fx).iter().any(|(m, _)| *m == "view/open"),
+        all_requests(&fx).iter().any(|(m, _)| *m == "view/set_read"),
         "…only the editor's view, asked for"
     );
 
@@ -11690,38 +11743,39 @@ fn read_ctrl_o_refused_stays_in_the_reading_view() {
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Toast { .. })));
 }
 
-/// The edit transitions leave the reading view at once *and* ask for the buffer's editor view —
-/// the sibling's window would otherwise bring the reader straight back mid-Insert. The mode they
-/// set survives the sibling's adoption: the cursor is the buffer's, shared by both views.
+/// The edit transitions leave the reading view at once *and* ask to see the source — the next
+/// pushed window would otherwise bring the reader straight back mid-Insert. The mode they set
+/// survives the flip: the view and the cursor are the same.
 #[test]
-fn read_edit_transitions_ask_for_the_editor() {
+fn read_edit_transitions_ask_for_the_source() {
     use aether_client::session::Mode;
     let mut s = read_session();
+    let view = s.view.view_id;
     let fx = key(&mut s, 'i');
     assert_eq!(s.view.mode, Mode::Insert);
     assert!(s.view.read.is_none(), "handed over to the editor at once");
-    let token = the_sibling_request(&s, &fx, "editor");
-    let fx = s.on_rpc_result(token, Ok(sibling_open(&s, 901)));
+    let token = the_read_request(&s, &fx, false);
+    let fx = s.on_rpc_result(token, Ok(read_set(false)));
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
-    assert_eq!(s.view.view_id, ViewId(901));
+    assert_eq!(s.view.view_id, view);
     assert_eq!(s.view.mode, Mode::Insert, "the transition's mode stands");
     // Space u out of Read asks the same way.
     let mut s = read_session();
     let fx = leader(&mut s, 'u');
     assert_eq!(s.view.mode, Mode::Normal);
-    let _ = the_sibling_request(&s, &fx, "editor");
+    let _ = the_read_request(&s, &fx, false);
 }
 
-/// Which view a file opens in is the server's: a plain open asks for nothing, and the window
-/// that comes back says what the view is.
+/// How a file opens is the server's: a plain open asks for nothing, and the window that comes
+/// back says whether it is being read.
 #[test]
-fn a_plain_open_leaves_the_kind_to_the_server() {
+fn a_plain_open_leaves_the_mode_to_the_server() {
     use aether_client::session::Mode;
     let mut s = read_session();
     let fx = s.open_path_at("/tmp/other.md".into(), None, None);
     let (token, _m, params) = the_request(&fx);
     assert!(
-        params.get("kind").is_none(),
+        params.get("read").is_none(),
         "no opinion: the server presents the file as it was last shown"
     );
     let _ = s.on_rpc_result(
@@ -12029,24 +12083,23 @@ fn space_v_toggles_back_to_the_editor() {
             .filter_map(|e| match e {
                 Effect::RevealCursor(aether_client::effect::RevealStyle::Jump) => Some("reveal"),
                 Effect::SaveContentAnchor => Some("anchor"),
-                Effect::Request { method, .. } if *method == "view/open" => Some("open"),
+                Effect::Request { method, .. } if *method == "view/set_read" => Some("flip"),
                 _ => None,
             })
             .collect();
-    assert_eq!(order, vec!["reveal", "anchor", "open"]);
-    let token = the_sibling_request(&s, &fx, "editor");
-    let fx = s.on_rpc_result(token, Ok(sibling_open(&s, 901)));
+    assert_eq!(order, vec!["reveal", "anchor", "flip"]);
+    let token = the_read_request(&s, &fx, false);
+    let fx = s.on_rpc_result(token, Ok(read_set(false)));
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
-    assert_eq!(s.view.view_id, ViewId(901));
     // The editor's window confirms it.
     let id = s.view.buffer.buffer_id;
     let _ = s.adopt_subscribe(editor_subscribe(id));
     assert_eq!(s.view.mode, Mode::Normal);
     assert!(s.view.read.is_none());
-    // `Space u` again asks for the reader, whatever the app default says.
+    // `Space u` again asks to read, whatever the app default says.
     s.markdown_read_default = false;
     let fx = leader(&mut s, 'u');
-    let _ = the_sibling_request(&s, &fx, "reader");
+    let _ = the_read_request(&s, &fx, true);
 }
 
 #[test]
@@ -12205,8 +12258,8 @@ fn jump_shaped_open_lands_in_editor_file_shaped_in_read() {
     let (token, method, params) = the_request(&fx);
     assert_eq!(method, "view/open");
     assert!(
-        params.get("jump_to").is_some() && params.get("kind").is_none(),
-        "the jump itself says editor; nothing else needs to"
+        params.get("jump_to").is_some() && params.get("read").is_none(),
+        "the jump itself says source; nothing else needs to"
     );
     let open = json!({
         "buffer_id": 7, "language": "markdown", "line_count": 5, "byte_count": 40,
@@ -12222,7 +12275,7 @@ fn jump_shaped_open_lands_in_editor_file_shaped_in_read() {
     let fx = s.open_path_at("/tmp/other.md".into(), None, None);
     let (token, _m, params) = the_request(&fx);
     assert!(
-        params.get("kind").is_none(),
+        params.get("read").is_none(),
         "file-shaped → the server's call"
     );
     assert!(params.get("jump_to").is_none());
@@ -12259,6 +12312,7 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
         view_id: aether_protocol::ViewId(buffer_id),
         scroll: None,
         transient: true,
+        read: false,
         buffer: BufferDescription {
             buffer_id,
             language: Some("markdown".into()),
@@ -12370,20 +12424,20 @@ fn read_click_activate_follows_a_link() {
     );
 }
 
-/// `Space t` on a footnote reference shows the definition's **text**, flattened from the parse.
+/// `Space n` on a footnote reference shows the definition's **text**, flattened from the parse.
 ///
 /// Not its source: the popover renders plain text, so slicing the definition's span showed its
 /// markup through and led with the `[^1]:` marker that names the very footnote you are standing
 /// on.
 #[test]
-fn space_t_shows_a_footnote_definition_as_text_not_source() {
+fn space_n_shows_a_footnote_definition_as_text_not_source() {
     use aether_client::session::HoverText;
     let mut s = md_session();
     let _ = enter_reader(&mut s, "A claim[^1].\n\n[^1]: The **bold** definition.\n");
     // On the reference itself (its span starts at byte 7, which is line 0 column 7).
     s.view.buffer.cursor.position = aether_protocol::LogicalPosition { line: 0, col: 7 };
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let fx = s.on_key(KeyCode::Char('t'), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, None);
     let shown =
         fx.0.iter()
             .find_map(|e| match e {
@@ -13758,27 +13812,68 @@ fn shell_run_push(
     })
 }
 
-/// `Space b` asks for a *new* shell only when the view in front of you is already one — which the
-/// client reads off the window's input element, not off any kind flag.
+/// `Space Alt-t` always asks for a **new** shell — from an ordinary view and from inside a shell
+/// alike. The old "give me the idle one" heuristic went with the shells picker: `Space t` lists
+/// what you have, so the open key has one meaning and carries no parameters at all.
 #[test]
-fn space_b_asks_for_a_new_shell_only_from_inside_one() {
+fn space_alt_t_always_asks_for_a_new_shell() {
     let mut s = session();
-    let fx = {
-        let _ = key(&mut s, ' ');
-        key(&mut s, 'b')
-    };
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "shell/open");
-    assert_eq!(params["new"], false, "an ordinary view: give me a shell");
+    assert_eq!(params, json!({}), "no `new` flag survives");
 
     let mut s = shell_session(1);
-    let fx = {
-        let _ = key(&mut s, ' ');
-        key(&mut s, 'b')
-    };
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "shell/open");
-    assert_eq!(params["new"], true, "already in one: give me another");
+    assert_eq!(params, json!({}));
+}
+
+/// `Space t` opens the shells picker — the other half of the pair.
+#[test]
+fn space_t_opens_the_shells_picker() {
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let fx = key(&mut s, 't');
+    let params = find_request(&fx, "picker/view").expect("the shells picker opens");
+    assert_eq!(params["kind"], "shells");
+}
+
+/// `Space a` opens the agents picker; `Space Alt-a` always mints a conversation, with no
+/// `from_view` to decide anything from.
+#[test]
+fn space_a_lists_agents_and_alt_a_makes_one() {
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let fx = key(&mut s, 'a');
+    let params = find_request(&fx, "picker/view").expect("the agents picker opens");
+    assert_eq!(params["kind"], "agents");
+
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('a'), Mods::ALT, None);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "agent/open");
+    assert_eq!(params, json!({}), "no `from_view`, no `agent`");
+}
+
+/// `Space b` lists buffers; `Space Alt-b` is the new scratch.
+#[test]
+fn space_b_lists_buffers_and_alt_b_makes_a_scratch() {
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let fx = key(&mut s, 'b');
+    let params = find_request(&fx, "picker/view").expect("the buffers picker opens");
+    assert_eq!(params["kind"], "buffers");
+
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
+    let (_, method, _) = the_request(&fx);
+    assert_eq!(method, "view/open");
 }
 
 /// Opening a shell lands the caret in its input, in Insert.
@@ -13786,7 +13881,7 @@ fn space_b_asks_for_a_new_shell_only_from_inside_one() {
 fn opening_a_shell_focuses_the_input_and_enters_insert() {
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = key(&mut s, 'b');
+    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None);
     let (token, method, _) = the_request(&fx);
     assert_eq!(method, "shell/open");
 
@@ -13882,6 +13977,99 @@ fn enter_follows_the_line_in_any_composed_view() {
     assert_eq!(the_request(&fx).1, "lsp/goto_definition");
 }
 
+/// `Enter` on a hunk of a review opens the file it windows **as its own view** — a switch, even
+/// though the cursor is already in that file. The adopter once judged "same buffer" as "a move
+/// within this view" and left the review on screen with the cursor nudged; a different view of
+/// the buffer you are in is a different window.
+#[test]
+fn enter_in_a_review_switches_to_the_file_under_the_cursor() {
+    let mut s = session();
+    // A review: its identity is the patch (view 9 over buffer 9); the cursor is in file 42, which
+    // element 2 windows.
+    s.view.view_id = ViewId(9);
+    s.view.view_buffer = 9;
+    s.view.buffer.buffer_id = 42;
+    s.view.focused_element = 2;
+
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "view/open");
+    assert_eq!(params["view_id"], json!(9), "named through the review");
+    assert_eq!(params["element"], json!(2), "the element the cursor is in");
+    assert_eq!(
+        params["record_nav_from"],
+        json!(9),
+        "Backspace returns to the review"
+    );
+
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "view_id": 42,
+            "buffer_id": 42,
+            "language": "rust",
+            "line_count": 10,
+            "byte_count": 100,
+            "revision": 1,
+            "saved_revision": 1,
+            "path": "/p/a.rs",
+            "cursor": { "position": {"line": 3, "col": 0}, "anchor": {"line": 3, "col": 0} },
+        })),
+    );
+    assert_eq!(
+        s.view.view_id,
+        ViewId(42),
+        "the file's own view is what is on screen now"
+    );
+    assert_eq!(s.view.view_buffer, 42, "and it is its own buffer's view");
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
+        "a switch re-subscribes the viewport"
+    );
+}
+
+/// A history step onto a patch — regenerated, so a new view over a new buffer — is a switch, and
+/// the step carries the seat: a scroll anchored in the hunk's element, and the cursor there.
+#[test]
+fn a_history_step_onto_a_regenerated_patch_switches_to_it() {
+    use aether_client::update::Event;
+    let mut s = session();
+    s.view.view_id = ViewId(5);
+    s.view.view_buffer = 5;
+    s.view.buffer.buffer_id = 5;
+    let patch = json!({
+        "view_id": 12,
+        "buffer_id": 12,
+        "language": null,
+        "line_count": 40,
+        "byte_count": 800,
+        "revision": 1,
+        "saved_revision": 1,
+        "path": null,
+        "title": "abc1234 — Add thing",
+        "read_only": true,
+        "is_patch": true,
+        "scroll": { "element": 3, "line": 7, "sub_row": 0.0 },
+        "cursor": { "position": {"line": 7, "col": 0}, "anchor": {"line": 7, "col": 0} },
+    });
+    let fx = s.on_event(Event::NavDone {
+        forward: false,
+        result: Ok(serde_json::from_value(json!({ "target": patch })).unwrap()),
+    });
+    assert_eq!(s.view.view_id, ViewId(12), "the patch's view is on screen");
+    assert_eq!(s.view.buffer.buffer_id, 12);
+    assert!(s.view.buffer.is_patch);
+    assert_eq!(
+        s.view.buffer.scroll.map(|sc| sc.element),
+        Some(3),
+        "seated in the hunk's element for the subscribe"
+    );
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
+        "a switch re-subscribes"
+    );
+}
+
 /// A line that leads nowhere is silence, not an error — `Enter` is a common key and most lines of
 /// output are not paths.
 #[test]
@@ -13906,45 +14094,76 @@ fn a_refused_submit_says_what_is_in_the_way() {
         Err(aether_client::transport::RpcError {
             method: "shell/run",
             code: aether_protocol::error::ErrorCode::SHELL_BUSY.code(),
-            message: "Shell 1 is running sleep 100 — Space Alt-b stops it".into(),
+            message: "Shell 1 is running sleep 100 — Space v c stops it".into(),
         }),
     );
     let toasts = toast_messages(&fx);
     assert_eq!(
         toasts,
-        vec!["Already running — Shell 1 is running sleep 100 — Space Alt-b stops it".to_string()]
+        vec!["Already running — Shell 1 is running sleep 100 — Space v c stops it".to_string()]
     );
     assert!(!has_error_toast(&fx), "busy is not a failure");
 }
 
-/// `Space Alt-b` stops the shell you are looking at, and says so plainly when there is nothing to
-/// stop — silence there reads as a dropped keystroke.
+/// `Space v c` stops whatever the view you are looking at is running.
+///
+/// One request whatever the view is — the client makes no guess about the kind, so a file view
+/// sends it too and the server's `interrupted: false` is what produces the toast. That is the
+/// whole reason "Not a shell" is gone: there was never a way for the client to know.
 #[test]
-fn space_alt_b_stops_the_focused_shells_run() {
+fn space_v_c_interrupts_the_focused_view() {
     let mut s = shell_session(1);
     let _ = s.on_event(shell_run_push(10, "sleep 100", json!({"kind": "running"})));
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
+    let _ = key(&mut s, 'v');
+    let fx = key(&mut s, 'c');
     let (_, method, params) = the_request(&fx);
-    assert_eq!(method, "shell/cancel");
+    assert_eq!(method, "view/interrupt");
     assert_eq!(params["view_id"], 10);
 
-    // Nothing running.
-    let mut s = shell_session(1);
+    // A file view asks all the same — and the answer is what says nothing was running.
+    let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
-    assert!(no_request(&fx));
+    let _ = key(&mut s, 'v');
+    let fx = key(&mut s, 'c');
+    let (token, method, _) = the_request(&fx);
+    assert_eq!(method, "view/interrupt");
+    let fx = s.on_rpc_result(token, Ok(json!({ "interrupted": false })));
     assert_eq!(
         toast_messages(&fx),
         vec!["Nothing is running here".to_string()]
     );
+}
 
-    // Not a shell at all.
-    let mut s = session();
+/// A stop that landed says nothing: the finish arrives as a push.
+#[test]
+fn a_landed_interrupt_is_silent() {
+    let mut s = shell_session(1);
+    let _ = s.on_event(shell_run_push(10, "sleep 100", json!({"kind": "running"})));
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
-    assert!(no_request(&fx));
-    assert_eq!(toast_messages(&fx), vec!["Not a shell".to_string()]);
+    let _ = key(&mut s, 'v');
+    let fx = key(&mut s, 'c');
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(token, Ok(json!({ "interrupted": true })));
+    assert!(toast_messages(&fx).is_empty());
+}
+
+/// `Esc` in the view sub-leader cancels the chord rather than acting: no verb is bound to it, and
+/// an unbound key clears the pending prefix.
+#[test]
+fn esc_cancels_the_view_sub_leader() {
+    let mut s = shell_session(1);
+    let _ = s.on_event(shell_run_push(10, "sleep 100", json!({"kind": "running"})));
+    let _ = key(&mut s, ' ');
+    let _ = key(&mut s, 'v');
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
+    assert!(no_request(&fx), "Esc is not a verb in the table");
+    // …and the chord is gone: the next `c` is an ordinary Normal-mode key, not the interrupt.
+    let fx = key(&mut s, 'c');
+    assert!(
+        find_request(&fx, "view/interrupt").is_none(),
+        "the pending chord was cancelled"
+    );
 }
 
 /// A run is appended above the input, so the input's element number goes up by one with every
@@ -14281,5 +14500,181 @@ fn the_external_change_notice_is_raised_once_per_buffer() {
         toast_parts(&s.adopt_subscribe(flagged())).len(),
         1,
         "a divergence after the buffer went clean is news again"
+    );
+}
+
+// ---- closing something that is still going -------------------------------------------------------
+
+/// A `agent/turn_changed` push, as the server sends it.
+fn agent_turn_push(view_id: u64, running: bool) -> aether_client::update::Event {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: aether_protocol::agent::AgentTurnChanged::NAME.into(),
+        params: json!({
+            "view_id": view_id,
+            "turn": { "running": running },
+        }),
+    })
+}
+
+/// `Space x` on a shell with a command in flight asks first — closing the view kills the process
+/// group, which is the same class of loss as discarding unsaved text.
+///
+/// One gate (`close_confirm_for`) for this and for every picker's `Ctrl-d`, so the two can never
+/// disagree about what is worth a prompt.
+#[test]
+fn closing_a_running_shell_confirms_and_an_idle_one_does_not() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    let mut s = shell_session(1);
+    let _ = s.on_event(shell_run_push(10, "sleep 100", json!({"kind": "running"})));
+    let _ = key(&mut s, ' ');
+    let fx = key(&mut s, 'x');
+    assert!(fx.0.is_empty(), "the confirm stages, nothing is sent");
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::CloseRunningShell { title },
+            ..
+        }) => assert_eq!(title, &s.view.view_label),
+        other => panic!("expected a running-shell confirm, got {other:?}"),
+    }
+    // `y` goes through to the ordinary close.
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
+    assert!(find_request(&fx, "view/close").is_some());
+
+    // An idle shell closes with no question at all.
+    let mut s = shell_session(1);
+    let _ = key(&mut s, ' ');
+    let fx = key(&mut s, 'x');
+    assert!(s.prompt.is_none(), "nothing is running — nothing to ask");
+    assert!(find_request(&fx, "view/close").is_some());
+}
+
+/// The agent counterpart: a turn in flight is worth asking about, an idle conversation is not.
+#[test]
+fn closing_a_busy_agent_confirms() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    let mut s = shell_session(1);
+    let _ = s.on_event(agent_turn_push(10, true));
+    let _ = key(&mut s, ' ');
+    let fx = key(&mut s, 'x');
+    assert!(fx.0.is_empty());
+    assert!(
+        matches!(
+            &s.prompt,
+            Some(Prompt::Confirm {
+                kind: ConfirmKind::CloseBusyAgent { .. },
+                ..
+            })
+        ),
+        "expected a busy-agent confirm, got {:?}",
+        s.prompt
+    );
+
+    // The turn ending clears it.
+    let mut s = shell_session(1);
+    let _ = s.on_event(agent_turn_push(10, true));
+    let _ = s.on_event(agent_turn_push(10, false));
+    let _ = key(&mut s, ' ');
+    let fx = key(&mut s, 'x');
+    assert!(s.prompt.is_none());
+    assert!(find_request(&fx, "view/close").is_some());
+}
+
+/// `Ctrl-d` in the shells and agents pickers goes through the same gate, reading the row's own
+/// badge instead of the focused view's state — the picker can close something you are not looking
+/// at, so the current view says nothing about it.
+#[test]
+fn picker_ctrl_d_confirms_a_running_row_and_closes_an_idle_one() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_protocol::picker::{AgentRowState, PickerItem, PickerKind};
+
+    let shell_row = |view_id: u64, title: &str, running: bool| PickerItem::Shell {
+        view_id: ViewId(view_id),
+        title: title.into(),
+        cwd: "~/proj".into(),
+        last_command: Some("cargo test".into()),
+        running,
+        exit: None,
+        elapsed_ms: None,
+        dormant: false,
+        match_indices: vec![],
+    };
+
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Shells, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![
+            shell_row(31, "Shell 1", true),
+            shell_row(32, "Shell 2", false),
+        ];
+        p.offset = 0;
+        p.total_matches = 2;
+        p.selected = 0;
+    }
+    let fx = ctrl(&mut s, 'd');
+    assert!(
+        find_request(&fx, "view/close").is_none(),
+        "a running shell asks first"
+    );
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::CloseRunningShell { title },
+            ..
+        }) => assert_eq!(title, "Shell 1"),
+        other => panic!("expected a running-shell confirm, got {other:?}"),
+    }
+    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
+    let close = find_request(&fx, "view/close").expect("the confirm closes it");
+    assert_eq!(close["view_id"], json!(31));
+
+    // The idle row closes straight away.
+    s.picker.as_mut().unwrap().selected = 1;
+    let fx = ctrl(&mut s, 'd');
+    assert!(s.prompt.is_none());
+    assert_eq!(
+        find_request(&fx, "view/close").expect("closes")["view_id"],
+        json!(32)
+    );
+
+    // An agent blocked on a permission request is *not* idle: the turn is stopped, not over.
+    let agent_row = |view_id: u64, title: &str, state: AgentRowState| PickerItem::Agent {
+        view_id: ViewId(view_id),
+        title: title.into(),
+        agent: "Claude Code".into(),
+        state,
+        last_prompt: None,
+        dormant: false,
+        match_indices: vec![],
+    };
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Agents, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![
+            agent_row(41, "Agent 1", AgentRowState::AwaitingPermission),
+            agent_row(42, "Agent 2", AgentRowState::Idle),
+        ];
+        p.offset = 0;
+        p.total_matches = 2;
+        p.selected = 0;
+    }
+    let _ = ctrl(&mut s, 'd');
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::CloseBusyAgent { title },
+            ..
+        }) => assert_eq!(title, "Agent 1"),
+        other => panic!("expected a busy-agent confirm, got {other:?}"),
+    }
+    s.prompt = None;
+    s.picker.as_mut().unwrap().selected = 1;
+    let fx = ctrl(&mut s, 'd');
+    assert!(s.prompt.is_none(), "an idle conversation closes at once");
+    assert_eq!(
+        find_request(&fx, "view/close").expect("closes")["view_id"],
+        json!(42)
     );
 }

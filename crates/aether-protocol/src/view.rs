@@ -26,8 +26,7 @@ impl RpcMethod for ViewOpen {
 pub struct ViewOpenParams {
     /// Present this **view** — one that exists: a picker row, the view a close hands you on to,
     /// the one a link or a history step recorded. Outranks the path fields, which are ignored
-    /// with it. With `kind`, the view's *file* as that kind: what `Space u` asks, naming the view
-    /// it is leaving. Errors if the id names no view, live or dormant.
+    /// with it. Errors if the id names no view, live or dormant.
     ///
     /// There is no open by buffer: a buffer is what a view shows, and a client never holds one
     /// it did not reach through a view.
@@ -39,17 +38,20 @@ pub struct ViewOpenParams {
     /// view windowing it can say which it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element: Option<u32>,
-    /// Which view of a markdown file to present: its editor, or its reader. `None` leaves it to
-    /// the server — the file's most recently used view, else one created per the app setting —
-    /// except that a `jump_to` open lands in the editor, where a `line:col` means something,
-    /// unless the client has the file's reader on screen: a jump inside the document being read
-    /// (its outline, a reference, a grep hit) stays on the page. A
-    /// client sends `Some` only when its route decided: `Space u` asks for the sibling, a followed
-    /// `#anchor` for the reader, the web shell's `view=` URL for what it recorded. The file's view
-    /// of that kind is reused when it has one, else created. Ignored for any other file, and for a
-    /// view a driver built.
+    /// How to present a markdown file to this client: as the rendered document (`Some(true)`) or
+    /// as its source (`Some(false)`). Reading is a **per-client presentation mode** of the file,
+    /// not a view of its own: one view, one buffer, and each client looking at it decides for
+    /// itself. `None` leaves it to the server — the mode this client last had the file in, else
+    /// the mode the file was last shown as by anyone, else the app setting — except that a
+    /// `jump_to` open lands in the editor, where a `line:col` means something, unless the client
+    /// has the file on screen and is reading it: a jump inside the document being read (its
+    /// outline, a reference, a grep hit) stays on the page. A client sends `Some` only when its
+    /// route decided: a followed `#anchor` asks to read, the web shell's `as=` URL for what it
+    /// recorded, a history step for the mode it left. Ignored for any file that is not markdown,
+    /// and for a view a driver built. `Space u` flips the mode in place with
+    /// [`ViewSetRead`] instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<crate::ui::ViewKind>,
+    pub read: Option<bool>,
     pub path_index: Option<u32>,
     pub relative_path: Option<String>,
     /// Open a file by absolute path, bypassing the `path_index`/`relative_path` workspace-root
@@ -169,6 +171,12 @@ pub struct ViewOpenResult {
     /// [`ViewOpenParams::transient`]). Promotion mid-session is pushed via `view/state`.
     #[serde(default)]
     pub transient: bool,
+    /// True when this client is **reading** the file — its window will carry the rendered
+    /// document as one prose element rather than lines. Always false for anything but a markdown
+    /// file presented on its own. Decided per client (see [`ViewOpenParams::read`]); a client
+    /// changes it with [`ViewSetRead`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read: bool,
     #[serde(flatten)]
     pub buffer: BufferDescription,
 }
@@ -300,6 +308,41 @@ pub struct ViewClosedParams {
     pub next_path: Option<BufferLocation>,
 }
 
+// ---- view/set_read ----------------------------------------------------------------------------
+
+/// Flip how **this client** sees a markdown file: read it as the rendered document, or edit its
+/// source — the `Space u` toggle.
+///
+/// A presentation mode of the file for one client, kept server-side beside the cursor (both are
+/// "this client's relationship to this buffer"): the server composes the window, and since the
+/// reader is one prose element carrying the parse, the server has to know before the first frame.
+/// Kept there rather than on the viewport because a viewport is superseded on every switch and
+/// would forget; the file is remembered as it was last shown, for this client while the file is
+/// open and for everyone as the seed of the next client's first landing. The client re-subscribes
+/// after the flip and adopts whatever window comes back, exactly as it does for a wrap toggle —
+/// the content anchor it captured first is what keeps the same lines on screen.
+///
+/// Errors for a file that has no reader — anything but markdown presented on its own.
+pub struct ViewSetRead;
+impl RpcMethod for ViewSetRead {
+    const NAME: &'static str = "view/set_read";
+    type Params = ViewSetReadParams;
+    type Result = ViewSetReadResult;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewSetReadParams {
+    pub view_id: crate::ViewId,
+    /// `true` to read the rendered document, `false` to edit its source.
+    pub read: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewSetReadResult {
+    /// The mode after the change — echoes the request so the client can confirm.
+    pub read: bool,
+}
+
 // ---- view/set_transient -----------------------------------------------------------------------
 
 pub struct ViewSetTransient;
@@ -396,4 +439,39 @@ pub struct ViewSubmitInputResult {
     /// what sort of view it was in. `None` when nothing was submitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::history::HistoryKind>,
+}
+
+// ---- view/interrupt ------------------------------------------------------------------------------
+
+/// Stop whatever the view is running — `Space v c`.
+///
+/// **Total over the kinds of composed view**, the counterpart of [`ViewSubmitInput`]: a shell has
+/// a run and an agent has a turn, the client cannot tell the two apart (the window marks the input
+/// by [`crate::ui::ElementRole`] and carries no view kind), so it asks one question and the server
+/// decides what stopping means here. A view running nothing — a file, an idle shell, an idle
+/// conversation — answers `interrupted: false` rather than erroring, and the client says "nothing
+/// is running here" off that one answer instead of guessing from what it thinks the view is.
+///
+/// [`crate::shell::ShellCancel`] and [`crate::agent::AgentCancel`] remain methods in their own
+/// right, for the reason `shell/run` and `agent/prompt` do: the shapes differ, and the tests that
+/// pin them are about those shapes rather than about the key that reaches them.
+pub struct ViewInterrupt;
+impl RpcMethod for ViewInterrupt {
+    const NAME: &'static str = "view/interrupt";
+    type Params = ViewInterruptParams;
+    type Result = ViewInterruptResult;
+    // Stopping a run edits nothing: the transcript grows by the runner's own writes, and the
+    // buffer the view presents is read-only either way.
+    const MUTATES_TEXT: bool = false;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewInterruptParams {
+    pub view_id: crate::ViewId,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewInterruptResult {
+    /// False when nothing was running — including a view that could never run anything.
+    pub interrupted: bool,
 }

@@ -41,21 +41,12 @@ const TRUNCATED: &str = "[output truncated — the run exceeded this shell's out
 pub async fn shell_open(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: ShellOpenParams,
+    _params: ShellOpenParams,
 ) -> Result<ShellOpenResult, RpcError> {
-    let client_id = ctx.client_id;
-    // Reuse before minting: `Space b` means "a shell I can type into", and the one already in
-    // front of you is the one you meant unless it is busy.
-    let existing = if params.new {
-        None
-    } else {
-        let s = state.lock().await;
-        idle_shell_for(&s, client_id)
-    };
-    let transcript = match existing {
-        Some(id) => id,
-        None => mint_shell(state, client_id, None).await?,
-    };
+    // Always a new one. Returning to a shell you already have is the shells picker's job
+    // (`Space t`), which is a list you can see — unlike the reuse heuristic this replaced, where
+    // the same key opened a new shell or an old one depending on which was idle.
+    let transcript = mint_shell(state, ctx.client_id, None).await?;
     let (opened, input) = land_in_input(state, ctx, transcript).await?;
     Ok(ShellOpenResult { opened, input })
 }
@@ -161,36 +152,6 @@ pub async fn open_restored_shell(
     Ok(opened)
 }
 
-/// The shell `Space b` should hand back when it is not being asked for a new one: the one this
-/// client is looking at if it is idle, else the workspace's most recently used idle shell.
-///
-/// `None` means "mint one" — every shell is busy, or there are none.
-fn idle_shell_for(s: &ServerState, client_id: ClientId) -> Option<BufferId> {
-    let workspace = s.active_workspace(client_id)?.id.clone();
-    let idle = |id: &BufferId| {
-        s.try_doc_of(*id)
-            .and_then(|d| d.transcript())
-            .is_some_and(|t| t.active().is_none())
-    };
-    let focused = s
-        .viewports
-        .values()
-        .find(|v| v.client_id == client_id)
-        .map(|v| s.view_of(v).presenting)
-        .filter(idle);
-    if focused.is_some() {
-        return focused;
-    }
-    // Most recently used first, which is the order the views list is kept in.
-    let entry = s.workspaces.get(&workspace)?;
-    entry
-        .mru_views
-        .iter()
-        .rev()
-        .filter_map(|v| s.try_view(*v).map(|view| view.presenting))
-        .find(idle)
-}
-
 /// Create a shell: a transcript document, an input document, and the view over the two — fresh,
 /// or as `seed` (a number and the snapshot written under it) left it.
 async fn mint_shell(
@@ -273,16 +234,16 @@ async fn mint_shell(
     // Not transient. A shell is somewhere you are working, not a preview you glanced at — and a
     // transient one would close itself the moment you looked at a file, taking a running build
     // with it.
-    s.open_view(transcript);
+    s.open_view(transcript, None);
     s.touch_mru(transcript);
+    // Recorded in the session at once, as every other open is: the shell's snapshot is what
+    // brings it back, and the session entry is what says there is one to bring. The `touch_mru`
+    // above marked it dirty; the flush at the end of the request writes it.
     let pushes = refresh_view_pickers(&mut s);
     drop(s);
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    // Recorded in the session at once, as every other open is: the shell's snapshot is what
-    // brings it back, and the session entry is what says there is one to bring.
-    persist_workspace_session(state, &workspace, false).await;
     Ok(transcript)
 }
 
@@ -671,7 +632,7 @@ pub async fn shell_cancel(
     {
         return Err(RpcError::not_a_shell(params.view_id));
     }
-    // Taking the handle rather than merely signalling through it: a second `Space Alt-b` after the
+    // Taking the handle rather than merely signalling through it: a second `Space v c` after the
     // run has ended must not signal a pid the system has since reused.
     let cancelled = s
         .with_transcript(transcript, |t| {
@@ -1002,12 +963,23 @@ async fn push_transcript_changed(state: &SharedState, transcript: BufferId) {
     }
 }
 
-/// Push `shell/run_changed` to every connected client.
+/// Push `shell/run_changed` to every connected client, and re-push every open shells picker.
 ///
 /// Every client, like `git/operation_changed`: a shell belongs to the workspace rather than to
 /// whoever pressed `Enter`, and a client with the view open wants the indicator whether or not it
 /// started the run.
+///
+/// The picker re-push rides here because this is the one funnel a run transition passes through,
+/// and a row's badge (`● running` → `✓ 0  3.2s`) is exactly what just changed. Recency ordering
+/// means the row re-paints where it is.
 async fn push_run_changed(state: &SharedState, view_id: ViewId, run: Option<RunState>) {
+    let picker_pushes = {
+        let mut s = state.lock().await;
+        refresh_shell_pickers(&mut s)
+    };
+    for (sender, notif) in picker_pushes {
+        let _ = sender.send(notif).await;
+    }
     let params = ShellRunChangedParams { view_id, run };
     let value = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
     let pushes: PendingPushes = {
@@ -1245,6 +1217,72 @@ pub async fn view_submit_input(
             Ok(ViewSubmitInputResult {
                 submitted: sent.sent,
                 history: sent.sent.then_some(HistoryKind::Agent),
+            })
+        }
+    }
+}
+
+// ---- view/interrupt ------------------------------------------------------------------------------
+
+/// **Total** over the kinds of composed view: what "stop what this is doing" means here.
+///
+/// The sibling of [`view_submit_input`], and for the same reason — the client cannot tell a shell
+/// from an agent view, so it asks one question and the server routes it. A shell's run is
+/// cancelled, an agent's turn is cancelled, and anything else — a file, an idle shell, an idle
+/// conversation — answers `interrupted: false`, which is what the client's one "Nothing is running
+/// here" toast is built on.
+pub async fn view_interrupt(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::view::ViewInterruptParams,
+) -> Result<aether_protocol::view::ViewInterruptResult, RpcError> {
+    use aether_protocol::view::ViewInterruptResult;
+
+    enum Stop {
+        Shell,
+        Agent,
+        Nothing,
+    }
+    let stop = {
+        let s = state.lock().await;
+        let Some(view_buffer) = s.try_presenting_buffer(params.view_id) else {
+            return Ok(ViewInterruptResult::default());
+        };
+        match s.try_doc_of(view_buffer).and_then(|d| d.generated.as_ref()) {
+            Some(Generated::Shell(_)) => Stop::Shell,
+            Some(Generated::Agent(_)) => Stop::Agent,
+            Some(Generated::Patch(_)) | None => Stop::Nothing,
+        }
+    };
+
+    // Straight through to the cancel bodies: the two methods keep their own shapes (the tests that
+    // pin them are about those), and this only decides which one the key meant.
+    match stop {
+        Stop::Nothing => Ok(ViewInterruptResult::default()),
+        Stop::Shell => {
+            let r = shell_cancel(
+                state,
+                ctx,
+                ShellCancelParams {
+                    view_id: params.view_id,
+                },
+            )
+            .await?;
+            Ok(ViewInterruptResult {
+                interrupted: r.cancelled,
+            })
+        }
+        Stop::Agent => {
+            let r = crate::handlers::agent_cancel(
+                state,
+                ctx,
+                aether_protocol::agent::AgentCancelParams {
+                    view_id: params.view_id,
+                },
+            )
+            .await?;
+            Ok(ViewInterruptResult {
+                interrupted: r.cancelled,
             })
         }
     }
