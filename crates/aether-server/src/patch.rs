@@ -30,6 +30,11 @@ use crate::syntax::{InjectionLayer, LanguageConfig};
 
 /// Largest blob to parse for highlighting, matching the threshold `view/open` defers a parse at.
 /// Past it the file's lines render unhighlighted rather than stalling the whole patch.
+///
+/// Both limits apply only to the files whose lines *stay in the generated document* — see
+/// [`PlannedFile::bound_path`]. A file the driver windows over a real buffer is highlighted from
+/// that buffer's own tree, and parsing its blobs here as well was, at three hundred files, the
+/// larger part of what generating a working-changes view cost.
 const MAX_HIGHLIGHT_BLOB_BYTES: usize = 128 * 1024;
 /// Most files in one patch to parse. A sweeping commit is a legitimate thing to look at, and it
 /// should open now and read plainly rather than open late and read beautifully.
@@ -213,11 +218,17 @@ struct StageIndex {
 }
 
 impl StageIndex {
-    fn for_file(repo: &git2::Repository, path: &str) -> Option<Self> {
-        let index_blob = repo
-            .index()
-            .ok()?
-            .get_path(std::path::Path::new(path), 0)
+    /// The stage split for `path` — or `None` when the index holds exactly what the diff's left
+    /// side (`left`) does, so nothing is staged and every change is unstaged without a diff to
+    /// prove it. That is most files most of the time, and the working-changes view is rebuilt on
+    /// every save under the repo: the index→worktree diff of every *unstaged* file was the larger
+    /// part of what each rebuild cost.
+    fn for_file(repo: &git2::Repository, path: &str, left: git2::Oid) -> Option<Self> {
+        let entry = repo.index().ok()?.get_path(std::path::Path::new(path), 0);
+        if entry.as_ref().is_some_and(|e| e.id == left) {
+            return None;
+        }
+        let index_blob = entry
             .and_then(|e| repo.find_blob(e.id).ok())
             .map(|b| b.content().to_vec())
             .unwrap_or_default();
@@ -669,6 +680,26 @@ pub struct PlannedFile {
     pub regions: Vec<PlannedRegion>,
 }
 
+impl PlannedFile {
+    /// The file the driver windows this delta's hunks over, if it windows one: a new side to open,
+    /// and hunks to window it with. `None` for a deletion, whose lines have nowhere to go but the
+    /// generated document, and for a hunkless delta, which is a placeholder line.
+    ///
+    /// The one place this is decided. [`layout_over_files`] binds by it, the open path binds only
+    /// what it names, and [`render_diff`] reads it to know which of the lines it emits will ever
+    /// be shown — a bound file's are replaced by the real buffer's before anyone sees them, so
+    /// its blobs are not parsed for highlights.
+    ///
+    /// Decided by status rather than by `new_path` alone: libgit2 gives a deleted delta's new
+    /// side the same path as its old one, with nothing behind it.
+    pub fn bound_path(&self) -> Option<&str> {
+        if self.regions.is_empty() || self.status == PatchFileStatus::Deleted {
+            return None;
+        }
+        self.new_path.as_deref()
+    }
+}
+
 /// One hunk, as line ranges on both sides. 1-based, as libgit2 reports them.
 ///
 /// `new_lines == 0` is a pure deletion: the hunk shows entirely as phantom rows above
@@ -800,8 +831,7 @@ pub fn layout_over_files(
             layout.push(generated_slice());
             continue;
         };
-        let (Some(path), Some(region)) =
-            (file.new_path.as_deref(), file.regions.get(hunk as usize))
+        let (Some(path), Some(region)) = (file.bound_path(), file.regions.get(hunk as usize))
         else {
             layout.push(generated_slice());
             continue;
@@ -915,8 +945,21 @@ fn close_last_box(layout: &mut [crate::state::ElementLayout]) {
 }
 
 /// The shape of a diff: which files it touches, and which line ranges of each.
+#[cfg(test)]
 pub fn plan_diff(diff: &git2::Diff<'_>) -> Result<PatchPlan, String> {
+    plan_diff_keeping_patches(diff).map(|(plan, _)| plan)
+}
+
+/// [`plan_diff`], handing back the per-delta [`git2::Patch`] it walked as well.
+///
+/// Materialising a patch is where libgit2 runs the file's line diff, so it is the expensive half
+/// of planning — and rendering needs the same patches for the same deltas, in the same order.
+/// Planning keeps them rather than have rendering diff every file a second time.
+fn plan_diff_keeping_patches<'d>(
+    diff: &'d git2::Diff<'_>,
+) -> Result<(PatchPlan, Vec<Option<git2::Patch<'d>>>), String> {
     let mut files = Vec::new();
+    let mut patches = Vec::new();
     for (idx, delta) in diff.deltas().enumerate() {
         let patch = git2::Patch::from_diff(diff, idx).map_err(|e| e.message().to_string())?;
         let hunk_count = patch.as_ref().map(|p| p.num_hunks()).unwrap_or(0);
@@ -1007,26 +1050,80 @@ pub fn plan_diff(diff: &git2::Diff<'_>) -> Result<PatchPlan, String> {
             removed: removed as u32,
             regions,
         });
+        patches.push(patch);
     }
-    Ok(PatchPlan { files })
+    Ok((PatchPlan { files }, patches))
 }
 
+/// The patch's opening caption — `N files changed  +A  −B`, plus `since <rev>` when the working
+/// changes are being measured against something other than HEAD.
+///
+/// Chrome, so it holds no cursor position: nothing in it can be staged, followed or navigated to.
+/// The counts take the same green/red as a file separator's, which is what makes the number you
+/// scan for readable at a glance instead of a run of muted text.
+///
+/// Summed off the plan, which already counted every file's lines: `git2::Diff::stats` would count
+/// them again, and at generation that meant diffing every file in the tree a second time.
+///
+/// The baseline rides here rather than in the buffer's title because the caption is regenerated
+/// with the content and the title isn't — a caption can't be left saying `since main` after the
+/// baseline went back to the index.
+///
+/// No blank below it: the first file's rule follows immediately, and a gap there left the caption
+/// floating between the top of the buffer and the diff instead of sitting on it.
+fn emit_summary(b: &mut PatchBuilder, plan: &PatchPlan, since: Option<&str>) {
+    let mut text = String::new();
+    let mut spans: Vec<Span> = Vec::new();
+
+    let files = format!(
+        "{} file{} changed",
+        plan.files.len(),
+        if plan.files.len() == 1 { "" } else { "s" }
+    );
+    spans.push((0, files.len(), META));
+    text.push_str(&files);
+    let added = format!("  +{}", plan.files.iter().map(|f| f.added).sum::<u32>());
+    spans.push((text.len(), text.len() + added.len(), ADDED));
+    text.push_str(&added);
+    let removed = format!("  −{}", plan.files.iter().map(|f| f.removed).sum::<u32>());
+    spans.push((text.len(), text.len() + removed.len(), REMOVED));
+    text.push_str(&removed);
+    if let Some(label) = since {
+        let since = format!("  since {label}");
+        spans.push((text.len(), text.len() + since.len(), META));
+        text.push_str(&since);
+    }
+
+    b.heading(text, &spans);
+}
+
+/// Render `diff` into `b`: the opening caption, then every file's block.
+///
+/// `against_worktree` says the right-hand side is the working tree, whose changes split into a
+/// staged and an unstaged layer; a commit's never do. `since` names the left-hand side in the
+/// caption when it is something other than HEAD.
+///
+/// An empty diff renders nothing at all — not even the caption — so a caller with something to say
+/// about the emptiness says it in place of the diff.
 pub fn render_diff(
     repo: &git2::Repository,
     diff: &git2::Diff<'_>,
     b: &mut PatchBuilder,
     against_worktree: bool,
+    since: Option<&str>,
 ) -> Result<(), String> {
     // The shape first, then the text. One source of truth for what each delta *is*: the driver will
     // build its elements from this same plan, and a second copy of the status refinement here is
     // exactly the kind of thing that drifts.
-    let plan = plan_diff(diff)?;
+    let (plan, patches) = plan_diff_keeping_patches(diff)?;
+    if !plan.files.is_empty() {
+        emit_summary(b, &plan, since);
+    }
     let mut parsed_files = 0usize;
-    for (idx, delta) in diff.deltas().enumerate() {
+    for ((idx, delta), patch) in diff.deltas().enumerate().zip(patches) {
         let planned = &plan.files[idx];
         let old_path = planned.old_path.clone();
         let new_path = planned.new_path.clone();
-        let patch = git2::Patch::from_diff(diff, idx).map_err(|e| e.message().to_string())?;
         let hunk_count = planned.regions.len();
         let (status, added, removed) = (planned.status, planned.added, planned.removed);
 
@@ -1049,24 +1146,28 @@ pub fn render_diff(
         if hunk_count == 0 {
             emit_placeholder(b, &delta, status, file_idx);
         } else {
-            // Both sides are parsed, and each from *its own* path: a rename can change the
-            // extension, and the old side has to highlight as what it was.
-            let (old_blob, new_blob) = if parsed_files < MAX_HIGHLIGHTED_FILES {
-                parsed_files += 1;
-                (
-                    ParsedBlob::parse(repo, delta.old_file().id(), old_path.as_ref()),
-                    ParsedBlob::parse(repo, delta.new_file().id(), new_path.as_ref()),
-                )
-            } else {
-                (None, None)
-            };
+            // Highlights, for the lines that will be read here. A file the driver binds shows the
+            // real buffer's lines under that buffer's own tree, and what is generated for it is
+            // never seen; only a file with no new side to open — a deletion — keeps its text, so
+            // only its blobs are parsed. Both sides are, and each from *its own* path: a rename
+            // can change the extension, and the old side has to highlight as what it was.
+            let (old_blob, new_blob) =
+                if planned.bound_path().is_none() && parsed_files < MAX_HIGHLIGHTED_FILES {
+                    parsed_files += 1;
+                    (
+                        ParsedBlob::parse(repo, delta.old_file().id(), old_path.as_ref()),
+                        ParsedBlob::parse(repo, delta.new_file().id(), new_path.as_ref()),
+                    )
+                } else {
+                    (None, None)
+                };
             // Only the working-tree diff has a staged/unstaged split to resolve; in a commit's
             // diff every line is equally history.
             let stages = (against_worktree)
                 .then(|| {
                     new_path
                         .as_deref()
-                        .and_then(|p| StageIndex::for_file(repo, p))
+                        .and_then(|p| StageIndex::for_file(repo, p, delta.old_file().id()))
                 })
                 .flatten();
             let patch = patch.as_ref().expect("hunks imply a patch");
@@ -1500,6 +1601,183 @@ mod tests {
         .unwrap()
     }
 
+    /// Every shape of delta in one commit: a modified Rust file (bound by the driver), a deleted
+    /// one (left in the generated text), a rename with no edits (a placeholder), and a binary
+    /// swap (another placeholder).
+    fn repo_with_every_delta_shape(root: &std::path::Path) -> git2::Repository {
+        let repo = git2::Repository::init(root).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let commit = |repo: &git2::Repository, add: &[&str], remove: &[&str]| {
+            let mut index = repo.index().unwrap();
+            for name in add {
+                index.add_path(std::path::Path::new(name)).unwrap();
+            }
+            for name in remove {
+                index.remove_path(std::path::Path::new(name)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = repo
+                .head()
+                .ok()
+                .and_then(|h| h.peel_to_commit().ok())
+                .into_iter()
+                .collect();
+            let refs: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &refs)
+                .unwrap();
+        };
+        std::fs::write(root.join("a.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        std::fs::write(root.join("gone.rs"), "fn gone() {}\nlet x = 1;\n").unwrap();
+        std::fs::write(root.join("old.txt"), "same\n").unwrap();
+        std::fs::write(root.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+        commit(&repo, &["a.rs", "gone.rs", "old.txt", "bin.dat"], &[]);
+
+        std::fs::write(
+            root.join("a.rs"),
+            "fn a() {}\nfn B() {}\nfn c() {}\nfn d() {}\n",
+        )
+        .unwrap();
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+        std::fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
+        std::fs::write(root.join("bin.dat"), [0u8, 9, 9, 9]).unwrap();
+        commit(
+            &repo,
+            &["a.rs", "new.txt", "bin.dat"],
+            &["gone.rs", "old.txt"],
+        );
+        repo
+    }
+
+    /// The caption used to come from `git2::Diff::stats`, which diffs every file a second time.
+    /// It comes from the plan now, and has to say exactly what libgit2 would have said — across a
+    /// modification, a deletion, a rename and a binary swap, which each count differently.
+    #[test]
+    fn the_caption_counts_what_libgit2_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_every_delta_shape(&root);
+        let mut diff = head_diff(&repo);
+        let _ = diff.find_similar(None);
+        let stats = diff.stats().unwrap();
+        let plan = plan_diff(&diff).expect("plans");
+
+        assert_eq!(plan.files.len(), 4, "the fixture has every shape");
+        assert_eq!(plan.files.len(), stats.files_changed());
+        assert_eq!(
+            plan.files.iter().map(|f| f.added).sum::<u32>() as usize,
+            stats.insertions()
+        );
+        assert_eq!(
+            plan.files.iter().map(|f| f.removed).sum::<u32>() as usize,
+            stats.deletions()
+        );
+        // Named, so agreement can't be a mutual zero.
+        assert_eq!(stats.insertions(), 2, "`fn B` and `fn d`");
+        assert_eq!(stats.deletions(), 3, "`fn b` and both lines of gone.rs");
+    }
+
+    /// Blobs are parsed for highlights only where the generated lines will be *read*: a file the
+    /// driver binds shows the real buffer's lines under that buffer's own tree, so parsing its
+    /// blobs here would style text nobody sees — at three hundred files, most of what a
+    /// working-changes rebuild cost. A deletion has no buffer to bind and keeps its highlights.
+    #[test]
+    fn blobs_are_parsed_only_for_files_left_in_the_generated_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_every_delta_shape(&root);
+        let mut diff = head_diff(&repo);
+        let _ = diff.find_similar(None);
+        let mut b = PatchBuilder::default();
+        render_diff(&repo, &diff, &mut b, false, None).expect("renders");
+        let (text, generated) = b.finish();
+
+        let line_at = |want: &str| {
+            text.lines()
+                .position(|l| l == want)
+                .unwrap_or_else(|| panic!("no line {want:?} in:\n{text}"))
+        };
+        let bound = generated
+            .plan
+            .files
+            .iter()
+            .find(|f| f.new_path.as_deref() == Some("a.rs"));
+        assert_eq!(bound.and_then(|f| f.bound_path()), Some("a.rs"));
+        assert!(
+            generated.decorations.highlights[line_at("fn B() {}")].is_empty(),
+            "a bound file's generated lines are never shown, so they are not styled"
+        );
+
+        let deleted = generated
+            .plan
+            .files
+            .iter()
+            .find(|f| f.old_path.as_deref() == Some("gone.rs"))
+            .expect("the deletion");
+        assert_eq!(
+            deleted.bound_path(),
+            None,
+            "nothing to window a deletion over"
+        );
+        let kinds: Vec<&str> = generated.decorations.highlights[line_at("fn gone() {}")]
+            .iter()
+            .map(|h| h.kind.as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"keyword"),
+            "a deletion reads highlighted: {kinds:?}"
+        );
+
+        // Placeholders bind nothing either — the rename and the binary swap have no regions.
+        for name in ["new.txt", "bin.dat"] {
+            let f = generated
+                .plan
+                .files
+                .iter()
+                .find(|f| f.new_path.as_deref() == Some(name))
+                .unwrap();
+            assert!(f.regions.is_empty(), "{name} is a placeholder");
+            assert_eq!(f.bound_path(), None);
+        }
+    }
+
+    /// The stage split is only computed for a file that has something staged. Most files in a
+    /// working tree don't, and the view is rebuilt on every save under the repo — so the
+    /// index→worktree diff of every *other* file was the larger part of what a rebuild cost.
+    #[test]
+    fn the_stage_index_skips_files_with_nothing_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_a_two_file_commit(&root);
+        let head_blob = |name: &str| {
+            repo.head()
+                .unwrap()
+                .peel_to_tree()
+                .unwrap()
+                .get_path(std::path::Path::new(name))
+                .unwrap()
+                .id()
+        };
+
+        // An unstaged edit: the index still holds HEAD's blob, so there is nothing to split.
+        std::fs::write(root.join("b.txt"), "ONE\nTWO\n").unwrap();
+        assert!(
+            StageIndex::for_file(&repo, "b.txt", head_blob("b.txt")).is_none(),
+            "index == HEAD: every change is unstaged without a diff"
+        );
+
+        // Stage it, then edit again: now the split has to be computed, and it says the second
+        // edit is the unstaged one.
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("b.txt")).unwrap();
+        index.write().unwrap();
+        std::fs::write(root.join("b.txt"), "ONE\nTWO\nTHREE\n").unwrap();
+        let split = StageIndex::for_file(&repo, "b.txt", head_blob("b.txt"))
+            .expect("index != HEAD: something is staged");
+        assert_eq!(split.stage_of(&[2], None), DiffStage::Staged, "`TWO`");
+        assert_eq!(split.stage_of(&[3], None), DiffStage::Unstaged, "`THREE`");
+    }
+
     /// A patch's shape comes from the diff alone — one region per hunk, with the new-side range
     /// each windows.
     ///
@@ -1604,7 +1882,7 @@ mod tests {
         let plan = plan_diff(&diff).expect("plans");
 
         let mut b = PatchBuilder::default();
-        render_diff(&repo, &diff, &mut b, false).expect("renders");
+        render_diff(&repo, &diff, &mut b, false, None).expect("renders");
         let (_, generated) = b.finish();
 
         let planned_regions: usize = plan.files.iter().map(|f| f.regions.len()).sum();

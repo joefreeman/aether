@@ -3852,8 +3852,9 @@ async fn git_show_decorates_the_patch_it_generates() {
     assert!(commit_line.contains("(HEAD -> "), "{commit_line:?}");
     assert_eq!(kinds("Author: "), vec!["diff.meta"]);
     assert_eq!(kinds("    "), vec!["text.title"], "the subject line");
-    // Content lines carry syntax spans too, projected at generation from a parse of the whole blob
-    // each side came from — so a patch line highlights exactly as that line does in the file.
+    // Content lines carry syntax spans too: the hunk windows the real blob, and the line is
+    // highlighted from that buffer's own tree — so a patch line highlights exactly as that line
+    // does in the file.
     assert!(
         kinds("fn TWO").contains(&"keyword".to_string()),
         "the added line is highlighted: {:?}",
@@ -5023,6 +5024,10 @@ async fn the_git_cluster_follows_the_focused_element() {
         },
     )
     .await;
+    // The counts below are each bound file's own Git baseline, which a view binding defers: they
+    // land a moment after the open, as a large file's gutter does. Wait for that, or this measures
+    // the deferral rather than which file the cluster follows.
+    settled(&server).await;
 
     async fn subscribe_in(ws: &mut Ws, buffer_id: u64, element: u32) -> ViewportSubscribeResult {
         send_request::<ViewportSubscribe>(
@@ -7784,6 +7789,189 @@ async fn enter_in_the_working_changes_view_opens_the_real_file() {
     assert_eq!(
         content.text, "one\nGONE\nthree\n",
         "HEAD's side of the diff"
+    );
+
+    drop(server);
+}
+
+/// A Rust source comfortably *under* the deferred-parse threshold, so a navigation would parse it
+/// inline — which is what makes it measure the binding rather than the size rule. Big enough that
+/// the parse outlasts a round trip, or the first frame would already be restyled.
+fn bindable_rust_source() -> String {
+    let line = "fn f() { let s = \"hi\"; }\n";
+    let source = line.repeat(100 * 1024 / line.len());
+    assert!(source.len() < 128 * 1024, "under the size threshold");
+    source
+}
+
+/// The bound view of a working-changes patch at `root`, subscribed with the diff on and the first
+/// hunk loaded, as a client opens it. Returns the patch's buffer and the subscribe result.
+async fn open_working_changes_subscribed(
+    ws: &mut Ws,
+    root: &std::path::Path,
+) -> (ViewOpenResult, ViewportSubscribeResult) {
+    let patch = show_buffer(
+        ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        ws,
+        &ViewportSubscribeParams {
+            view_id: patch.view_id,
+            cols: 80,
+            rows: 40,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: true,
+        },
+    )
+    .await;
+    (patch, sub)
+}
+
+/// The highlight kinds on the rendered line starting `prefix`, or `None` when no such line is in
+/// the window.
+fn highlight_kinds_of(
+    window: &aether_protocol::viewport::Window,
+    prefix: &str,
+) -> Option<Vec<String>> {
+    window
+        .root
+        .lines()
+        .into_iter()
+        .find(|l| {
+            l.visual_rows
+                .iter()
+                .flat_map(|r| &r.segments)
+                .map(|s| s.text.as_str())
+                .collect::<String>()
+                .starts_with(prefix)
+        })
+        .map(|l| {
+            l.visual_rows
+                .iter()
+                .flat_map(|r| &r.segments)
+                .flat_map(|s| &s.highlights)
+                .map(|h| h.kind.clone())
+                .collect()
+        })
+}
+
+/// A file the working-changes view binds is opened with its parse **deferred**, however small it
+/// is: the view has to appear now, and three hundred affordable parses are not affordable
+/// together. The first frame of the hunk is unhighlighted, and the background parse restyles it
+/// through the *composed* view's viewport — the push has to find a viewport whose elements window
+/// the file, not one presenting it.
+#[tokio::test]
+async fn a_bound_files_parse_is_deferred_and_restyles_the_working_changes_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base = bindable_rust_source();
+    commit_file(&repo, "big.rs", &base);
+    let changed = base.replacen("fn f() {", "fn TWO() {", 1);
+    std::fs::write(root.join("big.rs"), &changed).unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let (_patch, sub) = open_working_changes_subscribed(&mut ws, &root).await;
+
+    let first =
+        highlight_kinds_of(&sub.window, "fn TWO").expect("the changed line is in the first window");
+    assert!(
+        first.is_empty(),
+        "a bound file's first frame is unhighlighted — its parse was deferred: {first:?}"
+    );
+
+    // The parse lands and restyles the hunk in place: same content, same revision, now styled.
+    let push = 'restyled: {
+        for _ in 0..20 {
+            let push = expect_notification_within::<ViewportLinesChanged>(
+                &mut ws,
+                std::time::Duration::from_secs(15),
+            )
+            .await;
+            if highlight_kinds_of(&push.window, "fn TWO").is_some_and(|k| !k.is_empty()) {
+                break 'restyled push;
+            }
+        }
+        panic!("no viewport/lines_changed push restyled the bound hunk");
+    };
+    assert_eq!(
+        push.viewport_id, sub.viewport_id,
+        "the composed view's own viewport"
+    );
+    let kinds = highlight_kinds_of(&push.window, "fn TWO").unwrap();
+    assert!(
+        kinds.contains(&"keyword".to_string()),
+        "highlighted from the bound buffer's tree: {kinds:?}"
+    );
+
+    drop(server);
+}
+
+/// A bound file's Git baseline is deferred with its parse, and staging from the view is the one
+/// path that needs it *immediately*: the apply resolves the baseline on demand rather than
+/// refusing. The large-file variant of this is pinned beside `ensure_git_baseline`; this is the
+/// small file that only defers because a view bound it.
+#[tokio::test]
+async fn staging_from_a_freshly_bound_working_changes_view_completes_its_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (1..=20).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    std::fs::write(
+        root.join("a.rs"),
+        base.replace("fn f3() {}\n", "fn ONE() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    // No settling wait: staging before the deferred baseline lands is exactly the race.
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: patch.buffer_id,
+        },
+    )
+    .await;
+    let line = content
+        .text
+        .lines()
+        .position(|l| l == "fn ONE() {}")
+        .expect("the changed line") as u32;
+    set_cursor(&mut ws, patch.buffer_id, line, 0).await;
+    let r = apply_hunk(&mut ws, patch.buffer_id, HunkAction::Stage).await;
+    assert_eq!(r.status, ApplyHunkStatus::Staged);
+    assert!(
+        index_text(&root, "a.rs").is_some_and(|t| t.contains("fn ONE() {}")),
+        "and it really reached the index"
     );
 
     drop(server);

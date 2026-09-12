@@ -29,7 +29,7 @@ use aether_protocol::viewport::DiffStage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::patch::{GeneratedPatch, PatchBuilder, Span, ADDED, META, REMOVED};
+use crate::patch::{GeneratedPatch, PatchBuilder, META};
 
 /// One contiguous run of changes between the baseline and the live buffer, in **0-based buffer
 /// line** coordinates.
@@ -2585,14 +2585,12 @@ pub fn show_commit(repo_path: &Path, rev: &str) -> Result<RevisionContent, Strin
     // detected as the wrong language (or none) when its highlights are projected.
     let _ = diff.find_similar(None);
 
-    // A blank between the message and the diff's caption — here and not in `emit_summary` itself,
-    // which opens the working-changes view, where a leading blank line would be a cursor position
+    // A blank between the message and the diff's caption — here and not in the renderer, which
+    // also opens the working-changes view, where a leading blank line would be a cursor position
     // above everything.
     b.header_line("", &[]);
     // A commit's diff is against its own parent; no baseline applies.
-    emit_summary(&mut b, &diff, None);
-
-    crate::patch::render_diff(&repo, &diff, &mut b, false)?;
+    crate::patch::render_diff(&repo, &diff, &mut b, false, None)?;
 
     let (text, generated) = b.finish();
     Ok(RevisionContent {
@@ -2690,12 +2688,10 @@ pub fn show_working_changes(
             Some(label) => nothing_to_show(&mut b, &format!("No changes since {label}")),
             None => nothing_to_show(&mut b, "Nothing to commit — the working tree is clean"),
         }
-    } else {
-        emit_summary(&mut b, &diff, label);
     }
 
     // Only the default baseline has a staged layer to resolve — see this function's own doc.
-    crate::patch::render_diff(&repo, &diff, &mut b, label.is_none())?;
+    crate::patch::render_diff(&repo, &diff, &mut b, label.is_none(), label)?;
 
     let (text, generated) = b.finish();
     Ok(RevisionContent {
@@ -2710,46 +2706,6 @@ pub fn show_working_changes(
         language: None,
         generated: Some(generated),
     })
-}
-
-/// The patch's opening caption — `N files changed  +A  −B`, plus `since <rev>` when the working
-/// changes are being measured against something other than HEAD.
-///
-/// Chrome, so it holds no cursor position: nothing in it can be staged, followed or navigated to.
-/// The counts take the same green/red as a file separator's, which is what makes the number you
-/// scan for readable at a glance instead of a run of muted text.
-///
-/// The baseline rides here rather than in the buffer's title because the caption is regenerated
-/// with the content and the title isn't — a caption can't be left saying `since main` after the
-/// baseline went back to the index.
-///
-/// No blank below it: the first file's rule follows immediately, and a gap there left the caption
-/// floating between the top of the buffer and the diff instead of sitting on it.
-fn emit_summary(b: &mut PatchBuilder, diff: &git2::Diff<'_>, baseline_label: Option<&str>) {
-    let Ok(stats) = diff.stats() else { return };
-    let mut text = String::new();
-    let mut spans: Vec<Span> = Vec::new();
-
-    let files = format!(
-        "{} file{} changed",
-        stats.files_changed(),
-        if stats.files_changed() == 1 { "" } else { "s" }
-    );
-    spans.push((0, files.len(), META));
-    text.push_str(&files);
-    let added = format!("  +{}", stats.insertions());
-    spans.push((text.len(), text.len() + added.len(), ADDED));
-    text.push_str(&added);
-    let removed = format!("  −{}", stats.deletions());
-    spans.push((text.len(), text.len() + removed.len(), REMOVED));
-    text.push_str(&removed);
-    if let Some(label) = baseline_label {
-        let since = format!("  since {label}");
-        spans.push((text.len(), text.len() + since.len(), META));
-        text.push_str(&since);
-    }
-
-    b.heading(text, &spans);
 }
 
 /// The first parent of `rev`, as a full hash — the revision a patch's `-` lines belong to.
@@ -4715,6 +4671,20 @@ mod tests {
         stage_and_commit(dir, name, message);
     }
 
+    /// Remove `name` from the tree and commit the deletion on top of HEAD.
+    fn commit_deletion(dir: &Path, name: &str, message: &str) {
+        std::fs::remove_file(dir.join(name)).unwrap();
+        let repo = git2::Repository::open(dir).unwrap();
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new(name)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+            .unwrap();
+    }
+
     /// Index of the buffer line whose text is exactly `want`.
     fn line_at(text: &str, want: &str) -> usize {
         text.lines()
@@ -5016,7 +4986,7 @@ mod tests {
     }
 
     /// Rename detection is on. Without it a rename is an add plus a delete: twice the noise, and
-    /// the old side gets handed to the wrong grammar when its highlights are projected.
+    /// the delete's lines would be highlighted as the old extension's language.
     #[test]
     fn renames_are_detected_as_one_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -5082,6 +5052,10 @@ mod tests {
     /// That is the difference between a line highlighting the way it does in the file and the way a
     /// lone fragment would: tree-sitter is error tolerant, so a fragment does parse — just wrongly,
     /// because highlight queries key on parent context.
+    ///
+    /// A *deletion*, because that is the file whose lines stay in the generated text. A modified
+    /// file's hunks are windowed over the real blob and styled from its tree, and its generated
+    /// lines are deliberately left plain — see `PlannedFile::bound_path`.
     #[test]
     fn content_lines_are_highlighted_from_their_own_blob() {
         let dir = tempfile::tempdir().unwrap();
@@ -5090,12 +5064,7 @@ mod tests {
             "src.rs",
             "fn alpha() -> u32 {\n    let x = 1;\n    x\n}\n",
         );
-        commit_change(
-            dir.path(),
-            "src.rs",
-            "fn alpha() -> u32 {\n    let x = 2;\n    x\n}\n",
-            "bump",
-        );
+        commit_deletion(dir.path(), "src.rs", "drop it");
         let (text, g) = head_patch(dir.path());
 
         let words = |want: &str| -> Vec<(String, String)> {
@@ -5104,19 +5073,13 @@ mod tests {
                 .map(|h| (span_text(want, h.start, h.end).to_string(), h.kind.clone()))
                 .collect()
         };
-        // Both sides of the pair are highlighted, each from its own side's blob.
-        let added = words("    let x = 2;");
         let removed = words("    let x = 1;");
-        assert!(
-            added.contains(&("let".to_string(), "keyword".to_string())),
-            "{added:?}"
-        );
         assert!(
             removed.contains(&("let".to_string(), "keyword".to_string())),
             "{removed:?}"
         );
-        // Context too — and `alpha` is classified as a *function definition*, which only a parse
-        // with the surrounding `fn` item in view can know.
+        // `alpha` is classified as a *function definition*, which only a parse with the
+        // surrounding `fn` item in view can know.
         let ctx = words("fn alpha() -> u32 {");
         assert!(
             ctx.contains(&("fn".to_string(), "keyword".to_string())),
@@ -5127,6 +5090,24 @@ mod tests {
                 .any(|(w, k)| w == "alpha" && k.starts_with("function")),
             "{ctx:?}"
         );
+    }
+
+    /// The other half of the rule: a modified file's lines are shown from the real blob, so what is
+    /// generated for them is never read and is not styled. Pinned here so the parse it saves — the
+    /// larger part of generating a large working-changes view — can't quietly come back.
+    #[test]
+    fn a_bound_files_generated_lines_are_left_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        repo_with_committed_file(dir.path(), "src.rs", "fn alpha() {}\n");
+        commit_change(dir.path(), "src.rs", "fn ALPHA() {}\n", "shout");
+        let (text, g) = head_patch(dir.path());
+        assert_eq!(
+            g.plan.files[0].bound_path(),
+            Some("src.rs"),
+            "the driver windows this file"
+        );
+        assert!(g.decorations.highlights[line_at(&text, "fn ALPHA() {}")].is_empty());
+        assert!(g.decorations.highlights[line_at(&text, "fn alpha() {}")].is_empty());
     }
 
     /// Spans are line-local, so one crossing a line in the blob — a block comment, a multi-line
@@ -5140,15 +5121,10 @@ mod tests {
             "src.rs",
             "/* aaa\n   bbb\n   ccc */\nfn f() {}\n",
         );
-        commit_change(
-            dir.path(),
-            "src.rs",
-            "/* aaa\n   BBB\n   ccc */\nfn f() {}\n",
-            "shout",
-        );
+        commit_deletion(dir.path(), "src.rs", "drop it");
         let (text, g) = head_patch(dir.path());
 
-        let i = line_at(&text, "   BBB");
+        let i = line_at(&text, "   bbb");
         let spans = &g.decorations.highlights[i];
         assert!(!spans.is_empty(), "inside a block comment");
         assert!(spans.iter().all(|h| h.kind == "comment"), "{spans:?}");

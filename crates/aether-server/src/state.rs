@@ -3807,7 +3807,15 @@ pub enum LineEnding {
 
 impl Document {
     /// Load a document from disk. Detects line endings, normalizes to LF in-memory.
-    pub fn load_from_file(id: DocumentId, canonical: PathBuf) -> std::io::Result<Self> {
+    ///
+    /// `force_defer` skips the inline parse whatever the size, as it does for
+    /// [`Self::virtual_content`]: a working-changes view binds every changed file on the tree, and
+    /// three hundred affordable parses are not affordable together.
+    pub fn load_from_file(
+        id: DocumentId,
+        canonical: PathBuf,
+        force_defer: bool,
+    ) -> std::io::Result<Self> {
         let content = std::fs::read_to_string(&canonical)?;
         let line_ending = if content.contains("\r\n") {
             LineEnding::Crlf
@@ -3832,9 +3840,10 @@ impl Document {
         // the open round-trip returns in milliseconds; the first frame renders unhighlighted and a
         // `viewport/lines_changed` push restyles it when the tree lands. Small files parse inline —
         // the cost is a few ms and it keeps the first frame highlighted with no restyle flash.
-        let defer_parse = language
-            .as_deref()
-            .is_some_and(|name| !sync_parse_affordable(name, text.len_bytes()));
+        let defer_parse = force_defer
+            || language
+                .as_deref()
+                .is_some_and(|name| !sync_parse_affordable(name, text.len_bytes()));
         let syntax = if defer_parse {
             None
         } else {
@@ -5528,6 +5537,24 @@ impl Viewport {
         view.presenting == id || view.binds(id)
     }
 
+    /// Whether a change to how `id`'s lines are *styled* — a parse tree landing, a Git baseline
+    /// attaching — can alter what this viewport has rendered.
+    ///
+    /// Narrower than [`Self::shows`] on purpose. A restyle re-renders the slices the viewport has
+    /// loaded, and an element with nothing loaded has nothing to restyle: the next `view/window`
+    /// that loads it renders from the tree as it stands then. The distinction is what keeps a
+    /// working-changes view over three hundred files from re-shipping its whole tree three
+    /// hundred times as the deferred parses land, once for each file nobody has scrolled to.
+    /// An element the view supplies no decorations for is counted whether or not it is loaded:
+    /// its phantom rows come from the buffer's own hunks, so its *height* moves with them.
+    pub fn restyles(&self, view: &View, id: BufferId) -> bool {
+        view.elements.iter().enumerate().any(|(idx, e)| {
+            e.buffer_id == id
+                && (e.decorations.is_none()
+                    || self.loaded.get(idx).is_some_and(|slice| slice.is_some()))
+        })
+    }
+
     /// Every buffer this viewport shows, each named once — [`Self::shows`] enumerated rather than
     /// asked.
     ///
@@ -5607,6 +5634,90 @@ mod view_layout_tests {
             Some((12, 13))
         );
         assert_eq!(layout.clip(1, 20..40), None);
+    }
+
+    /// A restyle — a parse landing, a baseline attaching — re-renders what a viewport has loaded,
+    /// so it reaches a viewport only where that changes something: an element of the buffer with
+    /// a slice loaded, or one whose height the buffer's own hunks decide. A bound hunk nobody has
+    /// scrolled to is *shown* but not *restyled*; the distinction is what stops a large review
+    /// re-shipping its tree once per file as the deferred parses land.
+    #[test]
+    fn a_restyle_reaches_only_viewports_with_something_of_the_buffer_loaded() {
+        let mut s = ServerState::new();
+        let mut file = |id: BufferId, text: &str| {
+            let text = text.to_string();
+            s.insert_buffer_with_document(id, None, false, |d| {
+                let mut doc = Document::scratch(d, None);
+                doc.text = ropey::Rope::from_str(&text);
+                doc
+            });
+            id
+        };
+        let (a, b, c) = (
+            file(1, &"fn one() {}\n".repeat(40)),
+            file(2, &"fn two() {}\n".repeat(40)),
+            file(3, &"fn three() {}\n".repeat(40)),
+        );
+        let element = |buffer, decorated: bool| ElementLayout {
+            extent: ElementExtent::Bound {
+                buffer,
+                lines: 10..14,
+            },
+            chrome_before: Default::default(),
+            chrome_above: Default::default(),
+            decorations: decorated.then(|| std::sync::Arc::new(ElementDecorations::default())),
+            edges: aether_protocol::ui::Edges::NONE,
+            box_group: None,
+            title: Default::default(),
+            band: aether_protocol::ui::Band::None,
+            role: aether_protocol::ui::ElementRole::Field,
+        };
+        let patch = file(4, "patch\n");
+        // Two patch hunks the view decorates itself, and a plain editor element over `c`.
+        s.set_view_layout(
+            patch,
+            vec![element(a, true), element(b, true), element(c, false)],
+        );
+        let view_id = s.view_presenting(patch).expect("the layout's view");
+        let vp = Viewport {
+            id: 1,
+            client_id: uuid::Uuid::new_v4(),
+            view_id,
+            rows: 10,
+            overscan_rows: 0,
+            wrap: WrapMode::None,
+            tab_width: 4,
+            diff_view: false,
+            cols: 80,
+            continuation_marker_width: 0,
+            // Only `a`'s hunk is on screen.
+            loaded: vec![Some(10..14), None, None],
+            anchor: ScrollPosition::default(),
+            focused: 0,
+        };
+        let view = s.view(view_id);
+
+        assert!(
+            vp.restyles(view, a),
+            "loaded: a restyle changes what is drawn"
+        );
+        assert!(
+            !vp.restyles(view, b),
+            "bound but nothing loaded: the next window load renders from the tree as it stands"
+        );
+        assert!(
+            vp.shows(view, b),
+            "…though the viewport does show it, which is the broader question"
+        );
+        assert!(
+            vp.restyles(view, c),
+            "an element the view leaves undecorated takes its phantom rows from the buffer's own \
+             hunks, so its height can move — counted whether or not it is loaded"
+        );
+        assert!(
+            vp.shows(view, patch) && !vp.restyles(view, patch),
+            "the presenting document is shown, but no element renders it here"
+        );
     }
 
     /// An edit inside a hunk grows it; one above slides it; one below leaves it alone. The same

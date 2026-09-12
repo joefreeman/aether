@@ -1312,10 +1312,8 @@ async fn rebind_presented_view(state: &SharedState, ctx: &mut ConnectionCtx, buf
                 .get(span.start_line as usize)
                 .copied()
                 .flatten()?;
-            let hunk = info.hunk?;
-            let file = generated.plan.files.get(info.file as usize)?;
-            file.regions.get(hunk as usize)?;
-            file.new_path.as_deref()
+            info.hunk?;
+            generated.plan.files.get(info.file as usize)?.bound_path()
         };
         let unbound_with_file = generated
             .decorations
@@ -1385,7 +1383,9 @@ async fn patch_elements_over_files(
     // itself is a pure function of the diff plus this map.
     let mut buffers: std::collections::HashMap<String, BufferId> = std::collections::HashMap::new();
     for file in &generated.plan.files {
-        let Some(path) = file.new_path.as_deref() else {
+        // Only what the layout will window: a deletion or a placeholder has no file to open, and
+        // trying (and failing) once per deleted file is a cost a large review does not need.
+        let Some(path) = file.bound_path() else {
             continue;
         };
         if buffers.contains_key(path) {
@@ -1928,6 +1928,11 @@ pub async fn git_follow_patch_line(
 /// patch's hunks over the real blobs — and must do neither, or opening a forty-file diff would put
 /// forty files at the top of your recent list and flood the picker with content you never asked to
 /// open.
+///
+/// A binding also defers everything O(file) that a navigation does inline — the parse and the Git
+/// baseline — however small the file. Each is a few milliseconds a navigated file can afford, and a
+/// view binding three hundred of them cannot; the view has to appear now, and the background tasks
+/// that finish a large file's open restyle a bound one the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenIntent {
     Navigate,
@@ -2485,7 +2490,12 @@ async fn view_open_inner(
                 // New file: empty document with the target path attached. Save will write to disk.
                 Document::new_at_path(doc_id, canonical.clone(), params.language.clone())
             } else {
-                match Document::load_from_file(doc_id, canonical.clone()) {
+                // A view's buffer must not stall the view: see `OpenIntent`.
+                match Document::load_from_file(
+                    doc_id,
+                    canonical.clone(),
+                    intent == OpenIntent::Bind,
+                ) {
                     Ok(d) => d,
                     // The file is gone but we still hold unsaved content for it — recover from the
                     // backup and flag it externally-deleted rather than failing the open.
@@ -2566,7 +2576,9 @@ async fn view_open_inner(
     // the same deal the deferred parse gets. Computed per *buffer* even for a shared document:
     // git is workspace-scoped, so each attachment resolves its own baseline.
     let doc = &s.documents[&doc_id];
-    let git_deferred = !git_external && doc.byte_count() > GIT_BASELINE_SYNC_LIMIT_BYTES;
+    let git_deferred = !git_external
+        && (intent == OpenIntent::Bind || doc.byte_count() > GIT_BASELINE_SYNC_LIMIT_BYTES);
+    let git_token = git_deferred.then(|| s.deferred.start());
     let git = (!git_external).then(|| {
         // The repo *identity* is resolved however big the file is: which repo a file is in is a
         // fact about the workspace, and every git verb resolves its repo through it. Only the
@@ -2735,8 +2747,13 @@ async fn view_open_inner(
     if let Some(token) = syntax_token {
         tokio::spawn(finish_pending_parse(state.clone(), id, token));
     }
-    if git_deferred {
-        tokio::spawn(finish_git_baseline(state.clone(), id, canonical.clone()));
+    if let Some(token) = git_token {
+        tokio::spawn(finish_git_baseline(
+            state.clone(),
+            id,
+            canonical.clone(),
+            token,
+        ));
     }
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
@@ -2809,33 +2826,47 @@ const GIT_BASELINE_SYNC_LIMIT_BYTES: u64 = 128 * 1024;
 /// Complete a deferred Git baseline load: repo discovery and blob reads run on a blocking thread
 /// with no locks held, then the result attaches under the lock via [`attach_git_baseline`] — which
 /// diffs against the buffer's *current* text, so edits that landed while the blobs were loading
-/// are already accounted for. Every viewport on the buffer then gets a `viewport/lines_changed`
-/// push carrying the freshly-known hunks and branch status.
+/// are already accounted for. Every viewport rendering the buffer then gets a
+/// `viewport/lines_changed` push carrying the freshly-known hunks and branch status. `_token`
+/// keeps the load counted as deferred work for the same reason [`finish_pending_parse`]'s does.
 async fn finish_git_baseline(
     state: SharedState,
     buffer_id: BufferId,
     canonical: std::path::PathBuf,
+    _token: crate::state::DeferredToken,
 ) {
-    // Snapshotted rather than read inside the blocking task, which holds no lock. A
-    // `git/set_baseline` landing mid-load re-resolves every buffer in the repo anyway, so a
-    // snapshot that's one revision stale is corrected moments later rather than left wrong.
-    let revs = state.lock().await.git_baseline_choices.clone();
-    let Ok(baseline) =
-        tokio::task::spawn_blocking(move || crate::git::load_baseline(&canonical, &revs)).await
-    else {
-        return;
-    };
-    let pushes = {
-        let mut s = state.lock().await;
-        if !s.buffers.contains_key(&buffer_id) {
-            return; // closed while the baseline was loading
+    loop {
+        // Snapshotted rather than read inside the blocking task, which holds no lock. A
+        // `git/set_baseline` landing mid-load re-resolves every buffer in the repo, this one
+        // included — so a result loaded against the old choice must not land on top of that:
+        // it would put the old revision's blobs back under a gutter that now claims the new one,
+        // and let a stage through that the pinned baseline had just refused. Exactly the
+        // mid-parse edit `finish_pending_parse` guards against, guarded the same way.
+        let revs = state.lock().await.git_baseline_choices.clone();
+        let Ok(baseline) = tokio::task::spawn_blocking({
+            let (canonical, revs) = (canonical.clone(), revs.clone());
+            move || crate::git::load_baseline(&canonical, &revs)
+        })
+        .await
+        else {
+            return;
+        };
+        let pushes = {
+            let mut s = state.lock().await;
+            if !s.buffers.contains_key(&buffer_id) {
+                return; // closed while the baseline was loading
+            }
+            if s.git_baseline_choices != revs {
+                continue; // the choice moved mid-load — the blobs are the wrong revision's, go again
+            }
+            attach_git_baseline(&mut s, buffer_id, baseline)
+        };
+        for (sender, notif) in pushes {
+            let _ = sender.send(notif).await;
         }
-        attach_git_baseline(&mut s, buffer_id, baseline)
-    };
-    for (sender, notif) in pushes {
-        let _ = sender.send(notif).await;
+        tracing::debug!(buffer_id, "deferred git baseline attached");
+        return;
     }
-    tracing::debug!(buffer_id, "deferred git baseline attached");
 }
 
 /// Complete a deferred open parse (`Buffer::syntax_pending`): snapshot the rope (cheap — ropey
@@ -2903,17 +2934,21 @@ async fn finish_pending_parse(
     }
 }
 
-/// One `viewport/lines_changed` per viewport — any client — showing `buffer_id`, re-rendering each
-/// viewport's currently pushed range. For server-side changes that restyle a window without a
-/// content edit: a deferred open parse landing, a Git baseline attaching or refreshing. The
+/// One `viewport/lines_changed` per viewport — any client — rendering `buffer_id`, re-rendering
+/// each viewport's currently pushed range. For server-side changes that restyle a window without
+/// a content edit: a deferred open parse landing, a Git baseline attaching or refreshing. The
 /// buffer's current revision rides through unchanged.
+///
+/// *Rendering*, not merely showing ([`Viewport::restyles`] rather than [`Viewport::shows`]): a
+/// viewport whose view binds the buffer in an element it has loaded nothing of has nothing to
+/// restyle, and the push would ship its whole tree to say so.
 pub fn collect_buffer_refresh_pushes(s: &ServerState, buffer_id: BufferId) -> PendingPushes {
     let mut pushes: PendingPushes = Vec::new();
     if s.try_doc_of(buffer_id).is_none() {
         return pushes;
     }
     for vp in s.viewports.values() {
-        if !vp.shows(s.view_of(vp), buffer_id) {
+        if !vp.restyles(s.view_of(vp), buffer_id) {
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {
