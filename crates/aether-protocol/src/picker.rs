@@ -575,8 +575,15 @@ pub enum PickerItem {
         #[serde(default)]
         view_id: crate::ViewId,
         /// What the row renders: workspace-relative path for file-backed buffers, `(scratch N)`
-        /// for scratch buffers. Also the haystack the matcher scores against.
+        /// for scratch buffers, the bare repo-relative path for a file at a revision (whose
+        /// revision is `commit`).
         display: String,
+        /// The revision the row's buffer is *as of*, abbreviated (`abc1234`) — set only for a
+        /// **file at a revision**, whose `display` is then the bare path. Rendered muted after
+        /// the name, in the slot a multi-root workspace's root label takes: the two never
+        /// co-occur, since a materialised revision has no path and so no root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
         /// Save/disk state, rendered as a colour-coded dot. Omitted on the wire (and defaulting
         /// to `Clean`) for a clean buffer — the common case.
         #[serde(default, skip_serializing_if = "BufferDirtyState::is_clean")]
@@ -588,7 +595,11 @@ pub enum PickerItem {
         path_index: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relative_path: Option<String>,
-        /// Indices into `display` (char offsets) covered by fuzzy matches.
+        /// Indices into the row's composed haystack — `"{display}  {commit}"`, the empty part
+        /// elided, exactly as `Shell` composes its three. A row with no `commit` is its `display`
+        /// alone, so the offsets index that directly; one with a commit is found by its hash as
+        /// readily as by its path, and the shells split the offsets with
+        /// `aether_client::picker::row_match_segments`.
         #[serde(default)]
         match_indices: Vec<u32>,
         /// True while the buffer is transient (auto-closes once hidden) — rendered in italics.

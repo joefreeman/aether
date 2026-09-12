@@ -114,6 +114,7 @@ async fn mint_conversation(
             crate::state::VirtualSource {
                 target: crate::state::VirtualTarget::agent(&workspace, number),
                 title,
+                commit: None,
             },
             // The view's own document holds no text: every block has one. It exists to be the
             // thing the view presents and to carry the conversation.
@@ -893,7 +894,11 @@ async fn new_block(
     let doc_id = s.allocate_document_id();
     let doc = Document::block(
         doc_id,
-        crate::state::VirtualSource { target, title },
+        crate::state::VirtualSource {
+            target,
+            title,
+            commit: None,
+        },
         language.map(str::to_string),
     );
     s.documents.insert(doc_id, doc);

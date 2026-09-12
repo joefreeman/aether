@@ -78,7 +78,9 @@ pub fn boot_backoff(attempt: u32) -> std::time::Duration {
 #[derive(Clone, Debug)]
 pub struct BufferInfo {
     pub buffer_id: BufferId,
-    pub label: String,
+    /// What this buffer is called, and the revision it is a snapshot of — see
+    /// [`crate::labels::Label`].
+    pub label: crate::labels::Label,
     /// Canonical absolute path on disk; `None` for scratch buffers.
     pub path: Option<String>,
     pub language: Option<String>,
@@ -952,7 +954,8 @@ pub struct ViewState {
     /// "which buffer presents this view" from its table, and the client is told at open.
     pub view_buffer: BufferId,
     /// What to call this view in the status bar's file slot — the view's own label, captured when
-    /// the view was bound and *not* moved by focus.
+    /// the view was bound and *not* moved by focus. Name and revision together
+    /// ([`crate::labels::Label`]), so a shell paints the two shades from one field.
     ///
     /// [`Self::buffer`] cannot answer it: focus rebinds that to whichever file the cursor is in, so
     /// the slot showed the current hunk's filename and changed on every `Tab`. Worse, with the
@@ -960,7 +963,7 @@ pub struct ViewState {
     /// `Working changes — <repo>` — so the slot flipped between a view title and a filename
     /// depending on which hunk you were in. Identical to `buffer.label` for an ordinary view, which
     /// is one element windowing the buffer it is.
-    pub view_label: String,
+    pub view_label: crate::labels::Label,
     /// Whether this **view** is transient — a preview that closes itself once hidden.
     ///
     /// [`Self::buffer`] cannot answer it, for the same reason it cannot answer the label: focus
@@ -1114,7 +1117,7 @@ impl ViewState {
     ///
     /// One method rather than two assignments at each rename site, because a `view_label` left on
     /// the old name is invisible until someone reads the status bar.
-    pub fn relabel_focused(&mut self, label: String) {
+    pub fn relabel_focused(&mut self, label: crate::labels::Label) {
         if self.buffer.buffer_id == self.view_buffer {
             self.view_label = label.clone();
         }
@@ -1944,6 +1947,7 @@ impl Session {
                     cursor: Default::default(),
                     lsp_server: Default::default(),
                     title: Default::default(),
+                    commit: Default::default(),
                     read_only: Default::default(),
                     is_patch: Default::default(),
                 },
@@ -1996,12 +2000,13 @@ pub fn label_for_path(path: &str, roots: &[String]) -> String {
 /// buffer's: a description carries none, and the view state sets it from the open.
 pub fn buffer_info(open: BufferDescription, roots: &[String]) -> BufferInfo {
     // A virtual buffer (a revision materialised by `git/show`) is pathless but named: the server
-    // supplies the title, since only it knows what revision this is.
+    // supplies the title, since only it knows what revision this is — and, for a file shown at a
+    // revision, the commit that goes beside the name.
     let label = match (&open.path, &open.title, open.scratch_number) {
-        (Some(path), _, _) => label_for_path(path, roots),
-        (None, Some(title), _) => title.clone(),
-        (None, None, Some(n)) => format!("(scratch {n})"),
-        (None, None, None) => "(scratch)".into(),
+        (Some(path), _, _) => label_for_path(path, roots).into(),
+        (None, Some(title), _) => crate::labels::Label::at(title.clone(), open.commit.clone()),
+        (None, None, Some(n)) => format!("(scratch {n})").into(),
+        (None, None, None) => crate::labels::Label::from("(scratch)"),
     };
     BufferInfo {
         buffer_id: open.buffer_id,

@@ -29,9 +29,14 @@ pub struct BufferCandidate {
     pub buffer_id: BufferId,
     /// The row's view: what selecting the row presents and what closing it closes.
     pub view_id: aether_protocol::ViewId,
-    /// Display string used for both rendering and fuzzy matching. Workspace-relative for
-    /// file-backed buffers; `(scratch N)` for scratch buffers.
+    /// What the row renders. Workspace-relative for file-backed buffers; `(scratch N)` for
+    /// scratch buffers; the bare repo-relative path for a file at a revision. Matching goes
+    /// through [`Self::haystack`], which is this plus the commit.
     pub display: String,
+    /// The revision this buffer is *as of*, abbreviated — `Some` only for a file at a revision.
+    /// Rendered muted after the name, in the slot [`Self::path`]'s root label takes: a
+    /// materialised revision has no path, so the two never collide.
+    pub commit: Option<String>,
     pub status: BufferDirtyState,
     /// Workspace-relative location (root index + path) when the buffer is a file inside a root;
     /// `None` for scratch buffers / out-of-root files. Sent so the client can build an opener URL.
@@ -43,6 +48,10 @@ pub struct BufferCandidate {
     pub abs_path: Option<String>,
     /// Buffer is transient (auto-closes once hidden) — the row renders in italics.
     pub transient: bool,
+    /// `"{display}  {commit}"`, the empty part elided — see [`PickerItem::Buffer`], where the
+    /// composition is a wire contract because `match_indices` index it. A row at a revision is
+    /// found by its hash as readily as by its path, exactly as a shell is found by its cwd.
+    pub haystack: String,
 }
 
 /// One shells-picker candidate. Rebuilt on every view and on every run transition, like the
@@ -864,7 +873,9 @@ impl PickerCandidates {
     pub fn display_at(&self, idx: usize) -> &str {
         match self {
             PickerCandidates::Files { files, .. } => &files[idx].relative_path,
-            PickerCandidates::Buffers(v) => &v[idx].display,
+            // The composed haystack, not the display: a file at a revision is found by the hash
+            // its row shows beside the path. Same shape as a shell's.
+            PickerCandidates::Buffers(v) => &v[idx].haystack,
             // The composed haystack, not the title: a shell is found by its directory or by the
             // command it last ran as readily as by "Shell 2". Same for a conversation.
             PickerCandidates::Shells(v) => &v[idx].haystack,
@@ -914,6 +925,7 @@ impl PickerCandidates {
                     buffer_id: c.buffer_id,
                     view_id: c.view_id,
                     display: c.display.clone(),
+                    commit: c.commit.clone(),
                     status: c.status,
                     path_index: c.path.as_ref().map(|(i, _)| *i),
                     relative_path: c.path.as_ref().map(|(_, r)| r.clone()),

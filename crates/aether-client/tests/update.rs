@@ -359,6 +359,7 @@ fn a_gone_jumplist_entry_toasts_instead_of_opening_the_file() {
                     cursor: Default::default(),
                     lsp_server: None,
                     title: Some("Working changes".into()),
+                    commit: None,
                     read_only: true,
                     is_patch: true,
                 },
@@ -1076,14 +1077,14 @@ fn buffer_state_push_follows_a_save_as_rename() {
     // Another client saved-as foo.md -> sub/bar.md: we follow, relabelling to the new rel path.
     let _ = s.on_event(push(Some("/p/sub/bar.md")));
     assert_eq!(s.view.buffer.path.as_deref(), Some("/p/sub/bar.md"));
-    assert_eq!(s.view.buffer.label, "sub/bar.md");
+    assert_eq!(s.view.buffer.label.name, "sub/bar.md");
 
     // An in-place save (same path) is a no-op for the label; a legacy push (no path) too.
     let _ = s.on_event(push(Some("/p/sub/bar.md")));
-    assert_eq!(s.view.buffer.label, "sub/bar.md");
+    assert_eq!(s.view.buffer.label.name, "sub/bar.md");
     let _ = s.on_event(push(None));
     assert_eq!(s.view.buffer.path.as_deref(), Some("/p/sub/bar.md"));
-    assert_eq!(s.view.buffer.label, "sub/bar.md");
+    assert_eq!(s.view.buffer.label.name, "sub/bar.md");
 }
 
 /// Focus crossing into another buffer rebinds what the view is *showing*, not what it *is*.
@@ -3271,6 +3272,55 @@ fn space_alt_c_opens_the_buffer_locked_changes_picker() {
     );
 }
 
+/// A **file at a revision** is labelled by its path, with the commit it is shown at beside it —
+/// two fields, so a shell paints the name in the body colour and the hash muted after it. The
+/// plain-string surfaces (a window title, a confirm prompt) spell the pair out as one string.
+///
+/// A save-as replaces the label wholesale, which is what drops a stale hash: a file you wrote to
+/// disk is a file, not a revision, and nothing can leave the old commit sitting beside its name.
+#[test]
+fn a_file_at_a_revision_labels_by_path_with_the_commit_beside_it() {
+    use aether_client::session::buffer_info;
+    use aether_protocol::view::BufferDescription;
+
+    let roots = vec!["/p".to_string()];
+    let info = buffer_info(
+        serde_json::from_value::<BufferDescription>(json!({
+            "buffer_id": 7,
+            "line_count": 3,
+            "byte_count": 20,
+            "revision": 0,
+            "saved_revision": 0,
+            "path": null,
+            "title": "src/main.rs",
+            "commit": "abc1234",
+            "read_only": true,
+        }))
+        .unwrap(),
+        &roots,
+    );
+    assert_eq!(info.label.name, "src/main.rs");
+    assert_eq!(info.label.commit.as_deref(), Some("abc1234"));
+    assert_eq!(
+        info.label.joined(),
+        "src/main.rs (abc1234)",
+        "one string where there is no second shade to paint in — brackets included, since there \
+         is no colour there to say the revision annotates the name"
+    );
+    assert_eq!(info.label.commit_suffix().as_deref(), Some(" (abc1234)"));
+
+    let mut s = session();
+    s.view.buffer = info;
+    s.view.view_buffer = s.view.buffer.buffer_id;
+    s.view.view_label = s.view.buffer.label.clone();
+
+    // A save-as relabels: the new name arrives on its own, and the revision goes with the old one.
+    s.view
+        .relabel_focused(aether_client::labels::Label::from("src/renamed.rs"));
+    assert_eq!(s.view.buffer.label.commit, None);
+    assert_eq!(s.view.view_label.joined(), "src/renamed.rs");
+}
+
 /// A virtual buffer (a revision materialised by `git/show`) labels itself with the server's title
 /// rather than "(scratch)", and declines edits locally: the server refuses them anyway, so holding
 /// a key down should be quiet rather than a stream of round trips. Insert mode is refused at the
@@ -3297,7 +3347,11 @@ fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
         .unwrap(),
         &roots,
     );
-    assert_eq!(info.label, "abc1234 — Add commit grammar");
+    assert_eq!(info.label.name, "abc1234 — Add commit grammar");
+    assert_eq!(
+        info.label.commit, None,
+        "a commit's patch is named by the commit"
+    );
     assert!(info.read_only);
 
     let mut s = session();
@@ -4268,6 +4322,7 @@ fn jumplist_step_adopts_the_opened_entry() {
             cursor,
             lsp_server: None,
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -5886,6 +5941,7 @@ fn buffers_picker_close_closes_in_place() {
             buffer_id,
             view_id: aether_protocol::ViewId(buffer_id),
             display: display.into(),
+            commit: None,
             status,
             path_index: None,
             relative_path: None,
@@ -5974,6 +6030,7 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
             buffer_id,
             view_id: aether_protocol::ViewId(buffer_id),
             display: display.into(),
+            commit: None,
             status: BufferDirtyState::Clean,
             path_index: None,
             relative_path: None,
@@ -6030,6 +6087,7 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -8297,6 +8355,7 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
                 cursor: aether_protocol::cursor::CursorState::default(),
                 lsp_server: None,
                 title: None,
+                commit: None,
                 read_only: false,
                 is_patch: false,
             },
@@ -9403,6 +9462,7 @@ fn space_x_lands_on_the_successor_the_close_hands_back() {
             cursor,
             lsp_server: None,
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -9856,6 +9916,7 @@ fn open_path_prompt_submits_via_open_path_rpc() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -10197,6 +10258,7 @@ fn hint_session() -> Session {
                 cursor: aether_protocol::cursor::CursorState::default(),
                 lsp_server: None,
                 title: None,
+                commit: None,
                 read_only: false,
                 is_patch: false,
             },
@@ -12455,6 +12517,7 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -13479,6 +13542,7 @@ fn focus_on(
             scratch_number: None,
             lsp_server: None,
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -13725,7 +13789,8 @@ fn closing_a_composed_view_asks_about_unsaved_edits_in_any_element() {
             kind: ConfirmKind::DiscardOnClose { label },
             ..
         }) => assert_eq!(
-            label, &s.view.view_label,
+            label,
+            &s.view.view_label.joined(),
             "the prompt names the view — the dirty document may not be the focused one"
         ),
         other => panic!("expected a discard-on-close confirm, got {other:?}"),
@@ -14666,7 +14731,7 @@ fn closing_a_running_shell_confirms_and_an_idle_one_does_not() {
         Some(Prompt::Confirm {
             kind: ConfirmKind::CloseRunningShell { title },
             ..
-        }) => assert_eq!(title, &s.view.view_label),
+        }) => assert_eq!(title, &s.view.view_label.joined()),
         other => panic!("expected a running-shell confirm, got {other:?}"),
     }
     // `y` goes through to the ordinary close.

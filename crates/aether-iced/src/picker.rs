@@ -1388,15 +1388,22 @@ fn render_item<'a>(
         PickerItem::Buffer {
             buffer_id,
             display,
+            commit,
             status,
             path_index,
             match_indices,
             transient,
             ..
         } => {
-            let mut r = row![highlighted(
-                display,
+            // The row's two parts, as the server composed the haystack it scored: the name, then
+            // the revision a file-at-a-commit row is shown at. A hit in either highlights there.
+            let seg = aether_client::picker::row_match_segments(
+                [display, commit.as_deref().unwrap_or(""), ""],
                 match_indices,
+            );
+            let mut r = row![highlighted_owned(
+                display.clone(),
+                seg.first,
                 p.fg,
                 if *transient { SANS_ITALIC } else { SANS },
                 hovered,
@@ -1412,8 +1419,18 @@ fn render_item<'a>(
                 // the historic NORD3_BRIGHTER).
                 r = r.push(text("*").size(ui.body()).font(SANS).color(p.fg_muted));
             }
+            // The revision this buffer is shown at, bracketed and dim after the name — the pairing
+            // the status bar paints, and matchable, so a hash the query hit highlights like the
+            // path does (the bracket shifts those offsets, which `commit_annotation` does for us).
+            if let Some(commit) = commit.as_deref() {
+                let (text, indices) = aether_client::labels::commit_annotation(commit, &seg.second);
+                r = r.push(highlighted_owned(
+                    text, indices, p.fg_dim, SANS, hovered, ui, p,
+                ));
+            }
             // Multi-root workspaces: the root's label, dim, after the name — same placement as the
-            // Files picker. `path_index` is `None` for scratch/external buffers, so those show none.
+            // Files picker. `path_index` is `None` for scratch/external buffers and for a
+            // materialised revision (which has no path, so never both of these), so those show none.
             if let Some(label) = path_index.and_then(|i| root_label(roots, i)) {
                 r = r.push(
                     text(label)

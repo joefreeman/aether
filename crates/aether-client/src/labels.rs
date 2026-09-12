@@ -124,6 +124,93 @@ pub fn root_relative_display(roots: &[String], path_index: u32, relative_path: &
     }
 }
 
+/// What a buffer or a view is **called**: its name, and the revision its content is a snapshot of.
+///
+/// Two fields rather than one string, because the two are painted differently everywhere a buffer
+/// is named — the name in the body colour, the commit muted and bracketed after it
+/// (`src/main.rs (abc1234)`), in the status bar as in the buffers picker. A single
+/// `abc1234:src/main.rs` made the revision the *first* thing read on a row whose subject is the
+/// file, and left no shell able to shade it.
+///
+/// Paired in one type rather than carried as two fields side by side so they cannot drift: a
+/// save-as replaces the label wholesale ([`Label::from`]), which drops a stale hash by
+/// construction, and no shell can paint a commit next to a name it no longer belongs to.
+///
+/// `commit` is `Some` only for a **file at a revision** (`git/show <rev>:<path>`). A commit's own
+/// patch is named by the commit already; every other buffer has no revision to speak of.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Label {
+    pub name: String,
+    pub commit: Option<String>,
+}
+
+impl Label {
+    /// A name shown as of `commit` — the file-at-a-revision form.
+    pub fn at(name: impl Into<String>, commit: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            commit,
+        }
+    }
+
+    /// The muted piece a shell paints after the name, separator included, or `None` when there is
+    /// no revision to show. The one place the gap between the two is decided.
+    pub fn commit_suffix(&self) -> Option<String> {
+        self.commit
+            .as_ref()
+            .map(|c| format!(" {}", commit_annotation(c, &[]).0))
+    }
+
+    /// The whole label as *one string*, for the surfaces that have no second shade to paint in —
+    /// the window title, a confirm prompt, a toast, a log line. The brackets come too: they are
+    /// what says the revision annotates the name rather than being part of it, and that reading is
+    /// needed most where there is no colour to say it.
+    pub fn joined(&self) -> String {
+        match &self.commit {
+            Some(commit) => format!("{} {}", self.name, commit_annotation(commit, &[]).0),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// How a revision is written where it **annotates a name**: parenthesised, `(abc1234)`, and painted
+/// in the muted shade by every shell — the brackets as much as the hash, since they are chrome too.
+///
+/// Returns the rendered text with `matches` — offsets into the *bare* hash, as a picker row's
+/// composed haystack holds it — rebased onto it, because the bracket shifts every one of them by a
+/// char. Both halves here so no shell can paint the brackets and forget the shift, which shows up
+/// as a fuzzy highlight sitting one character to the left of the letters it matched.
+pub fn commit_annotation(commit: &str, matches: &[u32]) -> (String, Vec<u32>) {
+    let lead = COMMIT_OPEN.chars().count() as u32;
+    (
+        format!("{COMMIT_OPEN}{commit}{COMMIT_CLOSE}"),
+        matches.iter().map(|i| i + lead).collect(),
+    )
+}
+
+/// The brackets [`commit_annotation`] wraps a revision in. Named rather than inlined so the shift
+/// the opening one costs is derived from it, not counted by hand at each call site.
+pub const COMMIT_OPEN: &str = "(";
+pub const COMMIT_CLOSE: &str = ")";
+
+impl From<String> for Label {
+    fn from(name: String) -> Self {
+        Self { name, commit: None }
+    }
+}
+
+impl From<&str> for Label {
+    fn from(name: &str) -> Self {
+        Self::from(name.to_string())
+    }
+}
+
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.joined())
+    }
+}
+
 /// How a workspace id is shown to the user in a *workspace list* (the switcher). A persisted workspace
 /// shows its name verbatim; an *ephemeral* one (the synthesized "no workspace" context that hosts
 /// files opened outside any configured workspace) shows `(workspace <n>)` — mirroring scratch buffers'

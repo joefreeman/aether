@@ -300,6 +300,14 @@ fn shell_haystack(title: &str, cwd: &str, last_command: Option<&str>) -> String 
     join_haystack([title, cwd, last_command.unwrap_or("")])
 }
 
+/// The buffers picker's fuzzy haystack: `"{display}  {commit}"`, the commit elided when the row
+/// has none (every row but a file at a revision) — which leaves the display alone, as it always
+/// was. A wire contract for the reason [`shell_haystack`] is: a revision row is found by its hash
+/// as readily as by its path, and the shells split the offsets to highlight whichever was hit.
+fn buffer_haystack(display: &str, commit: Option<&str>) -> String {
+    join_haystack([display, commit.unwrap_or(""), ""])
+}
+
 /// The agents picker's fuzzy haystack: `"{title}  {agent}  {last_prompt}"`, empty parts elided.
 /// A wire contract for the reason [`shell_haystack`] is.
 fn agent_haystack(title: &str, agent: &str, last_prompt: Option<&str>) -> String {
@@ -323,33 +331,39 @@ fn dormant_candidate(
     d: &crate::state::DormantView,
     roots: &[std::path::PathBuf],
 ) -> picker_state::BufferCandidate {
-    let (display, path) = match &d.source {
+    let (display, path, commit) = match &d.source {
         crate::state::DormantSource::File(p) => (
             crate::workspace_index::workspace_relative_display(p, roots)
                 .unwrap_or_else(|| p.display().to_string()),
             crate::workspace_index::workspace_relative_parts(p, roots),
-        ),
-        crate::state::DormantSource::Scratch { number } => (format!("(scratch {number})"), None),
-        crate::state::DormantSource::Shell { number } => (format!("Shell {number}"), None),
-        crate::state::DormantSource::Agent { number } => (format!("Agent {number}"), None),
-        // Named as the live view names itself, as far as the key allows: a revision is its short
-        // hash and path (`abc1234:src/a.rs`) — the subject is generated with the content, which a
-        // dormant entry hasn't paid for yet. Only a file at a revision reaches here (`RowKind::
-        // of_dormant`); the other shapes stay written out so the naming is total rather than
-        // leaning on the filter above.
-        crate::state::DormantSource::Virtual { key } => (
-            match crate::state::VirtualTarget::parse_key(key).and_then(|t| t.what().cloned()) {
-                Some(aether_protocol::git::ShowTarget::WorkingChanges) => "Working changes".into(),
-                Some(aether_protocol::git::ShowTarget::Commit { rev }) => {
-                    rev.chars().take(7).collect()
-                }
-                Some(aether_protocol::git::ShowTarget::File { rev, path }) => {
-                    format!("{}:{path}", rev.chars().take(7).collect::<String>())
-                }
-                None => key.clone(),
-            },
             None,
         ),
+        crate::state::DormantSource::Scratch { number } => {
+            (format!("(scratch {number})"), None, None)
+        }
+        crate::state::DormantSource::Shell { number } => (format!("Shell {number}"), None, None),
+        crate::state::DormantSource::Agent { number } => (format!("Agent {number}"), None, None),
+        // Named as the live view names itself, as far as the key allows: a revision is its path,
+        // with the short hash beside it — the subject is generated with the content, which a
+        // dormant entry hasn't paid for yet. The hash is abbreviated from the key, which holds the
+        // revision as it was written down, where a live buffer's is abbreviated at materialisation.
+        // Only a file at a revision reaches here (`RowKind::of_dormant`); the other shapes stay
+        // written out so the naming is total rather than leaning on the filter above.
+        crate::state::DormantSource::Virtual { key } => {
+            let short = |rev: &str| rev.chars().take(7).collect::<String>();
+            let (display, commit) =
+                match crate::state::VirtualTarget::parse_key(key).and_then(|t| t.what().cloned()) {
+                    Some(aether_protocol::git::ShowTarget::WorkingChanges) => {
+                        ("Working changes".to_string(), None)
+                    }
+                    Some(aether_protocol::git::ShowTarget::Commit { rev }) => (short(&rev), None),
+                    Some(aether_protocol::git::ShowTarget::File { rev, path }) => {
+                        (path, Some(short(&rev)))
+                    }
+                    None => (key.clone(), None),
+                };
+            (display, None, commit)
+        }
     };
     // A dormant *file* row is Clean — its content lives safely on disk; closing it just forgets the
     // session entry. A dormant *scratch* exists only because unsaved content survived as a backup, so
@@ -369,7 +383,9 @@ fn dormant_candidate(
     picker_state::BufferCandidate {
         buffer_id: d.id,
         view_id: d.view,
+        haystack: buffer_haystack(&display, commit.as_deref()),
         display,
+        commit,
         status,
         path,
         abs_path: match &d.source {
@@ -396,7 +412,8 @@ fn buffer_candidate(
         (Some(p), _) => crate::workspace_index::workspace_relative_display(p, roots)
             .unwrap_or_else(|| p.display().to_string()),
         // A virtual buffer is pathless but named: show the revision title rather than calling a
-        // commit's diff "(scratch 3)".
+        // commit's diff "(scratch 3)". For a file at a revision that title is the path alone, and
+        // `commit` below carries the revision it is shown at.
         (None, Some(v)) => v.title.clone(),
         (None, None) => format!(
             "(scratch {})",
@@ -409,10 +426,13 @@ fn buffer_candidate(
         .canonical_path
         .as_deref()
         .and_then(|p| crate::workspace_index::workspace_relative_parts(p, roots));
+    let commit = doc.virtual_source.as_ref().and_then(|v| v.commit.clone());
     picker_state::BufferCandidate {
         buffer_id: buf.id,
         view_id,
+        haystack: buffer_haystack(&display, commit.as_deref()),
         display,
+        commit,
         status: buffer_dirty_state(doc),
         path,
         abs_path: doc

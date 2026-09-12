@@ -389,7 +389,14 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
                 position: None,
                 anchor: None,
                 group: None,
-                display: c.display.clone(),
+                // A jumplist row is one flat string, so a revision row spells out what its
+                // buffers row paints in two shades: the path, then the bracketed commit it is
+                // shown at (`aether_client::labels::Label::joined`'s form, which the client has no
+                // hand in here — a captured entry is text by the time it is a row).
+                display: match &c.commit {
+                    Some(commit) => format!("{} ({commit})", c.display),
+                    None => c.display.clone(),
+                },
             }
         }),
         PickerCandidates::Grep(v) => ranked_entries(picker, |ci| {
@@ -1173,6 +1180,8 @@ mod tests {
                 buffer_id: 4,
                 view_id: aether_protocol::ViewId(4),
                 display: "src/a.rs".into(),
+                haystack: "src/a.rs".into(),
+                commit: None,
                 status: BufferDirtyState::Clean,
                 path: Some((0, "src/a.rs".into())),
                 abs_path: Some("/w/src/a.rs".into()),
@@ -1182,6 +1191,8 @@ mod tests {
                 buffer_id: 9,
                 view_id: aether_protocol::ViewId(9),
                 display: "(scratch 1)".into(),
+                haystack: "(scratch 1)".into(),
+                commit: None,
                 status: BufferDirtyState::Unsaved,
                 path: None,
                 abs_path: None,

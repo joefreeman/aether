@@ -941,7 +941,7 @@ export type AgentRowState =
  *  are code-point offsets into the row's display string, covered by the fuzzy match. */
 export type PickerItem =
   | { kind: "file"; path_index: number; relative_path: string; match_indices?: number[]; git_status?: GitStatus }
-  | { kind: "buffer"; buffer_id: BufferId; view_id: number; display: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[]; transient?: boolean }
+  | { kind: "buffer"; buffer_id: BufferId; view_id: number; display: string; commit?: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[]; transient?: boolean }
   /** A shell view. `match_indices` are code-point offsets into the composed haystack
    *  `"{title}  {cwd}  {last_command}"` (empty parts elided, two spaces between the rest) — the
    *  server's `shell_haystack`, mirrored by `rowMatchSegments`. `cwd` arrives already shortened

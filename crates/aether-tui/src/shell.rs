@@ -3943,6 +3943,7 @@ mod scroll_tests {
                     cursor: Default::default(),
                     lsp_server: None,
                     title: None,
+                    commit: None,
                     read_only: false,
                     is_patch: false,
                 },

@@ -135,8 +135,20 @@ pub struct BufferDescription {
     /// content the server materialised from a revision (`git/show`: a commit's diff, or a file as
     /// of some commit). Rendered verbatim by the client, which otherwise labels a pathless buffer
     /// `(scratch N)`.
+    ///
+    /// The name alone: for a file at a revision it is the file's repo-relative path, and the
+    /// revision rides in [`Self::commit`] beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The revision this buffer's content is *as of*, abbreviated (`abc1234`) — set only for a
+    /// **file at a revision**, whose [`Self::title`] is then the bare path.
+    ///
+    /// Its own field rather than part of the title because it is painted differently: every shell
+    /// renders it muted, after the name (`src/main.rs abc1234`), in the status bar as in the
+    /// buffers picker. A commit's *patch* carries `None` — its title is the commit, not a file
+    /// shown at one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     /// The buffer refuses edits, saves and reloads. Set for virtual buffers: their content is a
     /// snapshot of something immutable, so there is nothing an edit could mean. Enforced
     /// server-side (`apply_edit` and the save/reload handlers); clients surface it and decline

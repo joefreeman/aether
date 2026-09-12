@@ -82,6 +82,38 @@ describe("shell rows", () => {
   });
 });
 
+describe("buffer rows", () => {
+  const buffer = (over: Partial<Extract<PickerItem, { kind: "buffer" }>> = {}) =>
+    ({
+      kind: "buffer",
+      buffer_id: 4,
+      view_id: 4,
+      display: "src/a.rs",
+      ...over,
+    }) as PickerItem;
+
+  it("names a file at a revision by its path, with the commit dim and bracketed after it", () => {
+    const d = describe_(buffer({ commit: "abc1234" }));
+    expect(d.primary).toBe("src/a.rs");
+    expect(d.suffix).toBe("(abc1234)");
+  });
+
+  it("splits the haystack's match offsets across the path and the commit", () => {
+    // "src/a.rs  abc1234": 0..7 path, two-space join, then the hash from 10.
+    const d = describe_(buffer({ commit: "abc1234", match_indices: [0, 10, 11] }));
+    expect(d.matches).toEqual([0]); // 's' of the path
+    // The rendered suffix is "(abc1234)", so the hash's own 0 and 1 sit past the bracket.
+    expect(d.suffixMatches).toEqual([1, 2]); // 'a', 'b' of the hash
+  });
+
+  it("an ordinary buffer has no commit, and its offsets index the path alone", () => {
+    const d = describe_(buffer({ match_indices: [0, 4] }));
+    expect(d.suffix).toBeUndefined();
+    expect(d.suffixMatches).toBeUndefined();
+    expect(d.matches).toEqual([0, 4]);
+  });
+});
+
 describe("agent rows", () => {
   it("leads with the name and trails the agent and last prompt", () => {
     const d = describe_(agent({ last_prompt: "fix the wrap bug" }));

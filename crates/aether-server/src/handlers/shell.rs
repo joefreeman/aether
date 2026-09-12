@@ -215,6 +215,7 @@ async fn mint_shell(
         crate::state::VirtualSource {
             target: crate::state::VirtualTarget::shell(&workspace, number),
             title,
+            commit: None,
         },
         text,
         None,

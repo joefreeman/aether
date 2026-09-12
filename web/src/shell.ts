@@ -489,6 +489,10 @@ interface CoreView {
   /** What to call the view in the status bar and the tab title. The view's own label, which focus
    *  does not move — `buffer.label` is the focused element's file and changes on every `Tab`. */
   view_label: string;
+  /** The revision the view's buffer is a snapshot of, abbreviated — only a file shown at a commit
+   *  has one. Painted muted and bracketed after the label; the tab title spells the two out as one
+   *  string, brackets included. */
+  view_commit: string | null;
   /** Whether the *view* is a preview that closes itself once hidden — a fact about the view, not
    *  about whichever file the cursor is in (focus rebinds `buffer`, and a working-changes view is a
    *  transient view over permanent files). */
@@ -865,6 +869,17 @@ export function rowMatchSegments(
   return out;
 }
 
+/** How a revision is written where it annotates a name: parenthesised, `(abc1234)`, painted in the
+ *  muted shade — brackets included, since they are chrome too. Mirrors the core's
+ *  `labels::commit_annotation`, offsets and all: `matches` index the *bare* hash as the composed
+ *  haystack holds it, and the opening bracket shifts every one of them by a char. */
+export function commitAnnotation(
+  commit: string,
+  matches: number[] = [],
+): { text: string; matches: number[] } {
+  return { text: `(${commit})`, matches: matches.map((i) => i + 1) };
+}
+
 /** The dim tail of a composed row: the second and third haystack parts, joined as the haystack
  *  joins them. `undefined` when both are empty (a shell that has run nothing in a directory the
  *  server could not name). */
@@ -957,16 +972,21 @@ export function describePickerItem(
       };
     }
     case "buffer": {
-      // Multi-root: the dim, disambiguated root label after the name — same placement as the Files
-      // picker. `display` is the bare relative path (the match haystack), so highlights land on the
-      // path, not the label. `path_index` is absent for scratch/external buffers → no suffix.
+      // Two dim suffixes, never both: the revision a file-at-a-commit row is shown at, or — for a
+      // file in a multi-root workspace — the disambiguated root label, same placement as the Files
+      // picker (a materialised revision has no path, so no `path_index` either). `display` is the
+      // bare path and the match indices index the composed `"{display}  {commit}"` haystack, so a
+      // hit highlights whichever part it landed in.
+      const parts: [string, string, string] = [item.display, item.commit ?? "", ""];
+      const seg = rowMatchSegments(parts, item.match_indices);
+      const commit = item.commit ? commitAnnotation(item.commit, seg.second) : undefined;
       const root =
         labels.length > 1 && item.path_index != null ? labels[item.path_index] : undefined;
-      const suffix = root || undefined;
       return {
         primary: item.display,
-        matches: item.match_indices,
-        suffix,
+        matches: seg.first,
+        suffix: commit?.text ?? root ?? undefined,
+        suffixMatches: commit?.matches,
         italic: item.transient,
         dirty: item.status && item.status !== "clean" ? item.status : undefined,
       };
@@ -5358,6 +5378,15 @@ export class Shell {
     name.textContent = truncatePath(v.view_label, undefined, labelBudget).display;
     used += [...name.textContent].length;
     fileGroup.append(name);
+    // The revision a file shown at a commit is *as of*, muted after the name — the same pairing the
+    // buffers picker paints, and upright even beside a slanted transient label.
+    if (v.view_commit) {
+      const commit = document.createElement("span");
+      commit.className = "status-commit";
+      commit.textContent = ` ${commitAnnotation(v.view_commit).text}`;
+      used += [...commit.textContent].length;
+      fileGroup.append(commit);
+    }
     left.append(fileGroup);
     // The running-shell indicator sits beside git's, in the same slot and the same shade: both
     // answer "something is happening that you are waiting on".
@@ -5555,9 +5584,15 @@ export class Shell {
     // would make the browser display the raw URL. The label is segment-elided to the same fixed cap
     // as the native titles (aether-client's TITLE_LABEL_MAX) so an external file's absolute path
     // doesn't overflow the tab title.
-    const titleLabel = v.view_label
+    // One string: a tab title has no second shade, so the commit is spelled out beside the name
+    // (aether-client's `Label::joined`).
+    const titleName = v.view_label
       ? truncatePath(v.view_label, undefined, TITLE_LABEL_MAX).display
       : "";
+    const titleLabel =
+      titleName && v.view_commit
+        ? `${titleName} ${commitAnnotation(v.view_commit).text}`
+        : titleName;
     document.title = showsWorkspaceChrome(v.workspace)
       ? titleLabel
         ? `[${v.workspace}] ${titleLabel}`

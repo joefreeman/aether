@@ -3280,9 +3280,17 @@ pub struct VirtualSource {
     /// attaches to the existing document instead of stacking duplicates — the pathless equivalent
     /// of the canonical-path sharing key.
     pub target: VirtualTarget,
-    /// Display name (`abc1234 — subject`, `abc1234:src/main.rs`, `Working changes`), shipped as
+    /// Display name (`abc1234 — subject`, `src/main.rs`, `Working changes`, `Shell 2`), shipped as
     /// `ViewOpenResult::title`.
     pub title: String,
+    /// The revision the content is *as of*, abbreviated — `Some` only for a file at a revision,
+    /// whose [`Self::title`] is then the bare path. Shipped as `ViewOpenResult::commit`, which
+    /// every shell paints muted after the name.
+    ///
+    /// Carried rather than derived from [`Self::target`]: the target holds the revision as the
+    /// caller *named* it (`HEAD`, `HEAD~1`, a full hash), and what a buffer is labelled with is
+    /// the commit that resolved to.
+    pub commit: Option<String>,
 }
 
 /// What a virtual document was generated from — content the server produced rather than loaded.
@@ -5949,6 +5957,7 @@ mod transcript_tests {
                 VirtualSource {
                     target: VirtualTarget::shell("proj", 1),
                     title: "Shell 1".into(),
+                    commit: None,
                 },
                 text.to_string(),
                 None,

@@ -5219,6 +5219,84 @@ async fn a_patch_is_not_a_buffers_row_but_a_file_at_a_revision_is() {
     drop(server);
 }
 
+/// A **file at a revision** is named by the file: the path is the row, and the revision it is
+/// shown at rides beside it as an abbreviated hash, which every shell paints muted after the name.
+///
+/// The commit is still *matchable* — it is half the row's identity when the working file and one
+/// of its revisions are both open, which is the ordinary case (they show the same path). The
+/// haystack is `"{display}  {commit}"`, so a query on the hash hits and the offsets come back
+/// pointing into the commit, not the path.
+#[tokio::test]
+async fn a_file_at_a_revision_shows_its_commit_beside_the_path_and_is_found_by_it() {
+    let (server, mut ws, root, head) = setup_git_workspace().await;
+    let short: String = head.chars().take(7).collect();
+
+    let at_rev = show_buffer(
+        &mut ws,
+        &show(
+            &root,
+            ShowTarget::File {
+                rev: head.clone(),
+                path: "b.rs".into(),
+            },
+        ),
+    )
+    .await;
+    assert_eq!(at_rev.title.as_deref(), Some("b.rs"), "named by the file");
+    assert_eq!(at_rev.commit.as_deref(), Some(short.as_str()));
+
+    // Two rows now read `b.rs` — the working file and this revision of it — and the commit is
+    // what tells them apart.
+    let rows = rows_of(&mut ws, PickerKind::Buffers).await;
+    let commits: Vec<Option<String>> = rows
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Buffer {
+                display, commit, ..
+            } if display == "b.rs" => Some(commit.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        commits,
+        vec![Some(short.clone()), None],
+        "the revision row carries the hash, the working file none: {rows:?}"
+    );
+
+    // Typing the hash finds the revision row alone, with the match inside the commit part of the
+    // composed haystack (`"b.rs  <hash>"` — the path is 4 chars, then the two-space join).
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::Buffers,
+            query: short[..4].to_string(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(&mut ws).await;
+    assert_eq!(update.total_matches, 1, "the hash names one row");
+    let PickerItem::Buffer {
+        display,
+        commit,
+        match_indices,
+        ..
+    } = &update.items()[0]
+    else {
+        panic!("expected a buffer row, got {:?}", update.items()[0]);
+    };
+    assert_eq!(display, "b.rs");
+    assert_eq!(commit.as_deref(), Some(short.as_str()));
+    assert_eq!(
+        match_indices,
+        &vec![6, 7, 8, 9],
+        "the hit lands past the path and its two-space join"
+    );
+
+    drop(server);
+}
+
 /// From inside a working-changes view, `Space b` still answers with the buffers you have — the
 /// review is filtered out, so **row 0 is the most recent plain buffer** rather than the view you
 /// are in, and selecting it switches to it.
@@ -5302,10 +5380,23 @@ async fn a_dormant_commit_key_is_never_a_buffers_row() {
         }
     }
 
-    let rows = names(&rows_of(&mut ws, PickerKind::Buffers).await);
+    let items = rows_of(&mut ws, PickerKind::Buffers).await;
+    let rows = names(&items);
     assert!(
-        rows.contains(&format!("{short}:a.rs")),
+        rows.contains(&"a.rs".to_string()),
         "the dormant file at a revision is a row: {rows:?}"
+    );
+    // Named by its path, with the revision it is shown at beside it — the same pair a live row
+    // carries, read off the key that named it.
+    assert_eq!(
+        items.iter().find_map(|i| match i {
+            PickerItem::Buffer {
+                display, commit, ..
+            } if display == "a.rs" => Some(commit.clone()),
+            _ => None,
+        }),
+        Some(Some(short.clone())),
+        "the dormant row shows which revision: {items:?}"
     );
     assert!(
         !rows.contains(&short),

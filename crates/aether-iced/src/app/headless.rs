@@ -930,6 +930,23 @@ fn a_running_shell_shows_in_the_status_bar() {
     snapshot(&mut sim, &app, "shell-indicator");
 }
 
+/// A file shown at a revision names itself by its path in the status bar, with the bracketed commit
+/// it is shown at beside it — the pairing the buffers picker paints, here in the filename's slot.
+#[test]
+fn a_file_at_a_revision_shows_its_commit_in_the_status_bar() {
+    let mut session = session_showing(shell_view());
+    session.view.view_label = aether_client::labels::Label::at("a.rs", Some("abc1234".into()));
+    let app = app_with(session);
+    let mut sim = simulate(&app);
+    let rows = rows(&mut sim);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("a.rs") && r.contains("(abc1234)")),
+        "the status bar names the file and the revision it is shown at:\n{}",
+        rows.join("\n")
+    );
+}
+
 /// An agent conversation as the server composes one: the prose bare, the machinery boxed, and the
 /// reply laid out by *this shell* rather than wrapped by the server.
 fn agent_view() -> Window {

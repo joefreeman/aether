@@ -41,8 +41,10 @@ pub fn build_view(s: &Session) -> Value {
         // `viewport/subscribe` addresses this one.
         "view_id": s.view.view_id,
         // What to call the view in the status bar and the document title — the view's own label,
-        // which focus does not move. See `ViewState::view_label`.
-        "view_label": s.view.view_label,
+        // which focus does not move. See `ViewState::view_label`. The name and the revision it is
+        // shown at travel apart because the shell paints them in two shades.
+        "view_label": s.view.view_label.name,
+        "view_commit": s.view.view_label.commit,
         // Whether the *view* is a preview that closes itself once hidden — a fact about the view,
         // not about whichever file the cursor is in. See `ViewState::view_transient`.
         "view_transient": s.view.view_transient,
@@ -474,7 +476,7 @@ fn buffer(s: &Session) -> Value {
     json!({
         "buffer_id": b.buffer_id,
         "path": b.path,
-        "label": b.label,
+        "label": b.label.name,
         "language": b.language,
         "cursor": jv(&b.cursor),
         // The buffer's restored scroll (server-provided; positions a fresh subscribe). The shell

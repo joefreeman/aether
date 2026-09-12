@@ -1171,6 +1171,7 @@ async fn open_restored_scratch(
             cursor,
             lsp_server: None, // scratch buffers are never language-server-backed
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -1235,6 +1236,7 @@ pub fn describe_buffer(
         cursor,
         lsp_server: buffer_lsp_server_ref(s, buffer_id),
         title: doc.virtual_source.as_ref().map(|v| v.title.clone()),
+        commit: doc.virtual_source.as_ref().and_then(|v| v.commit.clone()),
         read_only: doc.read_only(),
         is_patch: doc.patch().is_some(),
     })
@@ -1958,6 +1960,7 @@ async fn open_generated_buffer(
         crate::state::VirtualSource {
             target,
             title: content.title.clone(),
+            commit: content.commit.clone(),
         },
         content.text,
         content.language,
@@ -2010,6 +2013,7 @@ async fn open_generated_buffer(
             cursor: focused,
             lsp_server: None, // no file on disk for a server to have an opinion about
             title: Some(content.title),
+            commit: content.commit,
             read_only: true,
             // A commit's diff, not a file at a revision — both are read-only, only the first has a
             // patch index for `Enter` to follow through.
@@ -2235,6 +2239,7 @@ async fn view_open_inner(
         // The only reopen path that can meet a virtual buffer: switching back to one through the
         // view picker, which opens by id because there's no path to dispatch on.
         let virtual_title = doc.virtual_source.as_ref().map(|v| v.title.clone());
+        let virtual_commit = doc.virtual_source.as_ref().and_then(|v| v.commit.clone());
         let read_only = doc.read_only();
         let is_patch = doc.patch().is_some();
         let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(doc, jt));
@@ -2263,6 +2268,7 @@ async fn view_open_inner(
                 cursor,
                 lsp_server: buffer_lsp_server_ref(&s, buffer_id),
                 title: virtual_title,
+                commit: virtual_commit,
                 read_only,
                 is_patch,
             },
@@ -2332,6 +2338,7 @@ async fn view_open_inner(
                         cursor,
                         lsp_server: None, // scratch buffers are never language-server-backed
                         title: None,
+                        commit: None,
                         read_only: false,
                         is_patch: false,
                     },
@@ -2454,6 +2461,7 @@ async fn view_open_inner(
                     cursor,
                     lsp_server: buffer_lsp_server_ref(&s, existing),
                     title: None,
+                    commit: None,
                     read_only: false,
                     is_patch: false,
                 },
@@ -2705,6 +2713,7 @@ async fn view_open_inner(
             cursor,
             lsp_server: buffer_lsp_server_ref(&s, id),
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },

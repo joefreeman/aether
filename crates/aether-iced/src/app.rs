@@ -753,7 +753,12 @@ impl App {
 
     /// `[workspace] file` — mirrors the web client's page title and the TUI's terminal title.
     pub fn title(&self) -> String {
-        crate::labels::window_title(&self.session.workspace, &self.session.view.view_label)
+        // One string: a window title has no second shade, so a revision's commit is spelled out
+        // beside the name rather than painted behind it.
+        crate::labels::window_title(
+            &self.session.workspace,
+            &self.session.view.view_label.joined(),
+        )
     }
 
     /// Keyboard, modifier and resize events for *every* window, each tagged with the window it
@@ -4909,7 +4914,7 @@ impl App {
         // web's `truncatePath`; chars approximate px since the bar is sans).
         let budget = ((self.view_size.width * 0.5 / ui.char_width()) as usize).max(12);
         // The view's label, not the focused element's — see `ViewState::view_label`.
-        let label = crate::labels::truncate_path(&self.session.view.view_label, budget);
+        let label = crate::labels::truncate_path(&self.session.view.view_label.name, budget);
         used += label.chars().count();
         let name = text(label)
             .wrapping(iced::widget::text::Wrapping::None)
@@ -4924,6 +4929,12 @@ impl App {
                 },
             );
         left = left.push(name);
+        // The revision a file shown at a commit is *as of*, muted after the name — the same pairing
+        // the buffers picker paints, and upright even on a slanted transient label.
+        if let Some(commit) = self.session.view.view_label.commit_suffix() {
+            used += commit.chars().count();
+            left = left.push(t(commit, p.fg_muted));
+        }
         // The tether mark: a dim ` *` after the file label — closing this buffer exits the window.
         // Upright even on a slanted transient label, like the terminal client.
         if self.session.tethered() {

@@ -617,7 +617,9 @@ pub struct EditorState {
     pub blame: BlameState,
     /// Canonical absolute path of this buffer's file on disk, if any.
     pub file_path: Option<String>,
-    pub file_label: String,
+    /// What the status row calls this view: the name, and the revision it is shown at (painted
+    /// muted after it) — see `aether_client::labels::Label`.
+    pub file_label: aether_client::labels::Label,
     /// The buffer's language id (e.g. `"rust"`), from `view/open`. `None` for unknown/plain-text
     /// buffers. Used for language-scoped UI (e.g. the "no formatter for {lang}" note).
     pub language: Option<String>,
@@ -822,12 +824,14 @@ pub fn refresh_terminal_title(state: &mut AppState) {
 fn terminal_title(state: &AppState) -> String {
     // The label is only meaningful with an open editor (the transient workspace-switch window has
     // none). `title_body` yields `None` before a workspace is active → the title is just the app name.
+    // One string: a terminal title has no second shade, so a revision's commit is spelled out
+    // beside the name rather than painted behind it.
     let label = if state.has_editor() {
-        state.ed().file_label.as_str()
+        state.ed().file_label.joined()
     } else {
-        ""
+        String::new()
     };
-    let Some(body) = aether_client::labels::title_body(&state.workspace_name, label) else {
+    let Some(body) = aether_client::labels::title_body(&state.workspace_name, &label) else {
         return aether_client::labels::APP_NAME.to_string();
     };
     let dot = if state.has_editor() && state.buffer_status().is_some() {

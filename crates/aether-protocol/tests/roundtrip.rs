@@ -1921,6 +1921,7 @@ fn buffer_open_result_shape() {
                 workspace_root: "/proj".into(),
             }),
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -1936,6 +1937,52 @@ fn buffer_open_result_shape() {
     assert_eq!(v["cursor"]["position"]["col"], 0);
     // `scroll: None` skips serialisation — keeps the wire shape tight for first-open cases.
     assert!(v.get("scroll").is_none(), "scroll: None should be skipped");
+    assert!(
+        v.get("commit").is_none(),
+        "only a file at a revision is shown *as of* one"
+    );
+}
+
+/// A **file at a revision** is named by its path, with the commit it is shown at beside it — two
+/// fields, because every shell paints the commit muted after the name. Off the wire entirely for
+/// every other buffer.
+#[test]
+fn a_file_at_a_revision_carries_its_commit_beside_its_title() {
+    let open = ViewOpenResult {
+        transient: true,
+        read: false,
+        view_id: aether_protocol::ViewId(5),
+        scroll: None,
+        buffer: BufferDescription {
+            buffer_id: 5,
+            language: Some("rust".into()),
+            line_count: 10,
+            byte_count: 100,
+            revision: 0,
+            saved_revision: 0,
+            path: None,
+            scratch_number: None,
+            cursor: Default::default(),
+            lsp_server: None,
+            title: Some("src/main.rs".into()),
+            commit: Some("abc1234".into()),
+            read_only: true,
+            is_patch: false,
+        },
+    };
+    let v = to_value(&open).unwrap();
+    assert_eq!(v["title"], "src/main.rs");
+    assert_eq!(v["commit"], "abc1234");
+    let back: ViewOpenResult = from_value(v).unwrap();
+    assert_eq!(back.title.as_deref(), Some("src/main.rs"));
+    assert_eq!(back.commit.as_deref(), Some("abc1234"));
+    // A server that predates the field: the title still names the buffer, with no revision beside it.
+    let legacy: ViewOpenResult = from_value(json!({
+        "view_id": 5, "buffer_id": 5, "line_count": 10, "byte_count": 100,
+        "revision": 0, "saved_revision": 0, "title": "abc1234 — subject", "read_only": true,
+    }))
+    .unwrap();
+    assert_eq!(legacy.commit, None);
 }
 
 /// An open answers with the view it presented — always, since a client subscribes to it — and
@@ -1959,6 +2006,7 @@ fn buffer_open_result_reports_its_view() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -2047,6 +2095,7 @@ fn buffer_open_result_reports_reading() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -2097,6 +2146,7 @@ fn buffer_open_result_restored_scroll() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -3164,7 +3214,8 @@ fn follow_patch_line_shape() {
             scratch_number: None,
             cursor: Default::default(),
             lsp_server: None,
-            title: Some("abc1234:src/a.rs".into()),
+            title: Some("src/a.rs".into()),
+            commit: Some("abc1234".into()),
             read_only: true,
             is_patch,
         },
@@ -4688,6 +4739,7 @@ fn picker_item_buffer_is_tagged() {
         buffer_id: 7,
         view_id: aether_protocol::ViewId(7),
         display: "src/main.rs".into(),
+        commit: None,
         status: BufferDirtyState::ExternallyModified,
         path_index: Some(0),
         relative_path: Some("src/main.rs".into()),
@@ -4716,6 +4768,7 @@ fn picker_item_buffer_is_tagged() {
         buffer_id: 9,
         view_id: aether_protocol::ViewId(9),
         display: "(scratch 1)".into(),
+        commit: None,
         status: BufferDirtyState::Clean,
         path_index: None,
         relative_path: None,
@@ -4743,6 +4796,29 @@ fn picker_item_buffer_is_tagged() {
     }))
     .unwrap();
     assert_eq!(back, scratch);
+
+    // A file at a revision: the path is the display, the abbreviated commit rides beside it, and
+    // `match_indices` index the two joined (`"a.rs  abc1234"`), so a hash the query hit highlights
+    // in the piece it landed in.
+    let at_rev = PickerItem::Buffer {
+        buffer_id: 11,
+        view_id: aether_protocol::ViewId(11),
+        display: "src/a.rs".into(),
+        commit: Some("abc1234".into()),
+        status: BufferDirtyState::Clean,
+        path_index: None,
+        relative_path: None,
+        match_indices: vec![10, 11],
+        transient: true,
+    };
+    let rv = to_value(&at_rev).unwrap();
+    assert_eq!(rv["display"], "src/a.rs");
+    assert_eq!(rv["commit"], "abc1234");
+    assert_eq!(from_value::<PickerItem>(rv).unwrap(), at_rev);
+    assert!(
+        to_value(&scratch).unwrap().get("commit").is_none(),
+        "a buffer that is not a revision omits commit"
+    );
 }
 
 #[test]
@@ -7042,6 +7118,7 @@ fn every_subscribe_carries_the_focus_it_resolved() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            commit: None,
             read_only: false,
             is_patch: false,
         },
@@ -7172,6 +7249,7 @@ fn shell_open_shape() {
                 cursor: CursorState::default(),
                 lsp_server: None,
                 title: Some("Shell 1".into()),
+                commit: None,
                 read_only: true,
                 is_patch: false,
             },

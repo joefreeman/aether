@@ -2938,7 +2938,7 @@ impl Session {
                             path_index,
                             &rel,
                         );
-                        self.view.relabel_focused(label);
+                        self.view.relabel_focused(label.into());
                         format!("Saved as {rel} (rev {})", result.revision)
                     }
                     None => format!("Saved (rev {})", result.revision),
@@ -4030,7 +4030,7 @@ impl Session {
     /// views of that kind, so asking them is also asking what kind of view this is.
     fn closing_current_view(&self) -> Closing {
         Closing {
-            label: self.view.view_label.clone(),
+            label: self.view.view_label.joined(),
             unsaved: self.view.unsaved(),
             running_shell: self.shell_runs.contains_key(&self.view.view_id),
             busy_agent: self.agent_turns.contains_key(&self.view.view_id),
@@ -4520,6 +4520,7 @@ impl Session {
                 buffer_id: self.view.view_buffer,
                 view_id: self.view.view_id,
                 display: String::new(),
+                commit: None,
                 status: Default::default(),
                 path_index: None,
                 relative_path: None,
@@ -7175,7 +7176,7 @@ impl Session {
                     if self.view.buffer.path.as_deref() != Some(new_path.as_str()) {
                         let label =
                             super::session::label_for_path(&new_path, &self.workspace_paths);
-                        self.view.relabel_focused(label);
+                        self.view.relabel_focused(label.into());
                         self.view.buffer.path = Some(new_path);
                     }
                 }
@@ -10439,7 +10440,7 @@ impl Session {
                 // not apply either.
                 if self.view.buffer.buffer_id != self.view.view_buffer {
                     let view_id = self.view.view_id;
-                    let label = self.view.buffer.label.clone();
+                    let label = self.view.buffer.label.joined();
                     return self.request_str::<ViewSetTransient>(
                         ViewSetTransientParams {
                             view_id,
@@ -12651,6 +12652,7 @@ mod tests {
                     buffer_id: 7,
                     view_id: ViewId(7),
                     display: "(scratch 1)".into(),
+                    commit: None,
                     status: aether_protocol::picker::BufferDirtyState::default(),
                     path_index: None,
                     relative_path: None,

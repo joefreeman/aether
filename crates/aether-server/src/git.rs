@@ -2371,9 +2371,14 @@ fn short_hash(hash: &str) -> String {
 
 /// The content of a revision, materialised for a read-only virtual buffer (`git/show`).
 pub struct RevisionContent {
-    /// Buffer title — `abc1234 — subject` for a commit, `abc1234:src/main.rs` for a file. Git's own
-    /// syntax for the file form, so it reads the way you'd type it.
+    /// Buffer title — `abc1234 — subject` for a commit, the bare repo-relative path for a file at
+    /// a revision. A file is *named* by its path; which revision it is showing is [`Self::commit`],
+    /// so every shell can paint it muted beside the name rather than inside it.
     pub title: String,
+    /// The revision the content is as of, abbreviated — `Some` only for a file at a revision. A
+    /// commit's patch is *about* a revision rather than a snapshot of one, and its title already
+    /// leads with the hash.
+    pub commit: Option<String>,
     pub text: String,
     /// Detected from the path for a file. `None` for a commit's patch: no grammar spans a patch,
     /// and none needs to — the text is *generated* here, so its structure is classified at the
@@ -2595,6 +2600,7 @@ pub fn show_commit(repo_path: &Path, rev: &str) -> Result<RevisionContent, Strin
     let (text, generated) = b.finish();
     Ok(RevisionContent {
         title: format!("{short} — {subject}"),
+        commit: None,
         text,
         language: None,
         generated: Some(generated),
@@ -2649,6 +2655,7 @@ pub fn show_working_changes(
         let (text, generated) = b.finish();
         return Ok(RevisionContent {
             title: "Working changes".to_string(),
+            commit: None,
             text,
             language: None,
             generated: Some(generated),
@@ -2702,6 +2709,7 @@ pub fn show_working_changes(
         // either, and for the same reason: the status bar already carries it, on this buffer as on
         // every other one in the repo.
         title: "Working changes".to_string(),
+        commit: None,
         text,
         language: None,
         generated: Some(generated),
@@ -2740,9 +2748,11 @@ pub fn show_file(repo_path: &Path, rev: &str, path: &str) -> Result<RevisionCont
     if blob.is_binary() {
         return Err(format!("{path} is binary at {rev}"));
     }
-    let short = short_hash(&commit.id().to_string());
     Ok(RevisionContent {
-        title: format!("{short}:{path}"),
+        // The path alone: the file is what this buffer *is*, and the revision it is shown at is a
+        // fact about it, carried beside the name rather than jammed in front of it.
+        title: path.to_string(),
+        commit: Some(short_hash(&commit.id().to_string())),
         text: String::from_utf8_lossy(blob.content()).into_owned(),
         // Detected from the path, so a file at a revision highlights exactly like its working-tree
         // twin — the whole point of showing it in the editor rather than a pager.

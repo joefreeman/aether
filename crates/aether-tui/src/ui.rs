@@ -2918,12 +2918,14 @@ fn picker_item_spans(
             max_width,
         );
     }
-    // Buffer rows get a leading dim `{label}: ` prefix for multi-root workspaces, matching the
-    // status bar / title and the other clients. `display` (the match haystack) is the bare
-    // relative path, so the highlight lands only on the path, not the prefix.
+    // Buffer rows carry a dim suffix after the name — the revision a file-at-a-commit row is shown
+    // at, or the disambiguated root label in a multi-root workspace — matching the status bar and
+    // the other clients. `display` is the bare relative path; the match indices index the composed
+    // `"{display}  {commit}"` haystack, so a hit highlights whichever part it landed in.
     if let PickerItem::Buffer {
         buffer_id,
         display,
+        commit,
         status,
         path_index,
         match_indices,
@@ -2934,6 +2936,7 @@ fn picker_item_spans(
         return buffer_item_spans(
             *path_index,
             display,
+            commit.as_deref(),
             match_indices,
             *status,
             *transient,
@@ -3486,6 +3489,7 @@ fn file_item_spans(
 fn buffer_item_spans(
     path_index: Option<u32>,
     display: &str,
+    commit: Option<&str>,
     match_indices: &[u32],
     status: BufferDirtyState,
     transient: bool,
@@ -3505,18 +3509,44 @@ fn buffer_item_spans(
     }
     let label_style = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
 
-    // Suffix (multi-root only): the dim root label after the name, like the Files picker. `None`
-    // path_index (scratch/external buffers) → no suffix.
-    let suffix = match path_index {
-        Some(i) => {
+    // The row's two parts, as the server composed the haystack it scored: the name, then the
+    // revision a file-at-a-commit row is shown at. A hit in either highlights where it landed.
+    let seg = aether_client::picker::row_match_segments(
+        [display, commit.unwrap_or(""), ""],
+        match_indices,
+    );
+
+    // Suffix: the revision this buffer is shown at, bracketed, or — for a file inside a multi-root
+    // workspace — the dim root label, like the Files picker. Never both: a materialised revision
+    // has no path, so it has no root either, and `path_index` is `None` for it. Nothing to say (a
+    // scratch, a single-root workspace) → no suffix.
+    //
+    // **One space before the commit, two before a root label.** The two-space gap is the *haystack's*
+    // join, not a rendering rule — the offsets are rebased onto the rendered text, so the gap here
+    // is free to be whatever reads best, and the brackets already fence the hash off from the path.
+    // A root label has no brackets and needs the wider gap to read as separate; the status bar
+    // spells the commit the same single-space way (`Label::commit_suffix`).
+    let (suffix, suffix_indices) = match (commit, path_index) {
+        (Some(commit), _) => {
+            let (text, indices) = aether_client::labels::commit_annotation(commit, &seg.second);
+            const GAP: &str = " ";
+            (
+                format!("{GAP}{text}"),
+                indices
+                    .into_iter()
+                    .map(|i| i + GAP.width() as u32)
+                    .collect(),
+            )
+        }
+        (None, Some(i)) => {
             let label = root_label_or_blank(root_labels, i);
             if label.is_empty() {
-                String::new()
+                (String::new(), Vec::new())
             } else {
-                format!("  {label}")
+                (format!("  {label}"), Vec::new())
             }
         }
-        None => String::new(),
+        (None, None) => (String::new(), Vec::new()),
     };
 
     // The tether mark: a dim ` *` after the path, before the root label — matching the status bar.
@@ -3534,7 +3564,7 @@ fn buffer_item_spans(
         .saturating_sub(dot_w)
         .saturating_sub(tether_mark.width())
         .saturating_sub(suffix.width());
-    let (path, indices) = truncate_path_with_indices(display, match_indices, path_budget);
+    let (path, indices) = truncate_path_with_indices(display, &seg.first, path_budget);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     push_styled_with_match_indices(&mut spans, &path, &indices, base, match_style);
@@ -3542,7 +3572,16 @@ fn buffer_item_spans(
         spans.push(Span::styled(tether_mark.to_string(), label_style));
     }
     if !suffix.is_empty() {
-        spans.push(Span::styled(suffix, label_style));
+        // A hash the query hit highlights like the path does — it is half the row's identity when
+        // a file and a revision of it are both open. A root label has no offsets of its own (root
+        // identity is not matchable), so it paints as one dim span.
+        push_styled_with_match_indices(
+            &mut spans,
+            &suffix,
+            &suffix_indices,
+            label_style,
+            match_style,
+        );
     }
 
     if let Some(color) = buffer_dirty_dot_color(status) {
@@ -7456,12 +7495,13 @@ fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
     Style::default().bg(c(t.bg_panel)).fg(c(fg))
 }
 
-/// The status row's leading label: an optional `[workspace] ` prefix, the file label, whether the
-/// buffer is transient (which italicises the label), and whether it's the session's tether (which
-/// appends a dim ` *` — closing it exits the client).
+/// The status row's leading label: an optional `[workspace] ` prefix, the file label (its name and,
+/// for a file at a revision, the commit painted dim after it), whether the buffer is transient
+/// (which italicises the name), and whether it's the session's tether (which appends a dim ` *` —
+/// closing it exits the client).
 struct StatusLabel<'a> {
     workspace_prefix: &'a str,
-    file_label: &'a str,
+    file_label: &'a aether_client::labels::Label,
     transient: bool,
     tethered: bool,
 }
@@ -7490,6 +7530,10 @@ fn build_editor_status_spans(
         transient,
         tethered,
     } = label;
+    // The name, and the revision it is shown at — muted, after it, like the buffers-picker row.
+    // Empty for every buffer that is not a file at a revision, which is all of them but one kind.
+    let commit = file_label.commit_suffix().unwrap_or_default();
+    let file_label = file_label.name.as_str();
     let base_style = Style::default().bg(c(th().bg_panel)).fg(c(th().fg));
     // A transient (preview) buffer slants the file label (root + path — not the workspace name)
     // instead of spending row width on an explicit marker. Terminals without italic support
@@ -7521,7 +7565,9 @@ fn build_editor_status_spans(
         }
     }
     let pre_budget = left_max.saturating_sub(used);
-    if workspace_prefix.width() + file_label.width() + tether_mark.width() >= pre_budget {
+    if workspace_prefix.width() + file_label.width() + commit.width() + tether_mark.width()
+        >= pre_budget
+    {
         // Even the workspace/file segment overflows. The file label is the informative part, so
         // it gets the budget first (segment elision keeps the filename end visible); the
         // workspace prefix is shown only if it still fits whole — a partially-cut `[pr…` is
@@ -7538,13 +7584,21 @@ fn build_editor_status_spans(
     } else {
         spans.push(Span::styled(workspace_prefix.to_string(), base_style));
         spans.push(Span::styled(file_label.to_string(), label_style));
+        if !commit.is_empty() {
+            // Upright even on a slanted transient label: which revision this is, is chrome.
+            spans.push(Span::styled(
+                commit.clone(),
+                base_style.fg(c(th().fg_muted)),
+            ));
+        }
         if !tether_mark.is_empty() {
             spans.push(Span::styled(
                 tether_mark.to_string(),
                 base_style.fg(c(th().fg_muted)),
             ));
         }
-        used += workspace_prefix.width() + file_label.width() + tether_mark.width();
+        used +=
+            workspace_prefix.width() + file_label.width() + commit.width() + tether_mark.width();
         // Each following section is introduced by a dim ` · `, which is exactly as wide as the
         // 3-space gap it replaced — the divider is free.
         let separator = || {
@@ -9886,6 +9940,47 @@ mod tests {
         assert_eq!(text, spans_text(&grep));
     }
 
+    /// A buffers row for a **file at a revision**: the path in the body colour, the commit dim
+    /// after it. The row's match indices index the composed `"{display}  {commit}"` haystack, so a
+    /// query on the hash highlights inside the commit and leaves the path alone.
+    #[test]
+    fn buffer_row_shows_its_commit_dim_after_the_path() {
+        let item = PickerItem::Buffer {
+            buffer_id: 4,
+            view_id: aether_protocol::ViewId(4),
+            display: "src/a.rs".into(),
+            commit: Some("abc1234".into()),
+            status: BufferDirtyState::Clean,
+            path_index: None,
+            relative_path: None,
+            // "src/a.rs  abc1234": 8 chars of path, two of join, then the hash.
+            match_indices: vec![10, 11, 12],
+            transient: false,
+        };
+        let spans = picker_item_spans(&item, &[], None, false, 40);
+        let text = spans_text(&spans);
+        assert!(
+            text.starts_with("src/a.rs (abc1234)"),
+            "the path, one space, then the bracketed commit: {text:?}"
+        );
+        let dim: String = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(picker_dim_fg(false)))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            dim, " (1234)",
+            "brackets and hash are both chrome; the matched letters lift into the highlight: \
+             {text:?}"
+        );
+        let hl: String = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(c(th().match_highlight)))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(hl, "abc", "the hit lands in the hash, not the path");
+    }
+
     /// A whole-target entry — a file or buffer captured from the Files/view picker — has no line
     /// to show, so the row renders the path alone with no trailing number and no reserved gap for
     /// one.
@@ -9915,6 +10010,7 @@ mod tests {
             buffer_id: id,
             view_id: aether_protocol::ViewId(id),
             display: "notes.md".into(),
+            commit: None,
             status: aether_protocol::picker::BufferDirtyState::Clean,
             path_index: None,
             relative_path: None,
@@ -10010,6 +10106,11 @@ mod tests {
 
     // ---- build_editor_status_spans ----
 
+    /// A status label with no revision — what every buffer but a file at a commit carries.
+    fn status_label(name: &str) -> aether_client::labels::Label {
+        name.into()
+    }
+
     fn spans_text(spans: &[Span<'_>]) -> String {
         spans.iter().map(|s| s.content.as_ref()).collect::<String>()
     }
@@ -10042,7 +10143,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "[proj] ",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: false,
                 tethered: false,
             },
@@ -10059,6 +10160,42 @@ mod tests {
         assert_eq!(spans_total_width(&spans), 30);
     }
 
+    /// The status row names a file shown at a revision the way its picker row does: the path, then
+    /// the commit in the muted shade — upright even when the label beside it slants, since which
+    /// revision this is reads as chrome rather than as the name.
+    #[test]
+    fn editor_status_spans_show_the_commit_dim_after_the_label() {
+        let status = crate::app::StatusMessage::default();
+        let spans = build_editor_status_spans(
+            StatusLabel {
+                workspace_prefix: "[proj] ",
+                file_label: &aether_client::labels::Label::at("src/a.rs", Some("abc1234".into())),
+                transient: true,
+                tethered: false,
+            },
+            None,
+            Vec::new(),
+            &status,
+            &[],
+            vec![Span::raw("12:5")],
+            40,
+        );
+        let text = spans_text(&spans);
+        assert!(
+            text.starts_with("[proj] src/a.rs (abc1234)"),
+            "the path, then the bracketed commit: {text:?}"
+        );
+        let commit = spans
+            .iter()
+            .find(|s| s.content.contains("(abc1234)"))
+            .expect("a commit span");
+        assert_eq!(commit.style.fg, Some(c(th().fg_muted)));
+        assert!(
+            !commit.style.add_modifier.contains(Modifier::ITALIC),
+            "upright beside a slanted transient label"
+        );
+    }
+
     /// A transient buffer italicises the workspace/file segment (no explicit marker text); a
     /// permanent one doesn't.
     #[test]
@@ -10067,7 +10204,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "[proj] ",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: true,
                 tethered: false,
             },
@@ -10088,7 +10225,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "[proj] ",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: false,
                 tethered: false,
             },
@@ -10114,7 +10251,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "[proj] ",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: true,
                 tethered: true,
             },
@@ -10137,7 +10274,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "[proj] ",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: false,
                 tethered: false,
             },
@@ -10161,7 +10298,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "[proj] ",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: false,
                 tethered: false,
             },
@@ -10189,7 +10326,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "[proj] ",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: false,
                 tethered: false,
             },
@@ -10224,7 +10361,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "[proj] ",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: false,
                 tethered: false,
             },
@@ -10260,7 +10397,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "[proj] ",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: false,
                 tethered: false,
             },
@@ -10292,7 +10429,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "[proj] ",
-                file_label: "src/deeply/nested/module/file.rs",
+                file_label: &status_label("src/deeply/nested/module/file.rs"),
                 transient: false,
                 tethered: false,
             },
@@ -10328,7 +10465,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: false,
                 tethered: false,
             },
@@ -10354,7 +10491,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: false,
                 tethered: false,
             },
@@ -10388,7 +10525,7 @@ mod tests {
         let spans = build_editor_status_spans(
             StatusLabel {
                 workspace_prefix: "",
-                file_label: "file.rs",
+                file_label: &status_label("file.rs"),
                 transient: false,
                 tethered: false,
             },

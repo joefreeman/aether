@@ -3344,10 +3344,10 @@ async fn git_show_with_a_path_yields_that_file_at_the_revision() {
         Some("rust"),
         "highlights as Rust"
     );
-    assert_eq!(
-        opened.title.as_deref(),
-        Some(format!("{}:src/main.rs", &first[..7]).as_str())
-    );
+    // The file is named by its path; the revision it is shown at travels beside it, so every
+    // shell can paint the two in two shades.
+    assert_eq!(opened.title.as_deref(), Some("src/main.rs"));
+    assert_eq!(opened.commit.as_deref(), Some(&first[..7]));
     let content: BufferContentResult = send_request::<BufferContent>(
         &mut ws,
         &BufferContentParams {
@@ -3380,8 +3380,8 @@ async fn git_show_with_a_path_yields_that_file_at_the_revision() {
     drop(server);
 }
 
-/// A **file at a revision** is listed like any other buffer — by its title (`abc1234:a.rs`), not
-/// as "(scratch N)". It is a genuine read-only document: content you named and can name again, so
+/// A **file at a revision** is listed like any other buffer — by its title (`a.rs`, with the
+/// commit it is shown at beside it), not as "(scratch N)". It is a genuine read-only document: content you named and can name again, so
 /// it is a buffers row. It is keyed in the session by its revision rather than by a path or a
 /// scratch number; whether it comes back as a listed row or only as the landing is
 /// `tests/session.rs`'s subject.
@@ -4525,10 +4525,14 @@ async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
     let added_buffer = opened.buffer_id;
     assert!(!opened.is_patch, "it opened a file, not another patch");
     assert_eq!(
-        opened.title.as_deref().map(|t| t.ends_with(":a.rs")),
-        Some(true),
-        "title names the file at a revision: {:?}",
-        opened.title
+        opened.title.as_deref(),
+        Some("a.rs"),
+        "title names the file, not the revision it is shown at"
+    );
+    assert!(
+        opened.commit.is_some(),
+        "and the revision rides beside it: {:?}",
+        opened.commit
     );
     assert_eq!(opened.cursor.position.line, 4, "the 5th line, 0-based");
 
