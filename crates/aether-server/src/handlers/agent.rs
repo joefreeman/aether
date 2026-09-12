@@ -132,9 +132,10 @@ async fn mint_conversation(
             },
         );
         s.buffer_workspaces.insert(view_buffer, workspace.clone());
-        // Not transient: a conversation is somewhere you are working, and a transient one would
-        // close itself the moment you looked at a file, taking a running turn with it.
-        s.open_view(view_buffer, None);
+        // Kept, explicitly. An open that says nothing is a preview, and a conversation is
+        // somewhere you are working — a transient one would close itself the moment you looked at
+        // a file, taking a running turn with it.
+        s.open_view(view_buffer, Some(false));
         s.touch_mru(view_buffer);
         view_buffer
     };

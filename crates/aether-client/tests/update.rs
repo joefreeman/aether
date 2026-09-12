@@ -6045,6 +6045,62 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
     );
 }
 
+/// **A view created with no opinion is a preview.** The three client-side opens that used to lean
+/// on the old kept-by-default — a fresh scratch, a file created from the explorer, and the
+/// `Space Alt-w` open-by-path overlay — must all keep saying *nothing* about keeping, so the server
+/// makes each of them a preview. Each is kept the moment the user does something to it.
+#[test]
+fn opens_with_no_opinion_send_no_keep_flag() {
+    use aether_client::path_editor::PathEditor;
+    use aether_client::session::Prompt;
+    use aether_protocol::picker::PickerKind;
+
+    // A fresh scratch (`Space Alt-b`).
+    let mut s = session();
+    s.workspace = "proj".into();
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
+    let open = find_request(&fx, "view/open").expect("a new scratch opens a view");
+    assert_eq!(
+        open["transient"],
+        serde_json::Value::Null,
+        "a fresh scratch says nothing, so it is a preview until you type in it: {open}"
+    );
+
+    // A file created from the explorer.
+    let mut s = session();
+    s.workspace_paths = vec!["/proj".into()];
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.directory = Some("/proj/src".into());
+        p.query = "new.rs".into();
+    }
+    let fx = s.explorer_create_from_query();
+    let open = find_request(&fx, "view/open").expect("explorer create opens a view");
+    assert_eq!(
+        open["transient"],
+        serde_json::Value::Null,
+        "an explorer create says nothing; the save that writes it keeps it: {open}"
+    );
+
+    // `Space Alt-w`, the open-from-path overlay.
+    let mut s = session();
+    s.workspace = "proj".into();
+    s.prompt = Some(Prompt::OpenPath(Box::new(PathEditor::absolute(
+        String::new(),
+        true,
+    ))));
+    let _ = s.open_path_set_input("/etc/hosts".into());
+    let fx = s.on_prompt_key(KeyCode::Enter, Mods::NONE, None);
+    let open = find_request(&fx, "workspace/open_path").expect("the overlay opens by path");
+    assert_eq!(
+        open["transient"],
+        serde_json::Value::Null,
+        "naming a file is going to look at one, not keeping it: {open}"
+    );
+}
+
 #[test]
 fn explorer_create_makes_a_file_with_create_if_missing() {
     use aether_protocol::picker::PickerKind;

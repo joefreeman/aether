@@ -2413,6 +2413,46 @@ async fn workspace_switcher_names(ws: &mut Ws) -> Vec<String> {
         .collect()
 }
 
+/// `workspace/open_path` forwards the keep intent to `view/open`, so the same rule holds at the
+/// front door: **an open that says nothing is a preview**, and only an open that asks keeps. That
+/// asking is the tethered launch — `ae file` with no `--workspace`, where the process's life is
+/// the file's — which is the one boot that sends `Some(false)`.
+#[tokio::test]
+async fn open_path_is_a_preview_unless_it_asks_to_keep() {
+    let (server, mut ws, ext_abs) = setup_with_external_file().await;
+    let glanced: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: ext_abs.clone(),
+            transient: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let opened = glanced.opened.expect("open_path returns the opened buffer");
+    assert!(opened.transient, "no keep flag, so a preview");
+
+    // The tethered boot's open, on the same file: it promotes the very view it just made a
+    // preview of, since an open that asks to keep is never refused by one that didn't.
+    let tethered: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: ext_abs.clone(),
+            transient: Some(false),
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+    let kept = tethered
+        .opened
+        .expect("open_path returns the opened buffer");
+    assert_eq!(kept.buffer_id, opened.buffer_id, "the same buffer");
+    assert!(!kept.transient, "a tethered launch keeps its file");
+    drop(server);
+}
+
 #[tokio::test]
 async fn open_path_with_no_workspace_creates_ephemeral() {
     let (server, mut ws, ext_abs) = setup_with_external_file().await;

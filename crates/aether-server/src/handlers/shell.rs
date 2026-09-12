@@ -231,10 +231,10 @@ async fn mint_shell(
         },
     );
     s.buffer_workspaces.insert(transcript, workspace.clone());
-    // Not transient. A shell is somewhere you are working, not a preview you glanced at — and a
-    // transient one would close itself the moment you looked at a file, taking a running build
-    // with it.
-    s.open_view(transcript, None);
+    // Kept, explicitly. An open that says nothing is a preview, and a shell is somewhere you are
+    // working, not a preview you glanced at — a transient one would close itself the moment you
+    // looked at a file, taking a running build with it.
+    s.open_view(transcript, Some(false));
     s.touch_mru(transcript);
     // Recorded in the session at once, as every other open is: the shell's snapshot is what
     // brings it back, and the session entry is what says there is one to bring. The `touch_mru`
@@ -1129,8 +1129,10 @@ pub async fn view_follow_line(
                 opened: followed.opened,
             })
         }
-        // Not transient: you asked for this file, so it stays — the same rule `Enter` on a patch's
-        // bound element follows. `record_nav_from` is the view, so `Alt-Left` comes back here.
+        // An ordinary open, saying nothing about keeping: following an output line is a glance at
+        // where it points, so the file arrives as a preview and stays one until you do something
+        // to it — the same rule `Enter` on a patch's bound element follows. A file already kept is
+        // never demoted by this. `record_nav_from` is the view, so `Alt-Left` comes back here.
         Follow::File(path, jump_to) => {
             let view_buffer = {
                 let s = state.lock().await;

@@ -82,11 +82,14 @@ pub struct ViewOpenParams {
     /// the outline picker to land a symbol's identifier selected. Ignored without `jump_to`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump_to_anchor: Option<LogicalPosition>,
-    /// Transient-view intent. `Some(true)`: if this open *creates* the view, mark it transient —
-    /// the server closes it automatically once no viewport shows it anymore, unless it's been
-    /// promoted first (an existing view is never demoted). `Some(false)`: promote the view to
-    /// permanent. `None` (the default): leave the flag as it is. Views are also promoted by their
-    /// first edit, a save, or a user-initiated reload.
+    /// Transient-view intent. **An open that says nothing creates a preview**: `None` (the
+    /// default) leaves an existing view's flag alone, and a view this open *creates* is transient
+    /// — the server closes it automatically once no viewport shows it anymore. `Some(false)` keeps
+    /// the view: created permanent, or promoted if it already exists (an existing view is never
+    /// demoted by an open). `Some(true)` restates the default for a creating open and does nothing
+    /// to an existing one. A view is kept only because the user did something to it: an edit, a
+    /// save, a user-initiated reload, the keep toggle (`view/set_transient`), a tethered launch, or
+    /// a session row that recorded it kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transient: Option<bool>,
     /// Record the jump origin (the buffer the client is leaving) onto this client's nav history

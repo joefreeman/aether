@@ -999,11 +999,14 @@ async fn buffer_open_jump_to_clamps_out_of_range() {
 /// buffer for a qualifying jump — the open records it onto the nav back-stack (`record_nav_from`,
 /// composite A); pass `None` when the open is just following a back/forward step (which must not
 /// record).
+///
+/// Opened kept: these tests step back onto a file they left, and a preview would have closed
+/// itself the moment the next file's subscribe hid it, coming back under a new buffer id.
 async fn nav_open_file(ws: &mut Ws, file: &str, record_from: Option<u64>) -> (u64, u64) {
     let open: ViewOpenResult = send_request::<ViewOpen>(
         ws,
         &ViewOpenParams {
-            transient: None,
+            transient: Some(false),
             path_index: Some(0),
             relative_path: Some(file.into()),
             language: None,

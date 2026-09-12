@@ -226,8 +226,10 @@ pub struct WorkspaceOpenPathParams {
     /// rejected (the server won't resolve it against its own cwd). Must exist on disk unless
     /// `create_if_missing` is set.
     pub path: String,
-    /// Open the buffer as transient (auto-closes once hidden) — used when the open is a preview.
-    /// Defaults to a permanent open.
+    /// Keep intent, forwarded verbatim to `view/open`'s field of the same name. **Defaults to a
+    /// preview**: an open that says nothing creates a transient view, which auto-closes once
+    /// nothing shows it. `Some(false)` keeps the buffer — what a tethered launch (`ae file`, the
+    /// `$EDITOR` contract) sends, since that file is one you are going to work in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transient: Option<bool>,
     /// When `path` doesn't exist, open an empty buffer bound to it instead of failing (the file

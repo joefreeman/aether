@@ -954,10 +954,16 @@ impl ServerState {
     /// every live buffer has a view from its first moment, and **the one place a buffer's view is
     /// made**: a buffer has exactly one, and an open of a buffer that has it is that view again.
     ///
-    /// `transient` is the open's intent: a buffer's first view is transient only when asked
-    /// (`Some(true)`); an existing view is pinned by `Some(false)` and never demoted by an open. A
-    /// view made here that nothing has ever shown (its creation's placeholder, before the open that
-    /// created the buffer said what it wanted) takes the open's intent as its own.
+    /// **A view created with no opinion is a preview.** `transient` is the open's intent, and a
+    /// new view is transient unless the open says `Some(false)`: an open that says nothing is a
+    /// glance, and the view closes itself once nothing shows it. A view is *kept* only because the
+    /// user did something to it — an edit, a save, a user-initiated reload, `Space k`, a tethered
+    /// launch (`ae file`), or a session row that recorded it kept — and an open never demotes a
+    /// view that already is. `Some(true)` therefore only restates the default for a creating open,
+    /// and does nothing to an existing view.
+    ///
+    /// A view made here that nothing has ever shown (its creation's placeholder, before the open
+    /// that created the buffer said what it wanted) takes the open's intent as its own.
     ///
     /// How a client sees the view — a markdown file read as a document or edited as source — is
     /// not the view's to know: see [`Self::read_mode`].
@@ -967,7 +973,7 @@ impl ServerState {
                 // This open's own placeholder, made with the buffer: the intent is its own. Its
                 // *creation*, so it writes the flag directly — the composed-view refusal in
                 // `set_view_transient` is about changing a view's transience afterwards.
-                self.write_view_transient(id, transient == Some(true));
+                self.write_view_transient(id, transient != Some(false));
             } else if transient == Some(false) {
                 self.set_view_transient(id, false);
             }
@@ -975,7 +981,7 @@ impl ServerState {
             return id;
         }
         let mut view = self.default_view(buffer_id);
-        view.transient = transient == Some(true);
+        view.transient = transient != Some(false);
         let id = self.allocate_view_id();
         self.views.insert(id, view);
         self.touch_view(id);
@@ -5734,7 +5740,8 @@ mod transcript_tests {
         );
         s.buffer_workspaces.insert(transcript, "proj".into());
         s.buffer_workspaces.insert(input, "proj".into());
-        s.open_view(transcript, None);
+        // Kept, as `mint_shell` makes it: a shell is somewhere you are working.
+        s.open_view(transcript, Some(false));
         (s, transcript, input)
     }
 

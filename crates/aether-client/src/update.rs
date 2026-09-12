@@ -6853,9 +6853,10 @@ impl Session {
     /// integration eventually sends. `path` is absolute — the OS resolved it.
     ///
     /// Deliberately the same path as the `Space Alt-w` overlay's commit, so a file arriving from the
-    /// desktop behaves exactly like one the user typed: a real (non-transient) buffer, with its
-    /// workspace context resolved server-side (the workspace that owns the path, or a temporary
-    /// context for a file outside every one).
+    /// desktop behaves exactly like one the user typed: an open that says nothing about keeping —
+    /// so a preview, kept the moment you do something to it — with its workspace context resolved
+    /// server-side (the workspace that owns the path, or a temporary context for a file outside
+    /// every one).
     ///
     /// Closes whatever overlay was up first. That is nearly always the **boot chooser**: the
     /// document and the connection race, and the shell can only park the document while it is still
@@ -6863,9 +6864,9 @@ impl Session {
     /// a workspace picker sitting over the document the user asked for. Naming a file answers the
     /// question the chooser is asking, so it dismisses rather than layers.
     ///
-    /// Not [`Self::open_path_at`]: that opens a *transient preview* for result-style navigation
-    /// (picker rows, goto-definition), which would evaporate the moment the buffer was hidden. A
-    /// file someone deliberately opened from their file manager is not a preview.
+    /// Not [`Self::open_path_at`]: that one names a position to land on and is workspace-relative;
+    /// this resolves an absolute path against whatever context owns it. Both land a preview — an
+    /// open is only kept when it says so.
     pub fn open_path_from_os(&mut self, path: String) -> Effects {
         let fx = self.close_picker();
         fx.and(self.commit_open_path(path))
@@ -6881,6 +6882,8 @@ impl Session {
         self.request_str::<WorkspaceOpenPath>(
             WorkspaceOpenPathParams {
                 path,
+                // No opinion, so a preview: naming a file is how you go and look at one, and it
+                // is kept the moment you edit, save or `Space k` it.
                 transient: None,
                 // The overlay stays existing-files-only (a typo'd path should error readably,
                 // not silently mint a buffer); the CLI boot is the create route.
@@ -8079,6 +8082,8 @@ impl Session {
         };
         let from = self.view.buffer.buffer_id;
         let hide = self.close_picker();
+        // No keep flag: a file created here is a preview like any other open with no opinion —
+        // the save that first writes it to disk is what keeps it.
         hide.and(self.request_str::<ViewOpen>(
             ViewOpenParams {
                 path_index: Some(path_index),
@@ -10476,6 +10481,9 @@ impl Session {
             A::NewScratch => {
                 // Opening a fresh scratch is a buffer switch — record the origin so Alt-Left
                 // returns (folded into the open's `record_nav_from`).
+                //
+                // No keep flag: an empty scratch you never typed in is a preview and goes when
+                // you look elsewhere; the first keystroke keeps it.
                 self.request_str::<ViewOpen>(
                     ViewOpenParams {
                         record_nav_from: Some(buffer_id),
@@ -10800,9 +10808,10 @@ impl Session {
                 self.dispatch_action(A::SubmitInput, count, counted, extend)
             }
             A::Activate if self.view.buffer.buffer_id != self.view.view_buffer => {
-                // Not transient: you asked for this file, so it stays. `record_nav_from` is the
-                // view, so `Backspace` returns to the review rather than to the file you were
-                // already in.
+                // No keep flag: promoting an element to its own view is a glance at the file, so
+                // it lands as a preview and is kept only once you do something to it (a file
+                // already kept is never demoted by an open). `record_nav_from` is the view, so
+                // `Backspace` returns to the review rather than to the file you were already in.
                 let from = self.view.view_buffer;
                 self.request_str::<ViewOpen>(
                     ViewOpenParams {
@@ -12696,7 +12705,7 @@ mod tests {
     }
 
     /// A file handed to us by the desktop (macOS "Open With") opens like the `Space Alt-w` overlay
-    /// commit: `workspace/open_path`, non-transient, existing-files-only — and it takes over from
+    /// commit: `workspace/open_path`, no keep flag, existing-files-only — and it takes over from
     /// whatever overlay happened to be up, since the user's attention just moved to the new file.
     #[test]
     fn open_path_from_os_opens_a_real_buffer_and_drops_any_prompt() {
@@ -12721,7 +12730,7 @@ mod tests {
                 })
                 .expect("an OS-delivered file rides workspace/open_path");
         assert_eq!(params["path"], serde_json::json!("/elsewhere/notes.md"));
-        // Not a preview: it must survive being hidden.
+        // No keep flag: an open with no opinion is a preview, kept once you do something to it.
         assert_eq!(params["transient"], serde_json::Value::Null);
         // The OS only hands us files that exist; a create here would mint buffers for typos.
         assert_eq!(params["create_if_missing"], serde_json::json!(false));

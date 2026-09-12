@@ -427,9 +427,12 @@ async fn a_cursor_moved_while_hidden_drops_the_saved_scroll() {
         },
     )
     .await;
+    // Kept: this is about a saved scroll surviving being hidden, and a preview would close itself
+    // (taking its scroll) the moment the other file covered it.
     let open = |relative_path: &str| ViewOpenParams {
         path_index: Some(0),
         relative_path: Some(relative_path.into()),
+        transient: Some(false),
         ..Default::default()
     };
     let sub_params = |view_id| ViewportSubscribeParams {

@@ -2035,6 +2035,20 @@ pub fn strip_longest_root(abs: &str, roots: &[String]) -> Option<(u32, String)> 
         .map(|(i, _, rel)| (i, rel))
 }
 
+/// The keep flag a shell's **boot open** carries, given whether this launch tethers.
+///
+/// A view created with no opinion is a preview, so every launch opens one — except the tethered
+/// one. `ae file` with no `--workspace` is the `$EDITOR` contract: the process's life is that
+/// file's, so it is somewhere you are going to work rather than something you glanced at, and it
+/// opens kept (`Some(false)`). A launch that named a workspace, or a directory, is a session
+/// rather than an errand and says nothing, exactly as any other open does.
+///
+/// Shared by all three shells' boots (terminal, GUI, the `--web` waiter) so the rule is written
+/// once. The caller passes the *effective* tether — a directory never tethers.
+pub fn boot_keep_flag(tether: bool) -> Option<bool> {
+    tether.then_some(false)
+}
+
 /// The earlier of two positions (line-major).
 pub fn min_pos(a: LogicalPosition, b: LogicalPosition) -> LogicalPosition {
     if (a.line, a.col) <= (b.line, b.col) {
@@ -2281,6 +2295,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The boot open's keep flag: only a tethered launch (`ae file`, the `$EDITOR` contract) asks
+    /// to keep its file. Every other launch — `--workspace`, a directory, a bare `ae` — says
+    /// nothing and lands a preview, exactly as any other open with no opinion does. All three
+    /// shells' boots build their flag here, so this is the one place the rule is written.
+    #[test]
+    fn only_a_tethered_boot_asks_to_keep_its_file() {
+        assert_eq!(
+            boot_keep_flag(true),
+            Some(false),
+            "a tethered launch keeps the file it exists for"
+        );
+        assert_eq!(
+            boot_keep_flag(false),
+            None,
+            "any other launch says nothing, so its file is a preview"
+        );
     }
 
     /// The line table holds exactly one entry per line, so counting it and splitting the text

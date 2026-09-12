@@ -1747,8 +1747,9 @@ pub async fn git_follow_patch_line(
             };
             opened
         }
-        // An ordinary open, deliberately not transient: following a line into your own working
-        // tree is going somewhere to work, not previewing.
+        // An ordinary open, saying nothing about keeping: following a patch line into your own
+        // working tree is a glance at where it came from, so the file arrives as a preview and is
+        // kept only once you do something to it. A file already kept is never demoted by this.
         FollowTarget::WorkingFile { abs_path } => {
             Box::pin(view_open(
                 state,
@@ -2015,6 +2016,16 @@ async fn view_open_inner(
         };
         let dormant_read = dormant.as_ref().map(|d| d.read);
         let dormant_transient = dormant.as_ref().map(|d| d.transient);
+        // A row comes back as it was recorded — kept if it was kept, a preview if it was one.
+        // Materialising re-dispatches through the ordinary open, and an open that says nothing
+        // makes a preview, so the recorded flag has to be said out loud here or a kept row would
+        // come back as a preview. The caller's own intent still wins over the row's. (The
+        // path-open route says it through `restore_dormant_views` instead: it reaches a dormant
+        // file without ever touching this reserved id.)
+        let params = ViewOpenParams {
+            transient: params.transient.or(dormant_transient),
+            ..params
+        };
         match dormant.map(|d| d.source) {
             // A file re-dispatches as an absolute-path open, which loads the file and attaches
             // git/LSP exactly like a fresh open — and picks up any backup via recover-on-open. In

@@ -7590,7 +7590,10 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
             let opened = handle
                 .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                     path: abs.display().to_string(),
-                    transient: None,
+                    // A tethered launch keeps its file — the same condition as `tethered` below.
+                    // Any other launch says nothing and gets a preview, like every open with no
+                    // opinion.
+                    transient: aether_client::session::boot_keep_flag(args.tether && !directory),
                     create_if_missing: true,
                     // `ae /etc/hosts:42` lands on line 42; a directory has no position to jump to
                     // and the server ignores it.
@@ -7672,6 +7675,10 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
         match &resolved {
             Some(abs) if !abs.is_dir() => {
                 let abs_str = abs.display().to_string();
+                // A tethered launch keeps its file — the same condition as `tethered` below (this
+                // arm is a file, and `view_id` is `None` here). Any other launch says nothing and
+                // gets a preview.
+                let keep = aether_client::session::boot_keep_flag(args.tether);
                 match strip_longest_root(&abs_str, &workspace_paths) {
                     // Inside a workspace root: ordinary workspace-relative open (creating a
                     // missing file, like the terminal client). A `path:line:col` launch (or a
@@ -7682,6 +7689,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                             relative_path: Some(relative_path),
                             create_if_missing: true,
                             jump_to: args.jump_to,
+                            transient: keep,
                             ..Default::default()
                         })
                         .await
@@ -7691,7 +7699,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
                     None => handle
                         .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                             path: abs_str,
-                            transient: None,
+                            transient: keep,
                             create_if_missing: true,
                             jump_to: args.jump_to,
                         })

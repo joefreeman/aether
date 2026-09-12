@@ -1848,6 +1848,38 @@ async fn enter_follows_a_path_printed_by_a_command() {
     );
 }
 
+/// Following an output line is a **glance** at where the line points, so the file arrives as a
+/// preview like any other open with no opinion — and a file you had already kept is never demoted
+/// by it. The same rule `Enter` on a patch's bound element follows.
+#[tokio::test]
+async fn following_an_output_line_opens_a_preview_and_never_demotes() {
+    let (server, mut ws, dir) = setup().await;
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    let shell = open_shell(&mut ws).await;
+    run_and_wait(&mut ws, &server, &shell, "printf \"src/main.rs:1:1\\n\"").await;
+
+    let opened = follow(&mut ws, &server, &shell, 0)
+        .await
+        .opened
+        .expect("the file the line named");
+    assert!(
+        opened.transient,
+        "a follow says nothing about keeping, so the file is a preview"
+    );
+
+    // Keep it — an open that asks — then follow the same line again.
+    let kept: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("src/main.rs", Some(false))).await;
+    assert!(!kept.transient, "asked for, so kept");
+    let again = follow(&mut ws, &server, &shell, 0)
+        .await
+        .opened
+        .expect("the file the line named, again");
+    assert_eq!(again.buffer_id, kept.buffer_id, "the same file");
+    assert!(!again.transient, "and never demotes a file you have kept");
+}
+
 /// A path that does not exist is not a path: the parse is permissive on purpose, and this is what
 /// makes that safe.
 #[tokio::test]
@@ -1943,6 +1975,11 @@ async fn a_shell_view_cannot_be_made_transient() {
     use aether_protocol::view::{ViewSetTransient, ViewSetTransientParams, ViewSetTransientResult};
     let (server, mut ws, _dir) = setup().await;
     let shell = open_shell(&mut ws).await;
+    assert!(
+        !shell.opened.transient,
+        "a shell is created kept — an open that says nothing would be a preview, so `shell/open` \
+         says so"
+    );
 
     let answered: ViewSetTransientResult = send_request::<ViewSetTransient>(
         &mut ws,

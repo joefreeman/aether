@@ -486,6 +486,135 @@ async fn transient_buffer_closes_on_disconnect() {
     );
 }
 
+/// **The rule: a view created with no opinion is a preview.** A plain `view/open` by path that
+/// says nothing about keeping lands transient — reported as one, flagged as one in the buffers
+/// picker (the italic row), and closed as soon as another file's subscribe hides it. Nothing but
+/// the user doing something to it — an edit, a save, a reload, `Space k`, a tethered launch, or a
+/// session row that recorded it kept — keeps a view.
+#[tokio::test]
+async fn an_open_that_says_nothing_creates_a_preview() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    assert!(a.transient, "an open with no keep flag creates a preview");
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
+
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            limit: 30,
+            ..view_params(PickerKind::Buffers)
+        },
+    )
+    .await;
+    let update: PickerUpdateParams = expect_notification::<PickerUpdate>(&mut ws).await;
+    let flags: Vec<(u64, bool)> = update
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::Buffer {
+                buffer_id,
+                transient,
+                ..
+            } => Some((*buffer_id, *transient)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        flags.contains(&(a.buffer_id, true)),
+        "and the picker renders it as one: {flags:?}"
+    );
+
+    // Hidden behind another file: gone, as a preview goes.
+    let b: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(b.buffer_id)).await;
+    let err =
+        send_request_expect_err::<ViewOpen>(&mut ws, &attach_open_params(a.buffer_id, None)).await;
+    assert!(
+        err.contains("unknown view_id"),
+        "the preview closed once nothing showed it, got: {err}"
+    );
+    drop(server);
+}
+
+/// A fresh scratch is an open with no opinion like any other, so it is a preview — an empty
+/// buffer you glanced at and never typed in goes when you look elsewhere. The first keystroke
+/// keeps it, which is what makes a scratch you actually used survive.
+#[tokio::test]
+async fn a_new_scratch_is_a_preview_and_its_first_keystroke_keeps_it() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let scratch: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &ViewOpenParams::default()).await;
+    assert!(scratch.buffer.scratch_number.is_some(), "a scratch");
+    assert!(
+        scratch.transient,
+        "a scratch nobody asked to keep is a preview"
+    );
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(scratch.buffer_id)).await;
+
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        &InputTextParams {
+            buffer_id: scratch.buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
+    let again: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &attach_open_params(scratch.buffer_id, None)).await;
+    assert!(!again.transient, "the keystroke kept it");
+    drop(server);
+}
+
+/// Creating a file — the explorer's "+ Create" row, and `ae path/to/new-file` — is an open like
+/// any other: it says nothing, so it is a preview. The save that first writes the file to disk is
+/// what keeps it.
+#[tokio::test]
+async fn a_create_if_missing_open_is_a_preview() {
+    let (server, mut ws) = setup_transient_workspace().await;
+    let fresh: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            path_index: Some(0),
+            relative_path: Some("new.txt".into()),
+            create_if_missing: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        fresh.transient,
+        "a created file is a preview until you use it"
+    );
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(fresh.buffer_id)).await;
+
+    let a: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
+    let err =
+        send_request_expect_err::<ViewOpen>(&mut ws, &attach_open_params(fresh.buffer_id, None))
+            .await;
+    assert!(
+        err.contains("unknown view_id"),
+        "and closes when hidden, got: {err}"
+    );
+    drop(server);
+}
+
 /// The core lifecycle: a transient buffer dies when the client's viewport moves elsewhere.
 #[tokio::test]
 async fn transient_buffer_closes_when_hidden() {
@@ -499,7 +628,7 @@ async fn transient_buffer_closes_when_hidden() {
     // Switch to b: open + subscribe. The subscribe supersedes a's viewport, hiding a → closed.
     let b: ViewOpenResult =
         send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", None)).await;
-    assert!(!b.transient, "open without the flag is permanent");
+    assert!(b.transient, "an open that says nothing is a preview too");
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(b.buffer_id)).await;
 
@@ -512,12 +641,12 @@ async fn transient_buffer_closes_when_hidden() {
     drop(server);
 }
 
-/// A buffer opened without the flag survives being hidden — the pre-transient behavior.
+/// A buffer opened kept (`transient: Some(false)`) survives being hidden.
 #[tokio::test]
 async fn permanent_buffer_survives_hiding() {
     let (server, mut ws) = setup_transient_workspace().await;
     let a: ViewOpenResult =
-        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(false))).await;
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
     let b: ViewOpenResult =
@@ -613,12 +742,12 @@ async fn save_promotes_transient_buffer() {
     drop(server);
 }
 
-/// Opening an already-open (permanent) buffer with `transient: true` never demotes it.
+/// Opening an already-kept buffer with `transient: true` never demotes it.
 #[tokio::test]
 async fn transient_open_does_not_demote_existing_buffer() {
     let (server, mut ws) = setup_transient_workspace().await;
     let first: ViewOpenResult =
-        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(false))).await;
     let again: ViewOpenResult =
         send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(true))).await;
     assert_eq!(again.buffer_id, first.buffer_id);
@@ -631,10 +760,10 @@ async fn transient_open_does_not_demote_existing_buffer() {
 #[tokio::test]
 async fn set_transient_flips_the_flag_both_ways() {
     let (server, mut ws) = setup_transient_workspace().await;
-    // Open a.txt permanent (a fresh non-transient open ⇒ transient: false).
+    // Open a.txt kept — an open has to ask for that.
     let a: ViewOpenResult =
-        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
-    assert!(!a.transient, "a fresh non-transient open is permanent");
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(false))).await;
+    assert!(!a.transient, "an open asking to keep is permanent");
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(a.buffer_id)).await;
 
@@ -931,7 +1060,7 @@ async fn reload_promotes_transient_buffer() {
 async fn buffers_picker_reports_transient_flag() {
     let (server, mut ws) = setup_transient_workspace().await;
     let a: ViewOpenResult =
-        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(false))).await;
     let b: ViewOpenResult =
         send_request::<ViewOpen>(&mut ws, &file_open_params("b.txt", Some(true))).await;
     // Keep the transient buffer visible so it survives until the picker reads it.
@@ -2492,7 +2621,7 @@ async fn a_kept_file_comes_back_in_the_mode_it_was_left() {
     let mut ws = Ws::connect(&server).await;
     activate(&mut ws).await;
     let opened: ViewOpenResult =
-        send_request::<ViewOpen>(&mut ws, &file_open_params("doc.md", None)).await;
+        send_request::<ViewOpen>(&mut ws, &file_open_params("doc.md", Some(false))).await;
     assert!(opened.read);
     assert!(!set_read(&mut ws, opened.view_id, false).await);
     assert!(set_read(&mut ws, opened.view_id, true).await);

@@ -5306,9 +5306,8 @@ async fn a_kept_file_and_a_restored_review_land_together() {
             .collect()
     }
 
-    // First life: the file (read, then flipped to source) is kept by simply being opened; the
-    // commit and then the working changes are shown, and both are previews — a composed view
-    // cannot be anything else.
+    // First life: the file (read, then flipped to source) is opened kept; the commit and then the
+    // working changes are shown, and both are previews — a composed view cannot be anything else.
     let server = aether_server::spawn_for_test_multi_with_sessions(
         vec![("p".into(), vec![root.clone()])],
         Some(sessions_path.clone()),
@@ -5318,7 +5317,7 @@ async fn a_kept_file_and_a_restored_review_land_together() {
     let mut ws = Ws::connect(&server).await;
     activate(&mut ws, false).await;
     let readme: ViewOpenResult =
-        send_request::<ViewOpen>(&mut ws, &file_open_params("README.md", None)).await;
+        send_request::<ViewOpen>(&mut ws, &file_open_params("README.md", Some(false))).await;
     assert!(readme.read, "read, by the setting");
     let _ = send_request::<aether_protocol::view::ViewSetRead>(
         &mut ws,
@@ -7777,6 +7776,71 @@ async fn enter_in_the_working_changes_view_opens_the_real_file() {
         content.text, "one\nGONE\nthree\n",
         "HEAD's side of the diff"
     );
+
+    drop(server);
+}
+
+/// Following a patch line into the working tree is a **glance**: `Enter` takes you to where the
+/// line came from, so the file arrives as a preview like any other open with no opinion, and is
+/// kept the moment you do something to it. A file you had already kept is never demoted by it.
+#[tokio::test]
+async fn following_a_patch_line_opens_a_preview_and_never_demotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "one\ntwo\nthree\n");
+    std::fs::write(root.join("a.rs"), "one\nADDED\nthree\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: patch.buffer_id,
+        },
+    )
+    .await;
+    let added = content
+        .text
+        .lines()
+        .position(|l| l == "ADDED")
+        .unwrap_or_else(|| panic!("no ADDED line in:\n{}", content.text)) as u32;
+    let follow = GitFollowPatchLineParams {
+        buffer_id: patch.buffer_id,
+    };
+
+    set_cursor(&mut ws, patch.buffer_id, added, 0).await;
+    let opened = send_request::<GitFollowPatchLine>(&mut ws, &follow)
+        .await
+        .opened
+        .expect("the `+` side opens");
+    assert!(
+        opened.transient,
+        "a follow says nothing about keeping, so the file is a preview"
+    );
+
+    // Keep the file — an open that asks — then follow again: an open never demotes.
+    let kept: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.rs", Some(false))).await;
+    assert_eq!(kept.buffer_id, opened.buffer_id, "the same file");
+    assert!(!kept.transient, "asked for, so kept");
+    set_cursor(&mut ws, patch.buffer_id, added, 0).await;
+    let again = send_request::<GitFollowPatchLine>(&mut ws, &follow)
+        .await
+        .opened
+        .expect("the `+` side opens again");
+    assert_eq!(again.buffer_id, kept.buffer_id);
+    assert!(!again.transient, "and never demotes a file you have kept");
 
     drop(server);
 }
@@ -12520,12 +12584,14 @@ async fn history_steps_through_a_regenerated_commit_patch_in_both_directions() {
     let repo_id = root.to_string_lossy().into_owned();
     let sub_to = |view_id| review_sub_params(view_id);
 
-    // A file, then the commit from the log over it.
+    // A file, then the commit from the log over it. The file is opened kept — the steps below
+    // assert it is still there behind the patch, which a preview would not be.
     let file: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
         &ViewOpenParams {
             path_index: Some(0),
             relative_path: Some("b.rs".into()),
+            transient: Some(false),
             ..Default::default()
         },
     )

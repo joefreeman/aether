@@ -3420,7 +3420,10 @@ pub async fn bootstrap(
                     let opened = handle
                         .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                             path: abs.display().to_string(),
-                            transient: None,
+                            // A tethered launch keeps its file — the same condition that sets
+                            // `session.tether` below. Any other launch says nothing and gets a
+                            // preview, like every open that has no opinion.
+                            transient: aether_client::session::boot_keep_flag(tether && !directory),
                             create_if_missing: true,
                             // `ae /etc/hosts:42` lands on line 42; a directory has no position to
                             // jump to and the server ignores it.
@@ -3486,6 +3489,10 @@ pub async fn bootstrap(
             let open = match &resolved {
                 Some(abs) if !abs.is_dir() => {
                     let abs = abs.display().to_string();
+                    // A tethered launch keeps its file — the same condition that sets
+                    // `session.tether` below (inside this arm the path is a file, so it reduces to
+                    // `tether`). Any other launch says nothing and gets a preview.
+                    let keep = aether_client::session::boot_keep_flag(tether);
                     match aether_client::session::strip_longest_root(&abs, &workspace_paths) {
                         // Inside a workspace root: ordinary workspace-relative open. A `path:line:col`
                         // launch jumps to `jump_to` here.
@@ -3496,6 +3503,7 @@ pub async fn bootstrap(
                                     relative_path: Some(relative_path),
                                     create_if_missing: true,
                                     jump_to,
+                                    transient: keep,
                                     ..Default::default()
                                 })
                                 .await?
@@ -3505,7 +3513,7 @@ pub async fn bootstrap(
                         None => handle
                             .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
                                 path: abs,
-                                transient: None,
+                                transient: keep,
                                 create_if_missing: true,
                                 jump_to,
                             })

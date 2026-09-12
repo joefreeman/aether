@@ -1704,6 +1704,11 @@ async fn an_agent_view_cannot_be_made_transient() {
     use aether_protocol::view::{ViewSetTransient, ViewSetTransientParams, ViewSetTransientResult};
     let (server, mut ws, _dir, _t) = setup(Script::default()).await;
     let agent = open_agent(&mut ws).await;
+    assert!(
+        !agent.opened.transient,
+        "a conversation is created kept — an open that says nothing would be a preview, so \
+         `agent/open` says so"
+    );
 
     let answered: ViewSetTransientResult = send_request::<ViewSetTransient>(
         &mut ws,

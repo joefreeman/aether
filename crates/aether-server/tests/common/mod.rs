@@ -514,7 +514,9 @@ pub async fn setup_with_buffer(
     let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
         &ViewOpenParams {
-            transient: None,
+            // Kept: an open that says nothing is a preview, and a fixture's file is one the test
+            // is working in — listed, persisted, and still there after a switch away.
+            transient: Some(false),
             path_index: Some(0),
             relative_path: Some("buf.txt".into()),
             language: None,
@@ -586,7 +588,9 @@ pub async fn setup_with_named_file(
     let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
         &ViewOpenParams {
-            transient: None,
+            // Kept: an open that says nothing is a preview, and a fixture's file is one the test
+            // is working in — listed, persisted, and still there after a switch away.
+            transient: Some(false),
             path_index: Some(0),
             relative_path: Some(file_name.into()),
             language: None,
@@ -791,7 +795,9 @@ pub async fn open_test_buffer(ws: &mut Ws, relative_path: &str) -> u64 {
     let open: ViewOpenResult = send_request::<ViewOpen>(
         ws,
         &ViewOpenParams {
-            transient: None,
+            // Kept: an open that says nothing is a preview, and a fixture's file is one the test
+            // is working in — listed, persisted, and still there after a switch away.
+            transient: Some(false),
             path_index: Some(0),
             relative_path: Some(relative_path.into()),
             language: None,
@@ -926,7 +932,9 @@ pub async fn setup_git_apply(
     let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
         &ViewOpenParams {
-            transient: None,
+            // Kept: an open that says nothing is a preview, and a fixture's file is one the test
+            // is working in — listed, persisted, and still there after a switch away.
+            transient: Some(false),
             path_index: Some(0),
             relative_path: Some(name.into()),
             language: None,
@@ -1008,7 +1016,9 @@ pub async fn open_and_subscribe_with_lsp(
     let open: ViewOpenResult = send_request::<ViewOpen>(
         &mut ws,
         &ViewOpenParams {
-            transient: None,
+            // Kept: an open that says nothing is a preview, and a fixture's file is one the test
+            // is working in — listed, persisted, and still there after a switch away.
+            transient: Some(false),
             path_index: Some(0),
             relative_path: Some(rel_path.into()),
             language: None,

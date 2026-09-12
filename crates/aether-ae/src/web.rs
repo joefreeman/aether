@@ -114,7 +114,9 @@ async fn open_external(
     let opened = handle
         .rpc::<WorkspaceOpenPath>(WorkspaceOpenPathParams {
             path: abs.clone(),
-            transient: None,
+            // Kept: the tether is the `$EDITOR` contract, so this file is one you are going to
+            // work in, not a preview. (Only the tether reaches here — the rest returned above.)
+            transient: aether_client::session::boot_keep_flag(tether),
             create_if_missing: true,
             jump_to: None,
         })
@@ -193,6 +195,9 @@ async fn open_in_workspace(
             path_index: Some(path_index),
             relative_path: Some(relative_path.clone()),
             create_if_missing: true,
+            // Kept: the tether is the `$EDITOR` contract, so this file is one you are going to
+            // work in, not a preview. (Only the tether reaches here — the rest returned above.)
+            transient: aether_client::session::boot_keep_flag(tether),
             ..Default::default()
         })
         .await

@@ -524,12 +524,12 @@ async fn a_tethered_launch_drops_the_preview_row() {
     server.state.lock().await.workspaces_dir = Some(store);
     let mut ws = Ws::connect(&server).await;
     // No `workspace/activate` first: the path is what says which workspace this is, exactly as
-    // `ae file.rs` does.
+    // `ae file.rs` does — and, as the tether does, asking to keep the file it was given.
     let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
         &mut ws,
         &WorkspaceOpenPathParams {
             path: root.join("a.rs").display().to_string(),
-            transient: None,
+            transient: Some(false),
             create_if_missing: false,
             jump_to: None,
         },
@@ -538,6 +538,10 @@ async fn a_tethered_launch_drops_the_preview_row() {
     assert_eq!(opened.workspace.name, "p", "inferred from the path");
     let landed = opened.opened.expect("the file it was given");
     assert!(!landed.is_patch, "landed on the file, not the diff");
+    assert!(
+        !landed.transient,
+        "and kept it: the tether is why it opened"
+    );
 
     let views = recorded(&sessions, "p");
     assert_eq!(views.len(), 1, "the preview row is gone: {views:?}");
@@ -547,6 +551,65 @@ async fn a_tethered_launch_drops_the_preview_row() {
             .dormant_views
             .is_empty(),
         "and nothing dormant is left to re-persist it"
+    );
+
+    drop(server);
+}
+
+/// **A view created with no opinion is a preview**, and a preview leaves nothing behind. Glance at
+/// a file and move on: the glance closes itself when it is hidden, so the session has no row for
+/// it next time. Only the file you asked to keep comes back — the whole point of flipping the
+/// default, seen from the list the user reads.
+#[tokio::test]
+async fn a_glanced_file_leaves_no_session_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("kept.rs"), "fn kept() {}\n").unwrap();
+    std::fs::write(root.join("glanced.rs"), "fn glanced() {}\n").unwrap();
+    let sessions = root.join("sessions.json");
+    let (server, mut ws) = repo_workspace(&root, &sessions).await;
+
+    // The file being worked in: an open that asks to keep.
+    let kept: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("kept.rs", Some(false))).await;
+    assert!(!kept.transient, "asked for, so kept");
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(kept.buffer_id)).await;
+
+    // A glance: an open that says nothing.
+    let glanced: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("glanced.rs", None)).await;
+    assert!(glanced.transient, "said nothing, so a preview");
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(glanced.buffer_id)).await;
+    assert_eq!(
+        recorded(&sessions, "p").len(),
+        2,
+        "while it is on screen it is in the list, marked as a preview: {:?}",
+        recorded(&sessions, "p")
+    );
+
+    // Move on. The switch hides the glance, and the collector closes it — which is what takes it
+    // out of the MRU the session is written from.
+    let back: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("kept.rs", None)).await;
+    assert!(!back.transient, "an open never demotes a kept view");
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(back.buffer_id)).await;
+
+    let views = recorded(&sessions, "p");
+    assert_eq!(views.len(), 1, "the glance left no row: {views:?}");
+    assert_eq!(views[0]["kind"], "file", "{views:?}");
+    assert!(
+        views[0]["path"]
+            .as_str()
+            .expect("a file entry names its path")
+            .ends_with("kept.rs"),
+        "and the row is the file that was kept: {views:?}"
+    );
+    assert!(
+        views[0].get("transient").is_none(),
+        "recorded with no preview flag: {views:?}"
     );
 
     drop(server);
