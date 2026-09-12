@@ -1,4 +1,9 @@
-//! `nav/*` — per-client back/forward navigation history.
+//! `nav/*` — back/forward navigation history, one trail per (context, client).
+//!
+//! A trail's entries name files relative to the roots of the workspace that recorded them, so it
+//! is only meaningful inside that context: every access here goes through
+//! [`ServerState::nav_history`] / [`ServerState::nav_history_mut`], which resolve the client's
+//! *active* context ([`crate::state::WorkspaceEntry::nav_history`]).
 
 use super::*;
 
@@ -290,11 +295,11 @@ fn resolvable(s: &ServerState, entry: &NavEntry) -> bool {
         || s.buffers.contains_key(&entry.buffer_id)
 }
 
-/// Pop one direction of `client_id`'s history until an entry that can be presented again, dropping
-/// the ones that cannot. `None` once the stack is drained.
+/// Pop one direction of `client_id`'s trail in its active context until an entry that can be
+/// presented again, dropping the ones that cannot. `None` once the stack is drained.
 fn pop_resolvable(s: &mut ServerState, client_id: ClientId, forward: bool) -> Option<NavEntry> {
     loop {
-        let entry = s.nav_history.get_mut(&client_id).and_then(|h| {
+        let entry = s.nav_history_mut(client_id).and_then(|h| {
             if forward {
                 h.forward.pop()
             } else {
@@ -335,9 +340,9 @@ impl ClosedDoc {
     }
 }
 
-/// Strike `closed` from both of `client_id`'s stacks. A close is an explicit "not this", so no
-/// step may resurrect what it closed — by buffer id, by path, or by the key it would regenerate
-/// from.
+/// Strike `closed` from both stacks of `client_id`'s trail in its active context. A close is an
+/// explicit "not this", so no step may resurrect what it closed — by buffer id, by path, or by the
+/// key it would regenerate from.
 pub fn prune_closed(s: &mut ServerState, client_id: ClientId, closed: &ClosedDoc) {
     // The pair the closed document would have recorded *for this client*. `None` for a scratch or
     // a file outside the client's roots, which then matches nothing — an entry with no path is
@@ -354,7 +359,7 @@ pub fn prune_closed(s: &mut ServerState, client_id: ClientId, closed: &ClosedDoc
                 entry.path_index == *index && entry.relative_path == *rel
             })
     };
-    let Some(history) = s.nav_history.get_mut(&client_id) else {
+    let Some(history) = s.nav_history_mut(client_id) else {
         return;
     };
     history.back.retain(|entry| !names_it(entry));
@@ -367,6 +372,10 @@ pub fn prune_closed(s: &mut ServerState, client_id: ClientId, closed: &ClosedDoc
 /// that is empty, the place you came *from* before stepping back is the natural landing, so
 /// forward answers. `None` when the trail has nothing to say (a fresh window), leaving the caller
 /// on its own successor rule.
+///
+/// The trail read is the one for the client's **active context**, so a close can only ever land on
+/// somewhere in the workspace the client is standing in — the same guarantee the displaced-client
+/// landings get, since they resolve each client's trail the same way.
 ///
 /// Call **after** the teardown and after [`prune_closed`]: what is resolvable depends on which
 /// buffers the close left standing, so an entry whose buffer the close collected reopens by path
@@ -389,8 +398,7 @@ async fn nav_step_dir(
         let current = nav_entry_for(&s, client_id, current_buffer);
         let chosen = pop_resolvable(&mut s, client_id, forward);
         if chosen.is_some() {
-            if let Some(cur) = current {
-                let hist = s.nav_history.entry(client_id).or_default();
+            if let (Some(cur), Some(hist)) = (current, s.nav_history_mut(client_id)) {
                 let other = if forward {
                     &mut hist.back
                 } else {

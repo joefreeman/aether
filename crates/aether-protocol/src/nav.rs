@@ -6,12 +6,19 @@
 //! "this jump didn't move me" check gates recording). This keeps the terminal client and the web
 //! client — which rides the *native* browser history — behaving identically.
 //!
-//! - TUI: drives the server-side list via [`NavStep`] with a `direction` (the `Alt-Left` /
+//! - Native shells: step the server-side trail via [`NavStep`] with a `direction` (the `Alt-Left` /
 //!   `Alt-Right` keys). Recording the origin happens as part of the navigating `view/open`
 //!   (its `record_nav_from` field), not a separate call.
 //! - Web: uses native browser history + `popstate`; it only needs [`NavGoto`] to restore a stored
 //!   entry (open the buffer, reopening a closed file by path, and restore the full
 //!   cursor/selection) without polluting the per-buffer motion-undo (`z`) history.
+//!
+//! The server keeps one trail per **(workspace context, client)**: an entry names its file relative
+//! to the roots of the context that recorded it, so a step is always taken in the workspace the
+//! client is standing in, and switching workspaces neither clears the trail you had nor carries it
+//! across. A context also keeps the trail of the last client to leave it, so a fresh window
+//! activating it starts from a copy rather than from nothing. None of that is on the wire — the
+//! client names no trail; it asks for a direction and is told where it landed.
 
 use crate::cursor::{CursorState, Direction};
 use crate::envelope::RpcMethod;
@@ -21,6 +28,9 @@ use serde::{Deserialize, Serialize};
 
 /// `nav/step` — step one entry through the nav history in `direction` (`Backward` = back,
 /// `Forward` = forward, browser-style) and navigate there. The `Alt-Left` / `Alt-Right` keys.
+///
+/// The trail stepped is this client's, in the workspace it currently has active; a client with no
+/// active workspace has none, and answers `target: None`.
 pub struct NavStep;
 impl RpcMethod for NavStep {
     const NAME: &'static str = "nav/step";

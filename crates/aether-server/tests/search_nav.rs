@@ -1208,3 +1208,234 @@ async fn nav_goto_reopens_by_path() {
     assert_eq!(target.cursor.position, LogicalPosition { line: 2, col: 1 });
     drop(server);
 }
+
+// ---- nav history is per (context, client) --------------------------------------------------
+//
+// A nav entry names its file as `(path_index, relative_path)` *relative to the roots of the
+// workspace that recorded it*, so a trail shared across workspaces resolves its entries against
+// the wrong roots. These pin the ownership that fixes it: one trail per (context, client), plus
+// the copy a context keeps of the last trail to leave it.
+
+/// Two workspaces on one server, each rooted at a directory of its own — `proj-a` holding
+/// `a1..a3.txt`, `proj-b` holding `b1..b2.txt`. Both roots are `path_index: 0` of their own
+/// workspace, which is exactly the collision a cross-workspace trail used to fall into.
+async fn two_workspaces() -> aether_server::ServerHandle {
+    let dir_a = tempfile::tempdir().unwrap();
+    for (name, content) in [
+        ("a1.txt", "alpha\nsecond\n"),
+        ("a2.txt", "another\n"),
+        ("a3.txt", "again\n"),
+    ] {
+        std::fs::write(dir_a.path().join(name), content).unwrap();
+    }
+    let dir_b = tempfile::tempdir().unwrap();
+    for (name, content) in [("b1.txt", "bravo\n"), ("b2.txt", "beta\n")] {
+        std::fs::write(dir_b.path().join(name), content).unwrap();
+    }
+    let mut server = spawn_for_test_multi(vec![
+        ("proj-a".to_string(), vec![dir_a.path().to_path_buf()]),
+        ("proj-b".to_string(), vec![dir_b.path().to_path_buf()]),
+    ])
+    .await
+    .unwrap();
+    server.keep_alive(dir_a);
+    server.keep_alive(dir_b);
+    server
+}
+
+async fn activate(ws: &mut Ws, name: &str) {
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: name.into(),
+            open_last: false,
+        },
+    )
+    .await;
+}
+
+/// A client standing in `workspace`.
+async fn join_at(server: &aether_server::ServerHandle, workspace: &str) -> Ws {
+    let mut ws = Ws::connect(server).await;
+    activate(&mut ws, workspace).await;
+    ws
+}
+
+async fn nav_step_from(
+    ws: &mut Ws,
+    buffer_id: u64,
+    direction: Direction,
+) -> Option<ViewOpenResult> {
+    let result: NavStepResult = send_request::<NavStep>(
+        ws,
+        &NavStepParams {
+            buffer_id,
+            direction,
+        },
+    )
+    .await;
+    result.target
+}
+
+/// Wait for the server to finish tearing a disconnected client down — the socket closing and the
+/// teardown running are two different moments, and the hand-over happens in the second.
+async fn await_no_clients(server: &aether_server::ServerHandle) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if server.state.lock().await.clients.is_empty() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the disconnecting client was never torn down"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// An entry recorded in one workspace is not steppable from another: A's trail is non-empty, and a
+/// back step taken in B answers "no earlier location" rather than reaching across. B's own trail
+/// works independently.
+#[tokio::test]
+async fn nav_history_does_not_cross_workspaces() {
+    let server = two_workspaces().await;
+    let mut ws = join_at(&server, "proj-a").await;
+    let (a1, _) = nav_open_file(&mut ws, "a1.txt", None).await;
+    let (_a2, _) = nav_open_file(&mut ws, "a2.txt", Some(a1)).await;
+
+    activate(&mut ws, "proj-b").await;
+    let (b1, _) = nav_open_file(&mut ws, "b1.txt", None).await;
+    assert!(
+        nav_step_from(&mut ws, b1, Direction::Backward)
+            .await
+            .is_none(),
+        "A's trail is not B's — there is no earlier location here"
+    );
+
+    // B's own trail is a trail like any other.
+    let (b2, _) = nav_open_file(&mut ws, "b2.txt", Some(b1)).await;
+    assert_eq!(
+        nav_step_from(&mut ws, b2, Direction::Backward)
+            .await
+            .map(|t| t.buffer_id),
+        Some(b1),
+        "B steps its own"
+    );
+    drop(server);
+}
+
+/// A → B → A leaves A's trail exactly as it was, in both directions: the switch neither clears it
+/// nor carries it across.
+#[tokio::test]
+async fn nav_history_survives_a_workspace_round_trip() {
+    let server = two_workspaces().await;
+    let mut ws = join_at(&server, "proj-a").await;
+    let (a1, _) = nav_open_file(&mut ws, "a1.txt", None).await;
+    let (a2, _) = nav_open_file(&mut ws, "a2.txt", Some(a1)).await;
+    let (a3, _) = nav_open_file(&mut ws, "a3.txt", Some(a2)).await;
+    // Back: [a1, a2], forward: [a3] — both stacks carry something to lose.
+    assert_eq!(
+        nav_step_from(&mut ws, a3, Direction::Backward)
+            .await
+            .map(|t| t.buffer_id),
+        Some(a2)
+    );
+
+    activate(&mut ws, "proj-b").await;
+    let (b1, _) = nav_open_file(&mut ws, "b1.txt", None).await;
+    assert!(nav_step_from(&mut ws, b1, Direction::Backward)
+        .await
+        .is_none());
+    activate(&mut ws, "proj-a").await;
+    let (a2_again, _) = nav_open_file(&mut ws, "a2.txt", None).await;
+    assert_eq!(a2_again, a2, "the kept buffer survived the switch");
+
+    // The back stack is where it was...
+    assert_eq!(
+        nav_step_from(&mut ws, a2, Direction::Backward)
+            .await
+            .map(|t| t.buffer_id),
+        Some(a1),
+        "A's back stack came back intact"
+    );
+    // ...and so is the forward stack, both the entry that step just pushed and the one recorded
+    // before the round trip.
+    assert_eq!(
+        nav_step_from(&mut ws, a1, Direction::Forward)
+            .await
+            .map(|t| t.buffer_id),
+        Some(a2)
+    );
+    assert_eq!(
+        nav_step_from(&mut ws, a2, Direction::Forward)
+            .await
+            .map(|t| t.buffer_id),
+        Some(a3),
+        "A's forward stack came back intact"
+    );
+    drop(server);
+}
+
+/// A context keeps the trail of the last client to leave it: a fresh client activating A steps
+/// back along the trail the disconnected one left behind.
+#[tokio::test]
+async fn a_fresh_client_inherits_the_trail_of_the_last_to_leave() {
+    let server = two_workspaces().await;
+    let mut ws1 = join_at(&server, "proj-a").await;
+    let (a1, _) = nav_open_file(&mut ws1, "a1.txt", None).await;
+    let (_a2, _) = nav_open_file(&mut ws1, "a2.txt", Some(a1)).await;
+    drop(ws1);
+    await_no_clients(&server).await;
+
+    let mut ws2 = join_at(&server, "proj-a").await;
+    let (a2_again, _) = nav_open_file(&mut ws2, "a2.txt", None).await;
+    assert_eq!(
+        nav_step_from(&mut ws2, a2_again, Direction::Backward)
+            .await
+            .map(|t| t.buffer_id),
+        Some(a1),
+        "the new window steps the trail the old one left"
+    );
+    drop(server);
+}
+
+/// The hand-over is a **copy**: a second client that picks up a context's trail steps its own, and
+/// the window that left it behind still finds its trail where it was.
+#[tokio::test]
+async fn the_handed_over_trail_is_a_copy() {
+    let server = two_workspaces().await;
+    let mut ws1 = join_at(&server, "proj-a").await;
+    let (a1, _) = nav_open_file(&mut ws1, "a1.txt", None).await;
+    let (_a2, _) = nav_open_file(&mut ws1, "a2.txt", Some(a1)).await;
+    // Leaving by switching, not by disconnecting: ws1 is still connected and still owns its trail.
+    activate(&mut ws1, "proj-b").await;
+
+    let mut ws2 = join_at(&server, "proj-a").await;
+    let (a2_for_ws2, _) = nav_open_file(&mut ws2, "a2.txt", None).await;
+    assert_eq!(
+        nav_step_from(&mut ws2, a2_for_ws2, Direction::Backward)
+            .await
+            .map(|t| t.buffer_id),
+        Some(a1),
+        "the second window starts from the copy"
+    );
+    assert!(
+        nav_step_from(&mut ws2, a1, Direction::Backward)
+            .await
+            .is_none(),
+        "and it has spent that copy"
+    );
+
+    // ws1 comes back to a trail its neighbour's stepping never touched.
+    activate(&mut ws1, "proj-a").await;
+    let (a2_again, _) = nav_open_file(&mut ws1, "a2.txt", None).await;
+    assert_eq!(
+        nav_step_from(&mut ws1, a2_again, Direction::Backward)
+            .await
+            .map(|t| t.buffer_id),
+        Some(a1),
+        "stepping in one window did not move the other's trail"
+    );
+    drop(server);
+}

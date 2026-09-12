@@ -2874,6 +2874,8 @@ mod subscribe_snapshot_tests {
                 mru_views: std::collections::VecDeque::new(),
                 dormant_views: Vec::new(),
                 jumplist: None,
+                nav_history: Default::default(),
+                last_nav: None,
                 projects: Vec::new(),
             },
         );
@@ -2965,6 +2967,8 @@ mod subscribe_snapshot_tests {
                 mru_views: std::collections::VecDeque::new(),
                 dormant_views: Vec::new(),
                 jumplist: None,
+                nav_history: Default::default(),
+                last_nav: None,
                 projects: Vec::new(),
             },
         );

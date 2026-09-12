@@ -365,6 +365,8 @@ pub async fn activate_context(
                 mru_views: std::collections::VecDeque::new(),
                 dormant_views: Vec::new(),
                 jumplist: None,
+                nav_history: Default::default(),
+                last_nav: None,
                 projects,
             },
         );
@@ -452,9 +454,7 @@ pub async fn activate_context(
     let entry_projects = workspace_project_views_by_id(&s, &context);
     let server_started_at = s.started_at_unix_ms;
 
-    if let Some(session) = s.clients.get_mut(&client_id) {
-        session.active_workspace = Some(context.clone());
-    }
+    s.activate_workspace_for_client(client_id, &context);
 
     // Switching away from an ephemeral workspace can leave it empty (its transient buffers were
     // closed by the teardown above; any permanent ones keep it alive). Retire it now that this
@@ -1204,12 +1204,12 @@ pub async fn workspace_create(
             mru_views: std::collections::VecDeque::new(),
             dormant_views: Vec::new(),
             jumplist: None,
+            nav_history: Default::default(),
+            last_nav: None,
             projects: Vec::new(),
         },
     );
-    if let Some(session) = s.clients.get_mut(&client_id) {
-        session.active_workspace = Some(name.clone());
-    }
+    s.activate_workspace_for_client(client_id, &name);
     // Creating a workspace while parked in an ephemeral one retires the ephemeral if now empty.
     let mut unpin_pushes = Vec::new();
     if let Some(prior_id) = &prior {
@@ -1429,9 +1429,7 @@ pub async fn workspace_open_path(
             // the `--web` tether and the browser tab it opens end up on the same buffer.
             let joined = s.ephemeral_workspace_for(&canonical, directory);
             if let Some(id) = &joined {
-                if let Some(session) = s.clients.get_mut(&client_id) {
-                    session.active_workspace = Some(id.clone());
-                }
+                s.activate_workspace_for_client(client_id, id);
                 tracing::info!(%client_id, workspace = %id, "joined the temporary workspace holding this path");
             }
             joined
@@ -1454,9 +1452,7 @@ pub async fn workspace_open_path(
                     superseded_pushes.extend(refresh_lsp_server_pickers(&mut s));
                 }
                 let id = s.register_ephemeral_workspace();
-                if let Some(session) = s.clients.get_mut(&client_id) {
-                    session.active_workspace = Some(id.clone());
-                }
+                s.activate_workspace_for_client(client_id, &id);
                 tracing::info!(%client_id, workspace = %id, "activated ephemeral workspace for open-from-path");
                 (id, true)
             }

@@ -325,6 +325,9 @@ fn displaced_clients(s: &ServerState, buffer_id: BufferId, except: ClientId) -> 
 /// Apply the close rule to every other client the close reached: strike the closed document from
 /// its trail, and — for the ones it actually moves — take the step back that trail says. The
 /// entries answered are what the `view/closed` push then names.
+///
+/// Each client's trail is the one for the context *it* is standing in ([`history_landing`]), so a
+/// close never hands a client somewhere in a workspace it isn't in.
 fn displaced_landings(
     s: &mut ServerState,
     affected: &[AffectedByClose],
@@ -1053,7 +1056,8 @@ pub async fn view_open(
 /// scroll the client last recorded for this buffer predates the jump and would frame the wrong
 /// region — returning `None` lets the client centre on the jumped cursor with a single subscribe.
 /// The `record_nav_from` pre-step every navigating method shares: the origin the client is leaving,
-/// as a nav entry, onto its history — so `Backspace` returns there. `None` records nothing. One
+/// as a nav entry, onto its trail in the context it is standing in — so `Backspace` returns there.
+/// `None` records nothing, and so does a client with no active workspace (it has no trail). One
 /// definition, because a method that navigates without it (a commit shown from the log, once)
 /// leaves `Backspace` stepping to wherever was recorded before.
 pub async fn record_nav_origin(state: &SharedState, client_id: ClientId, from: Option<BufferId>) {
@@ -1062,7 +1066,9 @@ pub async fn record_nav_origin(state: &SharedState, client_id: ClientId, from: O
     };
     let mut s = state.lock().await;
     if let Some(entry) = nav_entry_for(&s, client_id, from) {
-        s.nav_history.entry(client_id).or_default().record(entry);
+        if let Some(history) = s.nav_history_mut(client_id) {
+            history.record(entry);
+        }
     }
 }
 
@@ -1833,7 +1839,9 @@ pub async fn git_follow_patch_line(
     {
         let mut s = state.lock().await;
         if let Some(entry) = nav_entry_for(&s, client_id, params.buffer_id) {
-            s.nav_history.entry(client_id).or_default().record(entry);
+            if let Some(history) = s.nav_history_mut(client_id) {
+                history.record(entry);
+            }
         }
     }
 
@@ -2940,6 +2948,8 @@ mod next_buffer_tests {
                 mru_views: std::collections::VecDeque::new(),
                 dormant_views: Vec::new(),
                 jumplist: None,
+                nav_history: Default::default(),
+                last_nav: None,
                 projects: Vec::new(),
             },
         );

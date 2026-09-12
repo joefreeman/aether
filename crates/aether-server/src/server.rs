@@ -671,6 +671,8 @@ pub async fn spawn_for_test_full(
                     mru_views: std::collections::VecDeque::new(),
                     dormant_views: Vec::new(),
                     jumplist: None,
+                    nav_history: Default::default(),
+                    last_nav: None,
                     projects: Vec::new(),
                 },
             );
@@ -852,6 +854,8 @@ mod tests {
                         mru_views: Default::default(),
                         dormant_views: Vec::new(),
                         jumplist: None,
+                        nav_history: Default::default(),
+                        last_nav: None,
                         projects: Vec::new(),
                     },
                 );

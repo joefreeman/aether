@@ -428,3 +428,68 @@ async fn each_client_is_sent_where_its_own_trail_says() {
     );
     drop(server);
 }
+
+/// A close lands only on entries of the context the client is standing in. The trail built in
+/// `proj-a` is still there — the switch neither cleared it nor carried it — but the close happens
+/// in `proj-b`, whose trail is empty, so the successor rule answers instead of A's back stack.
+///
+/// Both workspaces are rooted at `path_index: 0` of their own directory, which is what a
+/// cross-workspace landing used to resolve against: the entry named "a1.txt" and the client was
+/// standing somewhere that word meant nothing.
+#[tokio::test]
+async fn a_close_lands_only_on_the_active_context() {
+    let dir_a = tempfile::tempdir().unwrap();
+    std::fs::write(dir_a.path().join("a1.txt"), "alpha\n").unwrap();
+    std::fs::write(dir_a.path().join("a2.txt"), "another\n").unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    std::fs::write(dir_b.path().join("b1.txt"), "bravo\n").unwrap();
+    let mut server = spawn_for_test_multi(vec![
+        ("proj-a".to_string(), vec![dir_a.path().to_path_buf()]),
+        ("proj-b".to_string(), vec![dir_b.path().to_path_buf()]),
+    ])
+    .await
+    .unwrap();
+    server.keep_alive(dir_a);
+    server.keep_alive(dir_b);
+
+    let mut ws = Ws::connect(&server).await;
+    let activate = |name: &'static str| WorkspaceActivateParams {
+        worktrees: None,
+        name: name.into(),
+        open_last: false,
+    };
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut ws, &activate("proj-a")).await;
+    let a1 = open(&mut ws, "a1.txt", None).await;
+    let a2 = open(&mut ws, "a2.txt", Some(a1.buffer_id)).await;
+
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut ws, &activate("proj-b")).await;
+    let b1 = open(&mut ws, "b1.txt", None).await;
+
+    let landed = close(&mut ws, b1.view_id)
+        .await
+        .opened
+        .expect("a close with open_next lands somewhere");
+    assert_ne!(landed.buffer_id, a1.buffer_id, "not A's back stack");
+    assert_ne!(landed.buffer_id, a2.buffer_id, "not A's other file either");
+    assert!(
+        landed.path.is_none(),
+        "nothing left in this context, so the placeholder scratch: {:?}",
+        landed.path
+    );
+
+    // A's trail is untouched by the close over in B — going back finds it as it was.
+    let _: WorkspaceActivateResult =
+        send_request::<WorkspaceActivate>(&mut ws, &activate("proj-a")).await;
+    let a2_again = open(&mut ws, "a2.txt", None).await;
+    assert_eq!(a2_again.buffer_id, a2.buffer_id);
+    assert_eq!(
+        step(&mut ws, a2.buffer_id, Direction::Backward)
+            .await
+            .map(|t| t.buffer_id),
+        Some(a1.buffer_id),
+        "the trail A kept is the one A's steps take"
+    );
+    drop(server);
+}

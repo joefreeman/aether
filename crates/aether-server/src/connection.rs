@@ -318,6 +318,9 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_tree_selection_history_for_client(client_id);
         s.drop_last_scroll_for_client(client_id);
         s.drop_pickers_for_client(client_id);
+        // Takes this window's trails out of the contexts holding them and leaves each behind as
+        // that context's hand-over copy, so the next window to stand there picks up where this one
+        // left off (`WorkspaceEntry::last_nav`).
         s.drop_nav_history_for_client(client_id);
         // No jumplist teardown: it belongs to the context, not to this client, so it outlives the
         // window that captured it (`WorkspaceEntry::jumplist`).

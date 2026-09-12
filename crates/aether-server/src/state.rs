@@ -181,15 +181,6 @@ pub struct ServerState {
     /// Per-`(client, kind)` picker state. Survives `picker/hide` (so resume restores query +
     /// ranking); cleared on disconnect.
     pub pickers: HashMap<(ClientId, PickerKind), PickerState>,
-    /// Per-client navigation history: back/forward across files, browser-style. (Distinct from
-    /// the *jumplist* — the captured picker-results list, which is per *context* rather than per
-    /// client and lives on [`WorkspaceEntry::jumplist`].)
-    /// Distinct from `motion_history` (per-buffer cursor undo via `z`): coarse, cross-buffer, and
-    /// untouched by edits or `z`. Recorded on qualifying jumps (the navigating `view/open`'s
-    /// `record_nav_from`); driven by the TUI's `nav/back`/`nav/forward`. The web client rides
-    /// native browser history instead, so its
-    /// entries here go unused — but recording stays uniform across clients. Cleared on disconnect.
-    pub nav_history: HashMap<ClientId, NavHistory>,
     /// Per-buffer *unstaged* diff hunks: the live buffer against its **index** content
     /// (`git diff`). Populated on `view/open` for file-backed buffers; recomputed as the buffer
     /// changes. Empty / absent for scratch buffers and files outside a repo. Shared by all clients
@@ -489,9 +480,16 @@ pub struct NavEntry {
     pub read: Option<bool>,
 }
 
-/// A client's back/forward navigation history. Browser semantics: a jump pushes onto `back` and clears
+/// One back/forward navigation trail. Browser semantics: a jump pushes onto `back` and clears
 /// `forward`; stepping back/forward moves entries between the two and across the "current" cursor.
-#[derive(Default)]
+///
+/// A trail belongs to a **(context, client)** pair — it lives in
+/// [`WorkspaceEntry::nav_history`], keyed by the client standing there. Its entries name files as
+/// `(path_index, relative_path)` *relative to the context's roots*, so a trail is only meaningful
+/// inside the context that recorded it; one shared across workspaces resolved its entries against
+/// the wrong roots. Cloned when a context hands its trail on to an arriving client
+/// ([`WorkspaceEntry::last_nav`]) — a copy, never a share, so two windows never step each other.
+#[derive(Default, Clone, Debug)]
 pub struct NavHistory {
     pub back: Vec<NavEntry>,
     pub forward: Vec<NavEntry>,
@@ -516,6 +514,11 @@ impl NavHistory {
         }
         self.forward.clear();
         true
+    }
+
+    /// Nothing in either direction — a trail with nothing to hand on.
+    pub fn is_empty(&self) -> bool {
+        self.back.is_empty() && self.forward.is_empty()
     }
 }
 
@@ -596,6 +599,27 @@ pub struct WorkspaceEntry {
     /// the `workspaces` map is keyed by [`crate::worktree::context_id`] — name *plus* bindings —
     /// storing it here makes both right at once: one list per tree, each surviving the client.
     pub jumplist: Option<crate::jumplist::Jumplist>,
+    /// The back/forward navigation trails of the clients standing in this context — one each,
+    /// keyed by client, browser-style ([`NavHistory`]). Recorded on qualifying jumps (the
+    /// navigating `view/open`'s `record_nav_from`) and stepped by `nav/step`. The web client rides
+    /// native browser history instead, so its entries here go unused — but recording stays uniform
+    /// across clients.
+    ///
+    /// Per **(context, client)** for the two halves of the reason [`Self::jumplist`] is per
+    /// context: an entry's `(path_index, relative_path)` is relative to the roots of the workspace
+    /// that recorded it, so a trail stepped from another context resolves against the wrong ones —
+    /// and yet two windows on the same context must not step one another's trail, since back and
+    /// forward are where *this* window has been. Reached only through
+    /// [`ServerState::nav_history`] / [`ServerState::nav_history_mut`], which resolve the client's
+    /// active context, so no caller can pick the wrong trail.
+    pub nav_history: HashMap<ClientId, NavHistory>,
+    /// The trail the most recent client to leave this context left behind — by switching away or
+    /// by disconnecting. A client that activates this context with no trail of its own starts from
+    /// a **clone** of it, so closing a window and opening another keeps `Alt-Left` working where
+    /// you left off. A clone and not a share: concurrent windows each step their own.
+    ///
+    /// In memory only, like [`Self::jumplist`] — nothing about it is written to the session file.
+    pub last_nav: Option<NavHistory>,
     /// Projects declared by this workspace's config, whose language servers are pinned open while
     /// it's active. Flattened out of the config's nested `[[roots]]` form, so each carries the
     /// index of the root it was declared under.
@@ -684,6 +708,46 @@ impl DormantView {
 }
 
 impl WorkspaceEntry {
+    /// A client arrives in this context: give it the hand-over trail
+    /// ([`Self::last_nav`]) when it has none of its own here. A client that has stood here before
+    /// keeps what it had — returning from a switch finds back and forward exactly as it left them.
+    ///
+    /// "None of its own" counts an *empty* trail, which is the same judgement [`Self::leave_nav`]
+    /// makes in the other direction: a client can have an empty one recorded merely by having
+    /// pressed `Alt-Left` here once, and that is not a reason to refuse the hand-over.
+    fn join_nav(&mut self, client_id: ClientId) {
+        if self
+            .nav_history
+            .get(&client_id)
+            .is_some_and(|h| !h.is_empty())
+        {
+            return;
+        }
+        if let Some(handed_on) = self.last_nav.clone() {
+            self.nav_history.insert(client_id, handed_on);
+        }
+    }
+
+    /// A client leaves this context: leave its trail behind as the hand-over copy for whoever
+    /// arrives next. `take` also removes the client's own trail — a disconnect, where no window is
+    /// coming back to it; a switch leaves it in place, since the same client returning must find
+    /// it intact.
+    ///
+    /// An empty trail is not a hand-over: a window that passed through here without navigating has
+    /// nothing to pass on, and erasing the last real trail with it would lose the one thing this
+    /// field is for.
+    fn leave_nav(&mut self, client_id: ClientId, take: bool) {
+        let trail = if take {
+            self.nav_history.remove(&client_id)
+        } else {
+            self.nav_history.get(&client_id).cloned()
+        };
+        match trail {
+            Some(trail) if !trail.is_empty() => self.last_nav = Some(trail),
+            _ => {}
+        }
+    }
+
     /// True iff the given canonical path falls under one of this workspace's roots. A file that
     /// isn't contained is a *guest* — no git baseline, no language server (`view_open`). Note this
     /// is containment, not trust: an ephemeral workspace's own files are contained (it roots itself
@@ -781,7 +845,6 @@ impl ServerState {
             view_clock: 0,
             app_settings: aether_protocol::settings::AppSettings::default(),
             pickers: HashMap::new(),
-            nav_history: HashMap::new(),
             git_unstaged_hunks: HashMap::new(),
             git_both_hunks: HashMap::new(),
             git_baseline: HashMap::new(),
@@ -1651,6 +1714,42 @@ impl ServerState {
         }
     }
 
+    /// The navigation trail `client_id` steps: its own, in the context it is standing in
+    /// ([`WorkspaceEntry::nav_history`]). `None` with no active workspace — a client standing
+    /// nowhere has no trail — or with nothing recorded there yet.
+    ///
+    /// This and [`Self::nav_history_mut`] are the only ways in, so every read and write lands on
+    /// the trail of the context the client is actually in.
+    pub fn nav_history(&self, client_id: ClientId) -> Option<&NavHistory> {
+        self.active_workspace(client_id)?
+            .nav_history
+            .get(&client_id)
+    }
+
+    /// [`Self::nav_history`] for writing, creating the client's trail in its active context on
+    /// first use. `None` with no active workspace, which records nothing.
+    pub fn nav_history_mut(&mut self, client_id: ClientId) -> Option<&mut NavHistory> {
+        Some(
+            self.active_workspace_mut(client_id)?
+                .nav_history
+                .entry(client_id)
+                .or_default(),
+        )
+    }
+
+    /// Put `client_id` in `workspace_id`: the one place a client's active context is set, so the
+    /// nav-trail hand-over ([`WorkspaceEntry::last_nav`]) can't be skipped by a new caller. A
+    /// client arriving without a trail of its own here starts from a clone of the one the last
+    /// window to leave left behind.
+    pub fn activate_workspace_for_client(&mut self, client_id: ClientId, workspace_id: &str) {
+        if let Some(session) = self.clients.get_mut(&client_id) {
+            session.active_workspace = Some(workspace_id.to_string());
+        }
+        if let Some(entry) = self.workspaces.get_mut(workspace_id) {
+            entry.join_nav(client_id);
+        }
+    }
+
     /// Id of the workspace a buffer belongs to. `None` if the buffer is unknown or somehow
     /// untagged (shouldn't happen for live buffers but the lookup is defensive).
     pub fn workspace_for_buffer(&self, buffer_id: BufferId) -> Option<&str> {
@@ -1736,6 +1835,8 @@ impl ServerState {
                 mru_views: VecDeque::new(),
                 dormant_views: Vec::new(),
                 jumplist: None,
+                nav_history: Default::default(),
+                last_nav: None,
                 // An ephemeral workspace has no config file, so nothing can declare a project in it.
                 projects: Vec::new(),
             },
@@ -2620,10 +2721,15 @@ impl ServerState {
         self.pickers.retain(|(c, _), _| *c != client_id);
     }
 
-    /// Remove the navigation history for the given client. Used on disconnect (a reconnect is a
-    /// fresh session, so the nav history — like cursor/selection state — is not recovered).
+    /// Take the disconnecting client's navigation trails out of every context it holds one in,
+    /// leaving each behind as that context's hand-over copy ([`WorkspaceEntry::last_nav`]). The
+    /// window is gone, so its live trails go with it; the next client to activate the context
+    /// picks up where it left off, which is what makes closing and reopening a window keep
+    /// `Alt-Left` meaningful.
     pub fn drop_nav_history_for_client(&mut self, client_id: ClientId) {
-        self.nav_history.remove(&client_id);
+        for entry in self.workspaces.values_mut() {
+            entry.leave_nav(client_id, true);
+        }
     }
 
     /// Bump the view `buffer_id` presents — its most recently used one, which is the one an open
@@ -3113,7 +3219,8 @@ impl ServerState {
         // buffer on workspace re-entry should restore them. The MRU is preserved for the same
         // reason: the view picker filters by active workspace, so cross-workspace MRU entries
         // don't leak into the UI, but they still let us reattach to "the buffer you last had"
-        // when you come back.
+        // when you come back. The nav trail is preserved too, and for a stronger reason: it
+        // belongs to the context, not to the switch (see the hand-over below).
         self.searches.retain(|(c, b), _| !in_proj(c, b));
         self.sneaks.retain(|(c, b), _| !in_proj(c, b));
         self.symbol_highlights.retain(|(c, b), _| !in_proj(c, b));
@@ -3131,6 +3238,14 @@ impl ServerState {
         // paths point into — so coming back finds it, and stepping in the workspace you switched to
         // steps *its* list. Same rule, arrived at by ownership rather than by a wipe.
         self.pickers.retain(|(c, _), _| *c != client_id);
+
+        // The nav trail stays where it is — on the context being left, under this client — so
+        // coming back finds back and forward as they were, and stepping in the context switched
+        // *to* steps that context's own trail. A copy stays behind as its hand-over
+        // (`WorkspaceEntry::last_nav`) for the next window to arrive here without one.
+        if let Some(entry) = self.workspaces.get_mut(workspace_name) {
+            entry.leave_nav(client_id, false);
+        }
     }
 }
 
@@ -6182,6 +6297,8 @@ mod workspace_state_tests {
             mru_views: VecDeque::new(),
             dormant_views: Vec::new(),
             jumplist: None,
+            nav_history: Default::default(),
+            last_nav: None,
             projects: Vec::new(),
         }
     }
@@ -6200,6 +6317,74 @@ mod workspace_state_tests {
                 active_workspace: Some(active.to_string()),
             },
         )
+    }
+
+    /// One trail per (context, client), plus the copy a context keeps of the last one to leave it.
+    ///
+    /// Pins the whole ownership rule in one pass: recording in A leaves B's trail alone, switching
+    /// away stores a hand-over copy without taking the trail (so the return finds it intact), an
+    /// arriving client with none of its own starts from that copy — a *copy*, so stepping it does
+    /// not move the trail it came from — and a disconnect takes the trail out, leaving it behind
+    /// as the context's hand-over.
+    #[test]
+    fn nav_trails_belong_to_the_context_and_are_handed_over() {
+        let nav_entry = |view: u64| NavEntry {
+            view_id: ViewId(view),
+            buffer_id: 1,
+            path_index: Some(0),
+            relative_path: Some("a.txt".to_string()),
+            virtual_key: None,
+            element: None,
+            cursor: CursorState::default(),
+            read: None,
+        };
+
+        let mut s = ServerState::new();
+        s.workspaces
+            .insert("a".to_string(), workspace_entry("a", vec![]));
+        s.workspaces
+            .insert("b".to_string(), workspace_entry("b", vec![]));
+        let (c1, sess1) = session("a");
+        s.clients.insert(c1, sess1);
+
+        s.nav_history_mut(c1).unwrap().record(nav_entry(1));
+        assert_eq!(s.nav_history(c1).unwrap().back.len(), 1);
+
+        // Switch to B: a context the client has never navigated in has nothing to step.
+        s.teardown_client_state_for_workspace(c1, "a");
+        s.activate_workspace_for_client(c1, "b");
+        assert!(s.nav_history(c1).is_none(), "B's trail is not A's");
+        s.nav_history_mut(c1).unwrap().record(nav_entry(2));
+        assert_eq!(
+            s.workspaces["a"].nav_history[&c1].back[0].view_id,
+            ViewId(1),
+            "recording in B left A's trail alone"
+        );
+
+        // ...and back: the trail the client kept in A is the one it finds.
+        s.teardown_client_state_for_workspace(c1, "b");
+        s.activate_workspace_for_client(c1, "a");
+        assert_eq!(s.nav_history(c1).unwrap().back[0].view_id, ViewId(1));
+
+        // A second window in A starts from the hand-over the switch left behind — a copy.
+        let (c2, sess2) = session("a");
+        s.clients.insert(c2, sess2);
+        s.activate_workspace_for_client(c2, "a");
+        assert_eq!(s.nav_history(c2).unwrap().back[0].view_id, ViewId(1));
+        s.nav_history_mut(c2).unwrap().back.clear();
+        assert_eq!(
+            s.nav_history(c1).unwrap().back.len(),
+            1,
+            "stepping one window's trail does not move the other's"
+        );
+
+        // The disconnecting window's trail leaves A as A's hand-over.
+        s.drop_nav_history_for_client(c1);
+        assert!(!s.workspaces["a"].nav_history.contains_key(&c1));
+        assert_eq!(
+            s.workspaces["a"].last_nav.as_ref().unwrap().back[0].view_id,
+            ViewId(1)
+        );
     }
 
     /// The "rename while the workspace and its buffers are open" path: re-keys the workspace map (and
