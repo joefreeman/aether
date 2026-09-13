@@ -41,6 +41,8 @@ pub use config::{
 };
 /// Declared projects; re-exported for [`spawn_for_test_with_projects`].
 pub use config::{ProjectEntry, ProjectRef};
+
+pub use process::shed_build_environment;
 /// Dummy-LSP test fixture types (see [`spawn_for_test_with_lsp`]); re-exported for integration tests.
 pub use lsp::dummy::{
     DiagnosticsTrigger, DummyDiagnostic, DummyDocSymbol, DummyLspConfig, DummyRange, DummySymbol,

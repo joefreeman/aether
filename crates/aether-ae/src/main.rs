@@ -148,6 +148,13 @@ struct EditArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    // First, before a runtime exists to make it unsound and before anything can spawn a child:
+    // forget how this binary was built. In development `ae` is started by `cargo run`, which hands
+    // it `OUT_DIR`, `CARGO_MANIFEST_DIR` and the `CARGO_PKG_*` set — and `ring`'s build script
+    // watches every one of them, so a language server that inherits them puts the shared `target/`
+    // into a rebuild loop against the user's own terminal.
+    aether_server::shed_build_environment();
+
     // Which build this is, from the stamp `build.rs` left: the one fact the about panel and
     // `ae status` cannot learn from the protocol crate, which no longer carries it.
     aether_protocol::set_build_info(aether_protocol::BuildInfo::stamped(

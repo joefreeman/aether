@@ -14,11 +14,88 @@
 //! can hold: UTF-8 decoded across chunk boundaries, ANSI escapes stripped, and a carriage return
 //! rewriting the line it lands in rather than adding one. Kept here beside the reading because it
 //! is a fact about process output, and it is the part with all the edge cases.
+//!
+//! And one thing that is *not* about any single child: [`shed_build_environment`], which decides
+//! what every child does **not** inherit. It lives here because this is the module that knows what
+//! spawning a process means.
 
 use std::ffi::OsStr;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
+
+/// Variables `cargo run` and `cargo test` inject into the process they launch, naming the *build*
+/// of that binary. See [`shed_build_environment`] for why they must not outlive it.
+const BUILD_CONTEXT_VARS: &[&str] = &[
+    "CARGO",
+    "CARGO_MANIFEST_DIR",
+    "CARGO_MANIFEST_PATH",
+    "CARGO_CRATE_NAME",
+    "CARGO_BIN_NAME",
+    "CARGO_PRIMARY_PACKAGE",
+    "CARGO_TARGET_TMPDIR",
+    "OUT_DIR",
+    // rustup's re-entry guard, injected by its cargo/rustc proxies. Not a fingerprint input, but
+    // inherited it counts a depth the child never descended, and enough layers of it make rustup
+    // refuse to run at all with "infinite recursion detected".
+    "RUST_RECURSION_COUNT",
+];
+
+/// The injected *families*: `CARGO_PKG_*` (eleven of them, the crate's own manifest metadata) and,
+/// under `cargo test`, one `CARGO_BIN_EXE_<name>` per binary in the package.
+const BUILD_CONTEXT_PREFIXES: &[&str] = &["CARGO_PKG_", "CARGO_BIN_EXE_"];
+
+/// Whether `key` names build context rather than something the user's environment set.
+///
+/// The distinction matters: `CARGO_HOME`, `RUSTUP_HOME` and `RUSTUP_TOOLCHAIN` look like they
+/// belong to this list and do not. The first two are ordinary user configuration that a child
+/// running `cargo` still needs, and the third is how the toolchain that built us tells its own
+/// children which toolchain to be — dropping it would silently move every `cargo` a shell view
+/// runs onto whatever `rust-toolchain.toml` pins, which is a different build, in a different set
+/// of units, on a disk that does not have room for a third.
+fn is_build_context(key: &str) -> bool {
+    BUILD_CONTEXT_VARS.contains(&key)
+        || BUILD_CONTEXT_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// Drop the build context `cargo run` left in this process, so that nothing spawned from here can
+/// inherit it. Call once, first thing in `main`.
+///
+/// In development the daemon is started by `cargo run`, and cargo hands the binary it launches a
+/// description of the build it just did: `OUT_DIR`, `CARGO_MANIFEST_DIR`, `CARGO_PKG_*`. Those
+/// describe `ae`. They are meaningless to a language server, a shell command or an agent — and
+/// they are not inert.
+///
+/// `ring`'s build script declares `cargo:rerun-if-env-changed` on all six, and cargo tests such a
+/// variable against the environment of *the cargo process that is asking*. So a `cargo check` run
+/// by the rust-analyzer we spawned sees them set; a `cargo build` the user runs in their own
+/// terminal sees them unset; and ring's build script re-runs on every alternation, taking `rustls`,
+/// `rustls-webpki`, `ureq` and both leaf crates with it — about ten seconds, on a loop, for as long
+/// as the editor is open on its own source.
+///
+/// Shedding it here rather than at each spawn is the point. There are five places in this crate
+/// that start a child and a sixth that asks the user's login shell to describe its environment
+/// ([`crate::lsp::shell_env`]) — and that last one *inherits*, so a scrub applied per-seam would be
+/// undone by the very map the other seams overlay. One process-wide removal, before there is a
+/// second thread to race, leaves nothing for a new seam to forget.
+///
+/// # Safety and scope
+///
+/// `remove_var` is only sound while the process is single-threaded, which is why this must run
+/// before the runtime is built (it becomes `unsafe` to call at all in edition 2024). That also
+/// means it is deliberately *not* called by the server itself: a test server shares its process
+/// with the test harness's threads, so an in-process server still inherits whatever `cargo test`
+/// injected. Tests spawn dummy language servers and commands in temporary directories, so nothing
+/// there reaches a build fingerprint.
+pub fn shed_build_environment() {
+    let doomed: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| is_build_context(k))
+        .collect();
+    for key in doomed {
+        std::env::remove_var(key);
+    }
+}
 
 /// How long a cancelled group gets to exit on `SIGTERM` before `SIGKILL`. Long enough for a
 /// shell to run a trap and for git to unlink a lock file; short enough that `Space v c` feels
@@ -1052,5 +1129,60 @@ mod tests {
         assert_eq!(out.text(), "\ntail\n", "idempotent");
         out.push_line("[output truncated]");
         assert_eq!(out.text(), "\ntail\n[output truncated]\n");
+    }
+
+    /// The classification, stated as the two mistakes worth making: dropping a variable the user
+    /// set, and keeping one cargo set.
+    #[test]
+    fn build_context_is_what_cargo_injected_and_nothing_else() {
+        for injected in [
+            "OUT_DIR",
+            "CARGO",
+            "CARGO_MANIFEST_DIR",
+            "CARGO_MANIFEST_PATH",
+            "CARGO_PKG_NAME",
+            "CARGO_PKG_VERSION_PRE",
+            "CARGO_BIN_EXE_ae",
+            "RUST_RECURSION_COUNT",
+        ] {
+            assert!(is_build_context(injected), "{injected} is cargo's, not the user's");
+        }
+        for kept in [
+            // Ordinary user configuration a child running cargo still needs.
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            // How the toolchain that built us names itself to its children; see `is_build_context`.
+            "RUSTUP_TOOLCHAIN",
+            "RUSTUP_TOOLCHAIN_SOURCE",
+            "PATH",
+            "HOME",
+            "SHELL",
+        ] {
+            assert!(!is_build_context(kept), "{kept} is the user's, not cargo's");
+        }
+    }
+
+    /// The list cannot be checked against a document, so check it against the live article: this
+    /// test runs under `cargo test`, which injects the same family `cargo run` does. Anything
+    /// cargo-shaped in our own environment that [`is_build_context`] does not claim is either a
+    /// variable cargo started setting since this was written — in which case find out whether a
+    /// build script watches it and add it — or a user variable that wants naming in `keep` below.
+    #[test]
+    fn the_list_still_covers_what_cargo_injects_here() {
+        // Everything cargo-shaped that is legitimately the user's. `CARGO_HOME` is the only one
+        // cargo itself reads back, but it is set by the user (or by rustup's installer), not by
+        // the invocation.
+        const KEEP: &[&str] = &["CARGO_HOME"];
+        let missed: Vec<String> = std::env::vars()
+            .map(|(k, _)| k)
+            .filter(|k| k.starts_with("CARGO") || k == "OUT_DIR" || k == "RUST_RECURSION_COUNT")
+            .filter(|k| !KEEP.contains(&k.as_str()) && !is_build_context(k))
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "cargo set {missed:?} in this process and `is_build_context` does not claim them — \
+             a build script watching one of these would rebuild on every alternation between a \
+             child of ours and the user's terminal"
+        );
     }
 }
