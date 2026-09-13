@@ -336,6 +336,120 @@ fn shell_view() -> Window {
     ])
 }
 
+/// A shell with `runs` completed runs, tall enough to need scrolling — the case the sticky tail
+/// exists for. Same shape as [`shell_view`], repeated; `tail_loaded` says whether the last run's
+/// output came with the push or only its height.
+fn shell_of(runs: u32, tail_loaded: bool) -> Window {
+    use aether_protocol::ui::{Band, Edges, Sides};
+    let boxed = |title: &str, children: Vec<ViewElement>| {
+        ViewElement::titled(
+            Edges {
+                border: Sides::all(1),
+                padding: Sides::ZERO,
+                collapse: false,
+            },
+            Band::Chrome,
+            vec![ViewElement::text(title, Vec::new())],
+            children,
+        )
+    };
+    let mut children = Vec::new();
+    for n in 0..runs {
+        let out = if tail_loaded || n + 1 < runs {
+            editor(n, 7, n, vec![line(n, "out")])
+        } else {
+            ViewElement::Editor {
+                element: n,
+                buffer: 7,
+                rows: 1,
+                first_row: ElementRow::ZERO,
+                laid_out_by: LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Field,
+                first_buffer_line: n,
+                lines: Vec::new(),
+            }
+        };
+        children.push(boxed("~/proj  ok", vec![chrome(&format!("echo {n}")), out]));
+        children.push(chrome(""));
+    }
+    children.push(boxed("~/proj", vec![input(runs, 8, vec![line(0, "")])]));
+    window_of(children)
+}
+
+fn tall_shell(runs: u32) -> Window {
+    shell_of(runs, true)
+}
+
+/// [`tall_shell`] as a push leaves it when the run that just finished landed outside the slices
+/// the viewport had loaded: the last run carries its output's height and none of its lines.
+fn tall_shell_tail_unloaded(runs: u32) -> Window {
+    shell_of(runs, false)
+}
+
+/// A `view/lines_changed` push carrying `window` — how a run's output reaches a client.
+fn pushed(window: &Window) -> Message {
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::viewport::ViewportLinesChanged;
+    Message::Inbound(Some(Inbound::Notification(Notification {
+        jsonrpc: JsonRpc,
+        method: ViewportLinesChanged::NAME.into(),
+        params: serde_json::json!({
+            "viewport_id": 1,
+            "buffer": 7,
+            "revision": 2,
+            "window": window,
+        }),
+    })))
+}
+
+/// A shell parked at the end follows its own output: the run you just submitted lands at the
+/// bottom and the input stays on screen under it. Without it the view holds its scroll while the
+/// content grows past it, and everything you type happens off the bottom of the screen.
+#[test]
+fn a_shell_at_the_end_follows_its_output() {
+    let mut app = laid_out(app_showing(tall_shell(12)));
+    app.scroll_px = app.max_scroll_px();
+    let before = app.scroll_px;
+    assert!(before > 0.0, "the view has to exceed the screen to scroll");
+    // Every adopted window records the height the next one is compared against; this stands in
+    // for the adoption that put the view on screen.
+    let _ = app.sticky_tail_px();
+
+    let _ = app.update(pushed(&tall_shell(18)));
+
+    // Within a row of the new bottom: the policy puts the view's last row back on screen, which
+    // leaves the content's own bottom padding off it.
+    let bottom = app.max_scroll_px();
+    let row = app.cell.expect("a laid-out shell has a cell").height;
+    assert!(bottom > before, "the push has to have made the view taller");
+    assert!(
+        bottom - app.scroll_px <= row,
+        "a shell at the end must follow its output down: {} of {bottom}",
+        app.scroll_px
+    );
+}
+
+/// Following the output has to ask for the screen it lands on. The push carries the new run's
+/// height but not its lines — the viewport had not loaded rows that did not exist yet — so the
+/// scroll to the tail arrives on rows nothing has fetched, and the run box paints empty until
+/// some later scroll happens to ask. The terminal cannot reach this (it checks coverage once per
+/// loop, whatever moved the view) and the browser's own scroll event asks for it; this shell sets
+/// its offset directly, so the adoption is the only thing that can.
+#[test]
+fn following_the_output_asks_for_the_rows_it_lands_on() {
+    let mut app = laid_out(app_showing(tall_shell(12)));
+    app.scroll_px = app.max_scroll_px();
+    let _ = app.sticky_tail_px();
+    assert!(!app.fetch_in_flight, "nothing asked for yet");
+
+    let _ = app.update(pushed(&tall_shell_tail_unloaded(18)));
+
+    assert!(
+        app.fetch_in_flight,
+        "the view followed its output onto rows it never asked for"
+    );
+}
+
 /// A plain file: one editor element and no chrome at all, windowing lines partway down the file
 /// so nothing lands on the cursor's line 0 and every row paints the plain editor background.
 fn plain_file() -> Window {

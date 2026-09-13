@@ -1429,12 +1429,16 @@ impl App {
                     self.measured.elements.insert(element, measured);
                 }
                 if moved {
-                    if let Some(px) = self.sticky_tail_px() {
-                        self.scroll_px = px;
-                    }
-                    self.clamp_scroll();
+                    let fetch = match self.sticky_tail_px() {
+                        Some(px) => self.scroll_to_covered(px),
+                        None => {
+                            self.clamp_scroll();
+                            Task::none()
+                        }
+                    };
                     let (top, visible) = (self.scroll_top_units(), self.visible_units());
                     self.session.set_visible_lines(top, visible, &self.measured);
+                    return fetch;
                 }
                 Task::none()
             }
@@ -1699,13 +1703,11 @@ impl App {
                         // content anchor resolves there.
                         tasks.push(self.read_measure(ReadThen::Anchor));
                     } else if let Some(px) = self.resolve_anchor_px() {
-                        self.scroll_px = px;
-                        self.clamp_scroll();
+                        tasks.push(self.scroll_to_covered(px));
                     } else if let Some(px) = self.sticky_tail_px() {
                         // A shell whose output is arriving while you were at the end: follow it,
                         // and let an owed reveal go — the caret is in the input, at that end.
-                        self.scroll_px = px;
-                        self.clamp_scroll();
+                        tasks.push(self.scroll_to_covered(px));
                         self.pending_reveal.abandon();
                     } else {
                         self.clamp_scroll();
@@ -2590,11 +2592,38 @@ impl App {
         self.scroll_px = self.scroll_px.clamp(0.0, self.max_scroll_px());
     }
 
+    /// Put the view at `px` **and ask for the screen it lands on** — the move every
+    /// *content-driven* scroll makes: a content anchor restored after a re-layout, a shell
+    /// following its output.
+    ///
+    /// The two halves are one call because apart they came apart. A window arrives carrying the
+    /// heights of elements whose lines it does not carry (they were outside the slices this
+    /// viewport had loaded — the rows of a run that had not happened yet), so a scroll driven by
+    /// that window is precisely a scroll onto rows nothing has fetched: the boxes paint at their
+    /// right size and stand empty until some later scroll happens to ask. The other two shells
+    /// cannot reach it — the terminal checks coverage once per loop whatever moved the view, and
+    /// the browser's own scroll event asks — so this shell, which sets its offset as a field, is
+    /// the only one where moving and covering are separable acts. Nothing here may set
+    /// `scroll_px` from a window without going through this.
+    fn scroll_to_covered(&mut self, px: f32) -> Task<Message> {
+        self.scroll_px = px;
+        self.clamp_scroll();
+        self.maybe_fetch()
+    }
+
     /// Where to scroll to when a shell's output has just made its view taller — the core's policy,
     /// asked in units and answered in pixels.
     fn sticky_tail_px(&mut self) -> Option<f32> {
-        let top = VisualRow(self.units_of_px(self.scroll_px).max(0.0) as u32);
-        let rows = self.visible_rows() * self.measured.units_per_row;
+        // Asked in the same rounded units as every other scroll question here
+        // ([`Self::scroll_top_units`] / [`Self::visible_units`]), and not in whole rows: this
+        // viewport is only a whole number of rows tall by accident, and a `visible_rows()`
+        // truncated down by most of a row is enough to make "was the last row on screen?" answer
+        // no while the shell is scrolled to its very bottom — which is precisely when a run's
+        // output must be followed. The terminal cannot see this (its rows *are* its units) and the
+        // browser never did (it passes `visibleUnits()`), so the GUI was the one client whose
+        // shells stopped following their output at a window height that divided unkindly.
+        let top = self.scroll_top_units();
+        let rows = self.visible_units();
         let row = self.session.sticky_tail_row(top, rows, &self.measured)?;
         Some(self.px_of_units(row.get() as f32))
     }

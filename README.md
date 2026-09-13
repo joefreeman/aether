@@ -214,6 +214,22 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space q`/`Space Alt-q` | Quit / save and quit |
 | `Space y`/`Space ?` | Show keyboard shortcuts / about this build |
 
+### Shells and agents
+
+`Space t` and `Space a` switch between them, `Space Alt-t` and `Space Alt-a` make new ones. Both
+views are a transcript with an input at the bottom, and that input is a real editor element —
+every motion, edit and selection key works in it. Two keys mean something different while the
+caret is there:
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Run the command / send the prompt, from either mode |
+| `Alt-Enter` | A newline, for a multi-line command or prompt |
+
+`Up`/`Down` recall earlier commands while the input is a single line. `Tab`/`Shift-Tab` move the
+caret out to the transcript and back, where `Enter` opens the file the line under the cursor names
+and edits are refused.
+
 ### Git
 
 Navigation, reveals and views sit on the plain leader, beside their diagnostics counterparts; the

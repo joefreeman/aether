@@ -115,6 +115,9 @@ pub struct HintFacts {
     /// The reading view's focused block contains interactive elements (links, footnote refs,
     /// images) — gates the link-selection hints (`l/h`, Enter, Tab) to moments they can act.
     pub read_block_has_targets: bool,
+    /// The caret is in a shell's or agent's **input** element, where `Enter` submits — gates the
+    /// `Alt-Enter` newline hint to the one place `Enter` does not produce one.
+    pub view_input_focused: bool,
 }
 
 /// What marks a hint as demonstrated. Editor bindings match on the resolved [`Action`] (observed
@@ -268,6 +271,14 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "search-regex", tier: 3, contexts: &[C::Search], keys: "Alt-e",
         trigger: Trigger::Action(|a| matches!(a, Action::SearchToggleRegex)),
         text: "Use {} to toggle regex matching" },
+    // The one hint that teaches a key because another key's meaning *changed*: in a shell's or
+    // agent's input `Enter` submits, so the newline needs somewhere to live and nothing on screen
+    // says where. Gated (`cond_holds`) on the caret actually being in an input — in an ordinary
+    // file `Alt-Enter` is an alias for `Enter` and teaching it would be noise. Kind-blind for the
+    // same reason the dispatch is: the client cannot tell a shell from a conversation.
+    HintDef { id: "input-newline", tier: 3, contexts: &[C::Insert], keys: "Alt-Enter",
+        trigger: Trigger::Action(|a| matches!(a, Action::NewlineIndentLiteral)),
+        text: "Use {} for a newline — Enter submits what you have typed" },
 
     // ---- the markdown reading view ----
     // The entry point displays in Normal (main-track, ladder-gated) and only on markdown
@@ -841,6 +852,8 @@ impl HintEngine {
             }
             // The reading view's entry point only where the view can open.
             "reader" => self.facts.markdown_buffer,
+            // The newline only where `Enter` stopped being one.
+            "input-newline" => self.facts.view_input_focused,
             // The link-selection sequence: the ring only where the focused block has links,
             // and taught coarse-to-fine — the block step first, then selecting within it,
             // then acting on the selection.
@@ -1662,6 +1675,33 @@ mod tests {
         assert!(!e.cond_holds("reader"));
     }
 
+    /// The `Alt-Enter` newline is taught only where `Enter` stopped being one — in a shell's or
+    /// agent's input. In an ordinary file the two keys agree and the hint would be noise.
+    #[test]
+    fn the_input_newline_hint_waits_for_an_input() {
+        let mut e = HintEngine::default();
+        e.adopt(HintsStateResult::default());
+        let pooled = |e: &HintEngine| {
+            e.pool(C::Insert)
+                .iter()
+                .any(|&i| CURRICULUM[i].id == "input-newline")
+        };
+
+        assert!(
+            !pooled(&e),
+            "an ordinary file teaches no second newline key"
+        );
+        e.set_facts(HintFacts {
+            view_input_focused: true,
+            ..Default::default()
+        });
+        assert!(pooled(&e));
+
+        // Context-local, so no ladder gate — it is reachable on a fresh install, the way the
+        // reading view's own hints are.
+        assert_eq!(e.frontier_tier(), 0);
+    }
+
     fn trigger_action_for(id: &str) -> Action {
         use aether_protocol::cursor::Direction;
         match id {
@@ -1685,6 +1725,7 @@ mod tests {
             "read-back" => Action::NavBack,
             "read-headings" => Action::NavUnit(Direction::Forward),
             "read-copy" => Action::ReadCopy,
+            "input-newline" => Action::NewlineIndentLiteral,
             other => panic!("no test action mapped for hint {other}"),
         }
     }

@@ -8711,6 +8711,7 @@ impl Session {
             mandatory_chooser: self.is_placeholder(),
             markdown_buffer: self.view.buffer.language.as_deref() == Some("markdown"),
             read_block_has_targets: self.read_block_has_targets(),
+            view_input_focused: self.shell_input_focused(),
         }
     }
 
@@ -10238,10 +10239,20 @@ impl Session {
                     count,
                 })
             }
-            A::NewlineIndent => self.edit::<InputNewlineAndIndent>(InputNewlineAndIndentParams {
-                buffer_id,
-                park_before: false,
-            }),
+            // `Enter` in a shell's or agent's input runs what is typed — the same thing it means
+            // there in Normal mode (the `Activate` arm below), so the mode you happen to be in
+            // never decides whether a command runs. The newline is `Alt-Enter`, which resolves to
+            // `NewlineIndentLiteral` and so passes this guard by construction rather than by
+            // re-testing the modifier the binding already matched.
+            A::NewlineIndent if self.shell_input_focused() => {
+                self.dispatch_action(A::SubmitInput, count, counted, extend)
+            }
+            A::NewlineIndent | A::NewlineIndentLiteral => {
+                self.edit::<InputNewlineAndIndent>(InputNewlineAndIndentParams {
+                    buffer_id,
+                    park_before: false,
+                })
+            }
             A::UnjoinLines => self.edit::<InputNewlineAndIndent>(InputNewlineAndIndentParams {
                 buffer_id,
                 park_before: true,

@@ -330,7 +330,18 @@ pub enum Action {
         dir: Direction,
         boundary: WordBoundary,
     },
+    /// `Enter` in Insert. A newline everywhere except an input element, where the dispatch
+    /// re-routes it to [`Action::SubmitInput`] — see that action for why the choice is made there
+    /// and not in the table.
     NewlineIndent,
+    /// `Alt-Enter` — the newline that is **never** re-routed, so a multi-line command or prompt
+    /// can be typed in an input element where plain `Enter` submits.
+    ///
+    /// A separate action rather than a second binding onto [`Action::NewlineIndent`], because the
+    /// resolved action is all the dispatch sees of which row fired: sharing one would put both
+    /// keys on the same side of the input-role guard and leave no way to type a newline there.
+    /// Identical to `NewlineIndent` in every other respect, and in every other element.
+    NewlineIndentLiteral,
     /// Join's dual: insert a line break at the cursor, cursor staying *before* it (so a
     /// following join re-joins the same pair). Distinct from [`Action::NewlineIndent`], whose
     /// cursor advances onto the new line (Enter's typing flow).
@@ -455,11 +466,16 @@ pub enum Action {
     },
     /// Submit what is typed in a composed view's **input** element.
     ///
-    /// Not bound to a key of its own: Normal-mode `Enter` is [`Action::Activate`], and the
-    /// dispatch routes it here when the focused element is an input — a keymap row cannot see
-    /// which element holds the cursor, so the choice is made where that is known. Insert-mode
-    /// `Enter` stays the newline it is everywhere, so a multi-line command or prompt is typed like
-    /// any other text and submitted from Normal mode.
+    /// Not bound to a key of its own: `Enter` resolves to [`Action::Activate`] in Normal and
+    /// [`Action::NewlineIndent`] in Insert, and the dispatch routes *either* here when the focused
+    /// element is an input — a keymap row cannot see which element holds the cursor, so the choice
+    /// is made where that is known. The same override the input role already applies to `Up`/`Down`
+    /// (history recall), and the reason the keymap needs no notion of a shell.
+    ///
+    /// Both modes, deliberately: which mode you are in decides how text is *edited*, never whether
+    /// a command runs, so requiring `Esc` first would be a mode distinction with nothing behind it.
+    /// The newline moves to `Alt-Enter` ([`Action::NewlineIndentLiteral`]) inside an input, which
+    /// is how a multi-line command or prompt is typed.
     ///
     /// What submitting *means* is the server's to decide (`view/submit_input`): a shell runs the
     /// line, an agent view sends the prompt, and the client never learns which sort of view it is
@@ -1181,7 +1197,11 @@ static INSERT: &[Binding] = &[
     bind!(I, KeyCode::Backspace, Any, A::Backspace, "Edit", "Delete character before cursor"),
     bind!(I, KeyCode::Delete, IgnoreShift(Mods::ALT), A::DeleteWord { dir: Direction::Forward, boundary: WordBoundary::Word }, "Edit", "Delete word after cursor"),
     bind!(I, KeyCode::Delete, Any, A::DeletePoint, "Edit", "Delete character at cursor"),
-    bind!(I, KeyCode::Enter, Any, A::NewlineIndent, "Edit", "Newline and indent"),
+    // `Enter` submits in a shell's or agent's input element, so the newline needs a key that is
+    // never re-routed — the routing is by focused element and happens in the dispatch, which sees
+    // only the resolved action. `IgnoreShift` for the reason the Alt rows above give.
+    bind!(I, KeyCode::Enter, IgnoreShift(Mods::ALT), A::NewlineIndentLiteral, "Edit", "Newline — never submits (multi-line commands and prompts)"),
+    bind!(I, KeyCode::Enter, Any, A::NewlineIndent, "Edit", "Newline and indent — submits in a shell or agent input"),
     bind!(I, KeyCode::Tab, Any, A::InsertTab, "Edit", "Indent to next tab stop"),
     // Insert has no selection, so it can't borrow Normal's `w`-selects-a-word trick: both word
     // directions are plain motions here.

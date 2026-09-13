@@ -14105,20 +14105,24 @@ fn opening_a_shell_focuses_the_input_and_enters_insert() {
     assert_eq!(s.view.mode, aether_client::session::Mode::Insert);
 }
 
-/// Insert-mode `Enter` is a newline in a shell's input exactly as it is everywhere else: a
-/// multi-line command is typed like any other text, and running it is a Normal-mode act.
+/// Insert-mode `Enter` in the input runs the command, exactly as Normal-mode `Enter` does there:
+/// which mode you are in decides how text is edited, never whether a command runs. Everywhere
+/// else — the transcript, an ordinary file — it is the newline it has always been.
 #[test]
-fn insert_mode_enter_in_the_input_is_a_newline() {
-    for focused in [1, 0] {
-        let mut s = shell_session(focused);
-        s.view.mode = aether_client::session::Mode::Insert;
-        let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
-        let (_, method, _) = the_request(&fx);
-        assert_eq!(
-            method, "element/newline_and_indent",
-            "focused element {focused}"
-        );
-    }
+fn insert_mode_enter_in_the_input_submits() {
+    let mut s = shell_session(1);
+    s.view.mode = aether_client::session::Mode::Insert;
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "view/submit_input");
+    assert_eq!(params["view_id"], 10);
+
+    // The transcript element of the same view: no input focused, so no submit.
+    let mut s = shell_session(0);
+    s.view.mode = aether_client::session::Mode::Insert;
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let (_, method, _) = the_request(&fx);
+    assert_eq!(method, "element/newline_and_indent");
 
     // And in a view with no input at all.
     let mut s = session();
@@ -14126,6 +14130,30 @@ fn insert_mode_enter_in_the_input_is_a_newline() {
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let (_, method, _) = the_request(&fx);
     assert_eq!(method, "element/newline_and_indent");
+}
+
+/// `Alt-Enter` is the newline that survives the input's re-routing — the only way to type a
+/// multi-line command or prompt, so it must reach the edit from inside the input too. Shift is
+/// ignored on it for the reason every Insert-mode Alt chord ignores it: Insert has no selection
+/// to extend, and a held Shift must not drop the chord back onto the submitting row.
+#[test]
+fn alt_enter_is_the_newline_even_in_the_input() {
+    let alt_shift = Mods {
+        shift: true,
+        ..Mods::ALT
+    };
+    for mods in [Mods::ALT, alt_shift] {
+        for focused in [1, 0] {
+            let mut s = shell_session(focused);
+            s.view.mode = aether_client::session::Mode::Insert;
+            let fx = s.on_key(KeyCode::Enter, mods, None);
+            let (_, method, _) = the_request(&fx);
+            assert_eq!(
+                method, "element/newline_and_indent",
+                "focused element {focused}, mods {mods:?}"
+            );
+        }
+    }
 }
 
 /// Normal-mode `Enter` on the input runs the command — the one way to run one. Without the guard
