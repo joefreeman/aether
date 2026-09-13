@@ -639,7 +639,20 @@ where
                 // run into — because they are one drawing. Two mechanisms each drawing part of it
                 // is how the terminal ended up with a rail beside its own rail.
                 grid::PaintedRow::Edge { owner, side, join } => {
-                    fill(renderer, row_rect, p.bg_app);
+                    // A **collapsed** element's title row is the whole of that element, so the
+                    // cursor in it has no row of its own to be drawn on. The row takes the
+                    // cursorline instead — the plain one, since a box's frame carries no change of
+                    // its own — which is what marks the cursor's row everywhere else.
+                    let holds_cursor = owner.holds_collapsed(self.content.focused_element);
+                    fill(
+                        renderer,
+                        row_rect,
+                        if holds_cursor {
+                            p.cursor_line_bg
+                        } else {
+                            p.bg_app
+                        },
+                    );
                     let rule_y = y + (cell.height * 0.5).floor();
                     // The rails' own share of the join: down from the rule where it opens, up to
                     // it where it closes, through it where it tees. Detached draws no rail.

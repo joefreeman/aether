@@ -433,6 +433,18 @@ pub fn is_prose(kind: &BlockKind) -> bool {
     matches!(kind, BlockKind::UserMessage | BlockKind::AgentMessage)
 }
 
+/// Whether a block is **blocked on the user** — a tool call the agent cannot proceed past until
+/// it is allowed or declined.
+///
+/// Such a block refuses to fold. Folding is for the record of what happened, and this block is not
+/// a record yet: it is a question, and its answer lives in the chrome inside the box. A folded one
+/// would leave the turn stalled behind a rule with no way to see what it was asking. The view
+/// rebuilds on every status change, so this flips back the moment the question is answered and the
+/// block folds away on its own — no state to reconcile, and nothing that can strand a block open.
+pub fn awaits_permission(kind: &BlockKind) -> bool {
+    matches!(kind, BlockKind::ToolCall(tc) if tc.permission.is_some())
+}
+
 /// Whether a block is **prose on the wire** — sent as [`aether_protocol::ui::Element::Prose`], the
 /// markdown parsed, so a heading is a heading and a fence is a panel rather than source shown back.
 ///

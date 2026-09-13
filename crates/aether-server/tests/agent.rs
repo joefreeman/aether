@@ -14,6 +14,10 @@ use aether_protocol::agent::{
     AgentCancel, AgentCancelParams, AgentOpen, AgentOpenParams, AgentOpenResult, AgentPrompt,
     AgentPromptParams, AgentPromptResult, AgentRespond, AgentRespondParams,
 };
+use aether_protocol::viewport::{
+    FocusStep, FocusTarget, ViewportFocusElement, ViewportFocusElementParams,
+    ViewportFocusElementResult,
+};
 use aether_server::agent::dummy::{self, Script, Step, ALLOW_OR_REJECT};
 use agent_client_protocol::schema::v1::{ToolCallStatus, ToolKind};
 use std::sync::{Arc, Mutex};
@@ -1733,4 +1737,423 @@ async fn an_agent_view_cannot_be_made_transient() {
     );
 
     drop(server);
+}
+
+// ---- folding -----------------------------------------------------------------------------------
+//
+// A conversation is mostly machinery, and the machinery is mostly not what you came to read: tool
+// calls arrive folded, so what is on screen is the turn — what you asked, what the agent said —
+// with a titled rule per thing it did. `Tab` walks those rules and `Space v e` opens one up.
+
+/// Subscribe and return the window, at a size that fits everything the tests below produce.
+async fn window_of(
+    ws: &mut Ws,
+    view_id: aether_protocol::ViewId,
+) -> (aether_protocol::ViewportId, Window) {
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        ws,
+        &ViewportSubscribeParams {
+            view_id,
+            cols: 100,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    (sub.viewport_id, sub.window)
+}
+
+/// Every editor element of a window as `(element id, collapsed, rows, text)` — what a shell has to
+/// paint from, rather than what the server knows.
+fn editors_of(window: &Window) -> Vec<(u32, bool, u32, String)> {
+    window
+        .root
+        .editors()
+        .into_iter()
+        .filter_map(|e| match e {
+            aether_protocol::viewport::Element::Editor {
+                element,
+                collapsed,
+                rows,
+                lines,
+                ..
+            } => Some((
+                *element,
+                *collapsed,
+                *rows,
+                lines
+                    .iter()
+                    .flat_map(|l| l.visual_rows.iter())
+                    .flat_map(|r| r.segments.iter())
+                    .map(|s| s.text.as_str())
+                    .collect::<String>(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A script with one tool call that produced output, and a reply after it.
+fn one_call_and_a_reply() -> Script {
+    Script {
+        steps: vec![
+            Step::Call {
+                id: "t1",
+                title: "Running cargo test",
+                kind: ToolKind::Execute,
+            },
+            Step::Update {
+                id: "t1",
+                status: Some(ToolCallStatus::Completed),
+                text: Some("test result: ok\n"),
+            },
+            Step::Say {
+                message_id: Some("m1"),
+                text: "All green.\n",
+            },
+        ],
+        ..Script::default()
+    }
+}
+
+#[tokio::test]
+async fn a_tool_call_arrives_folded_and_its_output_stays_off_the_wire() {
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    let (_, window) = window_of(&mut ws, open.opened.view_id).await;
+    let editors = editors_of(&window);
+    let call = editors
+        .iter()
+        .find(|(_, collapsed, ..)| *collapsed)
+        .unwrap_or_else(|| panic!("nothing came back folded: {editors:?}"));
+    // Folded is not merely "drawn shorter": the rows are gone, so everything below it moves up,
+    // and the text never left the server.
+    assert_eq!(call.2, 0, "a folded element still claims rows: {editors:?}");
+    assert_eq!(call.3, "", "a folded element still shipped its lines");
+    assert!(
+        !window
+            .root
+            .lines()
+            .iter()
+            .flat_map(|l| l.visual_rows.iter())
+            .flat_map(|r| r.segments.iter())
+            .any(|s| s.text.contains("test result")),
+        "the folded call's output reached the wire anyway"
+    );
+    // The box is still there, still named — that is the whole point of folding rather than hiding.
+    assert!(
+        window_titles(&window)
+            .iter()
+            .any(|t| t.contains("Running cargo test")),
+        "the folded call lost its title: {:?}",
+        window_titles(&window)
+    );
+}
+
+/// Every box title in a window, as plain text.
+fn window_titles(window: &Window) -> Vec<String> {
+    fn walk(n: &aether_protocol::viewport::Element, out: &mut Vec<String>) {
+        if let aether_protocol::viewport::Element::Column {
+            title, children, ..
+        } = n
+        {
+            if !title.is_empty() {
+                out.push(
+                    title
+                        .iter()
+                        .flat_map(|t| t.inline())
+                        .filter_map(|t| match t {
+                            aether_protocol::viewport::Element::Text { text, .. } => {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect(),
+                );
+            }
+            for c in children {
+                walk(c, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&window.root, &mut out);
+    out
+}
+
+#[tokio::test]
+async fn the_reply_is_never_folded() {
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    // What the agent said is prose, and prose does not fold — the conversation is what you came to
+    // read, and it arrives whole.
+    let prose: Vec<_> = window
+        .root
+        .content()
+        .into_iter()
+        .filter(|e| matches!(e, aether_protocol::viewport::Element::Prose { .. }))
+        .collect();
+    assert_eq!(prose.len(), 1, "the reply did not survive the fold");
+
+    // And the key refuses on it rather than doing nothing: the element is real, so the request is
+    // well formed, and the answer has to be an error or the press reads as dropped.
+    let reply = prose[0].field_id().expect("the reply's element id");
+    let err = send_request_expect_err::<ViewportSetExpanded>(
+        &mut ws,
+        &ViewportSetExpandedParams {
+            viewport_id,
+            element: reply,
+            expanded: None,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("does not fold"),
+        "folding a reply was not refused: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn expanding_a_folded_call_brings_its_output_back() {
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    let call = editors_of(&window)
+        .into_iter()
+        .find(|(_, collapsed, ..)| *collapsed)
+        .expect("a folded call")
+        .0;
+
+    // The client loads element slices as it lays the view out; ask for the call's, so that what
+    // comes back is the real fetch path rather than a window that happened to carry everything.
+    let toggled: ViewportWindowResult = send_request::<ViewportSetExpanded>(
+        &mut ws,
+        &ViewportSetExpandedParams {
+            viewport_id,
+            element: call,
+            expanded: None,
+        },
+    )
+    .await;
+    let opened = editors_of(&toggled.window);
+    let (_, collapsed, rows, _) = opened
+        .iter()
+        .find(|(id, ..)| *id == call)
+        .expect("the call after expanding");
+    assert!(!collapsed, "the toggle did not open it: {opened:?}");
+    assert!(*rows > 0, "expanded, it still claims no rows: {opened:?}");
+
+    // And pressing it again puts it back — a fold is a way of looking at something, so the same
+    // key has to be able to undo it.
+    let again: ViewportWindowResult = send_request::<ViewportSetExpanded>(
+        &mut ws,
+        &ViewportSetExpandedParams {
+            viewport_id,
+            element: call,
+            expanded: None,
+        },
+    )
+    .await;
+    assert!(
+        editors_of(&again.window)
+            .iter()
+            .any(|(id, collapsed, ..)| *id == call && *collapsed),
+        "the second press did not fold it again"
+    );
+}
+
+#[tokio::test]
+async fn tab_stops_on_a_folded_call_rather_than_skipping_it() {
+    // The rule this whole design rests on. An element with no lines is skipped — a shell run that
+    // said nothing is drawn but never stepped to — and a folded element has no lines either. If
+    // the same rule caught both, every tool call in a conversation would be permanently out of
+    // reach, since focus is the only thing that says which element the fold key acts on.
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    let folded = editors_of(&window)
+        .into_iter()
+        .find(|(_, collapsed, ..)| *collapsed)
+        .expect("a folded call")
+        .0;
+
+    // Walk from the top and see whether focus ever lands on it.
+    let mut seen = vec![];
+    for _ in 0..8 {
+        let r: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
+            &mut ws,
+            &ViewportFocusElementParams {
+                viewport_id,
+                target: FocusTarget::Step {
+                    direction: FocusStep::Next,
+                },
+            },
+        )
+        .await;
+        if seen.last() == Some(&r.element) {
+            break; // stepping stopped, as it does at the end
+        }
+        seen.push(r.element);
+    }
+    assert!(
+        seen.contains(&folded),
+        "Tab skipped the folded call ({folded}): stopped at {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_call_awaiting_permission_refuses_to_fold() {
+    // A block that is asking you something is not a record of what happened — it is the question,
+    // and its options are the chrome inside its box. Folded by default, the turn would stall
+    // behind a rule with no way to see what it wanted.
+    let script = Script {
+        steps: vec![
+            Step::Call {
+                id: "t1",
+                title: "Deleting things",
+                kind: ToolKind::Delete,
+            },
+            Step::Ask {
+                id: "t1",
+                options: ALLOW_OR_REJECT,
+            },
+        ],
+        ..Script::default()
+    };
+    let (server, mut ws, _dir, _t) = setup(script).await;
+    let open = open_agent(&mut ws).await;
+    let input = input_buffer_of(&server, &open).await;
+    type_prompt(&mut ws, input, "go").await;
+    let _: AgentPromptResult = send_request::<AgentPrompt>(
+        &mut ws,
+        &AgentPromptParams {
+            view_id: open.opened.view_id,
+        },
+    )
+    .await;
+
+    // Wait for the question to reach the block.
+    loop {
+        let s = server.state.lock().await;
+        let view_buffer = s.try_presenting_buffer(open.opened.view_id).unwrap();
+        let asking = s
+            .try_doc_of(view_buffer)
+            .and_then(|d| d.conversation())
+            .and_then(|c| c.pending_permission())
+            .is_some();
+        drop(s);
+        if asking {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    assert!(
+        editors_of(&window)
+            .iter()
+            .all(|(_, collapsed, ..)| !collapsed),
+        "a block that is asking something came back folded: {:?}",
+        editors_of(&window)
+    );
+    // And it cannot be folded by hand either, for as long as the question stands.
+    let asking_element = editors_of(&window)
+        .into_iter()
+        .find(|(_, _, rows, _)| *rows > 0)
+        .expect("the asking block")
+        .0;
+    let err = send_request_expect_err::<ViewportSetExpanded>(
+        &mut ws,
+        &ViewportSetExpandedParams {
+            viewport_id,
+            element: asking_element,
+            expanded: None,
+        },
+    )
+    .await;
+    assert!(
+        err.contains("does not fold"),
+        "an open question was foldable: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn two_viewports_fold_independently() {
+    // Per viewport, like the diff toggle: two shells on one conversation are two people reading,
+    // and opening a call on one screen must not open it on the other.
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    // Two *connections*, because that is what two shells are — a second subscribe on one
+    // connection replaces the viewport rather than adding one.
+    let (first, window) = window_of(&mut ws, open.opened.view_id).await;
+    let mut ws2 = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws2,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "agent-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let (second, _) = window_of(&mut ws2, open.opened.view_id).await;
+    let call = editors_of(&window)
+        .into_iter()
+        .find(|(_, collapsed, ..)| *collapsed)
+        .expect("a folded call")
+        .0;
+
+    let opened: ViewportWindowResult = send_request::<ViewportSetExpanded>(
+        &mut ws,
+        &ViewportSetExpandedParams {
+            viewport_id: first,
+            element: call,
+            expanded: Some(true),
+        },
+    )
+    .await;
+    assert!(editors_of(&opened.window)
+        .iter()
+        .any(|(id, collapsed, ..)| *id == call && !collapsed));
+
+    let other: ViewportWindowResult = send_request::<ViewportWindow>(
+        &mut ws2,
+        &ViewportWindowParams {
+            viewport_id: second,
+            anchor: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            slices: vec![],
+        },
+    )
+    .await;
+    assert!(
+        editors_of(&other.window)
+            .iter()
+            .any(|(id, collapsed, ..)| *id == call && *collapsed),
+        "expanding on one viewport opened it on the other"
+    );
 }

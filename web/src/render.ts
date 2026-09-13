@@ -31,6 +31,7 @@ import type {
 // below stay as short as the five parallel fields they replaced.
 import {
   elementOrigins,
+  holdsCollapsed,
   inlineOf,
   paintedRows,
   proseOf,
@@ -573,11 +574,21 @@ function appendInline(into: HTMLElement, nodes: ViewNode[]): void {
  *  rail already was, and the name is a span that masks the rule where it sits (`.box-edge .title`)
  *  — the rule being one gradient across the row, splitting it in two would mean teaching the
  *  `--rule-from`/`--rule-to` rails to count characters. */
-function edgeRow(side: "top" | "bottom", join: RailJoin, band: Band, title: ViewNode[]): HTMLElement {
+function edgeRow(
+  side: "top" | "bottom",
+  join: RailJoin,
+  band: Band,
+  title: ViewNode[],
+  holdsCursor: boolean,
+): HTMLElement {
   const rowEl = document.createElement("div");
   rowEl.className = `row box-edge ${side} ${join}`;
   // A box's own cells take its band, the same as any other row of it.
   if (band === "chrome") rowEl.classList.add("patch-chrome");
+  // A **collapsed** element's title row is the whole of that element, so the cursor in it has no
+  // row of its own to be drawn on. The row takes the cursorline instead, which is what marks the
+  // cursor's row everywhere else.
+  if (holdsCursor) rowEl.classList.add("cursor-line");
   const g = document.createElement("span");
   g.className = "gutter";
   rowEl.appendChild(g);
@@ -792,7 +803,17 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
       // A box is named on the border it opens with; the closing one carries nothing.
       const title =
         item.side === "top" && item.owner.node === "column" ? (item.owner.title ?? []) : [];
-      frag.appendChild(inset(edgeRow(item.side, item.join, item.band, title)));
+      frag.appendChild(
+        inset(
+          edgeRow(
+            item.side,
+            item.join,
+            item.band,
+            title,
+            holdsCollapsed(item.owner, focusedElement),
+          ),
+        ),
+      );
       continue;
     }
     const { line, row, rowIndex, element } = item;

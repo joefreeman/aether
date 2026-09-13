@@ -6592,6 +6592,7 @@ fn sample_window() -> aether_protocol::viewport::Window {
         max_line_width: 88,
         git_status: None,
         root: Element::Editor {
+            collapsed: false,
             element: 0,
             buffer: 7,
             rows: 130,
@@ -6738,6 +6739,7 @@ fn viewport_params_round_trip() {
 fn an_editor_says_when_the_client_lays_it_out() {
     use aether_protocol::ui::{Element, LayoutOwner};
     let editor = |laid_out_by| Element::Editor {
+        collapsed: false,
         element: 0,
         buffer: 1,
         rows: 4,
@@ -7038,6 +7040,7 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
         // `None` would be skipped, and a field that never serialises cannot be checked.
         git_status: Some(Default::default()),
         root: Element::Editor {
+            collapsed: false,
             element: 0,
             buffer: 1,
             rows: 1,
@@ -7093,6 +7096,7 @@ fn every_subscribe_carries_the_focus_it_resolved() {
         max_line_width: 0,
         git_status: None,
         root: aether_protocol::viewport::Element::Editor {
+            collapsed: false,
             element: 0,
             buffer: 9,
             rows: 1,
@@ -7168,6 +7172,7 @@ fn window_at_cursor_names_no_coordinates() {
 fn an_editor_says_when_it_is_a_shells_input() {
     use aether_protocol::ui::{ElementRole, LayoutOwner};
     let editor = |role| Element::Editor {
+        collapsed: false,
         element: 2,
         buffer: 9,
         rows: 1,
@@ -7215,6 +7220,100 @@ fn an_editor_says_when_it_is_a_shells_input() {
         ts.contains("\"field\" | \"input\""),
         "…with both of the values it can take"
     );
+}
+
+/// A folded element says so, and an ordinary one says nothing — the flag is off the wire for every
+/// view that has no folding in it, which is nearly all of them.
+///
+/// It is a separate question from "has this element got lines", and the shape has to keep them
+/// separate: a folded element and an unloaded one both carry `rows: 0` and no lines, and only this
+/// flag tells a shell that the first is somewhere the cursor can be.
+#[test]
+fn an_editor_says_when_it_is_folded_shut() {
+    use aether_protocol::ui::{ElementRole, LayoutOwner};
+    let editor = |collapsed| Element::Editor {
+        element: 2,
+        buffer: 9,
+        rows: if collapsed { 0 } else { 3 },
+        first_row: ElementRow(0),
+        laid_out_by: LayoutOwner::Server,
+        role: ElementRole::Field,
+        collapsed,
+        first_buffer_line: 0,
+        lines: Vec::new(),
+    };
+    let open = to_value(editor(false)).unwrap();
+    assert!(
+        open.get("collapsed").is_none(),
+        "an unfolded element is the default and stays off the wire: {open}"
+    );
+    let folded = to_value(editor(true)).unwrap();
+    assert_eq!(folded["collapsed"], true);
+    let back: Element = from_value(folded).unwrap();
+    assert!(matches!(
+        back,
+        Element::Editor {
+            collapsed: true,
+            ..
+        }
+    ));
+
+    // What a painter asks of a box about its own title row: the row is the whole of the element
+    // inside it, so it is the row that wears the cursor's line.
+    let boxed = |child| {
+        Element::titled(
+            aether_protocol::ui::Edges {
+                border: aether_protocol::ui::Sides::all(1),
+                ..aether_protocol::ui::Edges::NONE
+            },
+            aether_protocol::ui::Band::Chrome,
+            vec![Element::text("Running cargo test", Vec::new())],
+            vec![child],
+        )
+    };
+    assert!(boxed(editor(true)).holds_collapsed(2));
+    assert!(
+        !boxed(editor(true)).holds_collapsed(3),
+        "another element's id"
+    );
+    assert!(
+        !boxed(editor(false)).holds_collapsed(2),
+        "an open box must not wear the fold's mark — its own rows carry the cursor"
+    );
+
+    // The browser hand-mirrors this; `tsc` cannot see a Rust rename.
+    let ts = include_str!("../../../web/src/protocol.ts");
+    assert!(
+        ts.contains("collapsed?:"),
+        "web/src/protocol.ts must declare the editor node's `collapsed`"
+    );
+}
+
+/// Folding is addressed to a viewport and an element, and says which way only when the caller
+/// cares — a key press does not, so the ordinary request is a toggle.
+#[test]
+fn set_expanded_shape() {
+    use aether_protocol::viewport::{ViewportSetExpanded, ViewportSetExpandedParams};
+    assert_eq!(ViewportSetExpanded::NAME, "view/set_expanded");
+    let toggle = to_value(ViewportSetExpandedParams {
+        viewport_id: 4,
+        element: 2,
+        expanded: None,
+    })
+    .unwrap();
+    assert_eq!(toggle, json!({ "viewport_id": 4, "element": 2 }));
+    let explicit = to_value(ViewportSetExpandedParams {
+        viewport_id: 4,
+        element: 2,
+        expanded: Some(true),
+    })
+    .unwrap();
+    assert_eq!(
+        explicit,
+        json!({ "viewport_id": 4, "element": 2, "expanded": true })
+    );
+    let back: ViewportSetExpandedParams = from_value(toggle).unwrap();
+    assert_eq!(back.expanded, None);
 }
 
 /// `shell/open` asks *nothing* and answers with an open plus the element to type into.

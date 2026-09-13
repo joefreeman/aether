@@ -5580,8 +5580,16 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     //
     // A title over-long for its box is cut where any chrome row is, by `fit`: the rule it was
     // going to trail simply never starts.
-    let box_edge_row = |cols: u16, title: &[Element]| -> Line<'static> {
-        let bg = c(th().bg_app);
+    // `focused` marks a **collapsed** element's title row: folded, that row is the whole of the
+    // element, and the cursor sitting in it has nowhere to be painted. It wears the cursorline
+    // instead — the plain one, not a diff variant, because a box's frame carries no change of its
+    // own — so that the row the cursor is on is marked by the same shade here as everywhere else.
+    let box_edge_row = |cols: u16, title: &[Element], focused: bool| -> Line<'static> {
+        let bg = c(if focused {
+            th().cursor_line_bg
+        } else {
+            th().bg_app
+        });
         let ink = Style::default().fg(c(th().fg_faint)).bg(bg);
         if title.is_empty() {
             return Line::from(vec![Span::styled("─".repeat(cols as usize), ink)]);
@@ -6042,7 +6050,13 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     aether_client::grid::Side::Top => owner.title(),
                     aether_client::grid::Side::Bottom => &[],
                 };
-                enclose(place, inner, Some(*join), box_edge_row(inner, title))
+                let holds_cursor = owner.holds_collapsed(state.ed().focused_element);
+                enclose(
+                    place,
+                    inner,
+                    Some(*join),
+                    box_edge_row(inner, title, holds_cursor),
+                )
             }
             aether_client::grid::PaintedRow::Baseline { row, .. } => {
                 enclose(place, inner, None, baseline_row(row, inner_text))
@@ -11147,6 +11161,7 @@ mod painter_tests {
                     chrome("a.rs"),
                     chrome("@@ fn f17"),
                     Element::Editor {
+                        collapsed: false,
                         element: 0,
                         buffer: 7,
                         rows: lines.len() as u32,
@@ -11211,6 +11226,7 @@ mod painter_tests {
                 children: vec![
                     chrome("alpha.rs"),
                     Element::Editor {
+                        collapsed: false,
                         element: 0,
                         buffer: 7,
                         rows: 1,
@@ -11222,6 +11238,7 @@ mod painter_tests {
                     },
                     chrome("beta.rs"),
                     Element::Editor {
+                        collapsed: false,
                         element: 1,
                         buffer: 8,
                         rows: 1,
@@ -11266,6 +11283,7 @@ mod painter_tests {
                 children: vec![
                     chrome("alpha.rs"),
                     Element::Editor {
+                        collapsed: false,
                         element: 0,
                         buffer: 7,
                         rows: 2,
@@ -11277,6 +11295,7 @@ mod painter_tests {
                     },
                     chrome("beta.rs"),
                     Element::Editor {
+                        collapsed: false,
                         element: 1,
                         buffer: 8,
                         rows: 2,
@@ -11344,6 +11363,7 @@ mod painter_tests {
                     chrome("a.rs"),
                     chrome("@@ a"),
                     Element::Editor {
+                        collapsed: false,
                         element: 0,
                         buffer: 7,
                         rows: 4,
@@ -11356,6 +11376,7 @@ mod painter_tests {
                     chrome("b.rs"),
                     chrome("@@ b"),
                     Element::Editor {
+                        collapsed: false,
                         element: 1,
                         buffer: 8,
                         rows: 3,
@@ -11616,6 +11637,7 @@ mod painter_tests {
                     Vec::new(),
                 )])]),
                 Element::Editor {
+                    collapsed: false,
                     element: 0,
                     buffer: 7,
                     rows: lines.len() as u32,
@@ -11777,6 +11799,7 @@ mod painter_tests {
         };
         let editor =
             |element: u32, buffer: u64, lines: Vec<LogicalLineRender>, role| Element::Editor {
+                collapsed: false,
                 element,
                 buffer,
                 rows: lines.len() as u32,
@@ -11937,6 +11960,7 @@ mod painter_tests {
                     Vec::new(),
                 )])]),
                 Element::Editor {
+                    collapsed: false,
                     element: 0,
                     buffer: 7,
                     rows: 0,
@@ -11981,6 +12005,7 @@ mod painter_tests {
             band: aether_protocol::ui::Band::None,
             title: Vec::new(),
             children: vec![Element::Editor {
+                collapsed: false,
                 element: 0,
                 buffer: 8,
                 rows: 1,
@@ -12022,6 +12047,7 @@ mod painter_tests {
         };
         let editor =
             |element: u32, buffer: u64, lines: Vec<LogicalLineRender>, role| Element::Editor {
+                collapsed: false,
                 element,
                 buffer,
                 rows: lines.len() as u32,
@@ -12122,6 +12148,90 @@ mod painter_tests {
             rows.iter().any(|r| r.contains(boxed_title)),
             "no box titled {boxed_title:?}:\n{}",
             rows.join("\n")
+        );
+    }
+
+    /// A **folded** tool call is one row — its own title — and that row is where the cursor shows.
+    ///
+    /// The shape option B rests on. A folded element ships `rows: 0` and no lines, so there is no
+    /// row of its own for a cursor to be painted on; what says "focus is here" is the box's title
+    /// row wearing the cursorline, and if that is missing then `Tab` into a folded call lands
+    /// somewhere invisible and the view looks frozen.
+    #[test]
+    fn a_folded_element_is_one_titled_row_that_carries_the_cursor() {
+        let folded = |element: u32, title: &str| {
+            UiElement::titled(
+                aether_protocol::ui::Edges {
+                    // No bottom border: that is what makes the box a single row, and it is the
+                    // server that drops it — see `render_window`.
+                    border: aether_protocol::ui::Sides {
+                        top: 1,
+                        left: 1,
+                        right: 1,
+                        bottom: 0,
+                    },
+                    padding: aether_protocol::ui::Sides::ZERO,
+                    collapse: false,
+                },
+                aether_protocol::ui::Band::Chrome,
+                vec![UiElement::text(title, Vec::new())],
+                vec![Element::Editor {
+                    element,
+                    buffer: 10 + element as u64,
+                    rows: 0,
+                    first_row: ElementRow::ZERO,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
+                    collapsed: true,
+                    first_buffer_line: 0,
+                    lines: Vec::new(),
+                }],
+            )
+        };
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![folded(0, "run cargo test"), folded(1, "read main.rs")],
+        };
+        let mut ed = editor_over(root, 0);
+        ed.focused_element = 1;
+        let state = crate::app::test_state(ed);
+
+        let rows = painted_cells(&state);
+        let text_of =
+            |r: &Vec<(String, Color)>| r.iter().map(|(s, _)| s.as_str()).collect::<String>();
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|r| text_of(r).contains(needle))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no row reading {needle:?}:\n{}",
+                        rows.iter().map(text_of).collect::<Vec<_>>().join("\n")
+                    )
+                })
+        };
+        // Two calls, two rows — folded, each box costs exactly the row its name rides.
+        let first = row_of("run cargo test");
+        let second = row_of("read main.rs");
+        assert_eq!(
+            second,
+            first + 1,
+            "a folded box spent more than its title row:\n{}",
+            rows.iter().map(text_of).collect::<Vec<_>>().join("\n")
+        );
+
+        // And the focused one wears the cursorline, the unfocused one the ground.
+        let bg_of = |row: usize| rows[row][TEST_PAINT_COLS as usize / 2].1;
+        assert_eq!(
+            bg_of(second),
+            c(th().cursor_line_bg),
+            "the focused folded call is not marked, so the cursor is nowhere on screen"
+        );
+        assert_eq!(
+            bg_of(first),
+            c(th().bg_app),
+            "an unfocused folded call wears the cursorline too — every box would look focused"
         );
     }
 

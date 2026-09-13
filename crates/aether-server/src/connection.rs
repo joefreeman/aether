@@ -54,8 +54,8 @@ use aether_protocol::syntax::SyntaxHighlightSnippet;
 use aether_protocol::view::{ViewClose, ViewFollowLine, ViewOpen, ViewSetRead, ViewSetTransient};
 use aether_protocol::view::{ViewInterrupt, ViewSubmitInput};
 use aether_protocol::viewport::{
-    ViewSave, ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportSetWrap,
-    ViewportSubscribe, ViewportWindow, ViewportWindowAtCursor,
+    ViewSave, ViewportFocusElement, ViewportNavigateChange, ViewportResize, ViewportSetExpanded,
+    ViewportSetWrap, ViewportSubscribe, ViewportWindow, ViewportWindowAtCursor,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceAddProject, WorkspaceAddRoot, WorkspaceBindWorktree,
@@ -524,6 +524,7 @@ async fn dispatch(
             run!(ViewportWindowAtCursor, handlers::viewport_window_at_cursor)
         }
         ViewportSetWrap::NAME => run!(ViewportSetWrap, handlers::viewport_set_wrap),
+        ViewportSetExpanded::NAME => run!(ViewportSetExpanded, handlers::viewport_set_expanded),
         ViewportFocusElement::NAME => {
             run!(ViewportFocusElement, handlers::viewport_focus_element)
         }

@@ -4797,6 +4797,19 @@ pub struct Viewport {
     /// been inert — and becomes load-bearing the moment they don't: it is what decides which
     /// *buffer* an edit, a search, a motion or an undo acts on. An index into the view's elements.
     pub focused: aether_protocol::viewport::FieldId,
+
+    /// The collapsible elements this viewport has **opened up**, by the buffer each windows.
+    ///
+    /// The expanded set rather than the collapsed one, so that folded-by-default costs nothing:
+    /// an empty set is every tool call shut, a block the agent adds mid-turn arrives shut without
+    /// anyone deciding it should, and there is no moment where a new element's default has to be
+    /// written down.
+    ///
+    /// Keyed by **buffer**, not by element index, because a block *is* a document: its buffer id
+    /// is stable for the life of the conversation while its index is positional — the input
+    /// element's index moves every time a block is appended. An index would have quietly folded
+    /// the wrong block as the turn went on.
+    pub expanded: std::collections::HashSet<BufferId>,
 }
 
 /// What a view is composed of: its elements, in order, each windowing some buffer.
@@ -4843,6 +4856,7 @@ impl View {
                 role: aether_protocol::ui::ElementRole::Field,
                 edges: aether_protocol::ui::Edges::NONE,
                 box_group: None,
+                collapsible: false,
                 title: Default::default(),
                 band: aether_protocol::ui::Band::None,
             }],
@@ -4941,6 +4955,7 @@ impl View {
                 role: aether_protocol::ui::ElementRole::Field,
                 edges: boxed,
                 box_group: Some(i as u32),
+                collapsible: false,
                 title: std::sync::Arc::new(crate::shell::run_title(run)),
                 band: Band::Chrome,
             })
@@ -4961,6 +4976,7 @@ impl View {
             role: aether_protocol::ui::ElementRole::Input,
             edges: boxed,
             box_group: Some(t.runs.len() as u32),
+            collapsible: false,
             title: std::sync::Arc::new(crate::shell::input_title(&t.cwd)),
             band: Band::Chrome,
         });
@@ -5038,6 +5054,14 @@ impl View {
                     role: aether_protocol::ui::ElementRole::Field,
                     edges: if bare { Edges::NONE } else { boxed },
                     box_group: (!bare).then_some(i as u32),
+                    // **The machinery folds; the conversation does not.** The same line `bare`
+                    // draws for the box, and for the same reason: what is boxed is a named thing
+                    // that happened, so its title row still says what it was when it is shut. A
+                    // reply has no title — it *is* the text — so folded it would be a rule with
+                    // nothing to account for it.
+                    //
+                    // Except while it is asking: see [`crate::agent::awaits_permission`].
+                    collapsible: !bare && !crate::agent::awaits_permission(&block.kind),
                     title: std::sync::Arc::new(if bare {
                         Vec::new()
                     } else {
@@ -5068,6 +5092,7 @@ impl View {
             // permission"). What is left is the line you are typing on, and the cursor is in it.
             edges: Edges::NONE,
             box_group: None,
+            collapsible: false,
             title: Default::default(),
             band: Band::None,
         });
@@ -5110,6 +5135,7 @@ impl View {
                     role: aether_protocol::ui::ElementRole::Field,
                     edges: aether_protocol::ui::Edges::NONE,
                     box_group: None,
+                    collapsible: false,
                     title: Default::default(),
                     band: aether_protocol::ui::Band::None,
                 })
@@ -5249,6 +5275,7 @@ impl ElementLayout {
             role: self.role,
             edges: self.edges,
             box_group: self.box_group,
+            collapsible: false,
             title: self.title.clone(),
             band: self.band,
         }
@@ -5355,6 +5382,15 @@ pub struct ElementBinding {
     /// the whole view addresses them that way. Consecutiveness is the driver's guarantee: a patch's
     /// file blocks are contiguous by construction, and nothing else builds boxes yet.
     pub box_group: Option<u32>,
+    /// Whether this element may be **folded shut** — `view/set_expanded` refuses every element
+    /// that says no.
+    ///
+    /// The driver's call, because folding only makes sense where the box already says what is
+    /// inside it: an agent's tool call is named by its title row, so folded it still reads
+    /// "✓ Running cargo test", while a reply folded to a rule would be a blank you could not
+    /// account for. It is *not* the same question as "is this element boxed" — a patch's file
+    /// blocks are boxed and nothing folds them yet — so it is a field rather than a derivation.
+    pub collapsible: bool,
     /// What the box this element **opens** says on its top border: the run's directory and
     /// outcome, for a shell. Empty for every element that opens no box and for every box with
     /// nothing to say.
@@ -5369,8 +5405,12 @@ pub struct ElementBinding {
 
 impl ElementBinding {
     /// Whether the element windows no lines at all — a shell run that said nothing. Such an
-    /// element is drawn (its box, its title, its chrome) but never focused or stepped to: there
-    /// is no line in it for a cursor to sit on.
+    /// element is drawn (its box, its title, its chrome) but never stepped to: there is no line
+    /// in it for a cursor to sit on.
+    ///
+    /// Deliberately asks about the element's **extent**, not about how many rows a viewport is
+    /// currently showing of it: a folded element windows its lines as much as ever and *is*
+    /// stepped to, which is the distinction `Viewport::expanded` rests on.
     pub fn is_empty(&self) -> bool {
         match self.lines {
             ElementLines::Whole => false,
@@ -5601,6 +5641,7 @@ mod view_layout_tests {
     /// behind. A whole-buffer element would make the two spaces coincide and prove nothing.
     fn two_hunks() -> Vec<ElementBinding> {
         let binding = |buffer_id| ElementBinding {
+            collapsible: false,
             buffer_id,
             lines: ElementLines::Range {
                 start: 10,
@@ -5688,6 +5729,7 @@ mod view_layout_tests {
         );
         let view_id = s.view_presenting(patch).expect("the layout's view");
         let vp = Viewport {
+            expanded: Default::default(),
             id: 1,
             client_id: uuid::Uuid::new_v4(),
             view_id,
@@ -5774,6 +5816,7 @@ mod view_layout_tests {
         );
         let view = s.view_presenting(patch).expect("the layout's view");
         let vp = Viewport {
+            expanded: Default::default(),
             id: 1,
             client_id: uuid::Uuid::new_v4(),
             view_id: view,
@@ -6122,6 +6165,7 @@ mod transcript_tests {
             "a fresh shell is only its input"
         );
         let viewport = |id, focused| Viewport {
+            expanded: Default::default(),
             id,
             client_id: uuid::Uuid::new_v4(),
             view_id: view,
@@ -7258,6 +7302,7 @@ mod workspace_state_tests {
         s.viewports.insert(
             viewport_id,
             Viewport {
+                expanded: Default::default(),
                 id: viewport_id,
                 view_id: viewed_view,
                 focused: 0,

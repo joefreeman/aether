@@ -646,6 +646,40 @@ pub struct ViewportFocusElementResult {
     pub buffer_status: BufferStatusSnapshot,
 }
 
+// ---- view/set_expanded --------------------------------------------------------------------------
+
+/// Fold one of a view's elements shut, or open it up.
+///
+/// **Per viewport, not per view** — the same reason `git/set_diff_view` is: two clients reading one
+/// conversation fold different blocks, and neither should move the other's. It is a fact about what
+/// *this* screen is showing, so it rides the viewport and dies with it.
+///
+/// Only the elements a view marked collapsible answer to this; everything else refuses. That is
+/// what keeps folding a property of the machinery a view builds — an agent's tool calls, its diffs,
+/// its plan — rather than something a client can do to any element it can name. An agent's own
+/// reply is not foldable, because the conversation is the thing you came to read.
+///
+/// Returns the rebuilt window rather than an acknowledgement: folding changes every row below the
+/// fold, so a client would have to ask for one immediately anyway.
+pub struct ViewportSetExpanded;
+impl RpcMethod for ViewportSetExpanded {
+    const NAME: &'static str = "view/set_expanded";
+    type Params = ViewportSetExpandedParams;
+    type Result = ViewportWindowResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewportSetExpandedParams {
+    pub viewport_id: ViewportId,
+    /// Which element to fold. Absolute, never relative: the key that presses this names the
+    /// focused element, and focus is the client's to report rather than the server's to re-derive.
+    pub element: FieldId,
+    /// `None` toggles, which is what a key press means. `Some` is for the caller that knows which
+    /// state it wants — expand-on-reveal, when something scrolls a folded block into view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded: Option<bool>,
+}
+
 // ---- viewport/navigate_change -------------------------------------------------------------------
 
 /// Step to the next or previous **change** in a view — `c` / `Alt-c`, whatever the view shows.

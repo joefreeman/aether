@@ -2739,6 +2739,7 @@ impl Shell {
                     first_row: aether_protocol::coords::ElementRow::ZERO,
                     laid_out_by: aether_protocol::ui::LayoutOwner::Server,
                     role: aether_protocol::ui::ElementRole::Field,
+                    collapsed: false,
                     first_buffer_line: 0,
                     lines: Vec::new(),
                 }),
@@ -3652,6 +3653,7 @@ mod scroll_tests {
                 Vec::new(),
             )]));
             children.push(Element::Editor {
+                collapsed: false,
                 element: i as u32,
                 buffer: *buffer,
                 rows: *height,
@@ -4127,6 +4129,7 @@ mod scroll_tests {
         aether_client::grid::prune_measured(
             &mut sh.measured,
             &aether_protocol::viewport::Element::Editor {
+                collapsed: false,
                 element: 0,
                 buffer: 1,
                 rows: 1,

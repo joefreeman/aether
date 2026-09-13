@@ -248,6 +248,7 @@ fn chrome(text: &str) -> ViewElement {
 
 fn editor(element: u32, buffer: u64, first: u32, lines: Vec<LogicalLineRender>) -> ViewElement {
     ViewElement::Editor {
+        collapsed: false,
         element,
         buffer,
         rows: lines.len() as u32,
@@ -257,6 +258,37 @@ fn editor(element: u32, buffer: u64, first: u32, lines: Vec<LogicalLineRender>) 
         first_buffer_line: first,
         lines,
     }
+}
+
+/// A box holding one **folded** element: no bottom border, so the whole box is the row its name
+/// rides. What `render_window` sends for a collapsed tool call.
+fn folded(element: u32, title: &str) -> ViewElement {
+    use aether_protocol::ui::{Band, Edges, Sides};
+    ViewElement::titled(
+        Edges {
+            border: Sides {
+                top: 1,
+                left: 1,
+                right: 1,
+                bottom: 0,
+            },
+            padding: Sides::ZERO,
+            collapse: false,
+        },
+        Band::Chrome,
+        vec![ViewElement::text(title, Vec::new())],
+        vec![ViewElement::Editor {
+            element,
+            buffer: 10 + element as u64,
+            rows: 0,
+            first_row: ElementRow::ZERO,
+            laid_out_by: LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
+            collapsed: true,
+            first_buffer_line: 0,
+            lines: Vec::new(),
+        }],
+    )
 }
 
 fn window_of(children: Vec<ViewElement>) -> Window {
@@ -293,6 +325,7 @@ fn app_showing(window: Window) -> App {
 /// A shell's input element: an editor like any other, marked so the client can find it.
 fn input(element: u32, buffer: u64, lines: Vec<LogicalLineRender>) -> ViewElement {
     ViewElement::Editor {
+        collapsed: false,
         element,
         buffer,
         rows: lines.len() as u32,
@@ -359,6 +392,7 @@ fn shell_of(runs: u32, tail_loaded: bool) -> Window {
             editor(n, 7, n, vec![line(n, "out")])
         } else {
             ViewElement::Editor {
+                collapsed: false,
                 element: n,
                 buffer: 7,
                 rows: 1,
@@ -526,6 +560,7 @@ fn two_files_second_unloaded() -> Window {
         editor(0, 7, 10, vec![line(10, "from alpha")]),
         chrome("beta.rs"),
         ViewElement::Editor {
+            collapsed: false,
             element: 1,
             buffer: 8,
             rows: 40,
@@ -1200,6 +1235,60 @@ impl Selector for ProseBounds {
     fn description(&self) -> String {
         format!("prose container {:?}", self.0)
     }
+}
+
+/// A **folded** tool call costs one row, and it is the row its title rides.
+///
+/// Row layout, which is what this harness is for — the cursorline fill that marks the focused one
+/// is pixels, and deliberately not compared. What would break here is the fold spending a second
+/// row on a bottom rule it should not have, which is the difference between a conversation that
+/// skims and one that still scrolls.
+#[test]
+fn a_folded_call_is_one_titled_row() {
+    let window = window_of(vec![
+        chrome("You"),
+        editor(0, 10, 0, vec![line(0, "fix the parser")]),
+        chrome(""),
+        folded(1, "Running cargo test"),
+        chrome(""),
+        folded(2, "Reading main.rs"),
+        chrome(""),
+        input(3, 13, vec![line(0, "and now this")]),
+    ]);
+    let mut session = session_showing(window);
+    session.view.focused_element = 2;
+    let app = laid_out(app_with(session));
+    let mut sim = simulate(&app);
+    let rows = rows(&mut sim);
+    // In **pixels**, not in the index of the text-bearing rows: `rows` skips the blank chrome
+    // between the boxes, so an index comparison would read the same whether or not each fold
+    // spent a closing rule. That rule is exactly what this is here to catch.
+    let y_of = |needle: &str| {
+        seen(&mut simulate(&app))
+            .into_iter()
+            .find(|s| s.visible && s.text.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not on the frame:\n{}", rows.join("\n")))
+            .bounds
+            .y
+    };
+    // One row, measured off the frame itself rather than off `app.cell`: the speaker chrome and
+    // the prompt under it are adjacent by construction, and the rasteriser's leading is its own.
+    let row_px = y_of("fix the parser") - y_of("You");
+    let gap = y_of("Reading main.rs") - y_of("Running cargo test");
+    // The title row, then the blank chrome row between the boxes — and no rule below either name.
+    assert!(
+        (gap - row_px * 2.0).abs() < 1.0,
+        "a folded box spent {gap} px where two rows are {}: it drew a rule below its name\n{}",
+        row_px * 2.0,
+        rows.join("\n")
+    );
+    // And the call's output is nowhere on screen, which is the point of the fold.
+    assert!(
+        !rows.iter().any(|r| r.contains("passed")),
+        "a folded call painted its output:\n{}",
+        rows.join("\n")
+    );
+    snapshot(&mut sim, &app, "agent-folded");
 }
 
 /// The reply renders as **real type**, in the layer over the editor: a container of its own,

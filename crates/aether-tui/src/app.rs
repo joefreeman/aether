@@ -675,6 +675,7 @@ pub(crate) fn test_editor_state() -> EditorState {
         unsaved: false,
         markdown: Default::default(),
         root: aether_protocol::viewport::Element::Editor {
+            collapsed: false,
             element: 0,
             buffer: 0,
             rows: 0,
@@ -1288,6 +1289,7 @@ mod tests {
             unsaved: false,
             markdown: Default::default(),
             root: aether_protocol::viewport::Element::Editor {
+                collapsed: false,
                 element: 0,
                 buffer: 0,
                 rows: 0,

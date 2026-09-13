@@ -456,6 +456,29 @@ describe("the box stylesheet", () => {
     );
   });
 
+  /** Prose is one block among rows, so its text has to start in the same column theirs does.
+   *
+   *  A row reaches that column two ways at once: the gutter, which is a real element inside it,
+   *  and the cells of whatever box encloses it, which are `--inset-*` padding. A reply carries no
+   *  gutter element, so there the column is padding too — and the two have to add up to the same
+   *  start. Both native shells spell the sum out (`inset.left + GUTTER`); getting it wrong is
+   *  invisible to a row walk and plain on screen, with the whole reply hanging a column left of
+   *  every line around it. The gutter's own width is named rather than spelled so the two rules
+   *  cannot drift apart. */
+  it("starts prose in the column a row's text starts in", () => {
+    // The declaration block, not the `.row.patch-chrome .gutter` override that precedes it.
+    expect(rule(".gutter {\n  flex:"), "the gutter's column is named, not spelled").toContain(
+      "width: var(--gutter-w)",
+    );
+    const box = rule(".md-reply-box {");
+    expect(box, "prose stands the gutter column off in padding, having no gutter element").toContain(
+      "padding-left: calc(var(--inset-left, 0px) + var(--gutter-w))",
+    );
+    expect(box, "and gives up the enclosing box's cells, as a row does").toContain(
+      "padding-right: var(--inset-right, 0px)",
+    );
+  });
+
   /** Both rails read one offset, each measured from its own edge.
    *
    *  A percentage in `background-position` resolves against the positioning area **minus the
@@ -885,6 +908,118 @@ describe("a prose element", () => {
       c.classList.contains("md-reply-box") ? "reply" : c.textContent,
     );
     expect(order).toEqual(["before", "reply", "after"]);
+  });
+
+  /** A reply inside a box gives up the box's cells, exactly as the rows beside it do — the
+   *  stylesheet adds the gutter column on top of whatever lands here. Prose *not* in a box leaves
+   *  the properties unset, which is the case the `0px` fallback in that rule covers: an agent's
+   *  reply is bare, so it is also the common one. */
+  it("gives up the cells of a box it sits inside", () => {
+    const inBox: BufferWindow = {
+      root: {
+        node: "column",
+        children: [
+          {
+            node: "column",
+            edges: { border: { top: 1, left: 1 }, padding: { left: 1 }, collapse: true },
+            band: "chrome",
+            children: [
+              { node: "prose", element: 0, blocks: replyBlocks("Heading", "body") },
+              { node: "editor", element: 1, buffer: 2, rows: 1, first_row: 0, first_buffer_line: 0, lines: [line(0, "after")] },
+            ],
+          },
+        ],
+      },
+      max_line_width: 20,
+    } as unknown as BufferWindow;
+
+    const boxed = renderOnly(inBox).querySelector(".md-reply-box") as HTMLElement;
+    expect(boxed.style.getPropertyValue("--inset-left"), boxed.className).toBe("2ch");
+
+    const bare = renderOnly(
+      {
+        root: {
+          node: "column",
+          children: [
+            { node: "prose", element: 0, blocks: replyBlocks("Heading", "body") },
+            { node: "editor", element: 1, buffer: 2, rows: 1, first_row: 0, first_buffer_line: 0, lines: [line(0, "after")] },
+          ],
+        },
+        max_line_width: 20,
+      } as unknown as BufferWindow,
+    ).querySelector(".md-reply-box") as HTMLElement;
+    expect(bare.style.getPropertyValue("--inset-left"), bare.className).toBe("");
+  });
+});
+
+describe("a folded element", () => {
+  /** A box holding one folded editor: no bottom border, so the whole box is the row its name
+   *  rides. That is what the server sends for a collapsed tool call. */
+  const folded = (element: number, title: string, collapsed = true): ViewNode => ({
+    node: "column",
+    edges: { border: { top: 1, left: 1, right: 1 }, collapse: false },
+    band: "chrome",
+    title: [{ node: "text", text: title, highlights: [] }],
+    children: [
+      {
+        node: "editor",
+        element,
+        buffer: 10 + element,
+        rows: collapsed ? 0 : 1,
+        first_row: 0,
+        first_buffer_line: 0,
+        collapsed,
+        lines: collapsed ? [] : [line(0, "test result: ok")],
+      },
+    ],
+  }) as unknown as ViewNode;
+
+  const paint = (root: ViewNode, focusedElement: number): HTMLElement => {
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window: { root, max_line_width: 40 } as unknown as BufferWindow,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement,
+    });
+    return container;
+  };
+
+  /** The whole of option B in one assertion: a folded element has no row of its own, so the row
+   *  that says "the cursor is here" is the box's title row. Without it, `Tab` into a folded call
+   *  lands somewhere invisible and the view reads as frozen. */
+  it("marks the title row of the folded element the cursor is in", () => {
+    const root = {
+      node: "column",
+      children: [folded(0, "run cargo test"), folded(1, "read main.rs")],
+    } as unknown as ViewNode;
+    const rows = [...paint(root, 1).querySelectorAll(".row")];
+    // Two calls, two rows — folded, each box costs exactly the row its name rides.
+    expect(rows.map((r) => r.textContent?.trim())).toEqual(["run cargo test", "read main.rs"]);
+    expect(rows[1].classList.contains("cursor-line"), rows[1].className).toBe(true);
+    expect(
+      rows[0].classList.contains("cursor-line"),
+      "an unfocused folded call wears it too, so every box looks focused",
+    ).toBe(false);
+  });
+
+  /** The mark belongs to *folding*, not to focus: an expanded element's own rows carry the
+   *  cursor, and marking its box's title row as well would put the tint on two rows at once. */
+  it("leaves an expanded element's box alone", () => {
+    const root = {
+      node: "column",
+      children: [folded(0, "run cargo test", false)],
+    } as unknown as ViewNode;
+    const edge = paint(root, 0).querySelector(".row.box-edge");
+    expect(edge?.classList.contains("cursor-line"), edge?.className).toBe(false);
   });
 });
 

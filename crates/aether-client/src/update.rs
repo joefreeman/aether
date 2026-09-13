@@ -360,6 +360,9 @@ pub enum Event {
         enabled: bool,
         result: Result<ViewportWindowResult, String>,
     },
+    /// `Space v e`: an element was folded shut or opened up. No flag rides along — which way it
+    /// went is in the window that came back, and the server decided it.
+    ExpandToggled(Result<ViewportWindowResult, String>),
     PickerViewed {
         initial: bool,
         result: Result<PickerViewResult, String>,
@@ -2067,6 +2070,17 @@ impl Session {
                     }
                 }
                 Err(e) => Effects::error_detail("Resolve failed", e),
+            },
+
+            Event::ExpandToggled(result) => match result {
+                Ok(r) => {
+                    self.replace_window(r.window);
+                    Effects::one(Effect::WindowAdopted)
+                }
+                // The refusal a non-folding element gives back. Said out loud rather than
+                // swallowed: the key was pressed, and a window that came back identical is
+                // indistinguishable from a dropped keystroke.
+                Err(e) => Effects::error_detail("Nothing to fold here", e),
             },
 
             Event::DiffViewSet { enabled, result } => match result {
@@ -10715,6 +10729,27 @@ impl Session {
             // One action for both kinds, and no client-side guess about which kind this is: the
             // server answers `interrupted: false` for a view running nothing — a file, an idle
             // shell, an idle conversation alike — and that one answer produces the one toast.
+            A::ToggleExpand => {
+                let Some(viewport_id) = self.view.viewport_id else {
+                    return Effects::none();
+                };
+                // Same shape as the diff toggle, and for the same reason: folding re-lays out
+                // every row below the fold, so the content anchor is captured against the window
+                // on screen now and restored when the rebuilt one is adopted. Without it, folding
+                // a block above the viewport would slide everything you were reading.
+                let mut fx = Effects::one(Effect::SaveContentAnchor);
+                fx = fx.and(
+                    self.request_str::<aether_protocol::viewport::ViewportSetExpanded>(
+                        aether_protocol::viewport::ViewportSetExpandedParams {
+                            viewport_id,
+                            element: self.view.focused_element,
+                            expanded: None,
+                        },
+                        Event::ExpandToggled,
+                    ),
+                );
+                fx
+            }
             A::Interrupt => self.request::<aether_protocol::view::ViewInterrupt>(
                 aether_protocol::view::ViewInterruptParams {
                     view_id: self.view.view_id,
@@ -12260,6 +12295,7 @@ mod tests {
             max_line_width: 0,
             git_status: None,
             root: Element::Editor {
+                collapsed: false,
                 element: 0,
                 buffer,
                 rows: 1,

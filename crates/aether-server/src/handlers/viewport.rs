@@ -96,6 +96,10 @@ pub async fn viewport_subscribe(
             id: viewport_id,
             view_id: params.view_id,
             focused,
+            // Everything foldable starts folded, and an empty set is what says so — see
+            // `Viewport::expanded`. A reopened conversation therefore opens shut, which is the
+            // right default for a record you are coming back to skim.
+            expanded: Default::default(),
             client_id,
             rows: params.rows,
             overscan_rows: params.overscan_rows,
@@ -369,21 +373,31 @@ pub async fn viewport_focus_element(
     let view = s.view_of(vp);
 
     let last = view.elements.len().saturating_sub(1) as u32;
-    // A step lands on the nearest element in that direction that has a line to land on — one
-    // with no lines (a shell run that said nothing) is drawn but skipped — and stays put when
-    // there is none.
-    let has_lines = |i: u32| view.elements.get(i as usize).is_some_and(|e| !e.is_empty());
+    // A step lands on the nearest element in that direction there is something to land *on*, and
+    // stays put when there is none.
+    //
+    // Two ways to qualify, and the split matters. An element with lines has somewhere to put the
+    // cursor — that is the ordinary case, and one with none (a shell run that said nothing) is
+    // drawn but skipped, because stopping there would be a press that visibly did nothing. A
+    // **collapsible** element qualifies whether or not it is folded: folded, its title row is the
+    // whole of it and unfolding it is the thing you came to do, so a step that skipped it would
+    // put every tool call in a conversation permanently out of reach.
+    let stoppable = |i: u32| {
+        view.elements
+            .get(i as usize)
+            .is_some_and(|e| !e.is_empty() || e.collapsible)
+    };
     let focused = match params.target {
         FocusTarget::Step {
             direction: FocusStep::Next,
         } => (vp.focused + 1..=last)
-            .find(|&i| has_lines(i))
+            .find(|&i| stoppable(i))
             .unwrap_or(vp.focused),
         FocusTarget::Step {
             direction: FocusStep::Previous,
         } => (0..vp.focused)
             .rev()
-            .find(|&i| has_lines(i))
+            .find(|&i| stoppable(i))
             .unwrap_or(vp.focused),
         // Clamped rather than refused: an id names an element the client just saw, and a view that
         // rebuilt underneath it is a stale id, not a protocol error.
@@ -1213,6 +1227,50 @@ pub async fn viewport_set_wrap(
     let mut s = state.lock().await;
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
     vp.wrap = params.wrap;
+    let window = render_viewport(&s, params.viewport_id, SneakLabels::Shown);
+    Ok(ViewportWindowResult { window })
+}
+
+/// `view/set_expanded`: fold one of the view's elements shut, or open it up.
+///
+/// Refuses an element the view did not mark collapsible, rather than silently doing nothing: a
+/// client pressing the key on a reply has asked for something the view has no answer to, and a
+/// window that came back unchanged would read as a dropped keystroke. That refusal is also what
+/// holds the "a block that is asking you something never folds" rule, since such a block reports
+/// itself uncollapsible for exactly as long as the question stands.
+pub async fn viewport_set_expanded(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::viewport::ViewportSetExpandedParams,
+) -> Result<ViewportWindowResult, RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    require_viewport_mut(&mut s, params.viewport_id, client_id)?;
+
+    let vp = &s.viewports[&params.viewport_id];
+    let binding = s
+        .view_of(vp)
+        .elements
+        .get(params.element as usize)
+        .filter(|e| e.collapsible)
+        .ok_or_else(|| {
+            RpcError::invalid_params(format!("element {} does not fold", params.element))
+        })?;
+    let buffer_id = binding.buffer_id;
+    // The *expanded* set, so the toggle's sense reads backwards from the key's: pressing it on a
+    // folded element inserts, pressing it on an open one removes.
+    let expanded = params.expanded.unwrap_or(!vp.expanded.contains(&buffer_id));
+
+    let vp = s
+        .viewports
+        .get_mut(&params.viewport_id)
+        .expect("checked above");
+    if expanded {
+        vp.expanded.insert(buffer_id);
+    } else {
+        vp.expanded.remove(&buffer_id);
+    }
+
     let window = render_viewport(&s, params.viewport_id, SneakLabels::Shown);
     Ok(ViewportWindowResult { window })
 }
@@ -2315,6 +2373,10 @@ struct RenderedElement {
     edges: aether_protocol::ui::Edges,
     band: aether_protocol::ui::Band,
     title: std::sync::Arc<Vec<Element>>,
+    /// Folded shut for this viewport — see [`aether_protocol::ui::Element::Editor`]'s `collapsed`.
+    /// Carried rather than re-derived because by the time `compose_tree` runs, a folded element is
+    /// indistinguishable from one with nothing loaded: both have no rows and no lines.
+    collapsed: bool,
     /// The parsed markdown this element renders as, when it is prose rather than lines, and the
     /// line table that says where the text it was parsed from begins each line. Parsed **here**,
     /// once, rather than in each shell: the server already holds the document and the parser, and
@@ -2379,6 +2441,10 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         let element = idx as aether_protocol::viewport::FieldId;
         let range = layout.element_range(element);
         let doc = s.doc_of(binding.buffer_id);
+        // Folded shut for this viewport: it windows its lines as ever, and none of them are going
+        // out. Everything below follows from this one flag — no rows, no lines, no parse, and the
+        // box loses its bottom border so the whole element is the single row its title rides.
+        let collapsed = binding.collapsible && !vp.expanded.contains(&binding.buffer_id);
         let loaded = vp
             .loaded
             .get(idx)
@@ -2390,42 +2456,72 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         // Prose ships its parse and nothing else: rendering its lines as well would wrap, highlight
         // and diff text no shell will ever paint, on every frame of a conversation. An element is
         // prose by construction (an agent's reply) or because this client reads the file.
-        let prose = (binding.prose || reading).then(|| element_prose(doc, range));
-        let (first_row, first_buffer_line, lines) = match loaded.filter(|_| prose.is_none()) {
-            Some(r) => (
-                element_rows_before(doc, geom, phantom_rows, range, r.start()),
-                r.start(),
-                render_element_lines(
-                    s,
-                    client_id,
-                    binding,
+        let prose = (binding.prose || reading)
+            .then(|| element_prose(doc, range))
+            .filter(|_| !collapsed);
+        let (first_row, first_buffer_line, lines) =
+            match loaded.filter(|_| prose.is_none() && !collapsed) {
+                Some(r) => (
+                    element_rows_before(doc, geom, phantom_rows, range, r.start()),
                     r.start(),
-                    r.end_exclusive(),
-                    geom,
-                    diff_view,
-                    sneak_labels,
+                    render_element_lines(
+                        s,
+                        client_id,
+                        binding,
+                        r.start(),
+                        r.end_exclusive(),
+                        geom,
+                        diff_view,
+                        sneak_labels,
+                    ),
                 ),
-            ),
-            None => (ElementRow::ZERO, range.start(), Vec::new()),
-        };
+                None => (ElementRow::ZERO, range.start(), Vec::new()),
+            };
         rendered.push(RenderedElement {
             element,
             buffer: binding.buffer_id,
             // The element's *whole* height, from the layout's clamped range rather than the raw
-            // extents: the diff's account of a hunk can outlive the lines it described.
-            rows: element_visual_rows(doc, range, geom, phantom_rows),
+            // extents: the diff's account of a hunk can outlive the lines it described. Folded,
+            // that height is zero — the element is still in the tree, still carrying its place in
+            // the view, and occupying no rows of it.
+            rows: if collapsed {
+                0
+            } else {
+                element_visual_rows(doc, range, geom, phantom_rows)
+            },
             first_row,
             laid_out_by: binding.laid_out_by,
             role: binding.role,
-            chrome_above: binding.chrome_above.clone(),
+            // Chrome *inside* the box — a tool call's permission question — folds with it. A block
+            // that is asking something never folds in the first place, so nothing a fold hides is
+            // ever waiting on an answer.
+            chrome_above: if collapsed {
+                Default::default()
+            } else {
+                binding.chrome_above.clone()
+            },
             chrome_before: binding.chrome_before.clone(),
             first_buffer_line,
             lines,
             box_group: binding.box_group,
-            edges: binding.edges,
+            // Drop the bottom border, so the box is the one row its title rides. The painters
+            // already spell this: a top edge with nothing below it resolves to the same join a
+            // run of collapsed boxes tees together with.
+            edges: if collapsed {
+                aether_protocol::ui::Edges {
+                    border: aether_protocol::ui::Sides {
+                        bottom: 0,
+                        ..binding.edges.border
+                    },
+                    ..binding.edges
+                }
+            } else {
+                binding.edges
+            },
             band: binding.band,
             title: binding.title.clone(),
             prose,
+            collapsed,
         });
     }
 
@@ -2623,6 +2719,7 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
             first_row: r.first_row,
             laid_out_by: r.laid_out_by,
             role: r.role,
+            collapsed: r.collapsed,
             first_buffer_line: r.first_buffer_line,
             lines: r.lines,
         },
@@ -3304,6 +3401,7 @@ mod slice_tests {
 
     fn whole(doc: &Document) -> BufferRange {
         let binding = ElementBinding {
+            collapsible: false,
             buffer_id: 1,
             lines: ElementLines::Whole,
             decorations: None,
@@ -3420,6 +3518,7 @@ mod tests {
                 elements: buffers
                     .into_iter()
                     .map(|buffer_id| ElementBinding {
+                        collapsible: false,
                         buffer_id,
                         lines: ElementLines::Range {
                             start: 0,
@@ -3440,6 +3539,7 @@ mod tests {
             },
         );
         Viewport {
+            expanded: Default::default(),
             id: 1,
             view_id,
             client_id: uuid::Uuid::new_v4(),
@@ -3670,6 +3770,7 @@ mod tests {
         let a = buffer_with(&mut s, "/a.txt", "alpha\nbravo\ncharlie\n");
         let b = buffer_with(&mut s, "/b.txt", "one\ntwo\nthree-longest\n");
         let binding = |buffer_id| ElementBinding {
+            collapsible: false,
             buffer_id,
             lines: ElementLines::Range {
                 start: 0,

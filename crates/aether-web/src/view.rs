@@ -588,6 +588,7 @@ mod tests {
                 children: vec![
                     chrome.clone(),
                     Element::Editor {
+                        collapsed: false,
                         element: 0,
                         buffer: 7,
                         rows: 2,
@@ -599,6 +600,7 @@ mod tests {
                     },
                     chrome,
                     Element::Editor {
+                        collapsed: false,
                         element: 1,
                         buffer: 8,
                         rows: 2,

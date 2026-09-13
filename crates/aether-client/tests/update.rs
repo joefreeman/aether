@@ -243,6 +243,7 @@ fn goto_line_from_end_counts_up_from_the_bottom() {
         max_line_width: 0,
         git_status: None,
         root: aether_protocol::viewport::Element::Editor {
+            collapsed: false,
             element: 0,
             buffer: 0,
             rows: 0,
@@ -3015,6 +3016,7 @@ fn diff_toggle_toast_is_grouped() {
         max_line_width: 0,
         git_status: None,
         root: aether_protocol::viewport::Element::Editor {
+            collapsed: false,
             element: 0,
             buffer: 0,
             rows: 0,
@@ -6735,6 +6737,7 @@ fn abandoning_a_stopped_operation_confirms_and_names_it() {
             ..Default::default()
         }),
         root: aether_protocol::viewport::Element::Editor {
+            collapsed: false,
             element: 0,
             buffer: 0,
             rows: 0,
@@ -7585,6 +7588,7 @@ fn space_k_refuses_a_view_with_another_element_dirty() {
         max_line_width: 0,
         git_status: None,
         root: aether_protocol::viewport::Element::Editor {
+            collapsed: false,
             element: 0,
             buffer: 0,
             rows: 0,
@@ -11192,6 +11196,7 @@ fn editor_subscribe(buffer_id: u64) -> aether_protocol::viewport::ViewportSubscr
             max_line_width: 0,
             git_status: None,
             root: Element::Editor {
+                collapsed: false,
                 element: 0,
                 buffer: buffer_id,
                 rows: 1,
@@ -13502,6 +13507,7 @@ fn subscribe_over(
             max_line_width: 0,
             git_status: None,
             root: Element::Editor {
+                collapsed: false,
                 element: 0,
                 buffer: element_buffer,
                 rows: 3,
@@ -13704,6 +13710,7 @@ fn a_press_in_another_element_focuses_it_before_setting_the_cursor() {
             children: vec![
                 w.root.clone(),
                 aether_protocol::viewport::Element::Editor {
+                    collapsed: false,
                     element: 1,
                     buffer: 12,
                     rows: 3,
@@ -14625,6 +14632,7 @@ fn a_prose_block_does_not_turn_a_conversation_into_the_reader() {
     let block = reader.window.root.clone();
     assert!(matches!(block, Element::Prose { .. }), "the reply is prose");
     let input = Element::Editor {
+        collapsed: false,
         element: 1,
         buffer: s.view.buffer.buffer_id + 1,
         rows: 1,

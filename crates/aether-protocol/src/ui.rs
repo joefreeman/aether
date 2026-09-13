@@ -99,6 +99,18 @@ pub enum Element {
         /// What this element is *for* — see [`ElementRole`]. Off the wire for the ordinary case.
         #[serde(default, skip_serializing_if = "ElementRole::is_field")]
         role: ElementRole,
+        /// Folded shut: the element windows lines, but this viewport is not showing them.
+        ///
+        /// `rows` is 0 and `lines` empty, exactly as for an element with nothing loaded — the
+        /// difference, and the reason this is on the wire rather than inferred from either, is
+        /// that a collapsed element is **focusable**. There is nowhere in it to paint a cursor,
+        /// so a shell marks the box's title row instead, and it can only know to do that if it
+        /// is told which element is folded.
+        ///
+        /// A fact about the *viewport*, not the view: two clients on one conversation fold
+        /// different blocks, the same way they hold different diff toggles.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        collapsed: bool,
     },
     /// **Rendered prose** — a span of a buffer as markdown, not as lines.
     ///
@@ -425,6 +437,26 @@ impl Element {
             Element::Editor { element, .. } | Element::Prose { element, .. } => Some(*element),
             _ => None,
         }
+    }
+
+    /// Whether this subtree holds `element` **folded shut** — the question a painter asks of a
+    /// box's top border row, since that row is the only one a collapsed element has.
+    ///
+    /// Asked of the box rather than answered by the element because the row being painted belongs
+    /// to the box: the walk hands a painter `PaintedRow::Edge { owner, .. }`, and what it needs to
+    /// know is whether the thing inside that owner is the folded element the cursor is in. Shared
+    /// here so the three shells cannot disagree about which row wears the focus.
+    pub fn holds_collapsed(&self, element: FieldId) -> bool {
+        self.content().into_iter().any(|e| {
+            matches!(
+                e,
+                Element::Editor {
+                    element: id,
+                    collapsed: true,
+                    ..
+                } if *id == element
+            )
+        })
     }
 
     /// The [`ElementRole::Input`] element of this tree, if it has one — which is also the answer

@@ -2118,6 +2118,7 @@ mod tests {
         use aether_protocol::coords::ElementRow;
         use aether_protocol::ui::{Element, ElementRole, LayoutOwner};
         let editor = |element: u32, role: ElementRole| Element::Editor {
+            collapsed: false,
             element,
             buffer: u64::from(element) + 1,
             rows: 1,

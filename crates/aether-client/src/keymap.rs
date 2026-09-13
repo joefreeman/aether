@@ -459,6 +459,12 @@ pub enum Action {
     /// which is the one toast this can produce ("Nothing is running here"). Same shape as
     /// `Space g x`.
     Interrupt,
+    /// `Space v e` — fold the focused element shut, or open it up.
+    ///
+    /// Addresses the **focused** element and no other, which is what makes `Tab` the movement and
+    /// this the verb. Whether that element folds at all is the view's to say, so a press on an
+    /// agent's reply comes back refused rather than doing nothing visible.
+    ToggleExpand,
     /// `Space v a` / `Space v d` — answer the pending permission request with the agent's first
     /// allowing or rejecting option. The wording is the agent's; this only says which way.
     AgentAnswer {
@@ -1500,12 +1506,17 @@ static LEADER: &[Binding] = &[
 /// chords rather than a modal prompt because answering usually means scrolling the transcript
 /// first, which an overlay would block.
 ///
+/// `e` folds the focused element shut or opens it up. One key rather than two, unlike `a`/`d`
+/// above: a fold is a way of looking at something and is taken back by pressing it again, which is
+/// the exact opposite of an answer.
+///
 /// `Esc` is deliberately unbound here, as in every leader table: it cancels the pending chord.
 #[rustfmt::skip]
 static LEADER_VIEW: &[Binding] = &[
     bind!(LV, ch('c'), Exact(Mods::NONE), A::Interrupt, "Agent", "Stop what this view is running"),
     bind!(LV, ch('a'), Exact(Mods::NONE), A::AgentAnswer { allow: true }, "Agent", "Allow what the agent is asking to do"),
     bind!(LV, ch('d'), Exact(Mods::NONE), A::AgentAnswer { allow: false }, "Agent", "Decline what the agent is asking to do"),
+    bind!(LV, ch('e'), Exact(Mods::NONE), A::ToggleExpand, "Agent", "Expand or collapse the focused block"),
 ];
 
 #[rustfmt::skip]

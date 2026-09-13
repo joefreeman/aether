@@ -210,6 +210,7 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space ,`/`Space .` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
 | `Space v c` | Stop what this view is running — a shell's command, an agent's turn |
 | `Space v a`/`Space v d` | Allow / decline what the agent is asking to do |
+| `Space v e` | Expand or collapse the focused block — `Tab` moves between them |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save and quit |
 | `Space y`/`Space ?` | Show keyboard shortcuts / about this build |

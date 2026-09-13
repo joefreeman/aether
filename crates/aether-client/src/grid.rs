@@ -1654,6 +1654,7 @@ mod tests {
             max_line_width: 0,
             git_status: None,
             root: Element::Editor {
+                collapsed: false,
                 element: 0,
                 buffer: 0,
                 rows: first_row + loaded,
@@ -1669,6 +1670,7 @@ mod tests {
     fn editor(element: u32, first_row: u32, rows: u32, lines: Vec<LogicalLineRender>) -> Element {
         let first_buffer_line = lines.first().map_or(0, |l| l.logical_line);
         Element::Editor {
+            collapsed: false,
             element,
             buffer: element as u64 + 1,
             rows,
@@ -3079,6 +3081,7 @@ mod tests {
     fn an_empty_window_falls_back_to_a_buffer_line() {
         let mut w = window(0, 0, vec![]);
         w.root = Element::Editor {
+            collapsed: false,
             element: 0,
             buffer: 0,
             rows: 0,
@@ -3100,6 +3103,7 @@ mod tests {
     /// shell's measurements attached — every third loaded line laid out three rows tall.
     fn prose(element: u32, first_row: u32, lines: u32, loaded: std::ops::Range<u32>) -> Element {
         Element::Editor {
+            collapsed: false,
             element,
             buffer: element as u64 + 1,
             rows: lines,
@@ -3387,6 +3391,7 @@ mod origin_tests {
 
     fn test_editor(element: FieldId, lines: usize) -> Element {
         Element::Editor {
+            collapsed: false,
             element,
             buffer: 1,
             rows: lines as u32,
@@ -3562,6 +3567,7 @@ mod prose_tests {
             max_line_width: 0,
             git_status: None,
             root: Element::Editor {
+                collapsed: false,
                 element: 0,
                 buffer: 1,
                 rows: 6,

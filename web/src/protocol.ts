@@ -228,6 +228,11 @@ export type ViewNode =
        *  element of an ordinary or composed view. `input`: the line a shell's next command is
        *  typed into, which is also how a client knows the view it is showing is a shell. */
       role?: "field" | "input";
+      /** Folded shut for this viewport. `rows` is 0 and `lines` empty, exactly as for an element
+       *  the viewport has not loaded — what this adds is that a folded element is **focusable**,
+       *  so the cursor can be in one with no row of its own to be painted on. The box's title row
+       *  wears the cursorline instead; see `holdsCollapsed`. */
+      collapsed?: boolean;
     }
   | {
       /** Rendered prose — a span of a buffer as markdown, not as lines. Mirrors `Element::Prose`.
@@ -337,6 +342,17 @@ export function proseOf(root: ViewNode): Extract<ViewNode, { node: "prose" }>[] 
   };
   walk(root);
   return out;
+}
+
+/** Whether this subtree holds `element` folded shut — mirrors `ui::Element::holds_collapsed`.
+ *
+ *  Asked of a box about its own top border row: folded, that row is the whole of the element
+ *  inside it, so it is the row that wears the cursor's line. */
+export function holdsCollapsed(n: ViewNode, element: number): boolean {
+  if (n.node === "editor") return n.element === element && n.collapsed === true;
+  if (n.node === "column" || n.node === "row")
+    return n.children.some((c) => holdsCollapsed(c, element));
+  return false;
 }
 
 export function nodeLines(n: ViewNode): LogicalLineRender[] {

@@ -154,6 +154,11 @@
      floating chrome above it (search bar, toasts) offsets by, so they keep clearing it as the
      chrome grows. */
   --ui-status-h: calc(var(--ui-font-size) * 1.5 + 4px);
+  /* The change-bar gutter's width, in buffer columns — `GUTTER_COLS` in shell.ts, which is what
+     the shell takes off the width it tells the server to wrap to. Named here because two rules
+     need the same column: the gutter element on a row, and the padding that stands in for it on
+     prose, which carries no gutter of its own. */
+  --gutter-w: 1ch;
 }
 
 /* ---- Roles: the LIGHT table (theme.rs Theme::LIGHT) ----
@@ -742,8 +747,19 @@ html, body, #app {
    to undo the things that belong to a *page*: the centred narrow measure, and the page padding.
    Nothing here marks a reading position or styles a focused block, because a reply has neither. */
 /* An agent's reply is prose, so it sits on the ground like the reading view's page — the rows of
-   the conversation around it are the editor's, and they keep the well. */
-.md-reply-box { background: var(--bg-app); }
+   the conversation around it are the editor's, and they keep the well.
+
+   Inset like a row, because it is one block among rows: the gutter, and whatever box encloses the
+   element. A row gets the gutter as a real element and its box's cells as `--inset-*` padding;
+   prose carries no gutter of its own, so the column is padding here and the two have to add up to
+   the same start — prose that began at the pane edge sat a column left of every line around it.
+   Both native shells indent by that same sum (`inset.left + GUTTER`), and the terminal paints the
+   indent as ground, which is what this box already is. */
+.md-reply-box {
+  background: var(--bg-app);
+  padding-left: calc(var(--inset-left, 0px) + var(--gutter-w));
+  padding-right: var(--inset-right, 0px);
+}
 .md-read.md-reply {
   /* The reading type itself, which the pane cannot supply here: the whole-pane reader gets it from
      `#buffer.md-read-host`, and a reply lives inside the *editor's* pane, whose monospace and
@@ -945,7 +961,7 @@ html, body, #app {
    border on every gutter keeps the text start aligned whether or not a line is changed. */
 .gutter {
   flex: 0 0 auto;
-  width: 1ch;
+  width: var(--gutter-w);
   box-sizing: border-box;
   border-left: 3px solid transparent;
   /* Stick to the left edge so the change-bar stays visible while scrolling horizontally. */

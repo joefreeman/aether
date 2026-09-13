@@ -112,9 +112,9 @@ pub use aether_protocol::viewport::{
 };
 pub use aether_protocol::viewport::{
     ScrollPosition, SliceRequest, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
-    ViewportResizeParams, ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe,
-    ViewportSubscribeParams, ViewportSubscribeResult, ViewportWindow, ViewportWindowParams,
-    ViewportWindowResult, WrapMode,
+    ViewportResizeParams, ViewportSetExpanded, ViewportSetExpandedParams, ViewportSetWrap,
+    ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
+    ViewportWindow, ViewportWindowParams, ViewportWindowResult, Window, WrapMode,
 };
 pub use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProject,
