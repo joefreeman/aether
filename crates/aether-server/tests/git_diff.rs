@@ -12911,3 +12911,180 @@ async fn history_steps_through_a_regenerated_commit_patch_in_both_directions() {
 
     drop(server);
 }
+
+/// A subscribe loads **every element the first screen reaches**, not just the one the scroll named.
+///
+/// The shape that blanked two shells: a working-changes view is an element per hunk, and a
+/// subscribe that loaded the anchor's alone shipped the whole tree — headings, rules, box rails,
+/// every element's height — with text inside the first file only. The terminal covered it by
+/// re-checking coverage every pass of its loop; the GUI and the browser had nothing on the
+/// subscribe path that did, so the view stood blank below the first file until a scroll or a
+/// cursor move happened to ask.
+#[tokio::test]
+async fn a_subscribe_loads_every_element_the_first_screen_reaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    for n in 0..4 {
+        commit_file(
+            &repo,
+            &format!("f{n}.rs"),
+            "fn a() {}\nfn b() {}\nfn c() {}\n",
+        );
+    }
+    for n in 0..4 {
+        std::fs::write(
+            root.join(format!("f{n}.rs")),
+            format!("fn a() {{}}\nfn CHANGED{n}() {{}}\nfn c() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+
+    // A screen tall enough for the whole view, which is what a client with one would ask for.
+    let rows = 40;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: opened.view_id,
+            cols: 100,
+            rows,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let window = &sub.window;
+    // The client's own coverage check, which is what each shell runs against the window it adopts:
+    // every slice the first screen reaches is loaded, so no shell has anything left to fetch.
+    let wanted =
+        aether_client::grid::slices_for(&window.root, VisualRow(0), rows, 0, &Measured::default());
+    assert!(
+        aether_client::grid::loaded_covers(&window.root, &wanted),
+        "the subscribe left the first screen short — the shells would paint a gap:\n\
+         wanted {wanted:?}\nof a view {} rows tall painting {} of them",
+        total_rows(window),
+        painted_rows(window),
+    );
+    assert_eq!(
+        painted_rows(window),
+        total_rows(window),
+        "a view that fits on one screen has no unpainted row in it"
+    );
+    let rendered: String = window
+        .root
+        .lines()
+        .into_iter()
+        .flat_map(|l| l.visual_rows.iter())
+        .flat_map(|r| &r.segments)
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for n in 0..4 {
+        assert!(
+            rendered.contains(&format!("fn CHANGED{n}() {{}}")),
+            "every file's changed line is on the first screen:\n{rendered}"
+        );
+    }
+
+    drop(server);
+}
+
+/// …and stops there. The budget is a screen and its overscan, not the view: a working-changes view
+/// over a big tree has hundreds of elements, and loading every one of them on subscribe is the
+/// round trip saved paid for many times over.
+#[tokio::test]
+async fn a_subscribe_loads_no_more_than_the_screen_it_was_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    for n in 0..40 {
+        commit_file(
+            &repo,
+            &format!("f{n:02}.rs"),
+            "fn a() {}\nfn b() {}\nfn c() {}\n",
+        );
+    }
+    for n in 0..40 {
+        std::fs::write(
+            root.join(format!("f{n:02}.rs")),
+            format!("fn a() {{}}\nfn CHANGED{n:02}() {{}}\nfn c() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+
+    let rows = 20;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: opened.view_id,
+            cols: 100,
+            rows,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let window = &sub.window;
+    let loaded = aether_client::grid::window_lines(window).len() as u32;
+    assert!(
+        loaded > 0 && loaded <= rows,
+        "a screen's worth of lines, not the view's: {loaded} loaded for {rows} rows of screen, \
+         out of a view {} rows tall",
+        total_rows(window),
+    );
+    // …and the screen it was given is still covered.
+    let wanted =
+        aether_client::grid::slices_for(&window.root, VisualRow(0), rows, 0, &Measured::default());
+    assert!(
+        aether_client::grid::loaded_covers(&window.root, &wanted),
+        "short of the screen: wanted {wanted:?}"
+    );
+
+    drop(server);
+}

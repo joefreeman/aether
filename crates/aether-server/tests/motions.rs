@@ -6997,6 +6997,87 @@ async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
     drop(server);
 }
 
+/// …and the rest of the screen around it. A cursor window **replaces** everything the viewport had
+/// loaded, so answering with the cursor's element alone unloaded every other file a composed view
+/// was showing: jump the cursor into one hunk of working changes and the hunks below it went blank
+/// until a scroll asked for them again.
+#[tokio::test]
+async fn a_window_fetched_for_the_cursor_fills_the_screen_around_it() {
+    use aether_protocol::viewport::{ViewportWindowAtCursor, ViewportWindowAtCursorParams};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    for n in 0..4 {
+        commit_file(
+            &repo,
+            &format!("f{n}.rs"),
+            "fn a() {}\nfn b() {}\nfn c() {}\n",
+        );
+        std::fs::write(
+            root.join(format!("f{n}.rs")),
+            format!("fn a() {{}}\nfn CHANGED{n}() {{}}\nfn c() {{}}\n"),
+        )
+        .unwrap();
+    }
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let rows = 40;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: opened.view_id,
+            cols: 100,
+            rows,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let res: ViewportWindowResult = send_request::<ViewportWindowAtCursor>(
+        &mut ws,
+        &ViewportWindowAtCursorParams {
+            viewport_id: sub.viewport_id,
+        },
+    )
+    .await;
+    let window = &res.window;
+    let wanted = aether_client::grid::slices_for(
+        &window.root,
+        VisualRow(0),
+        rows,
+        0,
+        &aether_client::grid::Measured::default(),
+    );
+    assert!(
+        aether_client::grid::loaded_covers(&window.root, &wanted),
+        "the cursor's window unloaded the rest of the screen: wanted {wanted:?}"
+    );
+
+    drop(server);
+}
+
 /// **A view's reported height is the number of rows it actually has.**
 ///
 /// The tree's height (`grid::total_rows`) is what a client scrolls against and what its scrollbar

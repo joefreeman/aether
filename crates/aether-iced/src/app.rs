@@ -1182,7 +1182,15 @@ impl App {
                     self.reveal_cursor();
                 }
                 // Diff view rides the subscribe params, so there's nothing to re-apply here.
-                self.run_core(read_fx)
+                //
+                // The coverage check every other window adoption ends in, for the same reason:
+                // the subscribe's own window is a screen the *server* estimated, and it cannot
+                // estimate an element this shell lays out. Without it a composed view — a patch's
+                // later files, a conversation's earlier blocks — stood blank below the anchor
+                // until a scroll or a cursor move happened to ask. `maybe_fetch` no-ops when the
+                // screen is covered, which for a view of one element it always is.
+                let fetch = self.maybe_fetch();
+                Task::batch([fetch, self.run_core(read_fx)])
             }
             Message::SubscribeFailed(e) => {
                 self.pending_subscribe = None;

@@ -404,6 +404,80 @@ fn two_files_starting_at_the_same_line_each_keep_their_heading() {
     snapshot(&mut sim, &app, "two-files");
 }
 
+/// [`two_files`] as a subscribe leaves it when the server's estimate of the first screen fell
+/// short: the second file carries its height and no lines at all.
+fn two_files_second_unloaded() -> Window {
+    window_of(vec![
+        chrome("alpha.rs"),
+        editor(0, 7, 10, vec![line(10, "from alpha")]),
+        chrome("beta.rs"),
+        ViewElement::Editor {
+            element: 1,
+            buffer: 8,
+            rows: 40,
+            first_row: ElementRow::ZERO,
+            laid_out_by: LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
+            first_buffer_line: 10,
+            lines: Vec::new(),
+        },
+    ])
+}
+
+/// A subscribe answering with `window`. The buffer half is built from JSON so the fields a test
+/// has no opinion about take their serde defaults rather than being spelled out here.
+fn subscribed(window: Window) -> Message {
+    let focus = serde_json::from_value(serde_json::json!({
+        "element": 0,
+        "buffer": {
+            "buffer_id": 7,
+            "language": null,
+            "line_count": 4,
+            "byte_count": 40,
+            "revision": 1,
+            "saved_revision": 1,
+            "path": null,
+        },
+    }))
+    .expect("a focus answer");
+    Message::Subscribed(Box::new(ViewportSubscribeResult {
+        viewport_id: 1,
+        window,
+        buffer_status: Default::default(),
+        focus,
+    }))
+}
+
+/// A subscribe's window is the server's estimate of the first screen, and it cannot estimate an
+/// element this shell lays out — so the shell checks coverage against its own layout and asks for
+/// what is missing, exactly as it does after every other window it adopts.
+///
+/// Without that check a composed view stood blank below the element the scroll named: the tree
+/// carries every hunk's height, so the headings and rules painted and the files' text never
+/// arrived, until a scroll or a cursor move happened to ask.
+#[test]
+fn a_subscribe_short_of_the_screen_fetches_the_rest() {
+    let mut app = laid_out(app_showing(plain_file()));
+    assert!(!app.fetch_in_flight, "nothing asked for yet");
+    let _ = app.update(subscribed(two_files_second_unloaded()));
+    assert!(
+        app.fetch_in_flight,
+        "the shell adopted a window that leaves the screen short and asked for nothing"
+    );
+}
+
+/// The other half, so the check above cannot pass by fetching unconditionally: a window that does
+/// cover the screen — every ordinary file view — asks for nothing.
+#[test]
+fn a_subscribe_that_covers_the_screen_fetches_nothing() {
+    let mut app = laid_out(app_showing(plain_file()));
+    let _ = app.update(subscribed(plain_file()));
+    assert!(
+        !app.fetch_in_flight,
+        "a covered screen still cost a round trip"
+    );
+}
+
 /// A click lands on the row it was painted at — the hit-test and the painter agree, which is
 /// the property the terminal pins by pressing where `cell_of` found the text.
 #[test]

@@ -1521,7 +1521,7 @@ async fn window_with_diff(
         },
     )
     .await;
-    // A subscribe loads a screen of one element; these helpers answer for the whole (small) view.
+    // A subscribe loads the first screen; these helpers answer for the whole (small) view.
     whole_view(ws, sub.viewport_id, sub.window).await
 }
 

@@ -34,12 +34,6 @@ pub async fn viewport_subscribe(
     // first frame shows a clean gutter for a modified file and stays wrong until the next edit.
     rediff_git_for_buffer(&mut s, buffer_id);
 
-    let geom = wrap::WrapGeometry {
-        wrap: params.wrap,
-        cols: params.cols,
-        marker_width: params.continuation_marker_width,
-        tab_width: params.tab_width,
-    };
     let reading = s.reads(client_id, params.view_id);
     let (focused, loaded, anchor) = {
         let view = s.view(params.view_id);
@@ -51,34 +45,37 @@ pub async fn viewport_subscribe(
         let anchor_element = params.scroll.element.min(last);
         let focused = params.focus.unwrap_or(anchor_element).min(last);
         let layout = s.layout_of(&view.elements);
-        let binding = &view.elements[anchor_element as usize];
         let range = layout.element_range(anchor_element);
-        let (geom, phantoms) = element_geometry(&s, binding, geom, params.diff_view, reading);
-        let doc = s.doc_of(binding.buffer_id);
         let line = params.scroll.line.clamp(
             range.start(),
             range.end_exclusive().saturating_sub(1).max(range.start()),
         );
-        // A screen of the anchor's element from its line, less the overscan above — the same slice
-        // the client would ask for once it has laid the view out, so the first frame needs no
-        // second round trip. An element the client lays out is loaded whole: see
-        // `whole_if_client_laid_out`.
-        let from_row = element_rows_before(doc, geom, &phantoms, range, line)
-            .saturating_sub(params.overscan_rows);
-        let slice = whole_if_client_laid_out(binding, reading, range, || {
-            slice_from(
-                doc,
-                geom,
-                &phantoms,
-                range,
-                from_row,
-                params.rows + 2 * params.overscan_rows,
-            )
-        });
-        let mut loaded = vec![None; view.elements.len()];
-        if !slice.is_empty() {
-            loaded[anchor_element as usize] = Some(slice);
-        }
+        // A screen from the anchor's line, less the overscan above — the same rows the client
+        // would ask for once it has laid the view out, so the first frame needs no second round
+        // trip. **Across elements**, not just the anchor's: a composed view puts a dozen of them
+        // on one screen, and loading only the one the scroll named left every other file's text
+        // blank until something moved. See `fill_screen`.
+        let loaded = fill_screen(
+            &s,
+            view,
+            &layout,
+            anchor_element,
+            line,
+            &ScreenFill {
+                geom: wrap::WrapGeometry {
+                    wrap: params.wrap,
+                    cols: params.cols,
+                    marker_width: params.continuation_marker_width,
+                    tab_width: params.tab_width,
+                },
+                rows: params.rows,
+                overscan_rows: params.overscan_rows,
+                // The line the subscribe named opens the view, so only the overscan sits above it.
+                lead_rows: params.overscan_rows,
+                diff_view: params.diff_view,
+                reading,
+            },
+        );
         (
             focused,
             loaded,
@@ -1255,35 +1252,39 @@ pub async fn viewport_window_at_cursor(
             .get(&(client_id, binding.buffer_id))
             .copied()
             .unwrap_or_default();
-        let (geom, phantoms) = element_geometry(&s, binding, geom, vp.diff_view, reading);
-        let doc = s.doc_of(binding.buffer_id);
         // Clamped into the element: its extent is a claim about the buffer that a rebuild between
         // the ask and the answer could have outrun.
         let line = cursor.position.line.clamp(
             range.start(),
             range.end_exclusive().saturating_sub(1).max(range.start()),
         );
-        let from_row = element_rows_before(doc, geom, &phantoms, range, line)
-            .saturating_sub(vp.rows / 3 + vp.overscan_rows);
-        let slice = whole_if_client_laid_out(binding, reading, range, || {
-            slice_from(
-                doc,
+        // The whole screen the cursor lands on, not its element alone — this *replaces* what the
+        // viewport had loaded, so filling one element would unload every other one a composed
+        // view was showing. See [`fill_screen`].
+        let loaded = fill_screen(
+            &s,
+            view,
+            &layout,
+            element,
+            line,
+            &ScreenFill {
                 geom,
-                &phantoms,
-                range,
-                from_row,
-                vp.rows + 2 * vp.overscan_rows,
-            )
-        });
-        let mut loaded = vec![None; view.elements.len()];
+                rows: vp.rows,
+                overscan_rows: vp.overscan_rows,
+                // The cursor's line rests a third of the way down, so that much of the screen is
+                // above it.
+                lead_rows: vp.rows / 3 + vp.overscan_rows,
+                diff_view: vp.diff_view,
+                reading,
+            },
+        );
         let anchor = ScrollPosition {
             element,
-            line: slice.start,
+            line: loaded[element as usize]
+                .as_ref()
+                .map_or(range.start(), |slice| slice.start),
             sub_row: 0.0,
         };
-        if !slice.is_empty() {
-            loaded[element as usize] = Some(slice);
-        }
         (loaded, anchor)
     };
     let vp = require_viewport_mut(&mut s, params.viewport_id, client_id)?;
@@ -1902,6 +1903,136 @@ fn element_rows_before(
         geom,
         extra_rows,
     ))
+}
+
+/// What a screen-filling load needs to know about the viewport asking for it — see
+/// [`fill_screen`].
+struct ScreenFill {
+    geom: wrap::WrapGeometry,
+    /// The screen, and the overscan either side of it: the budget is `rows + 2 * overscan_rows`.
+    rows: u32,
+    overscan_rows: u32,
+    /// How far above the anchor's line the load starts, in rows of its element. The overscan for a
+    /// subscribe, which opens with that line at the top; more for a cursor chase, which rests it
+    /// part of the way down the screen.
+    lead_rows: u32,
+    diff_view: bool,
+    reading: bool,
+}
+
+/// The slices to load for a screen resting on `line` of `anchor_element`: every element that
+/// screen reaches, from that line down.
+///
+/// A budget walk in **rows**, because a screen is measured in rows: each element spends the chrome
+/// standing before and above it, the box rows it opens or closes, and its own height, and the walk
+/// stops once a screen plus the overscan either side is accounted for. Loading the anchor's element
+/// alone — which is the whole of a view that has one — left every other file in a patch, every
+/// earlier run in a shell and every earlier block in a conversation blank until a scroll or a
+/// cursor move made a client ask again.
+///
+/// Forward only: everything on screen is at or below the anchor's line, and what sits above it is
+/// already taken off that element's own first row ([`ScreenFill::lead_rows`]).
+///
+/// An estimate, and only an estimate, in one case: an element the client lays out is loaded whole
+/// but has no height the server can know — proportional type is measured where it is rendered — so
+/// a walk that crosses one is guessing what it cost. That is why a shell re-checks coverage against
+/// its own layout after adopting a window rather than trusting this to have covered the screen.
+fn fill_screen(
+    s: &ServerState,
+    view: &crate::state::View,
+    layout: &crate::state::ViewLayout,
+    anchor_element: aether_protocol::viewport::FieldId,
+    line: u32,
+    fill: &ScreenFill,
+) -> Vec<Option<std::ops::Range<u32>>> {
+    let mut loaded: Vec<Option<std::ops::Range<u32>>> = vec![None; view.elements.len()];
+    let budget = fill.rows.saturating_add(2 * fill.overscan_rows);
+    let mut spent = 0u32;
+    let from = anchor_element as usize;
+    for (idx, (binding, slot)) in view
+        .elements
+        .iter()
+        .zip(loaded.iter_mut())
+        .enumerate()
+        .skip(from)
+    {
+        // Checked before any work: a working-changes view holds an element per hunk, and the
+        // walk must cost a screenful of them rather than all of them.
+        if spent >= budget && idx != from {
+            break;
+        }
+        let element = idx as aether_protocol::viewport::FieldId;
+        let range = layout.element_range(element);
+        let (geom, phantoms) =
+            element_geometry(s, binding, fill.geom, fill.diff_view, fill.reading);
+        let doc = s.doc_of(binding.buffer_id);
+        // Where the screen enters this element: the anchor's line less the lead above it, and the
+        // top of every element after it.
+        let from_row = if element == anchor_element {
+            element_rows_before(doc, geom, &phantoms, range, line).saturating_sub(fill.lead_rows)
+        } else {
+            ElementRow::ZERO
+        };
+        let slice = whole_if_client_laid_out(binding, fill.reading, range, || {
+            slice_from(
+                doc,
+                geom,
+                &phantoms,
+                range,
+                from_row,
+                budget.saturating_sub(spent),
+            )
+        });
+        if !slice.is_empty() {
+            *slot = Some(slice);
+        }
+        let own = element_visual_rows(doc, range, geom, &phantoms).saturating_sub(from_row.get());
+        spent = spent
+            .saturating_add(chrome_rows(view, idx))
+            .saturating_add(own);
+    }
+    loaded
+}
+
+/// The rows an element's own chrome spends: what stands before and above it, and the box edges it
+/// opens or closes.
+///
+/// Mirrors [`compose_tree`] — chrome before an element is skipped while a box is already open, and
+/// a box spends its top and bottom rows once per run of elements sharing it — because the budget
+/// [`fill_screen`] spends has to agree with the tree that composition produces. Only the estimate
+/// drifts if the two ever disagree: a client measures the tree it was sent, not this.
+fn chrome_rows(view: &crate::state::View, idx: usize) -> u32 {
+    let binding = &view.elements[idx];
+    let group = binding.box_group;
+    let before = idx.checked_sub(1).and_then(|i| view.elements[i].box_group);
+    let after = view.elements.get(idx + 1).and_then(|e| e.box_group);
+    let continuing = group.is_some() && group == before;
+    let opens = group.is_some() && !continuing;
+    let closes = group.is_some() && group != after;
+    let rows = |nodes: &[Element]| nodes.iter().map(node_rows).sum::<u32>();
+    // Chrome before an element is a sibling of its box, so a continuing element has already had it.
+    let before_rows = if continuing {
+        0
+    } else {
+        rows(&binding.chrome_before)
+    };
+    let top = if opens { binding.edges.top() } else { 0 };
+    let bottom = if closes { binding.edges.bottom() } else { 0 };
+    before_rows + rows(&binding.chrome_above) + u32::from(top + bottom)
+}
+
+/// The rows a chrome node occupies, as the client's row walk counts them: a row is one row however
+/// it nests, a column is its children plus its own edges, and inline content has no row of its own.
+fn node_rows(node: &Element) -> u32 {
+    match node {
+        Element::Column {
+            edges, children, ..
+        } => u32::from(edges.top() + edges.bottom()) + children.iter().map(node_rows).sum::<u32>(),
+        Element::Row { edges, .. } => u32::from(edges.top() + edges.bottom()) + 1,
+        Element::Text { .. } | Element::Space { .. } | Element::Fill { .. } => 1,
+        // Not chrome: an element's own height is the walk's business, not its chrome's.
+        Element::Editor { .. } | Element::Prose { .. } => 0,
+    }
 }
 
 /// The lines of `range` that fill `rows` rows from element row `from_row`: the line holding that

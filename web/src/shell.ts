@@ -2799,6 +2799,9 @@ export class Shell {
     const row = this.session.resolve_scroll_anchor();
     if (row != null) this.scrollTopTo(this.pxOfUnits(row), false);
     else this.revealCursor();
+    // A reflow changes every element's height, so the rows this viewport had loaded need not
+    // reach the bottom of it any more. See `onScroll`.
+    this.onScroll();
   }
 
   // ---- geometry (shell-owned; viewport RPCs issued here, results adopted by the core) ----------
@@ -2863,22 +2866,30 @@ export class Shell {
     const anchored = this.session.resolve_scroll_anchor();
     if (anchored != null) {
       this.bufferEl.scrollTop = this.pxOfUnits(anchored);
-      return;
-    }
-    const row = this.session.subscribe_top_row(scroll.element, scroll.line, scroll.sub_row);
-    if (row != null) {
-      this.bufferEl.scrollTop = this.pxOfUnits(row);
-    }
-    // The reading view frames its focused *block*, not the cursor's row — the placement above
-    // has just overridden the reveal the render made, so make it again from where the view now
-    // stands. The editor reveals its cursor.
-    const placed = this.view();
-    if (placed.read) {
-      const span = placed.read.target_span ?? placed.read.focus_span;
-      if (span) this.revealBlock(span, false);
     } else {
-      this.revealCursor();
+      const row = this.session.subscribe_top_row(scroll.element, scroll.line, scroll.sub_row);
+      if (row != null) {
+        this.bufferEl.scrollTop = this.pxOfUnits(row);
+      }
+      // The reading view frames its focused *block*, not the cursor's row — the placement above
+      // has just overridden the reveal the render made, so make it again from where the view now
+      // stands. The editor reveals its cursor.
+      const placed = this.view();
+      if (placed.read) {
+        const span = placed.read.target_span ?? placed.read.focus_span;
+        if (span) this.revealBlock(span, false);
+      } else {
+        this.revealCursor();
+      }
     }
+    // The coverage check every other window adoption ends in, for the same reason: the subscribe's
+    // own window is a screen the *server* estimated, and it cannot estimate an element this shell
+    // lays out. Without it a composed view — a patch's later files, a conversation's earlier blocks
+    // — stood blank below the anchor until a scroll or a cursor move happened to ask. Placing the
+    // view above may not have moved `scrollTop` at all (a patch opens at the top), so there is no
+    // scroll event to rely on. `onScroll` fetches nothing when the screen is covered, which for a
+    // view of one element it always is.
+    this.onScroll();
   }
 
   /** After a cursor-moving action: load around the cursor if it left the loaded window, paint, then
@@ -2913,11 +2924,14 @@ export class Shell {
       }
       if (epoch !== this.viewportEpoch) return; // a resubscribe superseded this fetch
       this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
-    this.refreshMeasured();
+      this.refreshMeasured();
     }
     this.render();
     if (style === "jump") this.revealCursorJump();
     else this.revealCursor();
+    // A cursor window replaces what was loaded, and the reveal above needn't have moved
+    // `scrollTop` at all — the cursor may already have been on screen. See `onScroll`.
+    this.onScroll();
   }
 
   /** Jump reveal: leave the view if the cursor is already visible, else rest it near the top.
@@ -2987,6 +3001,16 @@ export class Shell {
     return `${location.pathname}?${params.toString()}`;
   }
 
+  /** The coverage check: fetch when the rows the screen reaches are not all loaded.
+   *
+   *  Named for the scroll event it began as, but it is the shell's answer to a broader question —
+   *  *does what I hold still cover what I show?* — so *every* path that adopts a window ends here,
+   *  after it has positioned the view (this reads `scrollTop`, so it must run last). A scroll is
+   *  only the most obvious way the answer changes: a subscribe or a cursor chase answers with the
+   *  screen the **server** estimated, and the server cannot estimate an element this shell lays
+   *  out; a resize reaches rows nothing asked for; a wrap toggle moves every row there is. None of
+   *  those need move `scrollTop`, so nothing else would notice. It fetches nothing when the screen
+   *  is covered, which for an ordinary one-element view it always is. */
   private onScroll(): void {
     // The reading view is one element loaded whole — a scroll never reaches unloaded rows, so
     // there is nothing to prefetch.
@@ -3170,8 +3194,11 @@ export class Shell {
       .then(
         (res) => {
           this.runEffects(this.session.adopt_window(res) as CoreEffect[]);
-    this.refreshMeasured();
+          this.refreshMeasured();
           this.render();
+          // A taller viewport reaches rows the old one never asked for, and a narrower one wraps
+          // the content past where it ended. Neither moves `scrollTop`, so nothing else notices.
+          this.onScroll();
         },
         () => {},
       );
