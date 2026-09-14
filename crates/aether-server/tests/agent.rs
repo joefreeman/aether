@@ -161,7 +161,7 @@ async fn blocks(
         .iter()
         .map(|b| {
             (
-                aether_server::agent::outline_label(b),
+                aether_server::agent::block_label(b),
                 s.try_doc_of(b.buffer)
                     .map(|d| d.text.to_string())
                     .unwrap_or_default(),
@@ -1173,7 +1173,7 @@ async fn prose_is_bare_and_the_machinery_is_boxed() {
             element.edges.border.top == 0,
             bare,
             "{:?} is boxed the wrong way round",
-            aether_server::agent::outline_label(block)
+            aether_server::agent::block_label(block)
         );
         // A bare block has no title to hang on a border it does not have.
         assert_eq!(element.title.is_empty(), bare);
@@ -1341,13 +1341,13 @@ async fn the_agents_reply_is_prose_on_the_wire() {
             element.prose,
             rendered,
             "{:?} is bound as the wrong kind of content",
-            aether_server::agent::outline_label(block)
+            aether_server::agent::block_label(block)
         );
         // Prose implies the client's arithmetic: proportional type has no height in rows.
         assert!(
             !element.prose || element.laid_out_by == aether_protocol::ui::LayoutOwner::Client,
             "{:?} is prose the server claims to lay out",
-            aether_server::agent::outline_label(block)
+            aether_server::agent::block_label(block)
         );
     }
     // The input is typed into, so it is never prose and never the client's to lay out.
@@ -1524,7 +1524,7 @@ async fn a_block_has_no_trailing_blank_line() {
             shown.end - shown.start,
             doc.content_lines(),
             "{:?} shows {} rows for {} lines of content",
-            aether_server::agent::outline_label(block),
+            aether_server::agent::block_label(block),
             shown.end - shown.start,
             doc.content_lines()
         );
@@ -1677,7 +1677,7 @@ async fn a_conversation_survives_a_server_restart() {
     let labels: Vec<String> = c
         .blocks
         .iter()
-        .map(aether_server::agent::outline_label)
+        .map(aether_server::agent::block_label)
         .collect();
     assert_eq!(labels, vec!["You", "Agent", "read Reading parse.rs"]);
     assert_eq!(
@@ -1893,98 +1893,14 @@ fn window_titles(window: &Window) -> Vec<String> {
     out
 }
 
+/// A folded call is reached by its **disclosure**, not by the cursor.
+///
+/// The rule is one rule: the cursor goes where it can be *seen*, and a folded element draws no
+/// rows. So the focus step walks past it — and `Tab` reaches it anyway, because the ring is the
+/// buttons too, and the disclosure on its title row is drawn. That is the whole reason folding did
+/// not need a keybinding of its own.
 #[tokio::test]
-async fn the_reply_is_never_folded() {
-    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
-    prompt_and_wait(&mut ws, &server, &open, "hi").await;
-
-    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
-    // What the agent said is prose, and prose does not fold — the conversation is what you came to
-    // read, and it arrives whole.
-    let prose: Vec<_> = window
-        .root
-        .content()
-        .into_iter()
-        .filter(|e| matches!(e, aether_protocol::viewport::Element::Prose { .. }))
-        .collect();
-    assert_eq!(prose.len(), 1, "the reply did not survive the fold");
-
-    // And the key refuses on it rather than doing nothing: the element is real, so the request is
-    // well formed, and the answer has to be an error or the press reads as dropped.
-    let reply = prose[0].field_id().expect("the reply's element id");
-    let err = send_request_expect_err::<ViewportSetExpanded>(
-        &mut ws,
-        &ViewportSetExpandedParams {
-            viewport_id,
-            element: reply,
-            expanded: None,
-        },
-    )
-    .await;
-    assert!(
-        err.contains("does not fold"),
-        "folding a reply was not refused: {err:?}"
-    );
-}
-
-#[tokio::test]
-async fn expanding_a_folded_call_brings_its_output_back() {
-    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
-    prompt_and_wait(&mut ws, &server, &open, "hi").await;
-
-    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
-    let call = editors_of(&window)
-        .into_iter()
-        .find(|(_, collapsed, ..)| *collapsed)
-        .expect("a folded call")
-        .0;
-
-    // The client loads element slices as it lays the view out; ask for the call's, so that what
-    // comes back is the real fetch path rather than a window that happened to carry everything.
-    let toggled: ViewportWindowResult = send_request::<ViewportSetExpanded>(
-        &mut ws,
-        &ViewportSetExpandedParams {
-            viewport_id,
-            element: call,
-            expanded: None,
-        },
-    )
-    .await;
-    let opened = editors_of(&toggled.window);
-    let (_, collapsed, rows, _) = opened
-        .iter()
-        .find(|(id, ..)| *id == call)
-        .expect("the call after expanding");
-    assert!(!collapsed, "the toggle did not open it: {opened:?}");
-    assert!(*rows > 0, "expanded, it still claims no rows: {opened:?}");
-
-    // And pressing it again puts it back — a fold is a way of looking at something, so the same
-    // key has to be able to undo it.
-    let again: ViewportWindowResult = send_request::<ViewportSetExpanded>(
-        &mut ws,
-        &ViewportSetExpandedParams {
-            viewport_id,
-            element: call,
-            expanded: None,
-        },
-    )
-    .await;
-    assert!(
-        editors_of(&again.window)
-            .iter()
-            .any(|(id, collapsed, ..)| *id == call && *collapsed),
-        "the second press did not fold it again"
-    );
-}
-
-#[tokio::test]
-async fn tab_stops_on_a_folded_call_rather_than_skipping_it() {
-    // The rule this whole design rests on. An element with no lines is skipped — a shell run that
-    // said nothing is drawn but never stepped to — and a folded element has no lines either. If
-    // the same rule caught both, every tool call in a conversation would be permanently out of
-    // reach, since focus is the only thing that says which element the fold key acts on.
+async fn a_folded_call_is_reached_by_its_disclosure_not_by_the_cursor() {
     let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
     let open = open_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
@@ -1996,7 +1912,16 @@ async fn tab_stops_on_a_folded_call_rather_than_skipping_it() {
         .expect("a folded call")
         .0;
 
-    // Walk from the top and see whether focus ever lands on it.
+    // The cursor cannot be put there: there is nothing of it on screen to put one on.
+    {
+        let s = server.state.lock().await;
+        let vp = &s.viewports[&viewport_id];
+        let binding = &s.view_of(vp).elements[folded as usize];
+        assert!(
+            !vp.can_hold_cursor(binding),
+            "a folded element offered itself as a place for the cursor"
+        );
+    }
     let mut seen = vec![];
     for _ in 0..8 {
         let r: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
@@ -2010,13 +1935,27 @@ async fn tab_stops_on_a_folded_call_rather_than_skipping_it() {
         )
         .await;
         if seen.last() == Some(&r.element) {
-            break; // stepping stopped, as it does at the end
+            break;
         }
         seen.push(r.element);
     }
     assert!(
-        seen.contains(&folded),
-        "Tab skipped the folded call ({folded}): stopped at {seen:?}"
+        !seen.contains(&folded),
+        "the focus step stopped on a folded call ({folded}), where no cursor is drawn: {seen:?}"
+    );
+
+    // And the ring reaches it, through the button on its title row.
+    let ring = aether_client::grid::focus_ring(&window.root);
+    assert!(
+        ring.iter().any(|s| matches!(
+            s,
+            aether_client::grid::Stop::Action {
+                element,
+                action: aether_protocol::ui::ViewAction::Expand { .. },
+                ..
+            } if *element == folded
+        )),
+        "the folded call is unreachable: not a cursor stop and not on the ring either: {ring:?}"
     );
 }
 
@@ -2081,12 +2020,12 @@ async fn a_call_awaiting_permission_refuses_to_fold() {
         .find(|(_, _, rows, _)| *rows > 0)
         .expect("the asking block")
         .0;
-    let err = send_request_expect_err::<ViewportSetExpanded>(
+    let err = send_request_expect_err::<ViewportInvokeAction>(
         &mut ws,
-        &ViewportSetExpandedParams {
+        &ViewportInvokeActionParams {
             viewport_id,
             element: asking_element,
-            expanded: None,
+            action: aether_protocol::ui::ViewAction::Expand { expand: None },
         },
     )
     .await;
@@ -2124,12 +2063,12 @@ async fn two_viewports_fold_independently() {
         .expect("a folded call")
         .0;
 
-    let opened: ViewportWindowResult = send_request::<ViewportSetExpanded>(
+    let opened: ViewportWindowResult = send_request::<ViewportInvokeAction>(
         &mut ws,
-        &ViewportSetExpandedParams {
+        &ViewportInvokeActionParams {
             viewport_id: first,
             element: call,
-            expanded: Some(true),
+            action: aether_protocol::ui::ViewAction::Expand { expand: Some(true) },
         },
     )
     .await;
@@ -2155,5 +2094,880 @@ async fn two_viewports_fold_independently() {
             .iter()
             .any(|(id, collapsed, ..)| *id == call && *collapsed),
         "expanding on one viewport opened it on the other"
+    );
+}
+
+// ---- what `c` steps ------------------------------------------------------------------------------
+
+/// `c` steps the blocks that **touched a file**, and `o` steps all of them.
+///
+/// The two keys had converged: a conversation answered `c` with every block, so `c`, `o` and `Tab`
+/// walked one list under three names — and "change" stopped meaning anything, since an agent
+/// saying "I'll look at the parser" changed nothing. The script below is deliberately mostly
+/// not-changes: a reply, a read, a command that ran. One edit and one proposed diff are the only
+/// stops `c` may have.
+#[tokio::test]
+async fn changes_step_only_the_blocks_that_touched_a_file() {
+    let script = Script {
+        steps: vec![
+            Step::Say {
+                message_id: Some("m1"),
+                text: "Looking at the parser.\n",
+            },
+            Step::Call {
+                id: "t1",
+                title: "Reading src/parse.rs",
+                kind: ToolKind::Read,
+            },
+            Step::Update {
+                id: "t1",
+                status: Some(ToolCallStatus::Completed),
+                text: Some("fn parse() {}\n"),
+            },
+            Step::Call {
+                id: "t2",
+                title: "Editing src/parse.rs",
+                kind: ToolKind::Edit,
+            },
+            Step::Update {
+                id: "t2",
+                status: Some(ToolCallStatus::Completed),
+                text: Some("wrote 3 lines\n"),
+            },
+            Step::Call {
+                id: "t3",
+                title: "Running cargo test",
+                kind: ToolKind::Execute,
+            },
+            Step::Update {
+                id: "t3",
+                status: Some(ToolCallStatus::Completed),
+                text: Some("test result: ok\n"),
+            },
+        ],
+        ..Script::default()
+    };
+    let (server, mut ws, _dir, _t) = setup(script).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    let (viewport_id, _) = window_of(&mut ws, open.opened.view_id).await;
+    let step = |grain, direction| aether_protocol::viewport::ViewportNavigateChangeParams {
+        viewport_id,
+        direction,
+        count: Some(1),
+        grain,
+        extend: false,
+    };
+    use aether_protocol::viewport::{NavigateGrain, ViewportNavigateChange};
+
+    // Walk each grain from the top and collect where it stopped.
+    let walk = |grain| async move {
+        let mut seen: Vec<u32> = Vec::new();
+        for _ in 0..12 {
+            let r: ViewportFocusElementResult =
+                send_request::<ViewportNavigateChange>(&mut ws, &step(grain, FocusStep::Next))
+                    .await;
+            if seen.last() == Some(&r.element) {
+                break;
+            }
+            seen.push(r.element);
+        }
+        (ws, seen)
+    };
+
+    let (mut ws, changes) = walk(NavigateGrain::Change).await;
+    // The prompt, the reply, the read and the run are all things that happened and none of them
+    // is a change. Exactly one block here wrote to a file.
+    let blocks = blocks(&server, &open).await;
+    let edit = blocks
+        .iter()
+        .position(|(label, _)| label.starts_with("edit "))
+        .expect("the edit block") as u32;
+    assert_eq!(
+        changes,
+        vec![edit],
+        "`c` stopped somewhere that changed no file; blocks were {blocks:?}"
+    );
+
+    // Back to the top, and `o` answers a different question: the conversation's **turns**. The
+    // reply, the read and the run are things that happened inside this one turn; none of them is a
+    // division of the conversation, and none of them is anywhere a cursor can go.
+    let _ = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &aether_protocol::viewport::ViewportFocusElementParams {
+            viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element: 0 },
+        },
+    )
+    .await;
+    let mut outline: Vec<u32> = Vec::new();
+    for _ in 0..12 {
+        let r: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
+            &mut ws,
+            &step(NavigateGrain::Outline, FocusStep::Next),
+        )
+        .await;
+        if outline.last() == Some(&r.element) {
+            break;
+        }
+        outline.push(r.element);
+    }
+    let turn = blocks
+        .iter()
+        .position(|(label, _)| label == "You")
+        .expect("the turn that started all this") as u32;
+    assert_eq!(
+        outline,
+        vec![turn],
+        "`o` stops on the one turn and nothing else; blocks were {blocks:?}"
+    );
+    assert!(
+        !outline.contains(&edit),
+        "`o` and `c` are the same walk again: outline {outline:?} vs changes {changes:?}"
+    );
+}
+
+// ---- what `o` steps ------------------------------------------------------------------------------
+
+/// The outline of a conversation is its **turns**: `Space o` lists what you asked, `o` steps from
+/// one to the next, and the breadcrumb names the turn you are reading from anywhere inside it.
+///
+/// Every other block fails the one test an outline row has to pass — being somewhere you can go.
+/// The agent's reply is prose and wears no cursor by construction; its tool calls, diffs and plans
+/// are folded shut until you open them. Listing them gave rows that focused nothing and an `o` that
+/// stepped onto elements it could not land in. What you typed is an ordinary editable element, and
+/// it is the division the conversation actually has.
+///
+/// The rows are **flat**: they all belong to the one conversation, so an "Agent 1" header over them
+/// would be a group containing the whole list.
+#[tokio::test]
+async fn the_outline_is_the_turns() {
+    use aether_protocol::picker::{
+        PickerItem, PickerKind, PickerSelect, PickerSelectParams, PickerSelectResult, PickerView,
+        PickerViewParams, PickerViewResult,
+    };
+    use aether_protocol::viewport::{NavigateGrain, ViewportNavigateChange};
+
+    let script = Script {
+        steps: vec![
+            Step::Say {
+                message_id: None,
+                text: "Looking at the parser.\n",
+            },
+            Step::Call {
+                id: "t1",
+                title: "Reading src/parse.rs",
+                kind: ToolKind::Read,
+            },
+            Step::Update {
+                id: "t1",
+                status: Some(ToolCallStatus::Completed),
+                text: Some("fn parse() {}\n"),
+            },
+        ],
+        ..Script::default()
+    };
+    let (server, mut ws, _dir, _t) = setup(script).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "what does this parse?").await;
+    prompt_and_wait(&mut ws, &server, &open, "now fix it\nplease").await;
+    let (viewport_id, _) = window_of(&mut ws, open.opened.view_id).await;
+
+    // Two turns, three blocks each: what you typed, the reply, the tool call.
+    let blocks = blocks(&server, &open).await;
+    let turns: Vec<u32> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, (label, _))| label == "You")
+        .map(|(i, _)| i as u32)
+        .collect();
+    assert_eq!(turns, vec![0, 3], "two turns among {blocks:?}");
+    let kinds: Vec<&str> = blocks.iter().map(|(label, _)| label.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["You", "Agent", "read Reading src/parse.rs", "You", "Agent"],
+        "the second turn re-ran the same tool call, so it updated that block in place"
+    );
+
+    // `Space o` — a flat list, each row in your own words.
+    let outline: PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            kind: PickerKind::DocumentSymbols,
+            buffer_id: Some(open.opened.buffer_id),
+            view_id: Some(open.opened.view_id),
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    assert!(
+        !outline.collapsible,
+        "a conversation's turns are one view's structure, not a list of files to group"
+    );
+    let update = outline.update.expect("the outline answers with rows");
+    assert_eq!(
+        group_rows(update.items()),
+        vec![],
+        "no header over rows that all belong to the one conversation"
+    );
+    let rows: Vec<PickerItem> = update
+        .items()
+        .iter()
+        .filter(|i| matches!(i, PickerItem::GitChange { .. }))
+        .cloned()
+        .collect();
+    let labels: Vec<&str> = rows
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::GitChange { preview, .. } => Some(preview.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["what does this parse?", "now fix it \u{23ce}"],
+        "one row per turn, in the words it was asked in"
+    );
+
+    // Picking one focuses that turn's own element — the message you typed, which is the one thing
+    // in a conversation that can hold a cursor.
+    let selected: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        &PickerSelectParams {
+            kind: PickerKind::DocumentSymbols,
+            item: rows[1].clone(),
+        },
+    )
+    .await;
+    match selected {
+        PickerSelectResult::ViewElement {
+            element, position, ..
+        } => {
+            assert_eq!(element, turns[1], "the second turn's own element");
+            assert_eq!(position.line, 0);
+        }
+        other => panic!("expected the turn's element, got {other:?}"),
+    }
+
+    // `o` walks turn to turn, and stops at the last one: the input is where the *next* turn will
+    // be typed, not a turn.
+    let step = |direction| aether_protocol::viewport::ViewportNavigateChangeParams {
+        viewport_id,
+        direction,
+        count: Some(1),
+        grain: NavigateGrain::Outline,
+        extend: false,
+    };
+    let _ = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &aether_protocol::viewport::ViewportFocusElementParams {
+            viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element: turns[0] },
+        },
+    )
+    .await;
+    for expected in [turns[1], turns[1]] {
+        let landed: ViewportFocusElementResult =
+            send_request::<ViewportNavigateChange>(&mut ws, &step(FocusStep::Next)).await;
+        assert_eq!(landed.element, expected);
+    }
+
+    // And from inside a turn — the reply it drew, the tool it ran — the breadcrumb still names
+    // that turn: everything the agent did belongs to the turn that asked for it.
+    for (element, turn) in [(2, "what does this parse?"), (4, "now fix it \u{23ce}")] {
+        let inside: ViewportFocusElementResult =
+            send_request::<aether_protocol::viewport::ViewportFocusElement>(
+                &mut ws,
+                &aether_protocol::viewport::ViewportFocusElementParams {
+                    viewport_id,
+                    target: aether_protocol::viewport::FocusTarget::Element { element },
+                },
+            )
+            .await;
+        let crumbs: Vec<String> = inside
+            .buffer_status
+            .symbol_path
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(
+            crumbs,
+            vec!["Agent 1".to_string(), turn.to_string()],
+            "the breadcrumb in element {element} names the conversation and the turn"
+        );
+    }
+
+    // The input is nobody's turn: it is where the next one will be typed.
+    let at_input: ViewportFocusElementResult =
+        send_request::<aether_protocol::viewport::ViewportFocusElement>(
+            &mut ws,
+            &aether_protocol::viewport::ViewportFocusElementParams {
+                viewport_id,
+                target: aether_protocol::viewport::FocusTarget::Element { element: 5 },
+            },
+        )
+        .await;
+    assert!(
+        at_input.buffer_status.symbol_path.is_empty(),
+        "the input is under no turn: {:?}",
+        at_input.buffer_status.symbol_path
+    );
+}
+
+// ---- moving between blocks -----------------------------------------------------------------------
+
+/// Which element the server has this viewport's caret in — the shell tests' helper, since crossing
+/// is a claim about where the *server* thinks focus is, not just about what came back on the wire.
+async fn focused_element(server: &aether_server::ServerHandle, viewport_id: u64) -> u32 {
+    let s = server.state.lock().await;
+    s.viewports
+        .get(&viewport_id)
+        .expect("the subscribed viewport")
+        .focused
+}
+
+/// `j` at the bottom of a block lands in the next one, and `k` at the top of that one comes back.
+///
+/// A conversation is a list you read top to bottom, so the cursor moves through the **view**, not
+/// through one element of it. Before this, a line motion clamped at the element's edge and the only
+/// way onward was `Tab` — a different key, with different semantics, for what is plainly "down".
+#[tokio::test]
+async fn a_line_motion_walks_out_of_its_block() {
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    // Start in the first block, which is the prompt.
+    let first: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
+        &mut ws,
+        &ViewportFocusElementParams {
+            viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element: 0 },
+        },
+    )
+    .await;
+    let start_buffer = first.buffer.buffer_id;
+    let _ = window;
+
+    let down = |buffer_id| aether_protocol::cursor::CursorMoveParams {
+        buffer_id,
+        motion: aether_protocol::cursor::Motion::LogicalLine {
+            direction: aether_protocol::cursor::Direction::Forward,
+            count: 1,
+            preserve_col: true,
+        },
+        extend_selection: false,
+    };
+
+    // Walk down until it crosses. The prompt is one line, so this is the very first press — but
+    // the loop is written so the assertion is "it crosses", not "it crosses on press N".
+    let mut crossed = None;
+    let buffer_id = start_buffer;
+    for _ in 0..8 {
+        let r: aether_protocol::cursor::CursorMoveResult =
+            send_request::<aether_protocol::cursor::CursorMove>(&mut ws, &down(buffer_id)).await;
+        if let Some(c) = r.crossed {
+            crossed = Some(c);
+            break;
+        }
+    }
+    let crossed = crossed.expect("`j` never left the first block");
+    assert_ne!(
+        crossed.buffer.buffer_id, start_buffer,
+        "crossing did not change buffer — every block is its own document"
+    );
+    // The **next element the cursor can be drawn in**, which is not necessarily the next element:
+    // a prose reply wears no cursor and a folded call draws no rows, so `j` walks past both. Which
+    // ones those are is `a_line_motion_never_stops_where_no_cursor_is_drawn`'s subject; this test
+    // is about the mechanics of the crossing itself.
+    assert!(
+        crossed.element > 0,
+        "`j` went backwards: landed on {}",
+        crossed.element
+    );
+    {
+        let s = server.state.lock().await;
+        let vp = &s.viewports[&viewport_id];
+        let binding = &s.view_of(vp).elements[crossed.element as usize];
+        assert!(
+            vp.can_hold_cursor(binding),
+            "`j` landed on element {} where no cursor is drawn",
+            crossed.element
+        );
+    }
+    // It landed at the *top* of what it entered, which is what "down" means.
+    assert_eq!(
+        crossed.buffer.cursor.position.line, 0,
+        "entered from above but landed somewhere other than the first line"
+    );
+    // And the server agrees about who holds the cursor now — otherwise the next edit lands in the
+    // block we left.
+    assert_eq!(focused_element(&server, viewport_id).await, crossed.element);
+
+    // `k` comes back, landing at the *bottom* of the block above.
+    let up: aether_protocol::cursor::CursorMoveResult =
+        send_request::<aether_protocol::cursor::CursorMove>(
+            &mut ws,
+            &aether_protocol::cursor::CursorMoveParams {
+                buffer_id: crossed.buffer.buffer_id,
+                motion: aether_protocol::cursor::Motion::LogicalLine {
+                    direction: aether_protocol::cursor::Direction::Backward,
+                    count: 1,
+                    preserve_col: true,
+                },
+                extend_selection: false,
+            },
+        )
+        .await;
+    let back = up.crossed.expect("`k` did not come back out of the block");
+    assert_eq!(
+        back.buffer.buffer_id, start_buffer,
+        "came back to elsewhere"
+    );
+    assert_eq!(focused_element(&server, viewport_id).await, 0);
+}
+
+/// A **selection** never leaves the element: the protocol says a selection lives in one buffer, so
+/// `Shift-j` at the boundary clamps where a bare `j` would cross.
+#[tokio::test]
+async fn extending_clamps_where_moving_crosses() {
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    let (viewport_id, _) = window_of(&mut ws, open.opened.view_id).await;
+    let first: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
+        &mut ws,
+        &ViewportFocusElementParams {
+            viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element: 0 },
+        },
+    )
+    .await;
+
+    for _ in 0..8 {
+        let r: aether_protocol::cursor::CursorMoveResult =
+            send_request::<aether_protocol::cursor::CursorMove>(
+                &mut ws,
+                &aether_protocol::cursor::CursorMoveParams {
+                    buffer_id: first.buffer.buffer_id,
+                    motion: aether_protocol::cursor::Motion::LogicalLine {
+                        direction: aether_protocol::cursor::Direction::Forward,
+                        count: 1,
+                        preserve_col: true,
+                    },
+                    extend_selection: true,
+                },
+            )
+            .await;
+        assert!(
+            r.crossed.is_none(),
+            "a selection crossed into another buffer — it cannot span two"
+        );
+    }
+    assert_eq!(
+        focused_element(&server, viewport_id).await,
+        0,
+        "extending moved focus"
+    );
+}
+
+// ---- buttons -------------------------------------------------------------------------------------
+
+/// A permission question arrives as **buttons**, and `Tab`'s ring is what reaches them.
+///
+/// It used to be a row of coloured words with two keybindings pointing at it from the client's
+/// keymap — one chord per view kind, and nothing a pointer could press. What a view can do is the
+/// view's to say, so it says it, and one key activates whatever is focused.
+#[tokio::test]
+async fn a_permission_question_arrives_as_buttons_on_the_focus_ring() {
+    let script = Script {
+        steps: vec![
+            Step::Call {
+                id: "t1",
+                title: "Deleting things",
+                kind: ToolKind::Delete,
+            },
+            Step::Ask {
+                id: "t1",
+                options: ALLOW_OR_REJECT,
+            },
+        ],
+        ..Script::default()
+    };
+    let (server, mut ws, _dir, transcript) = setup(script).await;
+    let open = open_agent(&mut ws).await;
+    let input = input_buffer_of(&server, &open).await;
+    type_prompt(&mut ws, input, "go").await;
+    let _: AgentPromptResult = send_request::<AgentPrompt>(
+        &mut ws,
+        &AgentPromptParams {
+            view_id: open.opened.view_id,
+        },
+    )
+    .await;
+    loop {
+        let s = server.state.lock().await;
+        let view_buffer = s.try_presenting_buffer(open.opened.view_id).unwrap();
+        let asking = s
+            .try_doc_of(view_buffer)
+            .and_then(|d| d.conversation())
+            .and_then(|c| c.pending_permission())
+            .is_some();
+        drop(s);
+        if asking {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    let ring = aether_client::grid::focus_ring(&window.root);
+    let answers: Vec<bool> = ring
+        .iter()
+        .filter_map(|s| match s {
+            aether_client::grid::Stop::Action {
+                action: aether_protocol::ui::ViewAction::Permission { allow },
+                ..
+            } => Some(*allow),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        vec![true, false],
+        "the agent's two options did not come back as two buttons: ring is {ring:?}"
+    );
+    // The elements being shown are on the ring too — the input, and the prompt above — because
+    // putting the cursor in one is a thing you can do. The prose reply is not: it wears no cursor.
+    let elements: Vec<u32> = ring
+        .iter()
+        .filter_map(|s| match s {
+            aether_client::grid::Stop::Element { element } => Some(*element),
+            _ => None,
+        })
+        .collect();
+    assert!(!elements.is_empty(), "no element is on the ring: {ring:?}");
+
+    // Pressing one answers the agent, through the one method every button goes through.
+    let element = ring
+        .iter()
+        .find_map(|s| match s {
+            aether_client::grid::Stop::Action {
+                element,
+                action: aether_protocol::ui::ViewAction::Permission { allow: true },
+                ..
+            } => Some(*element),
+            _ => None,
+        })
+        .expect("the allow button");
+    let _: ViewportWindowResult = send_request::<ViewportInvokeAction>(
+        &mut ws,
+        &ViewportInvokeActionParams {
+            viewport_id,
+            element,
+            action: aether_protocol::ui::ViewAction::Permission { allow: true },
+        },
+    )
+    .await;
+    // The agent got an answer, and it was the allowing option's own id.
+    let answered = loop {
+        let answers = transcript.lock().expect("transcript").answers.clone();
+        if let Some(a) = answers.first() {
+            break a.clone();
+        }
+        tokio::task::yield_now().await;
+    };
+    assert!(
+        answered.is_some(),
+        "the button did not reach the agent: {answered:?}"
+    );
+}
+
+/// A foldable box wears its own disclosure, and pressing it folds — no keybinding involved.
+#[tokio::test]
+async fn the_fold_is_a_button_on_the_box() {
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    let ring = aether_client::grid::focus_ring(&window.root);
+    let (element, action) = ring
+        .iter()
+        .find_map(|s| match s {
+            aether_client::grid::Stop::Action {
+                element,
+                action: action @ aether_protocol::ui::ViewAction::Expand { .. },
+                ..
+            } => Some((*element, *action)),
+            _ => None,
+        })
+        .expect("the tool call's disclosure button");
+
+    let opened: ViewportWindowResult = send_request::<ViewportInvokeAction>(
+        &mut ws,
+        &ViewportInvokeActionParams {
+            viewport_id,
+            element,
+            action,
+        },
+    )
+    .await;
+    assert!(
+        editors_of(&opened.window)
+            .iter()
+            .any(|(id, collapsed, rows, _)| *id == element && !collapsed && *rows > 0),
+        "pressing the disclosure did not open the call: {:?}",
+        editors_of(&opened.window)
+    );
+}
+
+/// A block's document is **internal**, so it cannot be promoted to a view of its own.
+///
+/// The panic Joe hit: `Enter` on a block asks `view/open` for "this element, as its own view", and
+/// that path took the element's buffer without asking what sort of document it was. A conversation
+/// block is a *field of a view* — never listed, never session-recorded, gone with the conversation
+/// — so the view it made was one nothing could reopen, and the recorded row brought the server down
+/// with `no entry found for key` on the next restore, over and over.
+///
+/// Reachable now in a way it was not before: `j` crosses into an element, so the cursor can be
+/// inside a block — including a folded one — where only `Tab` could put it before.
+#[tokio::test]
+async fn a_block_cannot_be_opened_as_its_own_view() {
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    // Every element of the conversation, the input included: none of them is a document you can
+    // open, so each must refuse rather than mint a view over an internal document.
+    let count = {
+        let s = server.state.lock().await;
+        s.try_view(open.opened.view_id)
+            .expect("the view")
+            .elements
+            .len()
+    };
+    for element in 0..count as u32 {
+        let err = send_request_expect_err::<ViewOpen>(
+            &mut ws,
+            &ViewOpenParams {
+                view_id: Some(open.opened.view_id),
+                element: Some(element),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            err.contains("internal") || err.contains("cannot be opened"),
+            "element {element} was opened as its own view, or refused for the wrong reason: {err}"
+        );
+    }
+
+    // And the server is still alive to say so — the failure this guards was a panic, not an error.
+    let s = server.state.lock().await;
+    assert!(s.try_view(open.opened.view_id).is_some());
+}
+
+/// `Enter` on a tool call goes to the **file it touched**, not to the block's own text.
+///
+/// The block is internal, so opening it as a view is refused — and a client that asked anyway got
+/// a toast where it wanted a jump. What the conversation can answer is where the call was working:
+/// ACP sends locations for exactly this, and `view/follow_line` reads them.
+#[tokio::test]
+async fn following_a_tool_call_lands_in_the_file_it_touched() {
+    let script = Script {
+        steps: vec![
+            Step::Call {
+                id: "t1",
+                title: "Reading a.txt",
+                kind: ToolKind::Read,
+            },
+            Step::Update {
+                id: "t1",
+                status: Some(ToolCallStatus::Completed),
+                text: Some("hello\n"),
+            },
+        ],
+        ..Script::default()
+    };
+    let (server, mut ws, dir, _t) = setup(script).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    // Give the call a location, as a real agent does when it says where it worked.
+    {
+        let mut s = server.state.lock().await;
+        let view_buffer = s.try_presenting_buffer(open.opened.view_id).unwrap();
+        let c = s
+            .try_doc_of_mut(view_buffer)
+            .and_then(|d| d.generated.as_mut())
+            .and_then(aether_server::state::Generated::conversation_mut)
+            .expect("a conversation");
+        let block = c
+            .blocks
+            .iter_mut()
+            .find(|b| matches!(b.kind, aether_server::agent::BlockKind::ToolCall(_)))
+            .expect("the tool call");
+        if let aether_server::agent::BlockKind::ToolCall(tc) = &mut block.kind {
+            tc.locations = vec![aether_server::agent::Location {
+                path: dir.path().join("a.txt"),
+                line: Some(0),
+            }];
+        }
+    }
+
+    // Focus the call, then follow: the answer names the file, not the block.
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    let call = editors_of(&window)
+        .into_iter()
+        .find(|(_, collapsed, ..)| *collapsed)
+        .expect("a folded call")
+        .0;
+    let _: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
+        &mut ws,
+        &ViewportFocusElementParams {
+            viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element: call },
+        },
+    )
+    .await;
+    let followed: aether_protocol::view::ViewFollowLineResult =
+        send_request::<aether_protocol::view::ViewFollowLine>(
+            &mut ws,
+            &aether_protocol::view::ViewFollowLineParams {
+                view_id: open.opened.view_id,
+            },
+        )
+        .await;
+    let opened = followed.opened.expect("the call said where it was working");
+    assert!(
+        opened.path.as_deref().is_some_and(|p| p.ends_with("a.txt")),
+        "followed somewhere other than the file the call touched: {opened:?}"
+    );
+}
+
+/// `j` walks past everything the cursor cannot be **seen** in.
+///
+/// Three kinds of element fail that, and they fail it the same way rather than as three special
+/// cases: one with no lines, **prose** (a reply is a parse, not rows, and deliberately wears no
+/// cursor and no focus bar), and one **folded** for this viewport. Landing in any of them is a
+/// keystroke whose only visible effect is that the next one behaves oddly — which is exactly what
+/// it did: `j` down a conversation stopped invisibly in the replies and in every folded call.
+///
+/// `Viewport::can_hold_cursor` is the one statement of this, shared by the line motions and by the
+/// focus step, so it is not three checks that can each be forgotten.
+#[tokio::test]
+async fn a_line_motion_never_stops_where_no_cursor_is_drawn() {
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    // What the view holds: a prompt, a folded tool call, a prose reply, and the input.
+    assert!(
+        window
+            .root
+            .content()
+            .iter()
+            .any(|e| matches!(e, aether_protocol::viewport::Element::Prose { .. })),
+        "the fixture wants a prose reply to walk past"
+    );
+    assert!(
+        editors_of(&window)
+            .iter()
+            .any(|(_, collapsed, ..)| *collapsed),
+        "the fixture wants a folded call to walk past"
+    );
+
+    // Which elements the server will let the cursor into, by its own rule.
+    let allowed: Vec<u32> = {
+        let s = server.state.lock().await;
+        let vp = &s.viewports[&viewport_id];
+        s.view_of(vp)
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| vp.can_hold_cursor(b))
+            .map(|(i, _)| i as u32)
+            .collect()
+    };
+
+    // Walk the whole view with `j` and collect everywhere it stopped.
+    let first: ViewportFocusElementResult = send_request::<ViewportFocusElement>(
+        &mut ws,
+        &ViewportFocusElementParams {
+            viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element {
+                element: allowed[0],
+            },
+        },
+    )
+    .await;
+    let mut buffer_id = first.buffer.buffer_id;
+    let mut visited = vec![allowed[0]];
+    for _ in 0..40 {
+        let moved: aether_protocol::cursor::CursorMoveResult =
+            send_request::<aether_protocol::cursor::CursorMove>(
+                &mut ws,
+                &aether_protocol::cursor::CursorMoveParams {
+                    buffer_id,
+                    motion: aether_protocol::cursor::Motion::LogicalLine {
+                        direction: aether_protocol::cursor::Direction::Forward,
+                        count: 1,
+                        preserve_col: true,
+                    },
+                    extend_selection: false,
+                },
+            )
+            .await;
+        if let Some(crossed) = moved.crossed {
+            buffer_id = crossed.buffer.buffer_id;
+            visited.push(crossed.element);
+        }
+    }
+    visited.dedup();
+    assert_eq!(
+        visited, allowed,
+        "`j` stopped somewhere the cursor is not drawn (or skipped somewhere it is)"
+    );
+}
+
+/// The client's ring and the server's cursor rule **agree about which elements take a cursor**.
+///
+/// Two expressions of one idea, on two sides of the wire: the server asks the binding
+/// (`can_hold_cursor`), the client asks the window (`rows > 0` on an editor). They have to answer
+/// the same, or `Tab` offers a stop a line motion refuses — a place you can get to and not get
+/// back from. Pinned here rather than trusted, because neither side can see the other's reasoning.
+#[tokio::test]
+async fn the_focus_ring_and_the_cursor_rule_agree() {
+    let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
+    let open = open_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    let from_ring: Vec<u32> = aether_client::grid::focus_ring(&window.root)
+        .into_iter()
+        .filter_map(|s| match s {
+            aether_client::grid::Stop::Element { element } => Some(element),
+            aether_client::grid::Stop::Action { .. } => None,
+        })
+        .collect();
+    let from_server: Vec<u32> = {
+        let s = server.state.lock().await;
+        let vp = &s.viewports[&viewport_id];
+        s.view_of(vp)
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| vp.can_hold_cursor(b))
+            .map(|(i, _)| i as u32)
+            .collect()
+    };
+    assert_eq!(
+        from_ring, from_server,
+        "`Tab` and `j` disagree about which elements take a cursor"
     );
 }

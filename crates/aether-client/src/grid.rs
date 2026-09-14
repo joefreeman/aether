@@ -659,10 +659,371 @@ fn walk_rows<'a>(
                 );
             }
         }
-        Element::Text { .. } | Element::Space { .. } | Element::Fill { .. } => {
-            f(Visit::Node(node), frame, measured.row())
+        Element::Text { .. }
+        | Element::Space { .. }
+        | Element::Fill { .. }
+        | Element::Action { .. } => f(Visit::Node(node), frame, measured.row()),
+    }
+}
+
+/// One stop on a view's **focus ring** — the things `Tab` walks.
+///
+/// Not the elements. `Tab` used to step every element of a view, which in a composed view is the
+/// same walk `o` makes over the outline: two keys, one traversal, and no way at all to reach a
+/// button. What `Tab` means everywhere else is "the next thing I can act on", and that is what this
+/// is: a field to type in, or a button to press.
+#[derive(Debug, Clone, Copy)]
+pub enum Stop<'a> {
+    /// A button, the element it acts on, and **the node itself**.
+    ///
+    /// The node is what a painter compares against to know which button to light. By address: a
+    /// painter draws from the same tree the ring was walked over, and two buttons can be equal in
+    /// every field they carry — a file with one hunk staged and one not offers two identical
+    /// `Stage` actions — so the only thing that distinguishes them is where they are.
+    Action {
+        element: FieldId,
+        action: aether_protocol::ui::ViewAction,
+        node: &'a Element,
+    },
+    /// A place the cursor can go: an element this viewport is drawing rows of text for.
+    ///
+    /// **`rows > 0` is the whole test**, and it is the wire's own statement of the rule the server
+    /// applies to a line motion (`Viewport::can_hold_cursor`): an element with nothing in it, and
+    /// a folded one, both report no rows, and prose is not an `Editor` at all. So the two sides
+    /// agree without either restating the other's reasoning.
+    Element { element: FieldId },
+}
+
+impl Stop<'_> {
+    pub fn element(&self) -> FieldId {
+        match self {
+            Stop::Action { element, .. } | Stop::Element { element } => *element,
         }
     }
+
+    /// The node a painter lights, for the stops that have one.
+    pub fn node(&self) -> Option<&Element> {
+        match self {
+            Stop::Action { node, .. } => Some(node),
+            Stop::Element { .. } => None,
+        }
+    }
+}
+
+/// The view's focus ring, in view order — what `Tab` walks.
+///
+/// A button to press, or an element to put the cursor in. Still not the same walk as `o`, which
+/// steps the view's *outline*: everything that happened, an agent's replies and its folded blocks
+/// included. This is what is **on screen and actionable** — prose is left out (it wears no cursor
+/// and no focus bar), a folded block is reached by its disclosure rather than by contents that are
+/// not drawn, and every button is here, which `o` cannot reach at all.
+///
+/// **An action belongs to the nearest box around it.** The tree puts a box's buttons before the
+/// content they act on — a disclosure on the title row, a permission question in the chrome above
+/// the block — so an in-order walk meets them without yet knowing whose they are. Resolving by
+/// enclosing box is what makes "press this" unambiguous, and it is why this is computed once here
+/// rather than three times in three shells.
+pub fn focus_ring(root: &Element) -> Vec<Stop<'_>> {
+    fn content_of(node: &Element) -> Option<FieldId> {
+        node.content().first().and_then(|e| e.field_id())
+    }
+    fn walk<'a>(node: &'a Element, owner: Option<FieldId>, out: &mut Vec<Stop<'a>>) {
+        match node {
+            Element::Column {
+                title, children, ..
+            } => {
+                // The box's own element, if it holds one — the innermost wins, so a block inside a
+                // file's box binds its buttons to the block.
+                let owner = content_of(node).or(owner);
+                for t in title {
+                    walk(t, owner, out);
+                }
+                for c in children {
+                    walk(c, owner, out);
+                }
+            }
+            Element::Row { children, .. } => {
+                for c in children {
+                    walk(c, owner, out);
+                }
+            }
+            Element::Action {
+                action, enabled, ..
+            } => {
+                // A disabled button is drawn and skipped: stopping on something that refuses is a
+                // press that visibly does nothing, which is the rule the element walk follows too.
+                if *enabled {
+                    if let Some(element) = owner {
+                        out.push(Stop::Action {
+                            element,
+                            action: *action,
+                            node,
+                        });
+                    }
+                }
+            }
+            // Every element being *shown* — the input among them, which is an editor like any
+            // other. Not prose: a reply is a record of what was said, wears no cursor and no focus
+            // bar, and stopping there would be a press with nothing to show for it.
+            Element::Editor { element, rows, .. } if *rows > 0 => {
+                out.push(Stop::Element { element: *element })
+            }
+            Element::Editor { .. }
+            | Element::Prose { .. }
+            | Element::Text { .. }
+            | Element::Space { .. }
+            | Element::Fill { .. } => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, None, &mut out);
+    out
+}
+
+/// Where this client's focus **is** — exactly one thing.
+///
+/// A sum, not two flags, and that is the whole point: a view drawing a cursor *and* lighting a
+/// button is showing two things focused at once, which is a state the shells were able to build
+/// because "which button is lit" was additive state the cursor path never consulted. There is one
+/// answer now, every painter matches on it, and the both-at-once frame cannot be constructed.
+#[derive(Debug, Clone, Copy)]
+pub enum Focused<'a> {
+    /// The cursor, in this element's text. Drawn where the cursor is.
+    Cursor { element: FieldId },
+    /// A button. **No cursor is drawn** — the lit button is where you are.
+    Action {
+        element: FieldId,
+        action: aether_protocol::ui::ViewAction,
+        /// The node to light, compared by address: the same button can appear twice in a view and
+        /// be equal in every field it carries.
+        node: &'a Element,
+    },
+    /// An element with **nothing to put a caret in** — an agent's prose reply, a folded block.
+    ///
+    /// Navigation can land here even though a line motion cannot: `o` and the outline picker step
+    /// the view's *structure*, which is everything that happened, and a reply is part of that. What
+    /// must not happen is pretending a cursor is there. It was: focus landed, the painter believed
+    /// it, and the caret simply vanished — "the cursor disappears and I don't know where it went".
+    ///
+    /// So the element itself is what gets marked. Where exactly is the shell's business: a folded
+    /// block wears it on the title row that *is* the whole of it, and anything else on its first
+    /// row.
+    Element { element: FieldId },
+}
+
+impl<'a> Focused<'a> {
+    /// The button to light, if focus is on one.
+    pub fn lit(&self) -> Option<&'a Element> {
+        match self {
+            Focused::Action { node, .. } => Some(node),
+            Focused::Cursor { .. } | Focused::Element { .. } => None,
+        }
+    }
+
+    /// The element to mark, when what is focused draws no caret and wears no button.
+    pub fn marked(&self) -> Option<FieldId> {
+        match self {
+            Focused::Element { element } => Some(*element),
+            Focused::Cursor { .. } | Focused::Action { .. } => None,
+        }
+    }
+
+    /// Whether the cursor is drawn — and so whether anything decided against the cursor's position
+    /// (its cell, its line's tint, the blame beside it) applies at all.
+    pub fn draws_cursor(&self) -> bool {
+        matches!(self, Focused::Cursor { .. })
+    }
+
+    /// The action `Enter` would invoke.
+    pub fn action(&self) -> Option<(FieldId, aether_protocol::ui::ViewAction)> {
+        match self {
+            Focused::Action {
+                element, action, ..
+            } => Some((*element, *action)),
+            Focused::Cursor { .. } | Focused::Element { .. } => None,
+        }
+    }
+}
+
+/// Resolve where focus is, from the element holding the cursor and the ring position `Tab` left.
+///
+/// **Total**: it always answers, and answering `Action` is what makes the cursor not drawn. A
+/// remembered position is re-derived rather than trusted — a view rebuilds under the client
+/// constantly, so an index can name a button that has moved or gone, and focus moves by many keys
+/// that are not `Tab` — and anything stale degrades to `Cursor`, which is the safe default: the
+/// text is where focus was going to be anyway.
+pub fn focused(root: &Element, element: FieldId, focus: Focus) -> Focused<'_> {
+    // **Not merely what the client remembers.** Focus can be moved by things that do not consult
+    // the ring at all — `o`, the outline picker, a click — and they can land on an element with
+    // nothing to put a caret in. Believing `Focus::Text` there is what made the cursor vanish.
+    let in_text = || {
+        if content_of(root, element)
+            .is_some_and(|n| matches!(n, Element::Editor { rows, .. } if *rows > 0))
+        {
+            Focused::Cursor { element }
+        } else {
+            Focused::Element { element }
+        }
+    };
+    // A stop is the answer on its own — **not** "a stop, provided the server agrees about which
+    // element holds the cursor". That comparison is what made `Tab` flash: the server is told which
+    // element the cursor moved to and answers a round trip later, and until it did, the stop `Tab`
+    // had just reached read as stale and the *old* element was drawn as focused — a caret
+    // appearing in the block you had just left on the way past it. Which element holds the cursor
+    // decides what an edit acts on; it does not decide where focus is.
+    let on = match focus {
+        Focus::Text => return in_text(),
+        // An element stop: focus is in its text — but the caret belongs to the server's cursor, and
+        // that cursor is still in the element focus is leaving. Until the reply lands there is a
+        // place but no position, which is exactly what `Element` says.
+        Focus::Stop {
+            element: on,
+            button: None,
+        } => {
+            return if on == element {
+                in_text()
+            } else {
+                Focused::Element { element: on }
+            }
+        }
+        Focus::Stop {
+            element: on,
+            button: Some(_),
+        } => on,
+    };
+    let ring = focus_ring(root);
+    match focus.position(&ring).map(|i| &ring[i]) {
+        Some(Stop::Action { action, node, .. }) => Focused::Action {
+            element: on,
+            action: *action,
+            node,
+        },
+        // The button has gone — the view rebuilt without it. A name that no longer names anything
+        // is no focus at all, and the text is where focus was going to be anyway.
+        _ => in_text(),
+    }
+}
+
+/// The content node for `element`, if the tree holds one.
+fn content_of(root: &Element, element: FieldId) -> Option<&Element> {
+    root.content()
+        .into_iter()
+        .find(|e| e.field_id() == Some(element))
+}
+
+/// What `Tab` left behind — the client's own half of focus.
+///
+/// Deliberately not an `Option<usize>` beside the focused element: that reads as an extra fact
+/// about a view rather than as *which of two things* is focused, which is how a painter came to
+/// draw a cursor over a lit button.
+///
+/// **Named, not numbered.** This was a ring *index*, and an index is a position in a list the
+/// server rebuilds on every push: expanding a tool call gives its element a stop it did not have,
+/// which shifts every stop after it, so the remembered number came to point at something else and
+/// the painter fell back to drawing the cursor — the disclosure you were standing on went dark and
+/// a caret appeared in the block below it. Naming the stop by *what it is* survives the rebuild,
+/// and survives it without the two halves of focus having to be compared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Focus {
+    /// In the focused element's text — where focus is whenever `Tab` is not what put it there.
+    #[default]
+    Text,
+    /// The stop `Tab` reached: an element, and which of that element's buttons — `None` for the
+    /// element's own text, which is a stop like any other.
+    ///
+    /// Whether a cursor is drawn is still [`focused`]'s answer and not remembered here: the stop
+    /// may be gone entirely by the next window, and a `Focus` claiming to know what it pointed at
+    /// would go quietly stale.
+    Stop {
+        element: FieldId,
+        /// Which of `element`'s buttons, counted in ring order. `None` names the element itself.
+        button: Option<u16>,
+    },
+}
+
+impl Focus {
+    /// Where this focus sits on `ring` now, if it is still there.
+    ///
+    /// Resolved against the ring in hand rather than remembered, which is the whole of the
+    /// naming: a stop that moved is found where it moved to, and one that has gone is gone.
+    pub fn position(&self, ring: &[Stop<'_>]) -> Option<usize> {
+        let Focus::Stop { element, button } = *self else {
+            return None;
+        };
+        match button {
+            None => ring
+                .iter()
+                .position(|s| matches!(s, Stop::Element { element: e } if *e == element)),
+            Some(nth) => ring
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| matches!(s, Stop::Action { element: e, .. } if *e == element))
+                .map(|(i, _)| i)
+                .nth(nth as usize),
+        }
+    }
+}
+
+/// How [`Focus`] names the stop at ring position `i` — what `Tab` remembers when it lands there.
+///
+/// The inverse of [`Focus::position`], and the only place a position becomes a name, so the two
+/// cannot come to disagree about what a name means.
+pub fn focus_of(ring: &[Stop<'_>], i: usize) -> Option<Focus> {
+    let element = ring.get(i)?.element();
+    Some(match ring[i] {
+        Stop::Element { .. } => Focus::Stop {
+            element,
+            button: None,
+        },
+        Stop::Action { .. } => Focus::Stop {
+            element,
+            // Which of this element's buttons this is: the ones before it, in ring order.
+            button: Some(
+                ring[..i]
+                    .iter()
+                    .filter(|s| matches!(s, Stop::Action { element: e, .. } if *e == element))
+                    .count() as u16,
+            ),
+        },
+    })
+}
+
+/// The visual row a focus-ring stop is drawn on.
+///
+/// **Not the cursor's row.** A button lives in chrome — a box's title row, the question above a
+/// tool call — and a folded element has no rows of its own at all, so revealing "where the cursor
+/// is" answers nothing for either: the row is never loaded, the shell owes a reveal it cannot pay,
+/// and fetching a window around the cursor returns the same element folded again. That loop is
+/// what made `Tab` land somewhere off screen and stay there.
+pub fn focused_row_of(
+    root: &Element,
+    measured: &Measured,
+    focused: &Focused<'_>,
+) -> Option<VisualRow> {
+    let node = match focused {
+        // The cursor's own row is the caller's business — it knows the cursor's line.
+        Focused::Cursor { .. } => return None,
+        // An element with no caret in it is revealed by where it *starts*: a folded block's title
+        // row, a reply's first row of type.
+        Focused::Element { element } => return element_start_row_of(root, *element, measured),
+        Focused::Action { node, .. } => *node,
+    };
+    // By address, as everything about a lit button is: the same button can appear twice in a view
+    // and be equal in every field it carries.
+    let holds = |n: &Element| n.inline().iter().any(|i| std::ptr::eq(*i, node));
+    painted_rows_of(root, measured)
+        .into_iter()
+        .find_map(|(at, row)| match row {
+            PaintedRow::Chrome(chrome) if holds(chrome) => Some(at.row),
+            // A box is named on the border it opens with, and the name can carry buttons — the
+            // disclosure a foldable box wears is exactly that.
+            PaintedRow::Edge {
+                owner,
+                side: Side::Top,
+                ..
+            } if owner.title().iter().any(holds) => Some(at.row),
+            _ => None,
+        })
 }
 
 /// Every rendered line of the view, top to bottom, each paired with **where it is**.
@@ -3640,5 +4001,183 @@ mod prose_tests {
             (anchor.sub_row - 0.4).abs() < 0.01,
             "the fraction into the line is lost: {anchor:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::*;
+    use aether_protocol::viewport::Segment;
+
+    fn row(text: &str) -> WrappedRow {
+        WrappedRow {
+            byte_offset: 0,
+            continuation_indent: 0,
+            segments: vec![Segment {
+                text: text.into(),
+                highlights: vec![],
+            }],
+        }
+    }
+
+    fn line(logical_line: u32) -> LogicalLineRender {
+        LogicalLineRender {
+            change: Default::default(),
+            logical_line,
+            visual_rows: vec![row("x")],
+            search_matches: vec![],
+            baseline_above: vec![],
+            diagnostics: vec![],
+            sneak_targets: vec![],
+        }
+    }
+
+    fn editor(element: FieldId, rows: u32) -> Element {
+        Element::Editor {
+            collapsed: false,
+            element,
+            buffer: element as u64 + 1,
+            rows,
+            first_row: ElementRow::ZERO,
+            laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
+            first_buffer_line: 0,
+            lines: (0..rows).map(line).collect(),
+        }
+    }
+
+    /// A box with a disclosure on its title row, holding one element of `rows` rows — the shape of
+    /// an agent's tool call, which is where every focus bug in this area has been found.
+    fn foldable_box(element: FieldId, rows: u32) -> Element {
+        use aether_protocol::ui::{Band, Edges, ViewAction};
+        Element::Column {
+            edges: Edges::NONE,
+            band: Band::Chrome,
+            title: vec![Element::Action {
+                action: ViewAction::Expand { expand: None },
+                label: vec![Element::text("\u{25be}", Vec::new())],
+                enabled: true,
+            }],
+            children: vec![editor(element, rows)],
+        }
+    }
+
+    fn boxes(elements: &[(FieldId, u32)]) -> Element {
+        use aether_protocol::ui::{Band, Edges};
+        Element::Column {
+            edges: Edges::NONE,
+            band: Band::None,
+            title: Vec::new(),
+            children: elements
+                .iter()
+                .map(|&(element, rows)| foldable_box(element, rows))
+                .collect(),
+        }
+    }
+
+    /// **A stop is named, not numbered.** Expanding a block gives its element a stop it did not
+    /// have, which shifts every stop after it — and a remembered *index* then names something
+    /// else. That is what put the disclosure you were standing on out and a caret in the block
+    /// below it: the painter asked "is the stop at position 3 a button of the focused element?",
+    /// the answer had become no, and it fell back to the text.
+    #[test]
+    fn a_rebuild_that_moves_a_stop_does_not_move_focus() {
+        let collapsed = boxes(&[(0, 0), (1, 2)]);
+        let on_second_fold = {
+            let ring = focus_ring(&collapsed);
+            // Both disclosures, and only the second box has rows to put a cursor in.
+            assert_eq!(ring.len(), 3, "unexpected ring: {ring:?}");
+            focus_of(&ring, 1).expect("the second box's disclosure")
+        };
+        assert!(
+            matches!(
+                focused(&collapsed, 1, on_second_fold),
+                Focused::Action { element: 1, .. }
+            ),
+            "the disclosure is where focus is"
+        );
+
+        // The first box is expanded: it gains a stop *before* the one focus names.
+        let expanded = boxes(&[(0, 3), (1, 2)]);
+        assert_eq!(focus_ring(&expanded).len(), 4);
+        assert!(
+            matches!(
+                focused(&expanded, 1, on_second_fold),
+                Focused::Action { element: 1, .. }
+            ),
+            "the rebuild moved focus to whatever now sits at the old position"
+        );
+    }
+
+    /// **The button is lit before the server has moved the cursor to its element.** Which element
+    /// holds the cursor is the server's answer to `view/focus_element`, a round trip after the key
+    /// press; requiring it here is what made `Tab` flash the caret back on the way past.
+    #[test]
+    fn a_button_is_focus_before_the_server_answers() {
+        let root = boxes(&[(0, 3), (1, 2)]);
+        let on_second_fold = focus_of(&focus_ring(&root), 2).expect("the second box's disclosure");
+        // The focus reply has not landed, so the cursor is still recorded in element 0.
+        match focused(&root, 0, on_second_fold) {
+            Focused::Action { element: 1, .. } => {}
+            other => panic!("expected the button lit, got {other:?}"),
+        }
+        // And with it landed, nothing changes.
+        assert!(matches!(
+            focused(&root, 1, on_second_fold),
+            Focused::Action { element: 1, .. }
+        ));
+    }
+
+    /// The same round trip, for a stop that is an **element**: there is a place but not yet a
+    /// position, so the element is marked rather than a caret drawn in the block focus just left.
+    /// `Shift-Tab` off a disclosure used to flash one there on its way up.
+    #[test]
+    fn an_element_stop_marks_its_element_until_the_cursor_arrives() {
+        let root = boxes(&[(0, 3), (1, 2)]);
+        let ring = focus_ring(&root);
+        let at_second = ring
+            .iter()
+            .position(|s| matches!(s, Stop::Element { element: 1 }))
+            .expect("the second box's rows are a stop");
+        let on_second = focus_of(&ring, at_second).expect("that stop");
+        assert!(
+            matches!(
+                focused(&root, 0, on_second),
+                Focused::Element { element: 1 }
+            ),
+            "a caret was drawn in the element focus is leaving"
+        );
+        assert!(
+            matches!(focused(&root, 1, on_second), Focused::Cursor { element: 1 }),
+            "the caret should be drawn once the cursor is there"
+        );
+    }
+
+    /// A name that no longer names anything is no focus at all — the view rebuilt without the
+    /// button — and the text is where focus was going to be anyway.
+    #[test]
+    fn a_stop_that_has_gone_falls_back_to_the_text() {
+        let root = boxes(&[(0, 3)]);
+        let gone = Focus::Stop {
+            element: 0,
+            button: Some(1), // the box declares one button
+        };
+        assert!(matches!(
+            focused(&root, 0, gone),
+            Focused::Cursor { element: 0 }
+        ));
+    }
+
+    /// `focus_of` and `Focus::position` are inverses over the whole ring — the property that keeps
+    /// "where am I" and "what did I land on" from ever meaning different things.
+    #[test]
+    fn naming_a_stop_and_finding_it_again_are_inverses() {
+        let root = boxes(&[(0, 3), (1, 2), (2, 0)]);
+        let ring = focus_ring(&root);
+        assert!(ring.len() >= 5, "unexpected ring: {ring:?}");
+        for i in 0..ring.len() {
+            let name = focus_of(&ring, i).expect("every stop is nameable");
+            assert_eq!(name.position(&ring), Some(i), "stop {i} did not round-trip");
+        }
     }
 }

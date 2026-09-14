@@ -6,7 +6,7 @@ pub async fn cursor_move(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: CursorMoveParams,
-) -> Result<CursorState, RpcError> {
+) -> Result<aether_protocol::cursor::CursorMoveResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     // Every motion below resolves against this: the buffer, bounded to what the focused element
@@ -213,6 +213,27 @@ pub async fn cursor_move(
         match_bracket: None,
         jumplist_position: None,
     };
+    // **A line motion that could not move walks out of its element.** The scope clamped it, so the
+    // position came back unchanged — and for a line motion there is no other reason that can
+    // happen, which is what makes "did not move" a sound test for "hit the boundary". Every other
+    // motion reads text, and text belongs to this document, so none of them is offered the door.
+    //
+    // Never while extending: a selection lives in one buffer (the protocol says so), so `Shift-j`
+    // clamps here exactly as it did before.
+    let crosses = !params.extend_selection
+        && new_pos == current.position
+        && matches!(
+            params.motion,
+            Motion::LogicalLine { .. } | Motion::VisualLine { .. }
+        );
+    if crosses {
+        if let Some(crossed) =
+            cross_element(&mut s, client_id, params.buffer_id, &params.motion).await?
+        {
+            return Ok(crossed);
+        }
+    }
+
     let (response, search_update) = commit_move(
         &mut s,
         client_id,
@@ -225,7 +246,112 @@ pub async fn cursor_move(
     if let Some((sender, notif)) = search_update {
         let _ = sender.send(notif).await;
     }
-    Ok(response)
+    Ok(aether_protocol::cursor::CursorMoveResult {
+        cursor: response,
+        crossed: None,
+    })
+}
+
+/// Move focus to the element next door and seat the cursor at the edge it was entered from.
+///
+/// `None` when there is nowhere to go — the top of the first element, the bottom of the last —
+/// which is what makes `j` at the end of a view stop rather than wrap.
+///
+/// Where it lands: travelling **down** lands on the new element's first line, travelling up on its
+/// last. The virtual column rides across, so running `j` down a view keeps the column the way it
+/// keeps it down a file; a line too short for it clamps, as it always did.
+async fn cross_element(
+    s: &mut ServerState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    motion: &Motion,
+) -> Result<Option<aether_protocol::cursor::CursorMoveResult>, RpcError> {
+    let forward = match motion {
+        Motion::LogicalLine { direction, .. } => *direction == Direction::Forward,
+        Motion::VisualLine { direction, .. } => {
+            *direction == aether_protocol::cursor::VerticalDirection::Down
+        }
+        _ => return Ok(None),
+    };
+    // The viewport this motion belongs to: the client's, showing a view that binds this buffer —
+    // the same lookup `motion_scope` makes to decide the scope the motion just clamped against.
+    let Some(viewport_id) = s
+        .viewports
+        .values()
+        .find(|v| v.client_id == client_id && s.view_of(v).binds(buffer_id))
+        .map(|v| v.id)
+    else {
+        return Ok(None);
+    };
+    let vp = &s.viewports[&viewport_id];
+    let view = s.view_of(vp);
+    let Some(landing) = vp.step_element(view, vp.focused, forward) else {
+        return Ok(None);
+    };
+    let binding = view.elements[landing as usize].clone();
+    let lines = binding.lines_in(
+        s.try_doc_of(binding.buffer_id)
+            .map_or(1, |d| d.line_count()),
+    );
+    // Entered from above, the cursor lands on the first line; entered from below, the last.
+    let line = if forward {
+        lines.start
+    } else {
+        lines.end.saturating_sub(1).max(lines.start)
+    };
+    // The column the motion was carrying, clamped to the line it lands on — the same arithmetic
+    // a line motion does inside one element.
+    let virtual_col = s.virtual_col.get(&(client_id, buffer_id)).copied();
+    s.viewports
+        .get_mut(&viewport_id)
+        .expect("looked up above")
+        .focused = landing;
+
+    let target = binding.buffer_id;
+    let doc = s
+        .try_doc_of(target)
+        .ok_or_else(|| RpcError::buffer_not_found(target))?;
+    let position = crate::cursor::clamp_position(
+        doc,
+        LogicalPosition {
+            line,
+            col: virtual_col.unwrap_or(0),
+        },
+    );
+    s.cursors.insert(
+        (client_id, target),
+        CursorState {
+            position,
+            anchor: position,
+            match_bracket: None,
+            jumplist_position: None,
+        },
+    );
+    // Carried across rather than cleared: a column is a property of walking down a view, and the
+    // view did not end at the element boundary.
+    match virtual_col {
+        Some(col) => {
+            s.virtual_col.insert((client_id, target), col);
+        }
+        None => {
+            s.virtual_col.remove(&(client_id, target));
+        }
+    }
+    // An active search is the focused element's, so crossing re-runs it where the cursor now is.
+    let pushes = rescope_search(s, client_id, target);
+    let cursor = s.cursors[&(client_id, target)];
+    let crossed = aether_protocol::viewport::ViewportFocusElementResult {
+        element: landing,
+        buffer: crate::handlers::describe_buffer(s, target, cursor)?,
+        buffer_status: buffer_status_for(s, client_id, target),
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
+    Ok(Some(aether_protocol::cursor::CursorMoveResult {
+        cursor,
+        crossed: Some(crossed),
+    }))
 }
 
 /// What landing a motion yields: the cursor as the client should see it, and the search update the

@@ -2100,16 +2100,37 @@ async fn view_open_inner(
             let s = state.lock().await;
             let buffer_id = match (s.try_presenting_buffer(view), params.element) {
                 // The file one of the view's elements windows, as its own view.
-                (Some(_), Some(element)) => s
-                    .try_view(view)
-                    .and_then(|v| v.elements.get(element as usize))
-                    .map(|b| b.buffer_id)
-                    .ok_or_else(|| {
-                        RpcError::invalid_params(format!(
-                            "view {} has no element {element}",
+                (Some(_), Some(element)) => {
+                    let buffer_id = s
+                        .try_view(view)
+                        .and_then(|v| v.elements.get(element as usize))
+                        .map(|b| b.buffer_id)
+                        .ok_or_else(|| {
+                            RpcError::invalid_params(format!(
+                                "view {} has no element {element}",
+                                view.get()
+                            ))
+                        })?;
+                    // **An internal document is a field of a view, not a document of the user's**
+                    // — a conversation's blocks, a shell's input line. Promoting one to a view of
+                    // its own made a view nothing could reopen: never listed, never session-
+                    // recorded, gone with the conversation, and the recorded row then brought the
+                    // server down on the next restore (`doc_of`: no entry found for key) every
+                    // time it reconnected.
+                    //
+                    // Refused at the one door that turns an element's buffer into a view, rather
+                    // than by each caller remembering not to ask. `Document::internal` already
+                    // says this is not the user's work; this is the same flag deciding the same
+                    // question one place further on.
+                    if s.try_doc_of(buffer_id).is_some_and(|d| d.internal) {
+                        return Err(RpcError::invalid_params(format!(
+                            "element {element} of view {} is internal to it and cannot be opened \
+                             as a view of its own",
                             view.get()
-                        ))
-                    })?,
+                        )));
+                    }
+                    buffer_id
+                }
                 (Some(buffer_id), None) => buffer_id,
                 (None, _) => s
                     .dormant_buffer_of_view(&active_workspace_name, view)

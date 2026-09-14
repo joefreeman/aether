@@ -3385,7 +3385,7 @@ async fn navigate_diagnostic_goes_back_and_the_cursor_sticks() {
     assert!(back.moved);
     assert_eq!(back.cursor.position.line, 1);
 
-    let moved: CursorState = send_request::<CursorMove>(
+    let moved: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: b,

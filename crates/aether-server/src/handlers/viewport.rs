@@ -307,7 +307,7 @@ fn other_elements_dirty(
 ///
 /// Records the breadcrumb as last-sent, so the follow loop's next push is a real change rather than
 /// a duplicate of this seed — which is why it needs `&mut`.
-fn buffer_status_for(
+pub(crate) fn buffer_status_for(
     s: &mut ServerState,
     client_id: ClientId,
     buffer_id: BufferId,
@@ -374,30 +374,18 @@ pub async fn viewport_focus_element(
 
     let last = view.elements.len().saturating_sub(1) as u32;
     // A step lands on the nearest element in that direction there is something to land *on*, and
-    // stays put when there is none.
-    //
-    // Two ways to qualify, and the split matters. An element with lines has somewhere to put the
-    // cursor — that is the ordinary case, and one with none (a shell run that said nothing) is
-    // drawn but skipped, because stopping there would be a press that visibly did nothing. A
-    // **collapsible** element qualifies whether or not it is folded: folded, its title row is the
-    // whole of it and unfolding it is the thing you came to do, so a step that skipped it would
-    // put every tool call in a conversation permanently out of reach.
-    let stoppable = |i: u32| {
-        view.elements
-            .get(i as usize)
-            .is_some_and(|e| !e.is_empty() || e.collapsible)
-    };
+    // stays put when there is none — `Viewport::step_element` is that rule, shared with the line
+    // motions that cross out of an element so the two cannot disagree about where focus may sit.
     let focused = match params.target {
         FocusTarget::Step {
             direction: FocusStep::Next,
-        } => (vp.focused + 1..=last)
-            .find(|&i| stoppable(i))
+        } => vp
+            .step_element(view, vp.focused, true)
             .unwrap_or(vp.focused),
         FocusTarget::Step {
             direction: FocusStep::Previous,
-        } => (0..vp.focused)
-            .rev()
-            .find(|&i| stoppable(i))
+        } => vp
+            .step_element(view, vp.focused, false)
             .unwrap_or(vp.focused),
         // Clamped rather than refused: an id names an element the client just saw, and a view that
         // rebuilt underneath it is a stale id, not a protocol error.
@@ -433,6 +421,12 @@ pub async fn viewport_focus_element(
 
 /// Every change in a view, as `(element, first line of the run)`, in reading order.
 ///
+/// **A change is a change to a file.** Not "the next interesting thing" — that is what `o` steps,
+/// over the view's outline, and the two keys had silently converged: a shell answered with its
+/// runs and a conversation with every one of its blocks, so `c`, `o` and `Tab` walked one list
+/// under three names in every composed view. A command that printed something changed nothing; an
+/// agent saying "I'll look at the parser" changed nothing. Only what touched a file counts here.
+///
 /// A run is a maximal block of consecutive marked lines: one edit, however many lines it spans, is
 /// one stop — the same rule `c` follows in a file, so a patch does not suddenly stutter line by
 /// line through a rewritten paragraph.
@@ -450,36 +444,35 @@ fn change_anchors(
     let mut out = Vec::new();
     let view = s.view_of(vp);
     let view_buffer = view.presenting;
-    // A shell's changes are its **runs** — `c` steps from one command's output to the next, which
-    // is the grain a transcript actually has. Answered up front rather than by falling through the
-    // diff walk below: a shell's elements carry no decorations and window the view's own document,
-    // so that walk answers "no changes at all" and `c` does nothing. The input is not a change: it
-    // is where you are going to type, not something that happened.
-    if let Some(t) = s.try_doc_of(view_buffer).and_then(|d| d.transcript()) {
-        return t
-            .runs
-            .iter()
-            .enumerate()
-            // A run that said nothing has no line to stop on.
-            .filter(|(_, run)| run.end_line_exclusive > run.start_line)
-            .map(|(idx, run)| (idx as aether_protocol::viewport::FieldId, run.start_line))
-            .collect();
-    }
-    // An agent view's changes are its **blocks**, for the reason a shell's are its runs: the
-    // elements carry no decorations, so the diff walk below would answer "no changes at all".
-    if let Some(c) = s.try_doc_of(view_buffer).and_then(|d| d.conversation()) {
-        return c
-            .blocks
-            .iter()
-            .enumerate()
-            .filter(|(_, block)| {
-                s.try_doc_of(block.buffer)
-                    .is_some_and(|d| d.content_lines() > 0)
-            })
-            .map(|(idx, _)| (idx as aether_protocol::viewport::FieldId, 0))
-            .collect();
-    }
-    let generated = s.try_doc_of(view_buffer).and_then(|d| d.patch());
+    // Exhaustive over the kinds of generated content, which is what [`Generated`]'s own docs
+    // claim of this function and what it had stopped doing: a chain of `if let Some(..)` early
+    // returns let the shell arm answer for a kind that had no changes to report, and the next
+    // kind added inherited it. A `match` makes a new kind name its own answer or not compile.
+    let generated = match s.try_doc_of(view_buffer).and_then(|d| d.generated.as_ref()) {
+        // A shell changes no file this view can account for. Its runs are its *outline* — `o`
+        // steps them, and that is the grain a transcript has. `c` here answers nothing rather
+        // than answering the wrong question.
+        Some(crate::state::Generated::Shell(_)) => return Vec::new(),
+        // A conversation's changes are the blocks that **touched a file**: a patch the agent
+        // proposed, and the tools that write. Reading, searching, running a command and thinking
+        // out loud are things that happened — `o` has them — and none of them is a change.
+        Some(crate::state::Generated::Agent(c)) => {
+            return c
+                .blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| crate::agent::changes_a_file(&block.kind))
+                // A block with no text yet has no line to stop on — a tool call only announced.
+                .filter(|(_, block)| {
+                    s.try_doc_of(block.buffer)
+                        .is_some_and(|d| d.content_lines() > 0)
+                })
+                .map(|(idx, _)| (idx as aether_protocol::viewport::FieldId, 0))
+                .collect();
+        }
+        Some(crate::state::Generated::Patch(p)) => Some(p),
+        None => None,
+    };
     let layout = s.layout_of(&view.elements);
     for (idx, binding) in view.elements.iter().enumerate() {
         let Some(decorations) = binding.decorations.as_deref() else {
@@ -549,6 +542,15 @@ fn change_anchors(
 pub struct OutlineEntry {
     /// The element the change lives in.
     pub element: aether_protocol::viewport::FieldId,
+    /// The elements this entry **accounts for**: itself, and whatever follows it until the next
+    /// entry starts. `element..element + 1` for an outline whose entries are each a thing in their
+    /// own right — a hunk, a shell run — and wider for one whose entries are *divisions*: a
+    /// conversation's turn covers the blocks that turn produced, which is what lets the breadcrumb
+    /// say which turn you are reading from anywhere inside it.
+    ///
+    /// Only [`outline_entry_at`] reads it. Everything else wants [`Self::element`] — where the
+    /// entry *is*, and so where selecting it lands.
+    pub covers: std::ops::Range<aether_protocol::viewport::FieldId>,
     /// Its first line **in that element's buffer** — a file line for a bound element, a line of the
     /// generated document for one with no file behind it. This is the coordinate every consumer
     /// needs, and the one the patch's own index does *not* store: the index speaks patch lines.
@@ -879,6 +881,9 @@ pub fn view_outline_of(
             };
             out.push(OutlineEntry {
                 element,
+                // A hunk accounts for itself. Several of one file share an element, so an entry
+                // that reached past its own would claim rows belonging to the next hunk down.
+                covers: element..element + 1,
                 line,
                 file: file.path().to_string(),
                 label: signature.to_string(),
@@ -894,7 +899,14 @@ pub fn view_outline_of(
 
 /// A shell's outline: one entry per run, named by the command that produced it.
 ///
-/// The input is deliberately absent. An outline lists what a view *contains*, and the input
+/// Every entry is a place the cursor can go, which is what an outline row has to be: a run's
+/// element windows its own output, so selecting the row focuses that output and lands in it. A
+/// command that printed **nothing** has an element with no lines — drawn, with its command on the
+/// box, but nothing to put a cursor on — and is left out for the same reason `Tab` skips it
+/// ([`crate::state::Viewport::can_hold_cursor`]): a row that focuses nothing is a row that does
+/// nothing when you pick it.
+///
+/// The input is deliberately absent too. An outline lists what a view *contains*, and the input
 /// contains nothing yet — including it would put a nameless row at the end of every shell's
 /// `Space o` and make `o` stop there on the way past.
 fn transcript_outline(t: &crate::shell::Transcript) -> Vec<OutlineEntry> {
@@ -905,6 +917,9 @@ fn transcript_outline(t: &crate::shell::Transcript) -> Vec<OutlineEntry> {
         .filter(|(_, run)| run.end_line_exclusive > run.start_line)
         .map(|(idx, run)| OutlineEntry {
             element: idx as aether_protocol::viewport::FieldId,
+            // A run accounts for itself: it is one box holding one command's output.
+            covers: idx as aether_protocol::viewport::FieldId
+                ..idx as aether_protocol::viewport::FieldId + 1,
             line: run.start_line,
             // The "file" is the group a listing puts the entry under, and every run of one shell
             // belongs to that shell. Its title is the only name it has.
@@ -920,32 +935,60 @@ fn transcript_outline(t: &crate::shell::Transcript) -> Vec<OutlineEntry> {
         .collect()
 }
 
-/// An agent view's structure: one entry per block, labelled by what the block is.
+/// An agent view's structure: one entry per **turn** — each of your own messages, in your words.
 ///
 /// The same job [`transcript_outline`] does for a shell — `o`, `Space o` and the breadcrumb work
 /// in a conversation with no client-side check of what sort of view it is. The input is not an
-/// entry: it is where you are going to type, not something that happened.
+/// entry: it is where the *next* turn will be typed, not something that happened.
+///
+/// This listed one entry per **block**, and almost none of a conversation's blocks is a place the
+/// cursor can go: the agent's reply is prose and wears no cursor by construction, and the
+/// machinery — tool calls, diffs, the plan — is folded shut until you open it. So `o` stepped onto
+/// elements it could not land in and `Space o` offered rows that focused nothing. A list of
+/// places has to be a list of places you can be.
+///
+/// A turn is one: what you typed is an ordinary editable element, and it is also the division a
+/// conversation actually has — everything after it happened *because* of it. Each entry covers the
+/// blocks its turn produced, so the breadcrumb still names the turn from anywhere inside it.
 fn conversation_outline(s: &ServerState, c: &crate::agent::Conversation) -> Vec<OutlineEntry> {
-    c.blocks
+    use aether_protocol::viewport::FieldId;
+
+    let turns: Vec<usize> = c
+        .blocks
         .iter()
         .enumerate()
-        // A block with no text yet has no line to jump to — a tool call that has only been
-        // announced, most often.
+        .filter(|(_, block)| matches!(block.kind, crate::agent::BlockKind::UserMessage))
+        // A turn with nothing in it yet has no line to land on.
         .filter(|(_, block)| {
             s.try_doc_of(block.buffer)
                 .is_some_and(|d| d.content_lines() > 0)
         })
-        .map(|(idx, block)| {
-            let lines = s
-                .try_doc_of(block.buffer)
-                .map_or(1, |d| d.content_lines().max(1));
+        .map(|(idx, _)| idx)
+        .collect();
+    turns
+        .iter()
+        .enumerate()
+        .map(|(nth, &idx)| {
+            let block = &c.blocks[idx];
+            let doc = s.try_doc_of(block.buffer);
+            let lines = doc.map_or(1, |d| d.content_lines().max(1));
+            // The head of what was typed — a label is a row in a list, and a pasted essay's first
+            // line names it as well as the whole of it would.
+            let head = doc.map_or_else(String::new, |d| {
+                d.text.slice(..d.text.len_chars().min(512)).to_string()
+            });
             OutlineEntry {
-                element: idx as aether_protocol::viewport::FieldId,
+                element: idx as FieldId,
+                // Through to the next turn: everything the agent did in answer belongs to the turn
+                // that asked for it. The last turn runs to the end of the conversation — and no
+                // further, since past it is the input.
+                covers: idx as FieldId
+                    ..turns.get(nth + 1).copied().unwrap_or(c.blocks.len()) as FieldId,
                 line: 0,
-                // Every block of one conversation belongs to that conversation; its title is the
+                // Every turn of one conversation belongs to that conversation; its title is the
                 // only name it has.
                 file: c.title.clone(),
-                label: crate::agent::outline_label(block),
+                label: crate::agent::turn_label(&head),
                 patch_line: 0,
                 patch_lines: 0..lines,
                 // Nothing durable to name: a conversation does not survive a restart, so an entry
@@ -957,21 +1000,6 @@ fn conversation_outline(s: &ServerState, c: &crate::agent::Conversation) -> Vec<
         .collect()
 }
 
-/// The breadcrumb for a **composed** view: the path through its outline to the cursor.
-///
-/// `file.rs › fn outer` — the file the cursor is in, then the label of the change it is inside, both
-/// read from [`view_outline`]. `None` for an ordinary view, which has no outline of this kind and
-/// whose breadcrumb is its document symbols.
-///
-/// The third consumer of the one source, and the reason it exists: `Space o` lists these entries,
-/// `o`/`Alt-o` steps them, and this names the one you are in. Composed from a *file* crumb plus the
-/// entry's own label rather than the language server's chain, so the three cannot describe the same
-/// position in different words.
-/// **Where the cursor is in the outline**: the entry it sits in, and that entry's index.
-///
-/// The one question both the breadcrumb and the picker's opening selection ask, so they ask it once.
-/// Answered against the *focused element* first: entries of other elements are other files, and
-/// being "past" one of those says nothing about where the cursor is.
 /// The view `client_id` is looking at `buffer_id` through: its viewport presenting or windowing the
 /// buffer, else the buffer's most recently used view. What a location the client names by buffer
 /// — a nav-history entry, a jumplist step's origin — is turned into a view by.
@@ -983,6 +1011,14 @@ pub fn client_view_of(s: &ServerState, client_id: ClientId, buffer_id: BufferId)
         .or_else(|| s.view_presenting(buffer_id))
 }
 
+/// **Where the cursor is in the outline**: the entry it sits in, and that entry's index.
+///
+/// The one question both the breadcrumb and the picker's opening selection ask, so they ask it once.
+///
+/// Answered against the entries that **cover** the focused element ([`OutlineEntry::covers`]),
+/// which for a patch is the entries of that element alone: its neighbours are other files, and
+/// being "past" one of those says nothing about where the cursor is. A conversation's turn covers
+/// everything it produced, so the answer inside a tool call is the turn that ran it.
 pub fn outline_entry_at(
     s: &ServerState,
     client_id: ClientId,
@@ -1004,14 +1040,17 @@ pub fn outline_entry_at(
     entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.element == focused && e.line <= line)
+        .filter(|(_, e)| e.covers.contains(&focused))
+        // The line only decides between entries of the focused element itself — several hunks of
+        // one file. One that covers the element from further up covers all of it.
+        .filter(|(_, e)| e.element < focused || e.line <= line)
         .next_back()
         // Before the element's first change — still in its file, which is the answer that matters.
         .or_else(|| {
             entries
                 .iter()
                 .enumerate()
-                .find(|(_, e)| e.element == focused)
+                .find(|(_, e)| e.covers.contains(&focused))
         })
         .map(|(i, e)| (i, e.clone()))
 }
@@ -1231,18 +1270,20 @@ pub async fn viewport_set_wrap(
     Ok(ViewportWindowResult { window })
 }
 
-/// `view/set_expanded`: fold one of the view's elements shut, or open it up.
+/// `view/invoke_action`: press one of the buttons a view declared.
 ///
-/// Refuses an element the view did not mark collapsible, rather than silently doing nothing: a
-/// client pressing the key on a reply has asked for something the view has no answer to, and a
-/// window that came back unchanged would read as a dropped keystroke. That refusal is also what
-/// holds the "a block that is asking you something never folds" rule, since such a block reports
-/// itself uncollapsible for exactly as long as the question stands.
-pub async fn viewport_set_expanded(
+/// Refuses an action the element does not offer, rather than silently doing nothing: a press on a
+/// button that is no longer there — a permission already answered, a reply that never folded — has
+/// to say so, because a window that came back unchanged is indistinguishable from a dropped
+/// keystroke. Resolving against the view *as it is now* is also what makes the semantic naming
+/// safe: the client's idea of the button list can be a rebuild out of date without consequence.
+pub async fn viewport_invoke_action(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: aether_protocol::viewport::ViewportSetExpandedParams,
+    params: aether_protocol::viewport::ViewportInvokeActionParams,
 ) -> Result<ViewportWindowResult, RpcError> {
+    use aether_protocol::ui::ViewAction;
+
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
     require_viewport_mut(&mut s, params.viewport_id, client_id)?;
@@ -1252,23 +1293,82 @@ pub async fn viewport_set_expanded(
         .view_of(vp)
         .elements
         .get(params.element as usize)
-        .filter(|e| e.collapsible)
-        .ok_or_else(|| {
-            RpcError::invalid_params(format!("element {} does not fold", params.element))
-        })?;
-    let buffer_id = binding.buffer_id;
-    // The *expanded* set, so the toggle's sense reads backwards from the key's: pressing it on a
-    // folded element inserts, pressing it on an open one removes.
-    let expanded = params.expanded.unwrap_or(!vp.expanded.contains(&buffer_id));
+        .cloned()
+        .ok_or_else(|| RpcError::invalid_params(format!("no element {}", params.element)))?;
 
-    let vp = s
-        .viewports
-        .get_mut(&params.viewport_id)
-        .expect("checked above");
-    if expanded {
-        vp.expanded.insert(buffer_id);
-    } else {
-        vp.expanded.remove(&buffer_id);
+    match params.action {
+        ViewAction::Expand { expand } => {
+            if !binding.collapsible {
+                return Err(RpcError::invalid_params(format!(
+                    "element {} does not fold",
+                    params.element
+                )));
+            }
+            // The *expanded* set, so the toggle's sense reads backwards from the button's:
+            // pressing it on a folded element inserts, pressing it on an open one removes.
+            let expanded = expand.unwrap_or(!vp.expanded.contains(&binding.buffer_id));
+            let vp = s
+                .viewports
+                .get_mut(&params.viewport_id)
+                .expect("checked above");
+            if expanded {
+                vp.expanded.insert(binding.buffer_id);
+            } else {
+                vp.expanded.remove(&binding.buffer_id);
+            }
+        }
+        // Answering goes through the agent handler rather than being re-implemented here: it has
+        // to reach the connection and unblock the turn, and there is exactly one place that knows
+        // how. The block is named by *which one is blocked*, as a keystroke always named it —
+        // only one request can be outstanding, since the agent is waiting on it.
+        ViewAction::Permission { allow } => {
+            let view_id = s.viewports[&params.viewport_id].view_id;
+            drop(s);
+            let answer = if allow {
+                aether_protocol::agent::Answer::Allow
+            } else {
+                aether_protocol::agent::Answer::Decline
+            };
+            crate::handlers::agent_respond(
+                state,
+                ctx,
+                aether_protocol::agent::AgentRespondParams {
+                    view_id,
+                    answer,
+                    block: None,
+                },
+            )
+            .await?;
+            s = state.lock().await;
+        }
+        // Whole file, which is what the button on a file's heading means — `Space g s` is still
+        // how you stage one hunk or a selection. Delegated to the ordinary apply rather than
+        // reimplemented: that path resolves the repo, seats the cursor and rebuilds the patch, and
+        // there is exactly one place that knows how.
+        ViewAction::Stage { stage } => {
+            if stage_button(&binding).is_none() {
+                return Err(RpcError::invalid_params(format!(
+                    "element {} offers no stage action",
+                    params.element
+                )));
+            }
+            drop(s);
+            crate::handlers::git_apply_hunk(
+                state,
+                ctx,
+                aether_protocol::git::GitApplyHunkParams {
+                    buffer_id: binding.buffer_id,
+                    action: if stage {
+                        aether_protocol::git::HunkAction::Stage
+                    } else {
+                        aether_protocol::git::HunkAction::Unstage
+                    },
+                    scope: aether_protocol::git::ApplyScope::File,
+                },
+            )
+            .await?;
+            s = state.lock().await;
+        }
     }
 
     let window = render_viewport(&s, params.viewport_id, SneakLabels::Shown);
@@ -2087,7 +2187,11 @@ fn node_rows(node: &Element) -> u32 {
             edges, children, ..
         } => u32::from(edges.top() + edges.bottom()) + children.iter().map(node_rows).sum::<u32>(),
         Element::Row { edges, .. } => u32::from(edges.top() + edges.bottom()) + 1,
-        Element::Text { .. } | Element::Space { .. } | Element::Fill { .. } => 1,
+        // Inline, like the text beside it: a button sits *in* a row rather than costing one.
+        Element::Text { .. }
+        | Element::Space { .. }
+        | Element::Fill { .. }
+        | Element::Action { .. } => 1,
         // Not chrome: an element's own height is the walk's business, not its chrome's.
         Element::Editor { .. } | Element::Prose { .. } => 0,
     }
@@ -2444,7 +2548,7 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         // Folded shut for this viewport: it windows its lines as ever, and none of them are going
         // out. Everything below follows from this one flag — no rows, no lines, no parse, and the
         // box loses its bottom border so the whole element is the single row its title rides.
-        let collapsed = binding.collapsible && !vp.expanded.contains(&binding.buffer_id);
+        let collapsed = vp.is_collapsed(binding);
         let loaded = vp
             .loaded
             .get(idx)
@@ -2495,10 +2599,39 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
             // Chrome *inside* the box — a tool call's permission question — folds with it. A block
             // that is asking something never folds in the first place, so nothing a fold hides is
             // ever waiting on an answer.
+            //
+            // A reviewable element's chrome grows a stage button: its file heading is where you
+            // would reach for one, and `Tab` reaching it is what makes a review navigable by the
+            // same key a conversation is. The `Space g s`/`u` chords stay — a button says "this
+            // file", and those still say "this hunk" or "these lines", which is a distinction a
+            // single button cannot carry.
             chrome_above: if collapsed {
                 Default::default()
             } else {
-                binding.chrome_above.clone()
+                match stage_button(binding) {
+                    Some(button) => {
+                        let mut chrome = binding.chrome_above.as_ref().clone();
+                        // Onto the heading row, after what it already says.
+                        match chrome.iter_mut().find_map(|c| match c {
+                            Element::Row { children, .. } => Some(children),
+                            Element::Column { children, .. } => {
+                                children.iter_mut().find_map(|c| match c {
+                                    Element::Row { children, .. } => Some(children),
+                                    _ => None,
+                                })
+                            }
+                            _ => None,
+                        }) {
+                            Some(children) => {
+                                children.push(Element::Space { cols: 2 });
+                                children.push(button);
+                                std::sync::Arc::new(chrome)
+                            }
+                            None => binding.chrome_above.clone(),
+                        }
+                    }
+                    None => binding.chrome_above.clone(),
+                }
             },
             chrome_before: binding.chrome_before.clone(),
             first_buffer_line,
@@ -2519,7 +2652,26 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
                 binding.edges
             },
             band: binding.band,
-            title: binding.title.clone(),
+            // A foldable box wears its own disclosure, first on the title row — which costs no
+            // rows, since the title rides the border the box was already spending. It is what
+            // `Tab` stops on and what `Enter` presses, and it is the only thing folding needs:
+            // the client binds no key of its own for it.
+            title: if binding.collapsible {
+                let mut title = Vec::with_capacity(binding.title.len() + 2);
+                title.push(Element::Action {
+                    action: aether_protocol::ui::ViewAction::Expand { expand: None },
+                    label: vec![Element::text(
+                        if collapsed { "\u{25b8}" } else { "\u{25be}" },
+                        Vec::new(),
+                    )],
+                    enabled: true,
+                });
+                title.push(Element::Space { cols: 1 });
+                title.extend(binding.title.iter().cloned());
+                std::sync::Arc::new(title)
+            } else {
+                binding.title.clone()
+            },
             prose,
             collapsed,
         });
@@ -2544,6 +2696,39 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         other_elements_dirty: other_elements_dirty(s, elements, focused),
         root: compose_tree(rendered, trailing_chrome),
     }
+}
+
+/// The stage button a reviewable element offers, if it offers one.
+///
+/// Only an element that **opens a box and carries a diff's account of its own lines** — a file
+/// block in a review. Its state comes from those lines: everything already staged offers "Unstage",
+/// anything left offers "Stage", which is the same thing the `Space g Alt-s` chord decides from the
+/// same source. An element with no changes offers nothing, because there is nothing to stage.
+///
+/// Derived here rather than baked into the generated patch: staging is a fact about the working
+/// tree, and a commit's diff carries markers that are history rather than a layer you can move.
+/// Those come back `DiffStage::Unstaged` uniformly, so this is gated on the element having a box
+/// to open — which a commit's blocks also have — and then on there being a *split* to act on.
+fn stage_button(binding: &crate::state::ElementBinding) -> Option<Element> {
+    use aether_protocol::viewport::DiffStage;
+
+    let decorations = binding.decorations.as_deref()?;
+    binding.box_group?;
+    if decorations.markers.is_empty() {
+        return None;
+    }
+    let staged = decorations
+        .markers
+        .values()
+        .all(|(_, stage)| matches!(stage, DiffStage::Staged));
+    Some(Element::Action {
+        action: aether_protocol::ui::ViewAction::Stage { stage: !staged },
+        label: vec![Element::text(
+            if staged { "Unstage" } else { "Stage" },
+            Vec::new(),
+        )],
+        enabled: true,
+    })
 }
 
 /// The markdown an element renders as: the lines it windows, parsed — and where those lines begin.

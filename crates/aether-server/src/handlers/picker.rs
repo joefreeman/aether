@@ -1415,6 +1415,13 @@ fn build_outline_candidates(
     text: &ropey::Rope,
 ) -> Vec<crate::picker::GitChangeCandidate> {
     let view_buffer = s.view_of(vp).presenting;
+    // Whether the rows group by file. A patch's do — that is what its outline is *of*. A shell's
+    // runs and a conversation's turns have no files at all, and their one label would head a group
+    // holding every row; see [`crate::picker::GitChangeCandidate::grouped`].
+    let by_file = matches!(
+        s.try_doc_of(view_buffer).and_then(|d| d.generated.as_ref()),
+        Some(crate::state::Generated::Patch(_))
+    );
     crate::handlers::viewport::view_outline(s, vp)
         .into_iter()
         .enumerate()
@@ -1428,13 +1435,15 @@ fn build_outline_candidates(
             } else {
                 e.label.clone()
             };
-            // The element's own buffer and line, when it windows a real file — what everything
-            // acting on this row actually wants.
-            let file = s
+            // Where the row is **in the view**: its element, the buffer that element windows, and
+            // the line within it — which is the coordinate `OutlineEntry::line` already speaks,
+            // whether the element windows a file or the view's own document. Selecting a row
+            // focuses that element and lands there; without it a shell's rows set a cursor in an
+            // unfocused element, where nothing draws it.
+            let seat = s
                 .view_of(vp)
                 .elements
                 .get(e.element as usize)
-                .filter(|b| b.buffer_id != view_buffer)
                 .map(|b| (e.element, b.buffer_id, e.line));
             // And the file itself, for a jumplist entry to keep: a working-tree file by its path,
             // a file at a revision by the key that re-materialises it.
@@ -1450,10 +1459,10 @@ fn build_outline_candidates(
                 };
                 (target, e.file_lines.start)
             });
-            crate::picker::GitChangeCandidate::for_patch(
+            let row = crate::picker::GitChangeCandidate::for_patch(
                 crate::picker::PatchRowTarget {
                     view: vp.view_id,
-                    file,
+                    seat,
                     durable,
                     line_of: vec![e.patch_line],
                 },
@@ -1463,7 +1472,12 @@ fn build_outline_candidates(
                 0,
                 0,
                 vec![label],
-            )
+            );
+            if by_file {
+                row
+            } else {
+                row.ungrouped()
+            }
         })
         .collect()
 }
@@ -1519,7 +1533,7 @@ fn build_patch_change_candidates(
                     view: view_id,
                     // No viewport here, so no element to resolve against: this builder runs for a
                     // cursor that has not entered one.
-                    file: None,
+                    seat: None,
                     durable: None,
                     line_of,
                 },

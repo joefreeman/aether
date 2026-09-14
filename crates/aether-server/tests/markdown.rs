@@ -212,7 +212,7 @@ async fn out_of_window_edit_pushes_buffer_changed() {
         send_request::<ViewportSubscribe>(&mut ws2, &transient_sub_params(editor.buffer_id)).await;
 
     // Client 1 edits far below client 2's window → client 2 gets the revision-only signal.
-    let _: CursorState = send_request::<CursorMove>(
+    let _: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -245,7 +245,7 @@ async fn out_of_window_edit_pushes_buffer_changed() {
     assert_eq!(changed.revision, r.revision);
 
     // Client 1 edits inside client 2's window → the full window render as before.
-    let _: CursorState = send_request::<CursorMove>(
+    let _: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -1321,7 +1321,7 @@ async fn block_content_stops_before_the_terminator() {
 /// `i` and `a` land at the block's start and at its append point.
 #[tokio::test]
 async fn block_edge_lands_at_the_blocks_start_and_append_point() {
-    use aether_protocol::cursor::{CursorMove, CursorMoveParams, Motion};
+    use aether_protocol::cursor::{CursorMoveParams, Motion};
     let (server, mut ws, buffer_id) =
         setup_with_buffer("# Title\n\nFirst para.\n\nSee here.\n").await;
     let edge = |at_end| CursorMoveParams {
@@ -1330,9 +1330,9 @@ async fn block_edge_lands_at_the_blocks_start_and_append_point() {
         extend_selection: false,
     };
     set_cursor(&mut ws, buffer_id, 2, 4).await;
-    let r: CursorState = send_request::<CursorMove>(&mut ws, &edge(false)).await;
+    let r: CursorState = move_cursor(&mut ws, &edge(false)).await;
     assert_eq!(r.position, LogicalPosition { line: 2, col: 0 });
-    let r: CursorState = send_request::<CursorMove>(&mut ws, &edge(true)).await;
+    let r: CursorState = move_cursor(&mut ws, &edge(true)).await;
     assert_eq!(
         r.position,
         LogicalPosition { line: 2, col: 11 },
@@ -1344,9 +1344,9 @@ async fn block_edge_lands_at_the_blocks_start_and_append_point() {
 /// A document with no blocks is not a dead end: the edges are the element's own.
 #[tokio::test]
 async fn block_edge_falls_back_to_the_elements_ends_without_blocks() {
-    use aether_protocol::cursor::{CursorMove, CursorMoveParams, Motion};
+    use aether_protocol::cursor::{CursorMoveParams, Motion};
     let (server, mut ws, buffer_id) = setup_with_buffer("").await;
-    let r: CursorState = send_request::<CursorMove>(
+    let r: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -1360,7 +1360,7 @@ async fn block_edge_falls_back_to_the_elements_ends_without_blocks() {
 
     // Blank lines parse to no blocks either, and `a` still means the end, past them.
     let (server, mut ws, buffer_id) = setup_with_buffer("\n\n").await;
-    let r: CursorState = send_request::<CursorMove>(
+    let r: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,

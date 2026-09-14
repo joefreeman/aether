@@ -7289,31 +7289,102 @@ fn an_editor_says_when_it_is_folded_shut() {
     );
 }
 
-/// Folding is addressed to a viewport and an element, and says which way only when the caller
-/// cares — a key press does not, so the ordinary request is a toggle.
+/// Every affordance a view grows goes through **one** method, naming what to do rather than an id.
+///
+/// The naming is the point: a view rebuilds under the client constantly, so an id minted per build
+/// is stale before the press comes back. A closed enum also means a new action cannot arrive
+/// unhandled — every shell that paints one and every handler that runs one stops compiling.
 #[test]
-fn set_expanded_shape() {
-    use aether_protocol::viewport::{ViewportSetExpanded, ViewportSetExpandedParams};
-    assert_eq!(ViewportSetExpanded::NAME, "view/set_expanded");
-    let toggle = to_value(ViewportSetExpandedParams {
+fn invoke_action_shape() {
+    use aether_protocol::ui::{ActionKind, ViewAction};
+    use aether_protocol::viewport::{ViewportInvokeAction, ViewportInvokeActionParams};
+    assert_eq!(ViewportInvokeAction::NAME, "view/invoke_action");
+
+    let toggle = to_value(ViewportInvokeActionParams {
         viewport_id: 4,
         element: 2,
-        expanded: None,
-    })
-    .unwrap();
-    assert_eq!(toggle, json!({ "viewport_id": 4, "element": 2 }));
-    let explicit = to_value(ViewportSetExpandedParams {
-        viewport_id: 4,
-        element: 2,
-        expanded: Some(true),
+        action: ViewAction::Expand { expand: None },
     })
     .unwrap();
     assert_eq!(
-        explicit,
-        json!({ "viewport_id": 4, "element": 2, "expanded": true })
+        toggle,
+        json!({ "viewport_id": 4, "element": 2, "action": { "do": "expand" } })
     );
-    let back: ViewportSetExpandedParams = from_value(toggle).unwrap();
-    assert_eq!(back.expanded, None);
+    let answer = to_value(ViewportInvokeActionParams {
+        viewport_id: 4,
+        element: 2,
+        action: ViewAction::Permission { allow: false },
+    })
+    .unwrap();
+    assert_eq!(
+        answer,
+        json!({
+            "viewport_id": 4,
+            "element": 2,
+            "action": { "do": "permission", "allow": false }
+        })
+    );
+    let back: ViewportInvokeActionParams = from_value(toggle).unwrap();
+    assert!(matches!(back.action, ViewAction::Expand { expand: None }));
+
+    // How a shell paints one is **derived**, never sent: three shells cannot be told different
+    // things about which of two buttons you should hesitate over.
+    assert_eq!(
+        ViewAction::Permission { allow: true }.kind(),
+        ActionKind::Accept
+    );
+    assert_eq!(
+        ViewAction::Permission { allow: false }.kind(),
+        ActionKind::Reject
+    );
+    assert_eq!(
+        ViewAction::Expand { expand: None }.kind(),
+        ActionKind::Toggle
+    );
+    assert_eq!(ActionKind::Accept.role(), "diff.added");
+    assert_eq!(ActionKind::Reject.role(), "diff.removed");
+}
+
+/// A button is an element of the view's own vocabulary — and an inline **leaf**, so a painter that
+/// flattens a row to its leaves meets the button rather than its bare words.
+#[test]
+fn an_action_is_an_inline_leaf() {
+    use aether_protocol::ui::ViewAction;
+    let button = Element::Action {
+        action: ViewAction::Permission { allow: true },
+        label: vec![Element::text("Allow", Vec::new())],
+        enabled: true,
+    };
+    let v = to_value(&button).unwrap();
+    assert_eq!(
+        v,
+        json!({
+            "node": "action",
+            "action": { "do": "permission", "allow": true },
+            "label": [{ "node": "text", "text": "Allow" }]
+        }),
+        "enabled is the ordinary case and stays off the wire"
+    );
+    let row = Element::row(vec![Element::text("x", Vec::new()), button.clone()]);
+    let leaves = row.inline();
+    assert_eq!(leaves.len(), 2, "the button was flattened away: {leaves:?}");
+    assert!(matches!(leaves[1], Element::Action { .. }));
+    // One spelling of the drawn text, so no shell measures a row differently from how it paints it.
+    assert_eq!(
+        ViewAction::labelled(&[Element::text("Allow", Vec::new())]),
+        "[Allow]"
+    );
+
+    // The browser hand-mirrors this; `tsc` cannot see a Rust rename.
+    let ts = include_str!("../../../web/src/protocol.ts");
+    assert!(
+        ts.contains("node: \"action\""),
+        "web/src/protocol.ts must declare the action node"
+    );
+    assert!(
+        ts.contains("focusRing"),
+        "web/src/protocol.ts must mirror the focus ring `Tab` walks"
+    );
 }
 
 /// `shell/open` asks *nothing* and answers with an open plus the element to type into.

@@ -1736,8 +1736,12 @@ impl Shell {
         let line = self.session.view.buffer.cursor.position.line;
         // Per element: a cursor line is a line of *its element's* buffer, and comparing it against
         // the window's view-line range says "not loaded" for a line sitting in plain sight.
-        let loaded =
-            aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line);
+        //
+        // A reveal owed for a **button** needs no line at all: its row is in the tree already, and
+        // a folded element has no line that could ever load, so gating on one here is what left
+        // `Tab` owing a reveal forever and re-fetching a window that answers the same way.
+        let loaded = !self.session.view.reveal_wants_a_line()
+            || aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line);
         tracing::debug!(
             ?style,
             line,
@@ -1826,6 +1830,12 @@ impl Shell {
     /// Whether the reveal could be performed — `false` when the cursor's line isn't in the loaded
     /// window, so its visual row is unknown and the view can't be positioned on it yet. The
     /// [`RevealTarget`] impl below is what hands this answer back to [`PendingReveal`].
+    /// The row a reveal is about: the button `Tab` reached, else the cursor's line — the core's
+    /// one answer, shared with the GUI and the browser ([`aether_client::session::ViewState::reveal_row`]).
+    fn reveal_row(&self) -> Option<VisualRow> {
+        self.session.view.reveal_row(&self.measured)
+    }
+
     fn reveal_cursor_styled(&mut self, style: RevealStyle) -> bool {
         match style {
             RevealStyle::Follow => self.reveal_cursor(),
@@ -1840,15 +1850,10 @@ impl Shell {
             return true; // the reader's reveal is its own — nothing owed here
         }
         self.reveal_cursor_col();
-        let Some(window) = &self.session.view.window else {
+        if self.session.view.window.is_none() {
             return false;
-        };
-        let Some(row) = cursor_visual_row(
-            window,
-            self.session.view.focused_element,
-            self.session.view.buffer.cursor.position,
-            &self.measured,
-        ) else {
+        }
+        let Some(row) = self.reveal_row() else {
             return false;
         };
         let visible = self.visible_rows();
@@ -1868,15 +1873,10 @@ impl Shell {
             return true;
         }
         self.reveal_cursor_col();
-        let Some(window) = &self.session.view.window else {
+        if self.session.view.window.is_none() {
             return false;
-        };
-        let resolved = cursor_visual_row(
-            window,
-            self.session.view.focused_element,
-            self.session.view.buffer.cursor.position,
-            &self.measured,
-        );
+        }
+        let resolved = self.reveal_row();
         let visible = self.visible_rows();
         tracing::debug!(
             element = self.session.view.focused_element,
@@ -2729,6 +2729,7 @@ impl Shell {
                 .map(|(id, (_, _, rows))| (*id, rows.clone()))
                 .collect(),
             focused_element: self.session.view.focused_element,
+            focus: self.session.view.focus,
             root: window
                 .map(|w| w.root.clone())
                 .or_else(|| prev.map(|p| p.root.clone()))
@@ -3645,14 +3646,21 @@ mod scroll_tests {
     /// A patch-shaped view: each element is `(buffer, first_buffer_line, height)`, introduced by a
     /// chrome row, with `loaded` naming which elements carry lines (the rest are on-screen only as
     /// height — exactly how a window works once a view is taller than the fetch).
+    /// A review: a heading per file, and the file's hunk under it.
+    ///
+    /// **No buttons.** `Tab` walks the view's focus ring, and an element being shown is a stop in
+    /// its own right, so these tests reach what they mean without one. A stage button here would
+    /// put a stop on the heading *row above* each element — which is a fine thing for a review to
+    /// have and a bad thing for a test about where the view scrolls to, since the first landing
+    /// would rest the button and the second would find the element already on screen.
     fn window_of(elements: &[(u64, u32, u32)], loaded: &[usize]) -> Window {
         let mut children = Vec::new();
         for (i, (buffer, first, height)) in elements.iter().enumerate() {
-            children.push(Element::chrome(vec![aether_protocol::ui::Element::text(
+            let heading = Element::chrome(vec![aether_protocol::ui::Element::text(
                 "a file",
                 Vec::new(),
-            )]));
-            children.push(Element::Editor {
+            )]);
+            let editor = Element::Editor {
                 collapsed: false,
                 element: i as u32,
                 buffer: *buffer,
@@ -3666,7 +3674,8 @@ mod scroll_tests {
                 } else {
                     Vec::new()
                 },
-            });
+            };
+            children.push(Element::column(vec![heading, editor]));
         }
         Window {
             other_elements_dirty: false,
@@ -3756,6 +3765,56 @@ mod scroll_tests {
         })
     }
 
+    /// Press `Tab` until focus reaches ring position `at`, answering each focus request the way
+    /// the server would.
+    ///
+    /// The ring's *shape* is not what the reveal tests are about, and counting presses made them
+    /// about exactly that: adding a stop — a file's stage button, an element the cursor can enter
+    /// — silently landed them somewhere else, and they then failed on a reveal that was correct.
+    /// They walk to the stop they mean instead.
+    fn tab_to(sh: &mut Shell, at: usize) {
+        for _ in 0..16 {
+            if focus_position(sh) == Some(at) {
+                return;
+            }
+            let fx = sh.session.on_key(KeyCode::Tab, Mods::NONE, None);
+            let (token, method) = the_request(&fx);
+            assert_eq!(method, "view/focus_element");
+            let element = match sh.session.view.focus {
+                aether_client::grid::Focus::Stop { element, .. } => element,
+                aether_client::grid::Focus::Text => unreachable!("`Tab` lands on the ring"),
+            };
+            sh.run_effects(fx);
+            sh.on_response(
+                Continuation::Core { token },
+                "view/focus_element",
+                Ok(focus_result(element, 7 + element as u64, 0)),
+            );
+        }
+        panic!("`Tab` never reached ring position {at}");
+    }
+
+    /// Where the client's focus sits on the ring of the window it is showing.
+    fn focus_position(sh: &Shell) -> Option<usize> {
+        let root = &sh.session.view.window.as_ref().expect("a window").root;
+        sh.session
+            .view
+            .focus
+            .position(&aether_client::grid::focus_ring(root))
+    }
+
+    /// The ring position of the stop that *is* `element` — the place its rows are, as distinct
+    /// from the buttons that act on it and sit above them.
+    fn stop_of(sh: &Shell, element: u32) -> usize {
+        let root = &sh.session.view.window.as_ref().expect("a window").root;
+        aether_client::grid::focus_ring(root)
+            .iter()
+            .position(
+                |s| matches!(s, aether_client::grid::Stop::Element { element: e } if *e == element),
+            )
+            .unwrap_or_else(|| panic!("element {element} is not a stop"))
+    }
+
     /// `Tab` to an element **below the fold** rests it near the top, like any other jump.
     ///
     /// It used to reveal *minimally*, which scrolls the target just far enough to touch the bottom
@@ -3775,21 +3834,114 @@ mod scroll_tests {
             "the fixture wants the target off screen"
         );
 
-        let fx = sh.session.on_key(KeyCode::Tab, Mods::NONE, None);
-        let (token, method) = the_request(&fx);
-        assert_eq!(method, "view/focus_element");
-        sh.run_effects(fx);
-        sh.on_response(
-            Continuation::Core { token },
-            "view/focus_element",
-            Ok(focus_result(1, 8, 0)),
-        );
+        let at = stop_of(&sh, 1);
+        tab_to(&mut sh, at);
 
         let rest = (sh.visible_rows() as f32 * CURSOR_REST_FRACTION) as u32;
         assert_eq!(
             sh.top_visual_row,
             VisualRow(start.get() - rest),
             "a jump rests its target near the top, with context below"
+        );
+    }
+
+    /// `Tab` to a **folded** block scrolls its title row into view.
+    ///
+    /// The regression Joe found in the terminal: a folded element has no rows of its own and no
+    /// line that can ever load, so a reveal asked against the *cursor* could never be paid — the
+    /// shell owed one forever and kept fetching a window that came back with the element folded
+    /// again. `Tab` moved focus and the screen did not move. What has to be revealed is the row
+    /// the **button** is drawn on, which is in the tree the shell already holds.
+    #[test]
+    fn tab_to_a_folded_block_below_the_fold_scrolls_to_its_title() {
+        // A tall first element, then a folded box whose whole extent is its own title row.
+        let folded = {
+            let mut w = window_of(&[(7, 0, 60)], &[0]);
+            let Element::Column { children, .. } = &mut w.root else {
+                unreachable!("window_of builds a column")
+            };
+            children.push(Element::titled(
+                aether_protocol::ui::Edges {
+                    border: aether_protocol::ui::Sides {
+                        top: 1,
+                        left: 1,
+                        right: 1,
+                        bottom: 0,
+                    },
+                    padding: aether_protocol::ui::Sides::ZERO,
+                    collapse: false,
+                },
+                aether_protocol::ui::Band::Chrome,
+                vec![
+                    aether_protocol::ui::Element::Action {
+                        action: aether_protocol::ui::ViewAction::Expand { expand: None },
+                        label: vec![aether_protocol::ui::Element::text("\u{25b8}", Vec::new())],
+                        enabled: true,
+                    },
+                    aether_protocol::ui::Element::Space { cols: 1 },
+                    aether_protocol::ui::Element::text("Running cargo test", Vec::new()),
+                ],
+                vec![Element::Editor {
+                    collapsed: true,
+                    element: 1,
+                    buffer: 8,
+                    rows: 0,
+                    first_row: aether_protocol::coords::ElementRow::ZERO,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
+                    first_buffer_line: 0,
+                    lines: Vec::new(),
+                }],
+            ));
+            w
+        };
+        let mut sh = shell_with(folded, 0, 0);
+
+        // The fixture wants the fold off screen, and it is the box's own edge row that carries it.
+        let ring = aether_client::grid::focus_ring(&sh.session.view.window.as_ref().unwrap().root);
+        let fold = ring
+            .iter()
+            .find(|s| matches!(s, aether_client::grid::Stop::Action { element: 1, .. }))
+            .expect("the fold's disclosure is on the ring");
+        let root = &sh.session.view.window.as_ref().unwrap().root;
+        let at = ring
+            .iter()
+            .position(|s| std::ptr::eq(s as *const _, fold as *const _))
+            .expect("the fold is on the ring");
+        let row = aether_client::grid::focused_row_of(
+            root,
+            &sh.measured,
+            &aether_client::grid::focused(
+                root,
+                1,
+                aether_client::grid::focus_of(&ring, at).expect("a stop at that position"),
+            ),
+        )
+        .expect("the disclosure is drawn somewhere");
+        assert!(
+            row.get() >= sh.visible_rows(),
+            "the fixture wants the fold off screen"
+        );
+
+        // The folded element windows no lines, so its focus result carries a cursor that can never
+        // be revealed — precisely the case that used to leave the view where it was.
+        drop(ring);
+        tab_to(&mut sh, at);
+
+        // On screen, which is the whole contract here. Not a rest position: this view is barely
+        // taller than the viewport, so resting the fold near the top would scroll past the end and
+        // clamps — `tab_to_an_element_below_the_fold_rests_it_near_the_top` pins the resting rule
+        // where there is room for it.
+        let top = sh.top_visual_row.get();
+        assert!(
+            row.get() >= top && row.get() < top + sh.visible_rows(),
+            "`Tab` left the folded block off screen: it is at row {}, the view shows {top}..{}",
+            row.get(),
+            top + sh.visible_rows()
+        );
+        assert!(
+            top > 0,
+            "`Tab` to a folded block left the view where it was"
         );
     }
 
@@ -3828,30 +3980,31 @@ mod scroll_tests {
         );
     }
 
-    /// Tab at the last element doesn't move focus, so it doesn't re-frame anything.
+    /// `Tab` at the **last stop on the ring** asks for nothing, and the view does not move.
     ///
-    /// It still *reveals* — a keystroke may bring an off-screen cursor back — but a placement would
-    /// scroll a view that is already showing exactly what it should, on a keystroke that did
-    /// nothing. The distinction is why the focus reply's element is compared before it is adopted.
+    /// The client holds the window, so it knows where the ring ends: stepping past it is a press
+    /// that produces no request at all rather than one the server clamps and answers with the same
+    /// element. What has to hold either way is that a keystroke which went nowhere does not scroll
+    /// a view already showing exactly what it should.
     #[test]
-    fn tab_at_the_last_element_does_not_reframe_the_view() {
+    fn tab_at_the_last_stop_asks_for_nothing_and_does_not_reframe() {
         let mut sh = shell_with(window_of(&[(7, 0, 20), (8, 0, 100)], &[0, 1]), 1, 0);
-        // The cursor (element 1's first line, row 22) is the viewport's top row: visible, so a
-        // reveal has nothing to do and only a placement would move the view.
         sh.top_visual_row = VisualRow(22);
+        // Already on the ring's last stop — the second file's own stage button.
+        let ring = aether_client::grid::focus_ring(&sh.session.view.window.as_ref().unwrap().root);
+        sh.session.view.focus =
+            aether_client::grid::focus_of(&ring, ring.len() - 1).expect("the ring's last stop");
+
         let fx = sh.session.on_key(KeyCode::Tab, Mods::NONE, None);
-        let (token, _) = the_request(&fx);
-        sh.run_effects(fx);
-        // The server clamps at the end: focus comes back unchanged.
-        sh.on_response(
-            Continuation::Core { token },
-            "view/focus_element",
-            Ok(focus_result(1, 8, 0)),
+        assert!(
+            !fx.0.iter().any(|e| matches!(e, Effect::Request { .. })),
+            "`Tab` past the last stop asked the server something"
         );
+        sh.run_effects(fx);
         assert_eq!(
             sh.top_visual_row,
             VisualRow(22),
-            "a keystroke that changed no focus must not re-frame the view"
+            "a keystroke that went nowhere must not re-frame the view"
         );
     }
 

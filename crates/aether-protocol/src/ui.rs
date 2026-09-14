@@ -151,6 +151,27 @@ pub enum Element {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         highlights: Vec<Highlight>,
     },
+    /// Something the view offers to **do**, drawn as a button and reachable with `Tab`.
+    ///
+    /// The vocabulary's answer to "this view can be acted on", as [`Element::Editor`] is its answer
+    /// to "this is text to edit". Before it, every affordance a view grew took a *keybinding* with
+    /// it — `Space v a`/`d` to answer an agent, `Space g s`/`u` to stage — so the keymap grew a row
+    /// per view kind and the mouse could reach none of them. What a view can do is a fact about the
+    /// view, so the view says it, and one key activates whatever is focused.
+    ///
+    /// `label` is **the wording of whoever built the view** — an agent's own permission options,
+    /// verbatim. A shell never invents wording, exactly as it never invented it for the permission
+    /// row this replaces; what it styles by is [`ViewAction::kind`], which is a fact about the
+    /// *shape* of the action and not about its words.
+    Action {
+        action: ViewAction,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        label: Vec<Element>,
+        /// Drawn, reachable, and refused — a stage button on a file with nothing to stage. Off the
+        /// wire for the ordinary case, which is an action you can take.
+        #[serde(default = "yes", skip_serializing_if = "is_yes")]
+        enabled: bool,
+    },
     /// `cols` blank cells. Separating a rail from its heading is a layout fact, not a string of
     /// spaces someone has to remember to trim.
     Space { cols: u16 },
@@ -394,9 +415,14 @@ impl Element {
     pub fn inline(&self) -> Vec<&Element> {
         let mut out = Vec::new();
         self.walk(&mut |e| {
+            // A button is a leaf here, not a container: its label is *its* to draw, and a painter
+            // that flattened through it would lose the button and lay the words out bare.
             if matches!(
                 e,
-                Element::Text { .. } | Element::Space { .. } | Element::Fill { .. }
+                Element::Text { .. }
+                    | Element::Space { .. }
+                    | Element::Fill { .. }
+                    | Element::Action { .. }
             ) {
                 out.push(e);
             }
@@ -560,6 +586,93 @@ impl Edges {
     pub fn bottom(&self) -> u16 {
         self.border.bottom + self.padding.bottom
     }
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(b: &bool) -> bool {
+    *b
+}
+
+/// What invoking an [`Element::Action`] does.
+///
+/// **A closed enum, not an opaque id.** A view rebuilds constantly — an agent view on every event
+/// the agent sends — so an id minted per build is stale by the time a key press comes back, and the
+/// server would be resolving a number it can no longer place. Every variant here names its effect
+/// instead, so an invocation is re-resolved against the view as it is *now*: it does the thing or
+/// it refuses, and neither depends on the two sides having built the same list.
+///
+/// The same closed-enum discipline [`crate::viewport::Element`]'s own kinds follow: a new action
+/// has to be named here, which means every shell that paints one and every handler that runs one
+/// stops compiling until it is handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "do", rename_all = "snake_case")]
+pub enum ViewAction {
+    /// Answer the permission request the element's block is blocked on.
+    Permission { allow: bool },
+    /// Fold the element shut, or open it up. `None` toggles, which is what a key press means.
+    Expand {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expand: Option<bool>,
+    },
+    /// Stage or unstage the change this element windows.
+    Stage { stage: bool },
+}
+
+impl ViewAction {
+    /// The text a button draws, brackets included — one spelling, so the three shells cannot
+    /// measure a row differently from how they paint it.
+    pub fn labelled(label: &[Element]) -> String {
+        let mut out = String::from("[");
+        for l in label {
+            out.push_str(&l.text_content());
+        }
+        out.push(']');
+        out
+    }
+
+    /// How a shell should paint it. Derived rather than sent, so the three shells cannot be told
+    /// different things about one action — and so a new variant cannot arrive unstyled.
+    pub fn kind(&self) -> ActionKind {
+        match self {
+            ViewAction::Permission { allow: true } => ActionKind::Accept,
+            ViewAction::Permission { allow: false } => ActionKind::Reject,
+            ViewAction::Expand { .. } => ActionKind::Toggle,
+            ViewAction::Stage { .. } => ActionKind::Neutral,
+        }
+    }
+}
+
+impl ActionKind {
+    /// The highlight role a shell paints a button's label in.
+    ///
+    /// Named here rather than picked per shell, so the three cannot come to disagree about which
+    /// of two buttons is the one you should hesitate over. They resolve through the theme table
+    /// every shell already has, exactly as buffer text and chrome do — no new palette.
+    pub fn role(&self) -> &'static str {
+        match self {
+            ActionKind::Accept => "diff.added",
+            ActionKind::Reject => "diff.removed",
+            ActionKind::Toggle | ActionKind::Neutral => "diff.meta",
+        }
+    }
+}
+
+/// The shape of an action, for painting — never its meaning, which is [`ViewAction`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionKind {
+    /// Says yes to something that is waiting.
+    Accept,
+    /// Says no to it. Painted apart from `Accept`, because the two sit side by side and pressing
+    /// the wrong one cannot be taken back.
+    Reject,
+    /// Flips a way of looking at something. Reversible by pressing it again.
+    Toggle,
+    /// Everything else.
+    Neutral,
 }
 
 /// Cells per side, in the order a stylesheet names them.

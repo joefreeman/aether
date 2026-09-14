@@ -5578,6 +5578,64 @@ impl Viewport {
         self.focus(view).buffer_id
     }
 
+    /// The nearest element in `direction` the cursor can land on, or `None` at the ends.
+    ///
+    /// **One definition, two callers**: `Tab` steps with it, and a line motion that walks off the
+    /// end of its element crosses with it. They have to agree — an element `Tab` refuses to stop
+    /// on but `j` falls into is a place you can get to and not get back from — so neither owns the
+    /// rule and both ask here.
+    ///
+    /// Two ways an element qualifies. It has lines, which is somewhere to put the cursor; or it is
+    /// **collapsible**, folded or not, because folded it is a single titled row that is the whole
+    /// of it and opening it is the thing you came to do. What is left out is the element with no
+    /// lines and nothing to open — a shell run that said nothing — which is drawn and skipped,
+    /// since stopping there would be a press that visibly did nothing.
+    pub fn step_element(
+        &self,
+        view: &View,
+        from: aether_protocol::viewport::FieldId,
+        forward: bool,
+    ) -> Option<aether_protocol::viewport::FieldId> {
+        let last = view.elements.len().saturating_sub(1) as aether_protocol::viewport::FieldId;
+        let stoppable = |i: aether_protocol::viewport::FieldId| {
+            view.elements
+                .get(i as usize)
+                .is_some_and(|e| self.can_hold_cursor(e))
+        };
+        if forward {
+            (from + 1..=last).find(|&i| stoppable(i))
+        } else {
+            (0..from).rev().find(|&i| stoppable(i))
+        }
+    }
+
+    /// Whether this element is **folded shut for this viewport**.
+    ///
+    /// The view says what may fold; the viewport says what is folded. One expression, because the
+    /// renderer and everything that asks "is there anything of this element on screen" have to
+    /// mean the same thing by it.
+    pub fn is_collapsed(&self, binding: &ElementBinding) -> bool {
+        binding.collapsible && !self.expanded.contains(&binding.buffer_id)
+    }
+
+    /// Whether the cursor may be **in** this element — which is to say, whether this viewport is
+    /// drawing rows of text the cursor could sit on.
+    ///
+    /// **The cursor only goes where it can be seen.** Three ways an element fails that, and they
+    /// are failures of the same kind rather than three special cases:
+    ///
+    /// - it windows no lines (a shell run that said nothing);
+    /// - it is **prose** — an agent's reply is a parse, not rows, and deliberately wears no cursor
+    ///   and no focus bar (it is a record of what was said, not a place you are);
+    /// - it is **folded** for this viewport, so none of its rows are being drawn at all.
+    ///
+    /// Landing anywhere in that list is a keystroke whose only visible effect is that the next one
+    /// behaves oddly. Reaching such an element is what `Tab` is for — a folded block by its
+    /// disclosure, which *is* drawn — not what a line motion is for.
+    pub fn can_hold_cursor(&self, binding: &ElementBinding) -> bool {
+        !binding.is_empty() && !binding.prose && !self.is_collapsed(binding)
+    }
+
     /// Whether this viewport is showing `id` at all — as the view it presents, or as one of the
     /// buffers its elements window. The right question for anything fanning out *to viewers*,
     /// because a patch's viewers are watching the view even though no element windows it.

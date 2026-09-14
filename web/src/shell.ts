@@ -50,6 +50,7 @@ import type {
   CommitRef,
   CursorState,
   DiagnosticCounts,
+  FocusStop,
   GitOperation,
   GroupHeader,
   GroupSpan,
@@ -499,6 +500,9 @@ interface CoreView {
   view_transient: boolean;
   /** Which editor element holds the cursor — see `grid::line_is_loaded`. */
   focused_element: number;
+  /** The stop `Tab` left: which of an element's buttons is lit, named rather than numbered (the
+   *  ring is rebuilt on every push). Null when focus is in the text. */
+  focused_stop?: FocusStop | null;
   buffer: {
     buffer_id: number;
     path: string | null;
@@ -1348,6 +1352,9 @@ export class Shell {
    *  reading view replaces `#buffer`'s children wholesale). */
   private bufferHost: HTMLElement | null = null;
   private bufferShadow: ShadowRoot | null = null;
+  /** The reply boxes the last paint made, in view order — what `measureReplies` measures. Kept
+   *  from `renderBuffer`'s answer rather than found again: they live in a closed shadow root. */
+  private replyBoxes: HTMLElement[] = [];
   /** The adopted copy of `theme.css` for the shadow root, built once and shared. */
   private static bufferSheet: CSSStyleSheet | null = null;
   /** Pending coalesced-render frame (see `scheduleRender`); null when none is queued. */
@@ -2907,7 +2914,10 @@ export class Shell {
     if (v.read !== null) return;
     if (!v.window) return;
     const cl = v.buffer.cursor.position.line;
-    if (!lineIsLoaded(v.window, v.focused_element, cl)) {
+    // Only a **cursor** waits on a line. A button's row is in the tree already, and a folded block
+    // has no line that could ever load — fetching around the cursor for one of those returns the
+    // same window and leaves the reveal unpaid, which is how `Tab` came to land off screen.
+    if (this.session.reveal_wants_a_line() && !lineIsLoaded(v.window, v.focused_element, cl)) {
       const epoch = this.viewportEpoch;
       let res: ViewportWindowResult;
       try {
@@ -2937,7 +2947,7 @@ export class Shell {
   /** Jump reveal: leave the view if the cursor is already visible, else rest it near the top.
    *  `scrollTopTo` glides when the move is short and snaps when it's far (> ~1.5 screens). */
   private revealCursorJump(): void {
-    const cursorRow = this.cursorAbsoluteVisualRow();
+    const cursorRow = this.revealRow();
     if (cursorRow === null) return;
     const top = ((this.bufferEl.scrollTop - this.contentTop()) / this.cell.h) * UNITS_PER_ROW;
     const visible = this.visibleUnits();
@@ -3012,11 +3022,24 @@ export class Shell {
    *  those need move `scrollTop`, so nothing else would notice. It fetches nothing when the screen
    *  is covered, which for an ordinary one-element view it always is. */
   private onScroll(): void {
+    // The popover tracks its line via CSS `position: sticky` (it lives in the buffer's spacer), so
+    // scrolling needs no repositioning here — just the window prefetch.
+    this.ensureCovered();
+  }
+
+  /** **Fetch whatever the screen reaches and hasn't got.** Cheap when it has: the core answers
+   *  `null` without a round trip.
+   *
+   *  Run after every paint, not only on a scroll event, which is the terminal's rule
+   *  (`maybe_fetch` once per loop) and for the reason its comment gives: the window can change
+   *  under a view that never moved. Expanding a tool call is exactly that — the block's element
+   *  grows from nothing to its full height while `scrollTop` stays put, so no scroll event fires
+   *  and nothing asked for the lines. The box drew its reserved height with nothing in it until
+   *  something else happened to scroll. */
+  private ensureCovered(): void {
     // The reading view is one element loaded whole — a scroll never reaches unloaded rows, so
     // there is nothing to prefetch.
     if (this.readActive) return;
-    // The popover tracks its line via CSS `position: sticky` (it lives in the buffer's spacer), so
-    // scrolling needs no repositioning here — just the window prefetch below.
     // Skip the prefetch while disconnected: the RPC would reject instantly, and a smooth-scroll
     // animation firing scroll events would otherwise spin doomed fetches for the reconnect window.
     const viewportId = this.snapshot?.viewport_id;
@@ -3115,14 +3138,14 @@ export class Shell {
     this.refreshMeasured();
       this.render();
     }
-    const row = this.cursorAbsoluteVisualRow();
+    const row = this.revealRow();
     if (row === null) return;
     const above = Math.floor(this.visibleUnits() * fraction);
     this.scrollTopTo(this.pxOfUnits(row - above), true);
   }
 
   private revealCursor(): void {
-    const cursorRow = this.cursorAbsoluteVisualRow();
+    const cursorRow = this.revealRow();
     if (cursorRow === null) return;
     const top = ((this.bufferEl.scrollTop - this.contentTop()) / this.cell.h) * UNITS_PER_ROW;
     const visible = this.visibleUnits();
@@ -3303,8 +3326,14 @@ export class Shell {
    *  and re-render only when an answer actually changed, which is what stops it looping. */
   private measureReplies(): boolean {
     let moved = false;
-    for (const el of this.bufferEl.querySelectorAll("[data-element].md-reply-box")) {
-      if (!(el instanceof HTMLElement)) continue;
+    // **The boxes the paint just made**, handed back by `renderBuffer` rather than looked up again.
+    // This searched for them with `querySelectorAll` on `#buffer` — which is the *host* of a closed
+    // shadow root the rows are painted into, and a selector crosses no shadow boundary. It found
+    // none, so every reply stayed unmeasured. The paint was right either way (the browser flows a
+    // reply's real height); the grid counted each one as a single row, so every row below a reply
+    // was somewhere it is not, and `Tab` to the input scrolled short of it by the height of every
+    // reply above.
+    for (const el of this.replyBoxes) {
       const element = Number(el.dataset.element);
       if (!Number.isFinite(element)) continue;
       const units = Math.max(
@@ -3391,10 +3420,15 @@ export class Shell {
     this.scrollTopTo(el.scrollTop + (top - rest), smooth);
   }
 
-  /** Absolute visual row of the cursor in the view, or null if its line isn't loaded. The core
-   *  answers off the shared layout, so it is the row the painter draws the cursor on. */
-  private cursorAbsoluteVisualRow(): number | null {
-    return this.session.cursor_row() ?? null;
+  /** Absolute visual row a reveal is about: the stop `Tab` reached, else the cursor — null when
+   *  neither can be located, which for the cursor means its line isn't loaded.
+   *
+   *  The core answers, off the shared layout, so this is the row the painter drew the thing on —
+   *  and the same answer the terminal and the GUI scroll to. A button lives in chrome and a folded
+   *  block has no rows of its own, so scrolling to "where the cursor is" left `Tab` moving focus
+   *  off screen and the view where it was. */
+  private revealRow(): number | null {
+    return this.session.reveal_row() ?? null;
   }
 
   // ---- render ---------------------------------------------------------------------------------
@@ -3558,7 +3592,7 @@ export class Shell {
     this.bufferEl.classList.toggle("hscroll", v.wrap === "none");
     // Coding ligatures: the `ligatures` app setting flips the JetBrains Mono `calt`/`liga` features.
     this.bufferEl.classList.toggle("ligatures-off", !v.ligatures);
-    renderBuffer(this.bufferSurface(), {
+    this.replyBoxes = renderBuffer(this.bufferSurface(), {
       window: v.window,
       cursor: v.buffer.cursor,
       insertMode: v.mode === "insert",
@@ -3577,6 +3611,7 @@ export class Shell {
           ? format_blame(v.blame.author, v.blame.timestamp, v.blame.is_uncommitted)
           : null,
       focusedElement: v.focused_element,
+      focusedStop: v.focused_stop ?? undefined,
       diffView: v.diff_view,
     });
     // A reply's height is whatever the browser made of it, and the grid places everything below by
@@ -3585,7 +3620,11 @@ export class Shell {
     // re-renders, so it settles after one extra pass rather than looping.
     if (this.measureReplies()) {
       this.render();
+      return;
     }
+    // Everything the screen reaches, loaded — asked here so no path that changes the window or the
+    // scroll has to remember to ask. See `ensureCovered`.
+    this.ensureCovered();
   }
 
   /** Whether a keydown is plain text-editing (the native <input> should handle it and sync via its

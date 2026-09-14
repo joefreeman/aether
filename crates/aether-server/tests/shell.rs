@@ -95,6 +95,23 @@ async fn input_buffer_of(server: &aether_server::ServerHandle, open: &ShellOpenR
         .buffer_id
 }
 
+/// Where run `nth`'s output starts in the transcript.
+async fn run_start(
+    server: &aether_server::ServerHandle,
+    open: &ShellOpenResult,
+    nth: usize,
+) -> u32 {
+    let s = server.state.lock().await;
+    let view_buffer = s
+        .try_presenting_buffer(open.opened.view_id)
+        .expect("the shell's view");
+    s.try_doc_of(view_buffer)
+        .and_then(|d| d.transcript())
+        .expect("a shell view")
+        .runs[nth]
+        .start_line
+}
+
 /// Move this viewport's focus, as `Tab` and `Shift-Tab` do.
 async fn focus(
     ws: &mut Ws,
@@ -523,6 +540,9 @@ async fn both_streams_land_in_the_transcript() {
 
 /// A run that says nothing owns no line: its box is its title and its command, with no output
 /// row — and `Tab` steps over it, since there is nothing in it to land on.
+///
+/// The **outline** leaves it out for the same reason, so the two agree: a row you can pick has to
+/// be somewhere you can be, and the whole of a silent run is a name on a box.
 #[tokio::test]
 async fn a_silent_run_shows_no_output() {
     use aether_protocol::ui::Element;
@@ -560,6 +580,28 @@ async fn a_silent_run_shows_no_output() {
         .await;
         assert_eq!(r.element, expected);
     }
+
+    // And the outline says the same: one row, for the run that printed something.
+    let outline: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &PickerViewParams {
+            kind: PickerKind::DocumentSymbols,
+            buffer_id: Some(shell.opened.buffer_id),
+            view_id: Some(shell.opened.view_id),
+            ..view_params(PickerKind::DocumentSymbols)
+        },
+    )
+    .await;
+    let update = outline.update.expect("the outline answers with rows");
+    let rows: Vec<&str> = update
+        .items()
+        .iter()
+        .filter_map(|i| match i {
+            PickerItem::GitChange { preview, .. } => Some(preview.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows, vec!["echo hi"], "the silent run is not a stop");
 }
 
 // ---- several runs -------------------------------------------------------------------------------
@@ -1330,10 +1372,19 @@ async fn the_caret_stays_in_the_input_across_a_run() {
     assert_eq!(focused_element(&server, viewport_id).await, 0);
 }
 
-/// `c` and `o` step between runs and never stop on the input: an outline lists what a view
-/// contains, and the input contains nothing yet.
+/// `o` steps between runs and never stops on the input: an outline lists what a view contains, and
+/// the input contains nothing yet.
+///
+/// `c` steps **nothing at all** here, which is the other half of the same distinction. A command
+/// that printed something changed no file, and a shell has no other account of one — so answering
+/// with the runs made `c` a second name for `o` and left the word "change" meaning nothing. The
+/// runs are the shell's structure; `o` is the key for structure.
+///
+/// The rows are **flat**. Every run of one shell would sit under one "Shell 1" header, which is a
+/// group that contains the whole list: a row to scroll past and a key to press before the list you
+/// asked for appears.
 #[tokio::test]
-async fn changes_and_outline_step_the_runs_not_the_input() {
+async fn the_outline_steps_the_runs_and_changes_step_nothing() {
     let (server, mut ws, _dir) = setup().await;
     let shell = open_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "echo first").await;
@@ -1352,16 +1403,21 @@ async fn changes_and_outline_step_the_runs_not_the_input() {
     )
     .await;
     let update = outline.update.expect("the outline answers with rows");
-    // The rows arrive grouped under the shell, collapsed, like every other outline.
+    assert!(
+        !outline.collapsible,
+        "a shell's runs are one view's structure, not a list of files to group"
+    );
     assert_eq!(
         group_rows(update.items()),
-        vec![("Shell 1".to_string(), 2, false)],
-        "two runs under the shell, and nothing for the input"
+        vec![],
+        "no header over rows that all belong to the one shell"
     );
-    // Expanded, the rows are the commands.
-    let (_, expanded) = expand_file_group(&mut ws, PickerKind::DocumentSymbols, "Shell 1").await;
-    let labels: Vec<&str> = expanded
+    let rows: Vec<&PickerItem> = update
         .items()
+        .iter()
+        .filter(|i| matches!(i, PickerItem::GitChange { .. }))
+        .collect();
+    let labels: Vec<&str> = rows
         .iter()
         .filter_map(|i| match i {
             PickerItem::GitChange { preview, .. } => Some(preview.as_str()),
@@ -1371,34 +1427,83 @@ async fn changes_and_outline_step_the_runs_not_the_input() {
     assert_eq!(
         labels,
         vec!["echo first", "echo second"],
-        "one row per run, labelled by its command"
+        "one row per run, labelled by its command, straight in the list"
     );
 
-    // `c` — stepping changes walks run to run.
-    let step = |direction| aether_protocol::viewport::ViewportNavigateChangeParams {
+    // Picking a row **focuses the run's output**, which is the only thing a shell's outline can
+    // mean by a place: the box holds the command's output, and a cursor set in an element the view
+    // is not focused on is not drawn at all.
+    let selected: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        &PickerSelectParams {
+            kind: PickerKind::DocumentSymbols,
+            item: rows[1].clone(),
+        },
+    )
+    .await;
+    match selected {
+        PickerSelectResult::ViewElement {
+            element, position, ..
+        } => {
+            assert_eq!(element, 1, "the second run's own element");
+            assert_eq!(
+                position.line,
+                run_start(&server, &shell, 1).await,
+                "landing on the first line of that run's output"
+            );
+        }
+        other => panic!("expected the run's element, got {other:?}"),
+    }
+
+    // `o` — stepping the outline walks run to run, and stops rather than landing on the input.
+    let step = |grain, direction| aether_protocol::viewport::ViewportNavigateChangeParams {
         viewport_id,
         direction,
         count: Some(1),
-        grain: aether_protocol::viewport::NavigateGrain::Change,
+        grain,
         extend: false,
     };
+    use aether_protocol::viewport::{FocusStep, NavigateGrain, ViewportNavigateChange};
     let landed: aether_protocol::viewport::ViewportFocusElementResult =
-        send_request::<aether_protocol::viewport::ViewportNavigateChange>(
+        send_request::<ViewportNavigateChange>(
             &mut ws,
-            &step(aether_protocol::viewport::FocusStep::Next),
+            &step(NavigateGrain::Outline, FocusStep::Next),
         )
         .await;
     assert_eq!(landed.element, 1, "from the first run to the second");
     let landed: aether_protocol::viewport::ViewportFocusElementResult =
-        send_request::<aether_protocol::viewport::ViewportNavigateChange>(
+        send_request::<ViewportNavigateChange>(
             &mut ws,
-            &step(aether_protocol::viewport::FocusStep::Next),
+            &step(NavigateGrain::Outline, FocusStep::Next),
         )
         .await;
     assert_eq!(
         landed.element, 1,
-        "and stops there: the input is not a change to step onto"
+        "and stops there: the input is not an outline entry to step onto"
     );
+
+    // `c` — a shell has no changes, so it does not move at all. Checked from a caret parked on
+    // the *first* run, so that "did not move" cannot be confused with "ran out of stops".
+    let _ = send_request::<aether_protocol::viewport::ViewportFocusElement>(
+        &mut ws,
+        &aether_protocol::viewport::ViewportFocusElementParams {
+            viewport_id,
+            target: aether_protocol::viewport::FocusTarget::Element { element: 0 },
+        },
+    )
+    .await;
+    for direction in [FocusStep::Next, FocusStep::Previous] {
+        let landed: aether_protocol::viewport::ViewportFocusElementResult =
+            send_request::<ViewportNavigateChange>(
+                &mut ws,
+                &step(NavigateGrain::Change, direction),
+            )
+            .await;
+        assert_eq!(
+            landed.element, 0,
+            "a printed line is not a change: `c` must not step the runs ({direction:?})"
+        );
+    }
 }
 
 // ---- stopping -----------------------------------------------------------------------------------

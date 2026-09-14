@@ -1291,6 +1291,163 @@ fn a_folded_call_is_one_titled_row() {
     snapshot(&mut sim, &app, "agent-folded");
 }
 
+/// An **expanded** tool call with focus on its disclosure: the state Joe caught the GUI in, where
+/// the button was standing and the caret was drawn in the block below it at the same time.
+///
+/// Two ways to draw a cursor is what made it constructible. `grid::focused` answers once — and the
+/// caret is a **fill**, which no selector reports, so the frame is asked in pixels: the block
+/// cursor paints a whole cell in the foreground shade, so the row it would land on carries far more
+/// of that colour with focus in the text than with the button lit.
+#[test]
+fn a_focused_disclosure_is_the_whole_of_focus() {
+    use aether_protocol::ui::{Band, Edges, Sides, ViewAction};
+
+    // The shape: a box named by its command, with a disclosure on the title row, holding the
+    // block's own output.
+    let view = || {
+        let expanded = ViewElement::titled(
+            Edges {
+                border: Sides::all(1),
+                padding: Sides::ZERO,
+                collapse: false,
+            },
+            Band::Chrome,
+            vec![
+                ViewElement::Action {
+                    action: ViewAction::Expand { expand: None },
+                    label: vec![ViewElement::text("\u{25be}", Vec::new())],
+                    enabled: true,
+                },
+                ViewElement::Space { cols: 1 },
+                ViewElement::text("grep README", Vec::new()),
+            ],
+            vec![editor(
+                0,
+                10,
+                0,
+                vec![line(0, "List README"), line(1, "3:# Aether")],
+            )],
+        );
+        window_of(vec![expanded, input(1, 11, vec![line(0, "")])])
+    };
+    let on_fold = {
+        let window = view();
+        let ring = aether_client::grid::focus_ring(&window.root);
+        aether_client::grid::focus_of(&ring, 0).expect("the disclosure is the first stop")
+    };
+    let showing = |focus: aether_client::grid::Focus| {
+        let mut session = session_showing(view());
+        // The cursor is where the server seats it when focus moves to this element — the block's
+        // first character, which is exactly where the stray caret was drawn.
+        session.view.focused_element = 0;
+        session.view.buffer.cursor = Default::default();
+        session.view.focus = focus;
+        session
+    };
+
+    // One answer, and it is the button: no caret is drawn anywhere, whatever the cursor says.
+    let session = showing(on_fold);
+    let root = &session.view.window.as_ref().expect("a window").root;
+    let focused =
+        aether_client::grid::focused(root, session.view.focused_element, session.view.focus);
+    assert!(
+        matches!(
+            focused,
+            aether_client::grid::Focused::Action { element: 0, .. }
+        ),
+        "focus is not on the disclosure: {focused:?}"
+    );
+    assert!(
+        !focused.draws_cursor(),
+        "a caret is drawn while the button is lit"
+    );
+
+    let p = crate::theme::palette(ThemeMode::Dark);
+    let fg = {
+        let b = p.fg.into_rgba8();
+        [b[0], b[1], b[2]]
+    };
+    let caret_columns = |focus: aether_client::grid::Focus| {
+        let app = laid_out(app_with(showing(focus)));
+        let mut sim = simulate(&app);
+        let row = seen(&mut sim)
+            .into_iter()
+            .find(|s| s.visible && s.text == "List README")
+            .expect("the block's first row is on the frame");
+        let frame = pixels(&mut sim, &app);
+        let scale = frame.0 as f32 / WIDTH;
+        let y = ((row.bounds.y + row.bounds.height / 2.0) * scale) as usize;
+        columns_painted(&frame, y, fg).len()
+    };
+    let in_text = caret_columns(aether_client::grid::Focus::Text);
+    let on_button = caret_columns(on_fold);
+    assert!(
+        in_text > on_button + 4,
+        "a caret was drawn while the disclosure was lit ({in_text} vs {on_button} columns of \
+         foreground on the block's first row)"
+    );
+
+    let app = laid_out(app_with(showing(on_fold)));
+    let mut sim = simulate(&app);
+    let rows = rows(&mut sim);
+    let title = row_of(&rows, "grep README");
+    assert!(
+        rows[title].contains("[\u{25be}]"),
+        "the disclosure is not a bracketed button: {:?}",
+        rows[title]
+    );
+    assert!(
+        row_of(&rows, "List README") > title,
+        "the block's text should sit under the box's name"
+    );
+    snapshot(&mut sim, &app, "agent-fold-focused");
+}
+
+/// The view's buttons are drawn where the row says they are, and the lit one carries a fill.
+///
+/// Row layout and text, which is what this harness sees; the fill itself is pixels, so what is
+/// asserted here is that both buttons are on the frame, bracketed, in the agent's own order. The
+/// GUI's own regression was drawing the label bare — `inline()` flattening *through* the action —
+/// which reads as two words of chrome rather than as something to press.
+#[test]
+fn declared_actions_paint_as_buttons() {
+    use aether_protocol::ui::ViewAction;
+    let button = |allow: bool, label: &str| ViewElement::Action {
+        action: ViewAction::Permission { allow },
+        label: vec![ViewElement::text(label, Vec::new())],
+        enabled: true,
+    };
+    let window = window_of(vec![
+        ViewElement::chrome(vec![ViewElement::row(vec![
+            button(true, "Allow"),
+            ViewElement::Space { cols: 2 },
+            button(false, "Decline"),
+        ])]),
+        editor(0, 10, 0, vec![line(0, "rm -rf build")]),
+        input(1, 11, vec![line(0, "")]),
+    ]);
+    // The ring the client walks: the two buttons, then the two elements being shown — everything
+    // the view offers, whether to press or to put the cursor in.
+    // The second stop — Decline — named the way focus names one.
+    let on_decline = {
+        let ring = aether_client::grid::focus_ring(&window.root);
+        assert_eq!(ring.len(), 4, "unexpected ring: {ring:?}");
+        aether_client::grid::focus_of(&ring, 1).expect("the second stop")
+    };
+
+    let mut session = session_showing(window);
+    session.view.focus = on_decline;
+    let app = laid_out(app_with(session));
+    let mut sim = simulate(&app);
+    let rows = rows(&mut sim);
+    let row = &rows[row_of(&rows, "Allow")];
+    assert!(
+        row.contains("[Allow]") && row.contains("[Decline]"),
+        "the buttons were not drawn as buttons: {row:?}"
+    );
+    snapshot(&mut sim, &app, "agent-buttons");
+}
+
 /// The reply renders as **real type**, in the layer over the editor: a container of its own,
 /// starting where the grid puts the element and taller than the row the grid gives an unmeasured
 /// one.

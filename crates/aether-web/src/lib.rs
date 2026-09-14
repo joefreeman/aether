@@ -7,6 +7,11 @@
 //! `on_event`, `on_rpc_result`), gets back an `Effect[]` to execute, and reads a `View` to render.
 //! The core's own Rust types never cross the boundary — only the JSON DTOs built here.
 
+// The boundary DTOs are one `json!` object each, and the view's is the biggest of them; adding a
+// field to it is what tips the macro's expansion past the default depth. Raised rather than split,
+// because one object per DTO is the thing that makes the mirror in `web/src` readable against it.
+#![recursion_limit = "256"]
+
 mod view;
 
 use aether_client::effect::{Effect, Effects, RevealStyle, ShellAction, ToastKind};
@@ -425,6 +430,23 @@ impl WasmSession {
         self.inner.view.window.as_ref().map_or(0, |w| {
             aether_client::grid::total_rows(&w.root, &self.measured)
         })
+    }
+
+    /// **The row a reveal scrolls to**: the stop `Tab` reached, else the cursor's line. `null`
+    /// when neither can be located, which for the cursor means its line is not loaded — fetch a
+    /// window around it and reveal then.
+    ///
+    /// The core's one answer, shared with the terminal and the GUI: a button lives in chrome and a
+    /// folded block has no rows at all, so scrolling to "where the cursor is" left `Tab` moving
+    /// focus to something off screen and the view exactly where it was.
+    pub fn reveal_row(&self) -> Option<u32> {
+        self.inner.view.reveal_row(&self.measured).map(|r| r.get())
+    }
+
+    /// Whether the reveal owed is waiting on the cursor's **line** to load. False while focus is on
+    /// a button or an element with no caret: their row is in the tree already.
+    pub fn reveal_wants_a_line(&self) -> bool {
+        self.inner.view.reveal_wants_a_line()
     }
 
     /// The absolute row of the cursor's cell, or `null` when its line isn't loaded — what a

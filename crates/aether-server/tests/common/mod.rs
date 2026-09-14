@@ -111,10 +111,11 @@ pub use aether_protocol::viewport::{
     BaselineRow, ConflictLine, DiagnosticSeverity, DiffMarker, DiffStage, EmphasisRange, PatchLine,
 };
 pub use aether_protocol::viewport::{
-    ScrollPosition, SliceRequest, ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize,
-    ViewportResizeParams, ViewportSetExpanded, ViewportSetExpandedParams, ViewportSetWrap,
-    ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams, ViewportSubscribeResult,
-    ViewportWindow, ViewportWindowParams, ViewportWindowResult, Window, WrapMode,
+    ScrollPosition, SliceRequest, ViewportInvokeAction, ViewportInvokeActionParams,
+    ViewportLinesChanged, ViewportLinesChangedParams, ViewportResize, ViewportResizeParams,
+    ViewportSetWrap, ViewportSetWrapParams, ViewportSubscribe, ViewportSubscribeParams,
+    ViewportSubscribeResult, ViewportWindow, ViewportWindowParams, ViewportWindowResult, Window,
+    WrapMode,
 };
 pub use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProject,
@@ -457,6 +458,22 @@ pub fn view_params(kind: PickerKind) -> PickerViewParams {
         explorer_roots: false,
         keybindings: None,
     }
+}
+
+/// `element/move`, for the tests whose view is one whole buffer — which is nearly all of them.
+///
+/// A line motion can now walk **out** of its element, and then the answer is a cursor in another
+/// buffer rather than in the one asked about. A view of one element has nowhere to walk to, so
+/// this asserts that rather than quietly dropping the other half: a test that grew a composed
+/// view under it would otherwise keep passing while asserting about the wrong buffer. The tests
+/// that are *about* crossing (`agent.rs`) call the RPC directly and read `crossed`.
+pub async fn move_cursor(ws: &mut Ws, params: &CursorMoveParams) -> CursorState {
+    let r: aether_protocol::cursor::CursorMoveResult = send_request::<CursorMove>(ws, params).await;
+    assert!(
+        r.crossed.is_none(),
+        "the motion left its element; this helper is for views that have only one"
+    );
+    r.cursor
 }
 
 /// Like `send_request` but expects the RPC to return an error; returns the error message.

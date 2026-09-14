@@ -983,6 +983,15 @@ pub struct ViewState {
     /// which is the authority; the client keeps it to know where `Tab` starts from and, later,
     /// which of a view's buffers it is editing.
     pub focused_element: aether_protocol::viewport::FieldId,
+    /// Whether focus is in the focused element's **text** or on one of the view's **buttons** —
+    /// see [`crate::grid::Focus`], and [`crate::grid::focused`], which is the only thing that
+    /// reads it.
+    ///
+    /// Client-local, unlike `focused_element`: the server needs to know which element holds the
+    /// cursor, because that decides which buffer an edit acts on, but which of the two things the
+    /// user is *on* is presentation, and an invocation names its action semantically rather than
+    /// by position. Reset to `Text` by every key but `Tab`, `Shift-Tab` and `Enter`.
+    pub focus: crate::grid::Focus,
     /// How tall this view was the last time a shell asked about the tail, at that shell's
     /// resolution — see [`Session::sticky_tail_row`]. Zero for a view nothing has measured yet,
     /// which is also what a switch resets it to: landing in a shell with output already in it puts
@@ -1036,6 +1045,45 @@ pub struct ViewState {
 }
 
 impl ViewState {
+    /// **The row a reveal is about**: the stop `Tab` reached, else the cursor's line. `None` when
+    /// neither can be located — which for the cursor means its line is not loaded, and is the
+    /// shell's signal to fetch a window around it and pay the reveal then.
+    ///
+    /// One definition for three shells, because it is one question and they answered it three
+    /// ways: the terminal asked the focus ring, and the other two asked where the cursor's cell
+    /// was. A button is not where the cursor is — it lives in chrome, on a box's title row or in
+    /// the question above a tool call — and a folded block or a prose reply has no caret at all.
+    /// So `Tab` in the GUI and the browser moved focus to something off screen and left the view
+    /// exactly where it was, with no line that could ever load to bring it back.
+    pub fn reveal_row(
+        &self,
+        measured: &crate::grid::Measured,
+    ) -> Option<aether_protocol::coords::VisualRow> {
+        let window = self.window.as_ref()?;
+        let focused = crate::grid::focused(&window.root, self.focused_element, self.focus);
+        if let Some(row) = crate::grid::focused_row_of(&window.root, measured, &focused) {
+            return Some(row);
+        }
+        crate::grid::position_cell(
+            window,
+            self.focused_element,
+            self.buffer.cursor.position,
+            TAB_WIDTH,
+            measured,
+        )
+        .map(|(row, _, _)| row)
+    }
+
+    /// Whether the reveal owed for this view is waiting on a **line**: only a cursor is, and only
+    /// then is a window around it worth fetching. A button's row is in the tree already, and a
+    /// folded element has no line that could ever load — gating on one there is what left `Tab`
+    /// owing a reveal forever and re-fetching a window that came back folded again.
+    pub fn reveal_wants_a_line(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| {
+            crate::grid::focused(&w.root, self.focused_element, self.focus).draws_cursor()
+        })
+    }
+
     /// A fresh view over `buffer`, every other field at its opening value.
     ///
     /// This is the whole point of the struct: switching what's on screen is one assignment, not
@@ -1162,6 +1210,7 @@ impl ViewState {
             viewport_id: None,
             // A fresh view starts on its first element, as the server's viewport does.
             focused_element: 0,
+            focus: Default::default(),
             window: None,
             read: None,
             diagnostics: DiagnosticCounts::default(),

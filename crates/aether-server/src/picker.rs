@@ -181,6 +181,16 @@ pub struct GitChangeCandidate {
     pub path_index: u32,
     /// Path relative to `roots[path_index]` (forward-slash). The file-group key.
     pub relative_path: String,
+    /// Whether `relative_path` names a **group of its own** — whether the picker renders a header
+    /// for it and collapses the rows under it.
+    ///
+    /// True for everything with a file behind it, which is what the header says. False for the
+    /// outline of a view whose rows have no files at all — a shell's runs, a conversation's turns:
+    /// they all belong to the one shell, so a header would be a group holding the whole list, an
+    /// extra row and an extra keystroke that separates nothing from nothing. The label is still
+    /// carried, because a row captured into the jumplist lands among rows from everywhere and
+    /// "which shell" is the thing it then has to say.
+    pub grouped: bool,
     /// Absolute path, returned via `PickerSelectResult::FileAt` for `view/open`.
     pub abs_path: String,
     /// Position of this hunk within its file's change list (0-based, anchor order).
@@ -216,15 +226,18 @@ pub struct GitChangeCandidate {
 pub struct PatchRowTarget {
     /// The view the patch is presented in — the only address a row over generated text has.
     pub view: aether_protocol::ViewId,
-    /// The **same place, addressed as a real file line** — the element that windows it and the line
-    /// within that element's buffer. `None` for a row over generated text with no file behind it (a
-    /// deletion, a binary swap), which can only be addressed as a patch line.
+    /// **Where in the view the row is**: the element it belongs to, the buffer that element
+    /// windows, and the line within that buffer. `None` only for a row built without a viewport to
+    /// resolve elements against (see [`crate::handlers::picker`]'s patch-changes builder), which
+    /// can then be addressed as a patch line and nothing else.
     ///
-    /// Carried because a patch line is the wrong coordinate for almost everything that acts on a
-    /// row. A *bound* view's cursor lives in its elements, so a jump addressed at the patch document
-    /// lands wherever that line happens to fall in whichever element — which is why every jumplist
-    /// entry captured from a patch took you to the same place.
-    pub file: Option<(aether_protocol::viewport::FieldId, BufferId, u32)>,
+    /// Carried because a line of the view's own document is the wrong coordinate for almost
+    /// everything that acts on a row. A view's cursor lives in its *elements*: a jump addressed at
+    /// the document lands wherever that line happens to fall in whichever element is focused —
+    /// which is why every jumplist entry captured from a patch took you to the same place — and a
+    /// cursor set in an element that is not focused is not drawn at all, which is how a shell's
+    /// outline rows appeared to do nothing when picked.
+    pub seat: Option<(aether_protocol::viewport::FieldId, BufferId, u32)>,
     /// The same place named **durably**: the file it is in and the line of that file, however the
     /// element happens to window it right now. What a jumplist entry stores — an element index or
     /// a buffer id is dead as soon as the patch is rebuilt, and a patch line moves with every
@@ -263,6 +276,7 @@ impl GitChangeCandidate {
             lines,
             untracked: false,
             patch: None,
+            grouped: true,
         }
     }
 
@@ -291,6 +305,7 @@ impl GitChangeCandidate {
             lines,
             untracked: false,
             patch: Some(target),
+            grouped: true,
         }
     }
 
@@ -298,6 +313,13 @@ impl GitChangeCandidate {
     /// `::new`'s arg list stays put (its many call sites don't care about tracking state).
     pub fn with_untracked(mut self, untracked: bool) -> Self {
         self.untracked = untracked;
+        self
+    }
+
+    /// Builder tweak: this row's label is not a group of its own. See
+    /// [`GitChangeCandidate::grouped`].
+    pub fn ungrouped(mut self) -> Self {
+        self.grouped = false;
         self
     }
 
@@ -1502,11 +1524,11 @@ fn git_change_select(c: &GitChangeCandidate, re: Option<&regex::Regex>) -> Picke
         // A patch buffer was materialised, not loaded: there is no path to reopen, so the jump
         // addresses a buffer rather than a file.
         //
-        // **The element's buffer where there is one.** A bound view's cursor lives in its elements,
-        // so a jump addressed at the generated document set a cursor nothing displays and
+        // **The element, wherever the row knows one.** A view's cursor lives in its elements, so a
+        // jump addressed at the view's own document set a cursor nothing displays and
         // `seat_cursor_in_element` immediately overwrote it — the selection resolved, travelled, and
-        // was discarded. The row knows which file it is in; use it.
-        Some(p) => match p.file {
+        // was discarded. The row knows which element it is in; use it.
+        Some(p) => match p.seat {
             // Inside the view: focus the element and land there. A cursor moved into an element the
             // view is not focused on is not drawn at all.
             Some((element, buffer_id, line)) => PickerSelectResult::ViewElement {
@@ -1515,7 +1537,8 @@ fn git_change_select(c: &GitChangeCandidate, re: Option<&regex::Regex>) -> Picke
                 position: LogicalPosition { line, col: 0 },
                 open: None, // the view is the one on screen; nothing to reopen
             },
-            // Generated text with no file behind it — the patch itself is the only address.
+            // Built with no viewport to resolve elements against — the patch itself is the only
+            // address left.
             None => PickerSelectResult::ViewAt {
                 view_id: p.view,
                 position,
@@ -2452,10 +2475,12 @@ impl PickerState {
         match &self.candidates {
             PickerCandidates::Grep(v) => Some((v[ci].path_index, v[ci].relative_path.as_str())),
             // Patch rows group under a label, so they key on `LABEL_KEY` — must agree with
-            // `group_header_at`, same convention as the jumplist's label groups.
-            PickerCandidates::GitChanges(v) if v[ci].patch.is_some() => {
-                Some((LABEL_KEY, v[ci].relative_path.as_str()))
-            }
+            // `group_header_at`, same convention as the jumplist's label groups. A row whose label
+            // is no group of its own (a shell's runs, a conversation's turns) keys nothing, exactly
+            // as a flat kind's rows do.
+            PickerCandidates::GitChanges(v) if v[ci].patch.is_some() => v[ci]
+                .grouped
+                .then(|| (LABEL_KEY, v[ci].relative_path.as_str())),
             PickerCandidates::GitChanges(v) => {
                 Some((v[ci].path_index, v[ci].relative_path.as_str()))
             }
@@ -2493,9 +2518,11 @@ impl PickerState {
             // A `Label`, not a `File`: a patch names files relative to the *repo*, which may sit
             // outside every workspace root, so there is no `path_index` to render a root label
             // from. Same reasoning as WorkspaceSymbols below.
-            PickerCandidates::GitChanges(v) if v[ci].patch.is_some() => Some(GroupHeader::Label {
-                label: v[ci].relative_path.clone(),
-            }),
+            PickerCandidates::GitChanges(v) if v[ci].patch.is_some() => {
+                v[ci].grouped.then(|| GroupHeader::Label {
+                    label: v[ci].relative_path.clone(),
+                })
+            }
             PickerCandidates::GitChanges(v) => Some(GroupHeader::File {
                 path_index: v[ci].path_index,
                 relative_path: v[ci].relative_path.clone(),
@@ -2545,10 +2572,16 @@ impl PickerState {
     ///
     /// The buffer-locked changes picker is flat over a *file*, where one group would only repeat
     /// the filename. Over a **patch** it is the same picker on a scope that spans several files, so
-    /// its rows group like the workspace-wide picker's. The scope decides, not the kind.
+    /// its rows group like the workspace-wide picker's. The scope decides, not the kind — and a
+    /// scope with no files in it (a shell's runs, a conversation's turns) decides flat again.
     pub fn collapsible(&self) -> bool {
         match &self.candidates {
-            PickerCandidates::GitChanges(v) if v.first().is_some_and(|c| c.patch.is_some()) => true,
+            // Except where the rows have no files to group by at all: a shell's or a conversation's
+            // outline is one view's own structure, so a header over it is one group holding the
+            // whole list. See [`GitChangeCandidate::grouped`].
+            PickerCandidates::GitChanges(v) if v.first().is_some_and(|c| c.patch.is_some()) => {
+                v.first().is_some_and(|c| c.grouped)
+            }
             PickerCandidates::Jumplist(v) => {
                 self.kind.collapsible() && v.first().is_none_or(|e| e.group.is_some())
             }

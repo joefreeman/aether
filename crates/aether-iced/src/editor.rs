@@ -84,6 +84,9 @@ pub struct Content<'a> {
     /// Which editor element holds the live cursor. A logical line number names a line only within
     /// its element, so every position lookup here is made against this rather than searched for.
     pub focused_element: aether_protocol::viewport::FieldId,
+    /// Whether focus is in the focused element's text or on one of the view's buttons. Resolved
+    /// through [`grid::focused`], never read raw.
+    pub focus: grid::Focus,
     pub cursor: CursorState,
     pub insert_mode: bool,
     /// A capture is armed (find-char target, leader chord, partially-typed count): the cursor
@@ -533,7 +536,33 @@ where
             }
         };
 
-        let cursor_at = grid::ElementLine::new(self.content.focused_element, cursor_pos.line);
+        // One answer, so a frame showing a caret over a filled button is not constructible here.
+        let focused = self
+            .content
+            .window
+            .map(|w| grid::focused(&w.root, self.content.focused_element, self.content.focus));
+        let lit = focused.as_ref().and_then(|f| f.lit());
+        let draws_cursor = focused.as_ref().is_none_or(|f| f.draws_cursor());
+        // `None` while a button holds focus: the cursor's cell, its line's tint and its selection
+        // all hang off this pair, so they fall away together rather than each needing a guard.
+        let cursor_at = draws_cursor
+            .then(|| grid::ElementLine::new(self.content.focused_element, cursor_pos.line));
+        // **The caret's cell, or none at all** — the one binding every caret this widget draws
+        // comes from. Asking `position_cell` at the draw site instead is what let a block cursor
+        // outlive the answer above: that function knows where the cursor's cell *is* and nothing
+        // about whether a cursor is what is focused, so a caret sat in the text while `Tab` had a
+        // button lit, which is the one frame `Focused` exists to make impossible.
+        let caret = cursor_at.and_then(|_| {
+            grid::position_cell(
+                self.content.window?,
+                self.content.focused_element,
+                cursor_pos,
+                self.content.tab_width,
+                self.content.measured,
+            )
+        });
+        // The button `Tab` has lit, as a node of *this* tree — the comparison is by address, so it
+        // has to come from the same root the painting walks.
         // Every loaded row of the view at its absolute row, off the shared layout: chrome on a row
         // of its own, a loaded slice `first_row` rows into its element, the inline diff's phantom
         // rows above their line. The widget draws whatever is at each row, and nothing where
@@ -738,6 +767,48 @@ where
                     for leaf in title.iter().flat_map(ViewElement::inline) {
                         match leaf {
                             ViewElement::Space { cols } => col += u32::from(*cols),
+                            // A button the view declared. Filled when it is the one `Enter` would
+                            // press, outlined in its kind's colour otherwise — the same two states
+                            // the terminal draws, in the vocabulary pixels have.
+                            ViewElement::Action {
+                                action,
+                                label,
+                                enabled,
+                            } => {
+                                let text = aether_protocol::ui::ViewAction::labelled(label);
+                                let cols = text.chars().count() as u32;
+                                if lit.is_some_and(|n| std::ptr::eq(n, leaf)) {
+                                    fill(
+                                        renderer,
+                                        Rectangle {
+                                            x: text_x(col),
+                                            y,
+                                            width: cols as f32 * cell.width,
+                                            height: cell.height,
+                                        },
+                                        p.bg_selection,
+                                    );
+                                }
+                                let role = if *enabled {
+                                    action.kind().role()
+                                } else {
+                                    "diff.meta"
+                                };
+                                draw_runs(
+                                    renderer,
+                                    &text,
+                                    &[aether_protocol::viewport::Highlight {
+                                        start: 0,
+                                        end: text.len() as u32,
+                                        kind: role.into(),
+                                    }],
+                                    &text_x,
+                                    col,
+                                    y,
+                                    title_clip,
+                                );
+                                col += cols;
+                            }
                             ViewElement::Text { text, highlights } => {
                                 draw_runs(renderer, text, highlights, &text_x, col, y, title_clip);
                                 col += text.chars().count() as u32;
@@ -778,6 +849,47 @@ where
                                     },
                                     p.fg_faint,
                                 );
+                            }
+                            // A button the view declared — see the title row's arm above; the
+                            // only difference here is which clip it draws into.
+                            ViewElement::Action {
+                                action,
+                                label,
+                                enabled,
+                            } => {
+                                let text = aether_protocol::ui::ViewAction::labelled(label);
+                                let cols = text.chars().count() as u32;
+                                if lit.is_some_and(|n| std::ptr::eq(n, widget)) {
+                                    fill(
+                                        renderer,
+                                        Rectangle {
+                                            x: text_x(col),
+                                            y,
+                                            width: cols as f32 * cell.width,
+                                            height: cell.height,
+                                        },
+                                        p.bg_selection,
+                                    );
+                                }
+                                let role = if *enabled {
+                                    action.kind().role()
+                                } else {
+                                    "diff.meta"
+                                };
+                                draw_runs(
+                                    renderer,
+                                    &text,
+                                    &[aether_protocol::viewport::Highlight {
+                                        start: 0,
+                                        end: text.len() as u32,
+                                        kind: role.into(),
+                                    }],
+                                    &text_x,
+                                    col,
+                                    y,
+                                    content_clip,
+                                );
+                                col += cols;
                             }
                             // `inline()` yields only leaves, so nothing else can appear here.
                             ViewElement::Text { text, highlights } => {
@@ -914,8 +1026,9 @@ where
             };
             // The pair, never the number: `at == cursor_at` asks about *this* element's line.
             let at = grid::ElementLine::new(*element, line.logical_line);
-            let on_cursor_line = at == cursor_at;
-            let draw_sel = draw_selection && *element == self.content.focused_element;
+            let on_cursor_line = cursor_at == Some(at);
+            let draw_sel =
+                draws_cursor && draw_selection && *element == self.content.focused_element;
             let n_rows = line.visual_rows.len();
             // The row's own span — its gutter and its text — and no more: a line tint that ran
             // edge to edge painted over the box holding the row and buried its rails.
@@ -1426,14 +1539,8 @@ where
             }
         }
 
-        // Cursor, on top.
-        if let Some((row, dcol, width)) = grid::position_cell(
-            window,
-            self.content.focused_element,
-            cursor_pos,
-            self.content.tab_width,
-            self.content.measured,
-        ) {
+        // Cursor, on top — off `caret`, which is `None` whenever a caret is not what is focused.
+        if let Some((row, dcol, width)) = caret {
             let y = bounds.y + PAD + row.get() as f32 * unit_px - scroll;
             // The box holding the cursor's row, read off the same list the row was painted from.
             // Drawn without it, the block landed at the pane's edge while the row it belongs to
@@ -1532,7 +1639,7 @@ where
                     // over the cursor background).
                     if let Some(sev) = grid::window_lines(window)
                         .into_iter()
-                        .find(|(there, _)| *there == cursor_at)
+                        .find(|(there, _)| Some(*there) == cursor_at)
                         .and_then(|(_, l)| diagnostic_at(l, cursor_pos.col))
                     {
                         fill_wavy(
@@ -1726,6 +1833,12 @@ fn inline_text(leaves: Vec<&ViewElement>) -> String {
         match leaf {
             ViewElement::Text { text, .. } => out.push_str(text),
             ViewElement::Space { cols } => out.push_str(&" ".repeat(*cols as usize)),
+            // Brackets included, and through the one spelling the painter uses: this is what
+            // `title_cols` measures a row by and what the test harness reads back, so a button
+            // measured without them would be laid out two cells short of how it is drawn.
+            ViewElement::Action { label, .. } => {
+                out.push_str(&aether_protocol::ui::ViewAction::labelled(label))
+            }
             _ => {}
         }
     }

@@ -746,6 +746,19 @@ html, body, #app {
    `.md-read`'s own rules carry the type — headings, lists, quotes, code panels — so this only has
    to undo the things that belong to a *page*: the centred narrow measure, and the page padding.
    Nothing here marks a reading position or styles a focused block, because a reply has neither. */
+/* A button the view declared: something to press, drawn inline among the chrome it sits in.
+   Bracketed by the painter rather than by a border, so it occupies exactly the cells the terminal
+   spends on it and the three shells measure one row the same way. The colour is the action's kind
+   (an accept and a reject sit side by side and the wrong one cannot be taken back); `lit` is the
+   one `Enter` would press. */
+.action { white-space: pre; }
+.action.lit {
+  background: var(--bg-selection);
+  color: var(--fg-bright);
+  font-weight: 600;
+}
+.action.disabled { color: var(--fg-faint); }
+
 /* An agent's reply is prose, so it sits on the ground like the reading view's page — the rows of
    the conversation around it are the editor's, and they keep the well.
 

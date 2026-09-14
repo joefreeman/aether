@@ -228,7 +228,7 @@ pub struct CursorMove;
 impl RpcMethod for CursorMove {
     const NAME: &'static str = "element/move";
     type Params = CursorMoveParams;
-    type Result = CursorState;
+    type Result = CursorMoveResult;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -236,6 +236,36 @@ pub struct CursorMoveParams {
     pub buffer_id: BufferId,
     pub motion: Motion,
     pub extend_selection: bool,
+}
+
+/// Where the cursor ended up — and, when a line motion walked out of the element it started in,
+/// which element it is in now.
+///
+/// **A line motion moves through the view, not through one element.** `j` at the bottom of a hunk
+/// lands at the top of the next one; `k` at the top of an agent's reply lands at the end of the
+/// block above it. Everything else a motion can be — a word, a character, a find, a sneak, a
+/// search — stays inside the element, because those read *text*, and text belongs to one document.
+/// That is the whole rule, and it is why this result has two shapes rather than every motion
+/// growing a buffer field.
+///
+/// Crossing is never an extension: a selection lives in one buffer, so `Shift-j` clamps at the
+/// boundary rather than crossing. Page motions clamp too — "a screenful, or as far as there is" is
+/// already what a page means, and a page that leapt into the next file would read as a jump rather
+/// than as scrolling.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CursorMoveResult {
+    /// The cursor, in whichever buffer it is now in. Flattened, so a move that stays put — every
+    /// move in an ordinary file — is on the wire exactly as it was before crossing existed.
+    #[serde(flatten)]
+    pub cursor: CursorState,
+    /// Set only when the motion left its element. Carries what the client needs to rebind, in the
+    /// shape [`crate::viewport::ViewportFocusElement`] already answers with, so there is one path
+    /// for "focus moved to another buffer" rather than two that can drift.
+    ///
+    /// Its `buffer.cursor` is the same cursor as above; the flattened copy is what every existing
+    /// caller reads, and this one is what the rebind path reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crossed: Option<crate::viewport::ViewportFocusElementResult>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

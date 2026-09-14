@@ -163,6 +163,18 @@ pub enum Event {
     ReloadTried(Result<ReloadTry, String>),
     /// A cursor-returning RPC resolved (motions, selections, clicks). Reveals as a `Follow`.
     CursorMsg(Result<CursorState, String>),
+    /// `element/move` landed. Distinct from [`CursorMsg`](Event::CursorMsg) — which every other
+    /// path that just moves a cursor still uses — because a **line motion can leave its element**,
+    /// and then the answer is not a cursor in the buffer we asked about but a cursor in the one
+    /// next door. See [`aether_protocol::cursor::CursorMoveResult`].
+    ///
+    /// `jump` is how the landing is revealed: a targeted motion (go-to-line, a selection edge)
+    /// rests a quarter down the screen, an ordinary one minimally scrolls. It rides the event
+    /// rather than splitting into two, so that neither shape can forget to handle a crossing.
+    CursorMoved {
+        jump: bool,
+        result: Result<aether_protocol::cursor::CursorMoveResult, String>,
+    },
     /// `element/source` answered a reading-view copy: the Markdown the cursor had.
     ///
     /// `what` is what the toast calls it, decided when the request went out — the client knows
@@ -360,9 +372,9 @@ pub enum Event {
         enabled: bool,
         result: Result<ViewportWindowResult, String>,
     },
-    /// `Space v e`: an element was folded shut or opened up. No flag rides along — which way it
-    /// went is in the window that came back, and the server decided it.
-    ExpandToggled(Result<ViewportWindowResult, String>),
+    /// A button in the view was pressed. No flag rides along — what it did is in the window that
+    /// came back, and the server decided it.
+    ActionInvoked(Result<ViewportWindowResult, String>),
     PickerViewed {
         initial: bool,
         result: Result<PickerViewResult, String>,
@@ -688,6 +700,39 @@ impl Session {
                 self.install_staged_read()
                     .and(Effects::one(Effect::RevealCursor(RevealStyle::Follow)))
             }
+            // A move that stayed inside its element is a plain cursor move; one that walked out
+            // of it is a focus change, and the whole rebind — buffer, label, read-only, the
+            // breadcrumb — rides the same path a `Tab` between elements takes. Either way it
+            // reveals as a follow: `j` is still `j` whichever side of a boundary it lands on.
+            Event::CursorMoved {
+                jump,
+                result: Ok(r),
+            } => match r.crossed {
+                Some(crossed) => {
+                    let (_moved, fx) = self.adopt_focus(crossed);
+                    let style = if jump {
+                        RevealStyle::Jump
+                    } else {
+                        RevealStyle::Follow
+                    };
+                    self.install_staged_read()
+                        .and(fx)
+                        .and(Effects::one(Effect::RevealCursor(style)))
+                }
+                None if jump => self.jump_to_cursor(r.cursor),
+                None => {
+                    self.view.buffer.cursor = r.cursor;
+                    self.install_staged_read()
+                        .and(Effects::one(Effect::RevealCursor(RevealStyle::Follow)))
+                }
+            },
+            Event::CursorMoved {
+                jump,
+                result: Err(e),
+            } => self.install_staged_read().and(Effects::error_detail(
+                if jump { "Jump failed" } else { "Move failed" },
+                e,
+            )),
             Event::CursorMsg(Err(e)) => self
                 .install_staged_read()
                 .and(Effects::error_detail("Move failed", e)),
@@ -728,6 +773,9 @@ impl Session {
             // sends next is what moves the cursor, and its own reveal keeps it on screen if the
             // click landed at the very edge.
             Event::ElementClicked(Ok(r)) => {
+                // A press puts the cursor in text; whatever button `Tab` had lit is not where you
+                // are any more.
+                self.view.focus = crate::grid::Focus::Text;
                 let (_moved, fx) = self.adopt_focus(r);
                 fx
             }
@@ -2072,15 +2120,15 @@ impl Session {
                 Err(e) => Effects::error_detail("Resolve failed", e),
             },
 
-            Event::ExpandToggled(result) => match result {
+            Event::ActionInvoked(result) => match result {
                 Ok(r) => {
                     self.replace_window(r.window);
                     Effects::one(Effect::WindowAdopted)
                 }
-                // The refusal a non-folding element gives back. Said out loud rather than
-                // swallowed: the key was pressed, and a window that came back identical is
-                // indistinguishable from a dropped keystroke.
-                Err(e) => Effects::error_detail("Nothing to fold here", e),
+                // The refusal an element gives back for a button it no longer offers — a
+                // permission already answered, most often. Said out loud rather than swallowed:
+                // a window that came back identical is indistinguishable from a dropped press.
+                Err(e) => Effects::error_detail("That is no longer offered", e),
             },
 
             Event::DiffViewSet { enabled, result } => match result {
@@ -3708,6 +3756,103 @@ impl Session {
     ///
     /// A no-op without a viewport: focus is a property of a *presentation*, and there is nothing to
     /// step through before the first window arrives.
+    /// `Tab` / `Shift-Tab`: the next thing in the view you can **act on** — a button, or a field to
+    /// type in.
+    ///
+    /// Not the next element. Stepping elements was the same walk `o` makes over the outline, two
+    /// keys for one traversal, and it could not reach a button at all. What `Tab` means in every
+    /// other program is this, and it is why the view declares its buttons rather than the keymap
+    /// growing a chord per view kind.
+    ///
+    /// Stops at the ends rather than wrapping, as every other step in this editor does: repeated
+    /// presses make progress and then stop instead of silently cycling you back to the top.
+    fn step_focus_ring(&mut self, forward: bool) -> Effects {
+        // Before anything is remembered: without a viewport there is nothing to tell, and a press
+        // that moved the ring anyway would leave it one stop further on than the screen shows —
+        // so the *next* press would skip one.
+        if self.view.viewport_id.is_none() {
+            return Effects::none();
+        }
+        // Resolved to `(index, element)` before anything is borrowed mutably: the ring borrows the
+        // window, and the window lives on `self`.
+        let landing = {
+            let Some(window) = self.view.window.as_ref() else {
+                return Effects::none();
+            };
+            let ring = crate::grid::focus_ring(&window.root);
+            if ring.is_empty() {
+                return Effects::none();
+            }
+            // **Where we are on the ring**, so that stepping from it moves by one.
+            //
+            // The stop `Tab` last reached, found by name — a rebuild moves stops, and a remembered
+            // *position* would step from wherever that number now lands. Failing that (focus was
+            // put here by something that is not `Tab`), the focused element's own stop, which has
+            // to be found by identity rather than by "the first stop at or after this element": a
+            // box's buttons carry the same element id and sit *before* its rows, so that reading
+            // put us on the disclosure above the cursor, and `Tab` then walked backwards onto it
+            // and forwards onto the element again before making progress.
+            let at = self.view.focus.position(&ring).or_else(|| {
+                ring.iter().position(|s| {
+                    matches!(s, crate::grid::Stop::Element { element } if *element == self.view.focused_element)
+                })
+            });
+            let next = match (at, forward) {
+                (Some(i), true) => i.wrapping_add(1),
+                (Some(i), false) => match i.checked_sub(1) {
+                    Some(prev) => prev,
+                    // On the first stop already: `Shift-Tab` stops rather than wrapping round.
+                    None => return Effects::none(),
+                },
+                // Focus is on something the ring does not hold: a prose reply or a folded block,
+                // which `o` can step to and the cursor cannot. Enter the ring at the nearest stop
+                // in the direction of travel, counting that element's own buttons as "here".
+                (None, true) => match ring
+                    .iter()
+                    .position(|s| s.element() >= self.view.focused_element)
+                {
+                    Some(i) => i,
+                    None => return Effects::none(),
+                },
+                (None, false) => match ring
+                    .iter()
+                    .rposition(|s| s.element() <= self.view.focused_element)
+                {
+                    Some(i) => i,
+                    None => return Effects::none(),
+                },
+            };
+            match (crate::grid::focus_of(&ring, next), ring.get(next)) {
+                (Some(focus), Some(stop)) => (focus, stop.element()),
+                // Past the last stop: `Tab` stops, as every step in this editor does.
+                _ => return Effects::none(),
+            }
+        };
+        // Remembered for painting and for `Enter` — by name, so the window that arrives next
+        // cannot renumber it out from under the frame. The server is told which *element* holds
+        // the cursor, since that is what decides which buffer an edit, a search or an undo acts
+        // on; the painter does not wait for that answer, because the stop is where focus is.
+        self.view.focus = landing.0;
+        self.focus_element(FocusTarget::Element { element: landing.1 })
+    }
+
+    /// The button `Enter` would press, if focus is on one.
+    ///
+    /// **Re-derived, never trusted.** The ring is rebuilt from whatever window is on screen now,
+    /// and a view rebuilds under the client constantly — an agent view on every event the agent
+    /// sends — so a remembered position can name a button that has since gone. Checking that it
+    /// still lands on the element focus is actually in is what stops `Enter` pressing the
+    /// neighbour of the thing you were looking at.
+    pub fn focused_action(
+        &self,
+    ) -> Option<(
+        aether_protocol::viewport::FieldId,
+        aether_protocol::ui::ViewAction,
+    )> {
+        let window = self.view.window.as_ref()?;
+        crate::grid::focused(&window.root, self.view.focused_element, self.view.focus).action()
+    }
+
     fn focus_element(&mut self, target: FocusTarget) -> Effects {
         let Some(viewport_id) = self.view.viewport_id else {
             return Effects::none();
@@ -3759,6 +3904,15 @@ impl Session {
     fn adopt_focus(&mut self, r: ViewportFocusElementResult) -> (bool, Effects) {
         let moved = r.element != self.view.focused_element;
         self.view.focused_element = r.element;
+        // The server is the authority on which element holds the cursor, so this is the moment a
+        // stop `Tab` named is confirmed or abandoned: it asked for that element's focus, and if
+        // what came back is a different element (clamped to the view as it now is), the stop is
+        // not where we are. Reconciled here, once, rather than by every painter comparing the two
+        // — that comparison is what made a freshly lit button read as stale for a round trip.
+        if matches!(self.view.focus, crate::grid::Focus::Stop { element, .. } if element != r.element)
+        {
+            self.view.focus = crate::grid::Focus::Text;
+        }
         self.view.buffer = buffer_info(r.buffer, &self.workspace_paths);
         // The four buffer-level facts move with focus, because they are facts about the buffer the
         // cursor is in. Left out, they kept describing the element focus had just left: the pushes
@@ -9896,6 +10050,19 @@ impl Session {
         extend: bool,
     ) -> Effects {
         use Action as A;
+        // **Any key but the three that belong to a button takes the light off it.** A view showing
+        // an editor focused *and* a button lit is showing two things focused at once, and `Enter`
+        // would then press the one you are not looking at. Cleared here rather than at each of the
+        // dozen paths that move a cursor — `o`, `c`, a search, the jumplist, go-to-definition —
+        // because listing those is a list that goes stale, and this is the same statement in one
+        // place: `Tab` and `Shift-Tab` move along the ring, `Enter` presses what they reached, and
+        // everything else is you going somewhere else.
+        if !matches!(
+            action,
+            A::FocusNextElement | A::FocusPrevElement | A::Activate
+        ) {
+            self.view.focus = crate::grid::Focus::Text;
+        }
         let buffer_id = self.view.buffer.buffer_id;
         // While disconnected (boot `Connecting` or a mid-session `Reconnecting`) the buffer is
         // read-only: the server can't accept edits, so the RPCs are dropped anyway. Entering Insert
@@ -10704,19 +10871,6 @@ impl Session {
                 aether_protocol::agent::AgentOpenParams { agent: None },
                 Event::AgentOpened,
             ),
-            A::AgentAnswer { allow } => self.request::<aether_protocol::agent::AgentRespond>(
-                aether_protocol::agent::AgentRespondParams {
-                    view_id: self.view.view_id,
-                    answer: if allow {
-                        aether_protocol::agent::Answer::Allow
-                    } else {
-                        aether_protocol::agent::Answer::Decline
-                    },
-                    // The one the conversation is blocked on: there is only ever one.
-                    block: None,
-                },
-                Event::AgentAnswered,
-            ),
             // Always a new shell: returning to one you have is `Space t`, the shells picker.
             A::ShellOpen => self.request::<aether_protocol::shell::ShellOpen>(
                 aether_protocol::shell::ShellOpenParams {},
@@ -10729,27 +10883,6 @@ impl Session {
             // One action for both kinds, and no client-side guess about which kind this is: the
             // server answers `interrupted: false` for a view running nothing — a file, an idle
             // shell, an idle conversation alike — and that one answer produces the one toast.
-            A::ToggleExpand => {
-                let Some(viewport_id) = self.view.viewport_id else {
-                    return Effects::none();
-                };
-                // Same shape as the diff toggle, and for the same reason: folding re-lays out
-                // every row below the fold, so the content anchor is captured against the window
-                // on screen now and restored when the rebuilt one is adopted. Without it, folding
-                // a block above the viewport would slide everything you were reading.
-                let mut fx = Effects::one(Effect::SaveContentAnchor);
-                fx = fx.and(
-                    self.request_str::<aether_protocol::viewport::ViewportSetExpanded>(
-                        aether_protocol::viewport::ViewportSetExpandedParams {
-                            viewport_id,
-                            element: self.view.focused_element,
-                            expanded: None,
-                        },
-                        Event::ExpandToggled,
-                    ),
-                );
-                fx
-            }
             A::Interrupt => self.request::<aether_protocol::view::ViewInterrupt>(
                 aether_protocol::view::ViewInterruptParams {
                     view_id: self.view.view_id,
@@ -10852,10 +10985,43 @@ impl Session {
             // Declared before the composed-view arm below, which would otherwise fire first — the
             // input windows a different buffer than the view's own, so it looks like a hunk over a
             // file and `Enter` would promote it to a view of its own.
+            A::Activate if self.focused_action().is_some() => {
+                let Some((element, action)) = self.focused_action() else {
+                    return Effects::none();
+                };
+                let Some(viewport_id) = self.view.viewport_id else {
+                    return Effects::none();
+                };
+                // Pressing a button re-lays out everything below it — a fold most of all — so the
+                // content anchor is captured against the window on screen now and restored when
+                // the rebuilt one is adopted, exactly as the diff toggle does.
+                Effects::one(Effect::SaveContentAnchor).and(
+                    self.request_str::<aether_protocol::viewport::ViewportInvokeAction>(
+                        aether_protocol::viewport::ViewportInvokeActionParams {
+                            viewport_id,
+                            element,
+                            action,
+                        },
+                        Event::ActionInvoked,
+                    ),
+                )
+            }
             A::Activate if self.shell_input_focused() => {
                 self.dispatch_action(A::SubmitInput, count, counted, extend)
             }
-            A::Activate if self.view.buffer.buffer_id != self.view.view_buffer => {
+            // **And windowing a real file**, which "not the view's own buffer" only approximated.
+            // A conversation's blocks are separate documents too, and they are *fields of the
+            // view* — internal, never listed, gone with the conversation — so asking to open one
+            // as its own view is asking for something the server refuses. Falling through instead
+            // reaches `view/follow_line`, which for a tool call goes to the file it touched: the
+            // thing `Enter` on a block was always meant to mean.
+            //
+            // Reachable since line motions cross elements: the cursor can be inside a block now,
+            // where only `Tab` could put it before.
+            A::Activate
+                if self.view.buffer.buffer_id != self.view.view_buffer
+                    && self.view.buffer.path.is_some() =>
+            {
                 // No keep flag: promoting an element to its own view is a glance at the file, so
                 // it lands as a preview and is kept only once you do something to it (a file
                 // already kept is never demoted by an open). `record_nav_from` is the view, so
@@ -10893,12 +11059,8 @@ impl Session {
             // over source that's the language server's hover, over the reading view it's the target
             // of the focused link or image. They were separate bindings on `Tab` until `Tab` was
             // needed for moving between a view's editors.
-            A::FocusNextElement => self.focus_element(FocusTarget::Step {
-                direction: FocusStep::Next,
-            }),
-            A::FocusPrevElement => self.focus_element(FocusTarget::Step {
-                direction: FocusStep::Previous,
-            }),
+            A::FocusNextElement => self.step_focus_ring(true),
+            A::FocusPrevElement => self.step_focus_ring(false),
 
             A::Hover if self.view.mode == Mode::Read => self.read_show_target(),
             A::Hover => {
@@ -11813,7 +11975,10 @@ impl Session {
                 motion,
                 extend_selection: extend,
             },
-            Event::CursorMsg,
+            |result| Event::CursorMoved {
+                jump: false,
+                result,
+            },
         )
     }
 
@@ -11921,7 +12086,7 @@ impl Session {
                 motion,
                 extend_selection: extend,
             },
-            Event::CursorJump,
+            |result| Event::CursorMoved { jump: true, result },
         )
     }
 
@@ -11996,7 +12161,10 @@ impl Session {
                 motion: Motion::SelectionEdge { edge },
                 extend_selection: false,
             },
-            Event::CursorMsg,
+            |result| Event::CursorMoved {
+                jump: false,
+                result,
+            },
         )
     }
 

@@ -459,17 +459,7 @@ pub enum Action {
     /// which is the one toast this can produce ("Nothing is running here"). Same shape as
     /// `Space g x`.
     Interrupt,
-    /// `Space v e` — fold the focused element shut, or open it up.
-    ///
-    /// Addresses the **focused** element and no other, which is what makes `Tab` the movement and
-    /// this the verb. Whether that element folds at all is the view's to say, so a press on an
-    /// agent's reply comes back refused rather than doing nothing visible.
-    ToggleExpand,
-    /// `Space v a` / `Space v d` — answer the pending permission request with the agent's first
-    /// allowing or rejecting option. The wording is the agent's; this only says which way.
-    AgentAnswer {
-        allow: bool,
-    },
+
     /// Submit what is typed in a composed view's **input** element.
     ///
     /// Not bound to a key of its own: `Enter` resolves to [`Action::Activate`] in Normal and
@@ -1082,8 +1072,8 @@ static NORMAL: &[Binding] = &[
     bind!(N, KeyCode::Enter, Exact(Mods::NONE), A::Activate, "Code", "Go to definition"),
     // Reserved for this since the element tree landed; `Tab` still indents in Insert, where there
     // is no element to move between.
-    bind!(N, KeyCode::Tab, Exact(Mods::NONE), A::FocusNextElement, "Motion", "Focus the next editor element"),
-    bind!(N, KeyCode::BackTab, Any, A::FocusPrevElement, "Motion", "Focus the previous editor element"),
+    bind!(N, KeyCode::Tab, Exact(Mods::NONE), A::FocusNextElement, "Motion", "Next button or input"),
+    bind!(N, KeyCode::BackTab, Any, A::FocusPrevElement, "Motion", "Previous button or input"),
 
     // ---- cursor-local git / diagnostic navigation (the list pickers live under Space) ----
     bind!(N, ch('c'), IgnoreShift(Mods::NONE), A::NextHunk, "Git", "Next change (hunk)"),
@@ -1499,24 +1489,15 @@ static LEADER: &[Binding] = &[
 /// `c` stops whatever it is running — one key for a shell's command and an agent's turn, because
 /// the client cannot tell the two apart and does not need to (see [`Action::Interrupt`]).
 ///
-/// `a` and `d` answer the pending permission request an agent is blocked on — allow and decline.
-/// Two keys rather than one toggle for the reason staging and unstaging are two: an answer cannot
-/// be taken back, so pressing the same key twice must never mean the opposite of the first press.
-/// The *wording* of the options is always the agent's own; these only say which way. They stay
-/// chords rather than a modal prompt because answering usually means scrolling the transcript
-/// first, which an overlay would block.
-///
-/// `e` folds the focused element shut or opens it up. One key rather than two, unlike `a`/`d`
-/// above: a fold is a way of looking at something and is taken back by pressing it again, which is
-/// the exact opposite of an answer.
+/// Answering an agent, folding a tool call and staging a hunk used to be chords here. They are
+/// **buttons in the view** now ([`aether_protocol::ui::Element::Action`]): `Tab` reaches them and
+/// `Enter` presses them, so the wording is the view's and the keymap grows nothing per view kind.
+/// What is left is the one verb that belongs to the view itself rather than to anything in it.
 ///
 /// `Esc` is deliberately unbound here, as in every leader table: it cancels the pending chord.
 #[rustfmt::skip]
 static LEADER_VIEW: &[Binding] = &[
     bind!(LV, ch('c'), Exact(Mods::NONE), A::Interrupt, "Agent", "Stop what this view is running"),
-    bind!(LV, ch('a'), Exact(Mods::NONE), A::AgentAnswer { allow: true }, "Agent", "Allow what the agent is asking to do"),
-    bind!(LV, ch('d'), Exact(Mods::NONE), A::AgentAnswer { allow: false }, "Agent", "Decline what the agent is asking to do"),
-    bind!(LV, ch('e'), Exact(Mods::NONE), A::ToggleExpand, "Agent", "Expand or collapse the focused block"),
 ];
 
 #[rustfmt::skip]

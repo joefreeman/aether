@@ -234,6 +234,72 @@ fn ordinary_motion_follows_but_goto_line_jumps() {
     assert_eq!(reveal_style(&fx), Some(RevealStyle::Jump));
 }
 
+/// A window whose focus ring has exactly one stop: an input element.
+///
+/// `Tab` walks the things a view offers to act on, so a test that wants a focus request has to
+/// give it something to walk to — a view with nothing actionable in it is one `Tab` correctly does
+/// nothing in.
+/// A conversation's shape: a box whose title carries a disclosure, around the element it folds.
+///
+/// The **button comes before the rows it belongs to**, and carries the same element id — which is
+/// what made "where am I on the ring" ambiguous, and what this fixture exists to keep honest.
+fn window_with_a_box(element: u32) -> aether_protocol::viewport::Window {
+    let editor = |element: u32| aether_protocol::viewport::Element::Editor {
+        collapsed: false,
+        element,
+        buffer: 10 + element as u64,
+        rows: 3,
+        first_row: aether_protocol::coords::ElementRow(0),
+        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+        role: aether_protocol::ui::ElementRole::Field,
+        first_buffer_line: 0,
+        lines: vec![],
+    };
+    aether_protocol::viewport::Window {
+        other_elements_dirty: false,
+        max_line_width: 0,
+        git_status: None,
+        root: aether_protocol::viewport::Element::column(vec![
+            aether_protocol::viewport::Element::titled(
+                aether_protocol::ui::Edges {
+                    border: aether_protocol::ui::Sides::all(1),
+                    padding: aether_protocol::ui::Sides::ZERO,
+                    collapse: false,
+                },
+                aether_protocol::ui::Band::Chrome,
+                vec![aether_protocol::viewport::Element::Action {
+                    action: aether_protocol::ui::ViewAction::Expand { expand: None },
+                    label: vec![aether_protocol::viewport::Element::text("▾", Vec::new())],
+                    enabled: true,
+                }],
+                vec![editor(element)],
+            ),
+            editor(element + 1),
+        ]),
+    }
+}
+
+fn window_with_an_input(element: u32) -> aether_protocol::viewport::Window {
+    aether_protocol::viewport::Window {
+        other_elements_dirty: false,
+        max_line_width: 0,
+        git_status: None,
+        root: aether_protocol::viewport::Element::column(vec![
+            aether_protocol::viewport::Element::Editor {
+                collapsed: false,
+                element,
+                buffer: 0,
+                rows: 1,
+                first_row: aether_protocol::coords::ElementRow(0),
+                laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                role: aether_protocol::ui::ElementRole::Input,
+                first_buffer_line: 0,
+                lines: vec![],
+            },
+        ]),
+    }
+}
+
 #[test]
 fn goto_line_from_end_counts_up_from_the_bottom() {
     use aether_protocol::viewport::Window;
@@ -1101,6 +1167,7 @@ fn focusing_another_buffer_rebinds_the_view_content_but_not_its_identity() {
     s.view.view_id = ViewId(10);
     s.view.view_buffer = 10;
     s.view.buffer.buffer_id = 10;
+    s.view.window = Some(window_with_an_input(3));
 
     let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
     let (token, method, _) = the_request(&fx);
@@ -1182,6 +1249,136 @@ fn view_scoped_and_buffer_scoped_operations_address_different_ids() {
     );
 }
 
+/// `Tab` moves **one stop at a time**, and never backwards.
+///
+/// A box's buttons carry the id of the element they act on and sit *before* its rows, so resolving
+/// "where am I" as "the first stop at or after the focused element" put the cursor's position on
+/// the disclosure *above* it: `Tab` from the first line of an element went back to the button, then
+/// forward to the element again, and only then made progress. Walking the ring and asserting the
+/// sequence is strictly increasing is the property that catches it, whatever the ring holds.
+#[test]
+fn tab_walks_the_ring_one_stop_at_a_time() {
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    s.view.window = Some(window_with_a_box(0));
+    // In the *text* of the boxed element — arrived by `j`, not by `Tab`.
+    s.view.focused_element = 0;
+    s.view.focus = aether_client::grid::Focus::Text;
+
+    // Where the client's focus sits on the ring of the window it is showing, resolved afresh each
+    // time: the ring borrows the window, and pressing a key needs the session back.
+    let position = |s: &aether_client::session::Session| {
+        let root = &s.view.window.as_ref().unwrap().root;
+        s.view
+            .focus
+            .position(&aether_client::grid::focus_ring(root))
+    };
+    let here = {
+        let root = &s.view.window.as_ref().unwrap().root;
+        aether_client::grid::focus_ring(root)
+            .iter()
+            .position(|st| matches!(st, aether_client::grid::Stop::Element { element: 0 }))
+            .expect("the boxed element is a stop")
+    };
+
+    // The very first press must go *forward* from where the cursor is.
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "view/focus_element");
+    let landed = params["target"]["element"].as_u64().unwrap() as u32;
+    assert_eq!(
+        position(&s),
+        Some(here + 1),
+        "`Tab` from an element's text did not step to the stop after it (landed on element {landed})"
+    );
+
+    // And back the way it came: `Shift-Tab` returns to the disclosure above, one stop.
+    s.view.focus = aether_client::grid::Focus::Text;
+    let _ = s.on_key(KeyCode::BackTab, Mods::NONE, None);
+    assert_eq!(
+        position(&s),
+        Some(here - 1),
+        "`Shift-Tab` from an element's text did not step to the stop before it"
+    );
+}
+
+/// **Two presses step two stops**, even before the server has said anything.
+///
+/// `Tab` tells the server which element now holds the cursor and hears back a round trip later.
+/// The client therefore cannot read "where am I" off the focused element — under key repeat it is
+/// still the element two presses ago — so it reads the stop it last landed on. Naming that stop
+/// rather than numbering it is what keeps this true across the window the focus reply arrives with.
+#[test]
+fn tab_steps_again_before_the_focus_reply_lands() {
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    s.view.window = Some(window_with_a_box(0));
+    s.view.focused_element = 0;
+    s.view.focus = aether_client::grid::Focus::Text;
+
+    let position = |s: &aether_client::session::Session| {
+        let root = &s.view.window.as_ref().unwrap().root;
+        s.view
+            .focus
+            .position(&aether_client::grid::focus_ring(root))
+    };
+
+    // From the ring's first stop — the box's disclosure — so there are two steps left in it.
+    s.view.focus = {
+        let root = &s.view.window.as_ref().unwrap().root;
+        let ring = aether_client::grid::focus_ring(root);
+        assert!(ring.len() >= 3, "unexpected ring: {ring:?}");
+        aether_client::grid::focus_of(&ring, 0).expect("the disclosure is the first stop")
+    };
+
+    let _ = s.on_key(KeyCode::Tab, Mods::NONE, None);
+    assert_eq!(
+        position(&s),
+        Some(1),
+        "the first press did not step one stop"
+    );
+    // No `view/focus_element` reply: the focused element is still where it was.
+    let _ = s.on_key(KeyCode::Tab, Mods::NONE, None);
+    assert_eq!(
+        position(&s),
+        Some(2),
+        "the second press stepped from the focused element again, not from where the first landed"
+    );
+}
+
+/// A reveal follows the **stop**, not the cursor: a button lives in chrome, and a folded block has
+/// no rows of its own, so scrolling to where the cursor is leaves `Tab` off screen. One answer in
+/// the core, because all three shells were asking it and only the terminal asked it correctly.
+#[test]
+fn a_reveal_follows_the_button_tab_reached() {
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    s.view.window = Some(window_with_a_box(0));
+    s.view.focused_element = 0;
+    let measured = aether_client::grid::Measured::default();
+
+    // In the text: the cursor's own row, inside the box — below its title.
+    s.view.focus = aether_client::grid::Focus::Text;
+    s.view.buffer.cursor.position = aether_protocol::LogicalPosition { line: 0, col: 0 };
+    let in_text = s.view.reveal_row(&measured);
+
+    // On the disclosure: the title row the button rides, which is the box's top edge — above it.
+    let on_fold = {
+        let root = &s.view.window.as_ref().unwrap().root;
+        let ring = aether_client::grid::focus_ring(root);
+        aether_client::grid::focus_of(&ring, 0).expect("the disclosure is the first stop")
+    };
+    s.view.focus = on_fold;
+    let on_button = s
+        .view
+        .reveal_row(&measured)
+        .expect("the button is drawn somewhere");
+    assert!(
+        in_text.is_none_or(|row| on_button < row),
+        "the reveal aimed at the cursor rather than at the button on the border above it"
+    );
+}
+
 /// `Tab` asks the server to move focus to the next editor element; `Shift-Tab` the previous.
 ///
 /// The request needs a viewport — focus is a property of a presentation, and there is nothing to
@@ -1191,23 +1388,26 @@ fn tab_steps_focus_between_editor_elements() {
     let mut s = session();
 
     // No viewport yet: nothing to focus within.
+    s.view.window = Some(window_with_an_input(2));
     let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
     assert!(no_request(&fx), "no viewport, no focus step");
 
     s.view.viewport_id = Some(7);
+    // **Absolute, not a step.** `Tab` walks the view's *focus ring* — the buttons and inputs it
+    // offers to act on — and the client knows that ring, because it has the window. The server is
+    // told which element the landing belongs to, since that is what decides which buffer an edit
+    // acts on; it is not asked to re-derive where "next" is.
     let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "view/focus_element");
-    assert_eq!(params["target"], json!({"to": "step", "direction": "next"}));
+    assert_eq!(params["target"], json!({"to": "element", "element": 2}));
     assert_eq!(params["viewport_id"], 7);
 
+    // And it stops at the ends rather than wrapping: one stop, so there is nowhere further.
+    let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
+    assert!(no_request(&fx), "`Tab` wrapped past the last stop");
     let fx = s.on_key(KeyCode::BackTab, Mods::NONE, None);
-    let (_, method, params) = the_request(&fx);
-    assert_eq!(method, "view/focus_element");
-    assert_eq!(
-        params["target"],
-        json!({"to": "step", "direction": "previous"})
-    );
+    assert!(no_request(&fx), "`Shift-Tab` wrapped past the first stop");
 
     // A click names an element outright — stepping towards it is not something a pointer can do.
     s.view.focused_element = 0;
@@ -13609,6 +13809,7 @@ fn focusing_another_element_adopts_its_buffer_status() {
         ..Default::default()
     };
 
+    s.view.window = Some(window_with_an_input(1));
     let fx = s.on_key(KeyCode::Tab, Mods::NONE, None);
     let token =
         fx.0.iter()
@@ -14219,11 +14420,27 @@ fn enter_in_a_review_switches_to_the_file_under_the_cursor() {
     s.view.view_id = ViewId(9);
     s.view.view_buffer = 9;
     s.view.buffer.buffer_id = 42;
+    // A review's element windows a **file**, and that is what makes it promotable: a composed
+    // view's elements can also be documents internal to it — a conversation's blocks — which are
+    // not openable as views of their own and must fall through to `view/follow_line` instead.
+    s.view.buffer.path = Some("/p/src/other.rs".into());
     s.view.focused_element = 2;
 
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
-    let (token, method, params) = the_request(&fx);
-    assert_eq!(method, "view/open");
+    // The open, picked out by name: a buffer with a real path behind it also asks the server to
+    // follow blame, which is nothing to do with what `Enter` did.
+    let (token, params) =
+        fx.0.iter()
+            .find_map(|e| match e {
+                Effect::Request {
+                    token,
+                    method,
+                    params,
+                    ..
+                } if *method == "view/open" => Some((*token, params.clone())),
+                _ => None,
+            })
+            .expect("`Enter` in a review opens the file its element windows");
     assert_eq!(params["view_id"], json!(9), "named through the review");
     assert_eq!(params["element"], json!(2), "the element the cursor is in");
     assert_eq!(

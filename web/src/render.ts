@@ -11,6 +11,7 @@ import type {
   Band,
   BufferWindow,
   ConflictLine,
+  FocusStop,
   Measured,
   CursorState,
   DiagnosticSeverity,
@@ -30,7 +31,10 @@ import type {
 // Value imports: the `change*` accessors mirror the Rust ones on `LineChange`, so the call sites
 // below stay as short as the five parallel fields they replaced.
 import {
+  actionRole,
+  actionText,
   elementOrigins,
+  focused,
   holdsCollapsed,
   inlineOf,
   paintedRows,
@@ -532,9 +536,19 @@ function gutter(
  *
  *  Shared by a chrome row and a box's title: the same vocabulary, in the same roles, drawn in two
  *  different places on the row. */
-function appendInline(into: HTMLElement, nodes: ViewNode[]): void {
+function appendInline(into: HTMLElement, nodes: ViewNode[], lit?: ViewNode): void {
   for (const w of nodes) {
-    if (w.node === "space") {
+    if (w.node === "action") {
+      // A button the view declared. Its label is the view's own wording; what this decides is the
+      // shape — the kind's colour, dimmed when refused, filled when it is the one `Enter` would
+      // press. `lit` is compared by **identity**, since two buttons can be equal in every field.
+      const btn = document.createElement("span");
+      btn.className = `action ${highlightClass(actionRole(w.action)) ?? ""}`;
+      if (w.enabled === false) btn.classList.add("disabled");
+      if (lit !== undefined && w === lit) btn.classList.add("lit");
+      btn.textContent = actionText(w.label);
+      into.appendChild(btn);
+    } else if (w.node === "space") {
       const span = document.createElement("span");
       span.textContent = " ".repeat(w.cols);
       into.appendChild(span);
@@ -580,6 +594,7 @@ function edgeRow(
   band: Band,
   title: ViewNode[],
   holdsCursor: boolean,
+  lit: ViewNode | undefined,
 ): HTMLElement {
   const rowEl = document.createElement("div");
   rowEl.className = `row box-edge ${side} ${join}`;
@@ -597,7 +612,7 @@ function edgeRow(
   if (title.length) {
     const named = document.createElement("span");
     named.className = "title";
-    appendInline(named, title.flatMap(inlineOf));
+    appendInline(named, title.flatMap(inlineOf), lit);
     content.appendChild(named);
   }
   rowEl.appendChild(content);
@@ -611,7 +626,7 @@ function edgeRow(
  *  rather than a buffer line) and carries no gutter change-bar, since it belongs to no line of
  *  either side. The file separator's trailing rule is drawn in CSS, so it fills whatever width is
  *  left. */
-function chromeRow(v: ViewNode, band: Band): HTMLElement {
+function chromeRow(v: ViewNode, band: Band, lit: ViewNode | undefined): HTMLElement {
   const rowEl = document.createElement("div");
   rowEl.className = "row";
   // A row of presentation with no band paints none — since one vocabulary covers both axes, an
@@ -624,7 +639,7 @@ function chromeRow(v: ViewNode, band: Band): HTMLElement {
   rowEl.appendChild(g);
   const content = document.createElement("span");
   content.className = "content";
-  appendInline(content, inlineOf(v));
+  appendInline(content, inlineOf(v), lit);
   rowEl.appendChild(content);
   return rowEl;
 }
@@ -699,12 +714,18 @@ export interface RenderOpts {
   /** Which editor element holds the live cursor. A logical line number names a line only within
    *  its element, so everything decided against the cursor's line is narrowed to this one. */
   focusedElement: number;
+  /** The stop `Tab` left — which button it lit, named by element and ordinal. Absent means none
+   *  is: the cursor is in text rather than on a button. */
+  focusedStop?: FocusStop;
 }
 
 /** Repaint the whole buffer area from the current window + cursor. `container` is the shell's
  *  buffer surface — a shadow root in the browser (see `Shell.bufferSurface`), a plain element in
  *  tests; both satisfy the `:scope > .buffer-spacer` lookup and `replaceChildren` used below. */
-export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOpts): void {
+export function renderBuffer(
+  container: HTMLElement | ShadowRoot,
+  opts: RenderOpts,
+): HTMLElement[] {
   const {
     window,
     cursor,
@@ -718,7 +739,13 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
     blame,
     diffView,
     focusedElement,
+    focusedStop,
   } = opts;
+  // Where focus is, as one answer: the button `Tab` lit (compared by identity, so it comes from the
+  // same tree the painting walks) *or* the cursor — never both.
+  const where = focused(window.root, focusedElement, focusedStop);
+  const lit = where.kind === "action" ? where.node : undefined;
+  const drawsCursor = where.kind === "cursor";
   // The cursor's appearance is decided once here: an underscore while waiting for the next key of a
   // chord (overriding mode), else a bar in Insert, else a block. `makeSpan` just appends this class.
   const cursorClass = awaitingKey ? "cursor pending" : insertMode ? "cursor insert" : "cursor";
@@ -763,6 +790,8 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
   // away there is no row at its start, and hanging the block off a surviving row slid it down the
   // screen by however much was missing.
   const placements = elementOrigins(window.root, measured);
+  // Every reply this paint made, in view order — see `flushProse`.
+  const replies: HTMLElement[] = [];
   const pending = proseOf(window.root)
     .map((node) => ({ node, place: placements[node.element] }))
     .filter((p) => p.place !== undefined)
@@ -774,10 +803,14 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
       gapTo(place.at);
       const box = document.createElement("div");
       box.className = "md-reply-box";
-      // The shell finds this again to measure what the browser made of it: proportional type has
-      // no height until it is laid out, so the grid's idea of how tall this reply is comes back
-      // on the pass after this one.
+      // **Handed back to the caller**, which measures what the browser made of it: proportional
+      // type has no height until it is laid out, so the grid's idea of how tall this reply is
+      // comes back on the pass after this one. Returned rather than looked up again by selector —
+      // the rows are painted into a closed shadow root, and a `querySelectorAll` aimed at the host
+      // instead crosses no shadow boundary, finds nothing, and leaves every reply counted as a
+      // single row with everything below it placed somewhere it is not.
       box.dataset.element = String(node.element);
+      replies.push(box);
       renderReply(box, node.blocks);
       frag.appendChild(insetBy(place, box));
       // The measured height if the shell has one; a single row until then, which is wrong and is
@@ -791,7 +824,7 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
     next = item.at + unit;
     const inset = (el: HTMLElement): HTMLElement => insetBy(item, el);
     if (item.kind === "chrome") {
-      frag.appendChild(inset(chromeRow(item.node, item.band)));
+      frag.appendChild(inset(chromeRow(item.node, item.band, lit)));
       continue;
     }
     if (item.kind === "baseline") {
@@ -811,6 +844,7 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
             item.band,
             title,
             holdsCollapsed(item.owner, focusedElement),
+            lit,
           ),
         ),
       );
@@ -820,7 +854,9 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
     const L = line.logical_line;
     // The pair, not the number: two files' hunks both have a line 10, so deciding the cursor line
     // by the number alone paints a second cursor in the other file — two, moving in sync.
-    const onCursorElement = element === focusedElement;
+    // False while a button holds focus: the cursor's cell, its line's tint and its selection all
+    // hang off this, so they fall away together rather than each needing a guard of its own.
+    const onCursorElement = drawsCursor && element === focusedElement;
     const cursorByte = onCursorElement && cursor.position.line === L ? cursor.position.col : null;
     const bracketBytes = bracketPair
       ? bracketPair.filter((p) => p.line === L).map((p) => p.col)
@@ -859,6 +895,9 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
       ),
     );
   }
+  // Any reply below the last painted row — the rows of whatever follows it are not loaded, so no
+  // item ever came at or after its placement to flush it. Without this it painted nothing at all.
+  flushProse(Number.POSITIVE_INFINITY);
   // Virtual scroll: a full-document-height spacer (so the native scrollbar reflects the whole
   // file), with the loaded window absolutely positioned at its visual-row offset. Both axes scroll
   // natively; `contentWidthPx` widens the content past the container so the widest line is reachable.
@@ -882,4 +921,5 @@ export function renderBuffer(container: HTMLElement | ShadowRoot, opts: RenderOp
   const oldContent = spacer.querySelector(":scope > .buffer-content");
   if (oldContent) oldContent.replaceWith(content);
   else spacer.insertBefore(content, spacer.firstChild);
+  return replies;
 }

@@ -36,6 +36,11 @@ pub struct ViewOpenParams {
     /// file a composed view's focused editor shows, presented as its own view (`Enter` in a
     /// review). Named through the view because a file at a revision has no path, and only the
     /// view windowing it can say which it is.
+    ///
+    /// **Refused for an element whose document is internal to the view** — a conversation's
+    /// blocks, a shell's input line. Those are fields of the view rather than documents of the
+    /// user's: never listed, never session-recorded, gone with the view that owns them. A view
+    /// minted over one is a view nothing can reopen, and it outlives the buffer it names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element: Option<u32>,
     /// How to present a markdown file to this client: as the rendered document (`Some(true)`) or

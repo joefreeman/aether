@@ -12,7 +12,7 @@ use aether_protocol::{BufferId, ViewportId};
 async fn cursor_starts_at_origin_and_moves_by_char() {
     let (server, mut ws, buffer_id) = setup_with_buffer("hello\nworld\n").await;
 
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -28,7 +28,7 @@ async fn cursor_starts_at_origin_and_moves_by_char() {
     assert!((st.anchor == st.position));
 
     // Moving forward past the end of line should land on the next line.
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -892,7 +892,7 @@ async fn cursor_move_selection_edges() {
     ];
     for (edge, want) in cases {
         send_request::<CursorSet>(&mut ws, &select).await;
-        let st: CursorState = send_request::<CursorMove>(&mut ws, &edge_move(edge)).await;
+        let st: CursorState = move_cursor(&mut ws, &edge_move(edge)).await;
         assert_eq!(st.position, want, "{edge:?}");
         assert_eq!(st.anchor, want, "{edge:?} collapses to a point");
     }
@@ -909,8 +909,7 @@ async fn cursor_move_selection_edges() {
         },
     )
     .await;
-    let st: CursorState =
-        send_request::<CursorMove>(&mut ws, &edge_move(SelectionEdge::AfterEnd)).await;
+    let st: CursorState = move_cursor(&mut ws, &edge_move(SelectionEdge::AfterEnd)).await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 5 });
 
     // A point cursor on the empty line: every edge degenerates sensibly.
@@ -935,7 +934,7 @@ async fn cursor_move_selection_edges() {
     ];
     for (edge, want) in degenerate {
         send_request::<CursorSet>(&mut ws, &point).await;
-        let st: CursorState = send_request::<CursorMove>(&mut ws, &edge_move(edge)).await;
+        let st: CursorState = move_cursor(&mut ws, &edge_move(edge)).await;
         assert_eq!(st.position, want, "{edge:?} from a point on the empty line");
     }
 }
@@ -958,7 +957,7 @@ async fn cursor_set_and_extend_selection() {
 
     // Extend selection 3 chars right; block cursor lands on the 'a' of "beta" and the selection
     // operationally covers "beta" (position char is included in the selection's range).
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -1385,7 +1384,7 @@ async fn cursor_set_line_granularity_whole_line_normal_form() {
 async fn line_end_and_buffer_end_motions() {
     let (server, mut ws, buffer_id) = setup_with_buffer("abc\nxy\n").await;
 
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -1397,7 +1396,7 @@ async fn line_end_and_buffer_end_motions() {
     // LineEnd lands on the last visible char ('c'), not on the trailing newline.
     assert_eq!(st.position, LogicalPosition { line: 0, col: 2 });
 
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -1420,7 +1419,7 @@ async fn logical_line_first_nonblank_motion() {
     let p = |line: u32, col: u32| LogicalPosition { line, col };
     let motion = |direction, count| Motion::LogicalLineFirstNonblank { direction, count };
     async fn step(ws: &mut Ws, buffer_id: u64, motion: Motion, extend: bool) -> CursorState {
-        send_request::<CursorMove>(
+        move_cursor(
             ws,
             &CursorMoveParams {
                 buffer_id,
@@ -1486,7 +1485,7 @@ async fn logical_line_first_nonblank_all_blank_line() {
 
     // An all-blank line has no non-blank char; the cursor lands at its line end.
     set_cursor(&mut ws, buffer_id, 0, 0).await;
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -2354,7 +2353,7 @@ async fn match_bracket_motion_jumps_to_pair() {
         },
     )
     .await;
-    let r: CursorState = send_request::<CursorMove>(
+    let r: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: open.buffer_id,
@@ -2424,7 +2423,7 @@ async fn match_bracket_with_extend_selects_to_pair() {
         },
     )
     .await;
-    let r: CursorState = send_request::<CursorMove>(
+    let r: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: open.buffer_id,
@@ -2484,7 +2483,7 @@ async fn match_bracket_from_inside_pair_jumps_to_opener() {
         },
     )
     .await;
-    let r: CursorState = send_request::<CursorMove>(
+    let r: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: open.buffer_id,
@@ -2542,7 +2541,7 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
         },
     )
     .await;
-    let r: CursorState = send_request::<CursorMove>(
+    let r: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: open.buffer_id,
@@ -2555,7 +2554,7 @@ async fn match_bracket_inner_from_inside_lands_just_after_opener() {
     assert_eq!(r.position, LogicalPosition { line: 0, col: 10 });
 
     // A second press toggles to the inner-close side (one char before `}` at col 22).
-    let r: CursorState = send_request::<CursorMove>(
+    let r: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: open.buffer_id,
@@ -2615,7 +2614,7 @@ async fn match_bracket_inner_from_opener_jumps_to_inner_close() {
         },
     )
     .await;
-    let r: CursorState = send_request::<CursorMove>(
+    let r: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: open.buffer_id,
@@ -2673,7 +2672,7 @@ async fn match_bracket_inner_on_empty_pair_is_noop() {
         },
     )
     .await;
-    let r: CursorState = send_request::<CursorMove>(
+    let r: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: open.buffer_id,
@@ -2824,7 +2823,7 @@ async fn save_in_place_writes_file_and_clears_dirty() {
     .await;
 
     // Edit: append "!" at end. Move cursor to end then insert.
-    let _ = send_request::<CursorMove>(
+    let _ = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: open.buffer_id,
@@ -3082,7 +3081,7 @@ async fn copy_selection_returns_inclusive_text() {
         },
     )
     .await;
-    let _: CursorState = send_request::<CursorMove>(
+    let _: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -3165,7 +3164,7 @@ async fn cut_selection_deletes_and_returns_text() {
         },
     )
     .await;
-    let _: CursorState = send_request::<CursorMove>(
+    let _: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -3523,7 +3522,7 @@ async fn word_motion_forward_and_back() {
     let (server, mut ws, buffer_id) = setup_with_buffer("hello world-foo bar\n").await;
 
     // `w` forward: hello → world (col 6)
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -3539,7 +3538,7 @@ async fn word_motion_forward_and_back() {
     assert_eq!(st.position, LogicalPosition { line: 0, col: 6 });
 
     // `w` again: world → '-' (col 11) — the hyphen starts a new word category
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -3565,7 +3564,7 @@ async fn word_motion_forward_and_back() {
         },
     )
     .await;
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -3580,7 +3579,7 @@ async fn word_motion_forward_and_back() {
     .await;
     assert_eq!(st.position, LogicalPosition { line: 0, col: 6 });
     // Another WORD forward: "world-foo" → "bar" (col 16)
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -3596,7 +3595,7 @@ async fn word_motion_forward_and_back() {
     assert_eq!(st.position, LogicalPosition { line: 0, col: 16 });
 
     // `b` backward from col 16: → col 12 (start of "foo")
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -3617,7 +3616,7 @@ async fn word_motion_forward_and_back() {
 #[tokio::test]
 async fn word_end_motion_lands_on_last_char() {
     let (server, mut ws, buffer_id) = setup_with_buffer("hello world\n").await;
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -3891,7 +3890,7 @@ async fn input_text_with_selection_replaces_it() {
         },
     )
     .await;
-    let _: CursorState = send_request::<CursorMove>(
+    let _: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5058,7 +5057,7 @@ async fn visual_line_down_walks_wrapped_rows_within_a_logical_line() {
     let viewport_id = sub.viewport_id;
 
     // Cursor at start of line — visual col 0 of row 0. Down should land on row 1's col 0 (byte 10).
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5113,7 +5112,7 @@ async fn visual_line_preserves_visual_column() {
         },
     )
     .await;
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5129,7 +5128,7 @@ async fn visual_line_preserves_visual_column() {
     assert_eq!(st.position, LogicalPosition { line: 0, col: 15 });
 
     // Up: back to visual col 5 of row 0 = byte 5.
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5185,7 +5184,7 @@ async fn visual_line_crosses_logical_line_boundary() {
         },
     )
     .await;
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5242,7 +5241,7 @@ async fn visual_line_preserves_display_column_across_multibyte_chars() {
         },
     )
     .await;
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5297,7 +5296,7 @@ async fn visual_line_with_wrap_none_falls_back_to_logical() {
         },
     )
     .await;
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5363,7 +5362,7 @@ async fn move_to(ws: &mut Ws, buffer_id: BufferId, line: u32, col: u32) {
 }
 
 async fn step(ws: &mut Ws, buffer_id: BufferId, motion: Motion) -> LogicalPosition {
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         ws,
         &CursorMoveParams {
             buffer_id,
@@ -5693,7 +5692,7 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
 
     // Alt-j: visual col 1 < prefix 2 on row 1, so cursor clamps to start of row 1's text (byte 10).
     // The remembered virtual col stays at 1.
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5710,7 +5709,7 @@ async fn virtual_col_prevents_drift_through_continuation_rows() {
 
     // Alt-k: with virtual_col=1, target visual col is 1. On row 0 (prefix 0), byte = 1. We end
     // back where we started, not at byte 2 (which is what naive preserve-col would do).
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5767,7 +5766,7 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
     .await;
 
     // j → empty line 1; col clamps to 0 but virtual_col holds 5.
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5783,7 +5782,7 @@ async fn virtual_col_preserved_across_empty_line_for_logical_motion() {
     assert_eq!(st.position, LogicalPosition { line: 1, col: 0 });
 
     // j → line 2 with content; virtual_col restores col 5.
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5836,7 +5835,7 @@ async fn virtual_col_cleared_by_horizontal_motion() {
         },
     )
     .await;
-    send_request::<CursorMove>(
+    move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5852,7 +5851,7 @@ async fn virtual_col_cleared_by_horizontal_motion() {
     // Cursor now at byte 10 (visual col 2 = prefix); virtual_col stashed = 1.
 
     // Char Forward (a horizontal motion) clears the virtual col. Cursor at byte 11, visual col 3.
-    send_request::<CursorMove>(
+    move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5866,7 +5865,7 @@ async fn virtual_col_cleared_by_horizontal_motion() {
     .await;
 
     // Alt-k: without a virtual col, target is current visual col (3). Lands at byte 3 of row 0.
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5919,7 +5918,7 @@ async fn virtual_col_cleared_by_mutation() {
         },
     )
     .await;
-    send_request::<CursorMove>(
+    move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5949,7 +5948,7 @@ async fn virtual_col_cleared_by_mutation() {
 
     // Alt-k: target is current visual col (3, since cursor is on row 1 with prefix 2 at col 1
     // within the text). Lands at byte 3, not the original byte 1.
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -6180,7 +6179,7 @@ async fn a_plain_motion_clears_the_expand_history() {
     tree_select(&mut ws, b, TreeSelectDirection::Expand, 1).await;
     tree_select(&mut ws, b, TreeSelectDirection::Expand, 1).await;
 
-    let moved: CursorState = send_request::<CursorMove>(
+    let moved: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: b,
@@ -6316,7 +6315,7 @@ async fn every_motion_stays_inside_the_focused_element() {
     let inside = |p: LogicalPosition| extent.contains(&p.line);
 
     async fn mv(ws: &mut Ws, buffer_id: u64, motion: Motion) -> CursorState {
-        send_request::<CursorMove>(
+        move_cursor(
             ws,
             &CursorMoveParams {
                 buffer_id,
@@ -6684,7 +6683,7 @@ async fn focusing_an_element_the_cursor_is_in_keeps_the_cursor() {
     let (server, mut ws, buffer_id, extent, viewport_id) = hunk_view(dir.path()).await;
 
     // Move to the hunk's last line — a position inside the element that isn't its first line.
-    let moved: CursorState = send_request::<CursorMove>(
+    let moved: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -6724,7 +6723,7 @@ async fn focusing_an_element_the_cursor_is_in_keeps_the_cursor() {
 async fn focusing_a_patchs_element_lands_the_cursor_in_what_it_shows() {
     let dir = tempfile::tempdir().unwrap();
     let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
-    let cursor: CursorState = send_request::<CursorMove>(
+    let cursor: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -6962,7 +6961,7 @@ async fn a_window_fetched_for_the_cursor_contains_the_cursor() {
     let buffer_id = sub.focus.buffer.buffer_id;
 
     // Put the cursor deep inside the hunk — far past the screenful the element's start would carry.
-    let deep: CursorState = send_request::<CursorMove>(
+    let deep: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -7654,7 +7653,7 @@ async fn a_counted_goto_refuses_a_line_outside_the_element() {
     let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
 
     async fn goto(ws: &mut Ws, buffer_id: u64, line: u32) -> CursorState {
-        send_request::<CursorMove>(
+        move_cursor(
             ws,
             &CursorMoveParams {
                 buffer_id,
@@ -7711,7 +7710,7 @@ async fn a_counted_step_past_the_hunks_end_does_not_move_at_all() {
     let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
 
     async fn step(ws: &mut Ws, buffer_id: u64, count: u32) -> CursorState {
-        send_request::<CursorMove>(
+        move_cursor(
             ws,
             &CursorMoveParams {
                 buffer_id,
@@ -7765,7 +7764,7 @@ async fn every_counted_motion_is_all_or_nothing() {
     let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
 
     async fn mv(ws: &mut Ws, buffer_id: u64, motion: Motion) -> CursorState {
-        send_request::<CursorMove>(
+        move_cursor(
             ws,
             &CursorMoveParams {
                 buffer_id,
@@ -8001,7 +8000,7 @@ async fn extending_a_selection_cannot_anchor_outside_the_element() {
         .expect("the view windows the changed file");
 
     // Extend downward. The head moves within the hunk; the anchor must be dragged in with it.
-    let extended: CursorState = send_request::<CursorMove>(
+    let extended: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: file.buffer_id,
@@ -8224,7 +8223,7 @@ async fn motion_undo_refuses_a_position_in_another_hunk() {
     let buffer_id = first.buffer.buffer_id;
     let mut in_first = first.buffer.cursor.position;
     for _ in 0..2 {
-        let st: CursorState = send_request::<CursorMove>(
+        let st: CursorState = move_cursor(
             &mut ws,
             &CursorMoveParams {
                 buffer_id,

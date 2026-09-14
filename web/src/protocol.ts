@@ -235,6 +235,19 @@ export type ViewNode =
       collapsed?: boolean;
     }
   | {
+      /** Something the view offers to **do**, drawn as a button and reachable with `Tab`. Mirrors
+       *  `Element::Action`.
+       *
+       *  `label` is the wording of whoever built the view — an agent's own permission options,
+       *  verbatim. What a shell styles by is the action's *kind*, which is derived from `action`
+       *  rather than sent, so the three shells cannot be told different things about one button. */
+      node: "action";
+      action: ViewActionSpec;
+      label?: ViewNode[];
+      /** Drawn, reachable and refused. Absent means enabled, which is the ordinary case. */
+      enabled?: boolean;
+    }
+  | {
       /** Rendered prose — a span of a buffer as markdown, not as lines. Mirrors `Element::Prose`.
        *
        *  It carries no lines at all: the server parses once, for every shell, and the blocks *are*
@@ -250,6 +263,151 @@ export type ViewNode =
       blocks: MdBlock[];
       source: SourceLines;
     };
+
+/** What invoking an action does — mirrors `ui::ViewAction`, tagged `do`. A closed set: a view
+ *  rebuilds constantly, so an id minted per build would be stale before a press came back. */
+export type ViewActionSpec =
+  | { do: "permission"; allow: boolean }
+  | { do: "expand"; expand?: boolean }
+  | { do: "stage"; stage: boolean };
+
+/** Mirrors `ui::ActionKind::role` — the highlight role a button's label paints in. Derived, not
+ *  sent, so all three shells agree about which of two buttons you should hesitate over. */
+export function actionRole(a: ViewActionSpec): string {
+  if (a.do === "permission") return a.allow ? "diff.added" : "diff.removed";
+  return "diff.meta";
+}
+
+/** The text a button draws, brackets included — mirrors `ui::ViewAction::labelled`, so no shell
+ *  measures a row differently from how it paints it. */
+export function actionText(label: ViewNode[] | undefined): string {
+  const text = (n: ViewNode): string =>
+    n.node === "text" ? n.text : n.node === "column" || n.node === "row" ? n.children.map(text).join("") : "";
+  return `[${(label ?? []).map(text).join("")}]`;
+}
+
+/** One stop on the view's focus ring — mirrors `grid::Stop`. */
+export type Stop =
+  | { kind: "action"; element: number; action: ViewActionSpec; node: ViewNode }
+  /** A place the cursor can go. `rows > 0` is the whole test: an element with nothing in it, and a
+   *  folded one, both report no rows, and prose is not an editor at all — so this agrees with the
+   *  server's `Viewport::can_hold_cursor` without restating its reasoning. */
+  | { kind: "element"; element: number };
+
+/** The view's focus ring, in view order — mirrors `grid::focus_ring`.
+ *
+ *  A button to press, or an element to put the cursor in. Not the same walk as `o`, which steps the
+ *  view's *outline*; this is what is on screen and actionable. An action belongs to the **nearest
+ *  box around it**, because the tree puts a box's buttons before the content they act on. */
+export function focusRing(root: ViewNode): Stop[] {
+  const out: Stop[] = [];
+  const contentOf = (n: ViewNode): number | undefined => {
+    if (n.node === "editor" || n.node === "prose") return n.element;
+    if (n.node === "column" || n.node === "row")
+      for (const c of n.children) {
+        const found = contentOf(c);
+        if (found !== undefined) return found;
+      }
+    return undefined;
+  };
+  const walk = (n: ViewNode, owner: number | undefined): void => {
+    if (n.node === "column") {
+      const inner = contentOf(n) ?? owner;
+      for (const t of n.title ?? []) walk(t, inner);
+      for (const c of n.children) walk(c, inner);
+    } else if (n.node === "row") {
+      for (const c of n.children) walk(c, owner);
+    } else if (n.node === "action") {
+      // A disabled button is drawn and skipped: stopping on something that refuses is a press that
+      // visibly does nothing.
+      if (n.enabled !== false && owner !== undefined)
+        out.push({ kind: "action", element: owner, action: n.action, node: n });
+    } else if (n.node === "editor" && n.rows > 0) {
+      // Every element being shown, the input among them — it is an editor like any other. Not
+      // prose: a reply wears no cursor, so stopping there shows nothing.
+      out.push({ kind: "element", element: n.element });
+    }
+  };
+  walk(root, undefined);
+  return out;
+}
+
+/** Where focus **is** — exactly one thing. Mirrors `grid::Focused`.
+ *
+ *  A sum, not two flags: a view drawing a cursor *and* lighting a button is showing two things
+ *  focused at once, which is what "which button is lit" being additive state allowed. There is one
+ *  answer, every painter reads it, and the both-at-once frame cannot be built.
+ *
+ *  Total, and anything stale degrades to `cursor` — the text is where focus was going to be. */
+export type Focused =
+  | { kind: "cursor"; element: number }
+  | { kind: "action"; element: number; action: ViewActionSpec; node: ViewNode }
+  /** An element with **nothing to put a caret in** — a prose reply, a folded block. Navigation
+   *  steps the view's structure and can land here; a line motion cannot. The element is marked
+   *  rather than a cursor pretended at. */
+  | { kind: "element"; element: number };
+
+/** The stop `Tab` left, named the way `grid::Focus::Stop` names one: the element, and which of its
+ *  buttons (`button: null` is the element's own text). **Named, not numbered** — the ring is
+ *  rebuilt on every push, so a remembered position points at something else as soon as a block
+ *  expands, and the button you were standing on goes dark. */
+export interface FocusStop {
+  element: number;
+  button: number | null;
+}
+
+/** Mirrors `grid::focused`. `stop` is what `Tab` left, or undefined for the text. */
+export function focused(root: ViewNode, element: number, stop: FocusStop | undefined): Focused {
+  // Not merely what the client remembers: focus moves by things that never consult the ring — `o`,
+  // the outline picker, a click — and they can land where no caret can be drawn.
+  const inText = (): Focused => {
+    const node = contentOf(root, element);
+    return node !== undefined && node.node === "editor" && node.rows > 0
+      ? { kind: "cursor", element }
+      : { kind: "element", element };
+  };
+  // A stop is the answer on its own, and deliberately not "a stop, provided the server agrees about
+  // which element holds the cursor": that comparison made `Tab` flash, since the server answers a
+  // round trip later and until it did the stop just reached read as stale — a caret appearing in
+  // the block you had just left on the way past it.
+  if (stop === undefined) return inText();
+  // An element stop is focus in its text — but the caret belongs to the server's cursor, which is
+  // still in the element focus is leaving. Until the reply lands there is a place but no position.
+  if (stop.button === null) {
+    return stop.element === element ? inText() : { kind: "element", element: stop.element };
+  }
+  const at = ringPosition(focusRing(root), stop);
+  const found = at === undefined ? undefined : focusRing(root)[at];
+  if (found === undefined || found.kind !== "action") return inText();
+  return { kind: "action", element: stop.element, action: found.action, node: found.node };
+}
+
+/** Where `stop` sits on `ring` now, if it is still there — mirrors `grid::Focus::position`. */
+export function ringPosition(ring: Stop[], stop: FocusStop): number | undefined {
+  if (stop.button === null) {
+    const i = ring.findIndex((s) => s.kind === "element" && s.element === stop.element);
+    return i < 0 ? undefined : i;
+  }
+  let seen = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const s = ring[i];
+    if (s.kind !== "action" || s.element !== stop.element) continue;
+    if (seen === stop.button) return i;
+    seen++;
+  }
+  return undefined;
+}
+
+/** The content node for `element`, if the tree holds one. */
+function contentOf(root: ViewNode, element: number): ViewNode | undefined {
+  if ((root.node === "editor" || root.node === "prose") && root.element === element) return root;
+  if (root.node === "column" || root.node === "row")
+    for (const c of root.children) {
+      const found = contentOf(c, element);
+      if (found !== undefined) return found;
+    }
+  return undefined;
+}
 
 /** Mirrors `ui::SourceLines`: the shape of the text a parse came from, without the text — the byte
  *  offset each line starts at (one entry per line, always starting 0) and the text's byte length. */
@@ -367,7 +525,10 @@ export function nodeLines(n: ViewNode): LogicalLineRender[] {
 /** The leaves of one row, left to right — text, spaces and fills, in painting order.
  *  Mirrors `Element::inline`. */
 export function inlineOf(n: ViewNode): ViewNode[] {
-  if (n.node === "text" || n.node === "space" || n.node === "fill") return [n];
+  // A button is a leaf here, not a container: its label is *its* to draw, and flattening through
+  // it would lose the button and lay the words out bare. Mirrors `ui::Element::inline`.
+  if (n.node === "text" || n.node === "space" || n.node === "fill" || n.node === "action")
+    return [n];
   if (n.node === "column" || n.node === "row") return n.children.flatMap(inlineOf);
   return [];
 }

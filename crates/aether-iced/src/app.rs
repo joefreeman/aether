@@ -1717,6 +1717,12 @@ impl App {
                         if !self.settle_pending_reveal() {
                             self.reveal_cursor();
                         }
+                        // And whatever the screen reaches, loaded. The window just adopted can be
+                        // one that does not cover it — an element that grew where the view did not
+                        // move, which is a fold opening — and nothing else would ask: the two
+                        // branches above go through `scroll_to_covered`, and this one has no
+                        // scroll to chase. `maybe_fetch` no-ops when the screen is covered.
+                        tasks.push(self.maybe_fetch());
                     }
                 }
                 Effect::Request {
@@ -3106,7 +3112,14 @@ impl App {
         let line = self.session.view.buffer.cursor.position.line;
         // Loadedness is a per-element question: the window's line range is in *view* coordinates,
         // while the cursor's line belongs to its element's buffer.
-        if !aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line) {
+        //
+        // A reveal owed for a **button** — or for an element with no caret in it — needs no line at
+        // all: its row is in the tree already, and a folded element has no line that could ever
+        // load, so gating on one here is what left `Tab` owing a reveal forever and re-fetching a
+        // window that answers the same way. The terminal draws this distinction in the same place.
+        if self.session.view.reveal_wants_a_line()
+            && !aether_client::grid::line_is_loaded(window, self.session.view.focused_element, line)
+        {
             self.pending_reveal.owe_reveal(style);
             self.fetch_cursor_window();
             return Task::none();
@@ -3181,19 +3194,28 @@ impl App {
         }
     }
 
-    /// Jump reveal: leave the view if the cursor is already visible, else rest it near the top.
-    /// `scroll_to_px` animates a short glide there and snaps when the target is far (> ~1.5 screens).
-    fn reveal_cursor_jump(&mut self) -> bool {
-        let (Some(cell), Some(window)) = (self.cell, &self.session.view.window) else {
-            return false;
-        };
-        let Some((row, _, _)) = grid::position_cell(
-            window,
+    /// The row a reveal is about: the stop `Tab` reached, else the cursor's line — the core's one
+    /// answer, shared with the terminal and the browser
+    /// ([`aether_client::session::ViewState::reveal_row`]).
+    fn reveal_row(&self) -> Option<VisualRow> {
+        self.session.view.reveal_row(&self.measured)
+    }
+
+    /// Where the cursor's own cell is — its row, its display column, and the row's width.
+    fn cursor_cell(&self) -> Option<(VisualRow, u32, u32)> {
+        grid::position_cell(
+            self.session.view.window.as_ref()?,
             self.session.view.focused_element,
             self.session.view.buffer.cursor.position,
             TAB_WIDTH,
             &self.measured,
-        ) else {
+        )
+    }
+
+    /// Jump reveal: leave the view if the cursor is already visible, else rest it near the top.
+    /// `scroll_to_px` animates a short glide there and snaps when the target is far (> ~1.5 screens).
+    fn reveal_cursor_jump(&mut self) -> bool {
+        let (Some(cell), Some(row)) = (self.cell, self.reveal_row()) else {
             return false;
         };
         let h = cell.height;
@@ -3208,16 +3230,7 @@ impl App {
     }
 
     fn reveal_cursor(&mut self) -> bool {
-        let (Some(cell), Some(window)) = (self.cell, &self.session.view.window) else {
-            return false;
-        };
-        let Some((row, dcol, _)) = grid::position_cell(
-            window,
-            self.session.view.focused_element,
-            self.session.view.buffer.cursor.position,
-            TAB_WIDTH,
-            &self.measured,
-        ) else {
+        let (Some(cell), Some(row)) = (self.cell, self.reveal_row()) else {
             return false;
         };
         let h = cell.height;
@@ -3230,8 +3243,9 @@ impl App {
         } else if top + h + margin > self.scroll_px + view_h {
             self.scroll_to_px(top + h + margin - view_h, true);
         }
-        // Horizontal (no-wrap): keep the cursor's column clear of the gutter and right edge.
-        if self.session.wrap == WrapMode::None {
+        // Horizontal (no-wrap): keep the cursor's column clear of the gutter and right edge. Only
+        // the cursor has a column — a button is revealed by its row alone.
+        if let (WrapMode::None, Some((_, dcol, _))) = (self.session.wrap, self.cursor_cell()) {
             let cx = dcol as f32 * cell.width; // content-space x
             let content_w = self.view_size.width - (GUTTER_COLS as f32 + 1.0) * cell.width;
             if cx < self.scroll_x_px {
@@ -3345,6 +3359,7 @@ impl App {
                         palette: p,
                         window: self.session.view.window.as_ref(),
                         focused_element: self.session.view.focused_element,
+                        focus: self.session.view.focus,
                         cursor: self.session.view.buffer.cursor,
                         insert_mode: self.session.view.mode == Mode::Insert,
                         awaiting_key: !matches!(self.session.view.pending, Pending::None)

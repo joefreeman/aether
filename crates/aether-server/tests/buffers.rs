@@ -1371,7 +1371,7 @@ async fn watcher_reload_of_shrunken_file_keeps_viewport_in_range() {
     );
 
     // Park the cursor deep too, so the reload's clamp has something to do.
-    let st: CursorState = send_request::<CursorMove>(
+    let st: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,

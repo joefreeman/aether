@@ -433,6 +433,28 @@ pub fn is_prose(kind: &BlockKind) -> bool {
     matches!(kind, BlockKind::UserMessage | BlockKind::AgentMessage)
 }
 
+/// Whether a block **changed a file** — what `c` steps to, and nothing else.
+///
+/// A conversation is mostly things that happened, and only some of them are changes. A patch the
+/// agent proposed is one. A tool that writes — an edit, a delete, a move — is one. Reading a file,
+/// searching, running a command, fetching, thinking out loud: those happened, and `o` steps them,
+/// but calling them changes is what made `c` and `o` the same key in a conversation.
+///
+/// Read off [`ToolKind`], which ACP already gives us, rather than off anything we infer: the agent
+/// says what sort of tool it ran, and this is only a question about that.
+pub fn changes_a_file(kind: &BlockKind) -> bool {
+    match kind {
+        BlockKind::Diff(_) => true,
+        BlockKind::ToolCall(tc) => {
+            matches!(tc.kind, ToolKind::Edit | ToolKind::Delete | ToolKind::Move)
+        }
+        BlockKind::UserMessage
+        | BlockKind::AgentMessage
+        | BlockKind::AgentThought
+        | BlockKind::Plan => false,
+    }
+}
+
 /// Whether a block is **blocked on the user** — a tool call the agent cannot proceed past until
 /// it is allowed or declined.
 ///
@@ -477,10 +499,17 @@ pub fn speaker_row(block: &Block) -> Vec<Element> {
 /// The chrome inside a tool call's box: the permission question, when there is one. Everything
 /// else a block has to say is in its title or its text.
 ///
-/// The options are the agent's own words. A shell paints them and binds the accept/reject keys by
-/// [`aether_protocol::agent::PermissionKind`]; it never invents wording of its own.
+/// The options are **buttons** — [`aether_protocol::ui::Element::Action`] — so `Tab` reaches them
+/// and `Enter` answers, and a pointer can simply press one. They were a row of coloured words with
+/// two keybindings (`Space v a`, `Space v d`) pointing at them from the client's keymap, which is
+/// the arrangement the action vocabulary exists to end: what a view can do is the view's to say.
+///
+/// The wording stays the agent's own, as it always was. What the shell reads is
+/// [`aether_protocol::ui::ViewAction::kind`] — accept or reject — so it can paint the two apart
+/// without parsing labels, exactly as it did from
+/// [`aether_protocol::agent::PermissionKind`] before.
 pub fn permission_row(block: &Block) -> Vec<Element> {
-    use crate::patch::{ADDED, META, REMOVED};
+    use aether_protocol::ui::ViewAction;
 
     let BlockKind::ToolCall(tc) = &block.kind else {
         return Vec::new();
@@ -489,29 +518,22 @@ pub fn permission_row(block: &Block) -> Vec<Element> {
         return Vec::new();
     };
 
-    let mut text = String::new();
-    let mut highlights = Vec::new();
+    let mut children: Vec<Element> = Vec::new();
     for (i, option) in pending.options.iter().enumerate() {
         if i > 0 {
-            let start = text.len();
-            text.push_str("   ");
-            highlights.push(highlight(start, text.len(), META));
+            children.push(Element::Space { cols: 2 });
         }
-        let start = text.len();
-        text.push_str(&option.label);
-        let role = if option.kind.allows() {
-            ADDED
-        } else if option.kind.rejects() {
-            REMOVED
-        } else {
-            META
-        };
-        highlights.push(highlight(start, text.len(), role));
+        // An option that neither allows nor rejects is still an answer, and answering it ends the
+        // turn's wait — so it goes out as a reject, which is what declining to allow means.
+        children.push(Element::Action {
+            action: ViewAction::Permission {
+                allow: option.kind.allows(),
+            },
+            label: vec![Element::text(option.label.clone(), Vec::new())],
+            enabled: true,
+        });
     }
-
-    vec![Element::chrome(vec![Element::row(vec![Element::text(
-        text, highlights,
-    )])])]
+    vec![Element::chrome(vec![Element::row(children)])]
 }
 
 /// The agent's plan as the lines of its block: one entry per line, each marked with its state.
@@ -539,9 +561,19 @@ pub fn stop_notice(reason: &StopReason) -> Option<String> {
         .then(|| format!("[{}]\n", reason.label()))
 }
 
-/// How a block is listed in the outline and named in the breadcrumb: what it is, and what it says
-/// if that is not enough on its own.
-pub fn outline_label(block: &Block) -> String {
+/// How a **turn** is named where it is listed — the outline's rows, and the breadcrumb naming the
+/// turn you are reading.
+///
+/// The first line of what you typed. Your own words, because that is the only name a turn has and
+/// the only one that tells two of them apart; the word "You" over every row named nothing. A
+/// prompt that ran on gets the `⏎` the commands in a shell's outline get, for the same reason: the
+/// row says there was more without pretending to show it.
+pub fn turn_label(text: &str) -> String {
+    one_line(text.trim())
+}
+
+/// What a block is, in a word or two: its kind, and what it says if that is not enough on its own.
+pub fn block_label(block: &Block) -> String {
     match &block.kind {
         BlockKind::ToolCall(tc) => format!("{} {}", tc.kind.label(), one_line(&tc.title)),
         BlockKind::Diff(diff) => format!("diff {}", display_path(&diff.path)),

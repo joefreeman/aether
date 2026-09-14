@@ -646,38 +646,35 @@ pub struct ViewportFocusElementResult {
     pub buffer_status: BufferStatusSnapshot,
 }
 
-// ---- view/set_expanded --------------------------------------------------------------------------
+// ---- view/invoke_action ------------------------------------------------------------------------
 
-/// Fold one of a view's elements shut, or open it up.
+/// Do the thing a view said it could do — press a button.
 ///
-/// **Per viewport, not per view** — the same reason `git/set_diff_view` is: two clients reading one
-/// conversation fold different blocks, and neither should move the other's. It is a fact about what
-/// *this* screen is showing, so it rides the viewport and dies with it.
+/// **One method for every affordance any view will ever grow.** Answering an agent, folding a tool
+/// call, staging a hunk: each used to be a method and a keybinding, so the keymap grew a row per
+/// view kind and a pointer could reach none of them. What a view offers is a fact about the view,
+/// so the view declares it ([`crate::ui::Element::Action`]) and this invokes whatever was declared.
 ///
-/// Only the elements a view marked collapsible answer to this; everything else refuses. That is
-/// what keeps folding a property of the machinery a view builds — an agent's tool calls, its diffs,
-/// its plan — rather than something a client can do to any element it can name. An agent's own
-/// reply is not foldable, because the conversation is the thing you came to read.
+/// The action is named **semantically**, not by an id ([`crate::ui::ViewAction`]) — a view rebuilds
+/// under the client constantly, so an id minted per build is stale before the key press comes back.
+/// Re-resolved against the view as it is now: it does the thing, or it refuses.
 ///
-/// Returns the rebuilt window rather than an acknowledgement: folding changes every row below the
-/// fold, so a client would have to ask for one immediately anyway.
-pub struct ViewportSetExpanded;
-impl RpcMethod for ViewportSetExpanded {
-    const NAME: &'static str = "view/set_expanded";
-    type Params = ViewportSetExpandedParams;
+/// Per viewport, because half the actions are: a fold is what *this* screen is showing, the way a
+/// diff toggle is. Returns the rebuilt window, since pressing a button changes what is on it.
+pub struct ViewportInvokeAction;
+impl RpcMethod for ViewportInvokeAction {
+    const NAME: &'static str = "view/invoke_action";
+    type Params = ViewportInvokeActionParams;
     type Result = ViewportWindowResult;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ViewportSetExpandedParams {
+pub struct ViewportInvokeActionParams {
     pub viewport_id: ViewportId,
-    /// Which element to fold. Absolute, never relative: the key that presses this names the
-    /// focused element, and focus is the client's to report rather than the server's to re-derive.
+    /// The element the action belongs to. Absolute, never relative: the press names what is
+    /// focused, and focus is the client's to report rather than the server's to re-derive.
     pub element: FieldId,
-    /// `None` toggles, which is what a key press means. `Some` is for the caller that knows which
-    /// state it wants — expand-on-reveal, when something scrolls a folded block into view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expanded: Option<bool>,
+    pub action: crate::ui::ViewAction,
 }
 
 // ---- viewport/navigate_change -------------------------------------------------------------------

@@ -536,6 +536,10 @@ pub struct EditorState {
     /// so the painter can name a line without guessing. A logical line number identifies a line only
     /// *within* an element.
     pub focused_element: aether_protocol::viewport::FieldId,
+    /// Whether focus is in the focused element's text or on one of the view's buttons. Mirrored
+    /// from the session for the same reason `focused_element` is: the painter reads state, not
+    /// session. Resolved through [`aether_client::grid::focused`], never read raw.
+    pub focus: aether_client::grid::Focus,
     /// The window's tree: everything the painter draws, at the rows the shared layout
     /// ([`aether_client::grid::painted_rows_of`]) puts each thing on — chrome on a row of its own,
     /// a loaded slice `first_row` rows into its element. There is no flattened line list beside
@@ -693,6 +697,7 @@ pub(crate) fn test_editor_state() -> EditorState {
         cursor: Default::default(),
         paint_top: VisualRow::ZERO,
         focused_element: 0,
+        focus: Default::default(),
         git_status: None,
         total_rows: 0,
         measured: Default::default(),
@@ -1307,6 +1312,7 @@ mod tests {
             cursor: Default::default(),
             paint_top: VisualRow::ZERO,
             focused_element: 0,
+            focus: Default::default(),
             git_status: None,
             total_rows: 0,
             measured: Default::default(),

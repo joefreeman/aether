@@ -50,6 +50,16 @@ pub fn build_view(s: &Session) -> Value {
         "view_transient": s.view.view_transient,
         // Which element holds the cursor: "is this line loaded?" is a per-element question.
         "focused_element": s.view.focused_element,
+        // The stop `Tab` left, named the way the core names one: the element, and which of its
+        // buttons (`null` for the element's own text). Not a ring position — the ring is rebuilt on
+        // every push, so a number would name something else as soon as a block expanded.
+        "focused_stop": match s.view.focus {
+            aether_client::grid::Focus::Stop { element, button } => Some(json!({
+                "element": element,
+                "button": button,
+            })),
+            aether_client::grid::Focus::Text => None,
+        },
         "buffer": buffer(s),
         "viewport_id": s.view.viewport_id,
         "window": s.view.window.as_ref().map(jv),

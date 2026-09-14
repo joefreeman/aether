@@ -4331,7 +4331,7 @@ async fn changes_picker_in_a_patch_centres_on_the_cursors_change() {
         .lines()
         .position(|l| l.contains("fn TWO"))
         .expect("b.rs's added line") as u32;
-    let _: CursorState = send_request::<CursorMove>(
+    let _: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -4518,7 +4518,7 @@ async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
         buffer_id: patch_buffer,
     };
 
-    let _: CursorState = send_request::<CursorMove>(&mut ws, &goto(line_of("fn after() {}"))).await;
+    let _: CursorState = move_cursor(&mut ws, &goto(line_of("fn after() {}"))).await;
     let added: GitFollowPatchLineResult =
         send_request::<GitFollowPatchLine>(&mut ws, &follow).await;
     let opened = added.opened.expect("a `+` line follows somewhere");
@@ -4554,8 +4554,7 @@ async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
     );
 
     // A `-` line follows to the *old* side — the first parent's blob, where the pre-change text is.
-    let _: CursorState =
-        send_request::<CursorMove>(&mut ws, &goto(line_of("fn before() {}"))).await;
+    let _: CursorState = move_cursor(&mut ws, &goto(line_of("fn before() {}"))).await;
     let removed: GitFollowPatchLineResult =
         send_request::<GitFollowPatchLine>(&mut ws, &follow).await;
     let old = removed.opened.expect("a `-` line follows somewhere");
@@ -4575,7 +4574,7 @@ async fn enter_follows_a_patch_line_to_the_file_and_backspace_returns() {
     // `view/follow_line` is the method `Enter` actually routes through, and for a patch it is
     // this same logic: one question the client can ask of any composed view, answered by what the
     // document is. Same cursor, same landing.
-    let _: CursorState = send_request::<CursorMove>(&mut ws, &goto(line_of("fn after() {}"))).await;
+    let _: CursorState = move_cursor(&mut ws, &goto(line_of("fn after() {}"))).await;
     let via_view: ViewFollowLineResult = send_request::<ViewFollowLine>(
         &mut ws,
         &ViewFollowLineParams {
@@ -5711,7 +5710,7 @@ async fn staging_from_the_working_changes_view_moves_the_block_into_the_index() 
     };
 
     // Park on the first change and stage it.
-    let _: CursorState = send_request::<CursorMove>(
+    let _: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -5882,7 +5881,7 @@ async fn staging_pushes_the_rebuilt_patch_as_clean() {
         .lines()
         .position(|l| l == "fn EDITED() {}")
         .expect("the changed line") as u32;
-    let _: CursorState = send_request::<CursorMove>(
+    let _: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id,
@@ -9521,9 +9520,13 @@ async fn a_hunk_grows_when_you_type_a_line_into_it() {
 /// An element windows a *slice* of its file — one hunk. The cursor lives in that file's buffer, so
 /// an ordinary `j` at the hunk's end steps to the next line of the **file**, which the view does not
 /// render: the cursor leaves the visible content with nothing to say where it went.
+///
+/// Still true now that a line motion can walk out of its element: crossing lands on the *next
+/// element*, never on the unshown lines between. This view has one, so there is nowhere to cross
+/// to and the motion clamps exactly as it did — which is what makes it still the right guard.
 #[tokio::test]
 async fn moving_past_a_hunks_end_stays_within_the_view() {
-    use aether_protocol::cursor::{CursorMove, CursorMoveParams, Motion};
+    use aether_protocol::cursor::{CursorMoveParams, Motion};
     use aether_protocol::viewport::{
         FocusStep, ViewportFocusElementResult, ViewportNavigateChange, ViewportNavigateChangeParams,
     };
@@ -9602,7 +9605,7 @@ async fn moving_past_a_hunks_end_stays_within_the_view() {
 
     let mut cursor = at.buffer.cursor;
     for _ in 0..(shown.len() + 5) {
-        cursor = send_request::<CursorMove>(
+        cursor = move_cursor(
             &mut ws,
             &CursorMoveParams {
                 buffer_id: at.buffer.buffer_id,
@@ -9874,9 +9877,17 @@ async fn rendering_a_bound_patch_near_its_end_does_not_panic() {
 ///
 /// Regression (server panic): the request names the *patch* buffer while focus sits on an element
 /// windowing a real file, so a position in one coordinate space was measured against the other.
+///
+/// It also walks **out** of that element and into the next, which is the point of a review: sixty
+/// presses is further than the first hunk goes, and the cursor is meant to carry on down the view
+/// rather than stopping at a boundary the reader cannot see. The buffer the next press names is
+/// the one the crossing landed in — a block is its own document, so continuing to address the old
+/// one would be the coordinate-space confusion this test was written for, in a second shape.
 #[tokio::test]
 async fn walking_down_a_freshly_opened_commit_patch_does_not_panic() {
-    use aether_protocol::cursor::{CursorMove, CursorMoveParams, Direction, Motion};
+    use aether_protocol::cursor::{
+        CursorMove, CursorMoveParams, CursorMoveResult, Direction, Motion,
+    };
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -9933,12 +9944,14 @@ async fn walking_down_a_freshly_opened_commit_patch_does_not_panic() {
     )
     .await;
 
-    // Exactly what the client does: `j`, addressed to the view's own buffer.
+    // Exactly what the client does: `j`, addressed to whichever buffer the cursor is in now.
+    let mut buffer_id = opened.buffer_id;
+    let mut crossings = 0;
     for _ in 0..60 {
-        let _: CursorState = send_request::<CursorMove>(
+        let moved: CursorMoveResult = send_request::<CursorMove>(
             &mut ws,
             &CursorMoveParams {
-                buffer_id: opened.buffer_id,
+                buffer_id,
                 motion: Motion::LogicalLine {
                     direction: Direction::Forward,
                     count: 1,
@@ -9948,7 +9961,15 @@ async fn walking_down_a_freshly_opened_commit_patch_does_not_panic() {
             },
         )
         .await;
+        if let Some(crossed) = moved.crossed {
+            buffer_id = crossed.buffer.buffer_id;
+            crossings += 1;
+        }
     }
+    assert!(
+        crossings > 0,
+        "`j` never left the first element of a two-file commit — a review is one thing to read"
+    );
 
     drop(server);
 }
@@ -13087,4 +13108,101 @@ async fn a_subscribe_loads_no_more_than_the_screen_it_was_given() {
     );
 
     drop(server);
+}
+
+/// A review's file blocks declare a **stage button**, and `Tab` is what reaches it.
+///
+/// The keymap's `Space g Alt-s` still stages a whole file; what this adds is that the view *says*
+/// it can be staged, so the gesture is reachable by the same key a conversation's buttons are and
+/// by a pointer. It is also what keeps `Tab` meaningful in a review at all: the ring is the things
+/// a view offers to act on, and before this a patch offered none.
+#[tokio::test]
+async fn a_reviews_file_block_offers_a_stage_button() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    let base: String = (1..=20).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    commit_file(&repo, "a.rs", &base);
+    std::fs::write(
+        root.join("a.rs"),
+        base.replace("fn f3() {}\n", "fn ONE() {}\n"),
+    )
+    .unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: opened.view_id,
+            cols: 100,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let ring = aether_client::grid::focus_ring(&sub.window.root);
+    let (element, action) = ring
+        .iter()
+        .find_map(|s| match s {
+            aether_client::grid::Stop::Action {
+                element,
+                action: action @ aether_protocol::ui::ViewAction::Stage { .. },
+                ..
+            } => Some((*element, *action)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no stage button on the ring: {ring:?}"));
+    assert!(
+        matches!(
+            action,
+            aether_protocol::ui::ViewAction::Stage { stage: true }
+        ),
+        "an unstaged file's button should offer to stage it, not to unstage it"
+    );
+
+    // Pressing it stages the file — the same thing `Space g Alt-s` does, through the one method
+    // every button goes through.
+    let _: ViewportWindowResult = send_request::<ViewportInvokeAction>(
+        &mut ws,
+        &ViewportInvokeActionParams {
+            viewport_id: sub.viewport_id,
+            element,
+            action,
+        },
+    )
+    .await;
+    let _ = server;
+    let staged = std::process::Command::new("git")
+        .args(["diff", "--cached", "--name-only"])
+        .current_dir(&root)
+        .output()
+        .expect("git diff --cached");
+    assert_eq!(
+        String::from_utf8_lossy(&staged.stdout).trim(),
+        "a.rs",
+        "the button did not stage the file"
+    );
 }

@@ -16,7 +16,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { renderBuffer } from "./render";
 import { MEASURABLE_BLOCKS, renderReply } from "./read";
-import { editorsOf, paintedRows, totalRows } from "./protocol";
+import { editorsOf, focusRing, paintedRows, totalRows } from "./protocol";
 import { WHOLE_ROWS } from "./protocol";
 import type { BufferWindow, CursorState, LogicalLineRender, Measured, ViewNode } from "./protocol";
 import type { MdBlock } from "./markdown";
@@ -910,6 +910,52 @@ describe("a prose element", () => {
     expect(order).toEqual(["before", "reply", "after"]);
   });
 
+  /** **The painter hands back the boxes it made**, and the shell measures those.
+   *
+   *  It used to find them again with `querySelectorAll(".md-reply-box")` — aimed at `#buffer`,
+   *  which is the *host* of the closed shadow root the rows are painted into. A selector crosses no
+   *  shadow boundary, so it matched nothing and every reply stayed unmeasured: the browser flowed
+   *  each one at its real height while the grid counted it as a single row, and everything below a
+   *  reply was placed somewhere it is not — `Tab` to the input scrolled short of it by the height
+   *  of every reply above. Returning them removes the question of which root to look in.
+   *
+   *  Asserted through a shadow root, because that is where they really live. */
+  it("hands back every reply box it painted, wherever they are rendered", () => {
+    const window: BufferWindow = {
+      root: {
+        node: "column",
+        children: [
+          { node: "prose", element: 0, blocks: replyBlocks("First", "body") },
+          { node: "editor", element: 1, buffer: 2, rows: 1, first_row: 0, first_buffer_line: 0, lines: [line(0, "between")] },
+          { node: "prose", element: 2, blocks: replyBlocks("Second", "body") },
+        ],
+      },
+      max_line_width: 20,
+    } as unknown as BufferWindow;
+
+    const host = document.createElement("div");
+    const shadow = host.attachShadow({ mode: "closed" });
+    const boxes = renderBuffer(shadow, {
+      window,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+    });
+    expect(boxes.map((b) => b.dataset.element)).toEqual(["0", "2"]);
+    // And they are the nodes actually in the tree — a detached copy would measure as zero.
+    expect(boxes.every((b) => shadow.contains(b))).toBe(true);
+    // The lookup the shell used to do, from outside the shadow root: nothing.
+    expect(host.querySelectorAll(".md-reply-box").length).toBe(0);
+  });
+
   /** A reply inside a box gives up the box's cells, exactly as the rows beside it do — the
    *  stylesheet adds the gutter column on top of whatever lands here. Prose *not* in a box leaves
    *  the properties unset, which is the case the `0px` fallback in that rule covers: an agent's
@@ -1020,6 +1066,155 @@ describe("a folded element", () => {
     } as unknown as ViewNode;
     const edge = paint(root, 0).querySelector(".row.box-edge");
     expect(edge?.classList.contains("cursor-line"), edge?.className).toBe(false);
+  });
+});
+
+describe("a declared action", () => {
+  const button = (allow: boolean, label: string): ViewNode =>
+    ({
+      node: "action",
+      action: { do: "permission", allow },
+      label: [{ node: "text", text: label, highlights: [] }],
+    }) as unknown as ViewNode;
+
+  const asking = {
+    node: "column",
+    children: [
+      { node: "row", band: "chrome", children: [button(true, "Allow"), button(false, "Decline")] },
+      editor(0, 0, [line(0, "rm -rf build")]),
+    ],
+  } as unknown as ViewNode;
+
+  /** `button` is which of element 0's buttons `Tab` lit — the way focus names a stop. */
+  const paint = (button?: number): HTMLElement => {
+    const focusedStop = button === undefined ? undefined : { element: 0, button };
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window: { root: asking, max_line_width: 40 } as unknown as BufferWindow,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+      focusedStop,
+    });
+    return container;
+  };
+
+  /** The ring is the wire between "the view declared a button" and "`Tab` can reach it". Both
+   *  walks — this one and `grid::focus_ring` — have to agree, which is why the Rust side is
+   *  mirrored here rather than each shell deciding for itself what is reachable. */
+  it("puts both buttons on the focus ring, bound to the element they act on", () => {
+    const ring = focusRing(asking);
+    // The buttons, then the element being shown: everything the view offers, whether to press or
+    // to put the cursor in. A prose reply would not be here — it wears no cursor.
+    expect(ring.map((s) => (s.kind === "action" ? s.action : s.kind))).toEqual([
+      { do: "permission", allow: true },
+      { do: "permission", allow: false },
+      "element",
+    ]);
+    expect(ring.every((s) => s.element === 0)).toBe(true);
+  });
+
+  it("draws each as a bracketed button", () => {
+    const buttons = [...paint().querySelectorAll(".action")];
+    expect(buttons.map((b) => b.textContent)).toEqual(["[Allow]", "[Decline]"]);
+  });
+
+  /** Lit by **identity**, not by value: the two buttons here differ only in a field inside the
+   *  action, so comparing what they carry would light both. */
+  it("lights only the one Tab is on", () => {
+    const buttons = [...paint(1).querySelectorAll(".action")];
+    expect(buttons.map((b) => b.classList.contains("lit"))).toEqual([false, true]);
+  });
+
+  it("leaves them all unlit when the cursor is in text", () => {
+    const buttons = [...paint().querySelectorAll(".action")];
+    expect(buttons.some((b) => b.classList.contains("lit"))).toBe(false);
+  });
+
+  /** **Either the cursor or a button — never both.** The frame Joe caught in the terminal: a
+   *  disclosure filled *and* the caret in the text below it.
+   *
+   *  The cause was shape. "Which button is lit" was additive state beside "which element holds the
+   *  cursor", and the cursor path never consulted it, so both-at-once was constructible. `focused`
+   *  answers once and the cursor is read out of that answer. */
+  it("draws no cursor while a button holds focus", () => {
+    const withCursor = paint();
+    expect(withCursor.querySelector(".cursor"), "focus in the text draws a cursor").not.toBeNull();
+    expect(withCursor.querySelector(".row.cursor-line")).not.toBeNull();
+
+    const withButton = paint(0);
+    expect(withButton.querySelectorAll(".action.lit").length).toBe(1);
+    expect(
+      withButton.querySelector(".cursor"),
+      "a caret was drawn while a button was lit — two things focused at once",
+    ).toBeNull();
+    expect(
+      withButton.querySelector(".row.cursor-line"),
+      "the cursor's line was tinted while a button was lit",
+    ).toBeNull();
+  });
+
+  /** **The button is the answer on its own.** Which element holds the cursor is the server's to
+   *  say and arrives a round trip after the key press; comparing the two here is what made `Tab`
+   *  flash — the freshly lit button read as stale for that round trip and the old caret was drawn
+   *  instead. Nothing is shown twice either way: a lit button draws no cursor, wherever the cursor
+   *  happens to be. */
+  it("lights the button before the server has moved the cursor to its element", () => {
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window: { root: asking, max_line_width: 40 } as unknown as BufferWindow,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      // The focus reply has not landed, so the cursor is still recorded elsewhere.
+      focusedElement: 9,
+      focusedStop: { element: 0, button: 0 },
+    });
+    const buttons = [...container.querySelectorAll(".action")];
+    expect(buttons.map((b) => b.classList.contains("lit"))).toEqual([true, false]);
+    expect(
+      container.querySelector(".cursor"),
+      "a caret was drawn while a button was lit",
+    ).toBeNull();
+  });
+
+  /** A name that no longer names anything is no focus at all: the view rebuilt without the button,
+   *  and the text is where focus was going to be anyway. */
+  it("falls back to the cursor when the button it named has gone", () => {
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window: { root: asking, max_line_width: 40 } as unknown as BufferWindow,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+      // Element 0 declares two buttons; there is no third.
+      focusedStop: { element: 0, button: 2 },
+    });
+    expect(container.querySelectorAll(".action.lit").length).toBe(0);
+    expect(container.querySelector(".cursor")).not.toBeNull();
   });
 });
 

@@ -5441,18 +5441,38 @@ fn read_row_band(spans: &[aether_client::read_layout::ReadSpan]) -> Option<Color
 /// reading-position bar, block selection tints, table bands. Inside a conversation none of those
 /// apply: the element is a block of prose among other blocks, so this is the styling and nothing
 /// else.
-fn markdown_row_line(row: &aether_client::read_layout::ReadRow, indent: u16) -> Line<'static> {
+fn markdown_row_line(
+    row: &aether_client::read_layout::ReadRow,
+    indent: u16,
+    focused: bool,
+) -> Line<'static> {
+    // Focus is here and no caret can be: the row wears the cursorline, which is what says "the
+    // cursor's row" everywhere else. Prose is what `o` and the outline picker can land on and a
+    // line motion cannot, so without this the caret simply disappeared.
+    let bg = if focused {
+        c(th().cursor_line_bg)
+    } else {
+        c(th().bg_app)
+    };
     let mut spans: Vec<Span<'static>> = Vec::new();
     if indent > 0 {
         // The ground, like the prose it precedes: a reply is not an editor row, and the indent is
         // the same surface as the text after it.
         spans.push(Span::styled(
             " ".repeat(indent as usize),
-            Style::default().bg(c(th().bg_app)),
+            Style::default().bg(bg),
         ));
     }
     for s in &row.spans {
-        spans.push(Span::styled(s.text.clone(), read_span_style(s.style)));
+        let style = read_span_style(s.style);
+        spans.push(Span::styled(
+            s.text.clone(),
+            if focused && style.bg.is_none() {
+                style.bg(bg)
+            } else {
+                style
+            },
+        ));
     }
     Line::from(spans)
 }
@@ -5517,6 +5537,20 @@ fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
 }
 
 fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
+    // The button `Tab` has lit, as a node of *this* tree — resolved once per frame, because every
+    // inline painter below needs it and the comparison is by address (see `children_spans`).
+    let focused = aether_client::grid::focused(
+        &state.ed().root,
+        state.ed().focused_element,
+        state.ed().focus,
+    );
+    let lit = focused.lit();
+    // **Exactly one of these three is Some/true.** `Focused` is one answer, so a frame showing an
+    // editor's caret over a filled button — or, worse, showing nothing at all because focus landed
+    // on a reply — is not a thing this painter can build.
+    let draws_cursor = focused.draws_cursor();
+    let marked = focused.marked();
+
     // When the view is taller than the viewport, carve the rightmost column for a scrollbar (drawn
     // last, below). The decision uses the view's whole height — which the tree says, and which is
     // independent of this 1-col narrowing — so it can't flicker. The narrowing clips content by one
@@ -5535,10 +5569,15 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 
     let selection = ordered_selection(&state.ed().cursor, state.ed().mode);
     // Where the cursor is, as a pair. Everything decided against it compares pairs.
-    let cursor_at = aether_client::grid::ElementLine::new(
-        state.ed().focused_element,
-        state.ed().cursor.position.line,
-    );
+    // `None` while a button holds focus: everything decided against the cursor's position — its
+    // cell, its line's tint, the blame beside it — falls away with it rather than each needing a
+    // guard of its own.
+    let cursor_at = draws_cursor.then(|| {
+        aether_client::grid::ElementLine::new(
+            state.ed().focused_element,
+            state.ed().cursor.position.line,
+        )
+    });
     let viewport_rows = area.height as usize;
     let diff_view = state.ed().diff_view;
     // Horizontal scroll only kicks in for wrap-off; soft-wrapped content always fits horizontally.
@@ -5567,7 +5606,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     let chrome_row_within = |node: &Element, cols: u16, band: Band| -> Line<'static> {
         match node {
             Element::Row { children, .. } => {
-                Line::from(chrome_virtual_row_spans(children, cols, band))
+                Line::from(chrome_virtual_row_spans(children, cols, band, lit))
             }
             other => Line::raw(other.text_content()),
         }
@@ -5594,9 +5633,9 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         if title.is_empty() {
             return Line::from(vec![Span::styled("─".repeat(cols as usize), ink)]);
         }
-        let row = Element::row(title.to_vec());
+        let title_cols = title.iter().map(inline_cols).sum::<usize>() as u16;
         let mut spans = vec![Span::styled("─ ".to_string(), ink)];
-        spans.extend(element_spans(&row, inline_cols(&row) as u16, bg));
+        spans.extend(children_spans(title, title_cols, bg, lit));
         spans.push(Span::styled(" ".to_string(), Style::default().bg(bg)));
         spans.push(Span::styled("─".repeat(cols as usize), ink));
         Line::from(fit(spans, cols, bg))
@@ -5704,8 +5743,9 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         let logical_line = render.logical_line;
         // The pair, never the number. A selection — and the block cursor, which is drawn as one —
         // belongs to the focused element alone.
-        let on_cursor_element = element == cursor_at.element;
-        let on_cursor_line = on_cursor_element && logical_line == cursor_at.line;
+        let on_cursor_element = cursor_at.is_some_and(|at| element == at.element);
+        let on_cursor_line =
+            cursor_at.is_some_and(|at| element == at.element && logical_line == at.line);
 
         // The gutter change-bar reflects this line's marker (always on). With the diff view on, a
         // pure-deletion anchor's `▔` is redundant (the band above already shows it), so suppress
@@ -6009,13 +6049,21 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     let within = want.checked_sub(origin.row.get())? as usize;
                     // The gutter and the box's cells alike: prose starts where a wrapped line's
                     // text starts, and it was laid out to what is left after them.
-                    rows.get(within)
-                        .map(|row| (row, origin.inset.left as u16 + GUTTER_WIDTH))
+                    rows.get(within).map(|row| {
+                        (
+                            row,
+                            origin.inset.left as u16 + GUTTER_WIDTH,
+                            // Focus landed here and there is no caret to draw — `o` and the
+                            // outline picker step the view's structure, and a reply is part of it.
+                            // Its first row wears the mark, so "where am I" has an answer.
+                            marked == Some(*element) && within == 0,
+                        )
+                    })
                 });
                 lines.push(match md {
                     // Indented by whatever box encloses the element: an agent's reply is bare, but
                     // prose inside a box has to start inside its rails.
-                    Some((row, indent)) => markdown_row_line(row, indent),
+                    Some((row, indent, focused)) => markdown_row_line(row, indent, focused),
                     None => Line::default(),
                 });
                 continue;
@@ -6050,7 +6098,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                     aether_client::grid::Side::Top => owner.title(),
                     aether_client::grid::Side::Bottom => &[],
                 };
-                let holds_cursor = owner.holds_collapsed(state.ed().focused_element);
+                let holds_cursor = marked.is_some_and(|m| owner.holds_collapsed(m));
                 enclose(
                     place,
                     inner,
@@ -6127,7 +6175,12 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 ///
 /// `width` is the *content* width, as it is for every other row — the gutter column sits outside
 /// it, which is why chrome must not subtract one for it.
-fn chrome_virtual_row_spans(content: &[Element], width: u16, band: Band) -> Vec<Span<'static>> {
+fn chrome_virtual_row_spans(
+    content: &[Element],
+    width: u16,
+    band: Band,
+    lit: Option<&Element>,
+) -> Vec<Span<'static>> {
     // A presentation row with no band paints none: it still draws, it just sits on whatever the
     // pane filled behind it. Nothing produces one today; the vocabulary allows it, so the painter
     // does.
@@ -6137,10 +6190,11 @@ fn chrome_virtual_row_spans(content: &[Element], width: u16, band: Band) -> Vec<
     };
     let style = Style::default().fg(c(th().fg_faint)).bg(bg);
     let mut spans = vec![Span::styled(" ".repeat(GUTTER_WIDTH as usize), style)];
-    spans.append(&mut element_spans(
-        &Element::row(content.to_vec()),
+    spans.append(&mut children_spans(
+        content,
         width.saturating_sub(GUTTER_WIDTH),
         bg,
+        lit,
     ));
     spans
 }
@@ -6155,16 +6209,43 @@ fn chrome_virtual_row_spans(content: &[Element], width: u16, band: Band) -> Vec<
 /// a nested row banded the slack and then its parent banded the same slack again, so a chrome row
 /// came out at twice the width it asked for. Harmless while the row ended at the screen's edge;
 /// inside a box the row ends at a right rail, and an over-long one pushes that rail off the screen.
-fn element_spans(element: &Element, width: u16, bg: Color) -> Vec<Span<'static>> {
+/// [`element_spans`], told which button is lit.
+///
+/// `lit` is compared **by address**, not by value: two buttons can carry identical fields — a file
+/// offering `Stage` on each of two hunks — so where a node is in the tree is the only thing that
+/// tells them apart. The painter walks the same tree [`aether_client::grid::focus_ring`] did, so
+/// the comparison is sound.
+fn element_spans_focused(
+    element: &Element,
+    width: u16,
+    bg: Color,
+    lit: Option<&Element>,
+) -> Vec<Span<'static>> {
+    match element {
+        Element::Row { children, .. } => children_spans(children, width, bg, lit),
+        // A bare leaf is laid out as if it were the only child of a row — by reference, since
+        // cloning it here would lose the address `lit` is compared against.
+        other => children_spans(std::slice::from_ref(other), width, bg, lit),
+    }
+}
+
+/// The inline children of one row, laid out left to right.
+///
+/// Takes the children rather than a row **so that no caller has to build one**: a synthesized
+/// `Element::row(children.to_vec())` clones every node, and a clone has a different address than
+/// the tree the focus ring walked — which is exactly what tells two identical buttons apart.
+fn children_spans(
+    children: &[Element],
+    width: u16,
+    bg: Color,
+    lit: Option<&Element>,
+) -> Vec<Span<'static>> {
     let banded = |n: usize| Span::styled(" ".repeat(n), Style::default().bg(bg));
-    let Element::Row { children, .. } = element else {
-        // A bare leaf is laid out as if it were the only child of a row.
-        return element_spans(&Element::row(vec![element.clone()]), width, bg);
-    };
 
     // Everything except the fill, measured first, so the fill knows what is left for it. Measured
     // *through* nested rows: counting a container as zero is what made the slack be banded twice.
     let fixed: usize = children.iter().map(inline_cols).sum();
+    let children = children.iter();
     let mut remaining = (width as usize).saturating_sub(fixed);
 
     let mut out: Vec<Span<'static>> = Vec::new();
@@ -6199,9 +6280,42 @@ fn element_spans(element: &Element, width: u16, bg: Color) -> Vec<Span<'static>>
                 ));
                 remaining = 0;
             }
+            // A button the view declared. Bracketed so it reads as something to press even where
+            // colour is not available, tinted by what pressing it *means* — an accept and a reject
+            // sit side by side and the wrong one cannot be taken back — and filled when it is the
+            // one `Enter` would press.
+            Element::Action {
+                action,
+                label,
+                enabled,
+            } => {
+                let focused = lit.is_some_and(|n| std::ptr::eq(n, child));
+                use aether_protocol::ui::ActionKind;
+                let fg = match action.kind() {
+                    ActionKind::Accept => c(th().git_added),
+                    ActionKind::Reject => c(th().git_deleted),
+                    ActionKind::Toggle | ActionKind::Neutral => c(th().fg_muted),
+                };
+                let style = if !enabled {
+                    Style::default().fg(c(th().fg_faint)).bg(bg)
+                } else if focused {
+                    Style::default()
+                        .fg(c(th().fg_on_accent))
+                        .bg(fg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(fg).bg(bg)
+                };
+                out.push(Span::styled("[".to_string(), style));
+                let width = label.iter().map(inline_cols).sum::<usize>() as u16;
+                for span in children_spans(label, width, bg, lit) {
+                    out.push(Span::styled(span.content.to_string(), style));
+                }
+                out.push(Span::styled("]".to_string(), style));
+            }
             // A nested row, or anything else that found its way inline: laid out in place, into
             // what its siblings have left it.
-            _ => out.append(&mut element_spans(child, width, bg)),
+            _ => out.append(&mut element_spans_focused(child, width, bg, lit)),
         }
     }
     // Carry the band to the edge, once, off what was actually drawn. Section headings used to
@@ -6218,6 +6332,9 @@ fn inline_cols(element: &Element) -> usize {
         Element::Space { cols } => *cols as usize,
         Element::Text { text, .. } => text.chars().count(),
         Element::Row { children, .. } => children.iter().map(inline_cols).sum(),
+        // The brackets a button is drawn in are part of how wide it is, or every row holding one
+        // would measure two cells short and the fill beside it would overrun.
+        Element::Action { label, .. } => 2 + label.iter().map(inline_cols).sum::<usize>(),
         _ => 0,
     }
 }
@@ -8175,6 +8292,12 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
 /// different columns — two cursors on screen, one of them where nothing else was.
 pub fn cursor_visual_position(state: &AppState, viewport_rows: u32) -> Option<(u16, u16)> {
     let ed = state.ed();
+    // No caret while a button holds focus. The hardware cursor is the one part of the cursor the
+    // painter does not draw, so it needs saying here too — a terminal leaving its caret parked in
+    // the text is the both-focused frame in its last remaining form.
+    if !aether_client::grid::focused(&ed.root, ed.focused_element, ed.focus).draws_cursor() {
+        return None;
+    }
     let cursor = ed.cursor.position;
 
     let scroll_col = if matches!(ed.wrap, WrapMode::None) {
@@ -12232,6 +12355,319 @@ mod painter_tests {
             bg_of(first),
             c(th().bg_app),
             "an unfocused folded call wears the cursorline too — every box would look focused"
+        );
+    }
+
+    /// A view's buttons are painted as buttons, and the one `Tab` has lit is filled.
+    ///
+    /// The permission row used to be a string of coloured words with two keybindings aimed at it;
+    /// what makes this a button rather than a label is that the ring reaches it and the painter
+    /// marks which one is focused. Lit **by address**: the two options here differ only in the
+    /// field inside the action, and an earlier cut compared by value and lit both.
+    #[test]
+    fn a_declared_action_paints_as_a_button_and_the_lit_one_is_filled() {
+        use aether_protocol::ui::ViewAction;
+        let button = |allow: bool, label: &str| UiElement::Action {
+            action: ViewAction::Permission { allow },
+            label: vec![UiElement::text(label, Vec::new())],
+            enabled: true,
+        };
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![
+                UiElement::chrome(vec![UiElement::row(vec![
+                    button(true, "Allow"),
+                    UiElement::Space { cols: 2 },
+                    button(false, "Decline"),
+                ])]),
+                Element::Editor {
+                    element: 0,
+                    buffer: 10,
+                    rows: 1,
+                    first_row: ElementRow::ZERO,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
+                    collapsed: false,
+                    first_buffer_line: 0,
+                    lines: vec![line(0, "rm -rf build")],
+                },
+            ],
+        };
+        // The ring the client would walk: two buttons, in the agent's own order.
+        // Both buttons, then the element being shown: everything the view offers, whether to press
+        // or to put the cursor in.
+        let ring = aether_client::grid::focus_ring(&root);
+        assert_eq!(ring.len(), 3, "unexpected ring: {ring:?}");
+
+        let mut ed = editor_over(root, 0);
+        // The second button — Decline.
+        ed.focus = aether_client::grid::Focus::Stop {
+            element: 0,
+            button: Some(1),
+        };
+        let state = crate::app::test_state(ed);
+        let rows = painted_cells(&state);
+        let text_of =
+            |r: &Vec<(String, Color)>| r.iter().map(|(s, _)| s.as_str()).collect::<String>();
+        let row = rows
+            .iter()
+            .find(|r| text_of(r).contains("Allow"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no row with the buttons:\n{}",
+                    rows.iter().map(text_of).collect::<Vec<_>>().join("\n")
+                )
+            });
+        let text = text_of(row);
+        // Bracketed, so it reads as something to press even where colour is not available.
+        assert!(
+            text.contains("[Allow]") && text.contains("[Decline]"),
+            "the buttons were not drawn as buttons: {text:?}"
+        );
+
+        // The lit one is filled; the other is not. Found by the column each label starts at.
+        let col_of = |needle: &str| text.find(needle).expect("the label is on the row");
+        let bg_at = |col: usize| row[col].1;
+        assert_ne!(
+            bg_at(col_of("[Decline]")),
+            bg_at(col_of("[Allow]")),
+            "both buttons wear the same background, so nothing says which `Enter` would press"
+        );
+        assert_eq!(
+            bg_at(col_of("[Allow]")),
+            c(th().bg_app),
+            "the unlit button is filled: every button would look focused"
+        );
+    }
+
+    /// A button is lit while — and only while — focus **names** it.
+    ///
+    /// Focus is one value: either the text, or a button of an element. So a button lights when it
+    /// is named, goes dark when focus is in the text (`o`, `c`, a search, a click all put it
+    /// there), and goes dark when the name no longer names anything. What it does *not* wait for
+    /// is the server's word on which element holds the cursor: that arrives a round trip after the
+    /// press, and requiring it made the freshly lit button read as stale until it did.
+    #[test]
+    fn a_button_is_lit_while_focus_names_it() {
+        use aether_protocol::ui::ViewAction;
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![
+                UiElement::chrome(vec![UiElement::row(vec![UiElement::Action {
+                    action: ViewAction::Permission { allow: true },
+                    label: vec![UiElement::text("Allow", Vec::new())],
+                    enabled: true,
+                }])]),
+                Element::Editor {
+                    element: 0,
+                    buffer: 10,
+                    rows: 1,
+                    first_row: ElementRow::ZERO,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
+                    collapsed: false,
+                    first_buffer_line: 0,
+                    lines: vec![line(0, "rm -rf build")],
+                },
+            ],
+        };
+
+        let bg_of_allow = |focused_element: u32, focus: aether_client::grid::Focus| {
+            let mut ed = editor_over(root.clone(), 0);
+            ed.focused_element = focused_element;
+            ed.focus = focus;
+            let state = crate::app::test_state(ed);
+            let rows = painted_cells(&state);
+            let row = rows
+                .iter()
+                .find(|r| {
+                    r.iter()
+                        .map(|(s, _)| s.as_str())
+                        .collect::<String>()
+                        .contains("Allow")
+                })
+                .expect("the button is on screen");
+            let text = row.iter().map(|(s, _)| s.as_str()).collect::<String>();
+            row[text.find("[Allow]").expect("the label")].1
+        };
+
+        // On the button, it is filled; with focus in the element the button acts on, it is not.
+        let on_allow = aether_client::grid::Focus::Stop {
+            element: 0,
+            button: Some(0),
+        };
+        let lit = bg_of_allow(0, on_allow);
+        assert_ne!(
+            lit,
+            c(th().bg_app),
+            "the button is not lit when Tab is on it"
+        );
+        assert_eq!(
+            bg_of_allow(0, aether_client::grid::Focus::Text),
+            c(th().bg_app),
+            "the cursor is in the editor, so nothing should be lit"
+        );
+        // **The button is lit before the server has moved the cursor to its element.** Which
+        // element holds the cursor arrives a round trip after the press, and lighting only once it
+        // agreed is what made `Tab` flash the old caret back on the way past.
+        assert_eq!(
+            bg_of_allow(7, on_allow),
+            lit,
+            "the button went dark while the focus reply was in flight"
+        );
+        // A name that no longer names anything is no focus at all: element 0 has one button.
+        assert_eq!(
+            bg_of_allow(
+                0,
+                aether_client::grid::Focus::Stop {
+                    element: 0,
+                    button: Some(1),
+                }
+            ),
+            c(th().bg_app),
+            "a button that is not there was lit"
+        );
+    }
+
+    /// **Either the cursor or a button — never both.** The frame Joe caught: a folded box's
+    /// disclosure filled *and* the caret sitting in the text below it, two things focused at once.
+    ///
+    /// The cause was shape, not logic. "Which button is lit" was a second, additive piece of state
+    /// beside "which element holds the cursor", and the cursor path simply never consulted it, so
+    /// the both-at-once frame was constructible. `grid::focused` answers once, and the painter
+    /// reads the cursor out of that answer — so this is not a check that can be forgotten at a
+    /// fourth site, it is the only thing there is to read.
+    #[test]
+    fn a_button_and_a_cursor_are_never_both_drawn() {
+        use aether_client::grid::Focus;
+        use aether_protocol::ui::ViewAction;
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![
+                UiElement::chrome(vec![UiElement::row(vec![UiElement::Action {
+                    action: ViewAction::Permission { allow: true },
+                    label: vec![UiElement::text("Allow", Vec::new())],
+                    enabled: true,
+                }])]),
+                Element::Editor {
+                    element: 0,
+                    buffer: 10,
+                    rows: 1,
+                    first_row: ElementRow::ZERO,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
+                    collapsed: false,
+                    first_buffer_line: 0,
+                    lines: vec![line(0, "rm -rf build")],
+                },
+            ],
+        };
+
+        let drawn = |focus: Focus| {
+            let mut ed = editor_over(root.clone(), 0);
+            ed.focused_element = 0;
+            ed.focus = focus;
+            let state = crate::app::test_state(ed);
+            let rows = painted_cells(&state);
+            let text_of =
+                |r: &Vec<(String, Color)>| r.iter().map(|(s, _)| s.as_str()).collect::<String>();
+            let bg_at = |needle: &str, label: &str| {
+                let row = rows
+                    .iter()
+                    .find(|r| text_of(r).contains(needle))
+                    .expect("the row is on screen");
+                row[text_of(row).find(label).expect("the label")].1
+            };
+            let button_lit = bg_at("Allow", "[Allow]") != c(th().bg_app);
+            // The cursor's line wears the cursorline; the caret cell itself is the terminal's
+            // hardware cursor, which `cursor_visual_position` places — asserted below.
+            // Probed away from the cursor's own cell, which wears the block rather than the tint.
+            let cursor_line_tinted = bg_at("rm -rf build", "build") == c(th().cursor_line_bg);
+            let caret = crate::ui::cursor_visual_position(&state, 24).is_some();
+            (button_lit, cursor_line_tinted, caret)
+        };
+
+        // In the text: the cursorline and the caret, and no button.
+        assert_eq!(
+            drawn(Focus::Text),
+            (false, true, true),
+            "focus in the text should draw the cursor and light nothing"
+        );
+        // On the button: the button, and no cursor anywhere — not the tint, not the caret.
+        assert_eq!(
+            drawn(Focus::Stop {
+                element: 0,
+                button: Some(0)
+            }),
+            (true, false, false),
+            "focus on a button should light it and draw no cursor at all"
+        );
+    }
+
+    /// Focus on something with **nothing to put a caret in** marks it instead of vanishing.
+    ///
+    /// `o` and the outline picker step the view's *structure* — everything that happened — and a
+    /// prose reply is part of that, while a line motion cannot enter one. Landing there used to
+    /// leave `Focus::Text` believed and the caret drawn nowhere: "the cursor disappears and I'm
+    /// confused about where it ends up". `Focused` answers `Element` for it now, and the shell
+    /// marks the element rather than pretending a cursor is in it.
+    #[test]
+    fn focus_on_prose_marks_it_since_no_caret_can_be_drawn() {
+        let text = "# Heading\n\nSome prose.";
+        let blocks = aether_client::markdown::parse(text);
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![Element::Prose {
+                element: 0,
+                blocks: blocks.clone(),
+                source: aether_protocol::ui::SourceLines::of(text),
+            }],
+        };
+        // Prose takes no cursor, whatever the client remembers about where focus is.
+        assert!(matches!(
+            aether_client::grid::focused(&root, 0, aether_client::grid::Focus::Text),
+            aether_client::grid::Focused::Element { element: 0 }
+        ));
+
+        let painted_with = |focused_element: u32| {
+            let mut ed = editor_over(root.clone(), 0);
+            let laid = aether_client::read_layout::element(&blocks, TEST_PAINT_COLS, 1, 0, 0);
+            ed.measured.elements.insert(0, laid.measured);
+            ed.markdown.insert(0, std::sync::Arc::new(laid.rows));
+            ed.focused_element = focused_element;
+            let state = crate::app::test_state(ed);
+            let rows = painted_cells(&state);
+            let row = rows
+                .iter()
+                .find(|r| {
+                    r.iter()
+                        .map(|(s, _)| s.as_str())
+                        .collect::<String>()
+                        .contains("Heading")
+                })
+                .expect("the heading is on screen")
+                .clone();
+            let text: String = row.iter().map(|(s, _)| s.as_str()).collect();
+            row[text.find("Heading").expect("the word")].1
+        };
+
+        assert_eq!(
+            painted_with(0),
+            c(th().cursor_line_bg),
+            "focus is on the reply and nothing says so"
+        );
+        assert_ne!(
+            painted_with(9),
+            c(th().cursor_line_bg),
+            "a reply nothing is focused on wears the mark anyway"
         );
     }
 

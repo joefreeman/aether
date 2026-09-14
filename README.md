@@ -42,8 +42,9 @@ Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to ea
 Type `Space y` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
 `Shift-w`); a leading **count** repeats a motion (e.g. `3w`). `Space` is the leader for
 app/file/code commands, `Space g` the sub-leader for git operations, `Space v` the sub-leader for
-the verbs of the view you are in (stop what it is running, answer an agent), and `Space n` reveals
-hover info at the cursor.
+the verbs of the view you are in (stop what it is running), and `Space n` reveals hover info at the
+cursor. What a view offers to *do* — answering an agent, folding a tool call — is a button in the
+view itself: `Tab` reaches it and `Enter` presses it.
 
 ### Motions (normal mode)
 
@@ -69,7 +70,7 @@ hover info at the cursor.
 | `Backspace`/`Alt-Backspace` | Jump back/forward (cross-file history) |
 | `]`/`[` | Next/previous jumplist entry |
 | `}`/`{` | Next/previous jumplist entry in this file |
-| `Tab`/`Shift-Tab` | Focus the next/previous editor element (a patch's hunks) |
+| `Tab`/`Shift-Tab` | Next/previous button or input — the things a view offers to act on |
 
 ### Scrolling
 
@@ -209,8 +210,6 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space z`/`Space Alt-z` | Open another window / copy this view's web URL |
 | `Space ,`/`Space .` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
 | `Space v c` | Stop what this view is running — a shell's command, an agent's turn |
-| `Space v a`/`Space v d` | Allow / decline what the agent is asking to do |
-| `Space v e` | Expand or collapse the focused block — `Tab` moves between them |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save and quit |
 | `Space y`/`Space ?` | Show keyboard shortcuts / about this build |

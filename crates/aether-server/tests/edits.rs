@@ -3771,7 +3771,7 @@ async fn blame_follow_pushes_on_enable_and_cursor_moves() {
 
     // A same-line column move (no blame change) followed by a line move: exactly one push
     // arrives, for the landing line — the same-line settle was deduped on (line, revision).
-    let _: CursorState = send_request::<CursorMove>(
+    let _: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: open.buffer_id,
@@ -3787,7 +3787,7 @@ async fn blame_follow_pushes_on_enable_and_cursor_moves() {
     // the assertion below is that this move produced *no* push, and that is only exact once the
     // debounced pass it would have come from is known to be finished.
     settled(&server).await;
-    let _: CursorState = send_request::<CursorMove>(
+    let _: CursorState = move_cursor(
         &mut ws,
         &CursorMoveParams {
             buffer_id: open.buffer_id,
