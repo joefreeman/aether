@@ -4,7 +4,7 @@
 //! the core owns both tables and the semantic mappings (syntax kind / diagnostic severity /
 //! LSP status → role); this module is only the `Rgb → Color` edge.
 
-use aether_client::theme::Theme;
+use aether_client::theme::{LspDot, Theme};
 use aether_protocol::settings::ThemeMode;
 use iced::Color;
 use std::sync::LazyLock;
@@ -345,10 +345,11 @@ pub fn diag_glyph(severity: aether_protocol::viewport::DiagnosticSeverity) -> &'
     }
 }
 
-/// State colour for a language-server's status dot, via the core's [`Theme::lsp_status`]. A ready
-/// server with in-flight `$/progress` shows the busy colour; the caller checks `progress`.
-pub fn lsp_status_color(mode: ThemeMode, status: &aether_protocol::lsp::LspStatus) -> Color {
-    color(Theme::of(mode).lsp_status(status))
+/// Colour of a language-server's health dot, via the core's [`Theme::lsp_dot`] — one answer per
+/// [`LspDot`] for the status bar, the picker rows and the info dialog alike; each classifies its
+/// server through `LspDot::of` and paints through here.
+pub fn lsp_dot_color(mode: ThemeMode, dot: LspDot) -> Color {
+    color(Theme::of(mode).lsp_dot(dot))
 }
 
 #[cfg(test)]
@@ -426,7 +427,6 @@ mod tests {
     /// The mapping fns delegate to the core tables: dark answers must be the historic constants.
     #[test]
     fn mapping_fns_delegate_to_the_core() {
-        use aether_protocol::lsp::LspStatus;
         use aether_protocol::viewport::DiagnosticSeverity as S;
         let dark = ThemeMode::Dark;
         // Dotted fallback lives in the core; the wrapper just converts.
@@ -441,9 +441,11 @@ mod tests {
         assert_eq!(highlight_color(dark, "text.emphasis"), None);
         assert_eq!(diagnostic_color(dark, S::Error), c(0xbf616a)); // NORD11
         assert_eq!(diagnostic_color(dark, S::Hint), c(0xd8dee9)); // NORD4 — fg, not a hue
-        assert_eq!(lsp_status_color(dark, &LspStatus::Ready), c(0xa3be8c)); // NORD14
-        assert_eq!(lsp_status_color(dark, &LspStatus::Stopped), c(0x4c566a)); // NORD3
-                                                                              // Light resolves through its own table.
+        assert_eq!(lsp_dot_color(dark, LspDot::Ready), c(0xa3be8c)); // NORD14
+        assert_eq!(lsp_dot_color(dark, LspDot::Stopped), c(0x4c566a)); // NORD3
+        // NORD3_BRIGHTER — absent, not the crash red, and legible on the bar.
+        assert_eq!(lsp_dot_color(dark, LspDot::Missing), c(0x7b88a1));
+        // Light resolves through its own table.
         assert_ne!(
             highlight_color(ThemeMode::Light, "comment"),
             highlight_color(dark, "comment")

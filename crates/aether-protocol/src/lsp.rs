@@ -199,7 +199,8 @@ pub enum FormatStatus {
     NoChange,
     /// A server exists for this language but isn't `Ready` yet — try again shortly.
     NotReady,
-    /// The language server crashed or was stopped — it can't format until it's running again.
+    /// The language server crashed, isn't installed, or was stopped — it can't format until it's
+    /// running again.
     Unavailable,
     /// A ready server is attached but doesn't advertise a document formatter for this language.
     Unsupported,
@@ -387,6 +388,18 @@ pub enum LspStatus {
     Restarting,
     /// The subprocess exited unexpectedly.
     Crashed { code: Option<i32>, message: String },
+    /// The server's executable wasn't found, so nothing was ever started: it isn't installed, or
+    /// isn't on the `PATH` the daemon resolves for this root.
+    ///
+    /// Deliberately not a [`Self::Crashed`] with an ENOENT message, which is what it used to be:
+    /// "rust-analyzer is not installed" and "rust-analyzer died on startup" want opposite things
+    /// from the user — install it, versus read a log — and a red dot saying `spawn failed: No such
+    /// file or directory (os error 2)` told them neither. Clients colour it apart and name the
+    /// command so the fix is obvious.
+    Missing {
+        /// The executable we looked for, e.g. `"gopls"` — the thing to install.
+        command: String,
+    },
     /// Cleanly shut down; not running.
     Stopped,
 }

@@ -21,7 +21,7 @@
 //! provisional in the way the dark values are not.
 
 use aether_protocol::git::GitStatus;
-use aether_protocol::lsp::LspStatus;
+use aether_protocol::lsp::{LspProgress, LspServerStatus, LspStatus};
 use aether_protocol::settings::ThemeMode;
 use aether_protocol::viewport::{DiagnosticSeverity, DiffStage, PatchLine};
 
@@ -590,15 +590,26 @@ impl Theme {
         }
     }
 
-    /// State colour for a language-server's status dot. The transitional states read as "busy";
-    /// a ready server with in-flight `$/progress` should show [`Self::warning`] — the caller
-    /// checks `progress`.
-    pub fn lsp_status(&self, status: &LspStatus) -> Rgb {
-        match status {
-            LspStatus::Ready => self.ok,
-            LspStatus::Starting | LspStatus::Initializing | LspStatus::Restarting => self.warning,
-            LspStatus::Crashed { .. } => self.error,
-            LspStatus::Stopped => self.fg_faint,
+    /// Colour of a language-server's health dot, by what the dot shows ([`LspDot`]) rather than
+    /// by raw lifecycle state. Every place the dot is painted — status bar, picker row, detail
+    /// title, in each shell — classifies through [`LspDot::of`] and colours through here, so one
+    /// server can't be one colour in the bar and another in the picker.
+    ///
+    /// `Missing` is grey, not [`Self::error`]: a server that was never installed hasn't gone
+    /// wrong, and a red dot for it is a false alarm you learn to ignore.
+    ///
+    /// [`Self::fg_muted`] rather than the fainter [`Self::fg_faint`] of `Stopped`, because this
+    /// dot has to survive the *status bar*, whose panel ground is lighter than the picker's:
+    /// `fg_faint` measures 1.36:1 there against 2.46–4.94 for every other state — a dot you can't
+    /// see is not a status. `fg_muted` lands at 2.82/2.58 (dark/light), the same weight as the
+    /// rest. See `every_reachable_lsp_dot_is_legible_on_the_status_bar`.
+    pub fn lsp_dot(&self, dot: LspDot) -> Rgb {
+        match dot {
+            LspDot::Ready => self.ok,
+            LspDot::Busy => self.warning,
+            LspDot::Crashed => self.error,
+            LspDot::Missing => self.fg_muted,
+            LspDot::Stopped => self.fg_faint,
         }
     }
 
@@ -629,6 +640,69 @@ impl Theme {
 
 /// Resolved style for a tree-sitter capture: a role colour plus font attributes. Shells that
 /// can't render an attribute (no italics in some terminals) drop it.
+/// What a language server's health dot shows. The one classification behind every place the dot
+/// is painted — status bar, picker row, detail title, in all three shells — so those places can
+/// only disagree by not asking. It folds the lifecycle state and the `$/progress` list together
+/// because the fold is the half that used to be copied per site: a ready server with work in
+/// flight is `Busy`, exactly like one still starting, and a site that forgot the progress half
+/// painted a green dot over an indexing server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LspDot {
+    /// Ready and idle.
+    Ready,
+    /// Coming up (`Starting` / `Initializing` / `Restarting`), or ready with `$/progress` work in
+    /// flight — either way, results may still land.
+    Busy,
+    /// The process exited unexpectedly.
+    Crashed,
+    /// Never started: the executable isn't installed, or isn't on the daemon's `PATH`.
+    Missing,
+    /// Cleanly shut down.
+    Stopped,
+}
+
+impl LspDot {
+    /// Every variant, for the checks that have to cover them all (legibility, the web mirror).
+    pub const ALL: [LspDot; 5] = [
+        LspDot::Ready,
+        LspDot::Busy,
+        LspDot::Crashed,
+        LspDot::Missing,
+        LspDot::Stopped,
+    ];
+
+    /// Classify a server's lifecycle state together with its in-flight `$/progress` work.
+    pub fn of(status: &LspStatus, progress: &[LspProgress]) -> Self {
+        match status {
+            LspStatus::Ready if progress.is_empty() => LspDot::Ready,
+            LspStatus::Ready
+            | LspStatus::Starting
+            | LspStatus::Initializing
+            | LspStatus::Restarting => LspDot::Busy,
+            LspStatus::Crashed { .. } => LspDot::Crashed,
+            LspStatus::Missing { .. } => LspDot::Missing,
+            LspStatus::Stopped => LspDot::Stopped,
+        }
+    }
+
+    /// [`Self::of`] for a whole `lsp/status_changed` payload (or a picker row's worth of one).
+    pub fn for_server(s: &LspServerStatus) -> Self {
+        Self::of(&s.status, &s.progress)
+    }
+
+    /// The dot's name on the web: `lsp-<name>` is both the icon kind in `web/src/icons.ts` and the
+    /// colour class in `web/src/theme.css`, which hand-mirror this enum (a test holds them to it).
+    pub const fn name(self) -> &'static str {
+        match self {
+            LspDot::Ready => "ready",
+            LspDot::Busy => "busy",
+            LspDot::Crashed => "crashed",
+            LspDot::Missing => "missing",
+            LspDot::Stopped => "stopped",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SyntaxStyle {
     pub color: Option<Rgb>,
@@ -766,10 +840,182 @@ mod tests {
         let t = Theme::LIGHT;
         assert_eq!(t.diagnostic(DiagnosticSeverity::Error), t.error);
         assert_eq!(t.diagnostic(DiagnosticSeverity::Hint), t.fg);
-        assert_eq!(t.lsp_status(&LspStatus::Ready), t.ok);
-        assert_eq!(t.lsp_status(&LspStatus::Stopped), t.fg_faint);
+        assert_eq!(t.lsp_dot(LspDot::Ready), t.ok);
+        assert_eq!(t.lsp_dot(LspDot::Stopped), t.fg_faint);
         assert_eq!(t.git_status_bullet(GitStatus::Ignored), None);
         assert_eq!(t.git_status_bullet(GitStatus::Untracked), Some(t.git_added));
+    }
+
+    /// Every dot a server can actually reach has to be *visible* where it's drawn, and the
+    /// binding constraint is the status bar: its panel ground is lighter than the picker's, so a
+    /// dot legible in one can vanish in the other. `Missing` shipped as `fg_faint` for one commit
+    /// and measured 1.36:1 on the bar — grey as asked for, and invisible.
+    ///
+    /// The `match` is exhaustive with no wildcard on purpose: a new [`LspDot`] variant has to be
+    /// classified here rather than quietly skipping the check.
+    #[test]
+    fn every_reachable_lsp_dot_is_legible_on_the_status_bar() {
+        /// WCAG relative luminance.
+        fn lum(c: Rgb) -> f64 {
+            let f = |v: u8| {
+                let s = v as f64 / 255.0;
+                if s <= 0.03928 {
+                    s / 12.92
+                } else {
+                    ((s + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+        }
+        fn contrast(a: Rgb, b: Rgb) -> f64 {
+            let (x, y) = (lum(a), lum(b));
+            let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+            (hi + 0.05) / (lo + 0.05)
+        }
+        // Comfortably clear of the 1.36–1.69 an invisible dot measures, comfortably under the
+        // 2.46 of the dimmest state that *is* legible (the crash red in dark mode).
+        const FLOOR: f64 = 2.0;
+
+        for t in [Theme::DARK, Theme::LIGHT] {
+            for dot in LspDot::ALL {
+                let reachable = match dot {
+                    LspDot::Ready | LspDot::Busy | LspDot::Crashed | LspDot::Missing => true,
+                    // Nothing in the server ever assigns `Stopped` — servers go
+                    // Starting → Initializing → Ready, or `Crashed` when the process exits, and
+                    // teardown drops the handle rather than marking it stopped. If that changes,
+                    // this arm flips to `true` and the shade has to come up with it.
+                    LspDot::Stopped => false,
+                };
+                if !reachable {
+                    continue;
+                }
+                let colour = t.lsp_dot(dot);
+                for (name, ground) in [("status bar", t.bg_panel), ("picker", t.bg)] {
+                    let c = contrast(colour, ground);
+                    assert!(
+                        c >= FLOOR,
+                        "{:?}: {dot:?} dot is {c:.2}:1 on the {name} — invisible",
+                        t.mode
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fold is the whole reason [`LspDot`] exists: "ready" is only the idle dot, and work in
+    /// flight reads as busy exactly like a server still coming up. Nothing else is progress-aware —
+    /// a crashed server with stale progress is still crashed.
+    #[test]
+    fn lsp_dot_folds_state_and_progress() {
+        let indexing = [LspProgress {
+            title: "Indexing".into(),
+            message: None,
+            percentage: None,
+        }];
+        let crashed = LspStatus::Crashed {
+            code: Some(1),
+            message: "boom".into(),
+        };
+        let missing = LspStatus::Missing {
+            command: "gopls".into(),
+        };
+        assert_eq!(LspDot::of(&LspStatus::Ready, &[]), LspDot::Ready);
+        assert_eq!(LspDot::of(&LspStatus::Ready, &indexing), LspDot::Busy);
+        for transitional in [
+            LspStatus::Starting,
+            LspStatus::Initializing,
+            LspStatus::Restarting,
+        ] {
+            assert_eq!(LspDot::of(&transitional, &[]), LspDot::Busy, "{transitional:?}");
+            assert_eq!(
+                LspDot::of(&transitional, &indexing),
+                LspDot::Busy,
+                "{transitional:?}"
+            );
+        }
+        assert_eq!(LspDot::of(&crashed, &[]), LspDot::Crashed);
+        assert_eq!(LspDot::of(&crashed, &indexing), LspDot::Crashed);
+        assert_eq!(LspDot::of(&missing, &[]), LspDot::Missing);
+        assert_eq!(LspDot::of(&LspStatus::Stopped, &[]), LspDot::Stopped);
+        let server = LspServerStatus {
+            name: "gopls".into(),
+            language: "go".into(),
+            workspace_root: "/p".into(),
+            status: LspStatus::Ready,
+            progress: indexing.to_vec(),
+        };
+        assert_eq!(LspDot::for_server(&server), LspDot::Busy);
+    }
+
+    /// The browser shell paints the dot through CSS, so its half of the table is hand-mirrored:
+    /// an `lsp-<name>` icon kind in `icons.ts` and an `.lsp-<name> { color: var(--role) }` rule in
+    /// `theme.css`. This holds both to [`LspDot`]: every variant has its kind and its rule, and the
+    /// rule's role resolves to the very colour the core paints — in both themes — so the web's
+    /// status bar and picker can't quietly drift from the native shells'.
+    #[test]
+    fn the_web_mirrors_every_lsp_dot_in_the_same_role() {
+        let icons = include_str!("../../../web/src/icons.ts");
+        let css = include_str!("../../../web/src/theme.css");
+        fn role(t: &Theme, name: &str) -> Rgb {
+            match name {
+                "ok" => t.ok,
+                "warning" => t.warning,
+                "error" => t.error,
+                "info" => t.info,
+                "fg" => t.fg,
+                "fg-muted" => t.fg_muted,
+                "fg-dim" => t.fg_dim,
+                "fg-faint" => t.fg_faint,
+                other => panic!("theme.css colours an LSP dot with --{other}; teach this test that role"),
+            }
+        }
+        for dot in LspDot::ALL {
+            let kind = format!("\"lsp-{}\"", dot.name());
+            assert!(
+                icons.contains(&kind),
+                "web/src/icons.ts has no {kind} icon kind for {dot:?}"
+            );
+            let selector = format!(".lsp-{} ", dot.name());
+            let rule = css
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with(&selector))
+                .unwrap_or_else(|| panic!("web/src/theme.css has no `{selector}` rule for {dot:?}"));
+            let var = rule
+                .split("var(--")
+                .nth(1)
+                .and_then(|rest| rest.split(')').next())
+                .unwrap_or_else(|| panic!("`{rule}` doesn't colour through a --role variable"));
+            for t in [Theme::DARK, Theme::LIGHT] {
+                assert_eq!(
+                    role(&t, var),
+                    t.lsp_dot(dot),
+                    "{:?}: `{rule}` paints {dot:?} a different colour from the core",
+                    t.mode
+                );
+            }
+        }
+    }
+
+    /// The whole point of `Missing` is that it doesn't read as a failure: a server that was never
+    /// installed is grey, never the crash red — in either theme.
+    #[test]
+    fn a_missing_server_is_not_coloured_like_a_crashed_one() {
+        for t in [Theme::DARK, Theme::LIGHT] {
+            assert_eq!(t.lsp_dot(LspDot::Missing), t.fg_muted, "{:?}", t.mode);
+            assert_ne!(
+                t.lsp_dot(LspDot::Missing),
+                t.lsp_dot(LspDot::Crashed),
+                "{:?}",
+                t.mode
+            );
+            assert_ne!(
+                t.lsp_dot(LspDot::Missing),
+                t.lsp_dot(LspDot::Ready),
+                "{:?}",
+                t.mode
+            );
+        }
     }
 
     /// Every colour role must have a matching `--kebab-case` custom property in the web shell's

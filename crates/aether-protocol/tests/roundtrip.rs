@@ -2551,8 +2551,21 @@ fn lsp_status_is_internally_tagged() {
         .unwrap(),
         json!({"state": "crashed", "code": 1, "message": "boom"})
     );
+    // "Not installed" is its own state on the wire, carrying the command to install — a client
+    // must be able to tell it from a crash without parsing an error message.
+    assert_eq!(
+        to_value(LspStatus::Missing {
+            command: "gopls".into(),
+        })
+        .unwrap(),
+        json!({"state": "missing", "command": "gopls"})
+    );
     // Round-trips back.
     let s = LspStatus::Stopped;
+    assert_eq!(from_value::<LspStatus>(to_value(&s).unwrap()).unwrap(), s);
+    let s = LspStatus::Missing {
+        command: "gopls".into(),
+    };
     assert_eq!(from_value::<LspStatus>(to_value(&s).unwrap()).unwrap(), s);
 }
 

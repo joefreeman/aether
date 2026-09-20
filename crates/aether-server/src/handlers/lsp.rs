@@ -1014,7 +1014,9 @@ fn lsp_cursor_request(s: &ServerState, client_id: ClientId, buffer_id: BufferId)
         LspStatus::Starting | LspStatus::Initializing | LspStatus::Restarting => {
             return CursorResolve::Starting
         }
-        LspStatus::Crashed { .. } | LspStatus::Stopped => return CursorResolve::Unavailable,
+        LspStatus::Crashed { .. } | LspStatus::Missing { .. } | LspStatus::Stopped => {
+            return CursorResolve::Unavailable
+        }
     }
     // `Ready` should always carry a live client; treat a missing one as a transient outage.
     let Some(client) = handle.client.clone() else {
@@ -1475,7 +1477,9 @@ fn lsp_format_resolve(s: &ServerState, buffer_id: BufferId) -> FormatResolve {
         LspStatus::Starting | LspStatus::Initializing | LspStatus::Restarting => {
             return FormatResolve::NotReady
         }
-        LspStatus::Crashed { .. } | LspStatus::Stopped => return FormatResolve::Unavailable,
+        LspStatus::Crashed { .. } | LspStatus::Missing { .. } | LspStatus::Stopped => {
+            return FormatResolve::Unavailable
+        }
     }
     if !handle.document_formatting {
         return FormatResolve::Unsupported;

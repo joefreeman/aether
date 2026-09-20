@@ -28,6 +28,7 @@ use aether_protocol::cursor::Granularity;
 use aether_protocol::envelope::RpcMethod;
 use aether_protocol::view::{ViewOpen, ViewOpenParams, ViewOpenResult};
 
+use aether_client::theme::LspDot;
 use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::PickerKind;
 use aether_protocol::search::SearchSummary;
@@ -4324,12 +4325,9 @@ impl App {
         };
         let body: Element<'_, Message> = match prompt {
             Prompt::LspInfo(info) => {
-                let busy = matches!(info.status, LspStatus::Ready) && !info.progress.is_empty();
-                let dot = if busy {
-                    p.warning
-                } else {
-                    theme::lsp_status_color(p.mode, &info.status)
-                };
+                // The core's classification: the same dot the status bar and the picker row show.
+                let dot = LspDot::for_server(info);
+                let dot_color = theme::lsp_dot_color(p.mode, dot);
                 let kv = |k: &str, v: String| {
                     row![
                         container(
@@ -4344,7 +4342,7 @@ impl App {
                     .spacing(8)
                 };
                 let status_label = match &info.status {
-                    LspStatus::Ready if busy => "busy".to_string(),
+                    LspStatus::Ready if dot == LspDot::Busy => "busy".to_string(),
                     LspStatus::Ready => "ready".to_string(),
                     LspStatus::Starting => "starting".to_string(),
                     LspStatus::Initializing => "initializing".to_string(),
@@ -4353,11 +4351,14 @@ impl App {
                         Some(c) => format!("crashed ({c}): {message}"),
                         None => format!("crashed: {message}"),
                     },
+                    LspStatus::Missing { command } => {
+                        format!("not installed: {command} not found on PATH")
+                    }
                     LspStatus::Stopped => "stopped".to_string(),
                 };
                 let mut col = column![
                     row![
-                        text("● ").size(ui.heading()).color(dot),
+                        text("● ").size(ui.heading()).color(dot_color),
                         text(info.name.clone())
                             .size(ui.body())
                             .font(SANS_BOLD_UI)
@@ -5140,13 +5141,9 @@ impl App {
         let position = self.position_label();
         gap(&mut right_used, &position);
         right = right.push(t(position, p.fg));
-        // LSP health dot: state-coloured; a ready server with in-flight progress shows busy.
+        // LSP health dot — the core's classification, the one the picker rows paint too.
         if let Some(lsp) = &self.session.view.lsp {
-            let color = if matches!(lsp.status, LspStatus::Ready) && !lsp.progress.is_empty() {
-                p.warning
-            } else {
-                theme::lsp_status_color(p.mode, &lsp.status)
-            };
+            let color = theme::lsp_dot_color(p.mode, LspDot::for_server(lsp));
             right = right.push(t("•".into(), color));
             right_used += 3;
         }

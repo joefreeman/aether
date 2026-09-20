@@ -482,8 +482,8 @@ fn file_has_line(path: &Path, needle: &str) -> bool {
         .is_ok_and(|c| c.lines().any(|l| l.trim_start().starts_with(needle)))
 }
 
-/// Background task: spawn the subprocess, hand off to [`bring_up`]. Marks the handle `Crashed` if
-/// the process can't be spawned.
+/// Background task: spawn the subprocess, hand off to [`bring_up`]. Marks the handle `Missing` or
+/// `Crashed` (see [`spawn_failure_status`]) if the process can't be spawned.
 pub async fn launch(state: SharedState, key: LspServerKey, spec: LspServerSpec, generation: u64) {
     // Test seam: a registered in-process dummy server for this language stands in for the real
     // process, over in-memory pipes but through the identical `bring_up` handshake path. Checked
@@ -514,16 +514,7 @@ pub async fn launch(state: SharedState, key: LspServerKey, spec: LspServerSpec, 
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(server = %key.language, error = %e, "failed to spawn language server");
-            set_status(
-                &state,
-                &key,
-                generation,
-                LspStatus::Crashed {
-                    code: None,
-                    message: format!("spawn failed: {e}"),
-                },
-            )
-            .await;
+            set_status(&state, &key, generation, spawn_failure_status(spec.command, &e)).await;
             return;
         }
     };
@@ -536,6 +527,26 @@ pub async fn launch(state: SharedState, key: LspServerKey, spec: LspServerSpec, 
         Some(proc.child),
     )
     .await;
+}
+
+/// Why a spawn failed, as a status: the executable not being there at all is
+/// [`LspStatus::Missing`], anything else is a [`LspStatus::Crashed`] the user has to read.
+///
+/// `NotFound` from `Command::spawn` is ENOENT on the exec, which for a `PATH`-resolved command
+/// means no such executable — including the interpreter of a `#!` wrapper script, which is the
+/// same story ("the toolchain isn't installed here"). A server that *is* installed but can't run —
+/// no execute bit, a broken binary — keeps its error text, because that one needs reading.
+fn spawn_failure_status(command: &str, e: &std::io::Error) -> LspStatus {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        LspStatus::Missing {
+            command: command.to_string(),
+        }
+    } else {
+        LspStatus::Crashed {
+            code: None,
+            message: format!("spawn failed: {e}"),
+        }
+    }
 }
 
 /// Perform the handshake, mark the server `Ready`, open every registered buffer, push the status
@@ -1016,7 +1027,10 @@ async fn set_status(state: &SharedState, key: &LspServerKey, generation: u64, st
             return; // superseded by a newer instance
         }
         h.status = status;
-        if matches!(h.status, LspStatus::Crashed { .. } | LspStatus::Stopped) {
+        if matches!(
+            h.status,
+            LspStatus::Crashed { .. } | LspStatus::Missing { .. } | LspStatus::Stopped
+        ) {
             h.client = None;
         }
         let mut out = collect_status_pushes(&guard, key);
@@ -1083,6 +1097,46 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+
+    // ---- spawn failures -------------------------------------------------------------------------
+
+    /// The whole distinction rides on what the OS returns for an unresolvable command, so this
+    /// asks the real spawn path for the error rather than hand-rolling one.
+    #[tokio::test]
+    async fn a_server_that_isnt_installed_is_missing_not_crashed() {
+        let dir = tempdir().unwrap();
+        let command = "aether-definitely-not-a-language-server";
+        let Err(err) = process::spawn(command, &[], dir.path(), None) else {
+            panic!("a command that doesn't exist must not spawn");
+        };
+        assert_eq!(
+            spawn_failure_status(command, &err),
+            LspStatus::Missing {
+                command: command.to_string(),
+            }
+        );
+    }
+
+    /// Installed but unrunnable is the other story: it keeps `Crashed` and its error text, because
+    /// that one the user has to read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_server_that_cant_be_executed_still_crashes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("not-executable");
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        let command = path.to_str().unwrap();
+        let Err(err) = process::spawn(command, &[], dir.path(), None) else {
+            panic!("a file with no execute bit must not spawn");
+        };
+        assert!(
+            matches!(
+                spawn_failure_status(command, &err),
+                LspStatus::Crashed { .. }
+            ),
+            "{err} should stay a crash, not read as 'not installed'"
+        );
+    }
 
     // ---- discover_root --------------------------------------------------------------------------
 

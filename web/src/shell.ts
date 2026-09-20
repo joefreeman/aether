@@ -38,7 +38,7 @@ import {
   type ReadDoc,
 } from "./read";
 import { decodeRow } from "./text";
-import { statusIcon, severityIcon, lspStateClass, type IconKind } from "./icons";
+import { statusIcon, severityIcon, lspDotClass, type IconKind } from "./icons";
 import { truncatePath, charBudget } from "./paths";
 import { rootLabels } from "./labels";
 import { renderHoverDoc, mdToPlain, type MdBlock } from "./markdown";
@@ -679,13 +679,12 @@ function positionLabel(v: CoreView): string {
     : `${lo.line + 1}:${lo.col + 1}-${hi.line + 1}:${hi.col + 1}`;
 }
 
-/** LSP status icon + colour class: ready / busy (ready + active progress, or starting) / crashed /
- *  stopped — mirroring the TUI status indicator. Busy spins. */
+/** LSP status icon + colour class for the status bar — `lspDotClass`, the same classification the
+ *  picker rows and the info dialog paint, so the bar can't show a server a different colour from
+ *  the picker. Busy spins. */
 function lspIcon(lsp: LspServerStatus | null): { kind: IconKind; cls: string; spin: boolean } | null {
   if (!lsp) return null;
-  const state = lsp.status.state;
-  const busy = state === "ready" && (lsp.progress?.length ?? 0) > 0;
-  const cls = busy ? "lsp-busy" : lspStateClass(state);
+  const cls = lspDotClass(lsp);
   return { kind: cls, cls, spin: cls === "lsp-busy" };
 }
 
@@ -1167,10 +1166,10 @@ export function describePickerItem(
       };
     }
     case "lsp_server": {
-      // The status bar's SVG icon in the leading cell (spinning when busy); dim metadata matching
-      // the native/TUI clients: language, the monorepo sub-root, then the active operation.
-      const busy = item.status.state === "ready" && (item.progress?.length ?? 0) > 0;
-      const cls = busy ? "lsp-busy" : lspStateClass(item.status.state);
+      // The status bar's SVG icon in the leading cell — the same `lspDotClass`, spinning when busy;
+      // dim metadata matching the native/TUI clients: language, the monorepo sub-root, then the
+      // active operation.
+      const cls = lspDotClass(item);
       let meta = item.language;
       if (item.root_label) meta += ` · ${item.root_label}`;
       if (item.progress?.[0]) meta += ` · ${item.progress[0].title}`;
@@ -1180,7 +1179,7 @@ export function describePickerItem(
         meta,
         bullet: true,
         bulletIcon: cls,
-        bulletSpin: busy,
+        bulletSpin: cls === "lsp-busy",
       };
     }
     case "reference": {
@@ -3894,11 +3893,10 @@ export class Shell {
       // and any other key / Esc closes — both routed through the core's on_prompt_key, so this only
       // paints. The shortcuts aren't advertised in the dialog (kept clean), like the native client.
       const st = p.status;
-      const busy = st.status.state === "ready" && (st.progress?.length ?? 0) > 0;
       const header = document.createElement("div");
       header.className = "modal-message";
       // Same SVG icon (spinning when busy/restarting) the LSP picker rows and status bar use.
-      const cls = busy ? "lsp-busy" : lspStateClass(st.status.state);
+      const cls = lspDotClass(st);
       const icon = document.createElement("span");
       icon.className = `lsp-info-icon ${cls}`;
       icon.append(statusIcon(cls, cls === "lsp-busy"));
@@ -3920,8 +3918,11 @@ export class Shell {
           st.status.code != null
             ? `crashed (${st.status.code}): ${st.status.message}`
             : `crashed: ${st.status.message}`;
+      } else if (st.status.state === "missing") {
+        statusLabel = `not installed: ${st.status.command} not found on PATH`;
       } else {
-        statusLabel = busy ? "busy" : st.status.state;
+        // A ready server with work in flight says "busy"; the transitional states keep their names.
+        statusLabel = cls === "lsp-busy" && st.status.state === "ready" ? "busy" : st.status.state;
       }
       kv("Language", st.language);
       kv("Workspace", st.workspace_root);

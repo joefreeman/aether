@@ -7,6 +7,7 @@ pub use crate::core::picker::*;
 
 use crate::chips::{self, Chip, ChipEditorField, ChipId};
 use crate::theme;
+use aether_client::theme::LspDot;
 use aether_protocol::git::{CommitRef, CommitRefKind, GitStatus};
 use aether_protocol::picker::{BufferDirtyState, GroupHeader, GroupSpan, PickerItem, PickerKind};
 use aether_protocol::viewport::DiffStage;
@@ -1718,15 +1719,9 @@ fn render_item<'a>(
             match_indices,
             ..
         } => {
-            // Health dot (busy colour while progress is in flight), name, then dim metadata:
-            // language, monorepo sub-root, and the active operation.
-            let busy =
-                matches!(status, aether_protocol::lsp::LspStatus::Ready) && !progress.is_empty();
-            let color = if busy {
-                p.warning
-            } else {
-                theme::lsp_status_color(p.mode, status)
-            };
+            // Health dot (the core's classification — busy while progress is in flight), name,
+            // then dim metadata: language, monorepo sub-root, and the active operation.
+            let color = theme::lsp_dot_color(p.mode, LspDot::of(status, progress));
             let mut m = language.clone();
             if !root_label.is_empty() {
                 m.push_str(&format!(" · {root_label}"));

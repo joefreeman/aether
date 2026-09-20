@@ -2,6 +2,8 @@
 //! (`.sev-*`, `.lsp-*`) apply wherever the icon lands. Shared by the status bar and the LSP picker
 //! rows.
 
+import type { LspServerStatus } from "./protocol";
+
 export type IconKind =
   | "error"
   | "warning"
@@ -10,6 +12,7 @@ export type IconKind =
   | "lsp-ready"
   | "lsp-busy"
   | "lsp-crashed"
+  | "lsp-missing"
   | "lsp-stopped";
 
 const ICONS: Record<IconKind, string> = {
@@ -21,6 +24,8 @@ const ICONS: Record<IconKind, string> = {
   "lsp-ready": '<path d="M3.8 8.5l2.7 2.6L12.2 5.2"/>',
   "lsp-busy": '<path d="M8 2.7a5.3 5.3 0 1 1-5 3.6"/>',
   "lsp-crashed": '<path d="M5.2 5.2l5.6 5.6M10.8 5.2l-5.6 5.6"/>',
+  // Not installed: the `lsp-stopped` circle, dashed — an outline where a server would be.
+  "lsp-missing": '<circle cx="8" cy="8" r="4.2" stroke-dasharray="2.1 2.1"/>',
   "lsp-stopped": '<circle cx="8" cy="8" r="4.2"/>',
 };
 
@@ -52,10 +57,15 @@ export function severityIcon(
 
 export type LspIconKind = Extract<IconKind, `lsp-${string}`>;
 
-/** Icon kind / colour class for an LSP lifecycle state. starting/initializing/restarting share
- *  the busy icon; callers fold "ready + active progress" into busy themselves. */
-export function lspStateClass(state: string): LspIconKind {
-  return state === "ready" || state === "crashed" || state === "stopped"
-    ? (`lsp-${state}` as LspIconKind)
-    : "lsp-busy";
+/** Icon kind / colour class for a language server — the browser's copy of the core's `LspDot`,
+ *  and the ONE fold of lifecycle state and `$/progress` for every place the dot lands (status bar,
+ *  picker row, info dialog), so those can't disagree about a server. `ready` is only the idle dot:
+ *  work in flight is `busy`, exactly like a server still starting / initializing / restarting;
+ *  crashed, missing (not installed) and stopped are themselves. A core test holds these kinds and
+ *  `theme.css`'s `.lsp-*` rules to the enum. */
+export function lspDotClass(server: Pick<LspServerStatus, "status" | "progress">): LspIconKind {
+  const state = server.status.state;
+  if (state === "ready") return (server.progress?.length ?? 0) > 0 ? "lsp-busy" : "lsp-ready";
+  if (state === "crashed" || state === "missing" || state === "stopped") return `lsp-${state}`;
+  return "lsp-busy";
 }

@@ -489,6 +489,7 @@ html, body, #app {
 .lsp-ready { color: var(--ok); }
 .lsp-busy { color: var(--warning); }
 .lsp-crashed { color: var(--error); }
+.lsp-missing { color: var(--fg-muted); }
 .lsp-stopped { color: var(--fg-faint); }
 
 /* Toasts — transient messages, top-right, auto-dismissing. */

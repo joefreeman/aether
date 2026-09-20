@@ -6,7 +6,7 @@ use crate::app::{
 };
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_client::session::{AppSettingControl, ConnState};
-use aether_client::theme::{Rgb, Theme};
+use aether_client::theme::{LspDot, Rgb, Theme};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::{CommitRef, CommitRefKind, GitStatus};
 use aether_protocol::lsp::{LspProgress, LspStatus, SymbolCrumb};
@@ -2030,18 +2030,14 @@ fn draw_lsp_detail_overlay(f: &mut Frame, detail: &crate::picker::LspServerDetai
 }
 
 /// The LSP-server detail drill-down: a status dot + bold name title, then labelled rows —
-/// Language / Workspace / Error (crashed only) / Working (active progress) — matching the web
+/// Language / Workspace / Error (crashed) or Missing (not installed) / Working (active progress) —
+/// matching the web
 /// client's dialog field-for-field. The lifecycle state itself has no row: the dot's colour and
 /// the presence of an Error/Working row already say it. No input/separator split, so it doesn't
 /// masquerade as a filter box. Pre-wrapped so the scrollbar geometry is exact.
 fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area: Rect) {
     let text_w = area.width.saturating_sub(2).max(1); // reserve the scrollbar column + a gap
-    let busy = matches!(detail.status, LspStatus::Ready) && !detail.progress.is_empty();
-    let dot_color = if busy {
-        c(th().warning)
-    } else {
-        lsp_status_color(&detail.status)
-    };
+    let dot_color = lsp_dot_color(LspDot::of(&detail.status, &detail.progress));
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled("• ".to_string(), Style::default().fg(dot_color)),
@@ -2061,12 +2057,26 @@ fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area:
         c(th().fg),
         w,
     );
-    if let LspStatus::Crashed { code, message } = &detail.status {
-        let mut msg = message.clone();
-        if let Some(c) = code {
-            msg.push_str(&format!(" (exit code {c})"));
+    match &detail.status {
+        LspStatus::Crashed { code, message } => {
+            let mut msg = message.clone();
+            if let Some(c) = code {
+                msg.push_str(&format!(" (exit code {c})"));
+            }
+            push_detail_row(&mut lines, "Error", &msg, c(th().error), w);
         }
-        push_detail_row(&mut lines, "Error", &msg, c(th().error), w);
+        // Its own row, not an "Error": nothing failed, the executable simply isn't there. Naming
+        // the command is the whole content — that's what the user has to go and install, so it's
+        // plain foreground; the grey that says "absent" is the dot's job, and it would only make
+        // this line hard to read.
+        LspStatus::Missing { command } => push_detail_row(
+            &mut lines,
+            "Missing",
+            &format!("{command} not found on PATH"),
+            c(th().fg),
+            w,
+        ),
+        _ => {}
     }
     for (i, p) in detail.progress.iter().enumerate() {
         let mut text = p.title.clone();
@@ -4305,13 +4315,7 @@ fn lsp_server_item_spans(
         progress,
     } = server;
     let bg = picker_row_bg(highlighted);
-    // A ready server with active `$/progress` work shows the busy colour (same as the status bar).
-    let busy = matches!(status, LspStatus::Ready) && !progress.is_empty();
-    let dot_color = if busy {
-        c(th().warning)
-    } else {
-        lsp_status_color(status)
-    };
+    let dot_color = lsp_dot_color(LspDot::of(status, progress));
     let base = Style::default().fg(c(th().fg)).bg(bg);
     let match_style = base
         .fg(c(th().match_highlight))
@@ -7978,24 +7982,19 @@ fn lsp_indicator_span(state: &AppState) -> Option<Span<'static>> {
     let status = state
         .lsp_status
         .get(&(server.language.clone(), server.workspace_root.clone()))?;
-    // A ready server doing background work (`$/progress` — indexing, `cargo check`) shows the
-    // busy colour, so the bar reflects that diagnostics/results may still land.
-    let color = if matches!(status.status, LspStatus::Ready) && !status.progress.is_empty() {
-        c(th().warning)
-    } else {
-        lsp_status_color(&status.status)
-    };
+    let color = lsp_dot_color(LspDot::for_server(status));
     Some(Span::styled(
         "•".to_string(),
         Style::default().bg(c(th().bg_panel)).fg(color),
     ))
 }
 
-/// State colour for a language-server's status dot (`•`) — shared by the status bar, the LSP
-/// picker rows, and the detail title. The transitional states read as "busy" (the loop is
-/// event-driven, so the colour changes when a `lsp/status_changed` arrives rather than animating).
-fn lsp_status_color(status: &LspStatus) -> Color {
-    c(th().lsp_status(status))
+/// Colour of a language-server's health dot (`•`), by the core's [`LspDot`] classification —
+/// the status bar, the LSP picker rows and the detail title all classify their server through
+/// `LspDot::of` and paint through here, so they can't disagree about it. (The loop is
+/// event-driven: the colour changes when an `lsp/status_changed` arrives rather than animating.)
+fn lsp_dot_color(dot: LspDot) -> Color {
+    c(th().lsp_dot(dot))
 }
 
 /// Truncate `s` so its display width is at most `max`, appending `…` when the input was longer.
@@ -10975,19 +10974,154 @@ mod tests {
         );
     }
 
+    /// The detail drill-down has to *name* the missing executable — the dot's colour says
+    /// "different", the row says what to install — and must not dress it up as a crash.
     #[test]
-    fn lsp_status_color_maps_states() {
-        assert_eq!(lsp_status_color(&LspStatus::Ready), c(th().ok));
-        assert_eq!(lsp_status_color(&LspStatus::Initializing), c(th().warning));
-        assert_eq!(lsp_status_color(&LspStatus::Restarting), c(th().warning));
-        assert_eq!(
-            lsp_status_color(&LspStatus::Crashed {
-                code: None,
-                message: String::new()
-            }),
-            c(th().error)
+    fn the_lsp_detail_names_a_missing_servers_command() {
+        let detail = crate::picker::LspServerDetail {
+            name: "gopls".into(),
+            language: "go".into(),
+            workspace_root: "/p".into(),
+            status: LspStatus::Missing {
+                command: "gopls".into(),
+            },
+            progress: Vec::new(),
+            scroll: Default::default(),
+        };
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut term = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+        term.draw(|f| draw_lsp_detail(f, &detail, f.area()))
+            .expect("draw");
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Missing") && text.contains("gopls not found on PATH"),
+            "the detail must say what to install:\n{text}"
         );
-        assert_eq!(lsp_status_color(&LspStatus::Stopped), c(th().fg_faint));
+        assert!(
+            !text.contains("Error"),
+            "a server that was never installed did not error:\n{text}"
+        );
+    }
+
+    #[test]
+    fn lsp_dot_color_maps_dots() {
+        assert_eq!(lsp_dot_color(LspDot::Ready), c(th().ok));
+        assert_eq!(lsp_dot_color(LspDot::Busy), c(th().warning));
+        assert_eq!(lsp_dot_color(LspDot::Crashed), c(th().error));
+        assert_eq!(lsp_dot_color(LspDot::Stopped), c(th().fg_faint));
+        // A server that was never installed reads as absent, not as a crash — and in a grey that
+        // survives the status bar's panel ground (see the core's legibility test).
+        assert_eq!(lsp_dot_color(LspDot::Missing), c(th().fg_muted));
+        assert_ne!(lsp_dot_color(LspDot::Missing), lsp_dot_color(LspDot::Crashed));
+    }
+
+    /// The status bar's dot, the LSP picker row's and the detail title's are one answer for one
+    /// server. Painted end to end rather than asserted on the shared function: a site that
+    /// re-derived "busy" by hand, or restyled its span after the fact, comes out here as one glyph
+    /// a different colour from the other two — which is how the bar and the picker drifted once.
+    #[test]
+    fn one_lsp_dot_paints_the_status_bar_the_picker_row_and_the_detail() {
+        use aether_protocol::lsp::{LspServerRef, LspServerStatus};
+        use ratatui::{backend::TestBackend, Terminal};
+        /// Foreground of every `•` cell in a paint, in reading order.
+        fn dot_fgs(width: u16, height: u16, paint: impl FnOnce(&mut Frame)) -> Vec<Color> {
+            let mut term = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+            term.draw(paint).expect("draw");
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[(x, y)].symbol() == "•")
+                .map(|(x, y)| buf[(x, y)].fg)
+                .collect()
+        }
+        let indexing = vec![LspProgress {
+            title: "Indexing".into(),
+            message: None,
+            percentage: None,
+        }];
+        let samples = [
+            (LspStatus::Ready, Vec::new(), LspDot::Ready),
+            (LspStatus::Ready, indexing, LspDot::Busy),
+            (LspStatus::Starting, Vec::new(), LspDot::Busy),
+            (
+                LspStatus::Crashed {
+                    code: Some(1),
+                    message: "boom".into(),
+                },
+                Vec::new(),
+                LspDot::Crashed,
+            ),
+            (
+                LspStatus::Missing {
+                    command: "gopls".into(),
+                },
+                Vec::new(),
+                LspDot::Missing,
+            ),
+            (LspStatus::Stopped, Vec::new(), LspDot::Stopped),
+        ];
+        for (status, progress, dot) in samples {
+            let want = lsp_dot_color(dot);
+
+            let mut editor = crate::app::test_editor_state();
+            editor.lsp_server = Some(LspServerRef {
+                language: "go".into(),
+                workspace_root: "/p".into(),
+            });
+            let mut state = crate::app::test_state(editor);
+            state.lsp_status.insert(
+                ("go".into(), "/p".into()),
+                LspServerStatus {
+                    name: "gopls".into(),
+                    language: "go".into(),
+                    workspace_root: "/p".into(),
+                    status: status.clone(),
+                    progress: progress.clone(),
+                },
+            );
+            // The health dot is the bar's far-right glyph.
+            let bar = *dot_fgs(100, 1, |f| draw_status(f, &state, f.area()))
+                .last()
+                .expect("the status bar shows the buffer's server dot");
+
+            let row = lsp_server_item_spans(
+                LspServerRow {
+                    name: "gopls",
+                    language: "go",
+                    root_label: "",
+                    status: &status,
+                    progress: &progress,
+                },
+                &[],
+                false,
+                60,
+            )[0]
+                .style
+                .fg
+                .expect("the picker row leads with its dot");
+
+            let detail = crate::picker::LspServerDetail {
+                name: "gopls".into(),
+                language: "go".into(),
+                workspace_root: "/p".into(),
+                status: status.clone(),
+                progress: progress.clone(),
+                scroll: Default::default(),
+            };
+            let title = dot_fgs(60, 12, |f| draw_lsp_detail(f, &detail, f.area()))[0];
+
+            assert_eq!(bar, want, "status bar: {status:?} + {} progress", progress.len());
+            assert_eq!(row, want, "picker row: {status:?} + {} progress", progress.len());
+            assert_eq!(title, want, "detail title: {status:?} + {} progress", progress.len());
+        }
     }
 
     #[test]

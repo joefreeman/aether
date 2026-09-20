@@ -1008,7 +1008,9 @@ export interface LspProgress {
 /** Mirrors aether-protocol::lsp::LspStatus (serde internally tagged on `state`). */
 export type LspStatus =
   | { state: "starting" | "initializing" | "ready" | "restarting" | "stopped" }
-  | { state: "crashed"; code?: number | null; message: string };
+  | { state: "crashed"; code?: number | null; message: string }
+  /** The executable wasn't found — not installed, or not on the daemon's PATH for this root. */
+  | { state: "missing"; command: string };
 /** lsp/status_changed payload (also a row in the LSP servers picker). */
 export interface LspServerStatus {
   name: string;

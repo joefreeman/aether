@@ -3204,6 +3204,52 @@ fn lsp_restart_toasts_are_grouped_per_server_and_resolve_to_ready() {
     );
 }
 
+/// Restarting a server that was never installed must say so, not "failed to restart" — pressing
+/// `Ctrl-r` right after installing it is the natural move, and the toast is what tells you whether
+/// the install took.
+#[test]
+fn restarting_an_uninstalled_server_says_it_isnt_installed() {
+    use aether_client::session::Prompt;
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::lsp::{LspServerStatus, LspStatus, LspStatusChanged};
+
+    let status = |st: LspStatus| {
+        Box::new(LspServerStatus {
+            name: "gopls".into(),
+            language: "go".into(),
+            workspace_root: "/p".into(),
+            status: st,
+            progress: vec![],
+        })
+    };
+    let mut s = session();
+    s.prompt = Some(Prompt::LspInfo(status(LspStatus::Missing {
+        command: "gopls".into(),
+    })));
+    let _ = s.on_key(KeyCode::Char('r'), Mods::CTRL, None);
+
+    let fx = s.on_event(Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: LspStatusChanged::NAME.into(),
+        params: serde_json::to_value(&*status(LspStatus::Missing {
+            command: "gopls".into(),
+        }))
+        .unwrap(),
+    }));
+    let body = fx.0.iter().find_map(|e| match e {
+        Effect::Toast { title, body, .. } => Some((title.clone(), body.clone())),
+        _ => None,
+    });
+    assert_eq!(
+        body,
+        Some((
+            "gopls is not installed".into(),
+            Some("gopls not found on PATH".into())
+        ))
+    );
+}
+
 #[test]
 fn diff_toggle_toast_is_grouped() {
     use aether_client::update::Event;

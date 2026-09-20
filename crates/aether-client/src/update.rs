@@ -7460,6 +7460,18 @@ impl Session {
                                 group: Some(group.clone()),
                             })
                         }
+                        // Not "failed to restart": there was nothing to restart. Restarting is the
+                        // natural thing to press after installing the server, so the toast has to
+                        // say it still isn't on the PATH rather than imply the process died.
+                        LspStatus::Missing { command } => {
+                            self.lsp_restart_pending.remove(&group);
+                            Some(Effect::Toast {
+                                title: format!("{} is not installed", s.name),
+                                body: Some(format!("{command} not found on PATH")),
+                                kind: ToastKind::Error,
+                                group: Some(group.clone()),
+                            })
+                        }
                         // Starting / Initializing / Restarting: still in flight — keep waiting.
                         _ => None,
                     }
