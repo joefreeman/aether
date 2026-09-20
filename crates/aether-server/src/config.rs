@@ -1370,27 +1370,31 @@ pub fn list_workspace_names_in(dir: &Path) -> anyhow::Result<Vec<String>> {
 /// Outcome of inferring which configured workspace owns a given path.
 ///
 /// The **whole** answer, deliberately — [`infer_workspace_for_path_in`] decides which workspace
-/// owns a path and nothing else, leaving what to do about `None`/`Ambiguous` to the caller, because
-/// the two callers want opposite things and both are right:
+/// owns a path and nothing else. Its two callers read the answer the same way, and that is the
+/// contract: `One` opens there; `None` and `Ambiguous` both mean **no owner**, and the file opens
+/// in a temporary context.
 ///
-/// - **`ae PATH`** (`aether-ae`'s `resolve_workspace`, before it has even connected) turns
-///   `Ambiguous` into a hard error naming the candidates, because there is a person at a terminal
-///   who can re-run with `--workspace NAME`.
-/// - **`workspace/open_path`** (`handlers::inferred_workspace`) treats it as no answer and falls
-///   back to a temporary context, because a file handed over by the desktop — macOS "Open With", a
-///   Dock drop — has nobody to ask, and refusing to open it would be the worse failure.
+/// - **`workspace/open_path`** (`handlers::inferred_workspace`) has nobody to ask: a file handed
+///   over by the desktop — macOS "Open With", a Dock drop — arrives with no terminal, and refusing
+///   to open it would be the worse failure.
+/// - **`ae PATH`** (`aether-ae`'s `resolve_workspace`, before it has even connected) used to turn
+///   `Ambiguous` into an error asking for `--workspace NAME`, on the theory that a person at a
+///   terminal can re-run. The launch that hits a tie most can't: `git commit` running `$EDITOR`
+///   chose the argv, and the only workaround was a per-repo `GIT_EDITOR`. It now reads the answer
+///   as the server does.
 ///
-/// So: one matching rule, two policies. A third caller should pick one of those two readings rather
-/// than invent a third — and if it needs a *different* rule, that belongs in the matcher below where
-/// every caller gets it.
+/// `Ambiguous` stays its own variant because it is rare and worth logging: it survives only when
+/// several workspaces contain the path at the same depth **and** recency can't separate them (see
+/// [`match_workspace`]) — in practice, none of them has ever been activated. A caller that wants a
+/// different *rule* changes the matcher, where every caller gets it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceMatch {
-    /// Exactly one workspace (most-specific root wins) owns the path.
+    /// Exactly one workspace owns the path: the most specific root, then the most recently used.
     One(String),
     /// No configured workspace's roots contain the path.
     None,
-    /// Several workspaces contain the path with equal specificity — the caller must disambiguate.
-    /// Names are sorted.
+    /// Several workspaces contain the path with equal specificity and equal recency — nothing left
+    /// to choose on, so the caller opens a temporary context. Names are sorted.
     Ambiguous(Vec<String>),
 }
 
@@ -1430,15 +1434,22 @@ pub fn resolve_path_for_match(path: &Path) -> PathBuf {
 /// Infer which configured workspace in `dir` owns `path` by matching it against every workspace's
 /// canonical roots. The path is resolved (and made absolute) first. Most-specific match wins: the
 /// workspace with the deepest containing root is chosen, so a workspace rooted inside another
-/// doesn't collide with its parent. A genuine tie at the deepest root is [`WorkspaceMatch::Ambiguous`];
-/// see that type for the two ways callers read this answer.
+/// doesn't collide with its parent. A tie at the deepest root — two workspaces over one checkout —
+/// goes to the one most recently activated per `sessions`; a tie that survives that is
+/// [`WorkspaceMatch::Ambiguous`], which callers read as no owner.
 ///
 /// **The only inference entry point**, in-process and out. `dir` is a parameter and not resolved
 /// here for the reason given on [`load_workspace_in`]: a running server must read its workspaces
 /// through `ServerState::workspaces_dir` (redirectable by a test), and a convenience wrapper that
 /// resolved the profile directory itself would be the thing a server-side caller reached for by
-/// mistake. `aether-ae` runs outside the server and passes [`workspaces_dir`] explicitly.
-pub fn infer_workspace_for_path_in(dir: &Path, path: &Path) -> anyhow::Result<WorkspaceMatch> {
+/// mistake. `sessions` is passed for the same reason — the server reads the file through
+/// `ServerState::sessions_path`, unset in tests, where recency is simply off — and `aether-ae`
+/// runs outside the server and passes [`workspaces_dir`] and [`workspace_sessions_path`] itself.
+pub fn infer_workspace_for_path_in(
+    dir: &Path,
+    sessions: &WorkspaceSessions,
+    path: &Path,
+) -> anyhow::Result<WorkspaceMatch> {
     let target = resolve_path_for_match(path);
     let mut workspaces: Vec<(String, Vec<PathBuf>)> = Vec::new();
     for name in list_workspace_names_in(dir)? {
@@ -1454,13 +1465,26 @@ pub fn infer_workspace_for_path_in(dir: &Path, path: &Path) -> anyhow::Result<Wo
             .collect();
         workspaces.push((name, roots));
     }
-    Ok(match_workspace(&target, &workspaces))
+    Ok(match_workspace(&target, &workspaces, sessions))
 }
 
-/// Pure core of [`infer_workspace_for_path`]: pick the most-specific workspace for a resolved target
-/// among each workspace's canonical roots. Kept free of disk access so it can be unit-tested.
-fn match_workspace(target: &Path, workspaces: &[(String, Vec<PathBuf>)]) -> WorkspaceMatch {
-    let mut matches: Vec<(String, usize)> = Vec::new();
+/// Pure core of [`infer_workspace_for_path_in`]: pick the most-specific workspace for a resolved
+/// target among each workspace's canonical roots, then break a tie by recency. Kept free of disk
+/// access so it can be unit-tested.
+///
+/// Specificity first, recency second, never the other way round: a workspace rooted inside another
+/// wins on depth however stale it is, and the session stamps only decide between workspaces that
+/// contain the path at the *same* depth. Among those, the most recently activated wins —
+/// [`WorkspaceSession::activated_at`], the stamp the switcher sorts on, so being in a worktree of a
+/// workspace counts as being in the workspace. One never activated has no stamp, so a single
+/// stamped candidate wins outright; only an exact tie — in practice, none of them stamped — is
+/// [`WorkspaceMatch::Ambiguous`].
+fn match_workspace(
+    target: &Path,
+    workspaces: &[(String, Vec<PathBuf>)],
+    sessions: &WorkspaceSessions,
+) -> WorkspaceMatch {
+    let mut by_depth: Vec<(String, usize)> = Vec::new();
     for (name, roots) in workspaces {
         let best = roots
             .iter()
@@ -1468,23 +1492,44 @@ fn match_workspace(target: &Path, workspaces: &[(String, Vec<PathBuf>)]) -> Work
             .map(|root| root.components().count())
             .max();
         if let Some(depth) = best {
-            matches.push((name.clone(), depth));
+            by_depth.push((name.clone(), depth));
         }
     }
-    let Some(max_depth) = matches.iter().map(|(_, d)| *d).max() else {
+    let deepest = leaders(by_depth);
+    if deepest.is_empty() {
         return WorkspaceMatch::None;
-    };
-    let mut winners: Vec<String> = matches
+    }
+    let by_recency = deepest
         .into_iter()
-        .filter(|(_, d)| *d == max_depth)
-        .map(|(name, _)| name)
+        .map(|name| {
+            let at = sessions
+                .workspaces
+                .get(&name)
+                .map_or(0, WorkspaceSession::activated_at);
+            (name, at)
+        })
         .collect();
-    winners.sort();
+    let mut winners = leaders(by_recency);
     if winners.len() == 1 {
-        WorkspaceMatch::One(winners.into_iter().next().unwrap())
+        WorkspaceMatch::One(winners.pop().unwrap())
     } else {
         WorkspaceMatch::Ambiguous(winners)
     }
+}
+
+/// The names scoring highest on their key, sorted — one stage of [`match_workspace`]'s ranking,
+/// applied first to root depth and then, among the deepest, to activation recency.
+fn leaders<K: Ord + Copy>(scored: Vec<(String, K)>) -> Vec<String> {
+    let Some(top) = scored.iter().map(|(_, k)| *k).max() else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = scored
+        .into_iter()
+        .filter(|(_, k)| *k == top)
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    names
 }
 
 pub fn runtime_info_path() -> anyhow::Result<PathBuf> {
@@ -1636,11 +1681,35 @@ mod tests {
         (name.to_string(), roots.iter().map(PathBuf::from).collect())
     }
 
+    /// No workspace has ever been activated: the session file of a fresh install, and what a test
+    /// server with `sessions_path` unset behaves like.
+    fn never_activated() -> WorkspaceSessions {
+        WorkspaceSessions::default()
+    }
+
+    /// A session file whose named workspaces were last activated at the given Unix-ms stamps (the
+    /// base context's own). Anything unnamed was never activated.
+    fn activated(stamps: &[(&str, u64)]) -> WorkspaceSessions {
+        let mut sessions = WorkspaceSessions::default();
+        for (name, at) in stamps {
+            sessions
+                .workspaces
+                .entry(name.to_string())
+                .or_default()
+                .last_activated_at = *at;
+        }
+        sessions
+    }
+
     #[test]
     fn no_workspace_contains_path() {
         let workspaces = [wks("work", &["/home/joe/work"])];
         assert_eq!(
-            match_workspace(Path::new("/tmp/elsewhere/file.rs"), &workspaces),
+            match_workspace(
+                Path::new("/tmp/elsewhere/file.rs"),
+                &workspaces,
+                &never_activated()
+            ),
             WorkspaceMatch::None
         );
     }
@@ -1652,7 +1721,11 @@ mod tests {
             wks("dots", &["/home/joe/.config"]),
         ];
         assert_eq!(
-            match_workspace(Path::new("/home/joe/work/src/main.rs"), &workspaces),
+            match_workspace(
+                Path::new("/home/joe/work/src/main.rs"),
+                &workspaces,
+                &never_activated()
+            ),
             WorkspaceMatch::One("work".to_string())
         );
     }
@@ -1661,7 +1734,7 @@ mod tests {
     fn path_equal_to_root_matches() {
         let workspaces = [wks("work", &["/home/joe/work"])];
         assert_eq!(
-            match_workspace(Path::new("/home/joe/work"), &workspaces),
+            match_workspace(Path::new("/home/joe/work"), &workspaces, &never_activated()),
             WorkspaceMatch::One("work".to_string())
         );
     }
@@ -1674,26 +1747,117 @@ mod tests {
             wks("sub", &["/home/joe/work/sub"]),
         ];
         assert_eq!(
-            match_workspace(Path::new("/home/joe/work/sub/file.rs"), &workspaces),
+            match_workspace(
+                Path::new("/home/joe/work/sub/file.rs"),
+                &workspaces,
+                &never_activated()
+            ),
             WorkspaceMatch::One("sub".to_string())
         );
         // A sibling under `work` but outside `sub` still resolves to `work`.
         assert_eq!(
-            match_workspace(Path::new("/home/joe/work/other/file.rs"), &workspaces),
+            match_workspace(
+                Path::new("/home/joe/work/other/file.rs"),
+                &workspaces,
+                &never_activated()
+            ),
             WorkspaceMatch::One("work".to_string())
         );
     }
 
     #[test]
-    fn equal_depth_tie_is_ambiguous() {
-        // Two workspaces share the same root — a genuine tie.
+    fn equal_depth_tie_with_no_recency_is_ambiguous() {
+        // Two workspaces share the same root and neither has ever been activated — a genuine tie,
+        // with nothing left to break it on.
         let workspaces = [
             wks("alpha", &["/home/joe/shared"]),
             wks("beta", &["/home/joe/shared"]),
         ];
         assert_eq!(
-            match_workspace(Path::new("/home/joe/shared/x.rs"), &workspaces),
+            match_workspace(
+                Path::new("/home/joe/shared/x.rs"),
+                &workspaces,
+                &never_activated()
+            ),
             WorkspaceMatch::Ambiguous(vec!["alpha".to_string(), "beta".to_string()])
+        );
+    }
+
+    #[test]
+    fn equal_depth_tie_goes_to_the_most_recently_activated() {
+        // Two workspaces over one checkout: the one used last is where the file opens.
+        let workspaces = [
+            wks("alpha", &["/home/joe/shared"]),
+            wks("beta", &["/home/joe/shared"]),
+        ];
+        let target = Path::new("/home/joe/shared/x.rs");
+        assert_eq!(
+            match_workspace(
+                target,
+                &workspaces,
+                &activated(&[("alpha", 10), ("beta", 20)])
+            ),
+            WorkspaceMatch::One("beta".to_string())
+        );
+        assert_eq!(
+            match_workspace(
+                target,
+                &workspaces,
+                &activated(&[("alpha", 30), ("beta", 20)])
+            ),
+            WorkspaceMatch::One("alpha".to_string())
+        );
+        // Never activated is older than any stamp: one used once beats one never used.
+        assert_eq!(
+            match_workspace(target, &workspaces, &activated(&[("beta", 1)])),
+            WorkspaceMatch::One("beta".to_string())
+        );
+    }
+
+    #[test]
+    fn a_bound_context_stamp_counts_for_its_workspace() {
+        // `alpha` was last used through a worktree context, which is still using `alpha`. Its
+        // base stamp is older than `beta`'s, so reading only that would pick `beta` — the same
+        // trap the switcher's ordering avoids with `activated_at`.
+        let workspaces = [
+            wks("alpha", &["/home/joe/shared"]),
+            wks("beta", &["/home/joe/shared"]),
+        ];
+        let mut sessions = activated(&[("alpha", 10), ("beta", 20)]);
+        sessions
+            .workspaces
+            .get_mut("alpha")
+            .unwrap()
+            .contexts
+            .push(WorkspaceContextSession {
+                worktrees: BTreeMap::from([(
+                    PathBuf::from("/home/joe/shared-feature"),
+                    "feature".to_string(),
+                )]),
+                last_activated_at: 30,
+                views: Vec::new(),
+            });
+        assert_eq!(
+            match_workspace(Path::new("/home/joe/shared/x.rs"), &workspaces, &sessions),
+            WorkspaceMatch::One("alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn recency_never_overrides_depth() {
+        // `alpha` is far more recent, but `beta`'s root is deeper: specificity decides first, and
+        // the stamps only ever choose among workspaces tied on it.
+        let workspaces = [
+            wks("alpha", &["/home/joe"]),
+            wks("beta", &["/home/joe/work"]),
+        ];
+        assert_eq!(
+            match_workspace(
+                Path::new("/home/joe/work/file.rs"),
+                &workspaces,
+                &activated(&[("alpha", 100)])
+            ),
+            WorkspaceMatch::One("beta".to_string())
         );
     }
 
@@ -1705,7 +1869,11 @@ mod tests {
             wks("beta", &["/home/joe/work"]),
         ];
         assert_eq!(
-            match_workspace(Path::new("/home/joe/work/file.rs"), &workspaces),
+            match_workspace(
+                Path::new("/home/joe/work/file.rs"),
+                &workspaces,
+                &never_activated()
+            ),
             WorkspaceMatch::One("beta".to_string())
         );
     }

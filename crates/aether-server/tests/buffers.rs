@@ -2343,6 +2343,123 @@ async fn open_path_with_no_workspace_infers_the_workspace_that_owns_the_file() {
     drop(server);
 }
 
+/// Two workspaces over one checkout, and a chooser-boot client opening a file in it. Neither
+/// contains the file more specifically than the other, so the session stamps decide: the workspace
+/// activated most recently — by *any* client — is where the file opens. This is what lands a commit
+/// message launched from a terminal next to the editor you were just in, instead of refusing to
+/// open it or dropping it in a temporary context.
+///
+/// The stamp comes from a real activation rather than a hand-written session file, so the whole
+/// chain is under test: activate → stamped write before the reply → read by the next inference.
+#[tokio::test]
+async fn open_path_with_no_workspace_breaks_a_tie_by_recency() {
+    let (dir, store, root) = shared_root_store();
+    let mut server = aether_server::spawn_for_test_multi_with_sessions(
+        vec![
+            ("alpha".to_string(), vec![root.clone()]),
+            ("beta".to_string(), vec![root.clone()]),
+        ],
+        Some(dir.path().join("sessions.json")),
+    )
+    .await
+    .unwrap();
+    server.state.lock().await.workspaces_dir = Some(store);
+    server.keep_alive(dir);
+
+    // Someone was just working in `beta`.
+    let mut editor = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut editor,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "beta".into(),
+            open_last: false,
+        },
+    )
+    .await;
+
+    // The chooser-boot client: nothing activated, a path both workspaces contain.
+    let mut ws = Ws::connect(&server).await;
+    let file = root.join("shared.rs").display().to_string();
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: file.clone(),
+            transient: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        opened.workspace.name, "beta",
+        "the most recently activated of the two, not a temporary context"
+    );
+    let buf = opened.opened.expect("open_path returns the opened buffer");
+    assert_eq!(buf.path.as_deref(), Some(file.as_str()));
+    drop(server);
+}
+
+/// The residual tie: the same two workspaces, but nothing has ever activated either — there is no
+/// session file at all, which is also what every test server without one looks like. Nothing is
+/// left to choose on, and a desktop open has nobody to ask, so the file opens in a temporary
+/// context rather than failing.
+#[tokio::test]
+async fn open_path_with_no_workspace_and_an_unbreakable_tie_opens_a_temporary_context() {
+    let (dir, store, root) = shared_root_store();
+    let mut server = spawn_for_test_multi(vec![
+        ("alpha".to_string(), vec![root.clone()]),
+        ("beta".to_string(), vec![root.clone()]),
+    ])
+    .await
+    .unwrap();
+    server.state.lock().await.workspaces_dir = Some(store);
+    server.keep_alive(dir);
+
+    let mut ws = Ws::connect(&server).await;
+    let file = root.join("shared.rs").display().to_string();
+    let opened: WorkspaceActivateResult = send_request::<WorkspaceOpenPath>(
+        &mut ws,
+        &WorkspaceOpenPathParams {
+            path: file.clone(),
+            transient: None,
+            create_if_missing: false,
+            jump_to: None,
+        },
+    )
+    .await;
+
+    assert!(
+        aether_protocol::is_ephemeral_workspace_id(&opened.workspace.name),
+        "with no recency to choose on, a tie opens a temporary context, not {:?}",
+        opened.workspace.name
+    );
+    let buf = opened.opened.expect("open_path returns the opened buffer");
+    assert_eq!(buf.path.as_deref(), Some(file.as_str()));
+    drop(server);
+}
+
+/// A workspace store holding `alpha` and `beta` over one root, and a file in that root — the shape
+/// of both tie tests. Returns the tempdir (keep it alive), the store, and the shared root.
+fn shared_root_store() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(dir.path()).unwrap();
+    let (store, root) = (base.join("workspaces"), base.join("shared"));
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("shared.rs"), "fn shared() {}\n").unwrap();
+    // On disk as well as in memory: the on-disk form is the only one inference can see.
+    for name in ["alpha", "beta"] {
+        std::fs::write(
+            store.join(format!("{name}.toml")),
+            format!("[[roots]]\npath = {:?}\n", root.display().to_string()),
+        )
+        .unwrap();
+    }
+    (dir, store, root)
+}
+
 /// The other half of the inference rule: it only applies to a client with **nothing** active. Once
 /// you are in a workspace, an explicit open attaches there — as a guest for a file another workspace
 /// owns — rather than yanking you across into that other workspace.

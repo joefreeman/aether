@@ -514,7 +514,13 @@ pub async fn launch(state: SharedState, key: LspServerKey, spec: LspServerSpec, 
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(server = %key.language, error = %e, "failed to spawn language server");
-            set_status(&state, &key, generation, spawn_failure_status(spec.command, &e)).await;
+            set_status(
+                &state,
+                &key,
+                generation,
+                spawn_failure_status(spec.command, &e),
+            )
+            .await;
             return;
         }
     };

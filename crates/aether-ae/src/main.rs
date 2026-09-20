@@ -11,9 +11,10 @@
 //!
 //! `edit` is the default command: a bare `ae` (or `ae file.rs`) runs it, so the common case needs
 //! no subcommand. With a PATH, the workspace is inferred by matching it against configured workspace
-//! roots; a bare `ae` (no PATH) opens the workspace picker rather than guessing from the working
-//! directory. `-w/--workspace` overrides inference, and `ae edit ...` is the explicit form for when a
-//! PATH would otherwise collide with the `server` subcommand name.
+//! roots (the most specific root, then the most recently used workspace when two share it); a bare
+//! `ae` (no PATH) opens the workspace picker rather than guessing from the working directory.
+//! `-w/--workspace` overrides inference, and `ae edit ...` is the explicit form for when a PATH
+//! would otherwise collide with the `server` subcommand name.
 //!
 //! A PATH *without* `-w` also tethers the client to the opened buffer: closing that buffer — `Space
 //! x`, or `Space Alt-x` to save-and-close — exits the client, giving `ae file` the `$EDITOR`
@@ -127,8 +128,9 @@ struct EditArgs {
     /// Workspace to open, overriding inference from PATH.
     ///
     /// Config lives at `$XDG_CONFIG_HOME/aether/profiles/<profile>/workspaces/<name>.toml`.
-    /// Omit to infer from PATH; a PATH outside every workspace opens a temporary one, and with no
-    /// PATH at all the picker opens.
+    /// Omit to infer from PATH: the workspace whose roots contain it, or the most recently used of
+    /// several that do. A PATH no workspace claims opens a temporary one, and with no PATH at all
+    /// the picker opens.
     #[arg(short = 'w', long)]
     workspace: Option<String>,
 
@@ -445,46 +447,64 @@ fn split_path_and_jump(arg: &str) -> (String, Option<(u32, u32)>) {
     }
 }
 
-/// Decide which workspace to open. `--workspace` always wins. Otherwise infer from the PATH: a path
-/// inside exactly one workspace opens there; a path inside *several* is an error the user must
-/// disambiguate. A path inside *no* configured workspace is no longer an error — we return `None`,
+/// Decide which workspace to open. `--workspace` always wins. Otherwise infer from the PATH: the
+/// workspace whose roots contain it opens — the most specific root, and between two workspaces over
+/// one checkout, the most recently activated. A path that leaves no workspace to open is `None`,
 /// and the client opens it in an ephemeral "(no workspace)" context: a file in a buffer
-/// (`ae /etc/hosts`), a directory as that context's root (`ae ~/notes`). With no PATH at all, we
-/// return `None` so a bare `ae` opens the workspace picker — the working directory is deliberately
-/// *not* used to guess a workspace (it only resolves relative file paths).
+/// (`ae /etc/hosts`), a directory as that context's root (`ae ~/notes`). That is a path *outside*
+/// every workspace, and one that several never-used workspaces contain alike — which used to be an
+/// error asking for `--workspace NAME`, an answer the launch that hits it most can't give: a
+/// `git commit` running `$EDITOR` chose the argv. With no PATH at all, we return `None` so a bare
+/// `ae` opens the workspace picker — the working directory is deliberately *not* used to guess a
+/// workspace (it only resolves relative file paths).
 ///
 /// Runs **here**, before the launcher has connected to anything, because two of its consumers can't
 /// wait for a server: `--web` needs the name to build the URL it hands the browser (and in the
 /// pure-launcher case never connects at all), and a directory launch needs it to decide whether to
 /// raise the explorer over a workspace or root a temporary context at the directory. The server
-/// applies the same rule for the opens that never pass through here at all — see
-/// [`aether_server::WorkspaceMatch`] for why the two read `Ambiguous` differently.
+/// applies the same rule, read the same way, for the opens that never pass through here at all —
+/// see [`aether_server::WorkspaceMatch`].
 fn resolve_workspace(edit: &EditArgs) -> anyhow::Result<Option<String>> {
-    use aether_server::WorkspaceMatch;
-
     if edit.workspace.is_some() {
         return Ok(edit.workspace.clone());
     }
 
-    if let Some(path) = &edit.path {
-        let dir = aether_server::workspaces_dir()?;
-        return match aether_server::infer_workspace_for_path_in(&dir, std::path::Path::new(path))? {
-            WorkspaceMatch::One(name) => Ok(Some(name)),
-            // Outside every workspace: open workspace-lessly (the client falls back to open-from-path).
-            WorkspaceMatch::None => Ok(None),
-            WorkspaceMatch::Ambiguous(names) => anyhow::bail!(
-                "{path} is within multiple workspaces ({}) — disambiguate with `--workspace NAME`",
-                names.join(", ")
-            ),
-        };
-    }
+    let Some(path) = &edit.path else {
+        // No `--workspace` and no path: open the workspace picker rather than guessing from the
+        // working directory. The working directory is only meaningful for resolving a relative
+        // *file* path (the inference below, and the open-from-path overlay), not as a standalone
+        // workspace signal — a bare `ae` should land on the (recency-sorted) chooser regardless of
+        // where it's launched from.
+        return Ok(None);
+    };
 
-    // No `--workspace` and no path: open the workspace picker rather than guessing from the working
-    // directory. The working directory is only meaningful for resolving a relative *file* path
-    // (the `path` branch above, and the open-from-path overlay), not as a standalone workspace
-    // signal — a bare `ae` should land on the (recency-sorted) chooser regardless of where it's
-    // launched from.
-    Ok(None)
+    let dir = aether_server::workspaces_dir()?;
+    // The activation stamps that break a tie. Best-effort, as the chooser's recency sort is: an
+    // unreadable session file means no recency, and a tie then opens a temporary context rather
+    // than failing the launch over machine-managed state.
+    let sessions = aether_server::workspace_sessions_path()
+        .and_then(|p| aether_server::load_workspace_sessions_at(&p))
+        .unwrap_or_default();
+    infer_workspace(&dir, &sessions, std::path::Path::new(path))
+}
+
+/// The PATH half of [`resolve_workspace`], over an explicit workspace store and session file so it
+/// can be tested against a tempdir rather than the profile's own.
+fn infer_workspace(
+    dir: &std::path::Path,
+    sessions: &aether_server::WorkspaceSessions,
+    path: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    use aether_server::WorkspaceMatch;
+    Ok(
+        match aether_server::infer_workspace_for_path_in(dir, sessions, path)? {
+            WorkspaceMatch::One(name) => Some(name),
+            // Outside every workspace, or tied between several with nothing to choose on: open
+            // workspace-lessly. The client falls back to open-from-path, which lands the file in
+            // a temporary context.
+            WorkspaceMatch::None | WorkspaceMatch::Ambiguous(_) => None,
+        },
+    )
 }
 
 /// Decide whether to launch the GUI when the user didn't force a client. `--gui`/`--tui` win
@@ -822,6 +842,58 @@ mod tests {
             resolve_workspace(&edit).unwrap(),
             Some("myproj".to_string())
         );
+    }
+
+    /// Two workspaces over one root, written to a throwaway store the way the profile's own would
+    /// be, plus a file they both contain — the `$EDITOR` shape: a commit message in a checkout two
+    /// workspaces share. Returns the store and the file; the caller removes the store's parent.
+    fn tied_store(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aether-tie-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, shared) = (dir.join("workspaces"), dir.join("shared"));
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        // Canonical, as the matcher compares canonical roots (`/tmp` may be a symlink).
+        let shared = std::fs::canonicalize(&shared).unwrap();
+        for name in ["alpha", "beta"] {
+            std::fs::write(
+                store.join(format!("{name}.toml")),
+                format!("[[roots]]\npath = {:?}\n", shared.display().to_string()),
+            )
+            .unwrap();
+        }
+        let file = shared.join("COMMIT_EDITMSG");
+        std::fs::write(&file, b"\n").unwrap();
+        (store, file)
+    }
+
+    #[test]
+    fn a_tie_between_never_used_workspaces_opens_without_one() {
+        let (store, file) = tied_store("fresh");
+        assert_eq!(
+            infer_workspace(&store, &aether_server::WorkspaceSessions::default(), &file).unwrap(),
+            None,
+            "a tie is not an error: `$EDITOR` can't add `--workspace` to an argv git chose"
+        );
+        std::fs::remove_dir_all(store.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_most_recently_used_workspace() {
+        let (store, file) = tied_store("recent");
+        let mut sessions = aether_server::WorkspaceSessions::default();
+        sessions.workspaces.insert(
+            "beta".into(),
+            aether_server::WorkspaceSession {
+                last_activated_at: 5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            infer_workspace(&store, &sessions, &file).unwrap(),
+            Some("beta".to_string())
+        );
+        std::fs::remove_dir_all(store.parent().unwrap()).ok();
     }
 
     #[test]

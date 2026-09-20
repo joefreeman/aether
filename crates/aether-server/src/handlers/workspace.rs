@@ -1257,23 +1257,43 @@ async fn client_has_workspace(state: &SharedState, client_id: ClientId) -> bool 
         .is_some_and(|c| c.active_workspace.is_some())
 }
 
-/// The configured workspace that owns `path`, when exactly one does. `None` for a path outside every
-/// workspace (the temporary-context case) and for one that several claim with equal specificity —
-/// a file handed over by the desktop has nobody to ask, and a temporary context is a better answer
-/// than an error.
+/// The configured workspace that owns `path`, when one does. `None` for a path outside every
+/// workspace (the temporary-context case) and for one that several claim with equal specificity
+/// and equal recency — a file handed over by the desktop has nobody to ask, and a temporary context
+/// is a better answer than an error.
 ///
 /// The rule itself is [`crate::config::infer_workspace_for_path_in`], shared with `aether-ae`'s
 /// `resolve_workspace` — which the desktop open routes never reach, since Finder passes the document
-/// by Apple event rather than in argv. Only the reading of an ambiguous answer differs between the
-/// two; see [`crate::config::WorkspaceMatch`].
+/// by Apple event rather than in argv. Both read its answer the same way; see
+/// [`crate::config::WorkspaceMatch`].
 ///
 /// Reads the workspace TOMLs, so it runs outside the state lock (like `activate_context`'s cold
 /// load) and via `workspaces_dir` rather than the profile default, so tests see their own tempdir.
+/// The session file, which breaks a tie by recency, is read *under* the lock like the switcher's
+/// ordering is: `persist_workspace_session` writes it under the lock, so this can never see a torn
+/// write. Unset (tests, embeddings) means no recency, and a tie stays a tie.
 async fn inferred_workspace(state: &SharedState, path: &std::path::Path) -> Option<String> {
-    let dir = state.lock().await.workspaces_dir().ok()?;
-    match crate::config::infer_workspace_for_path_in(&dir, path) {
+    let (dir, sessions) = {
+        let s = state.lock().await;
+        let dir = s.workspaces_dir().ok()?;
+        let sessions = s
+            .sessions_path
+            .as_deref()
+            .and_then(|p| crate::config::load_workspace_sessions_at(p).ok())
+            .unwrap_or_default();
+        (dir, sessions)
+    };
+    match crate::config::infer_workspace_for_path_in(&dir, &sessions, path) {
         Ok(crate::config::WorkspaceMatch::One(name)) => Some(name),
-        Ok(_) => None,
+        Ok(crate::config::WorkspaceMatch::None) => None,
+        Ok(crate::config::WorkspaceMatch::Ambiguous(names)) => {
+            tracing::debug!(
+                path = %path.display(),
+                candidates = ?names,
+                "several never-activated workspaces contain the path; opening a temporary context"
+            );
+            None
+        }
         Err(e) => {
             tracing::warn!(error = %e, "could not infer a workspace for an open-from-path");
             None

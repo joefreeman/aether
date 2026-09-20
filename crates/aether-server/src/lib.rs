@@ -35,9 +35,9 @@ mod wrap;
 
 pub use config::{
     active_profile, ensure_profile_port, infer_workspace_for_path_in, list_profiles,
-    profile_idle_timeout_secs, running_server_pid, set_active_profile, workspaces_dir,
-    ProfileEntry, WorkspaceConfig, WorkspaceMatch, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_PROFILE,
-    SERVER_PORT,
+    load_workspace_sessions_at, profile_idle_timeout_secs, running_server_pid, set_active_profile,
+    workspace_sessions_path, workspaces_dir, ProfileEntry, WorkspaceConfig, WorkspaceMatch,
+    WorkspaceSession, WorkspaceSessions, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_PROFILE, SERVER_PORT,
 };
 /// Declared projects; re-exported for [`spawn_for_test_with_projects`].
 pub use config::{ProjectEntry, ProjectRef};
