@@ -926,7 +926,11 @@ mod tests {
             LspStatus::Initializing,
             LspStatus::Restarting,
         ] {
-            assert_eq!(LspDot::of(&transitional, &[]), LspDot::Busy, "{transitional:?}");
+            assert_eq!(
+                LspDot::of(&transitional, &[]),
+                LspDot::Busy,
+                "{transitional:?}"
+            );
             assert_eq!(
                 LspDot::of(&transitional, &indexing),
                 LspDot::Busy,
@@ -966,7 +970,9 @@ mod tests {
                 "fg-muted" => t.fg_muted,
                 "fg-dim" => t.fg_dim,
                 "fg-faint" => t.fg_faint,
-                other => panic!("theme.css colours an LSP dot with --{other}; teach this test that role"),
+                other => {
+                    panic!("theme.css colours an LSP dot with --{other}; teach this test that role")
+                }
             }
         }
         for dot in LspDot::ALL {
@@ -980,7 +986,9 @@ mod tests {
                 .lines()
                 .map(str::trim)
                 .find(|l| l.starts_with(&selector))
-                .unwrap_or_else(|| panic!("web/src/theme.css has no `{selector}` rule for {dot:?}"));
+                .unwrap_or_else(|| {
+                    panic!("web/src/theme.css has no `{selector}` rule for {dot:?}")
+                });
             let var = rule
                 .split("var(--")
                 .nth(1)

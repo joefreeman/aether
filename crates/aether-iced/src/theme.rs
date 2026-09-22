@@ -443,6 +443,7 @@ mod tests {
         assert_eq!(diagnostic_color(dark, S::Hint), c(0xd8dee9)); // NORD4 — fg, not a hue
         assert_eq!(lsp_dot_color(dark, LspDot::Ready), c(0xa3be8c)); // NORD14
         assert_eq!(lsp_dot_color(dark, LspDot::Stopped), c(0x4c566a)); // NORD3
+
         // NORD3_BRIGHTER — absent, not the crash red, and legible on the bar.
         assert_eq!(lsp_dot_color(dark, LspDot::Missing), c(0x7b88a1));
         // Light resolves through its own table.

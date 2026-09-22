@@ -42,12 +42,12 @@ pub use config::{
 /// Declared projects; re-exported for [`spawn_for_test_with_projects`].
 pub use config::{ProjectEntry, ProjectRef};
 
-pub use process::shed_build_environment;
 /// Dummy-LSP test fixture types (see [`spawn_for_test_with_lsp`]); re-exported for integration tests.
 pub use lsp::dummy::{
     DiagnosticsTrigger, DummyDiagnostic, DummyDocSymbol, DummyLspConfig, DummyRange, DummySymbol,
     DummyTextEdit,
 };
+pub use process::shed_build_environment;
 pub use server::{
     run, run_with_listener, spawn_for_test, spawn_for_test_full, spawn_for_test_multi,
     spawn_for_test_multi_with_persistence, spawn_for_test_multi_with_sessions,

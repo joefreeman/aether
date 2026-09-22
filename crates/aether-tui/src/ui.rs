@@ -11020,7 +11020,10 @@ mod tests {
         // A server that was never installed reads as absent, not as a crash — and in a grey that
         // survives the status bar's panel ground (see the core's legibility test).
         assert_eq!(lsp_dot_color(LspDot::Missing), c(th().fg_muted));
-        assert_ne!(lsp_dot_color(LspDot::Missing), lsp_dot_color(LspDot::Crashed));
+        assert_ne!(
+            lsp_dot_color(LspDot::Missing),
+            lsp_dot_color(LspDot::Crashed)
+        );
     }
 
     /// The status bar's dot, the LSP picker row's and the detail title's are one answer for one
@@ -11104,9 +11107,9 @@ mod tests {
                 false,
                 60,
             )[0]
-                .style
-                .fg
-                .expect("the picker row leads with its dot");
+            .style
+            .fg
+            .expect("the picker row leads with its dot");
 
             let detail = crate::picker::LspServerDetail {
                 name: "gopls".into(),
@@ -11118,9 +11121,24 @@ mod tests {
             };
             let title = dot_fgs(60, 12, |f| draw_lsp_detail(f, &detail, f.area()))[0];
 
-            assert_eq!(bar, want, "status bar: {status:?} + {} progress", progress.len());
-            assert_eq!(row, want, "picker row: {status:?} + {} progress", progress.len());
-            assert_eq!(title, want, "detail title: {status:?} + {} progress", progress.len());
+            assert_eq!(
+                bar,
+                want,
+                "status bar: {status:?} + {} progress",
+                progress.len()
+            );
+            assert_eq!(
+                row,
+                want,
+                "picker row: {status:?} + {} progress",
+                progress.len()
+            );
+            assert_eq!(
+                title,
+                want,
+                "detail title: {status:?} + {} progress",
+                progress.len()
+            );
         }
     }
 

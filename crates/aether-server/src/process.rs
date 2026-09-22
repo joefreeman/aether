@@ -54,8 +54,7 @@ const BUILD_CONTEXT_PREFIXES: &[&str] = &["CARGO_PKG_", "CARGO_BIN_EXE_"];
 /// runs onto whatever `rust-toolchain.toml` pins, which is a different build, in a different set
 /// of units, on a disk that does not have room for a third.
 fn is_build_context(key: &str) -> bool {
-    BUILD_CONTEXT_VARS.contains(&key)
-        || BUILD_CONTEXT_PREFIXES.iter().any(|p| key.starts_with(p))
+    BUILD_CONTEXT_VARS.contains(&key) || BUILD_CONTEXT_PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
 /// Drop the build context `cargo run` left in this process, so that nothing spawned from here can
@@ -1145,7 +1144,10 @@ mod tests {
             "CARGO_BIN_EXE_ae",
             "RUST_RECURSION_COUNT",
         ] {
-            assert!(is_build_context(injected), "{injected} is cargo's, not the user's");
+            assert!(
+                is_build_context(injected),
+                "{injected} is cargo's, not the user's"
+            );
         }
         for kept in [
             // Ordinary user configuration a child running cargo still needs.
