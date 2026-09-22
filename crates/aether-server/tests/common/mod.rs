@@ -50,15 +50,16 @@ pub use aether_protocol::git::{
 };
 pub use aether_protocol::input::{
     BlockDepthParams, BlockUnit, BufferOnlyParams, CaseKind, CommentStyle, CountedEditParams,
-    EditRedo, EditResult, EditUndo, InputAdjustNumber, InputAdjustNumberParams, InputBackspace,
-    InputBlockDepth, InputChange, InputDedent, InputDelete, InputDeleteBlock, InputDeleteWord,
-    InputDeleteWordParams, InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines,
-    InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenBlock,
-    InputOpenLine, InputOpenLineParams, InputPasteBlock, InputSurround, InputSurroundParams,
-    InputTab, InputText, InputTextParams, InputToggleComment, InputToggleTask, InputTransformCase,
-    InputTransformCaseParams, InputUnsurround, InputUnsurroundParams, LineSide, MoveBlockParams,
-    OpenBlockParams, PasteBlockParams, SurroundTarget, ToggleCommentParams, ToggleTaskParams,
-    UndoRedoParams, UndoResult,
+    EditRedo, EditResult, EditUndo, EditUndoGroup, EditUndoGroupParams, InputAdjustNumber,
+    InputAdjustNumberParams, InputBackspace, InputBlockDepth, InputChange, InputDedent,
+    InputDelete, InputDeleteBlock, InputDeleteWord, InputDeleteWordParams, InputIndent,
+    InputJoinLines, InputMoveBlock, InputMoveLines, InputMoveLinesParams, InputNewlineAndIndent,
+    InputNewlineAndIndentParams, InputOpenBlock, InputOpenLine, InputOpenLineParams,
+    InputPasteBlock, InputSurround, InputSurroundParams, InputTab, InputText, InputTextParams,
+    InputToggleComment, InputToggleTask, InputTransformCase, InputTransformCaseParams,
+    InputUnsurround, InputUnsurroundParams, LineSide, MoveBlockParams, OpenBlockParams,
+    PasteBlockParams, SurroundTarget, ToggleCommentParams, ToggleTaskParams, UndoRedoParams,
+    UndoResult,
 };
 pub use aether_protocol::input::{
     InputChangeLine, InputDeleteLine, InputReplaceLine, InputReplaceLineParams,

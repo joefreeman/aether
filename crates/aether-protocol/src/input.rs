@@ -34,6 +34,7 @@ pub struct InputText;
 impl RpcMethod for InputText {
     const NAME: &'static str = "element/text";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = InputTextParams;
     type Result = EditResult;
 }
@@ -68,6 +69,7 @@ pub struct InputDelete;
 impl RpcMethod for InputDelete {
     const NAME: &'static str = "element/delete";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
 }
@@ -83,6 +85,7 @@ pub struct InputChange;
 impl RpcMethod for InputChange {
     const NAME: &'static str = "element/change";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
 }
@@ -112,6 +115,7 @@ pub struct InputBackspace;
 impl RpcMethod for InputBackspace {
     const NAME: &'static str = "element/backspace";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
 }
@@ -130,6 +134,7 @@ pub struct InputDeleteWord;
 impl RpcMethod for InputDeleteWord {
     const NAME: &'static str = "element/delete_word";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = InputDeleteWordParams;
     type Result = EditResult;
 }
@@ -162,11 +167,12 @@ pub struct InputTab;
 impl RpcMethod for InputTab {
     const NAME: &'static str = "element/tab";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
 }
 
-// ---- line operations (Insert-mode Ctrl-d / Ctrl-c / Ctrl-r) -------------------------------------
+// ---- line operations (Insert-mode Ctrl-d / Ctrl-c / Ctrl-x) -------------------------------------
 
 /// Delete the cursor's line entirely — both content and trailing newline. The buffer shrinks
 /// by one line; the cursor lands at col 0 of what's now at the line's position (the next line
@@ -175,6 +181,7 @@ pub struct InputDeleteLine;
 impl RpcMethod for InputDeleteLine {
     const NAME: &'static str = "element/delete_line";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
 }
@@ -185,17 +192,19 @@ pub struct InputChangeLine;
 impl RpcMethod for InputChangeLine {
     const NAME: &'static str = "element/change_line";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = BufferOnlyParams;
     type Result = EditResult;
 }
 
 /// Replace the cursor's line (content + newline) with `text`. The clipboard payload usually
 /// ends in `\n`; if it doesn't, the replacement is "the line's text becomes `text`, and the
-/// newline boundary moves to wherever `text` ends." Insert-mode `Ctrl-r`.
+/// newline boundary moves to wherever `text` ends." Insert-mode `Ctrl-Alt-v`.
 pub struct InputReplaceLine;
 impl RpcMethod for InputReplaceLine {
     const NAME: &'static str = "element/replace_line";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = InputReplaceLineParams;
     type Result = EditResult;
 }
@@ -212,6 +221,7 @@ pub struct InputIndent;
 impl RpcMethod for InputIndent {
     const NAME: &'static str = "element/indent";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
 }
@@ -220,6 +230,7 @@ pub struct InputDedent;
 impl RpcMethod for InputDedent {
     const NAME: &'static str = "element/dedent";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
 }
@@ -237,6 +248,7 @@ pub struct InputAdjustNumber;
 impl RpcMethod for InputAdjustNumber {
     const NAME: &'static str = "element/adjust_number";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = InputAdjustNumberParams;
     type Result = EditResult;
 }
@@ -261,6 +273,7 @@ pub struct InputNewlineAndIndent;
 impl RpcMethod for InputNewlineAndIndent {
     const NAME: &'static str = "element/newline_and_indent";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = InputNewlineAndIndentParams;
     type Result = EditResult;
 }
@@ -285,6 +298,7 @@ pub struct InputOpenLine;
 impl RpcMethod for InputOpenLine {
     const NAME: &'static str = "element/open_line";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = InputOpenLineParams;
     type Result = EditResult;
 }
@@ -329,6 +343,7 @@ pub struct InputToggleComment;
 impl RpcMethod for InputToggleComment {
     const NAME: &'static str = "element/toggle_comment";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = ToggleCommentParams;
     type Result = EditResult;
 }
@@ -355,6 +370,7 @@ pub struct InputMoveLines;
 impl RpcMethod for InputMoveLines {
     const NAME: &'static str = "element/move_lines";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = InputMoveLinesParams;
     type Result = EditResult;
 }
@@ -396,6 +412,7 @@ pub struct InputSurround;
 impl RpcMethod for InputSurround {
     const NAME: &'static str = "element/surround";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = InputSurroundParams;
     type Result = EditResult;
 }
@@ -417,6 +434,7 @@ pub struct InputUnsurround;
 impl RpcMethod for InputUnsurround {
     const NAME: &'static str = "element/unsurround";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = InputUnsurroundParams;
     type Result = EditResult;
 }
@@ -475,7 +493,7 @@ pub enum CaseKind {
 }
 
 impl CaseKind {
-    /// The keystroke that selects this transform after the `Ctrl-r` chord. The single source of
+    /// The keystroke that selects this transform after the `Ctrl-u` chord. The single source of
     /// truth for the mnemonic mapping, shared by the client keymap and the help overlay.
     pub fn from_char(c: char) -> Option<CaseKind> {
         Some(match c {
@@ -498,7 +516,7 @@ impl CaseKind {
     }
 }
 
-/// Recase the operand (`Ctrl-r <key>`). Normal mode (`scan_at_cursor: false`): the operand is
+/// Recase the operand (`Ctrl-u <key>`). Normal mode (`scan_at_cursor: false`): the operand is
 /// exactly the selected chars — a point cursor being the single char under the block — and the
 /// result stays selected so transforms can be chained. Insert mode (`scan_at_cursor: true`): the
 /// operand is the identifier under the caret — the word run of alphanumeric/`_` chars — and the
@@ -508,6 +526,7 @@ pub struct InputTransformCase;
 impl RpcMethod for InputTransformCase {
     const NAME: &'static str = "element/transform_case";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = InputTransformCaseParams;
     type Result = EditResult;
 }
@@ -562,6 +581,32 @@ pub struct UndoRedoParams {
     pub collapse_selection: bool,
 }
 
+// ---- element/undo_group -------------------------------------------------------------------------
+
+/// Bracket a run of edits into **one undo step**, whatever their kinds.
+///
+/// The server otherwise groups edits by kind and time (a typing burst, a delete burst), which is
+/// right for hand typing and wrong for a replay: `Ctrl-r` re-issuing `Ctrl-e` then `foo` is one
+/// gesture, and one `Ctrl-z` must take all of it back. `open: true` closes whatever group is
+/// running so the next edit starts a fresh one, then holds that group open for every edit on the
+/// document until `open: false`, which closes it and lets the next edit start its own. Held per
+/// document, released when the holding client disconnects. Not an edit itself — a bracket around
+/// nothing changes nothing — so it is neither `MUTATES_TEXT` nor `REPLAYABLE`, and a read-only
+/// document accepts it (the edits inside are what get refused).
+pub struct EditUndoGroup;
+impl RpcMethod for EditUndoGroup {
+    const NAME: &'static str = "element/undo_group";
+    type Params = EditUndoGroupParams;
+    type Result = ();
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EditUndoGroupParams {
+    pub buffer_id: BufferId,
+    /// `true` opens (and holds) a group; `false` closes it.
+    pub open: bool,
+}
+
 // ---- input/join_lines ---------------------------------------------------------------------------
 
 /// Join the current line with the next: drop the line's trailing whitespace + the newline + the
@@ -571,6 +616,7 @@ pub struct InputJoinLines;
 impl RpcMethod for InputJoinLines {
     const NAME: &'static str = "element/join_lines";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = CountedEditParams;
     type Result = EditResult;
 }
@@ -629,6 +675,7 @@ pub struct InputMoveBlock;
 impl RpcMethod for InputMoveBlock {
     const NAME: &'static str = "element/move_block";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = MoveBlockParams;
     type Result = BlockEditResult;
 }
@@ -646,6 +693,7 @@ pub struct InputDeleteBlock;
 impl RpcMethod for InputDeleteBlock {
     const NAME: &'static str = "element/delete_block";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = BufferOnlyParams;
     type Result = BlockEditResult;
 }
@@ -681,6 +729,7 @@ pub struct InputPasteBlock;
 impl RpcMethod for InputPasteBlock {
     const NAME: &'static str = "element/paste_block";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = PasteBlockParams;
     type Result = BlockEditResult;
 }
@@ -699,6 +748,7 @@ pub struct InputOpenBlock;
 impl RpcMethod for InputOpenBlock {
     const NAME: &'static str = "element/open_block";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = OpenBlockParams;
     type Result = BlockEditResult;
 }
@@ -715,6 +765,7 @@ pub struct InputBlockDepth;
 impl RpcMethod for InputBlockDepth {
     const NAME: &'static str = "element/block_depth";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = BlockDepthParams;
     type Result = BlockEditResult;
 }
@@ -731,6 +782,7 @@ pub struct InputToggleTask;
 impl RpcMethod for InputToggleTask {
     const NAME: &'static str = "element/toggle_task";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = ToggleTaskParams;
     type Result = BlockEditResult;
 }

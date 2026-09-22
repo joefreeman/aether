@@ -12299,7 +12299,7 @@ fn read_ctrl_x_cuts_and_the_response_lands_on_the_clipboard() {
 }
 
 #[test]
-fn read_r_reverses_the_selection_and_alt_r_orients_it_forward() {
+fn read_u_reverses_the_selection_and_alt_u_orients_it_forward() {
     // The editor's own pair, reused verbatim: focus derives from the cursor, so swapping the
     // ends moves the bar to the other edge — and Shift-j/k then grow from there, because
     // `read_step` extends from the cursor's block and keeps the anchor.
@@ -12309,11 +12309,11 @@ fn read_r_reverses_the_selection_and_alt_r_orients_it_forward() {
         method, "element/select_block",
         "a block selection to reverse"
     );
-    let (_t, method, p) = the_request(&key(&mut s, 'r'));
+    let (_t, method, p) = the_request(&key(&mut s, 'u'));
     assert_eq!(method, "element/swap_anchor");
     // `forward_only: false` is the wire default and skips (the plain toggle).
     assert!(p.get("forward_only").is_none(), "{p}");
-    let fx = s.on_key(KeyCode::Char('r'), Mods::ALT, None);
+    let fx = s.on_key(KeyCode::Char('u'), Mods::ALT, None);
     let (_t, method, p) = the_request(&fx);
     assert_eq!(method, "element/swap_anchor");
     assert_eq!(p["forward_only"], json!(true));
@@ -12575,6 +12575,9 @@ fn read_table_contains_no_editing_action() {
                     // deliberately, keeping the discipline as an explicit list.
                     | Action::Undo
                     | Action::Redo
+                    // Repeat-change re-issues one of the edits below against the current
+                    // selection; it can produce no shape this table cannot.
+                    | Action::RepeatChange
                     // Phase 2: the to-the-editor transitions — they place the cursor
                     // and hand over to the editor's own insert/change machinery.
                     | Action::ReadInsert { .. }
@@ -15171,4 +15174,342 @@ fn picker_ctrl_d_confirms_a_running_row_and_closes_an_idle_one() {
         find_request(&fx, "view/close").expect("closes")["view_id"],
         json!(42)
     );
+}
+
+// ---- repeat keys: `r` (last motion) and `Ctrl-r` (last change) ------------------------------------
+
+/// The wire calls a key sequence makes, in order, as `(method, params)`.
+fn requests_of(
+    s: &mut Session,
+    presses: &[(KeyCode, Mods, Option<&str>)],
+) -> Vec<(&'static str, serde_json::Value)> {
+    let mut out = Vec::new();
+    for (code, mods, text) in presses {
+        let fx = s.on_key(*code, *mods, text.map(str::to_string));
+        out.extend(all_requests(&fx));
+    }
+    out
+}
+
+fn esc(s: &mut Session) -> Effects {
+    s.on_key(KeyCode::Esc, Mods::NONE, None)
+}
+
+fn shift(s: &mut Session, c: char) -> Effects {
+    s.on_key(
+        KeyCode::Char(c),
+        Mods::SHIFT,
+        Some(c.to_ascii_uppercase().to_string()),
+    )
+}
+
+/// `r` replays the request as it was made: Shift is part of the request, so `Shift-w r` keeps
+/// extending and `w r` keeps not extending. It used to read Shift off the repeat key itself —
+/// which is bound without Shift, so a repeat could never extend, and `Shift-w r` threw the
+/// extension away.
+#[test]
+fn repeat_replays_shift_as_pressed() {
+    let mut s = session();
+    let fx = shift(&mut s, 'w');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "element/select_word");
+    assert_eq!(params["extend"], json!(true));
+
+    let fx = key(&mut s, 'r');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "element/select_word");
+    assert_eq!(
+        params["extend"],
+        json!(true),
+        "Shift-w then r extends again"
+    );
+
+    let fx = key(&mut s, 'w');
+    assert_eq!(the_request(&fx).2["extend"], json!(false));
+    let fx = key(&mut s, 'r');
+    assert_eq!(
+        the_request(&fx).2["extend"],
+        json!(false),
+        "w then r does not"
+    );
+
+    // The find capture records what it resolved to, Shift included.
+    let _ = shift(&mut s, 'f');
+    let fx = key(&mut s, 'x');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "element/move");
+    assert_eq!(params["extend_selection"], json!(true));
+    let fx = key(&mut s, 'r');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "element/move");
+    assert_eq!(params["motion"]["ch"], json!("x"));
+    assert_eq!(
+        params["extend_selection"],
+        json!(true),
+        "Shift-f x then r extends"
+    );
+}
+
+/// `Ctrl-r` re-issues the last Ctrl edit against the current selection, inside an undo-group
+/// bracket so the gesture is one undo step. Its own count says how many times; the bracket stays
+/// one. Pressing it again replays the same edit — it never records itself.
+#[test]
+fn ctrl_r_replays_the_last_edit_in_one_undo_group() {
+    let mut s = session();
+    let fx = ctrl(&mut s, 'l');
+    assert_eq!(the_request(&fx).1, "element/indent");
+
+    let reqs = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)]);
+    let methods: Vec<&str> = reqs.iter().map(|(m, _)| *m).collect();
+    assert_eq!(
+        methods,
+        ["element/undo_group", "element/indent", "element/undo_group"]
+    );
+    assert_eq!(reqs[0].1["open"], json!(true));
+    assert_eq!(reqs[2].1["open"], json!(false));
+
+    let reqs = requests_of(
+        &mut s,
+        &[
+            (KeyCode::Char('3'), Mods::NONE, Some("3")),
+            (KeyCode::Char('r'), Mods::CTRL, None),
+        ],
+    );
+    let methods: Vec<&str> = reqs.iter().map(|(m, _)| *m).collect();
+    assert_eq!(
+        methods,
+        [
+            "element/undo_group",
+            "element/indent",
+            "element/indent",
+            "element/indent",
+            "element/undo_group"
+        ],
+        "3 Ctrl-r replays three times inside one bracket"
+    );
+
+    let reqs = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)]);
+    assert_eq!(reqs.len(), 3, "a repeat does not become the thing repeated");
+    assert_eq!(reqs[1].0, "element/indent");
+}
+
+/// An insert session — the entering key, the typing (Backspace included, never coalesced), the
+/// `Esc` — is one change. From Normal mode `Ctrl-r` replays the whole run, entering and leaving
+/// Insert around it; the recorder stays out while it does.
+#[test]
+fn ctrl_r_replays_an_insert_session_as_one_unit() {
+    use aether_client::session::Mode;
+    let mut s = session();
+    let fx = ctrl(&mut s, 'e');
+    assert_eq!(the_request(&fx).1, "element/change");
+    assert_eq!(s.view.mode, Mode::Insert);
+    let _ = key(&mut s, 'f');
+    let _ = key(&mut s, 'o');
+    let _ = s.on_key(KeyCode::Backspace, Mods::NONE, None);
+    let _ = key(&mut s, 'o');
+    let _ = esc(&mut s);
+    assert_eq!(s.view.mode, Mode::Normal);
+
+    let reqs = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)]);
+    let methods: Vec<&str> = reqs.iter().map(|(m, _)| *m).collect();
+    assert_eq!(
+        methods,
+        [
+            "element/undo_group",
+            "element/change",
+            "element/text",
+            "element/text",
+            "element/backspace",
+            "element/text",
+            "element/undo_group",
+        ]
+    );
+    assert_eq!(reqs[2].1["text"], json!("f"));
+    assert_eq!(reqs[5].1["text"], json!("o"));
+    assert_eq!(
+        s.view.mode,
+        Mode::Normal,
+        "the replay leaves Insert as the session did"
+    );
+
+    // Again: the replay did not overwrite the session with itself.
+    let reqs = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)]);
+    assert_eq!(reqs.len(), 7);
+}
+
+/// In Insert mode `Ctrl-r` replays a session's *typing* inline — no entry, no exit — and what it
+/// re-typed joins the session being recorded, so the next repeat carries it too.
+#[test]
+fn ctrl_r_in_insert_replays_the_typing_inline() {
+    use aether_client::session::Mode;
+    let mut s = session();
+    let _ = ctrl(&mut s, 'e');
+    let _ = key(&mut s, 'a');
+    let _ = key(&mut s, 'b');
+    let _ = esc(&mut s);
+
+    let _ = key(&mut s, 'i');
+    assert_eq!(s.view.mode, Mode::Insert);
+    let reqs = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)]);
+    let methods: Vec<&str> = reqs.iter().map(|(m, _)| *m).collect();
+    assert_eq!(
+        methods,
+        [
+            "element/undo_group",
+            "element/text",
+            "element/text",
+            "element/undo_group"
+        ],
+        "no element/change, no mode flip"
+    );
+    assert_eq!(s.view.mode, Mode::Insert);
+    let _ = key(&mut s, 'c');
+    let _ = esc(&mut s);
+
+    // The second session is `i`, the re-typed `a` `b`, then `c`.
+    let reqs = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)]);
+    let methods: Vec<&str> = reqs.iter().map(|(m, _)| *m).collect();
+    assert_eq!(
+        methods,
+        [
+            "element/undo_group",
+            "element/move",
+            "element/text",
+            "element/text",
+            "element/text",
+            "element/undo_group"
+        ]
+    );
+    let typed: Vec<&str> = reqs
+        .iter()
+        .filter(|(m, _)| *m == "element/text")
+        .map(|(_, p)| p["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(typed, ["a", "b", "c"]);
+}
+
+/// Undo, redo, a format, a save: text changes, but not as a change anyone repeats. Outside a
+/// session they leave the last change alone; inside one they drop the recording, because a
+/// session with an undo in the middle has no faithful replay. Typing after the drop is not a
+/// change on its own either.
+#[test]
+fn history_and_wholesale_edits_are_not_changes_and_abort_a_session() {
+    let mut s = session();
+    let _ = ctrl(&mut s, 'l');
+    let fx = ctrl(&mut s, 'z');
+    assert_eq!(the_request(&fx).1, "element/undo");
+    let fx = ctrl(&mut s, 'f');
+    assert_eq!(the_request(&fx).1, "lsp/format");
+    let reqs = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)]);
+    assert_eq!(
+        reqs[1].0, "element/indent",
+        "undo and format did not become the change"
+    );
+
+    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, 'a');
+    let _ = ctrl(&mut s, 'z');
+    let _ = key(&mut s, 'b');
+    let _ = esc(&mut s);
+    let reqs = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)]);
+    let methods: Vec<&str> = reqs.iter().map(|(m, _)| *m).collect();
+    assert_eq!(
+        methods,
+        ["element/undo_group", "element/indent", "element/undo_group"],
+        "the undone session was dropped; the indent is still the last change"
+    );
+}
+
+/// A paste is a change even though its edit follows the clipboard read: the replay asks the
+/// shell for the clipboard again, so it pastes what is on it now.
+#[test]
+fn paste_replays_against_the_live_clipboard() {
+    let mut s = session();
+    let fx = ctrl(&mut s, 'v');
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::ReadClipboard(_))));
+    assert!(no_request(&fx));
+
+    let fx = ctrl(&mut s, 'r');
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::ReadClipboard(_))),
+        "the repeat reads the clipboard afresh"
+    );
+    let methods: Vec<&str> = all_requests(&fx).iter().map(|(m, _)| *m).collect();
+    assert_eq!(methods, ["element/undo_group", "element/undo_group"]);
+}
+
+/// The captures record what they resolved to: `Ctrl-s (` replays as a surround with `(`, never
+/// as the arming keystroke waiting for a delimiter.
+#[test]
+fn a_surround_replays_its_delimiter() {
+    let mut s = session();
+    let _ = ctrl(&mut s, 's');
+    let fx = key(&mut s, '(');
+    let (_, method, params) = the_request(&fx);
+    assert_eq!(method, "element/surround");
+    assert_eq!(params["delimiter"], json!("("));
+
+    let reqs = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)]);
+    assert_eq!(reqs[1].0, "element/surround");
+    assert_eq!(reqs[1].1["delimiter"], json!("("));
+    assert_eq!(reqs[1].1["target"], params["target"]);
+}
+
+/// A session half-recorded in one buffer is dropped by a switch to another; a finished change
+/// replays anywhere.
+#[test]
+fn a_buffer_switch_drops_a_half_recorded_session() {
+    use aether_client::session::Mode;
+    let mut s = session();
+    let _ = ctrl(&mut s, 'l');
+    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, 'a');
+    assert_eq!(s.view.mode, Mode::Insert);
+    let _ = s.adopt_switch(aether_protocol::view::ViewOpenResult {
+        view_id: aether_protocol::ViewId(7),
+        scroll: None,
+        transient: false,
+        read: false,
+        buffer: aether_protocol::view::BufferDescription {
+            buffer_id: 7,
+            language: None,
+            line_count: 1,
+            byte_count: 0,
+            revision: 0,
+            saved_revision: 0,
+            path: Some("/proj/b.rs".into()),
+            scratch_number: None,
+            cursor: Default::default(),
+            lsp_server: None,
+            title: None,
+            commit: None,
+            read_only: false,
+            is_patch: false,
+        },
+    });
+    // (The first key after a switch to a real path also syncs the blame follow; only the edit
+    // calls are the point here.)
+    let reqs: Vec<_> = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)])
+        .into_iter()
+        .filter(|(m, _)| m.starts_with("element/"))
+        .collect();
+    let methods: Vec<&str> = reqs.iter().map(|(m, _)| *m).collect();
+    assert_eq!(
+        methods,
+        ["element/undo_group", "element/indent", "element/undo_group"],
+        "the indent, not the abandoned session"
+    );
+    assert_eq!(
+        reqs[1].1["buffer_id"],
+        json!(7),
+        "replayed in the buffer we are in now"
+    );
+}
+
+/// With nothing recorded both keys are silent, like an empty repeat always was.
+#[test]
+fn repeat_keys_with_nothing_recorded_are_silent() {
+    let mut s = session();
+    assert!(no_request(&key(&mut s, 'r')));
+    assert!(no_request(&ctrl(&mut s, 'r')));
 }

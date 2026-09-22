@@ -287,7 +287,7 @@ pub enum Action {
     },
     SelectLine(Direction),
     SelectAll,
-    /// Swap cursor and anchor (`r`). With `forward_only` (`Alt-r`), only a backward selection
+    /// Swap cursor and anchor (`u`). With `forward_only` (`Alt-u`), only a backward selection
     /// swaps — normalize to forward orientation instead of toggling.
     SwapAnchor {
         forward_only: bool,
@@ -297,7 +297,22 @@ pub enum Action {
     TreeContract,
     MotionUndo,
     MotionRedo,
+    /// `r` — replay the last motion ([`Action::is_repeatable`]), Shift and count as recorded.
     RepeatMotion,
+    /// `Ctrl-r` — replay the last change against the current selection: the last Ctrl edit, or the
+    /// last insert session as one unit (see `session::Change`). A Ctrl chord because Ctrl is the
+    /// edit class, so the repeat key wears the modifier of what it repeats and, like every Ctrl
+    /// edit, works in Insert too (replaying a session's typing inline). Separate from `r` because
+    /// the two interleave: `n Ctrl-r n Ctrl-r` needs the motion slot and the change slot to
+    /// survive each other.
+    ///
+    /// The pair sits on `r`/`Ctrl-r`, not the `.`/`Ctrl-.` the dot idiom suggests, because **no
+    /// terminal can deliver Ctrl with punctuation** unless it speaks the kitty keyboard protocol:
+    /// VTE sends a bare `.` for `Ctrl-.` (measured on 0.84, and pushing the protocol's flags or
+    /// xterm's `modifyOtherKeys` changes nothing), so the chord silently repeated the *motion*
+    /// instead. Ctrl+letter is the only Ctrl encoding every terminal has; swap/transform moved to
+    /// `u`/`Alt-u`/`Ctrl-u` to free it.
+    RepeatChange,
     /// Reposition the view so the cursor's line sits at a fixed fraction down the viewport
     /// (`;` / `Alt-;`). Shell-owned (geometry).
     PlaceCursor(ViewportPlace),
@@ -380,7 +395,7 @@ pub enum Action {
     /// `Ctrl-s ␣` — the next keystroke names the delimiter to wrap the target with.
     BeginSurround(SurroundTarget),
     Unsurround(SurroundTarget),
-    /// `Ctrl-r ␣` — the next keystroke names the case transform (see [`CaseKind::from_char`]).
+    /// `Ctrl-u ␣` — the next keystroke names the case transform (see [`CaseKind::from_char`]).
     /// Operand: the selection, or the identifier under a point cursor.
     BeginTransform,
 
@@ -728,6 +743,25 @@ impl Action {
         )
     }
 
+    /// Whether this action puts the client into Insert mode — the key that opens an insert
+    /// session, for the change recorder, and the one the disconnected guard refuses (entering a
+    /// mode where typing would vanish reads as a hang). One list, two readers: the recorder needs
+    /// the *intent* rather than an observed mode flip because two of these (`ReadOpenBlock`, a
+    /// shell's open) flip the mode only when the server answers.
+    pub fn enters_insert(&self) -> bool {
+        matches!(
+            self,
+            Action::EnterInsert(_)
+                | Action::OpenLineBelow
+                | Action::OpenLineAbove
+                | Action::Change
+                | Action::CutChange
+                | Action::ReadInsert { .. }
+                | Action::ReadChange
+                | Action::ReadOpenBlock { .. }
+        )
+    }
+
     /// Whether `.` replays this action: every cursor/selection motion (absolute ones included)
     /// plus the selection motions and the cursor-jumping navigations (symbol / hunk / diagnostic
     /// next-prev); never edits, scroll, or the non-motion selection ops. (`SearchCycle` joins when
@@ -1019,13 +1053,13 @@ static NORMAL: &[Binding] = &[
     // ---- meta / selection ----
     bind!(N, KeyCode::Esc, Any, A::DropSearch, "Search", "Clear the active search"),
     bind!(N, ch(','), Exact(Mods::NONE), A::CollapseSelection, "Selection", "Collapse selection"),
-    bind!(N, ch('r'), Exact(Mods::NONE), A::SwapAnchor { forward_only: false }, "Selection", "Reverse selection (swap cursor and anchor)"),
-    bind!(N, ch('r'), Exact(Mods::ALT), A::SwapAnchor { forward_only: true }, "Selection", "Orient selection forward (cursor to end)"),
+    bind!(N, ch('u'), Exact(Mods::NONE), A::SwapAnchor { forward_only: false }, "Selection", "Reverse selection (swap cursor and anchor)"),
+    bind!(N, ch('u'), Exact(Mods::ALT), A::SwapAnchor { forward_only: true }, "Selection", "Orient selection forward (cursor to end)"),
     bind!(N, ch('q'), Exact(Mods::NONE), A::TreeExpand, "Selection", "Expand selection to parent syntax node"),
     bind!(N, ch('q'), Exact(Mods::ALT), A::TreeContract, "Selection", "Contract selection to child syntax node"),
     bind!(N, ch('z'), Exact(Mods::ALT), A::MotionRedo, "Selection", "Redo cursor/selection motion"),
     bind!(N, ch('z'), Exact(Mods::NONE), A::MotionUndo, "Selection", "Undo cursor/selection motion"),
-    bind!(N, ch('.'), Exact(Mods::NONE), A::RepeatMotion, "Selection", "Repeat last motion"),
+    bind!(N, ch('r'), Exact(Mods::NONE), A::RepeatMotion, "Selection", "Repeat last motion"),
 
     // ---- motions: chars / lines ----
     bind!(N, KeyCode::Home, Any, A::MoveLineStart, "Motion", "Logical line start"),
@@ -1139,7 +1173,7 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('v'), Exact(Mods::CTRL_ALT), A::ReplaceClipboard, "Clipboard", "Replace selection with clipboard"),
     bind!(N, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Selection), "Edit", "Unsurround selection"),
     bind!(N, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Selection), "Edit", "Surround selection"),
-    bind!(N, ch('r'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform selection (u/l/i/r/m/c/p/s/k/w/t/n/d/x)"),
+    bind!(N, ch('u'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform selection (u/l/i/r/m/c/p/s/k/w/t/n/d/x)"),
     bind!(N, ch('y'), Exact(Mods::CTRL), A::ToggleComment(CommentStyle::Line, SurroundTarget::Selection), "Edit", "Toggle line comment"),
     bind!(N, ch('y'), Exact(Mods::CTRL_ALT), A::ToggleComment(CommentStyle::Block, SurroundTarget::Selection), "Edit", "Toggle block comment"),
 
@@ -1153,6 +1187,10 @@ static NORMAL: &[Binding] = &[
 static GLOBAL: &[Binding] = &[
     bind!(G, ch('z'), Exact(Mods::CTRL), A::Undo, "Edit", "Undo"),
     bind!(G, ch('z'), Exact(Mods::CTRL_ALT), A::Redo, "Edit", "Redo"),
+    // Ctrl+letter, never Ctrl+punctuation: outside the kitty keyboard protocol a terminal has no
+    // encoding for the latter, and VTE (ptyxis, GNOME Terminal) speaks neither that protocol nor
+    // xterm's modifyOtherKeys, so `Ctrl-.` reached us as a bare `.` — the motion repeat.
+    bind!(G, ch('r'), Exact(Mods::CTRL), A::RepeatChange, "Edit", "Repeat last change"),
     bind!(G, ch('j'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Down), "Edit", "Move line(s) down"),
     bind!(G, ch('k'), Exact(Mods::CTRL), A::MoveLines(VerticalDirection::Up), "Edit", "Move line(s) up"),
     // The paragraph-grain sibling of Ctrl-j/k: swap the blank-line-delimited chunk under the
@@ -1222,7 +1260,7 @@ static INSERT: &[Binding] = &[
     bind!(I, ch('v'), Exact(Mods::CTRL_ALT), A::ReplaceLineClipboard, "Clipboard", "Replace line with clipboard"),
     bind!(I, ch('s'), Exact(Mods::CTRL_ALT), A::Unsurround(SurroundTarget::Line), "Edit", "Unsurround line"),
     bind!(I, ch('s'), Exact(Mods::CTRL), A::BeginSurround(SurroundTarget::Line), "Edit", "Surround line"),
-    bind!(I, ch('r'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform identifier (u/l/i/r/m/c/p/s/k/w/t/n/d/x)"),
+    bind!(I, ch('u'), Exact(Mods::CTRL), A::BeginTransform, "Edit", "Transform identifier (u/l/i/r/m/c/p/s/k/w/t/n/d/x)"),
     bind!(I, ch('y'), Exact(Mods::CTRL), A::ToggleComment(CommentStyle::Line, SurroundTarget::Line), "Edit", "Toggle line comment"),
     bind!(I, ch('y'), Exact(Mods::CTRL_ALT), A::ToggleComment(CommentStyle::Block, SurroundTarget::Line), "Edit", "Toggle block comment on line"),
 ];
@@ -1282,6 +1320,9 @@ static READ: &[Binding] = &[
     bind!(R, ch('g'), IgnoreShift(Mods::NONE), A::ReadEnds { last: false }, "Read", "First element"),
     bind!(R, ch('g'), IgnoreShift(Mods::ALT), A::ReadEnds { last: true }, "Read", "Last element"),
     bind!(R, KeyCode::Enter, Exact(Mods::NONE), A::ReadActivate, "Read", "Follow link / open image / jump to footnote"),
+    // GUI and browser only, deliberately: a terminal has no encoding for Ctrl with a named key
+    // (VTE sends plain `^M`), and no window or tab to open a link in either — so the TUI just
+    // follows the link in place, which is the only thing it could do.
     bind!(R, KeyCode::Enter, Exact(Mods::CTRL), A::ReadActivateNewWindow, "Read", "Open link in a new window/tab"),
     bind!(R, ch('c'), Exact(Mods::CTRL), A::ReadCopy, "Read", "Copy selection, link URL, or element source"),
 
@@ -1291,9 +1332,9 @@ static READ: &[Binding] = &[
     bind!(R, ch('x'), IgnoreShift(Mods::ALT), A::ReadSelectBlock(Direction::Backward), "Read", "Select block upward (Shift extends)"),
     // The editor's own reverse/orient pair, unchanged: swapping the ends moves the bar to the
     // other edge of the block range, and every extension key already grows from the cursor's
-    // end — so `r` is what re-aims `x`/`Shift-j`/`Shift-k` at the top of a selection.
-    bind!(R, ch('r'), Exact(Mods::NONE), A::SwapAnchor { forward_only: false }, "Read", "Reverse selection (swap cursor and anchor)"),
-    bind!(R, ch('r'), Exact(Mods::ALT), A::SwapAnchor { forward_only: true }, "Read", "Orient selection forward (cursor to end)"),
+    // end — so `u` is what re-aims `x`/`Shift-j`/`Shift-k` at the top of a selection.
+    bind!(R, ch('u'), Exact(Mods::NONE), A::SwapAnchor { forward_only: false }, "Read", "Reverse selection (swap cursor and anchor)"),
+    bind!(R, ch('u'), Exact(Mods::ALT), A::SwapAnchor { forward_only: true }, "Read", "Orient selection forward (cursor to end)"),
     // The editor's whole-buffer / collapse pair at block grain. A whole-buffer selection is
     // already whole-line normal form, so `%` needs no read-side math — every block selected,
     // front matter included (structural ops on it still refuse server-side, as they do for an
@@ -1307,6 +1348,9 @@ static READ: &[Binding] = &[
     // whose other chords are edits; the curated-edit discipline) ----
     bind!(R, ch('z'), Exact(Mods::CTRL), A::Undo, "Edit", "Undo"),
     bind!(R, ch('z'), Exact(Mods::CTRL_ALT), A::Redo, "Edit", "Redo"),
+    // Repeat-change likewise: Read's block edits are changes, and the reader is where a run of
+    // "deepen this heading too" wants one key.
+    bind!(R, ch('r'), Exact(Mods::CTRL), A::RepeatChange, "Edit", "Repeat last change"),
     // The editor's adjust-the-value pair, re-declared because Read skips Global. Same action, so
     // the same key does the same thing on either side of `Space u`.
     bind!(R, ch('a'), Exact(Mods::CTRL), A::IncrementNumber, "Edit", "Check task item"),
@@ -2445,6 +2489,120 @@ mod tests {
         }
         .is_repeatable());
         assert!(!Action::RepeatMotion.is_repeatable());
+        assert!(!Action::RepeatChange.is_repeatable());
+    }
+
+    /// `Ctrl-r` is a Ctrl edit: Global (so Normal and Insert alike) and re-declared in Read, which
+    /// skips Global. `r` alone stays the motion repeat, and Shift never rides a repeat key —
+    /// both patterns are `Exact`, so `Shift-r` matches nothing and the *target* records the Shift.
+    #[test]
+    fn repeat_change_is_a_ctrl_edit_in_every_mode() {
+        for ctx in [KeyContext::Normal, KeyContext::Insert] {
+            assert!(
+                lookup(ctx, ch('r'), Mods::CTRL).is_none(),
+                "Ctrl-r lives in Global"
+            );
+        }
+        assert!(matches!(
+            lookup(KeyContext::Global, ch('r'), Mods::CTRL).map(|b| b.action),
+            Some(Action::RepeatChange)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Read, ch('r'), Mods::CTRL).map(|b| b.action),
+            Some(Action::RepeatChange)
+        ));
+        assert!(matches!(
+            lookup(KeyContext::Normal, ch('r'), Mods::NONE).map(|b| b.action),
+            Some(Action::RepeatMotion)
+        ));
+        assert!(lookup(KeyContext::Normal, ch('r'), Mods::SHIFT).is_none());
+        // `.` is now the leader's alone (`Space .`), and the repeat pair displaced swap and
+        // transform onto `u`, one letter over, in both editing contexts.
+        assert!(lookup(KeyContext::Normal, ch('.'), Mods::NONE).is_none());
+        assert!(lookup(KeyContext::Global, ch('.'), Mods::CTRL).is_none());
+        let u = |ctx, mods| lookup(ctx, ch('u'), mods).map(|b| b.action);
+        assert!(matches!(
+            u(KeyContext::Normal, Mods::NONE),
+            Some(Action::SwapAnchor {
+                forward_only: false
+            })
+        ));
+        assert!(matches!(
+            u(KeyContext::Normal, Mods::ALT),
+            Some(Action::SwapAnchor { forward_only: true })
+        ));
+        assert!(matches!(
+            u(KeyContext::Normal, Mods::CTRL),
+            Some(Action::BeginTransform)
+        ));
+        assert!(matches!(
+            u(KeyContext::Insert, Mods::CTRL),
+            Some(Action::BeginTransform)
+        ));
+        assert!(matches!(
+            u(KeyContext::Read, Mods::NONE),
+            Some(Action::SwapAnchor {
+                forward_only: false
+            })
+        ));
+    }
+
+    /// **Ctrl lives on letters.** A terminal without the kitty keyboard protocol has no encoding
+    /// for Ctrl+punctuation at all: VTE (ptyxis, GNOME Terminal) hands over the bare character,
+    /// and neither pushing the protocol's flags nor xterm's `modifyOtherKeys` changes that. So
+    /// such a chord does not fail visibly — it silently fires the *unmodified* key's binding,
+    /// which is how `Ctrl-.` (repeat change) quietly repeated the last *motion* in ptyxis.
+    /// Ctrl+letter is the one Ctrl encoding every terminal has.
+    #[test]
+    fn ctrl_chords_live_on_letters() {
+        // Ctrl with a *named* key is equally invisible to a terminal (`Ctrl-Enter` arrives as
+        // plain Enter). Only an action that is meaningless in a terminal anyway may sit there.
+        const NON_LETTER_CTRL: &[(KeyContext, KeyCode, &str)] = &[(
+            KeyContext::Read,
+            KeyCode::Enter,
+            "opens a link in a new window/tab: GUI and browser only",
+        )];
+
+        for b in all() {
+            if !b.mods.display_mods().ctrl {
+                continue;
+            }
+            match b.code {
+                KeyCode::Char(c) => assert!(
+                    c.is_ascii_lowercase(),
+                    "{:?} binds Ctrl-{c}: no terminal can encode Ctrl with punctuation, so it \
+                     would silently fire {c}'s own binding instead",
+                    b.ctx,
+                ),
+                code => assert!(
+                    NON_LETTER_CTRL
+                        .iter()
+                        .any(|&(cx, k, _)| cx == b.ctx && k == code),
+                    "{:?} binds Ctrl-{code:?}, which a terminal cannot encode — list it in \
+                     NON_LETTER_CTRL with a reason only if the action makes no sense there",
+                    b.ctx,
+                ),
+            }
+        }
+    }
+
+    /// The insert-entering set is what opens a change recording — the mode flip alone cannot be
+    /// the signal, because the block open and a shell's open flip it only on the server's answer.
+    #[test]
+    fn enters_insert_covers_every_entry_key() {
+        assert!(Action::EnterInsert(InsertWhere::SelectionStart).enters_insert());
+        assert!(Action::Change.enters_insert());
+        assert!(Action::CutChange.enters_insert());
+        assert!(Action::OpenLineBelow.enters_insert());
+        assert!(Action::ReadInsert { at_end: true }.enters_insert());
+        assert!(Action::ReadChange.enters_insert());
+        assert!(Action::ReadOpenBlock { above: false }.enters_insert());
+        assert!(
+            !Action::ChangeLine.enters_insert(),
+            "an Insert-mode edit, already there"
+        );
+        assert!(!Action::LeaveInsert.enters_insert());
+        assert!(!Action::DeleteSelection.enters_insert());
     }
 
     #[test]
@@ -2577,7 +2735,7 @@ mod tests {
             Some(Action::SearchHistoryPrev)
         ));
         assert!(lookup(KeyContext::Search, ch('k'), Mods::NONE).is_none());
-        // `n` cycles and is repeatable via `r`.
+        // `n` cycles and is repeatable via `r` (the motion repeat).
         let n = lookup(KeyContext::Normal, ch('n'), Mods::NONE).unwrap();
         assert!(matches!(n.action, Action::SearchCycle(Direction::Forward)));
         assert!(n.action.is_repeatable());

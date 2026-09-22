@@ -24,7 +24,7 @@ const HOME_PREFIX: &str = "~/";
 use super::picker::{GroupLanding, PickerLevel, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::session::{
     buffer_info, min_pos, severity_label, step_font_size, step_markdown_width, strip_longest_root,
-    AfterSave, AppSettingId, AppSettingsOverlay, CommitDetails, ConfirmAction, ConfirmKind,
+    AfterSave, AppSettingId, AppSettingsOverlay, Change, CommitDetails, ConfirmAction, ConfirmKind,
     ConnState, HoverBlock, HoverText, Mode, PasteKind, Pending, PendingCommit, Prompt, ReadView,
     ReloadTry, RepeatTarget, SaveTry, SearchSnapshot, Session, SettingsRow, SneakState, TextField,
     ViewState, WorkspaceSettings,
@@ -81,9 +81,9 @@ use aether_protocol::history::{
 };
 use aether_protocol::input::{
     BlockDepthParams, BlockEditResult, BufferOnlyParams, CaseKind, CountedEditParams, EditRedo,
-    EditResult, EditUndo, ElementSource, ElementSourceResult, InputAdjustNumber,
-    InputAdjustNumberParams, InputBackspace, InputBlockDepth, InputChange, InputChangeLine,
-    InputDedent, InputDelete, InputDeleteBlock, InputDeleteLine, InputDeleteWord,
+    EditResult, EditUndo, EditUndoGroup, EditUndoGroupParams, ElementSource, ElementSourceResult,
+    InputAdjustNumber, InputAdjustNumberParams, InputBackspace, InputBlockDepth, InputChange,
+    InputChangeLine, InputDedent, InputDelete, InputDeleteBlock, InputDeleteLine, InputDeleteWord,
     InputDeleteWordParams, InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines,
     InputMoveLinesParams, InputNewlineAndIndent, InputNewlineAndIndentParams, InputOpenBlock,
     InputOpenLine, InputOpenLineParams, InputPasteBlock, InputReplaceLine, InputReplaceLineParams,
@@ -189,6 +189,9 @@ pub enum Event {
     CursorJump(Result<CursorState, String>),
     /// An edit resolved: adopt the new revision + cursor.
     EditDone(Result<EditResult, String>),
+    /// The undo-group bracket around a `Ctrl-r` replay was acknowledged. Nothing to adopt: the
+    /// edits inside it report their own revisions.
+    UndoGroupBracketed(Result<(), String>),
     /// Focus moved to another editor element by *navigation* — `Tab`, `c` — where the element being
     /// moved to is not necessarily on screen: adopt its cursor and buffer, and frame it.
     ElementFocused(Result<ViewportFocusElementResult, String>),
@@ -746,6 +749,8 @@ impl Session {
                 Effects::one(Effect::RevealCursor(RevealStyle::Follow))
             }
             Event::EditDone(Err(e)) => Effects::error_detail("Edit failed", e),
+            Event::UndoGroupBracketed(Ok(())) => Effects::none(),
+            Event::UndoGroupBracketed(Err(e)) => Effects::error_detail("Repeat failed", e),
 
             Event::ElementFocused(Ok(r)) => {
                 // Navigating to another element is a **jump**, and reveals like every other one
@@ -3212,6 +3217,15 @@ impl Session {
         if self.conn != ConnState::Connected {
             return Effects::none();
         }
+        // Tell the change recorder what kind of thing this was — read back once the dispatch that
+        // sent it returns. Declared on the method (`RpcMethod::REPLAYABLE`) for the reason
+        // `MUTATES_TEXT` is, and learned here for the same reason: every request passes this one
+        // funnel, so an edit added later classifies itself.
+        if M::REPLAYABLE {
+            self.sent_replayable_edit = true;
+        } else if M::MUTATES_TEXT {
+            self.sent_wholesale_edit = true;
+        }
         let token = self.next_token;
         self.next_token += 1;
         self.pending_rpcs.insert(
@@ -3546,6 +3560,9 @@ impl Session {
         // Not view state, but bound to whatever was on screen when it opened, so a switch dismisses
         // it: a modal prompt is the session's, and it has nowhere to return to.
         self.prompt = None;
+        // An insert session recorded half in one buffer and half in another is not a change anyone
+        // asked to repeat. `last_change` survives: a finished change replays anywhere.
+        self.change_recording = None;
         self.sync_read_anchor_on_switch();
         sneak_fx.and(Effects::one(Effect::Resubscribe))
     }
@@ -9807,8 +9824,11 @@ impl Session {
                     till,
                 };
                 // `BeginFind` only armed the capture; the repeatable thing is this resolved
-                // find (with its target char), so record it here.
-                self.last_repeat = Some(RepeatTarget::Find(motion.clone()));
+                // find (with its target char, and whether it extended), so record it here.
+                self.last_repeat = Some(RepeatTarget::Find {
+                    motion: motion.clone(),
+                    extend,
+                });
                 return self.move_motion(motion, extend);
             }
             Pending::Surround(target) => {
@@ -9817,10 +9837,13 @@ impl Session {
                 let Some(delimiter) = ch.filter(|c| !c.is_control()) else {
                     return Effects::none(); // Esc / non-char cancels
                 };
-                return self.edit::<InputSurround>(InputSurroundParams {
-                    buffer_id: self.view.buffer.buffer_id,
-                    delimiter,
-                    target,
+                // `BeginSurround` only armed the capture; the change is this resolved surround.
+                return self.recorded(RepeatTarget::Surround { delimiter, target }, |s| {
+                    s.edit::<InputSurround>(InputSurroundParams {
+                        buffer_id: s.view.buffer.buffer_id,
+                        delimiter,
+                        target,
+                    })
                 });
             }
             Pending::Transform => {
@@ -9833,13 +9856,20 @@ impl Session {
                 let Some(kind) = kind else {
                     return Effects::none();
                 };
-                return self.edit::<InputTransformCase>(InputTransformCaseParams {
-                    buffer_id: self.view.buffer.buffer_id,
+                // Insert mode has no selection, so the server scans for the identifier under the
+                // caret; Normal mode recases exactly the selection (a point being the single char
+                // under the block).
+                let scan_at_cursor = self.view.mode == Mode::Insert;
+                let step = RepeatTarget::Transform {
                     kind,
-                    // Insert mode has no selection, so the server scans for the identifier
-                    // under the caret; Normal mode recases exactly the selection (a point
-                    // being the single char under the block).
-                    scan_at_cursor: self.view.mode == Mode::Insert,
+                    scan_at_cursor,
+                };
+                return self.recorded(step, |s| {
+                    s.edit::<InputTransformCase>(InputTransformCaseParams {
+                        buffer_id: s.view.buffer.buffer_id,
+                        kind,
+                        scan_at_cursor,
+                    })
                 });
             }
             Pending::Leader => {
@@ -9919,12 +9949,14 @@ impl Session {
                     .filter(|c| !c.is_control() || *c == '\t')
                     .collect();
                 if !typed.is_empty() {
-                    return self.edit::<InputText>(InputTextParams {
-                        buffer_id: self.view.buffer.buffer_id,
-                        text: typed,
-                        select_pasted: false,
-                        replace_selection: false,
-                        at: None,
+                    return self.recorded(RepeatTarget::Text(typed.clone()), |s| {
+                        s.edit::<InputText>(InputTextParams {
+                            buffer_id: s.view.buffer.buffer_id,
+                            text: typed,
+                            select_pasted: false,
+                            replace_selection: false,
+                            at: None,
+                        })
                     });
                 }
             }
@@ -9957,19 +9989,141 @@ impl Session {
             self.hints.observe_action(&action, hint_ctx, enabled)
         };
         let hint_fx = self.emit_hint_events(evs);
-        let task = self.dispatch_action(action, count, counted, extend);
+        let step = RepeatTarget::Action {
+            action,
+            count,
+            counted,
+            extend,
+        };
+        let task = self.recorded(step.clone(), |s| {
+            s.dispatch_action(action, count, counted, extend)
+        });
         // Remember the action for `.` to replay. Recorded at dispatch (the RPC is still in flight —
         // a failed motion just leaves a harmless no-op target). `RepeatMotion` itself isn't
         // repeatable, so it never overwrites the target with itself; find records its resolved
         // motion at the capture site instead.
         if action.is_repeatable() {
-            self.last_repeat = Some(RepeatTarget::Action {
+            self.last_repeat = Some(step);
+        }
+        hint_fx.and(task)
+    }
+
+    /// Run one dispatched step through the change recorder: what `Ctrl-r` will replay is decided
+    /// here, from what the step *did* rather than from which key it was.
+    ///
+    /// Three facts, all observed rather than listed: the request funnel says whether a replayable
+    /// edit (or a wholesale, non-replayable mutation) went out; the effects say whether a paste is
+    /// on its way (its edit follows the clipboard read, so the funnel cannot see it yet); and the
+    /// mode says whether an insert session just ended. The one list is [`Action::enters_insert`],
+    /// because two entries flip the mode only when the server answers.
+    fn recorded(
+        &mut self,
+        step: RepeatTarget,
+        dispatch: impl FnOnce(&mut Self) -> Effects,
+    ) -> Effects {
+        let mode_before = self.view.mode;
+        self.sent_replayable_edit = false;
+        self.sent_wholesale_edit = false;
+        let fx = dispatch(self);
+        let sent_replayable = std::mem::take(&mut self.sent_replayable_edit);
+        let sent_wholesale = std::mem::take(&mut self.sent_wholesale_edit);
+        let action = match &step {
+            RepeatTarget::Action { action, .. } => Some(*action),
+            _ => None,
+        };
+        // The repeat keys replay through `dispatch_action`, below the recorder — but the edits
+        // they re-issue still pass the funnel, so without this a `Ctrl-r` would record itself
+        // (the `.` self-overwrite guard, for the change slot).
+        if matches!(action, Some(Action::RepeatChange | Action::RepeatMotion)) {
+            return fx;
+        }
+        // Undo, redo, a format, a save: text changed, but not as a change anyone repeats — and a
+        // session with one in the middle has no faithful replay, so it is dropped rather than
+        // closed. Submitting an input likewise: a session that ran a command must not run it again.
+        if sent_wholesale || matches!(action, Some(Action::SubmitInput)) {
+            self.change_recording = None;
+            return fx;
+        }
+        let reads_clipboard = fx.0.iter().any(|e| matches!(e, Effect::ReadClipboard(_)));
+        let is_edit = sent_replayable || reads_clipboard;
+        if let Some(recording) = self.change_recording.as_mut() {
+            recording.push(step);
+            if mode_before == Mode::Insert && self.view.mode != Mode::Insert {
+                let steps = self.change_recording.take().expect("checked above");
+                self.last_change = Some(Change {
+                    steps,
+                    session: true,
+                });
+            }
+            return fx;
+        }
+        if action.is_some_and(|a| a.enters_insert()) {
+            // Only an entry that took: a read-only refusal leaves the mode alone and sends
+            // nothing, and the two server-answered entries have sent their edit.
+            if self.view.mode == Mode::Insert || is_edit {
+                self.change_recording = Some(vec![step]);
+            }
+            return fx;
+        }
+        // Typing with no session open — in a shell's input, or after an undo dropped the session
+        // — is not a change on its own: a keystroke is repeated by pressing it again.
+        if matches!(step, RepeatTarget::Text(_)) {
+            return fx;
+        }
+        if is_edit {
+            self.last_change = Some(Change {
+                steps: vec![step],
+                session: false,
+            });
+        }
+        fx
+    }
+
+    /// Re-issue one recorded step. The request as it was made, against the cursor as it is now.
+    fn replay_step(&mut self, step: &RepeatTarget) -> Effects {
+        let buffer_id = self.view.buffer.buffer_id;
+        match step {
+            RepeatTarget::Action {
                 action,
                 count,
                 counted,
-            });
+                extend,
+            } => self.dispatch_action(*action, *count, *counted, *extend),
+            RepeatTarget::Find { motion, extend } => self.move_motion(motion.clone(), *extend),
+            RepeatTarget::Text(text) => self.edit::<InputText>(InputTextParams {
+                buffer_id,
+                text: text.clone(),
+                select_pasted: false,
+                replace_selection: false,
+                at: None,
+            }),
+            RepeatTarget::Surround { delimiter, target } => {
+                self.edit::<InputSurround>(InputSurroundParams {
+                    buffer_id,
+                    delimiter: *delimiter,
+                    target: *target,
+                })
+            }
+            RepeatTarget::Transform {
+                kind,
+                scan_at_cursor,
+            } => self.edit::<InputTransformCase>(InputTransformCaseParams {
+                buffer_id,
+                kind: *kind,
+                scan_at_cursor: *scan_at_cursor,
+            }),
         }
-        hint_fx.and(task)
+    }
+
+    /// One side of the undo-group bracket around a replay (`element/undo_group`).
+    fn undo_group(&mut self, open: bool) -> Effects {
+        self.request_str::<EditUndoGroup>(
+            EditUndoGroupParams {
+                buffer_id: self.view.buffer.buffer_id,
+                open,
+            },
+            Event::UndoGroupBracketed,
+        )
     }
 
     /// Which element of the view on screen is a shell's **input** — and so, whether this view is
@@ -10080,19 +10234,7 @@ impl Session {
         // read-only: the server can't accept edits, so the RPCs are dropped anyway. Entering Insert
         // would leave the user in a mode where typing silently vanishes — it reads as a hang. Refuse
         // the insert-entering actions and stay in Normal, with a hint so the inaction is explained.
-        if self.conn != ConnState::Connected
-            && matches!(
-                action,
-                A::EnterInsert(_)
-                    | A::OpenLineBelow
-                    | A::OpenLineAbove
-                    | A::Change
-                    | A::CutChange
-                    | A::ReadInsert { .. }
-                    | A::ReadChange
-                    | A::ReadOpenBlock { .. }
-            )
-        {
+        if self.conn != ConnState::Connected && action.enters_insert() {
             // Grouped: each blocked keystroke while disconnected refreshes one hint, not a stack.
             return Effects::toast_grouped_detail(
                 "Not connected",
@@ -10297,25 +10439,50 @@ impl Session {
             A::MotionRedo => self.motion_history::<CursorRedo>(count),
             A::RepeatMotion => {
                 // `.`'s own count is how many times to replay; the stored target keeps the
-                // original count baked in. The replayed requests enqueue in order at build
-                // time (the transport sends in call order), so the server applies them
+                // original count (and Shift) baked in. The replayed requests enqueue in order at
+                // build time (the transport sends in call order), so the server applies them
                 // sequentially even though the result futures resolve independently.
                 let Some(target) = self.last_repeat.clone() else {
                     return Effects::none();
                 };
                 let mut fx = Effects::none();
                 for _ in 0..count.max(1) {
-                    let step = match &target {
-                        RepeatTarget::Action {
-                            action,
-                            count,
-                            counted,
-                        } => self.dispatch_action(*action, *count, *counted, extend),
-                        RepeatTarget::Find(motion) => self.move_motion(motion.clone(), extend),
-                    };
-                    fx = fx.and(step);
+                    fx = fx.and(self.replay_step(&target));
                 }
                 fx
+            }
+            A::RepeatChange => {
+                // The same shape as `.`: the count says how many times, the steps keep their own.
+                // In Insert mode a session replays its typing inline, without the entry and exit
+                // that would bracket it; a plain edit replays whole in either mode.
+                let Some(change) = self.last_change.clone() else {
+                    return Effects::none();
+                };
+                let steps: Vec<RepeatTarget> = if self.view.mode == Mode::Insert {
+                    change.inline_steps().to_vec()
+                } else {
+                    change.steps
+                };
+                if steps.is_empty() {
+                    return Effects::none();
+                }
+                // One gesture, one undo step: the bracket holds every replayed edit in one group,
+                // whatever mix of kinds a session is. (A paste inside the replay lands after the
+                // bracket closes — its edit waits on the clipboard — and stays its own step.)
+                let mut fx = self.undo_group(true);
+                for _ in 0..count.max(1) {
+                    for step in &steps {
+                        fx = fx.and(self.replay_step(step));
+                    }
+                }
+                // Replayed inside a session being recorded, the typing is now part of that
+                // session too: the next `Ctrl-r` repeats what this one produced.
+                if let Some(recording) = self.change_recording.as_mut() {
+                    for _ in 0..count.max(1) {
+                        recording.extend(steps.iter().cloned());
+                    }
+                }
+                fx.and(self.undo_group(false))
             }
             // Geometry (pixel scroll, cell metrics) and viewport plumbing — the shell executes
             // these against its own state.

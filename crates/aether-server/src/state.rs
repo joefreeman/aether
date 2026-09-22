@@ -2649,6 +2649,17 @@ impl ServerState {
         self.sneaks.retain(|(c, _), _| *c != client_id);
     }
 
+    /// Release every undo-group hold (`element/undo_group`) the given client owns. Used on
+    /// disconnect: a bracket the holder can no longer close would otherwise fold every later edit
+    /// on the document, anyone's, into one undo step forever.
+    pub fn drop_undo_group_holds_for_client(&mut self, client_id: ClientId) {
+        for doc in self.documents.values_mut() {
+            if doc.undo_group_holder() == Some(client_id) {
+                doc.close_undo_group();
+            }
+        }
+    }
+
     /// Remove all last-scroll records for the given client. Used on disconnect.
     pub fn drop_last_scroll_for_client(&mut self, client_id: ClientId) {
         self.last_scroll.retain(|(c, _), _| *c != client_id);
@@ -3631,6 +3642,12 @@ pub struct Document {
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
     active_group: Option<ActiveGroup>,
+    /// A client is holding the running undo group open (`element/undo_group`): while set, every
+    /// edit joins `active_group` whatever its kind or timing, so a replayed gesture lands as one
+    /// undo step. Document-level on purpose — one hold, not one per client — because the group
+    /// itself is one per document, and a second client's edit landing mid-bracket has nowhere else
+    /// to go anyway. Released by the closing bracket or by the holder's disconnect.
+    undo_group_held_by: Option<ClientId>,
 }
 
 pub struct BufferSyntax {
@@ -3878,6 +3895,7 @@ impl Document {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             active_group: None,
+            undo_group_held_by: None,
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
@@ -3922,6 +3940,7 @@ impl Document {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             active_group: None,
+            undo_group_held_by: None,
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
@@ -3982,6 +4001,7 @@ impl Document {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             active_group: None,
+            undo_group_held_by: None,
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
@@ -4081,6 +4101,7 @@ impl Document {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             active_group: None,
+            undo_group_held_by: None,
             externally_modified: false,
             externally_deleted: false,
             backed_up_revision: None,
@@ -4213,9 +4234,12 @@ impl Document {
         self.snapshot_disk_text();
         let now = Instant::now();
 
-        // Decide whether to start a new undo group.
+        // Decide whether to start a new undo group. A held group (`element/undo_group`) takes
+        // every edit regardless of kind or timing; otherwise a burst is broken by a pause or a
+        // change of kind.
         let start_new_group = match &self.active_group {
             None => true,
+            Some(_) if self.undo_group_held_by.is_some() => false,
             Some(g) => now.duration_since(g.last_edit_at) > GROUP_TIME_WINDOW || g.kind != kind,
         };
         if start_new_group {
@@ -4313,6 +4337,30 @@ impl Document {
         }
 
         self.revision
+    }
+
+    /// Open the bracket of `element/undo_group`: close whatever group is running, so the next
+    /// edit starts a fresh undo entry rather than coalescing with typing that happened just before,
+    /// and hold that entry open for every edit until [`Self::close_undo_group`]. Opening twice is
+    /// the same as opening once.
+    ///
+    /// Not behind [`Editable`]: a bracket is not an edit, and a read-only document accepts it —
+    /// the edits inside are what get refused.
+    pub fn open_undo_group(&mut self, client_id: ClientId) {
+        self.active_group = None;
+        self.undo_group_held_by = Some(client_id);
+    }
+
+    /// Close the bracket: release the hold and end the running group, so the edit after the
+    /// bracket starts its own entry. Harmless without a matching open.
+    pub fn close_undo_group(&mut self) {
+        self.active_group = None;
+        self.undo_group_held_by = None;
+    }
+
+    /// Which client holds this document's undo group open, if any.
+    pub fn undo_group_holder(&self) -> Option<ClientId> {
+        self.undo_group_held_by
     }
 
     /// Write the buffer to disk atomically: write to `<dir>/.aether-tmp-<pid>-<name>`,

@@ -10,7 +10,7 @@ use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
 use aether_protocol::git::{CommitInfo, GitOperation, GitRepoOperation};
 use aether_protocol::history::{HistoryEntry, HistoryKind, HistoryLists};
-use aether_protocol::input::SurroundTarget;
+use aether_protocol::input::{CaseKind, SurroundTarget};
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus, SymbolCrumb};
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::SearchSummary;
@@ -904,23 +904,75 @@ pub enum Pending {
     },
     /// `Ctrl-s` armed: the next keystroke names the surround delimiter.
     Surround(SurroundTarget),
-    /// `Ctrl-r` armed: the next keystroke names the case transform (`CaseKind::from_char`).
+    /// `Ctrl-u` armed: the next keystroke names the case transform (`CaseKind::from_char`).
     Transform,
 }
 
-/// What `.` replays: the binding intent for table actions, the resolved motion (with its target
-/// char) for find.
+/// One step a repeat key replays — the unit both `r` (last motion) and `Ctrl-r` (last change)
+/// store. A motion is one step; a change is one step or, for an insert session, a run of them
+/// ([`Change`]).
+///
+/// Every variant is the *request as made*, not a reconstruction of it. `counted` rides along
+/// because bare `g` and `1g` are different motions (the field's top vs. buffer line 1) and both
+/// record `count: 1`, so the count alone cannot tell them apart on replay. `extend` rides along for
+/// the same reason: `Shift-w` is a different request from `w`, and a repeat that read Shift off
+/// the repeat key instead would collapse the extension it was asked to grow (`Shift-w r` used to
+/// select just the next word). The captures (`f x`, `Ctrl-s (`, `Ctrl-u u`) record what the capture
+/// resolved to — the arming keystroke on its own is nothing to repeat.
 #[derive(Debug, Clone)]
 pub enum RepeatTarget {
-    /// `counted` rides along because `.` must repeat the *request*, not a reconstruction of it:
-    /// bare `g` and `1g` are different motions (the field's top vs. buffer line 1) and both record
-    /// `count: 1`, so the count alone cannot tell them apart on replay.
     Action {
         action: Action,
         count: u32,
         counted: bool,
+        extend: bool,
     },
-    Find(Motion),
+    Find {
+        motion: Motion,
+        extend: bool,
+    },
+    /// Text typed in Insert mode — one step per key event, never coalesced, so a session replays
+    /// exactly the keystrokes it recorded (a Backspace in the middle stays a Backspace).
+    Text(String),
+    /// `Ctrl-s` resolved: the delimiter and the target it was armed for.
+    Surround {
+        delimiter: char,
+        target: SurroundTarget,
+    },
+    /// `Ctrl-u` resolved: the case kind, and whether the operand is scanned from the caret (Insert)
+    /// or is the selection (Normal).
+    Transform {
+        kind: CaseKind,
+        scan_at_cursor: bool,
+    },
+}
+
+/// What `Ctrl-r` replays: the last change, as the steps that made it.
+///
+/// A plain edit (`Ctrl-d`, `Ctrl-l`, a resolved surround) is one step. An **insert session** is the
+/// run from the key that entered Insert (`i`, `Ctrl-e`, `Ctrl-o`, …) through everything typed or
+/// done in it to the `Esc` that left, recorded as one change because that is the unit a repeat is
+/// asked for: "do that again" after `Ctrl-e foo Esc` means the change *and* the text. Replayed
+/// against the current selection — never bundled with the motion that made the selection, so `r`
+/// and `Ctrl-r` stay orthogonal (`n Ctrl-r n Ctrl-r`).
+#[derive(Debug, Clone)]
+pub struct Change {
+    pub steps: Vec<RepeatTarget>,
+    /// The steps are an insert session: first the entering action, last the leaving one. In Insert
+    /// mode `Ctrl-r` replays only what lies between — the typing — inline.
+    pub session: bool,
+}
+
+impl Change {
+    /// The steps `Ctrl-r` replays from Insert mode: a session's inner keystrokes, a plain edit
+    /// whole.
+    pub fn inline_steps(&self) -> &[RepeatTarget] {
+        if self.session && self.steps.len() >= 2 {
+            &self.steps[1..self.steps.len() - 1]
+        } else {
+            &self.steps
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1269,7 +1321,23 @@ pub struct Session {
     pub tether: Option<BufferId>,
     /// The commit message buffer this client opened, if any — see [`PendingCommit`].
     pub pending_commit: Option<PendingCommit>,
+    /// What `.` replays. Per keyboard and ephemeral, like the mode: another window on the same
+    /// workspace has its own, and nothing survives a reconnect.
     pub last_repeat: Option<RepeatTarget>,
+    /// What `Ctrl-r` replays — see [`Change`].
+    pub last_change: Option<Change>,
+    /// An insert session being recorded: opened by the action that entered Insert, fed by every
+    /// step until the one that leaves, which closes it into `last_change`. Dropped on the way out
+    /// if something that is not a change lands inside it (undo, a wholesale write) or the view
+    /// moves to another buffer under it — a half-recorded session replays nothing.
+    pub(crate) change_recording: Option<Vec<RepeatTarget>>,
+    /// What the request funnel saw go out during the current dispatch, read back by the change
+    /// recorder once the action returns: a replayable edit makes the action a change; a mutating
+    /// method that is *not* replayable (undo, format, save) makes it a non-change that also aborts
+    /// any session being recorded. Set in [`Session::request`] off the method's own flags, so a
+    /// method added later classifies itself.
+    pub(crate) sent_replayable_edit: bool,
+    pub(crate) sent_wholesale_edit: bool,
     /// `Up`/`Down` recall for every overlay text input. Session-wide, not per-overlay: the lists
     /// are workspace-scoped and only one input has the keyboard at a time.
     pub history: InputHistory,
@@ -1741,6 +1809,10 @@ impl Session {
             tether: None,
             pending_commit: None,
             last_repeat: None,
+            last_change: None,
+            change_recording: None,
+            sent_replayable_edit: false,
+            sent_wholesale_edit: false,
             history: InputHistory::default(),
             wrap: WrapMode::Soft,
             ligatures: true,

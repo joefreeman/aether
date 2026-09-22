@@ -319,6 +319,28 @@ pub async fn edit_redo(
     undo_redo_counted(state, ctx, params, UndoDirection::Redo).await
 }
 
+/// `element/undo_group`: bracket the edits that follow into one undo step, whatever their kinds.
+///
+/// Deliberately not through `editable_doc`: the bracket is not an edit, so a read-only document
+/// accepts it and refuses the edits inside instead. Only an unknown buffer is an error.
+pub async fn edit_undo_group(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: EditUndoGroupParams,
+) -> Result<(), RpcError> {
+    let client_id = ctx.client_id;
+    let mut s = state.lock().await;
+    let doc = s
+        .try_doc_of_mut(params.buffer_id)
+        .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+    if params.open {
+        doc.open_undo_group(client_id);
+    } else {
+        doc.close_undo_group();
+    }
+    Ok(())
+}
+
 /// `3u`: step the undo/redo stack `count` times, stopping early once it's exhausted (the
 /// `applied: false` result is returned so the client still learns the final state).
 async fn undo_redo_counted(

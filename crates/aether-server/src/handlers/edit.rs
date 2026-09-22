@@ -667,7 +667,7 @@ pub enum EditKind {
     DeleteLine,
     /// Blank the cursor's line — content only, newline preserved. Insert-mode `Ctrl-e`.
     ChangeLine,
-    /// Replace the cursor's line (content + newline) with `text`. Insert-mode `Ctrl-r`.
+    /// Replace the cursor's line (content + newline) with `text`. Insert-mode `Ctrl-Alt-v`.
     ReplaceLine { text: String },
     /// Wrap the surround target with `open`…`close` (`Ctrl-s <delim>`). Modeled as a single replace
     /// of the target range with `open + <target text> + close` so it's one undo step. `line` selects
@@ -684,7 +684,7 @@ pub enum EditKind {
     /// count and repeated presses stay on the number. `input_increment_number` guarantees a number
     /// exists before issuing this — the no-op case never reaches here.
     AdjustNumber { delta: i64, scan: bool },
-    /// Recase the operand (`Ctrl-r <key>`). The operand range + replacement text are resolved by
+    /// Recase the operand (`Ctrl-u <key>`). The operand range + replacement text are resolved by
     /// `resolve_transform_case`: with `scan` (Insert mode) it recases the identifier under the
     /// caret (post-edit cursor collapses past the result); otherwise it recases exactly the
     /// selection — a point being the single char under the block — which stays selected, so

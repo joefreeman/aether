@@ -486,7 +486,7 @@ impl RpcMethod for CursorSwapAnchor {
 pub struct CursorSwapAnchorParams {
     pub buffer_id: BufferId,
     /// Only swap when the selection is backward (cursor before anchor): normalize to the forward
-    /// orientation instead of toggling (`Alt-r` vs `r`). An already-forward selection or a point
+    /// orientation instead of toggling (`Alt-u` vs `u`). An already-forward selection or a point
     /// cursor is left untouched.
     #[serde(default, skip_serializing_if = "is_false")]
     pub forward_only: bool,

@@ -62,11 +62,12 @@ use aether_protocol::history::{
 };
 use aether_protocol::input::{
     BlockDepthParams, BlockEditResult, BlockUnit, BufferOnlyParams, CaseKind, CommentStyle,
-    CountedEditParams, EditResult, ElementSourceResult, InputAdjustNumberParams,
-    InputDeleteWordParams, InputMoveLinesParams, InputNewlineAndIndentParams, InputOpenLineParams,
-    InputSurroundParams, InputTextParams, InputTransformCaseParams, InputUnsurroundParams,
-    LineSide, MoveBlockParams, OpenBlockParams, PasteBlockParams, SurroundTarget,
-    ToggleCommentParams, ToggleTaskParams, UndoRedoParams, UndoResult,
+    CountedEditParams, EditResult, EditUndoGroupParams, ElementSourceResult,
+    InputAdjustNumberParams, InputDeleteWordParams, InputMoveLinesParams,
+    InputNewlineAndIndentParams, InputOpenLineParams, InputSurroundParams, InputTextParams,
+    InputTransformCaseParams, InputUnsurroundParams, LineSide, MoveBlockParams, OpenBlockParams,
+    PasteBlockParams, SurroundTarget, ToggleCommentParams, ToggleTaskParams, UndoRedoParams,
+    UndoResult,
 };
 use aether_protocol::jumplist::{
     JumplistCaptureParams, JumplistCaptureResult, JumplistClearParams, JumplistClearResult,

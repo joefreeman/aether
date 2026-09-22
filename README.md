@@ -88,12 +88,12 @@ These move the view, not the cursor, and work the same in the reading view.
 | Key | Action |
 | --- | --- |
 | `,` | Collapse selection |
-| `r`/`Alt-r` | Reverse selection (swap cursor and anchor) / orient it forward |
+| `u`/`Alt-u` | Reverse selection (swap cursor and anchor) / orient it forward |
 | `%` | Select all |
 | `q`/`Alt-q` | Expand/contract selection to syntax node |
 | `x`/`Alt-x` | Select line downward/upward |
 | `z`/`Alt-z` | Undo/redo cursor motion |
-| `.` | Repeat last motion |
+| `r` | Repeat last motion, with its count and Shift as pressed (`Shift-w r` keeps extending) |
 | `;`/`Alt-;` | Cursor near top/bottom of window |
 
 ### Search (normal mode)
@@ -128,8 +128,9 @@ identical in both.
 | `Ctrl-Alt-v` | Replace selection with clipboard | Replace line with clipboard |
 | `Ctrl-s` | Surround selection (next key = delimiter) | Surround line |
 | `Ctrl-Alt-s` | Unsurround selection | Unsurround line |
-| `Ctrl-r` | Transform selection (next key = transform: case styles, invert, reverse, randomise) | Transform identifier under cursor |
+| `Ctrl-u` | Transform selection (next key = transform: case styles, invert, reverse, randomise) | Transform identifier under cursor |
 | `Ctrl-z`/`Ctrl-Alt-z` | Undo/redo | Undo/redo |
+| `Ctrl-r` | Repeat the last change on the current selection — a Ctrl edit, or an insert session as one unit (`Ctrl-e foo Esc`, then `n Ctrl-r`) | Repeat the last insert session's typing inline |
 | `Ctrl-l`/`Ctrl-h` | Indent/dedent | Indent/dedent |
 | `Ctrl-j`/`Ctrl-k` | Move line(s) down/up | Move line(s) down/up |
 | `Ctrl-Alt-j`/`Ctrl-Alt-k` | Move paragraph down/up | Move paragraph down/up |
@@ -173,13 +174,14 @@ configured; the rest of the reading view works without one.
 | `g`/`Alt-g` | First/last element |
 | `z`/`Alt-z` | Undo/redo the reading-position move |
 | `Enter` | Follow the link, open the image, jump to the footnote, or toggle a task's checkbox |
-| `Ctrl-Enter` | Follow a relative link in a new window |
+| `Ctrl-Enter` | Follow a relative link in a new window (GUI and browser: a terminal has no window to open it in, and no way to send the chord) |
 | `Space n` | Show the link's or image's target |
 | `x`/`Alt-x`, `Shift-j`/`Shift-k` | Select blocks — as in the editor, plain `x` walks and Shift extends |
-| `r`/`Alt-r` | Reverse the selection / orient it forward |
+| `u`/`Alt-u` | Reverse the selection / orient it forward |
 | `%`/`,` | Select every block / collapse the selection to the cursor's block |
 | `Ctrl-c` | Copy the selection, the link URL, or the element's Markdown source |
 | `Ctrl-z`/`Ctrl-Alt-z` | Undo / redo |
+| `Ctrl-r` | Repeat the last change on the focused block(s) |
 | `Ctrl-a`/`Ctrl-Alt-a` | Check / uncheck the focused task item |
 | `i`/`a` | Edit: insert at block/selection start / end |
 | `Ctrl-e` | Edit: rewrite the selected block(s) |

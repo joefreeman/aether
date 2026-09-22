@@ -1899,6 +1899,52 @@ fn input_adjust_number_methods() {
     assert!(!back.collapse_selection);
 }
 
+/// The undo-group bracket names the buffer and a direction, nothing else: it is a bracket around
+/// edits, not an edit, so it is neither mutating nor replayable.
+#[test]
+fn undo_group_bracket_is_a_buffer_and_a_direction() {
+    use aether_protocol::input::{EditUndoGroup, EditUndoGroupParams};
+    assert_eq!(EditUndoGroup::NAME, "element/undo_group");
+    assert!(!mutates::<EditUndoGroup>());
+    assert!(!replayable::<EditUndoGroup>());
+    let open = to_value(EditUndoGroupParams {
+        buffer_id: 3,
+        open: true,
+    })
+    .unwrap();
+    assert_eq!(open, json!({"buffer_id": 3, "open": true}));
+    let back: EditUndoGroupParams =
+        serde_json::from_value(json!({"buffer_id": 3, "open": false})).unwrap();
+    assert!(!back.open);
+}
+
+// Read through a function so the assertions are on values, not on constants clippy would fold.
+fn mutates<M: RpcMethod>() -> bool {
+    M::MUTATES_TEXT
+}
+fn replayable<M: RpcMethod>() -> bool {
+    M::REPLAYABLE
+}
+
+/// `REPLAYABLE` is the change recorder's whole classifier, so pin its edges: a cursor-relative
+/// edit is replayable, history navigation and wholesale writes are not, and nothing is replayable
+/// without also mutating.
+#[test]
+fn replayable_marks_cursor_relative_edits_only() {
+    use aether_protocol::buffer::{BufferCut, BufferReload, BufferSave};
+    use aether_protocol::input::{EditRedo, EditUndo, InputDeleteBlock, InputSurround};
+    use aether_protocol::lsp::LspFormat;
+    assert!(replayable::<InputText>() && mutates::<InputText>());
+    assert!(replayable::<InputSurround>());
+    assert!(replayable::<InputDeleteBlock>());
+    assert!(replayable::<BufferCut>());
+    assert!(!replayable::<EditUndo>() && mutates::<EditUndo>());
+    assert!(!replayable::<EditRedo>());
+    assert!(!replayable::<LspFormat>() && mutates::<LspFormat>());
+    assert!(!replayable::<BufferSave>());
+    assert!(!replayable::<BufferReload>());
+}
+
 #[test]
 fn buffer_open_result_shape() {
     let v = to_value(ViewOpenResult {

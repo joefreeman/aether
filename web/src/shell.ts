@@ -2619,7 +2619,7 @@ export class Shell {
 
   /** Handle `Effect::ReadClipboard`. A Ctrl-v gesture (before / at_cursor / block) rides the native
    *  `paste` event into the focused capture textarea — no permission prompt — so we just stash the
-   *  descriptor for the paste handler. Ctrl-r (replace / line) has no native paste, so read directly
+   *  descriptor for the paste handler. Ctrl-Alt-v (replace / line) has no native paste, so read directly
    *  (prompts in Firefox — acceptable per the user).
    *
    *  The list must track every kind the keydown handler lets through un-`preventDefault`ed: the
@@ -2638,7 +2638,7 @@ export class Shell {
     }
   }
 
-  /** Read the clipboard directly (`navigator.clipboard.readText`) — used for Ctrl-r replace, which
+  /** Read the clipboard directly (`navigator.clipboard.readText`) — used for Ctrl-Alt-v replace, which
    *  has no native paste event. Prompts for permission in Firefox. */
   private readClipboard(paste: unknown): void {
     const deliver = (text: string | undefined) => {

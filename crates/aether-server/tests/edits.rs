@@ -5023,3 +5023,156 @@ async fn keeping_a_transient_buffer_persists_it_as_kept() {
 
     drop(server);
 }
+
+// ---- element/undo_group -------------------------------------------------------------------------
+
+/// `element/undo_group { open }` — the bracket a replay puts around the edits it re-issues.
+async fn undo_group(ws: &mut Ws, buffer_id: u64, open: bool) {
+    send_request::<EditUndoGroup>(ws, &EditUndoGroupParams { buffer_id, open }).await;
+}
+
+/// An `EditKindTag::Text` edit at the cursor.
+async fn type_text(ws: &mut Ws, buffer_id: u64, text: &str) {
+    let _: EditResult = send_request::<InputText>(
+        ws,
+        &InputTextParams {
+            buffer_id,
+            text: text.into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+}
+
+/// An `EditKindTag::Delete` edit: the char before the cursor goes.
+async fn backspace(ws: &mut Ws, buffer_id: u64) {
+    let _: EditResult = send_request::<InputBackspace>(ws, &BufferOnlyParams { buffer_id }).await;
+}
+
+async fn undo_once(ws: &mut Ws, buffer_id: u64) {
+    let _: UndoResult = send_request::<EditUndo>(
+        ws,
+        &UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        },
+    )
+    .await;
+}
+
+/// A typing edit and a delete edit are different kinds, so on their own they are two undo steps.
+/// Inside the bracket they are one.
+#[tokio::test]
+async fn undo_group_makes_two_kinds_one_undo_step() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello\n").await;
+    undo_group(&mut ws, buffer_id, true).await;
+    type_text(&mut ws, buffer_id, "ab").await;
+    backspace(&mut ws, buffer_id).await;
+    assert_eq!(buffer_text(&mut ws, buffer_id).await, "ahello\n");
+    undo_group(&mut ws, buffer_id, false).await;
+
+    undo_once(&mut ws, buffer_id).await;
+    assert_eq!(
+        buffer_text(&mut ws, buffer_id).await,
+        "hello\n",
+        "one undo takes back both edits"
+    );
+
+    drop(server);
+}
+
+/// Opening the bracket ends the group that was running: the typing just before it stays its own
+/// undo step, even though by kind and timing the bracketed typing would have coalesced with it.
+#[tokio::test]
+async fn undo_group_does_not_swallow_the_edit_before_it() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello\n").await;
+    type_text(&mut ws, buffer_id, "x").await;
+    undo_group(&mut ws, buffer_id, true).await;
+    type_text(&mut ws, buffer_id, "y").await;
+    undo_group(&mut ws, buffer_id, false).await;
+    assert_eq!(buffer_text(&mut ws, buffer_id).await, "xyhello\n");
+
+    undo_once(&mut ws, buffer_id).await;
+    assert_eq!(
+        buffer_text(&mut ws, buffer_id).await,
+        "xhello\n",
+        "the y went; the x stays"
+    );
+
+    drop(server);
+}
+
+/// Closing the bracket ends the group too: the typing right after it starts its own undo step
+/// rather than joining what the bracket held.
+#[tokio::test]
+async fn an_edit_after_the_group_closes_starts_its_own_step() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello\n").await;
+    undo_group(&mut ws, buffer_id, true).await;
+    type_text(&mut ws, buffer_id, "a").await;
+    undo_group(&mut ws, buffer_id, false).await;
+    type_text(&mut ws, buffer_id, "b").await;
+    assert_eq!(buffer_text(&mut ws, buffer_id).await, "abhello\n");
+
+    undo_once(&mut ws, buffer_id).await;
+    assert_eq!(
+        buffer_text(&mut ws, buffer_id).await,
+        "ahello\n",
+        "the b went; the a stays"
+    );
+
+    drop(server);
+}
+
+/// The hold goes with the client that opened it: a bracket nobody can close must not fold every
+/// later edit on the document — another client's — into one undo step forever.
+#[tokio::test]
+async fn a_disconnect_releases_the_hold() {
+    let (server, mut a, buffer_id) = setup_with_buffer("hello\n").await;
+
+    // B views the same file in the same workspace: one path, one document, one buffer id.
+    let mut b = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut b,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let b_open: ViewOpenResult = send_request::<ViewOpen>(
+        &mut b,
+        &ViewOpenParams {
+            transient: Some(false),
+            path_index: Some(0),
+            relative_path: Some("buf.txt".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(b_open.buffer_id, buffer_id, "same path, same buffer");
+
+    // A opens the bracket, then goes away without closing it.
+    undo_group(&mut a, buffer_id, true).await;
+    drop(a);
+    wait_for_client_count(&server, 1).await;
+
+    // B's two kinds of edit are two undo steps again.
+    type_text(&mut b, buffer_id, "ab").await;
+    backspace(&mut b, buffer_id).await;
+    assert_eq!(buffer_text(&mut b, buffer_id).await, "ahello\n");
+    undo_once(&mut b, buffer_id).await;
+    assert_eq!(
+        buffer_text(&mut b, buffer_id).await,
+        "abhello\n",
+        "only the backspace went"
+    );
+
+    drop(server);
+}

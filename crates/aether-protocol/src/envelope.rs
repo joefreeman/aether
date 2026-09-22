@@ -100,6 +100,21 @@ pub trait RpcMethod {
     /// writing text: invoked on a patch view it stages *into a different buffer*, which is the
     /// one thing a read-only buffer is legitimately the subject of.
     const MUTATES_TEXT: bool = false;
+
+    /// Whether `Ctrl-r` (repeat last change) may re-issue this method against the current
+    /// selection.
+    ///
+    /// True for the cursor-relative edits — the `element/*` input methods and `buffer/cut` — whose
+    /// params carry no position, so the same request means "do that here" wherever the cursor now
+    /// is. False for everything wholesale (save, reload, format, git) and for history navigation
+    /// (undo, redo): those change text too, but repeating them at a new cursor is never what a
+    /// repeat key means. Declared on the method, like [`RpcMethod::MUTATES_TEXT`], so the client's
+    /// change recorder learns it in the same request funnel and a method added later is classified
+    /// where it is defined — the default is the safe one (not repeated).
+    ///
+    /// Implies `MUTATES_TEXT`; a mutating method that is *not* replayable aborts an insert-session
+    /// recording when it lands inside one.
+    const REPLAYABLE: bool = false;
 }
 
 /// One-way server→client notifications. No response.

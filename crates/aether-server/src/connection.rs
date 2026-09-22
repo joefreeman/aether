@@ -31,9 +31,9 @@ use aether_protocol::git::{
 use aether_protocol::hints::{HintsRecord, HintsState};
 use aether_protocol::history::{HistoryRecord, HistoryState};
 use aether_protocol::input::{
-    EditRedo, EditUndo, ElementSource, InputAdjustNumber, InputBackspace, InputBlockDepth,
-    InputChange, InputChangeLine, InputDedent, InputDelete, InputDeleteBlock, InputDeleteLine,
-    InputDeleteWord, InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines,
+    EditRedo, EditUndo, EditUndoGroup, ElementSource, InputAdjustNumber, InputBackspace,
+    InputBlockDepth, InputChange, InputChangeLine, InputDedent, InputDelete, InputDeleteBlock,
+    InputDeleteLine, InputDeleteWord, InputIndent, InputJoinLines, InputMoveBlock, InputMoveLines,
     InputNewlineAndIndent, InputOpenBlock, InputOpenLine, InputPasteBlock, InputReplaceLine,
     InputSurround, InputTab, InputText, InputToggleComment, InputToggleTask, InputTransformCase,
     InputUnsurround,
@@ -315,6 +315,7 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
         s.drop_virtual_col_for_client(client_id);
         s.drop_searches_for_client(client_id);
         s.drop_sneaks_for_client(client_id);
+        s.drop_undo_group_holds_for_client(client_id);
         s.drop_tree_selection_history_for_client(client_id);
         s.drop_last_scroll_for_client(client_id);
         s.drop_pickers_for_client(client_id);
@@ -551,6 +552,7 @@ async fn dispatch(
         InputReplaceLine::NAME => run!(InputReplaceLine, handlers::input_replace_line),
         EditUndo::NAME => run!(EditUndo, handlers::edit_undo),
         EditRedo::NAME => run!(EditRedo, handlers::edit_redo),
+        EditUndoGroup::NAME => run!(EditUndoGroup, handlers::edit_undo_group),
         InputJoinLines::NAME => run!(InputJoinLines, handlers::input_join_lines),
         InputMoveLines::NAME => run!(InputMoveLines, handlers::input_move_lines),
         InputMoveBlock::NAME => run!(InputMoveBlock, handlers::input_move_block),

@@ -92,6 +92,7 @@ pub struct BufferCut;
 impl RpcMethod for BufferCut {
     const NAME: &'static str = "buffer/cut";
     const MUTATES_TEXT: bool = true;
+    const REPLAYABLE: bool = true;
     type Params = BufferCopyParams;
     type Result = BufferCutResult;
 }
