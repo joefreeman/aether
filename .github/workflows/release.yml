@@ -32,7 +32,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       # wasm-bindgen-cli — pinned to match the wasm-bindgen crate in Cargo.lock (a mismatch fails
       # at runtime). install-action is cache-aware and doesn't go through cargo's install ledger,
