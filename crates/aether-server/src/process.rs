@@ -1171,14 +1171,32 @@ mod tests {
     /// build script watches it and add it — or a user variable that wants naming in `keep` below.
     #[test]
     fn the_list_still_covers_what_cargo_injects_here() {
-        // Everything cargo-shaped that is legitimately the user's. `CARGO_HOME` is the only one
-        // cargo itself reads back, but it is set by the user (or by rustup's installer), not by
-        // the invocation.
-        const KEEP: &[&str] = &["CARGO_HOME"];
+        // Everything cargo-shaped that is legitimately the user's: `CARGO_HOME`, and cargo's
+        // configuration-by-environment (`CARGO_<SECTION>_<KEY>`), which cargo reads but never
+        // injects. CI sets some of these — `Swatinem/rust-cache` exports `CARGO_INCREMENTAL=0` —
+        // and a child running cargo should inherit them like any other config.
+        const KEEP: &[&str] = &[
+            "CARGO_HOME",
+            "CARGO_INCREMENTAL",
+            "CARGO_TARGET_DIR",
+            "CARGO_LOG",
+        ];
+        const KEEP_PREFIXES: &[&str] = &[
+            "CARGO_BUILD_",
+            "CARGO_TERM_",
+            "CARGO_NET_",
+            "CARGO_HTTP_",
+            "CARGO_REGISTRY_",
+            "CARGO_REGISTRIES_",
+            "CARGO_PROFILE_",
+        ];
         let missed: Vec<String> = std::env::vars()
             .map(|(k, _)| k)
             .filter(|k| k.starts_with("CARGO") || k == "OUT_DIR" || k == "RUST_RECURSION_COUNT")
-            .filter(|k| !KEEP.contains(&k.as_str()) && !is_build_context(k))
+            .filter(|k| {
+                !KEEP.contains(&k.as_str()) && !KEEP_PREFIXES.iter().any(|p| k.starts_with(p))
+            })
+            .filter(|k| !is_build_context(k))
             .collect();
         assert!(
             missed.is_empty(),
