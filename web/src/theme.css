@@ -1585,7 +1585,9 @@ a.picker-row:not(.selected):hover .picker-main {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.picker-row.symbol .picker-meta { flex: 0 0 auto; }
+/* `margin-left: auto` pins the kind tag to the right edge when there's no signature to grow into
+   the gap (most outline rows) — with one, the suffix already takes the free space. */
+.picker-row.symbol .picker-meta { flex: 0 0 auto; margin-left: auto; }
 .picker-dir { color: var(--accent); } /* directories in frost blue, matching the terminal UI */
 /* Dimmed explorer entries — .gitignore'd files/folders (same shade for both: the trailing `/`
    already tells dirs apart). A lighter gray, legible on both the normal and selected backgrounds
