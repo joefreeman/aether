@@ -650,6 +650,18 @@ impl Theme {
     }
 }
 
+/// Braille throbber frames, for the picker's "still searching" spinner and a busy language server.
+pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How long a timer-driven throbber shows each of [`SPINNER_FRAMES`].
+pub const SPINNER_FRAME_MS: u64 = 100;
+
+/// The throbber frame for a wall-clock time (Unix ms) — derived from the clock rather than counted,
+/// so every glyph painted in one frame agrees and a repaint for any other reason can't skip ahead.
+pub const fn spinner_frame(now_ms: u64) -> usize {
+    (now_ms / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len()
+}
+
 /// Resolved style for a tree-sitter capture: a role colour plus font attributes. Shells that
 /// can't render an attribute (no italics in some terminals) drop it.
 /// What a language server's health dot shows. The one classification behind every place the dot
@@ -702,6 +714,24 @@ impl LspDot {
         Self::of(&s.status, &s.progress)
     }
 
+    /// The state as one text glyph, the nearest to the web's `lsp-*` icon: a tick, a braille
+    /// throbber at `frame` (see [`spinner_frame`]) while busy, a cross, and a dashed and a plain
+    /// outline for an uninstalled and a stopped server. Every glyph is one column wide.
+    pub fn glyph(self, frame: usize) -> &'static str {
+        match self {
+            LspDot::Ready => "✓",
+            LspDot::Busy => SPINNER_FRAMES[frame % SPINNER_FRAMES.len()],
+            LspDot::Crashed => "✕",
+            LspDot::Missing => "◌",
+            LspDot::Stopped => "○",
+        }
+    }
+
+    /// Whether the icon animates — the one state a shell has to keep repainting for.
+    pub const fn spins(self) -> bool {
+        matches!(self, LspDot::Busy)
+    }
+
     /// The dot's name on the web: `lsp-<name>` is both the icon kind in `web/src/icons.ts` and the
     /// colour class in `web/src/theme.css`, which hand-mirror this enum (a test holds them to it).
     pub const fn name(self) -> &'static str {
@@ -726,6 +756,47 @@ pub struct SyntaxStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every state has its own glyph, one terminal column wide (the status bar and picker rows
+    /// budget exactly one), and only a busy server's changes with the frame.
+    #[test]
+    fn lsp_glyphs_are_distinct_single_columns() {
+        use unicode_width::UnicodeWidthStr;
+        let still: Vec<&str> = LspDot::ALL
+            .iter()
+            .filter(|d| !d.spins())
+            .map(|d| d.glyph(0))
+            .collect();
+        for dot in LspDot::ALL {
+            for frame in 0..SPINNER_FRAMES.len() {
+                assert_eq!(dot.glyph(frame).width(), 1, "{dot:?} at frame {frame}");
+            }
+            assert_eq!(dot.spins(), dot.glyph(0) != dot.glyph(1), "{dot:?}");
+            if dot.spins() {
+                assert!(
+                    !still.contains(&dot.glyph(0)),
+                    "a throbber frame is a state glyph"
+                );
+            }
+        }
+        let mut unique = still.clone();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            still.len(),
+            "two states share a glyph: {still:?}"
+        );
+    }
+
+    /// The frame is the clock's: it steps once per `SPINNER_FRAME_MS` and wraps.
+    #[test]
+    fn spinner_frame_steps_with_the_clock() {
+        assert_eq!(spinner_frame(0), 0);
+        assert_eq!(spinner_frame(SPINNER_FRAME_MS - 1), 0);
+        assert_eq!(spinner_frame(SPINNER_FRAME_MS), 1);
+        let lap = SPINNER_FRAME_MS * SPINNER_FRAMES.len() as u64;
+        assert_eq!(spinner_frame(lap + 3 * SPINNER_FRAME_MS), 3);
+    }
 
     /// Dark must stay pixel-identical to the constants the shells carried before themes existed.
     #[test]

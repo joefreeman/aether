@@ -20,12 +20,12 @@ use iced::{Border, Color, Element, Length, Rectangle, Size};
 /// head, drawn with `fill_quad` (no canvas feature needed). `phase` (radians) is advanced over time
 /// by the app's frame ticks while a search is in progress, so the rotation is smooth regardless of
 /// how fast results stream in.
-struct Spinner {
-    phase: f32,
+pub(crate) struct Spinner {
+    pub(crate) phase: f32,
     /// Diameter in px — the chrome body size, so the throbber tracks the text it sits beside.
-    size: f32,
+    pub(crate) size: f32,
     /// Dot colour (the palette's accent) — the alpha comet is applied per dot.
-    color: Color,
+    pub(crate) color: Color,
 }
 
 impl Spinner {
@@ -98,6 +98,22 @@ where
 {
     fn from(s: Spinner) -> Self {
         Element::new(s)
+    }
+}
+
+/// A language server's health icon at `size`: the core's glyph, or — busy — the same rotating
+/// throbber a streaming search shows, which is the nearer match for the web's spinning arc than a
+/// braille frame. `phase` is the app's frame-driven spinner phase.
+pub(crate) fn lsp_icon<'a, M: 'a>(
+    dot: LspDot,
+    color: Color,
+    size: f32,
+    phase: f32,
+) -> Element<'a, M> {
+    if dot.spins() {
+        Spinner { phase, size, color }.into()
+    } else {
+        text(dot.glyph(0)).size(size).font(SANS).color(color).into()
     }
 }
 
@@ -443,7 +459,7 @@ pub fn overlay<'a>(
                 // Two-level hierarchy: the collapsible kinds' item rows indent under their group
                 // header, aligning with the header text past its disclosure-mark cell. Header rows
                 // start flush.
-                let mut content = render_item(item, roots, tether, hovered, ui, p);
+                let mut content = render_item(item, roots, tether, hovered, spinner_phase, ui, p);
                 if state.collapsible && !matches!(item, PickerItem::Group { .. }) {
                     content = row![
                         iced::widget::Space::new().width(group_item_indent(ui)),
@@ -1325,6 +1341,7 @@ fn render_item<'a>(
     roots: &'a [String],
     tether: Option<aether_protocol::BufferId>,
     hovered: bool,
+    spinner_phase: f32,
     ui: theme::Ui,
     p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
@@ -1737,7 +1754,8 @@ fn render_item<'a>(
         } => {
             // Health dot (the core's classification — busy while progress is in flight), name,
             // then dim metadata: language, monorepo sub-root, and the active operation.
-            let color = theme::lsp_dot_color(p.mode, LspDot::of(status, progress));
+            let dot = LspDot::of(status, progress);
+            let color = theme::lsp_dot_color(p.mode, dot);
             let mut m = language.clone();
             if !root_label.is_empty() {
                 m.push_str(&format!(" · {root_label}"));
@@ -1746,7 +1764,9 @@ fn render_item<'a>(
                 m.push_str(&format!(" · {}", p.title));
             }
             row![
-                dot_cell(Some(color), ui),
+                container(lsp_icon(dot, color, ui.body(), spinner_phase))
+                    .width(ui.at(14.0))
+                    .align_x(iced::alignment::Horizontal::Center),
                 highlighted(name, match_indices, p.fg_bright, SANS, hovered, ui, p),
                 iced::widget::Space::new().width(Length::Fill),
                 meta(m, ui, p),

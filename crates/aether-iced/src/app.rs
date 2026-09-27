@@ -835,7 +835,10 @@ impl App {
 
     /// Whether this window has something moving that needs frame ticks.
     fn is_animating(&self) -> bool {
-        (self.scroll_anim.is_some() || self.read_scroll_anim.is_some() || self.picker_ticking())
+        (self.scroll_anim.is_some()
+            || self.read_scroll_anim.is_some()
+            || self.picker_ticking()
+            || self.session.lsp_spinning())
             && self.session.conn == ConnState::Connected
     }
 
@@ -1459,9 +1462,10 @@ impl App {
             Message::Noop => Task::none(),
 
             Message::AnimTick(now) => {
-                // Advance the picker throbber by elapsed time (clamped so a gap between animation
-                // bursts doesn't jump it); ~1 rotation/sec. Processing the tick re-renders the view.
-                if self.picker_ticking() {
+                // Advance the throbber — the picker's, and a busy language server's — by elapsed
+                // time (clamped so a gap between animation bursts doesn't jump it); ~1
+                // rotation/sec. Processing the tick re-renders the view.
+                if self.picker_ticking() || self.session.lsp_spinning() {
                     let dt = self
                         .last_anim_tick
                         .map_or(0.0, |t| (now - t).as_secs_f32().min(0.1));
@@ -4358,7 +4362,13 @@ impl App {
                 };
                 let mut col = column![
                     row![
-                        text("● ").size(ui.heading()).color(dot_color),
+                        container(crate::picker::lsp_icon(
+                            dot,
+                            dot_color,
+                            ui.body(),
+                            self.spinner_phase,
+                        ))
+                        .padding(iced::Padding::ZERO.right(6)),
                         text(info.name.clone())
                             .size(ui.body())
                             .font(SANS_BOLD_UI)
@@ -5084,7 +5094,8 @@ impl App {
             left = left.push(t(seg, p.work));
         }
 
-        let mut right = row![].spacing(10);
+        // Centred: the busy server's throbber is a square the height of the text, not a line box.
+        let mut right = row![].spacing(10).align_y(iced::Alignment::Center);
         // Same accumulation as the left segment: the breadcrumb is sized from what's left over, so
         // the right segment has to declare how much room it's taking. `spacing(10)` between
         // children is roughly two chars at any body size.
@@ -5131,8 +5142,14 @@ impl App {
         right = right.push(t(position, p.fg));
         // LSP health dot — the core's classification, the one the picker rows paint too.
         if let Some(lsp) = &self.session.view.lsp {
-            let color = theme::lsp_dot_color(p.mode, LspDot::for_server(lsp));
-            right = right.push(t("•".into(), color));
+            let dot = LspDot::for_server(lsp);
+            let color = theme::lsp_dot_color(p.mode, dot);
+            right = right.push(crate::picker::lsp_icon(
+                dot,
+                color,
+                ui.body(),
+                self.spinner_phase,
+            ));
             right_used += 3;
         }
 
@@ -5164,14 +5181,31 @@ impl App {
         // indicator and language-server dot) always gets its natural width and can never be pushed
         // off the end — clipping the whole row instead meant an overlong breadcrumb shoved the
         // position out of the window entirely, losing the more useful of the two.
-        container(row![container(left).width(Length::Fill).clip(true), right,].width(Length::Fill))
-            .padding([2, STATUS_PAD_X as u16])
-            .width(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(p.bg_panel.into()),
-                text_color: Some(p.fg),
-                ..container::Style::default()
-            })
+        let bar = container(
+            row![container(left).width(Length::Fill).clip(true), right,].width(Length::Fill),
+        )
+        .padding([3, STATUS_PAD_X as u16])
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(p.bg_panel.into()),
+            text_color: Some(p.fg),
+            // A subtle lift above the pane: the bar sits at the bottom, so the shadow casts upward.
+            shadow: iced::Shadow {
+                color: iced::Color::from_rgba8(0, 0, 0, 0.15),
+                offset: iced::Vector::new(0.0, -1.0),
+                blur_radius: 4.0,
+            },
+            ..container::Style::default()
+        });
+        // The bar gets a render layer of its own, or the shadow is painted over: within a layer
+        // iced draws every quad before any text, so the pane's bottom row of glyphs would cover
+        // it, and a layer the pane pushed (the prose stack) is drawn after the one the pane
+        // returns to. A stack draws everything but its first child in a new layer, spanning the
+        // viewport rather than its own bounds, so the shadow isn't clipped either. The empty
+        // child goes *under* so the bar stays the base: a stack takes its base child's size.
+        iced::widget::Stack::new()
+            .push(bar)
+            .push_under(iced::widget::Space::new())
             .into()
     }
 
@@ -8027,10 +8061,11 @@ impl Shell {
         // delivery instead, which is the more accurate moment anyway.
         #[cfg(target_os = "macos")]
         subs.push(Subscription::run(crate::mac_open::opened_files).map(ShellMessage::OpenFromOs));
-        // Frame ticks drive scroll easing and the picker's search throbber. One subscription for
-        // the whole process, delivered to the window whose redraw it was; subscribed while *any*
-        // window is animating, and never while disconnected, where a throbber stuck mid-search
-        // would otherwise pin the 60fps redraw loop for the whole reconnect window.
+        // Frame ticks drive scroll easing and the throbbers (a streaming search, a busy language
+        // server). One subscription for the whole process, delivered to the window whose redraw
+        // it was; subscribed while *any* window is animating, and never while disconnected, where
+        // a throbber stuck mid-search would otherwise pin the 60fps redraw loop for the whole
+        // reconnect window.
         if self.windows.values().any(App::is_animating) {
             subs.push(iced::event::listen_raw(
                 |event, _status, window| match event {

@@ -25,6 +25,7 @@ use aether_client::session::{
     boot_backoff, reconnect_backoff, ConfirmKind, ConnState, HoverText, Mode, Pending, Prompt,
     Session,
 };
+use aether_client::theme::{spinner_frame, SPINNER_FRAME_MS};
 use aether_client::update::Event as CoreEvent;
 use aether_protocol::coords::VisualRow;
 
@@ -368,8 +369,14 @@ pub async fn run(
     // The theme mode is thread-local in `ui`; stamp it from the session before every paint so
     // a settings toggle (or the boot-time restore) takes effect on the next frame.
     ui::set_theme_mode(shell.session.theme);
+    ui::set_spin_frame(spinner_frame(now_unix_ms()));
     terminal.draw(|f| ui::draw(f, &shell.state))?;
     crate::app::refresh_terminal_title(&mut shell.state);
+
+    // A busy language server's throbber: one repaint per frame, armed only while one is on screen
+    // (the core's gate, which is also off while disconnected), so an idle terminal stays idle.
+    let mut spin_tick = tokio::time::interval(std::time::Duration::from_millis(SPINNER_FRAME_MS));
+    spin_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // The hint engine's clock: a slow tick whose arm is gated below on "connected + hints on". The
     // engine's own idle gate covers unattended terminals (crossterm focus events aren't universal,
@@ -395,6 +402,8 @@ pub async fn run(
                 let fx = shell.session.on_hint_tick(now_unix_ms());
                 shell.run_effects(fx);
             }
+            // Nothing to do but fall through to the repaint below, which reads the new frame.
+            _ = spin_tick.tick(), if shell.session.lsp_spinning() => {}
             // Only poll the inbound stream while connected. Once the socket dies the channel
             // is closed, so `recv` returns `None` *immediately* — without this guard the `select!`
             // would spin on that arm (re-dispatching `ConnectionLost` + redrawing) and peg a core
@@ -424,6 +433,7 @@ pub async fn run(
         shell.sync();
         crate::app::apply_cursor_style(&shell.state);
         ui::set_theme_mode(shell.session.theme);
+        ui::set_spin_frame(spinner_frame(now_unix_ms()));
         terminal.draw(|f| ui::draw(f, &shell.state))?;
         crate::app::refresh_terminal_title(&mut shell.state);
     }

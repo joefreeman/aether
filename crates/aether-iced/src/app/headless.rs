@@ -1184,6 +1184,56 @@ fn a_running_shell_shows_in_the_status_bar() {
     snapshot(&mut sim, &app, "shell-indicator");
 }
 
+/// The status bar's language-server icon is the core's glyph for each still state; a busy server
+/// is the rotating throbber instead (a widget, not text, so it shows only in the snapshot).
+#[test]
+fn the_status_bar_shows_the_language_servers_state() {
+    use aether_client::theme::LspDot;
+    use aether_protocol::lsp::{LspServerStatus, LspStatus};
+    let with_server = |status: LspStatus| {
+        let mut session = session_showing(shell_view());
+        session.view.lsp = Some(LspServerStatus {
+            name: "gopls".into(),
+            language: "go".into(),
+            workspace_root: "/p".into(),
+            status,
+            progress: Vec::new(),
+        });
+        app_with(session)
+    };
+    for (status, dot) in [
+        (LspStatus::Ready, LspDot::Ready),
+        (
+            LspStatus::Crashed {
+                code: Some(1),
+                message: "boom".into(),
+            },
+            LspDot::Crashed,
+        ),
+        (
+            LspStatus::Missing {
+                command: "gopls".into(),
+            },
+            LspDot::Missing,
+        ),
+        (LspStatus::Stopped, LspDot::Stopped),
+    ] {
+        let app = with_server(status);
+        let mut sim = simulate(&app);
+        let rows = rows(&mut sim);
+        let glyph = dot.glyph(0);
+        assert!(
+            rows.last().is_some_and(|r| r.contains(glyph)),
+            "{dot:?} paints {glyph} in the status bar:\n{}",
+            rows.join("\n")
+        );
+        snapshot(&mut sim, &app, &format!("lsp-{}", dot.name()));
+    }
+    let app = with_server(LspStatus::Starting);
+    let mut sim = simulate(&app);
+    snapshot(&mut sim, &app, "lsp-busy");
+}
+
 /// A file shown at a revision names itself by its path in the status bar, with the bracketed commit
 /// it is shown at beside it — the pairing the buffers picker paints, here in the filename's slot.
 #[test]

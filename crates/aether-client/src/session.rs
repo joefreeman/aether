@@ -5,6 +5,7 @@
 use super::effect::{Effects, ToastKind};
 use super::keymap::Action;
 use super::picker::PickerState;
+use super::theme::LspDot;
 use aether_protocol::buffer::{BufferReloadResult, BufferSaveResult};
 use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
@@ -12,6 +13,7 @@ use aether_protocol::git::{CommitInfo, GitOperation, GitRepoOperation};
 use aether_protocol::history::{HistoryEntry, HistoryKind, HistoryLists};
 use aether_protocol::input::{CaseKind, SurroundTarget};
 use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus, SymbolCrumb};
+use aether_protocol::picker::PickerItem;
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::SearchSummary;
 use aether_protocol::settings::{MarkdownWidth, ThemeMode};
@@ -1778,6 +1780,23 @@ pub fn read_only_toast() -> Effects {
 pub const TAB_WIDTH: u32 = 4;
 
 impl Session {
+    /// Whether a busy language server's throbber is on screen — the status bar's server, a row of
+    /// the language-servers picker, or the detail dialog — so the shell keeps repainting for it.
+    /// Only while connected: a throbber frozen by a lost connection would otherwise pin the
+    /// repaint loop for the whole reconnect.
+    pub fn lsp_spinning(&self) -> bool {
+        let spins = |s: &LspServerStatus| LspDot::for_server(s).spins();
+        self.conn == ConnState::Connected
+            && (self.view.lsp.as_ref().is_some_and(spins)
+                || matches!(&self.prompt, Some(Prompt::LspInfo(info)) if spins(info))
+                || self.picker.as_ref().is_some_and(|p| {
+                    p.items.iter().any(|i| {
+                        matches!(i, PickerItem::LspServer { status, progress, .. }
+                            if LspDot::of(status, progress).spins())
+                    })
+                }))
+    }
+
     /// Build a session for a workspace the shell has just activated.
     ///
     /// Takes the whole [`WorkspaceInfo`] rather than picking fields out of it: boot is the one
@@ -2230,6 +2249,51 @@ mod tests {
         s.view.buffer.revision = revision;
         s.view.buffer.saved_revision = saved_revision;
         s
+    }
+
+    /// The repaint gate follows a busy server to each place its icon lands — the status bar, a
+    /// language-servers picker row, the detail dialog — and nowhere else: a ready server doesn't
+    /// spin, and nothing spins while disconnected.
+    #[test]
+    fn lsp_spinning_tracks_every_place_a_busy_server_shows() {
+        use aether_protocol::lsp::{LspServerStatus, LspStatus};
+        use aether_protocol::picker::PickerKind;
+        let server = |status: LspStatus| LspServerStatus {
+            name: "gopls".into(),
+            language: "go".into(),
+            workspace_root: "/p".into(),
+            status,
+            progress: Vec::new(),
+        };
+
+        let mut s = Session::placeholder();
+        assert!(!s.lsp_spinning(), "no server anywhere");
+
+        s.view.lsp = Some(server(LspStatus::Ready));
+        assert!(!s.lsp_spinning(), "a ready server holds still");
+        s.view.lsp = Some(server(LspStatus::Starting));
+        assert!(s.lsp_spinning(), "the status bar's server is busy");
+        s.conn = ConnState::Connecting;
+        assert!(!s.lsp_spinning(), "no repaints while disconnected");
+        s.conn = ConnState::Connected;
+        s.view.lsp = None;
+
+        s.prompt = Some(Prompt::LspInfo(Box::new(server(LspStatus::Initializing))));
+        assert!(s.lsp_spinning(), "the detail dialog's server is busy");
+        s.prompt = None;
+
+        let mut picker = PickerState::new(PickerKind::LspServers);
+        picker.items.push(PickerItem::LspServer {
+            name: "gopls".into(),
+            language: "go".into(),
+            workspace_root: "/p".into(),
+            root_label: String::new(),
+            status: LspStatus::Restarting,
+            progress: Vec::new(),
+            match_indices: Vec::new(),
+        });
+        s.picker = Some(picker);
+        assert!(s.lsp_spinning(), "a picker row's server is busy");
     }
 
     /// Typing a command bumps the input's revision past the saved point the client learned when

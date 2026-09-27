@@ -3,6 +3,7 @@
 //! (`src/picker.rs`).
 //!
 use crate::chips::{self, Chip, ChipEditor, ChipEditorKind, ChipId, ChipValue, DirListingState};
+use crate::theme::SPINNER_FRAMES;
 use aether_protocol::picker::{
     GroupHeader, GroupRunRows, GroupSpan, PickerFilters, PickerItem, PickerKind, PickerUpdateParams,
 };
@@ -224,9 +225,6 @@ pub struct PickerState {
     /// Files or view picker has no groups and renders flat.
     pub collapsible: bool,
 }
-
-/// Braille throbber frames for the "still searching" spinner (left of the picker's count).
-const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl PickerState {
     pub fn new(kind: PickerKind) -> Self {

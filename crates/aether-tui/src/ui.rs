@@ -82,6 +82,16 @@ thread_local! {
     /// The mode this thread paints with. The shell sets it every frame from `session.theme`
     /// before `draw`; tests exercising light mode set it (and restore Dark) themselves.
     static THEME_MODE: std::cell::Cell<ThemeMode> = const { std::cell::Cell::new(ThemeMode::Dark) };
+    /// The throbber frame this thread paints a busy language server with — stamped by the shell
+    /// before every `draw`, the same way as the theme mode, rather than threaded down to each of
+    /// the three places the icon lands.
+    static SPIN_FRAME: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Install the throbber frame (see [`aether_client::theme::spinner_frame`]) for this thread's
+/// subsequent painting.
+pub fn set_spin_frame(frame: usize) {
+    SPIN_FRAME.with(|f| f.set(frame));
 }
 
 /// Install the theme mode for this thread's subsequent painting.
@@ -2037,10 +2047,13 @@ fn draw_lsp_detail_overlay(f: &mut Frame, detail: &crate::picker::LspServerDetai
 /// masquerade as a filter box. Pre-wrapped so the scrollbar geometry is exact.
 fn draw_lsp_detail(f: &mut Frame, detail: &crate::picker::LspServerDetail, area: Rect) {
     let text_w = area.width.saturating_sub(2).max(1); // reserve the scrollbar column + a gap
-    let dot_color = lsp_dot_color(LspDot::of(&detail.status, &detail.progress));
+    let dot = LspDot::of(&detail.status, &detail.progress);
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
-            Span::styled("• ".to_string(), Style::default().fg(dot_color)),
+            Span::styled(
+                format!("{} ", lsp_glyph(dot)),
+                Style::default().fg(lsp_dot_color(dot)),
+            ),
             Span::styled(
                 detail.name.clone(),
                 Style::default().fg(c(th().fg)).add_modifier(Modifier::BOLD),
@@ -4336,7 +4349,7 @@ fn lsp_server_item_spans(
         progress,
     } = server;
     let bg = picker_row_bg(highlighted);
-    let dot_color = lsp_dot_color(LspDot::of(status, progress));
+    let dot = LspDot::of(status, progress);
     let base = Style::default().fg(c(th().fg)).bg(bg);
     let match_style = base
         .fg(c(th().match_highlight))
@@ -4380,8 +4393,8 @@ fn lsp_server_item_spans(
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
-        "• ".to_string(),
-        Style::default().fg(dot_color).bg(bg),
+        format!("{} ", lsp_glyph(dot)),
+        Style::default().fg(lsp_dot_color(dot)).bg(bg),
     ));
     if kept_indices.is_empty() {
         spans.push(Span::styled(truncated, base));
@@ -8005,7 +8018,7 @@ fn diagnostic_count_spans(state: &AppState) -> Vec<Span<'static>> {
     parts
 }
 
-/// The far-right LSP health dot for the buffer's own server — the same state-coloured `•` the
+/// The far-right LSP health dot for the buffer's own server — the same state-coloured glyph the
 /// LSP picker rows and detail title use. `None` when the buffer has no attached server or no
 /// status yet. Keyed by the buffer's `(language, workspace_root)` so it's correct even when
 /// several same-language servers run.
@@ -8014,17 +8027,22 @@ fn lsp_indicator_span(state: &AppState) -> Option<Span<'static>> {
     let status = state
         .lsp_status
         .get(&(server.language.clone(), server.workspace_root.clone()))?;
-    let color = lsp_dot_color(LspDot::for_server(status));
+    let dot = LspDot::for_server(status);
     Some(Span::styled(
-        "•".to_string(),
-        Style::default().bg(c(th().bg_panel)).fg(color),
+        lsp_glyph(dot).to_string(),
+        Style::default().bg(c(th().bg_panel)).fg(lsp_dot_color(dot)),
     ))
 }
 
-/// Colour of a language-server's health dot (`•`), by the core's [`LspDot`] classification —
-/// the status bar, the LSP picker rows and the detail title all classify their server through
-/// `LspDot::of` and paint through here, so they can't disagree about it. (The loop is
-/// event-driven: the colour changes when an `lsp/status_changed` arrives rather than animating.)
+/// A language server's health glyph, at the current throbber frame when it's busy.
+fn lsp_glyph(dot: LspDot) -> &'static str {
+    dot.glyph(SPIN_FRAME.with(|f| f.get()))
+}
+
+/// Colour of a language-server's health glyph, by the core's [`LspDot`] classification — the
+/// status bar, the LSP picker rows and the detail title all classify their server through
+/// `LspDot::of` and paint through here, so they can't disagree about it. (The colour changes when
+/// an `lsp/status_changed` arrives; only a busy server's throbber animates, on the shell's timer.)
 fn lsp_dot_color(dot: LspDot) -> Color {
     c(th().lsp_dot(dot))
 }
@@ -9486,9 +9504,9 @@ mod tests {
             60,
         );
         let text = spans_text(&spans);
-        assert!(text.starts_with("• rust-analyzer"));
+        assert!(text.starts_with("✓ rust-analyzer"));
         assert!(text.ends_with("rust · backend"));
-        assert_eq!(spans[0].style.fg, Some(c(th().ok))); // ready → green dot
+        assert_eq!(spans[0].style.fg, Some(c(th().ok))); // ready → green tick
                                                          // At the workspace root the tail is just the language — no separator.
         let single = lsp_server_item_spans(
             LspServerRow {
@@ -9502,8 +9520,36 @@ mod tests {
             false,
             60,
         );
+        assert!(spans_text(&single).starts_with("○ rust-analyzer"));
         assert!(spans_text(&single).ends_with("  rust"));
         assert_eq!(single[0].style.fg, Some(c(th().fg_faint))); // stopped → dim dot
+    }
+
+    /// A busy server's glyph is the throbber frame the shell stamped, not a fixed one — that's
+    /// what the spin timer's repaint changes.
+    #[test]
+    fn busy_lsp_glyph_follows_the_stamped_frame() {
+        let busy = |frame| {
+            set_spin_frame(frame);
+            let spans = lsp_server_item_spans(
+                LspServerRow {
+                    name: "gopls",
+                    language: "go",
+                    root_label: "",
+                    status: &LspStatus::Starting,
+                    progress: &[],
+                },
+                &[],
+                false,
+                60,
+            );
+            spans[0].content.to_string()
+        };
+        let (first, next) = (busy(0), busy(1));
+        set_spin_frame(0);
+        assert_eq!(first, format!("{} ", LspDot::Busy.glyph(0)));
+        assert_eq!(next, format!("{} ", LspDot::Busy.glyph(1)));
+        assert_ne!(first, next);
     }
 
     // ---- collapsed picker box ----
@@ -11144,14 +11190,19 @@ mod tests {
     fn one_lsp_dot_paints_the_status_bar_the_picker_row_and_the_detail() {
         use aether_protocol::lsp::{LspServerRef, LspServerStatus};
         use ratatui::{backend::TestBackend, Terminal};
-        /// Foreground of every `•` cell in a paint, in reading order.
-        fn dot_fgs(width: u16, height: u16, paint: impl FnOnce(&mut Frame)) -> Vec<Color> {
+        /// Foreground of every `glyph` cell in a paint, in reading order.
+        fn dot_fgs(
+            glyph: &str,
+            width: u16,
+            height: u16,
+            paint: impl FnOnce(&mut Frame),
+        ) -> Vec<Color> {
             let mut term = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
             term.draw(paint).expect("draw");
             let buf = term.backend().buffer().clone();
             (0..buf.area.height)
                 .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-                .filter(|&(x, y)| buf[(x, y)].symbol() == "•")
+                .filter(|&(x, y)| buf[(x, y)].symbol() == glyph)
                 .map(|(x, y)| buf[(x, y)].fg)
                 .collect()
         }
@@ -11183,6 +11234,7 @@ mod tests {
         ];
         for (status, progress, dot) in samples {
             let want = lsp_dot_color(dot);
+            let glyph = lsp_glyph(dot);
 
             let mut editor = crate::app::test_editor_state();
             editor.lsp_server = Some(LspServerRef {
@@ -11201,7 +11253,7 @@ mod tests {
                 },
             );
             // The health dot is the bar's far-right glyph.
-            let bar = *dot_fgs(100, 1, |f| draw_status(f, &state, f.area()))
+            let bar = *dot_fgs(glyph, 100, 1, |f| draw_status(f, &state, f.area()))
                 .last()
                 .expect("the status bar shows the buffer's server dot");
 
@@ -11229,7 +11281,7 @@ mod tests {
                 progress: progress.clone(),
                 scroll: Default::default(),
             };
-            let title = dot_fgs(60, 12, |f| draw_lsp_detail(f, &detail, f.area()))[0];
+            let title = dot_fgs(glyph, 60, 12, |f| draw_lsp_detail(f, &detail, f.area()))[0];
 
             assert_eq!(
                 bar,
