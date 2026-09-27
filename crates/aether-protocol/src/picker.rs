@@ -233,6 +233,27 @@ pub enum PickerKind {
     /// you are standing in — "where you are" is the selection, not a glyph on the row. So the row
     /// carries no `current` flag: nothing renders one.
     GitBaseline,
+    /// The tasks runnable **from here** (`Space .`): the justfile, Makefile, `mise.toml` and
+    /// `package.json` tasks in the directory of the file you are looking at and in each directory
+    /// above it up to its workspace root, nearest first. That is the set the runners themselves
+    /// resolve — `just` and `npm run` take the nearest file upward, mise merges every ancestor's
+    /// config — so a row is what typing its command where you are would do.
+    ///
+    /// "Here" is [`PickerViewParams::buffer_id`]'s file and nothing else, as a repo is for the Git
+    /// pickers: from a scratch, a patch or a shell the open is refused.
+    ///
+    /// Rows are [`PickerItem::Task`]. A task is a shortcut for starting a shell, so `Enter` is not a
+    /// `picker/select`: the client opens a shell in the task's directory with its command
+    /// ([`crate::shell::ShellOpenParams`]), and `Ctrl-e` does the same without running it, so the
+    /// command can be given arguments first. `picker/select` answers `Ctrl-g`: the definition, as a
+    /// `FileAt`.
+    ///
+    /// Rebuilt on every fresh open — discovery reads a handful of small files — and preserved
+    /// across a scroll re-view, like the other snapshot kinds.
+    Tasks,
+    /// Every task in the workspace (`Space Alt-.`) — the modal sibling of [`Self::Tasks`], found
+    /// through the workspace's file index rather than by walking up from a file.
+    TasksWorkspace,
 }
 
 impl PickerKind {
@@ -625,8 +646,8 @@ pub enum PickerItem {
         /// user's home — the same string the run boxes inside the shell wear. Shortened
         /// server-side rather than per shell: the server is the one that knows the home directory
         /// (the browser client does not), and the haystack must hold the same string the row shows
-        /// or the fuzzy highlight would land off the text. Empty for a dormant row, whose directory
-        /// is in a snapshot nothing has read yet.
+        /// or the fuzzy highlight would land off the text. A dormant row carries its snapshot's, as
+        /// it does the last command and outcome; empty only when the snapshot could not be read.
         cwd: String,
         /// The last command this shell ran, or `None` for one that has run nothing yet.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -671,6 +692,36 @@ pub enum PickerItem {
         /// subprocess behind it. Its state is always [`AgentRowState::Disconnected`].
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         dormant: bool,
+        /// Char offsets into the composed haystack described above.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One task ([`PickerKind::Tasks`] / [`PickerKind::TasksWorkspace`]). Identity is
+    /// `(path, name)`: two files can define a task of the same name, and each is its own row.
+    ///
+    /// The fuzzy haystack is `"{name}  {display_path}  {description}"` (the empty parts elided) —
+    /// a **wire contract**, exactly as [`Self::Shell`]'s is, and split by the same
+    /// `row_match_segments`.
+    Task {
+        /// The task's name as its runner knows it (`test`, `build:web`).
+        name: String,
+        /// What running it types: the runner and the name (`just test`, `npm run build`), in the
+        /// editor's own shell language. What a shell opened for the task receives as its input.
+        command: String,
+        /// Absolute directory the command runs in — the defining file's, which is where the runner
+        /// would look for it.
+        dir: String,
+        /// Absolute path of the file that defines the task.
+        path: String,
+        /// That file as the row shows it: workspace-relative when it lies inside a root, else
+        /// `~`-shortened absolute (a mise task can come from the user's global config).
+        display_path: String,
+        /// 0-based line of the definition — where `Ctrl-g` lands.
+        line: u32,
+        /// The task's own description (a justfile doc comment, mise's `description`, a Makefile
+        /// `## …`). Empty when it has none.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        description: String,
         /// Char offsets into the composed haystack described above.
         #[serde(default)]
         match_indices: Vec<u32>,

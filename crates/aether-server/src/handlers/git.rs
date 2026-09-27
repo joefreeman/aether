@@ -1013,6 +1013,7 @@ pub async fn rebind_loaded_workspace(
                 read: false,
                 transient: false,
                 source: crate::state::DormantSource::File(path),
+                shell: None,
             }
         })
         .collect();

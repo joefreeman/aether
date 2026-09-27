@@ -121,6 +121,16 @@ fn picker_rows(
     (views, dormant)
 }
 
+/// The shells picker's rows for `client_id`, in its order: live views most-recently-used first, then
+/// the restored-but-unopened ones. What `shell/open`'s `reuse` searches, so a task lands on the
+/// first matching row you would see.
+pub(crate) fn shell_rows(
+    s: &ServerState,
+    client_id: ClientId,
+) -> (Vec<ViewId>, Vec<&crate::state::DormantView>) {
+    picker_rows(s, client_id, RowKind::Shell)
+}
+
 /// Build the buffers-picker candidate list for `client_id`: every *buffer* of the client's active
 /// workspace — a file, a scratch, or a file as of a revision — most-recently-used first, then the
 /// kept-but-unvisited ones, then the session's dormant rows. `(scratch N)` placeholder display for
@@ -202,19 +212,25 @@ fn build_shell_candidates(
         let crate::state::DormantSource::Shell { number } = &d.source else {
             continue;
         };
-        // A dormant shell's snapshot holds its directory and its runs, and reading it is a disk hit
-        // per row — so a row that has not been opened says its name and nothing else. Selecting it
-        // materialises the shell, and the refresh that follows fills the row in.
+        // What the snapshot said, read when the row was restored (see `SnapshotSummary`) — so an
+        // unopened shell reads like the one it was: where it is, what it last ran, how that went.
+        // Nothing is running in it, whatever the snapshot caught mid-run.
         let title = format!("Shell {number}");
+        let summary = d.shell.clone().unwrap_or_default();
+        let cwd = if summary.cwd.as_os_str().is_empty() {
+            String::new()
+        } else {
+            crate::shell::display_path(&summary.cwd)
+        };
         out.push(picker_state::ShellCandidate {
             view_id: d.view,
-            haystack: shell_haystack(&title, "", None),
+            haystack: shell_haystack(&title, &cwd, summary.last_command.as_deref()),
             title,
-            cwd: String::new(),
-            last_command: None,
+            cwd,
+            last_command: summary.last_command,
             running: false,
-            exit: None,
-            elapsed_ms: None,
+            exit: summary.exit,
+            elapsed_ms: summary.elapsed_ms,
             dormant: true,
         });
     }
@@ -314,12 +330,82 @@ fn agent_haystack(title: &str, agent: &str, last_prompt: Option<&str>) -> String
     join_haystack([title, agent, last_prompt.unwrap_or("")])
 }
 
+/// The tasks picker's fuzzy haystack: `"{name}  {display_path}  {description}"`, empty parts elided.
+/// A wire contract for the reason [`shell_haystack`] is.
+fn task_haystack(name: &str, display_path: &str, description: &str) -> String {
+    join_haystack([name, display_path, description])
+}
+
 fn join_haystack(parts: [&str; 3]) -> String {
     parts
         .into_iter()
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>()
         .join("  ")
+}
+
+/// Discover the tasks for `kind` — from where `buffer_id` is, or across the workspace — as picker
+/// candidates.
+///
+/// Workspace state is read under a brief lock; the discovery itself (file reads, and mise, which
+/// may resolve the login shell's environment first) runs off it.
+async fn build_task_candidates(
+    state: &SharedState,
+    client_id: ClientId,
+    kind: PickerKind,
+    buffer_id: Option<BufferId>,
+) -> Result<Vec<picker_state::TaskCandidate>, RpcError> {
+    let (roots, ephemeral, index, start) = {
+        let s = state.lock().await;
+        let w = s.active_workspace_or_err(client_id)?;
+        let (roots, ephemeral, index) =
+            (w.paths.clone(), w.is_ephemeral(), w.workspace_index.clone());
+        // "Here" is the focused file's directory, and nothing else stands in for one — the rule
+        // the Git pickers resolve a repo by. A fallback (the last file looked at, the roots) would
+        // make the list depend on history you cannot see.
+        let start = match kind {
+            PickerKind::Tasks => Some(
+                buffer_id
+                    .and_then(|b| s.try_doc_of(b))
+                    .and_then(|d| d.canonical_path.as_deref()?.parent())
+                    .map(std::path::Path::to_path_buf)
+                    .ok_or_else(RpcError::tasks_need_file)?,
+            ),
+            _ => None,
+        };
+        (roots, ephemeral, index, start)
+    };
+    // mise is the one runner asked rather than read, and asking it runs a program — so only in a
+    // workspace the user configured, and only about directories inside it. The rule language
+    // servers follow, for the same reason.
+    let tasks = match start {
+        Some(start) => {
+            let root = roots
+                .iter()
+                .filter(|r| start.starts_with(r))
+                .max_by_key(|r| r.components().count())
+                .cloned();
+            let trusted = !ephemeral && root.is_some();
+            crate::tasks::discover_here(start.clone(), root.unwrap_or(start), trusted).await
+        }
+        None => {
+            let files = index.files().await;
+            crate::tasks::discover_workspace(&files, &roots, !ephemeral).await
+        }
+    };
+    Ok(tasks
+        .into_iter()
+        .map(|task| {
+            let display_path =
+                crate::workspace_index::workspace_relative_display(&task.path, &roots)
+                    .unwrap_or_else(|| crate::shell::display_path(&task.path));
+            picker_state::TaskCandidate {
+                haystack: task_haystack(&task.name, &display_path, &task.description),
+                display_path,
+                task,
+            }
+        })
+        .collect())
 }
 
 /// Picker candidate for a dormant (session-restored, not-yet-loaded) buffer: it carries the
@@ -1817,7 +1903,9 @@ fn re_view_build(kind: PickerKind) -> ReViewBuild {
         | PickerKind::GitLog
         | PickerKind::GitLogFile
         | PickerKind::GitStash
-        | PickerKind::GitBaseline => ReViewBuild::Placeholder,
+        | PickerKind::GitBaseline
+        | PickerKind::Tasks
+        | PickerKind::TasksWorkspace => ReViewBuild::Placeholder,
         // Cheap and live: re-reading them is the point, and a stale list would be the bug.
         PickerKind::Buffers
         | PickerKind::Shells
@@ -2320,6 +2408,18 @@ pub async fn picker_view(
             )
         }
         PickerKind::GitBaseline => picker_state::PickerCandidates::GitBaseline(Vec::new()),
+        kind @ (PickerKind::Tasks | PickerKind::TasksWorkspace)
+            if params.reset == PickerReset::All =>
+        {
+            picker_state::PickerCandidates::Tasks(
+                build_task_candidates(state, client_id, kind, params.buffer_id).await?,
+            )
+        }
+        // Scroll / resume re-view: keep the snapshot rather than re-reading every runner file (and
+        // asking mise again) per page.
+        PickerKind::Tasks | PickerKind::TasksWorkspace => {
+            picker_state::PickerCandidates::Tasks(Vec::new())
+        }
     };
 
     let mut s = state.lock().await;

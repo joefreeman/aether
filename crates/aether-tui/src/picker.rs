@@ -874,6 +874,11 @@ pub enum ItemKey<'a> {
     GitBaseline {
         label: &'a str,
     },
+    /// A task, identified by the file defining it and its name there.
+    Task {
+        path: &'a str,
+        name: &'a str,
+    },
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -961,6 +966,10 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::GitStash { oid, .. } => ItemKey::GitStash { oid: oid.as_str() },
         PickerItem::GitBaseline { label, .. } => ItemKey::GitBaseline {
             label: label.as_str(),
+        },
+        PickerItem::Task { path, name, .. } => ItemKey::Task {
+            path: path.as_str(),
+            name: name.as_str(),
         },
         PickerItem::Group { header, .. } => match header {
             aether_protocol::picker::GroupHeader::File {

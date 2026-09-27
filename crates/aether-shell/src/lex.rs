@@ -182,6 +182,33 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, Refusal> {
     Ok(out)
 }
 
+/// `text` as one word that reads back as exactly `text`: bare when nothing in it means anything,
+/// quoted otherwise. For writing a line on the user's behalf — a task's command — that the parser
+/// will take the way it was meant.
+pub fn quote(text: &str) -> String {
+    let live = |c: char| {
+        is_word_break(c) || c.is_control() || matches!(c, '"' | '$' | '\\' | '*' | '?' | '[')
+    };
+    if !text.is_empty() && !text.starts_with('~') && !text.chars().any(live) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' | '\\' | '$' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn is_word_break(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\r' | '\n' | '|' | '&' | ';' | '<' | '>')
 }
@@ -405,6 +432,37 @@ mod tests {
             words("ls -la src"),
             vec![vec![bare("ls")], vec![bare("-la")], vec![bare("src")]]
         );
+    }
+
+    #[test]
+    fn quote_reads_back_as_one_word_of_the_same_text() {
+        for text in [
+            "test",
+            "build:web",
+            "",
+            "two words",
+            "a|b",
+            "say \"hi\"",
+            "$HOME",
+            "back\\slash",
+            "glob*",
+            "~home",
+            "tab\there",
+        ] {
+            let quoted = quote(text);
+            let toks = tokenize(&quoted).unwrap();
+            let [Token {
+                kind: TokenKind::Word(w),
+                ..
+            }] = toks.as_slice()
+            else {
+                panic!("{quoted:?} is not one word: {toks:?}");
+            };
+            assert_eq!(w.literal().as_deref(), Some(text), "{quoted:?}");
+        }
+        // Plain names stay plain: a quoted `just test` would be noise in the input.
+        assert_eq!(quote("build:web"), "build:web");
+        assert_eq!(quote("two words"), "\"two words\"");
     }
 
     #[test]

@@ -13,7 +13,7 @@ A modal text editor with a client–server architecture for Linux and macOS. Nat
 - LSP support (diagnostics, hover, go-to-definition, references, document/workspace symbols, formatting)
 - Git integration (gutter, inline diff, blame, hunk staging, remotes, commit, branch switching, worktrees, history, stashes)
 - Markdown reader mode
-- Fuzzy pickers (files, buffers, shells, agents, symbols, diagnostics, git changes), workspace grep
+- Fuzzy pickers (files, buffers, shells, agents, tasks, symbols, diagnostics, git changes), workspace grep
 - File explorer, cross-file jump history, workspace switching
 - Native, terminal and web clients with consistent keymaps and behaviour
 
@@ -210,7 +210,8 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space k`/`Space Alt-k` | Keep this document — in a review, the file under the cursor / reload from disk |
 | `Space x`/`Space Alt-x` | Close view / save and close it |
 | `Space z`/`Space Alt-z` | Open another window / copy this view's web URL |
-| `Space ,`/`Space .` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
+| `Space .`/`Space Alt-.` | Run a task from here / from anywhere in the workspace — `Ctrl-e` edits its command first, `Ctrl-g` goes to its definition |
+| `Space ,`/`Space ;` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
 | `Space v c` | Stop what this view is running — a shell's command, an agent's turn |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save and quit |
@@ -231,6 +232,13 @@ caret is there:
 `Up`/`Down` recall earlier commands while the input is a single line. `Tab`/`Shift-Tab` move the
 caret out to the transcript and back, where `Enter` opens the file the line under the cursor names
 and edits are refused.
+
+A task is a shortcut for starting a shell. `Space .` lists the justfile recipes, Makefile targets,
+`package.json` scripts and mise tasks defined in the current file's directory and each directory
+above it, nearest first — it needs a file open, as the Git commands need one to find their
+repository; `Space Alt-.` lists every one in the workspace. `Enter` runs it where it is
+defined, in the shell that last ran that command there if one is open (or was, before a restart)
+— otherwise in a new one.
 
 ### Git
 

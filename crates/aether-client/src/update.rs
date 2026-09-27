@@ -938,9 +938,28 @@ impl Session {
             Event::ShellOpened(Ok(r)) => {
                 let input = r.input;
                 let same_view = r.opened.view_id == self.view.view_id;
-                let fx = self.adopt_open(r.opened);
+                let mut fx = self.adopt_open(r.opened);
                 self.view.focused_element = input;
                 self.view.mode = Mode::Insert;
+                // A task's line that did not run. The shell is open either way, so these are the
+                // toasts a refused or busy `Enter` in it would have produced.
+                match r.not_run {
+                    Some(aether_protocol::shell::NotRun::Refused { message }) => {
+                        fx = fx.and(Effects::toast_detail(
+                            "Not accepted",
+                            message,
+                            ToastKind::Info,
+                        ));
+                    }
+                    Some(aether_protocol::shell::NotRun::Busy { message }) => {
+                        fx = fx.and(Effects::toast_detail(
+                            "Already running",
+                            message,
+                            ToastKind::Info,
+                        ));
+                    }
+                    None => {}
+                }
                 // A switch already resubscribes; landing on the shell you were already looking at
                 // does not, and the focus move is what that subscribe carries.
                 if same_view {
@@ -4785,6 +4804,8 @@ impl Session {
                             // Likewise the baseline picker: the repo it re-baselines is the one
                             // the buffer you are looking at lives in.
                             | PickerKind::GitBaseline
+                            // The tasks picker lists what runs from where that buffer's file is.
+                            | PickerKind::Tasks
                     ))
                 .then_some(buffer_id),
                 // The **listing** kinds also get the view, so they answer for everything it shows
@@ -6158,6 +6179,9 @@ impl Session {
                 self.prompt = Some(Prompt::LspInfo(Box::new(info)));
                 return Effects::none();
             }
+            // A task is a shortcut for starting a shell: Enter opens one where the task runs, with
+            // its command, and runs it.
+            PickerItem::Task { .. } => return self.open_task(item, true),
             PickerItem::Keybinding { .. } => {
                 // Informational — a shortcut row isn't a jump target and Enter doesn't fire the
                 // binding, so it does nothing: the picker stays open (no close, no `picker/select`).
@@ -6192,6 +6216,25 @@ impl Session {
         });
 
         observed.and(select).and(self.close_picker())
+    }
+
+    /// Open a shell for a task row — in the task's directory, with its command in the input — and
+    /// run it, or (`Ctrl-e`) leave it there to be given arguments first. The shell that last ran
+    /// the command there is used if there is one, which is what the shells picker's rows show.
+    fn open_task(&mut self, item: PickerItem, run: bool) -> Effects {
+        let PickerItem::Task { command, dir, .. } = item else {
+            return Effects::none();
+        };
+        let hide = self.close_picker();
+        hide.and(self.request::<aether_protocol::shell::ShellOpen>(
+            aether_protocol::shell::ShellOpenParams {
+                cwd: Some(dir),
+                input: Some(command),
+                run,
+                reuse: true,
+            },
+            Event::ShellOpened,
+        ))
     }
 
     /// Drop the panel and unsubscribe (the server keeps walker/matcher state for resume).
@@ -6548,6 +6591,34 @@ impl Session {
                     action: ConfirmAction::DropStash { repo_id, oid },
                 });
                 return Effects::none();
+            }
+            // The tasks pickers' two other ways into a row. `Ctrl-e` opens the task's shell with its
+            // command typed but not run — *edit* it first, the `Ctrl-e` of Normal mode — and
+            // `Ctrl-g` *goes* to where it is defined, which is the `picker/select` answer. Not
+            // `Ctrl-o`, which in this editor makes a new thing rather than opening one.
+            KeyCode::Char(c @ ('e' | 'g'))
+                if mods.ctrl
+                    && !mods.alt
+                    && matches!(p.kind, PickerKind::Tasks | PickerKind::TasksWorkspace) =>
+            {
+                let Some(item @ PickerItem::Task { .. }) = p.selected_item().cloned() else {
+                    return Effects::none();
+                };
+                if c == 'e' {
+                    let observed = self.observe_picker_cmd(PickerCmd::EditTask);
+                    return observed.and(self.open_task(item, false));
+                }
+                let kind = p.kind;
+                let observed = self.observe_picker_cmd(PickerCmd::TaskDefinition);
+                // Resolved before the close, as `picker_accept` resolves: the close releases the
+                // candidate set the select is answered from.
+                let select =
+                    self.request::<PickerSelect>(PickerSelectParams { kind, item }, move |r| {
+                        Event::PickerSelected {
+                            result: r.map_err(|e| e.message),
+                        }
+                    });
+                return observed.and(select).and(self.close_picker());
             }
             // All three view-listing pickers: the row names a view, and `Ctrl-d` closes it.
             KeyCode::Char('d')
@@ -11052,7 +11123,7 @@ impl Session {
             ),
             // Always a new shell: returning to one you have is `Space t`, the shells picker.
             A::ShellOpen => self.request::<aether_protocol::shell::ShellOpen>(
-                aether_protocol::shell::ShellOpenParams {},
+                aether_protocol::shell::ShellOpenParams::default(),
                 Event::ShellOpened,
             ),
             // Stopping names the *view*, exactly as `Space g x` names the repo: the thing in front

@@ -631,6 +631,16 @@ pub struct GitBaselineCandidate {
     pub current: bool,
 }
 
+/// One tasks-picker candidate ([`PickerKind::Tasks`] / [`PickerKind::TasksWorkspace`]): a task, the
+/// file it came from as the row shows it, and the composed haystack
+/// (`"{name}  {display_path}  {description}"` — the wire contract [`PickerItem::Task`] documents).
+#[derive(Debug, Clone)]
+pub struct TaskCandidate {
+    pub task: crate::tasks::Task,
+    pub display_path: String,
+    pub haystack: String,
+}
+
 /// Shortest query treated as a hash abbreviation — git's own floor for an abbreviated object name.
 /// Below it, a hex-looking query is far more likely to be prose ("add", "fed") than an id.
 pub const HASH_PREFIX_MIN: usize = 4;
@@ -786,6 +796,9 @@ pub enum PickerCandidates {
     /// meaning order. Rebuilt on every fresh open like [`Self::GitBranches`] — the branch list and
     /// the `current` marker both go stale the moment HEAD or the baseline moves.
     GitBaseline(Vec<GitBaselineCandidate>),
+    /// The tasks runnable from here, or the whole workspace's. Discovered on every fresh open and
+    /// preserved across scroll re-views, like the other snapshot kinds.
+    Tasks(Vec<TaskCandidate>),
 }
 
 /// One row in the Explorer's Roots mode. `absolute_path` is what the client navigates to on
@@ -827,6 +840,7 @@ impl PickerCandidates {
             PickerCandidates::GitLog(v) => v.len(),
             PickerCandidates::GitStash(v) => v.len(),
             PickerCandidates::GitBaseline(v) => v.len(),
+            PickerCandidates::Tasks(v) => v.len(),
         }
     }
 
@@ -858,6 +872,7 @@ impl PickerCandidates {
             PickerCandidates::GitLog(v) => v.clear(),
             PickerCandidates::GitStash(v) => v.clear(),
             PickerCandidates::GitBaseline(v) => v.clear(),
+            PickerCandidates::Tasks(v) => v.clear(),
         }
     }
 
@@ -885,6 +900,8 @@ impl PickerCandidates {
             PickerCandidates::GitLog(_) => PickerKind::GitLog,
             PickerCandidates::GitStash(_) => PickerKind::GitStash,
             PickerCandidates::GitBaseline(_) => PickerKind::GitBaseline,
+            // Serves the workspace-wide `TasksWorkspace` too, in a slot of its own.
+            PickerCandidates::Tasks(_) => PickerKind::Tasks,
         }
     }
 
@@ -927,6 +944,8 @@ impl PickerCandidates {
             // The label alone. `detail` is prose the row shows, not something anyone types to
             // find a baseline — matching it would make "disk" hit the `saved` row's explanation.
             PickerCandidates::GitBaseline(v) => &v[idx].row.label,
+            // The composed haystack: a task is found by the file it is in as readily as by name.
+            PickerCandidates::Tasks(v) => &v[idx].haystack,
         }
     }
 
@@ -1164,6 +1183,19 @@ impl PickerCandidates {
                     match_indices,
                 }
             }
+            PickerCandidates::Tasks(v) => {
+                let c = &v[idx];
+                PickerItem::Task {
+                    name: c.task.name.clone(),
+                    command: c.task.command.clone(),
+                    dir: c.task.dir.to_string_lossy().into_owned(),
+                    path: c.task.path.to_string_lossy().into_owned(),
+                    display_path: c.display_path.clone(),
+                    line: c.task.line,
+                    description: c.task.description.clone(),
+                    match_indices,
+                }
+            }
             PickerCandidates::GitLog(v) => {
                 let c = &v[idx];
                 PickerItem::GitCommit {
@@ -1319,6 +1351,11 @@ impl PickerCandidates {
             (PickerCandidates::GitStash(v), PickerItem::GitStash { oid, .. }) => {
                 v.iter().position(|c| c.row.oid == *oid)
             }
+            (PickerCandidates::Tasks(v), PickerItem::Task { path, name, .. }) => {
+                v.iter().position(|c| {
+                    c.task.name == *name && c.task.path.to_string_lossy() == path.as_str()
+                })
+            }
             _ => None,
         }
     }
@@ -1346,7 +1383,8 @@ impl PickerCandidates {
             | PickerCandidates::GitBranches(_)
             | PickerCandidates::GitLog(_)
             | PickerCandidates::GitStash(_)
-            | PickerCandidates::GitBaseline(_) => MatchStrategy::Fuzzy,
+            | PickerCandidates::GitBaseline(_)
+            | PickerCandidates::Tasks(_) => MatchStrategy::Fuzzy,
             // GitChanges greps the diff content (regex, not path); document order is kept so the
             // per-file grouping stays contiguous, like the symbols outline.
             PickerCandidates::GitChanges(_) => MatchStrategy::RegexContent,
@@ -1479,6 +1517,17 @@ impl PickerCandidates {
             PickerCandidates::GitStash(_) => None,
             // Enter fires `git/set_baseline` from the client, like every other `Space g` picker.
             PickerCandidates::GitBaseline(_) => None,
+            // Enter runs a task, and running one is opening a shell, which the client asks for
+            // itself. What `select` answers is the other thing a task row can take you to: where
+            // it is defined (`Ctrl-g`).
+            PickerCandidates::Tasks(v) => Some(PickerSelectResult::FileAt {
+                path: v[idx].task.path.to_string_lossy().into_owned(),
+                position: LogicalPosition {
+                    line: v[idx].task.line,
+                    col: 0,
+                },
+                anchor: None,
+            }),
             // Entries land exactly as selecting the source row would — which is what decides the
             // variant here: `position`/`anchor` were captured from the source picker's own select
             // semantics, and a whole-target entry has none precisely because its source picker

@@ -21,7 +21,7 @@ pub mod parse;
 pub mod validate;
 pub mod world;
 
-pub use lex::{Part, Span, Word};
+pub use lex::{quote, Part, Span, Word};
 pub use parse::{
     parse, Assignment, Command, Item, ListOp, Pipeline, Program, Redirect, RedirectKind,
 };

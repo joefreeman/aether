@@ -24,11 +24,12 @@ pub type RunId = u64;
 
 /// Mint a shell — `Space Alt-t`.
 ///
-/// **Always creates.** "New" is the explicit half of the pair: `Space t` opens the shells picker,
-/// which is how you get back to one you already have. The old "focused idle shell, else the MRU
-/// idle one, else a new one" heuristic went with the picker — it existed because there was no way
-/// to *list* the shells, and it made the same key mean two different things depending on state the
-/// user could not see.
+/// **Creates**, unless [`ShellOpenParams::reuse`] names a shell by what it shows. "New" is the
+/// explicit half of the pair: `Space t` opens the shells picker, which is how you get back to one
+/// you already have. The old "focused idle shell, else the MRU idle one, else a new one" heuristic
+/// went with the picker — it existed because there was no way to *list* the shells, and it made the
+/// same key mean two different things depending on state the user could not see. `reuse` is not
+/// that: it matches a directory and a last command, which the shells picker's rows display.
 pub struct ShellOpen;
 impl RpcMethod for ShellOpen {
     const NAME: &'static str = "shell/open";
@@ -36,8 +37,43 @@ impl RpcMethod for ShellOpen {
     type Result = ShellOpenResult;
 }
 
+/// All optional: `{}` is `Space Alt-t`'s empty shell where a new one starts. The fields are what
+/// makes a **task** a shortcut for starting a shell rather than a mechanism of its own — the tasks
+/// picker opens one in the task's directory with its command typed, and runs it unless asked not
+/// to, in the shell that ran it last if there is one (`reuse`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ShellOpenParams {}
+pub struct ShellOpenParams {
+    /// Absolute directory to start in, in place of the one a new shell would pick. Must exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Text to put in the input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// Run the input at once, exactly as `Enter` in it would ([`ShellRun`]). Ignored without
+    /// `input`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub run: bool,
+    /// Rather than minting a shell, use one of this workspace's that is **in `cwd` and whose last
+    /// command was `input`** — live or restored, the first in the shells picker's order. Nothing
+    /// links a shell to a task: the match is read off what the shell shows, so running anything
+    /// else in it lets it go, and `input` typed by hand counts the same. On a match, `run` runs the
+    /// line without touching what is typed in that shell's input, and without `run` the line
+    /// replaces it. A match that is still running is switched to and nothing more
+    /// ([`NotRun::Busy`]). Ignored without both `cwd` and `input`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reuse: bool,
+}
+
+/// Why an asked-for run did not start. The shell is open either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NotRun {
+    /// The line did not parse, or named a command that is not there.
+    Refused { message: String },
+    /// The shell asked for is running something already — its message names what, and the key
+    /// that stops it.
+    Busy { message: String },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellOpenResult {
@@ -48,6 +84,12 @@ pub struct ShellOpenResult {
     /// re-deriving it from the window it has not received yet. The same number the window's
     /// [`crate::ui::ElementRole::Input`] marks.
     pub input: FieldId,
+    /// Why an asked-for run did not start. The shell is open regardless — for a refusal in a new
+    /// shell, with the text still in its input and the word at fault selected, exactly as a refused
+    /// `Enter` leaves it: failing the whole open would throw away the one place the line can be
+    /// fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_run: Option<NotRun>,
 }
 
 // ---- shell/run ---------------------------------------------------------------------------------

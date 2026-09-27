@@ -33,7 +33,7 @@ async fn setup() -> (aether_server::ServerHandle, Ws, tempfile::TempDir) {
 /// Open a shell. Always a new one: `shell/open` takes no "reuse" question any more — returning to
 /// a shell you have is the shells picker's job.
 async fn open_shell(ws: &mut Ws) -> ShellOpenResult {
-    send_request::<ShellOpen>(ws, &ShellOpenParams {}).await
+    send_request::<ShellOpen>(ws, &ShellOpenParams::default()).await
 }
 
 /// Subscribe a viewport to a shell's view, wide and tall enough to hold everything these tests
@@ -1255,6 +1255,24 @@ async fn a_shell_survives_a_server_restart() {
         )),
         "the dormant shell is listed, and nothing it once ran is still going: {rows:?}"
     );
+    // Unopened, it still says where it is and what it last ran — read from its snapshot — and the
+    // run that was going reports the way its box will: stopped, not exited.
+    let row = rows
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::Shell {
+                title,
+                cwd,
+                last_command,
+                exit,
+                ..
+            } if title == "Shell 1" => Some((cwd.clone(), last_command.clone(), *exit)),
+            _ => None,
+        })
+        .expect("the dormant row");
+    assert!(row.0.ends_with("/sub"), "its directory: {row:?}");
+    assert_eq!(row.1.as_deref(), Some("sleep 100"));
+    assert_eq!(row.2, None);
     let buffers = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Buffers)).await;
     let buffer_rows = buffers.update.and_then(|u| u.items).expect("a window");
     assert!(
@@ -1280,6 +1298,7 @@ async fn a_shell_survives_a_server_restart() {
     let shell = ShellOpenResult {
         opened: restored,
         input: 0,
+        not_run: None,
     };
     let (_, window) = shell_window(&mut ws, &shell).await;
     assert_eq!(
@@ -2194,4 +2213,326 @@ async fn space_k_on_a_shells_input_keeps_nothing() {
     assert_eq!(before, after, "and nothing, anywhere, was kept by it");
 
     drop(server);
+}
+
+// ---- opening with a command: what a task is ------------------------------------------------------
+
+/// A shell opened in a directory with a line to run starts there and runs it at once — a task is
+/// exactly this. The line goes through the input like a typed one, so the input is clear after.
+#[tokio::test]
+async fn a_shell_opened_with_a_command_runs_it_where_asked() {
+    let (server, mut ws, dir) = setup().await;
+    let sub = dir.path().canonicalize().unwrap().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let open: ShellOpenResult = send_request::<ShellOpen>(
+        &mut ws,
+        &ShellOpenParams {
+            cwd: Some(sub.to_string_lossy().into_owned()),
+            input: Some("pwd".into()),
+            run: true,
+            reuse: false,
+        },
+    )
+    .await;
+    assert_eq!(open.not_run, None);
+    let run = finished_run(&mut ws).await;
+    assert_eq!(run.status, RunStatus::Exited { code: 0 });
+
+    let (viewport, window) = shell_window(&mut ws, &open).await;
+    assert_eq!(
+        body(&window).first().map(String::as_str),
+        Some(sub.to_string_lossy().as_ref())
+    );
+    let input = input_buffer_of(&server, &open).await;
+    assert_eq!(
+        input_text(&mut ws, input).await,
+        "",
+        "submitted, not copied"
+    );
+    // The caret waits in the input for the next command, as after a typed `Enter` — not in the
+    // run's box, which now sits where the input was when the shell opened.
+    let input_element = window.root.input_element().expect("an input");
+    assert_eq!(open.input, input_element);
+    assert_eq!(open.opened.scroll.map(|s| s.element), Some(input_element));
+    assert_eq!(focused_element(&server, viewport).await, input_element);
+}
+
+/// Without `run`, the line waits in the input — `Ctrl-e` on a task, to add arguments first.
+#[tokio::test]
+async fn a_shell_opened_with_a_command_but_no_run_leaves_it_typed() {
+    let (server, mut ws, _dir) = setup().await;
+    let open: ShellOpenResult = send_request::<ShellOpen>(
+        &mut ws,
+        &ShellOpenParams {
+            cwd: None,
+            input: Some("echo hi".into()),
+            run: false,
+            reuse: false,
+        },
+    )
+    .await;
+    let input = input_buffer_of(&server, &open).await;
+    assert_eq!(input_text(&mut ws, input).await, "echo hi");
+    let runs = {
+        let s = server.state.lock().await;
+        s.try_doc_of(open.opened.buffer_id)
+            .and_then(|d| d.transcript())
+            .map(|t| t.runs.len())
+    };
+    assert_eq!(runs, Some(0));
+}
+
+/// A line the shell refuses still opens the shell — the refusal comes back beside the open, with
+/// the text left in the input and the word at fault selected, as a refused `Enter` leaves it.
+#[tokio::test]
+async fn a_refused_line_still_opens_its_shell() {
+    let (server, mut ws, _dir) = setup().await;
+    let open: ShellOpenResult = send_request::<ShellOpen>(
+        &mut ws,
+        &ShellOpenParams {
+            cwd: None,
+            input: Some("lss -la".into()),
+            run: true,
+            reuse: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        open.not_run,
+        Some(NotRun::Refused {
+            message: "unknown command `lss`".into()
+        })
+    );
+    let input = input_buffer_of(&server, &open).await;
+    assert_eq!(input_text(&mut ws, input).await, "lss -la");
+    assert_eq!(
+        input_selection(&server, input).await,
+        (pos(0, 0), pos(0, 2))
+    );
+}
+
+/// A directory that is not there is refused outright: there is nowhere to open the shell.
+#[tokio::test]
+async fn opening_a_shell_in_a_missing_directory_is_refused() {
+    let (_server, mut ws, dir) = setup().await;
+    let missing = dir.path().join("nope");
+    let err = send_request_expect_error::<ShellOpen>(
+        &mut ws,
+        &ShellOpenParams {
+            cwd: Some(missing.to_string_lossy().into_owned()),
+            input: None,
+            run: false,
+            reuse: false,
+        },
+    )
+    .await;
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("is not a directory"),
+        "{err}"
+    );
+}
+
+// ---- reuse: the shell that last ran a task's line ------------------------------------------------
+
+/// `shell/open` as the tasks picker sends it: here, this line, run it, and use the shell that ran
+/// it last if there is one.
+fn task_params(dir: &std::path::Path, line: &str, run: bool) -> ShellOpenParams {
+    ShellOpenParams {
+        cwd: Some(dir.to_string_lossy().into_owned()),
+        input: Some(line.into()),
+        run,
+        reuse: true,
+    }
+}
+
+/// How many runs the shell presenting `view_id` has.
+async fn run_count(
+    server: &aether_server::ServerHandle,
+    view_id: aether_protocol::ViewId,
+) -> usize {
+    let s = server.state.lock().await;
+    let transcript = s.try_presenting_buffer(view_id).expect("the shell's view");
+    s.try_doc_of(transcript)
+        .and_then(|d| d.transcript())
+        .map_or(0, |t| t.runs.len())
+}
+
+/// Running a task again runs it in the shell that ran it, below the last run — and leaves what was
+/// being typed in that shell alone.
+#[tokio::test]
+async fn a_task_reruns_in_the_shell_that_last_ran_it() {
+    let (server, mut ws, dir) = setup().await;
+    let root = dir.path().canonicalize().unwrap();
+    let first: ShellOpenResult =
+        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    finished_run(&mut ws).await;
+    let input = input_buffer_of(&server, &first).await;
+    type_command(&mut ws, &first, input, "draft").await;
+
+    let again: ShellOpenResult =
+        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    assert_eq!(again.opened.view_id, first.opened.view_id, "the same shell");
+    assert_eq!(again.not_run, None);
+    finished_run(&mut ws).await;
+    assert_eq!(run_count(&server, first.opened.view_id).await, 2);
+    assert_eq!(
+        input_text(&mut ws, input).await,
+        "draft",
+        "typing ahead survives"
+    );
+}
+
+/// A shell is found by what it shows, so running anything else in it lets it go — and a line typed
+/// by hand counts the same as one a task ran.
+#[tokio::test]
+async fn a_shell_matches_a_task_by_its_directory_and_last_command() {
+    let (server, mut ws, dir) = setup().await;
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+
+    // Typed by hand in a plain shell, which starts at the root.
+    let plain = open_shell(&mut ws).await;
+    run_and_wait(&mut ws, &server, &plain, "echo hi").await;
+    let task: ShellOpenResult =
+        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    assert_eq!(
+        task.opened.view_id, plain.opened.view_id,
+        "a hand-typed run counts"
+    );
+    finished_run(&mut ws).await;
+
+    // The same line elsewhere is another task.
+    let sub: ShellOpenResult =
+        send_request::<ShellOpen>(&mut ws, &task_params(&root.join("sub"), "echo hi", true)).await;
+    assert_ne!(
+        sub.opened.view_id, plain.opened.view_id,
+        "another directory"
+    );
+    finished_run(&mut ws).await;
+
+    // Something else run in the matched shell lets it go.
+    run_and_wait(&mut ws, &server, &plain, "echo other").await;
+    let after: ShellOpenResult =
+        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    assert_ne!(
+        after.opened.view_id, plain.opened.view_id,
+        "no longer its last command"
+    );
+    assert_ne!(after.opened.view_id, sub.opened.view_id);
+    finished_run(&mut ws).await;
+}
+
+/// A matched shell still running the line is switched to and left running: asking again does not
+/// stop it, and says why nothing ran.
+#[tokio::test]
+async fn a_busy_task_shell_is_switched_to_and_not_rerun() {
+    let (server, mut ws, dir) = setup().await;
+    let root = dir.path().canonicalize().unwrap();
+    let first: ShellOpenResult =
+        send_request::<ShellOpen>(&mut ws, &task_params(&root, "sleep 30", true)).await;
+    let again: ShellOpenResult =
+        send_request::<ShellOpen>(&mut ws, &task_params(&root, "sleep 30", true)).await;
+    assert_eq!(again.opened.view_id, first.opened.view_id);
+    assert!(
+        matches!(&again.not_run, Some(NotRun::Busy { message }) if message.contains("sleep 30")),
+        "{:?}",
+        again.not_run
+    );
+    assert_eq!(
+        run_count(&server, first.opened.view_id).await,
+        1,
+        "not rerun"
+    );
+
+    let _: ShellCancelResult = send_request::<ShellCancel>(
+        &mut ws,
+        &ShellCancelParams {
+            view_id: first.opened.view_id,
+        },
+    )
+    .await;
+}
+
+/// `Ctrl-e` on a task: the matched shell, with the line in its input to be edited — replacing
+/// what was typed there — and nothing run.
+#[tokio::test]
+async fn editing_a_task_puts_its_line_in_the_matched_shell() {
+    let (server, mut ws, dir) = setup().await;
+    let root = dir.path().canonicalize().unwrap();
+    let first: ShellOpenResult =
+        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    finished_run(&mut ws).await;
+    let input = input_buffer_of(&server, &first).await;
+    type_command(&mut ws, &first, input, "draft").await;
+
+    let edit: ShellOpenResult =
+        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", false)).await;
+    assert_eq!(edit.opened.view_id, first.opened.view_id);
+    assert_eq!(input_text(&mut ws, input).await, "echo hi");
+    assert_eq!(run_count(&server, first.opened.view_id).await, 1);
+}
+
+/// A shell restored from the session is matched from its snapshot, without being loaded first, and
+/// running the task brings it back and runs there — the same shell, not a new one beside it.
+#[tokio::test]
+async fn a_task_reuses_a_restored_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let sessions_path = root.join("sessions.json");
+    let backups = root.join("backups");
+
+    {
+        let server = aether_server::spawn_for_test_multi_with_persistence(
+            vec![("p".to_string(), vec![root.clone()])],
+            Some(sessions_path.clone()),
+            Some(backups.clone()),
+        )
+        .await
+        .unwrap();
+        let mut ws = Ws::connect(&server).await;
+        activate_p(&mut ws).await;
+        let _: ShellOpenResult =
+            send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+        finished_run(&mut ws).await;
+        wait_for_snapshot(&backups, 1, "echo hi").await;
+        drop(ws);
+        drop(server);
+    }
+
+    // Cold-load the workspace, as the restart test does, so the shell comes back dormant.
+    let store = root.join("workspaces");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("p.toml"),
+        format!("[[roots]]\npath = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![],
+        Some(sessions_path.clone()),
+        Some(backups.clone()),
+    )
+    .await
+    .unwrap();
+    server.state.lock().await.workspaces_dir = Some(store);
+    let mut ws = Ws::connect(&server).await;
+    activate_p(&mut ws).await;
+
+    let again: ShellOpenResult =
+        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    assert_eq!(
+        again.opened.title.as_deref(),
+        Some("Shell 1"),
+        "the restored shell"
+    );
+    assert_eq!(again.not_run, None);
+    finished_run(&mut ws).await;
+    assert_eq!(
+        run_count(&server, again.opened.view_id).await,
+        2,
+        "run below the first"
+    );
 }

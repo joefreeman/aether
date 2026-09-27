@@ -59,11 +59,13 @@ describe("shell rows", () => {
     expect(bad.metaParts).toEqual([{ text: "✗ 101  1.2s", cls: "picker-badge-bad" }]);
   });
 
-  it("a shell that has run nothing wears no badge, and neither does a dormant row", () => {
+  it("a shell that has run nothing wears no badge; a dormant one wears its last outcome", () => {
     expect(describe_(shell()).metaParts).toBeUndefined();
-    expect(describe_(shell({ dormant: true, exit: 0, elapsed_ms: 1 })).metaParts).toBeUndefined();
-    // …but the dormant row is dimmed, which is how "present, not loaded" reads.
-    expect(describe_(shell({ dormant: true })).dim).toBe(true);
+    expect(describe_(shell({ dormant: true, exit: 0, elapsed_ms: 1200 })).metaParts).toEqual([
+      { text: "✓ 0  1.2s", cls: "picker-badge-ok" },
+    ]);
+    // …and it is not dimmed: being unloaded changes nothing about what you can do with it.
+    expect(describe_(shell({ dormant: true })).dim).toBeUndefined();
   });
 
   it("a killed run says so rather than claiming an exit code", () => {
@@ -79,6 +81,36 @@ describe("shell rows", () => {
     expect(d.matches).toEqual([0]); // 'S' of the name
     // The tail is "~/proj  cargo test": the cwd hit at 0, the command hit at 8.
     expect(d.suffixMatches).toEqual([0, 8]);
+  });
+});
+
+describe("task rows", () => {
+  const task = (over: Partial<Extract<PickerItem, { kind: "task" }>> = {}) =>
+    ({
+      kind: "task",
+      name: "test",
+      command: "just test",
+      dir: "/w/web",
+      path: "/w/web/justfile",
+      display_path: "web/justfile",
+      line: 3,
+      ...over,
+    }) as PickerItem;
+
+  it("leads with the name and trails the file and description, with no badge", () => {
+    const d = describe_(task({ description: "Run the tests" }));
+    expect(d.primary).toBe("test");
+    expect(d.suffix).toBe("web/justfile  Run the tests");
+    expect(d.metaParts).toBeUndefined();
+    // A task without a description is its name and file.
+    expect(describe_(task()).suffix).toBe("web/justfile");
+  });
+
+  it("splits the haystack's match offsets across the name and the file", () => {
+    // "test  web/justfile" — 0..4 name, 6..18 file.
+    const d = describe_(task({ match_indices: [0, 6] }));
+    expect(d.matches).toEqual([0]);
+    expect(d.suffixMatches).toEqual([0]);
   });
 });
 

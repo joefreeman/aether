@@ -654,6 +654,9 @@ pub struct DormantView {
     /// What to materialize: a file (by path) or a scratch (by per-workspace number, whose unsaved
     /// content is restored from its backup).
     pub source: DormantSource,
+    /// For a shell, what its snapshot says — the picker row's directory, last command and outcome.
+    /// `None` for every other source, and for a snapshot that could not be read.
+    pub shell: Option<crate::shell::SnapshotSummary>,
 }
 
 /// The thing a [`DormantView`] materializes into.
@@ -6780,6 +6783,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::File(PathBuf::from("/p/c.rs")),
+                shell: None,
             },
             DormantView {
                 id: d_dup,
@@ -6787,6 +6791,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
+                shell: None,
             },
         ];
 
@@ -6827,6 +6832,7 @@ mod workspace_state_tests {
                 read: false,
                 transient,
                 source: DormantSource::File(PathBuf::from(path)),
+                shell: None,
             }
         };
         let front = row(&mut s, "/p/front.rs", true);
@@ -6929,6 +6935,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
+                shell: None,
             },
             DormantView {
                 id: d2,
@@ -6936,6 +6943,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::File(PathBuf::from("/p/b.rs")),
+                shell: None,
             },
         ];
 
@@ -6978,6 +6986,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::Scratch { number: 1 },
+                shell: None,
             },
             DormantView {
                 id: file,
@@ -6985,6 +6994,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
+                shell: None,
             },
         ];
 

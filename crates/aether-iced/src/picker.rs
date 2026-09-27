@@ -1159,15 +1159,12 @@ fn composed_row<'a>(
     parts: [&'a str; 3],
     match_indices: &'a [u32],
     badge: Option<(String, aether_client::labels::RowBadgeTone)>,
-    dormant: bool,
     hovered: bool,
     ui: theme::Ui,
     p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
     let seg = aether_client::picker::row_match_segments(parts, match_indices);
-    // A dormant row is "present but not loaded" — greyed, as the buffers picker greys one.
-    let name = if dormant { p.fg_faint } else { p.fg };
-    let colours = [name, p.fg_dim, p.fg_dim];
+    let colours = [p.fg, p.fg_dim, p.fg_dim];
     let indices = [seg.first, seg.second, seg.third];
     let mut r = row![].spacing(8).align_y(iced::Alignment::Center);
     for ((part, colour), idx) in parts.iter().zip(colours).zip(indices) {
@@ -1455,14 +1452,27 @@ fn render_item<'a>(
             running,
             exit,
             elapsed_ms,
-            dormant,
             match_indices,
             ..
         } => composed_row(
             [title, cwd, last_command.as_deref().unwrap_or("")],
             match_indices,
-            aether_client::labels::shell_row_badge(*running, *exit, *elapsed_ms, *dormant),
-            *dormant,
+            aether_client::labels::shell_row_badge(*running, *exit, *elapsed_ms),
+            hovered,
+            ui,
+            p,
+        ),
+        // `test   web/justfile   Run the tests` — the shell row's shape, with no badge.
+        PickerItem::Task {
+            name,
+            display_path,
+            description,
+            match_indices,
+            ..
+        } => composed_row(
+            [name, display_path, description],
+            match_indices,
+            None,
             hovered,
             ui,
             p,
@@ -1479,7 +1489,6 @@ fn render_item<'a>(
             [title, agent, last_prompt.as_deref().unwrap_or("")],
             match_indices,
             aether_client::labels::agent_row_badge(state, *dormant),
-            *dormant,
             hovered,
             ui,
             p,

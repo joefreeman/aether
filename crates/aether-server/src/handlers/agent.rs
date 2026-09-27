@@ -189,7 +189,7 @@ async fn ensure_agent(state: &SharedState, view_buffer: BufferId) -> Result<(), 
     }
 
     // Resolved outside the lock: it may run the user's login shell.
-    let env = crate::handlers::shell::shell_environment(&cwd).await;
+    let env = crate::shell::environment(&cwd).await;
 
     // Where the agent comes from — a real subprocess, an in-process dummy, or nothing at all on a
     // test server that installed no dummy. The refusal is the whole point of the enum: see

@@ -173,6 +173,13 @@ impl RpcError {
         )
     }
 
+    /// `Space .` from something with no file behind it — a scratch, a patch, a shell. Tasks are
+    /// found from a file's directory, as a repo is found from a file; phrased as the remedy, like
+    /// [`Self::repo_needs_file`].
+    pub fn tasks_need_file() -> Self {
+        Self::new(ErrorCode::BUFFER_HAS_NO_PATH, "Open a file first")
+    }
+
     pub fn buffer_has_no_path() -> Self {
         Self::new(
             ErrorCode::BUFFER_HAS_NO_PATH,

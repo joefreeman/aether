@@ -640,15 +640,15 @@ pub enum Action {
     /// tables. An unshifted letter rather than punctuation: the punctuation slots are taken by the
     /// settings pair, and `Space /` is grep (mirroring Normal mode's `/`).
     OpenHelp,
-    /// `Space .` — the workspace-settings overlay (roots + rename). The neighbour of the app-wide
-    /// settings on `Space ,`: same overlay family, narrower scope. Was `Space Alt-,`, which
-    /// terminal emulators tend to swallow before we see it.
+    /// `Space ;` — the workspace-settings overlay (roots + rename). Beside the app-wide settings on
+    /// `Space ,`: same overlay family, narrower scope. Was `Space Alt-,`, which terminal emulators
+    /// tend to swallow before we see it, then `Space .` until the tasks pickers took that.
     OpenWorkspaceSettings,
     /// `Space,` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
     /// lives here too (a stepped value row), not on a keybinding.
     OpenAppSettings,
     /// `Space ?` — the application-info dialog: build identity, the daemon we're connected to, and
-    /// where this profile's state lives. Keeps its key through every `,`/`.`//` reshuffle: `?` is a
+    /// where this profile's state lives. Keeps its key through every `,`/`.`/`/` reshuffle: `?` is a
     /// strong enough "what is this thing?" mnemonic to stand on its own.
     ShowAppInfo,
 
@@ -1473,10 +1473,15 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('q'), Exact(Mods::ALT), A::SaveAndQuit, "App", "Save and quit"),
     // `?` is a shifted `/` on every layout we care about, so the terminal reports it with SHIFT set
     // while the GUI/web report the resolved character — `IgnoreShift` accepts both. It keeps its
-    // key now `/` is grep: "?" asks about the install, and the shortcut list is one key away on `.`.
+    // key now `/` is grep: "?" asks about the install, and the shortcut list is on `y`.
     bind!(L, ch('?'), IgnoreShift(Mods::NONE), A::ShowAppInfo, "App", "About / diagnostics"),
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
-    bind!(L, ch('.'), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
+    bind!(L, ch(';'), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
+    // Tasks: what `just`, `make`, mise and `package.json` define, each run as a new shell. `.` is
+    // Vim's "do it again", which is most of what running a task is. Plain lists what runs from
+    // here, Alt widens to the workspace — the `Space d`/`Space c` grammar.
+    bind!(L, ch('.'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Tasks), "Workspace", "Run a task from here"),
+    bind!(L, ch('.'), Exact(Mods::ALT), A::OpenPicker(PickerKind::TasksWorkspace), "Workspace", "Run a task from the workspace"),
     bind!(L, ch('y'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseView, "App", "Close view"),
     bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close view"),
@@ -2229,19 +2234,28 @@ mod tests {
     }
 
     #[test]
-    fn leader_punctuation_is_settings_and_grep() {
+    fn leader_punctuation_is_settings_tasks_and_grep() {
         let l = |code, mods| lookup(KeyContext::Leader, code, mods).map(|b| b.action);
-        // `,` app-wide, `.` this workspace: same overlay family, adjacent keys, narrower scope on
-        // the second. Neither may move onto an Alt-chord — terminals eat `Alt-,`.
+        // `,` app-wide, `;` this workspace: same overlay family, narrower scope on the second.
+        // Neither may move onto an Alt-chord — terminals eat `Alt-,`.
         assert!(matches!(
             l(ch(','), Mods::NONE),
             Some(Action::OpenAppSettings)
         ));
         assert!(matches!(
-            l(ch('.'), Mods::NONE),
+            l(ch(';'), Mods::NONE),
             Some(Action::OpenWorkspaceSettings)
         ));
         assert!(l(ch(','), Mods::ALT).is_none());
+        // `.` runs a task: from here, and Alt from anywhere in the workspace.
+        assert!(matches!(
+            l(ch('.'), Mods::NONE),
+            Some(Action::OpenPicker(PickerKind::Tasks))
+        ));
+        assert!(matches!(
+            l(ch('.'), Mods::ALT),
+            Some(Action::OpenPicker(PickerKind::TasksWorkspace))
+        ));
         // The shortcut reference sits on `y`; `/` is grep, mirroring Normal mode's `/` and `Alt-/`.
         assert!(matches!(l(ch('y'), Mods::NONE), Some(Action::OpenHelp)));
         assert!(matches!(

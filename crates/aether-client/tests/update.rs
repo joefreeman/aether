@@ -3784,6 +3784,128 @@ fn stash_picker_rows_preview_pop_apply_and_confirm_a_drop() {
     assert_eq!(params["oid"], json!("abc1234def"));
 }
 
+/// The tasks pickers. `Space .` asks about where you are — the focused buffer's file, and the view
+/// for when that is a shell — and `Space Alt-.` about the workspace. On a row, `Enter` opens a
+/// shell where the task is defined and runs its command, `Ctrl-e` opens it with the command typed
+/// but not run, and `Ctrl-g` asks where it is defined.
+#[test]
+fn tasks_picker_runs_edits_and_finds_a_task() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let fx = key(&mut s, '.');
+    let params = find_request(&fx, "picker/view").expect("Space . opens the tasks picker");
+    assert_eq!(params["kind"], json!("tasks"));
+    assert_eq!(params["buffer_id"], json!(s.view.buffer.buffer_id));
+
+    let mut s = session();
+    let _ = key(&mut s, ' ');
+    let fx = s.on_key(KeyCode::Char('.'), Mods::ALT, Some('.'.to_string()));
+    let params = find_request(&fx, "picker/view").expect("Space Alt-. opens the workspace's");
+    assert_eq!(params["kind"], json!("tasks_workspace"));
+
+    let row = || PickerItem::Task {
+        name: "test".into(),
+        command: "just test".into(),
+        dir: "/p/web".into(),
+        path: "/p/web/justfile".into(),
+        display_path: "web/justfile".into(),
+        line: 3,
+        description: String::new(),
+        match_indices: Vec::new(),
+    };
+    let open = |s: &mut aether_client::session::Session| {
+        let _ = s.open_picker(PickerKind::Tasks, None, None, false, None);
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![row()];
+        p.selected = 0;
+    };
+
+    // Enter runs it: a new shell, there, with the command.
+    let mut s = session();
+    open(&mut s);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let params = find_request(&fx, "shell/open").expect("Enter opens a shell");
+    assert_eq!(
+        *params,
+        json!({"cwd": "/p/web", "input": "just test", "run": true, "reuse": true})
+    );
+    assert!(s.picker.is_none(), "and the picker goes");
+
+    // Ctrl-e types it and stops.
+    let mut s = session();
+    open(&mut s);
+    let fx = s.on_key(KeyCode::Char('e'), Mods::CTRL, None);
+    let params = find_request(&fx, "shell/open").expect("Ctrl-e opens a shell");
+    assert_eq!(
+        *params,
+        json!({"cwd": "/p/web", "input": "just test", "reuse": true})
+    );
+
+    // Ctrl-g resolves the row before closing, so the select has a candidate set to answer from.
+    let mut s = session();
+    open(&mut s);
+    let fx = s.on_key(KeyCode::Char('g'), Mods::CTRL, None);
+    let params = find_request(&fx, "picker/select").expect("Ctrl-g asks for the definition");
+    assert_eq!(params["item"]["kind"], json!("task"));
+    let requests: Vec<&str> =
+        fx.0.iter()
+            .filter_map(|e| match e {
+                Effect::Request { method, .. } => Some(*method),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(requests, ["picker/select", "picker/hide"]);
+}
+
+/// A task's line the shell would not run still lands you in the shell, with the refusal said.
+#[test]
+fn a_refused_task_opens_its_shell_and_says_why() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Tasks, None, None, false, None);
+    let p = s.picker.as_mut().unwrap();
+    p.items = vec![PickerItem::Task {
+        name: "test".into(),
+        command: "just test".into(),
+        dir: "/p".into(),
+        path: "/p/justfile".into(),
+        display_path: "justfile".into(),
+        line: 0,
+        description: String::new(),
+        match_indices: Vec::new(),
+    }];
+    p.selected = 0;
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let token = request_token(&fx, "shell/open").expect("Enter opens a shell");
+    let fx = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "opened": {
+                "view_id": 9,
+                "buffer_id": 9,
+                "line_count": 1,
+                "byte_count": 0,
+                "revision": 0,
+                "saved_revision": 0,
+                "cursor": {"position": {"line": 0, "col": 0}, "anchor": {"line": 0, "col": 0}},
+                "title": "Shell 1",
+                "read_only": true,
+                "is_patch": false,
+            },
+            "input": 1,
+            "not_run": {"kind": "refused", "message": "unknown command `just`"},
+        })),
+    );
+    assert_eq!(s.view.view_id, ViewId(9), "the shell is open regardless");
+    assert_eq!(s.view.focused_element, 1);
+    assert_eq!(
+        toast_messages(&fx),
+        ["Not accepted — unknown command `just`"]
+    );
+}
+
 /// `Space c`: the workspace changes picker lists every root, whatever repos they span, so it needs
 /// no repo-resolution hint — it sends the buffer only as the *centring* target, to land on the hunk
 /// nearest the cursor.
@@ -7940,15 +8062,15 @@ fn app_settings_overlay_opens_via_leader_comma() {
         s.app_settings.is_some(),
         "Space , opens the app-settings overlay"
     );
-    // Its neighbour on `.` is the workspace-scoped overlay — a distinct chord.
+    // Its neighbour on `;` is the workspace-scoped overlay — a distinct chord.
     assert!(s.workspace_settings.is_none());
 
     let mut s = session();
     let _ = key(&mut s, ' ');
-    s.on_key(KeyCode::Char('.'), Mods::NONE, Some('.'.to_string()));
+    s.on_key(KeyCode::Char(';'), Mods::NONE, Some(';'.to_string()));
     assert!(
         s.workspace_settings.is_some(),
-        "Space . opens the workspace-settings overlay"
+        "Space ; opens the workspace-settings overlay"
     );
     assert!(s.app_settings.is_none());
 }

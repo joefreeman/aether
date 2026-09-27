@@ -999,6 +999,7 @@ impl PickerState {
             PickerKind::GitBranches => "No branches yet",
             PickerKind::GitLog | PickerKind::GitLogFile => "No commits",
             PickerKind::GitStash => "No stashes",
+            PickerKind::Tasks | PickerKind::TasksWorkspace => "No tasks found",
             // Only reachable by filtering it away: the three fixed rows are always built.
             PickerKind::GitBaseline => "No matching baseline",
             _ => "No results",
@@ -1040,6 +1041,8 @@ pub enum ItemKey<'a> {
     /// A stash entry's hash — stable where its `stash@{n}` position isn't.
     GitStash(&'a str),
     GitBaseline(&'a str),
+    /// `(path, name)` — the defining file and the task's name in it.
+    Task(&'a str, &'a str),
 }
 
 /// A Keybinding row's `match_indices` split per rendered segment. The wire indices are char
@@ -1199,6 +1202,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
         PickerItem::GitCommit { hash, .. } => ItemKey::GitCommit(hash),
         PickerItem::GitStash { oid, .. } => ItemKey::GitStash(oid),
         PickerItem::GitBaseline { label, .. } => ItemKey::GitBaseline(label),
+        PickerItem::Task { path, name, .. } => ItemKey::Task(path, name),
         PickerItem::Group { header, .. } => match header {
             GroupHeader::File {
                 path_index,

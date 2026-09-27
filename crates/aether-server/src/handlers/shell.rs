@@ -8,7 +8,7 @@
 
 use super::*;
 use aether_protocol::shell::{
-    RunId, RunState, RunStatus, ShellCancelParams, ShellCancelResult, ShellOpenParams,
+    NotRun, RunId, RunState, RunStatus, ShellCancelParams, ShellCancelResult, ShellOpenParams,
     ShellOpenResult, ShellRunChanged, ShellRunChangedParams, ShellRunParams, ShellRunResult,
 };
 use aether_protocol::ViewId;
@@ -41,14 +41,219 @@ const TRUNCATED: &str = "[output truncated — the run exceeded this shell's out
 pub async fn shell_open(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    _params: ShellOpenParams,
+    params: ShellOpenParams,
 ) -> Result<ShellOpenResult, RpcError> {
-    // Always a new one. Returning to a shell you already have is the shells picker's job
-    // (`Space t`), which is a list you can see — unlike the reuse heuristic this replaced, where
-    // the same key opened a new shell or an old one depending on which was idle.
-    let transcript = mint_shell(state, ctx.client_id, None).await?;
-    let (opened, input) = land_in_input(state, ctx, transcript).await?;
-    Ok(ShellOpenResult { opened, input })
+    let cwd = match params.cwd {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if !dir.is_dir() {
+                return Err(RpcError::invalid_params(format!(
+                    "{} is not a directory",
+                    crate::shell::display_path(&dir)
+                )));
+            }
+            Some(dir)
+        }
+        None => None,
+    };
+    let line = params
+        .input
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string);
+    let run = params.run && line.is_some();
+
+    // The shell that last ran this line, here — if asked, and if there is one.
+    let found = match (params.reuse, &cwd, &line) {
+        (true, Some(dir), Some(line)) => {
+            let s = state.lock().await;
+            shell_for(&s, ctx.client_id, dir, line)
+        }
+        _ => None,
+    };
+    let (transcript, reused) = match found {
+        Some(Found::Live(transcript)) => (transcript, true),
+        // Brought back the way selecting its row would, which lands in it.
+        Some(Found::Dormant(view_id)) => {
+            let params = ViewOpenParams {
+                view_id: Some(view_id),
+                ..Default::default()
+            };
+            let opened = crate::handlers::buffer::view_open(state, ctx, params).await?;
+            let s = state.lock().await;
+            let transcript = s
+                .try_presenting_buffer(opened.view_id)
+                .ok_or_else(|| RpcError::internal("a restored shell has no view"))?;
+            (transcript, true)
+        }
+        // Always a new one otherwise. Returning to a shell you already have is the shells
+        // picker's job (`Space t`), which is a list you can see — unlike the reuse heuristic this
+        // replaced, where the same key opened a new shell or an old one depending on which was
+        // idle.
+        None => {
+            let fresh = Fresh {
+                cwd,
+                input: params.input,
+            };
+            (
+                mint_shell(state, ctx.client_id, Start::Fresh(fresh)).await?,
+                false,
+            )
+        }
+    };
+    // Not running it: the line goes in the input to be edited, replacing whatever was there — the
+    // same edit a user's own select-all-and-type makes, so it is undoable like one.
+    if let (true, false, Some(line)) = (reused, run, &line) {
+        replace_input(state, ctx.client_id, transcript, line).await?;
+    }
+    let (mut opened, mut input) = land_in_input(state, ctx, transcript).await?;
+    if !run {
+        return Ok(ShellOpenResult {
+            opened,
+            input,
+            not_run: None,
+        });
+    }
+
+    // A matched shell still running the line: switched to, and nothing more — stopping it is a
+    // decision for `Space v c`, not a side effect of asking again.
+    let busy = {
+        let s = state.lock().await;
+        s.try_doc_of(transcript)
+            .and_then(|d| d.transcript())
+            .and_then(|t| Some(RpcError::shell_busy(&t.title, &t.active()?.command)))
+    };
+    let not_run = match busy {
+        Some(e) => Some(NotRun::Busy { message: e.message }),
+        // Through `shell/run`'s own path, so a line run on open is parsed, refused, recorded in the
+        // recall list and started exactly as the same line typed and entered would be. A new
+        // shell runs its input (landing first puts the caret where a refusal selects the word at
+        // fault); a reused one runs the line itself, leaving whatever was typed in it alone.
+        None => {
+            let line = reused.then(|| line.clone()).flatten();
+            run_line(state, ctx, opened.view_id, line)
+                .await
+                .err()
+                .map(|e| {
+                    if e.code == aether_protocol::error::ErrorCode::SHELL_BUSY.code() {
+                        NotRun::Busy { message: e.message }
+                    } else {
+                        NotRun::Refused { message: e.message }
+                    }
+                })
+        }
+    };
+    // A run is an element *above* the input, so the number the landing named the input by now
+    // names the run. Viewports already showing the view follow the input by themselves
+    // (`reinstate`); the answer has to be told, or the client subscribes focused on the run.
+    let s = state.lock().await;
+    if let Some(moved) = input_element_of(&s, transcript) {
+        input = moved;
+        if let Some(scroll) = opened.scroll.as_mut() {
+            scroll.element = moved;
+        }
+    }
+    Ok(ShellOpenResult {
+        opened,
+        input,
+        not_run,
+    })
+}
+
+/// A shell `shell/open`'s `reuse` found.
+enum Found {
+    /// Open now, by its transcript.
+    Live(BufferId),
+    /// Restored from the session and not opened yet, by its row's view.
+    Dormant(ViewId),
+}
+
+/// The first shell, in the shells picker's order, that is in `dir` and whose last command was
+/// `line` — read off what the row shows: the directory the shell is in now (where the line would
+/// run), and the last command, running or not. A restored shell answers from its snapshot's
+/// summary, so finding one does not load it.
+fn shell_for(
+    s: &ServerState,
+    client_id: ClientId,
+    dir: &std::path::Path,
+    line: &str,
+) -> Option<Found> {
+    let (live, dormant) = crate::handlers::picker::shell_rows(s, client_id);
+    live.into_iter()
+        .find_map(|view_id| {
+            let transcript = s.try_view(view_id)?.presenting;
+            let t = s.try_doc_of(transcript)?.transcript()?;
+            (t.cwd == dir && t.runs.last().is_some_and(|r| r.command == line))
+                .then_some(Found::Live(transcript))
+        })
+        .or_else(|| {
+            dormant.into_iter().find_map(|d| {
+                let summary = d.shell.as_ref()?;
+                (summary.cwd == dir && summary.last_command.as_deref() == Some(line))
+                    .then_some(Found::Dormant(d.view))
+            })
+        })
+}
+
+/// Replace what is typed in `transcript`'s input with `line`, through the ordinary edit path.
+async fn replace_input(
+    state: &SharedState,
+    client_id: ClientId,
+    transcript: BufferId,
+    line: &str,
+) -> Result<(), RpcError> {
+    let input = {
+        let mut s = state.lock().await;
+        let input = s
+            .try_doc_of(transcript)
+            .and_then(|d| d.transcript())
+            .map(|t| t.input)
+            .ok_or_else(|| RpcError::internal("a shell view has lost its input"))?;
+        let end = motion::clamp_position(
+            s.doc_of(input),
+            LogicalPosition {
+                line: u32::MAX,
+                col: u32::MAX,
+            },
+        );
+        set_cursor(
+            &mut s,
+            (client_id, input),
+            CursorState {
+                position: end,
+                anchor: LogicalPosition { line: 0, col: 0 },
+                match_bracket: None,
+                jumplist_position: None,
+            },
+        );
+        input
+    };
+    let empty = state.lock().await.doc_of(input).text.len_chars() == 0;
+    let edit = EditKind::ReplaceWith {
+        text: line.to_string(),
+        select_pasted: false,
+        // An empty input has no selection to replace — a point cursor would be a character.
+        replace_selection: !empty,
+        park_before: false,
+    };
+    apply_edit(state, client_id, input, edit).await?;
+    Ok(())
+}
+
+/// How a shell comes to exist: new, or brought back from the snapshot written under its number.
+enum Start {
+    Fresh(Fresh),
+    Restored(u32, crate::shell::ShellSnapshot),
+}
+
+/// What a new shell starts with beyond the defaults.
+#[derive(Default)]
+struct Fresh {
+    /// Where it starts, in place of [`shell_cwd`]'s pick.
+    cwd: Option<PathBuf>,
+    /// What its input already says.
+    input: Option<String>,
 }
 
 /// Open the shell `transcript` presents for this client and put the caret in its input.
@@ -147,22 +352,30 @@ pub async fn open_restored_shell(
                 format!("Shell {number} has no snapshot to come back from"),
             )
         })?;
-    let transcript = mint_shell(state, client_id, Some((number, snapshot))).await?;
+    let transcript = mint_shell(state, client_id, Start::Restored(number, snapshot)).await?;
     let (opened, _input) = land_in_input(state, ctx, transcript).await?;
     Ok(opened)
 }
 
 /// Create a shell: a transcript document, an input document, and the view over the two — fresh,
-/// or as `seed` (a number and the snapshot written under it) left it.
+/// or as a snapshot left it.
 async fn mint_shell(
     state: &SharedState,
     client_id: ClientId,
-    seed: Option<(u32, crate::shell::ShellSnapshot)>,
+    start: Start,
 ) -> Result<BufferId, RpcError> {
+    let (seed, fresh) = match start {
+        Start::Fresh(fresh) => (None, fresh),
+        Start::Restored(number, snapshot) => (Some((number, snapshot)), Fresh::default()),
+    };
     let cwd = {
         let s = state.lock().await;
         s.active_workspace_or_err(client_id)?;
-        match seed.as_ref().map(|(_, snap)| snap.cwd.clone()) {
+        match seed
+            .as_ref()
+            .map(|(_, snap)| snap.cwd.clone())
+            .or(fresh.cwd)
+        {
             // A directory that has gone since falls back to where a new shell would start.
             Some(dir) if dir.is_dir() => dir,
             _ => shell_cwd(&s, client_id),
@@ -172,7 +385,7 @@ async fn mint_shell(
     // can't find the tools the user's own shell would is a shell that can't build anything.
     // Resolved once here, outside the lock (it may run the login shell), and kept on the
     // transcript: from now on the shell's environment is its own.
-    let env = shell_environment(&cwd).await;
+    let env = crate::shell::environment(&cwd).await;
 
     let mut s = state.lock().await;
     let workspace = s.active_workspace_or_err(client_id)?.id.clone();
@@ -185,7 +398,10 @@ async fn mint_shell(
     // The input first: the transcript's own state names it, so it has to exist to be named. No
     // language: what is typed here is this shell's own command line, not anyone's script.
     let input = s.allocate_buffer_id();
-    let typed = seed.as_ref().map(|(_, snap)| snap.input.clone());
+    let typed = match &seed {
+        Some((_, snap)) => Some(snap.input.clone()),
+        None => fresh.input,
+    };
     s.insert_buffer_with_document(input, None, false, |id| {
         let mut doc = Document::field(id, None);
         if let Some(typed) = typed.filter(|t| !t.is_empty()) {
@@ -248,18 +464,6 @@ async fn mint_shell(
     Ok(transcript)
 }
 
-/// The environment a new shell starts with: the daemon's, overlaid with what the user's login
-/// shell sets for this directory.
-pub(crate) async fn shell_environment(
-    cwd: &std::path::Path,
-) -> std::collections::HashMap<String, String> {
-    let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
-    if let Some(resolved) = crate::lsp::shell_env::resolve(cwd).await {
-        env.extend(resolved);
-    }
-    env
-}
-
 /// Where a new shell runs: the workspace root containing the file you were looking at, else the
 /// workspace's first root.
 ///
@@ -302,6 +506,20 @@ pub async fn shell_run(
     ctx: &mut ConnectionCtx,
     params: ShellRunParams,
 ) -> Result<ShellRunResult, RpcError> {
+    run_line(state, ctx, params.view_id, None).await
+}
+
+/// Run a line in the shell `view_id` presents: `line`, or — `None` — what is typed in its input,
+/// which is then cleared. A `line` given leaves the input alone, refusal included: the words a
+/// refusal would select are not in it.
+async fn run_line(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    view_id: ViewId,
+    line: Option<String>,
+) -> Result<ShellRunResult, RpcError> {
+    let params = ShellRunParams { view_id };
+    let from_input = line.is_none();
     let client_id = ctx.client_id;
     let (transcript, input, source, cwd, prev_cwd, env, workspace, current_file) = {
         let s = state.lock().await;
@@ -317,7 +535,10 @@ pub async fn shell_run(
         if let Some(active) = t.active() {
             return Err(RpcError::shell_busy(&t.title, &active.command));
         }
-        let source = s.doc_of(t.input).text.to_string();
+        let source = match line {
+            Some(line) => line,
+            None => s.doc_of(t.input).text.to_string(),
+        };
         if source.trim().is_empty() {
             return Err(RpcError::invalid_params("nothing to run"));
         }
@@ -350,7 +571,9 @@ pub async fn shell_run(
         Ok(accepted) => accepted,
         Err(refusal) => {
             // The word at fault is selected so that typing replaces it; the text stays.
-            select_in_input(state, client_id, input, refusal.span).await;
+            if from_input {
+                select_in_input(state, client_id, input, refusal.span).await;
+            }
             return Err(RpcError::shell_rejected(refusal.message));
         }
     };
@@ -359,28 +582,30 @@ pub async fn shell_run(
     // Clear the input through the ordinary edit path — selection then delete — rather than by
     // swapping its rope: that is what keeps the revision-guarded pushes and every viewer's cursor
     // coherent, and it is the same path a user pressing `Ctrl-a Delete` would take.
-    {
-        let mut s = state.lock().await;
-        let doc = s.doc_of(input);
-        let end = motion::clamp_position(
-            doc,
-            LogicalPosition {
-                line: u32::MAX,
-                col: u32::MAX,
-            },
-        );
-        set_cursor(
-            &mut s,
-            (client_id, input),
-            CursorState {
-                position: end,
-                anchor: LogicalPosition { line: 0, col: 0 },
-                match_bracket: None,
-                jumplist_position: None,
-            },
-        );
+    if from_input {
+        {
+            let mut s = state.lock().await;
+            let doc = s.doc_of(input);
+            let end = motion::clamp_position(
+                doc,
+                LogicalPosition {
+                    line: u32::MAX,
+                    col: u32::MAX,
+                },
+            );
+            set_cursor(
+                &mut s,
+                (client_id, input),
+                CursorState {
+                    position: end,
+                    anchor: LogicalPosition { line: 0, col: 0 },
+                    match_bracket: None,
+                    jumplist_position: None,
+                },
+            );
+        }
+        apply_edit(state, client_id, input, EditKind::DeleteSelection).await?;
     }
-    apply_edit(state, client_id, input, EditKind::DeleteSelection).await?;
 
     // Recorded only once it is really accepted, so a refused submit never enters the recall list.
     if let Some(workspace) = workspace {

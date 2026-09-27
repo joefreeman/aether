@@ -220,6 +220,56 @@ pub struct RunSnapshot {
     pub elapsed_ms: Option<u64>,
 }
 
+/// What the shells picker says about a shell nobody has opened since the restart: where it is, what
+/// it last ran and how that went — the live row's fields, read out of the snapshot.
+///
+/// Read once, when the workspace restores its dormant rows, and kept on the row: a snapshot does
+/// not change while its shell is dormant, and reading one per row on every picker refresh would
+/// be a disk read of up to [`SNAPSHOT_BUDGET`] under the state lock.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotSummary {
+    pub cwd: PathBuf,
+    pub last_command: Option<String>,
+    /// The last *finished* run's exit code, as a live row reports it.
+    pub exit: Option<i32>,
+    pub elapsed_ms: Option<u64>,
+}
+
+impl SnapshotSummary {
+    /// Summarise the snapshot at `path`, or `None` when it is missing or unreadable. The transcript
+    /// text is skipped rather than kept: nothing here needs it.
+    pub fn read(path: &Path) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        struct Head {
+            cwd: PathBuf,
+            #[serde(default)]
+            runs: Vec<RunHead>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RunHead {
+            command: String,
+            status: RunStatus,
+            #[serde(default)]
+            elapsed_ms: Option<u64>,
+        }
+        let head: Head = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        let finished = head
+            .runs
+            .iter()
+            .rev()
+            .find(|r| !matches!(r.status, RunStatus::Running));
+        Some(SnapshotSummary {
+            last_command: head.runs.last().map(|r| r.command.clone()),
+            exit: finished.and_then(|r| match r.status {
+                RunStatus::Exited { code } => Some(code),
+                _ => None,
+            }),
+            elapsed_ms: finished.and_then(|r| r.elapsed_ms),
+            cwd: head.cwd,
+        })
+    }
+}
+
 /// Most transcript text a snapshot keeps. A shell that has been running builds all day holds far
 /// more than anyone will scroll back through after a restart; the oldest runs go first.
 pub const SNAPSHOT_BUDGET: usize = 2 * 1024 * 1024;
@@ -394,6 +444,16 @@ fn highlight(start: usize, end: usize, kind: &str) -> aether_protocol::viewport:
     }
 }
 
+/// The environment a new shell starts with: the daemon's, overlaid with what the user's login
+/// shell sets for this directory.
+pub(crate) async fn environment(cwd: &Path) -> std::collections::HashMap<String, String> {
+    let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    if let Some(resolved) = crate::lsp::shell_env::resolve(cwd).await {
+        env.extend(resolved);
+    }
+    env
+}
+
 /// `$HOME` shortened to `~`, as every shell prompt does — a header naming an absolute path three
 /// levels deep spends the whole row on saying where you already are.
 pub(crate) fn display_path(path: &Path) -> String {
@@ -518,6 +578,46 @@ mod tests {
             started.starts_with(&title_text(&input)),
             "{started:?} does not begin as the input's title does"
         );
+    }
+
+    /// A dormant shell's picker row is read from its snapshot: the directory, the last command,
+    /// and the last finished run's outcome — the transcript text is not needed and not kept.
+    #[test]
+    fn a_snapshot_summarises_for_the_picker_row() {
+        let (handle, _token) = crate::process::cancel_channel();
+        let mut t = Transcript::new(9, PathBuf::from("/tmp/p"), "Shell 1".into());
+        let a = t.push_run("cargo test".into(), 0, handle);
+        t.run_mut(a).unwrap().end_line_exclusive = 1;
+        t.run_mut(a).unwrap().status = RunStatus::Exited { code: 101 };
+        t.run_mut(a).unwrap().elapsed_ms = Some(1200);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1");
+        let write = |t: &Transcript| {
+            let json = serde_json::to_string(&t.snapshot("failed\n", "")).unwrap();
+            std::fs::write(&path, json).unwrap();
+        };
+        write(&t);
+        assert_eq!(
+            SnapshotSummary::read(&path),
+            Some(SnapshotSummary {
+                cwd: PathBuf::from("/tmp/p"),
+                last_command: Some("cargo test".into()),
+                exit: Some(101),
+                elapsed_ms: Some(1200),
+            })
+        );
+
+        // A run caught going is written down killed, so it is the last command and the outcome is
+        // "stopped" — what the restored shell's own box will say.
+        let (handle, _token) = crate::process::cancel_channel();
+        t.push_run("sleep 100".into(), 1, handle);
+        write(&t);
+        let summary = SnapshotSummary::read(&path).unwrap();
+        assert_eq!(summary.last_command.as_deref(), Some("sleep 100"));
+        assert_eq!(summary.exit, None);
+
+        assert_eq!(SnapshotSummary::read(&dir.path().join("missing")), None);
     }
 
     /// A snapshot carries everything a restart needs, and a run still going comes back killed —

@@ -1098,7 +1098,9 @@ export type PickerKind =
   | "git_log"
   | "git_log_file"
   | "git_stash"
-  | "git_baseline";
+  | "git_baseline"
+  | "tasks"
+  | "tasks_workspace";
 
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
@@ -1136,6 +1138,19 @@ export type PickerItem =
       exit?: number;
       elapsed_ms?: number;
       dormant?: boolean;
+      match_indices?: number[];
+    }
+  /** A task (`tasks` / `tasks_workspace`). Haystack is `"{name}  {display_path}  {description}"`,
+   *  composed like the shell row's. `command` runs in `dir`; `path`/`line` are the definition. */
+  | {
+      kind: "task";
+      name: string;
+      command: string;
+      dir: string;
+      path: string;
+      display_path: string;
+      line: number;
+      description?: string;
       match_indices?: number[];
     }
   /** An agent conversation. Haystack is `"{title}  {agent}  {last_prompt}"`, composed like the

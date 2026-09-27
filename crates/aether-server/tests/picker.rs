@@ -4930,7 +4930,7 @@ async fn setup_three_kinds() -> (aether_server::ServerHandle, Ws, aether_protoco
         send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
     let _ = send_request::<aether_protocol::shell::ShellOpen>(
         &mut ws,
-        &aether_protocol::shell::ShellOpenParams {},
+        &aether_protocol::shell::ShellOpenParams::default(),
     )
     .await;
     let _ = send_request::<aether_protocol::agent::AgentOpen>(
@@ -5031,7 +5031,7 @@ async fn shell_and_agent_rows_carry_their_own_fields() {
 async fn the_shells_picker_is_ordered_by_recency() {
     use aether_protocol::shell::{ShellOpen, ShellOpenParams};
     let (server, mut ws, file_view) = setup_three_kinds().await;
-    let second = send_request::<ShellOpen>(&mut ws, &ShellOpenParams {}).await;
+    let second = send_request::<ShellOpen>(&mut ws, &ShellOpenParams::default()).await;
 
     assert_eq!(
         names(&rows_of(&mut ws, PickerKind::Shells).await),
@@ -5376,6 +5376,7 @@ async fn a_dormant_commit_key_is_never_a_buffers_row() {
                 read: false,
                 transient: false,
                 source: DormantSource::Virtual { key },
+                shell: None,
             });
         }
     }
@@ -5407,5 +5408,228 @@ async fn a_dormant_commit_key_is_never_a_buffers_row() {
         "nor are the dormant working changes: {rows:?}"
     );
 
+    drop(server);
+}
+
+// ---- tasks ---------------------------------------------------------------------------------------
+
+/// A workspace with a task at the root (a justfile) and two below it in `web/` (a Makefile and a
+/// `package.json`), plus files to stand in: one inside `web/`, one beside it in `docs/`.
+async fn setup_tasks_workspace() -> (aether_server::ServerHandle, Ws, tempfile::TempDir) {
+    let dir = lay_out(&[
+        ("justfile", "# Build everything\nbuild:\n    true\n"),
+        ("web/Makefile", "serve: ## Serve it\n\ttrue\n"),
+        (
+            "web/package.json",
+            "{\n  \"scripts\": {\n    \"test\": \"vitest run\"\n  }\n}\n",
+        ),
+        ("web/src/app.ts", "export {}\n"),
+        ("docs/readme.md", "hi\n"),
+    ]);
+    let root = dir.path().canonicalize().unwrap();
+    let mut server = spawn_for_test("tasks-proj", vec![root]).await.unwrap();
+    server.keep_alive(());
+    let mut ws = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "tasks-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    (server, ws, dir)
+}
+
+/// Each task row as `(name, command, where it is defined)`.
+fn task_rows(items: &[PickerItem]) -> Vec<(String, String, String)> {
+    items
+        .iter()
+        .map(|i| match i {
+            PickerItem::Task {
+                name,
+                command,
+                display_path,
+                ..
+            } => (name.clone(), command.clone(), display_path.clone()),
+            other => panic!("not a task row: {other:?}"),
+        })
+        .collect()
+}
+
+fn row(name: &str, command: &str, file: &str) -> (String, String, String) {
+    (name.into(), command.into(), file.into())
+}
+
+/// `Space .` lists what runs from where you are: the file's own directory first, then each one up
+/// to the root — and nothing from a directory beside it.
+#[tokio::test]
+async fn tasks_picker_lists_the_tasks_from_the_files_directory_upward() {
+    let (server, mut ws, _dir) = setup_tasks_workspace().await;
+    let app = open_test_buffer(&mut ws, "web/src/app.ts").await;
+    let view: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::Tasks, app)).await;
+    let items = view.update.expect("an initial window").items().to_vec();
+    assert_eq!(
+        task_rows(&items),
+        [
+            row("serve", "make serve", "web/Makefile"),
+            row("test", "npm run test", "web/package.json"),
+            row("build", "just build", "justfile"),
+        ]
+    );
+    let descriptions: Vec<&str> = items
+        .iter()
+        .map(|i| match i {
+            PickerItem::Task { description, .. } => description.as_str(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(descriptions, ["Serve it", "vitest run", "Build everything"]);
+    // Each runs where its runner would look for it.
+    let dirs: Vec<std::path::PathBuf> = items
+        .iter()
+        .map(|i| match i {
+            PickerItem::Task { dir, .. } => std::path::PathBuf::from(dir),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert!(dirs[0].ends_with("web") && dirs[1].ends_with("web"));
+    assert_eq!(dirs[2], dirs[0].parent().unwrap());
+
+    // From beside `web/`, its tasks are not "here".
+    let readme = open_test_buffer(&mut ws, "docs/readme.md").await;
+    let view: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::Tasks, readme)).await;
+    assert_eq!(
+        task_rows(view.update.expect("an initial window").items()),
+        [row("build", "just build", "justfile")]
+    );
+    drop(server);
+}
+
+/// `Space Alt-.` lists every task in the workspace, a directory's before its subdirectories'.
+#[tokio::test]
+async fn tasks_workspace_picker_lists_every_task() {
+    let (server, mut ws, _dir) = setup_tasks_workspace().await;
+    let readme = open_test_buffer(&mut ws, "docs/readme.md").await;
+    let view: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::TasksWorkspace, readme))
+            .await;
+    assert_eq!(
+        task_rows(view.update.expect("an initial window").items()),
+        [
+            row("build", "just build", "justfile"),
+            row("serve", "make serve", "web/Makefile"),
+            row("test", "npm run test", "web/package.json"),
+        ]
+    );
+    drop(server);
+}
+
+/// The query matches the file a task is in as well as its name — the composed haystack — and the
+/// offsets it reports land in the part that matched.
+#[tokio::test]
+async fn tasks_picker_matches_the_defining_file() {
+    let (server, mut ws, _dir) = setup_tasks_workspace().await;
+    let _ = send_request::<PickerView>(&mut ws, &view_params(PickerKind::TasksWorkspace)).await;
+    let _: () = send_request::<PickerQuery>(
+        &mut ws,
+        &PickerQueryParams {
+            filters: Default::default(),
+            kind: PickerKind::TasksWorkspace,
+            query: "pack".into(),
+            generation: 1,
+        },
+    )
+    .await;
+    let update = loop {
+        let u = expect_notification::<PickerUpdate>(&mut ws).await;
+        if u.generation == 1 {
+            break u;
+        }
+    };
+    let items = update.items();
+    assert_eq!(
+        task_rows(items),
+        [row("test", "npm run test", "web/package.json")]
+    );
+    let PickerItem::Task { match_indices, .. } = &items[0] else {
+        unreachable!()
+    };
+    // `test  web/package.json  vitest run`: "pack" is in the path, which starts at 6.
+    assert!(
+        match_indices.iter().all(|i| (10..14).contains(i)),
+        "{match_indices:?}"
+    );
+    drop(server);
+}
+
+/// `Ctrl-g`: selecting a task answers where it is defined.
+#[tokio::test]
+async fn tasks_picker_select_lands_on_the_definition() {
+    let (server, mut ws, dir) = setup_tasks_workspace().await;
+    let view: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut ws, &view_params(PickerKind::TasksWorkspace)).await;
+    let item = view.update.expect("an initial window").items()[0].clone();
+    let result: PickerSelectResult = send_request::<PickerSelect>(
+        &mut ws,
+        &PickerSelectParams {
+            kind: PickerKind::TasksWorkspace,
+            item,
+        },
+    )
+    .await;
+    let PickerSelectResult::FileAt { path, position, .. } = result else {
+        panic!("expected FileAt, got {result:?}")
+    };
+    let justfile = dir.path().canonicalize().unwrap().join("justfile");
+    assert_eq!(std::path::PathBuf::from(path), justfile);
+    assert_eq!(
+        (position.line, position.col),
+        (1, 0),
+        "the recipe, below its comment"
+    );
+    drop(server);
+}
+
+/// A workspace with no runner files lists nothing.
+#[tokio::test]
+async fn tasks_picker_is_empty_without_runner_files() {
+    let (server, mut ws) = setup_picker_workspace().await;
+    let lib = open_test_buffer(&mut ws, "src/lib.rs").await;
+    let view: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut ws, &view_params_on(PickerKind::Tasks, lib)).await;
+    assert_eq!(view.total_candidates, 0);
+    drop(server);
+}
+
+/// "Here" is a file's directory and nothing stands in for one: from a scratch — or with nothing
+/// named at all — `Space .` is refused with the remedy, as the Git pickers refuse without a file to
+/// find a repo from. The workspace-wide list needs no file.
+#[tokio::test]
+async fn tasks_picker_needs_a_file() {
+    let (server, mut ws, _dir) = setup_tasks_workspace().await;
+    // A file looked at earlier is not "here" once a scratch is in front.
+    let _ = open_test_buffer(&mut ws, "web/src/app.ts").await;
+    let scratch: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &ViewOpenParams::default()).await;
+    assert!(scratch.buffer.path.is_none(), "a scratch");
+
+    for params in [
+        view_params_on(PickerKind::Tasks, scratch.buffer_id),
+        view_params(PickerKind::Tasks),
+    ] {
+        let err = send_request_expect_error::<PickerView>(&mut ws, &params).await;
+        assert_eq!(err["message"], "Open a file first", "{err}");
+    }
+
+    let view: aether_protocol::picker::PickerViewResult = send_request::<PickerView>(
+        &mut ws,
+        &view_params_on(PickerKind::TasksWorkspace, scratch.buffer_id),
+    )
+    .await;
+    assert_eq!(view.total_candidates, 3);
     drop(server);
 }

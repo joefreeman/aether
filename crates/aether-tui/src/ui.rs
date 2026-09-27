@@ -2963,7 +2963,6 @@ fn picker_item_spans(
         running,
         exit,
         elapsed_ms,
-        dormant,
         match_indices,
         ..
     } = item
@@ -2971,8 +2970,25 @@ fn picker_item_spans(
         return composed_row_spans(
             [title, cwd, last_command.as_deref().unwrap_or("")],
             match_indices,
-            aether_client::labels::shell_row_badge(*running, *exit, *elapsed_ms, *dormant),
-            *dormant,
+            aether_client::labels::shell_row_badge(*running, *exit, *elapsed_ms),
+            highlighted,
+            max_width,
+        );
+    }
+    // `test   web/justfile   Run the tests` — the shell row's shape: the name leads, where it is
+    // defined and what it does follow dim.
+    if let PickerItem::Task {
+        name,
+        display_path,
+        description,
+        match_indices,
+        ..
+    } = item
+    {
+        return composed_row_spans(
+            [name, display_path, description],
+            match_indices,
+            None,
             highlighted,
             max_width,
         );
@@ -2991,7 +3007,6 @@ fn picker_item_spans(
             [title, agent, last_prompt.as_deref().unwrap_or("")],
             match_indices,
             aether_client::labels::agent_row_badge(state, *dormant),
-            *dormant,
             highlighted,
             max_width,
         );
@@ -3263,6 +3278,7 @@ fn picker_item_spans(
         | PickerItem::GitCommit { .. }
         | PickerItem::GitStash { .. }
         | PickerItem::GitBaseline { .. }
+        | PickerItem::Task { .. }
         | PickerItem::Group { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {
@@ -3618,15 +3634,11 @@ fn composed_row_spans(
     parts: [&str; 3],
     match_indices: &[u32],
     badge: Option<(String, aether_client::labels::RowBadgeTone)>,
-    dormant: bool,
     highlighted: bool,
     max_width: usize,
 ) -> Vec<Span<'static>> {
     let bg = picker_row_bg(highlighted);
-    // A dormant row loses its foreground brightness — "present but not loaded", the same treatment
-    // a dormant workspace row gets.
-    let fg = if dormant { th().fg_faint } else { th().fg };
-    let base = Style::default().fg(c(fg)).bg(bg);
+    let base = Style::default().fg(c(th().fg)).bg(bg);
     let match_style = base
         .fg(c(th().match_highlight))
         .add_modifier(Modifier::BOLD);
@@ -9896,8 +9908,36 @@ mod tests {
         );
     }
 
+    /// A tasks-picker row wears the shell row's shape: the name, then the defining file and the
+    /// description dim, and no badge. A match in the file highlights there.
+    #[test]
+    fn task_row_lays_out_name_then_file_then_description() {
+        // "test  web/justfile  Run the tests": 0..4 name, 6..18 file, 20.. description.
+        let item = PickerItem::Task {
+            name: "test".into(),
+            command: "just test".into(),
+            dir: "/p/web".into(),
+            path: "/p/web/justfile".into(),
+            display_path: "web/justfile".into(),
+            line: 3,
+            description: "Run the tests".into(),
+            match_indices: vec![0, 6],
+        };
+        let spans = picker_item_spans(&item, &[], None, false, 60);
+        assert_eq!(
+            spans_text(&spans).trim_end(),
+            "test  web/justfile  Run the tests"
+        );
+        let hl: String = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(c(th().match_highlight)))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(hl, "tw");
+    }
+
     /// An agents-picker row wears the shell row's shape with a conversation's fields, and a
-    /// dormant one greys out and drops its badge.
+    /// dormant one drops its badge.
     #[test]
     fn agent_row_lays_out_name_agent_prompt_and_badge() {
         use aether_protocol::picker::AgentRowState;
@@ -9925,7 +9965,8 @@ mod tests {
         let text = spans_text(&picker_item_spans(&idle, &[], None, false, 70));
         assert_eq!(text.trim_end(), "Agent 1  Claude Code  fix the wrap bug");
 
-        // A dormant row: no badge, no agent name it has not read, and greyed text.
+        // A dormant row: no badge, and no agent name it has not read — but not greyed: being
+        // unloaded changes nothing about what you can do with it.
         let dormant = PickerItem::Agent {
             view_id: aether_protocol::ViewId(21),
             title: "Agent 2".into(),
@@ -9937,7 +9978,7 @@ mod tests {
         };
         let spans = picker_item_spans(&dormant, &[], None, false, 70);
         assert_eq!(spans_text(&spans).trim_end(), "Agent 2");
-        assert_eq!(spans[0].style.fg, Some(c(th().fg_faint)));
+        assert_eq!(spans[0].style.fg, Some(c(th().fg)));
     }
 
     #[test]

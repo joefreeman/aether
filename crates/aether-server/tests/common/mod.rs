@@ -93,7 +93,7 @@ pub use aether_protocol::settings::{
     AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
 };
 pub use aether_protocol::shell::{
-    RunState, RunStatus, ShellCancel, ShellCancelParams, ShellCancelResult, ShellOpen,
+    NotRun, RunState, RunStatus, ShellCancel, ShellCancelParams, ShellCancelResult, ShellOpen,
     ShellOpenParams, ShellOpenResult, ShellRun, ShellRunChanged, ShellRunChangedParams,
     ShellRunParams, ShellRunResult,
 };

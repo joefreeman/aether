@@ -3049,6 +3049,7 @@ mod next_buffer_tests {
                 read: false,
                 transient: false,
                 source: crate::state::DormantSource::File(std::path::PathBuf::from("/p/a.rs")),
+                shell: None,
             },
             crate::state::DormantView {
                 id: d2,
@@ -3056,6 +3057,7 @@ mod next_buffer_tests {
                 read: false,
                 transient: false,
                 source: crate::state::DormantSource::File(std::path::PathBuf::from("/p/b.rs")),
+                shell: None,
             },
         ];
         assert_eq!(next_view_for_client(&st, client_id), Some(ViewId(d1)));

@@ -912,14 +912,12 @@ export function formatElapsed(ms: number): string {
 }
 
 /** The shells row's status badge. Mirrors the core's `labels::shell_row_badge` — same words, same
- *  tones, so the three shells read alike. */
+ *  tones, so the three shells read alike. A dormant row wears its snapshot's last outcome. */
 export function shellRowBadge(item: {
   running?: boolean;
   exit?: number;
   elapsed_ms?: number;
-  dormant?: boolean;
 }): { text: string; cls: string } | undefined {
-  if (item.dormant) return undefined;
   if (item.running) return { text: "● running", cls: "picker-badge-running" };
   const took = item.elapsed_ms == null ? "" : `  ${formatElapsed(item.elapsed_ms)}`;
   if (item.exit === 0) return { text: `✓ 0${took}`, cls: "picker-badge-ok" };
@@ -1007,7 +1005,6 @@ export function describePickerItem(
         suffix: composedTail(parts),
         suffixMatches: composedTailMatches(parts, seg),
         ...(badge ? { metaParts: [badge] } : {}),
-        dim: item.dormant || undefined,
       };
     }
     case "agent": {
@@ -1022,7 +1019,18 @@ export function describePickerItem(
         suffix: composedTail(parts),
         suffixMatches: composedTailMatches(parts, seg),
         ...(badge ? { metaParts: [badge] } : {}),
-        dim: item.dormant || undefined,
+      };
+    }
+    case "task": {
+      // `test   web/justfile   Run the tests` — the shell row's shape, with no badge: the name
+      // leads, where it is defined and what it does follow dim.
+      const parts: [string, string, string] = [item.name, item.display_path, item.description ?? ""];
+      const seg = rowMatchSegments(parts, item.match_indices);
+      return {
+        primary: item.name,
+        matches: seg.first,
+        suffix: composedTail(parts),
+        suffixMatches: composedTailMatches(parts, seg),
       };
     }
     case "grep_hit": {

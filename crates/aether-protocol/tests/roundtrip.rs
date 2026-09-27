@@ -4999,6 +4999,71 @@ fn picker_item_shell_is_tagged() {
     assert_eq!(back, fresh);
 }
 
+/// The tasks pickers are two kinds with one row: from here (`Space .`) and the whole workspace
+/// (`Space Alt-.`). A task row carries what to run and where, the file it came from twice (the path
+/// to open, and the path to show), and a description only when the task has one.
+#[test]
+fn picker_tasks_kinds_and_row_shape() {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    assert_eq!(to_value(PickerKind::Tasks).unwrap(), json!("tasks"));
+    assert_eq!(
+        to_value(PickerKind::TasksWorkspace).unwrap(),
+        json!("tasks_workspace")
+    );
+    // A task row is a definition, not a place you were — no jumplist, no cursor centring.
+    assert!(!PickerKind::Tasks.captures_to_jumplist());
+    assert!(!PickerKind::Tasks.centers_on_cursor());
+
+    let row = PickerItem::Task {
+        name: "build:web".into(),
+        command: "npm run build:web".into(),
+        dir: "/w/web".into(),
+        path: "/w/web/package.json".into(),
+        display_path: "web/package.json".into(),
+        line: 7,
+        description: "vite build".into(),
+        match_indices: vec![0, 1],
+    };
+    assert_eq!(
+        to_value(&row).unwrap(),
+        json!({
+            "kind": "task",
+            "name": "build:web",
+            "command": "npm run build:web",
+            "dir": "/w/web",
+            "path": "/w/web/package.json",
+            "display_path": "web/package.json",
+            "line": 7,
+            "description": "vite build",
+            "match_indices": [0, 1],
+        })
+    );
+    let bare: PickerItem = from_value(json!({
+        "kind": "task", "name": "test", "command": "just test", "dir": "/w",
+        "path": "/w/justfile", "display_path": "justfile", "line": 0
+    }))
+    .unwrap();
+    let PickerItem::Task {
+        description,
+        match_indices,
+        ..
+    } = &bare
+    else {
+        panic!("not a task: {bare:?}");
+    };
+    assert!(description.is_empty() && match_indices.is_empty());
+    assert!(to_value(&bare).unwrap().get("description").is_none());
+
+    // The browser shell mirrors the strings by hand, so `tsc` cannot see a rename.
+    let ts = include_str!("../../../web/src/protocol.ts");
+    for needle in ["\"tasks\"", "\"tasks_workspace\"", "kind: \"task\""] {
+        assert!(
+            ts.contains(needle),
+            "web/src/protocol.ts must declare `{needle}`"
+        );
+    }
+}
+
 /// An agent row carries its name, which agent is behind it, what it is doing, and the last thing
 /// said to it. The state is a tagged enum so `thinking` can name the tool call it is working on.
 #[test]
@@ -7446,19 +7511,41 @@ fn an_action_is_an_inline_leaf() {
     );
 }
 
-/// `shell/open` asks *nothing* and answers with an open plus the element to type into.
+/// `shell/open` answers with an open plus the element to type into. Its params are all optional:
+/// `Space Alt-t` sends `{}`, and a task sends where to start, what to type and whether to run it.
 ///
 /// The `new` flag is gone with the reuse heuristic: the key always mints a shell, and returning to
-/// one you have is the shells picker. An old client's `{"new": true}` still parses — the params are
-/// an empty struct, and serde ignores what it does not know — so a stale build asking for a new
-/// shell gets exactly that.
+/// one you have is the shells picker. An old client's `{"new": true}` still parses — serde ignores
+/// what it does not know — so a stale build asking for a new shell gets exactly that.
 #[test]
 fn shell_open_shape() {
     use aether_protocol::shell::{ShellOpen, ShellOpenParams, ShellOpenResult};
     assert_eq!(ShellOpen::NAME, "shell/open");
-    assert_eq!(to_value(ShellOpenParams {}).unwrap(), json!({}));
+    assert_eq!(to_value(ShellOpenParams::default()).unwrap(), json!({}));
     from_value::<ShellOpenParams>(json!({})).unwrap();
     from_value::<ShellOpenParams>(json!({"new": true})).unwrap();
+    let task = ShellOpenParams {
+        cwd: Some("/w/web".into()),
+        input: Some("npm run build".into()),
+        run: true,
+        reuse: true,
+    };
+    assert_eq!(
+        to_value(&task).unwrap(),
+        json!({"cwd": "/w/web", "input": "npm run build", "run": true, "reuse": true})
+    );
+    // Why a run did not start is tagged, so a client can say "not accepted" and "already running"
+    // differently.
+    use aether_protocol::shell::NotRun;
+    assert_eq!(
+        to_value(NotRun::Busy {
+            message: "Shell 2 is running just test".into()
+        })
+        .unwrap(),
+        json!({"kind": "busy", "message": "Shell 2 is running just test"})
+    );
+    let typed: ShellOpenParams = from_value(json!({"input": "just test"})).unwrap();
+    assert!(!typed.run && typed.cwd.is_none());
 
     let result = ShellOpenResult {
         opened: ViewOpenResult {
@@ -7484,8 +7571,13 @@ fn shell_open_shape() {
             },
         },
         input: 1,
+        not_run: None,
     };
     let v = to_value(&result).unwrap();
+    assert!(
+        v.get("not_run").is_none(),
+        "a run that started says nothing"
+    );
     // Flattened exactly as `git/show`'s is, so the client's adopt path is the same one.
     assert_eq!(v["opened"]["buffer_id"], 3);
     assert_eq!(v["opened"]["title"], "Shell 1");

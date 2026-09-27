@@ -549,6 +549,8 @@ pub fn picker_placeholder(kind: Option<PickerKind>) -> &'static str {
         PickerKind::GitStash => "Find stash…",
         PickerKind::GitBaseline => "Diff against…",
         PickerKind::Jumplist => "Filter the jumplist…",
+        PickerKind::Tasks => "Run a task…",
+        PickerKind::TasksWorkspace => "Run a workspace task…",
     }
 }
 
@@ -659,8 +661,8 @@ pub enum RowBadgeTone {
 }
 
 /// The shells picker row's status badge: `● running`, `✓ 0  3.2s`, `✗ 101  1.2s`, `stopped  1.2s`.
-/// `None` for a shell that has run nothing, and for a dormant row (whose transcript is on disk and
-/// whose runs are therefore all in the past — the row's own dimming says "not loaded").
+/// `None` for a shell that has run nothing. A dormant row wears its snapshot's last outcome, which
+/// is what that shell's own box says when you open it.
 ///
 /// No live duration on a running row: the picker re-pushes on transitions, not on a timer, so a
 /// counter drawn here would freeze at whatever second the run started.
@@ -668,11 +670,7 @@ pub fn shell_row_badge(
     running: bool,
     exit: Option<i32>,
     elapsed_ms: Option<u64>,
-    dormant: bool,
 ) -> Option<(String, RowBadgeTone)> {
-    if dormant {
-        return None;
-    }
     if running {
         return Some(("● running".into(), RowBadgeTone::Running));
     }
@@ -832,31 +830,30 @@ mod tests {
     #[test]
     fn a_shells_row_badge_reports_the_last_run() {
         assert_eq!(
-            shell_row_badge(true, None, None, false),
+            shell_row_badge(true, None, None),
             Some(("● running".into(), RowBadgeTone::Running))
         );
         // While a run is going, the previous run's outcome is still on the row's other fields —
         // the badge is what changes.
         assert_eq!(
-            shell_row_badge(true, Some(0), Some(3200), false),
+            shell_row_badge(true, Some(0), Some(3200)),
             Some(("● running".into(), RowBadgeTone::Running))
         );
         assert_eq!(
-            shell_row_badge(false, Some(0), Some(3200), false),
+            shell_row_badge(false, Some(0), Some(3200)),
             Some(("✓ 0  3.2s".into(), RowBadgeTone::Ok))
         );
         assert_eq!(
-            shell_row_badge(false, Some(101), Some(1200), false),
+            shell_row_badge(false, Some(101), Some(1200)),
             Some(("✗ 101  1.2s".into(), RowBadgeTone::Bad))
         );
         // Killed or truncated: it ended, but with no exit code to report.
         assert_eq!(
-            shell_row_badge(false, None, Some(1200), false),
+            shell_row_badge(false, None, Some(1200)),
             Some(("stopped  1.2s".into(), RowBadgeTone::Muted))
         );
-        // A shell that has run nothing, and a dormant row, wear none at all.
-        assert_eq!(shell_row_badge(false, None, None, false), None);
-        assert_eq!(shell_row_badge(false, Some(0), Some(10), true), None);
+        // A shell that has run nothing wears none at all.
+        assert_eq!(shell_row_badge(false, None, None), None);
     }
 
     /// The agents row's badge. Idle says nothing — "ready" is the resting state — and a blocked
@@ -929,6 +926,8 @@ mod tests {
             GitLogFile,
             GitStash,
             Jumplist,
+            Tasks,
+            TasksWorkspace,
         ] {
             let p = picker_placeholder(Some(kind));
             assert!(p.ends_with('…'), "{kind:?} prompt should trail off: {p:?}");

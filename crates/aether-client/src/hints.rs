@@ -94,6 +94,10 @@ pub enum PickerCmd {
     CaptureJumplist,
     /// `Ctrl-o` in the branch picker — create a worktree for the highlighted branch.
     CreateWorktree,
+    /// `Ctrl-e` in a tasks picker — open the task's shell with its command typed, not run.
+    EditTask,
+    /// `Ctrl-g` in a tasks picker — go to where the task is defined.
+    TaskDefinition,
 }
 
 /// Session facts that condition a hint's display eligibility beyond the context id — the engine
@@ -356,6 +360,15 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "worktree-create", tier: 4, contexts: &[C::Picker(PickerKind::GitBranches)], keys: "Ctrl-o",
         trigger: Trigger::Picker(PickerCmd::CreateWorktree),
         text: "Use {} to create a worktree for the selected branch" },
+    // A tasks picker's rows run on Enter; the other two ways in are its least guessable keys.
+    HintDef { id: "task-edit", tier: 4,
+        contexts: &[C::Picker(PickerKind::Tasks), C::Picker(PickerKind::TasksWorkspace)], keys: "Ctrl-e",
+        trigger: Trigger::Picker(PickerCmd::EditTask),
+        text: "Use {} to edit a task's command before running it" },
+    HintDef { id: "task-definition", tier: 4,
+        contexts: &[C::Picker(PickerKind::Tasks), C::Picker(PickerKind::TasksWorkspace)], keys: "Ctrl-g",
+        trigger: Trigger::Picker(PickerCmd::TaskDefinition),
+        text: "Use {} to go to where the selected task is defined" },
     // (Not the Jumplist, whose path chips are data-gated — the hint could name a chord that
     // isn't available for the current capture.)
     HintDef { id: "picker-scope", tier: 4,
