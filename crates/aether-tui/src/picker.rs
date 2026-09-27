@@ -5,9 +5,7 @@
 use crate::scroll::ScrollState;
 use aether_protocol::directory::DirectoryEntry;
 use aether_protocol::lsp::{LspProgress, LspStatus};
-use aether_protocol::picker::{
-    CaseMode, GroupSpan, PickerFilters, PickerItem, PickerKind, ScopedPath,
-};
+use aether_protocol::picker::{GroupSpan, PickerItem, PickerKind};
 use aether_protocol::BufferId;
 use std::collections::HashMap;
 
@@ -136,15 +134,10 @@ pub struct PickerState {
     /// (a drill-down entered with `Enter`) instead of the list; `Esc` clears it back to the list.
     /// A snapshot taken at `Enter` time — it doesn't live-update.
     pub lsp_detail: Option<LspServerDetail>,
-    /// The filter set in effect, stored as the ordered chip list — the client's *single* source of
-    /// truth, in insertion order. The wire format (the normalized, unordered `PickerFilters`) is
-    /// derived on demand by [`PickerState::wire_filters`] and converted back by
-    /// [`PickerState::adopt_filters`] on open/resume — the order itself never crosses the wire, so
-    /// a resumed picker comes back in canonical order and true insertion order is
-    /// session-ephemeral, like `chip_selected`.
-    pub chips: Vec<ChipValue>,
-    /// Index into the chip row — which, the row being the stored list itself, is also an index
-    /// into [`PickerState::chips`]. While set, editing keys act on the chip (Enter edits,
+    /// The chip row as the core renders it ([`aether_client::picker::PickerState::chip_row`]) —
+    /// labels and ids only; the filter state behind them lives in the core.
+    pub chips: Vec<aether_client::chips::Chip>,
+    /// Index into [`PickerState::chips`]. While set, editing keys act on the chip (Enter edits,
     /// Backspace/Delete removes, Left/Right move) instead of the query/results. Entered via
     /// Left/Backspace at query cursor 0.
     pub chip_selected: Option<usize>,
@@ -153,59 +146,6 @@ pub struct PickerState {
     /// Enter commits a chip, Esc cancels, Alt-h/l move between its fields, Alt-j/k cycle the
     /// root field's candidates.
     pub chip_editor: Option<ChipEditor>,
-}
-
-/// Which filter a chip stands for — the handle used to edit/remove it. `Dir` and `Glob` carry
-/// their index into [`PickerState::chips`] (the repeatable chips; the rendered row is the
-/// stored list, so row index = storage index). There's no root chip: scoping to a whole root
-/// is a `Dir` chip with an empty relative path (a directory always implies its root).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChipId {
-    Dir(usize),
-    Glob(usize),
-    Case,
-    Word,
-    Regex,
-    Ignored,
-    Hidden,
-    Changed,
-    Untracked,
-}
-
-/// One chip, by value — the element of the client's ordered filter state. Everything the
-/// chip row renders (and the wire `PickerFilters` folds up) lives here.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-pub enum ChipValue {
-    Dir(ScopedPath),
-    Glob(String),
-    /// `Sensitive` or `Insensitive` — `Smart` (the default) is "no chip".
-    Case(CaseMode),
-    Word,
-    Regex,
-    /// Gitignored-file visibility. `hide` records the per-kind direction at creation time
-    /// (the Explorer hides, Grep includes — see docs), so the wire conversion needs no
-    /// kind context.
-    Ignored {
-        hide: bool,
-    },
-    /// Hidden-file visibility; same `hide` convention as `Ignored`.
-    Hidden {
-        hide: bool,
-    },
-    Changed,
-    /// Hide untracked entries. Plain on/off, like `Changed` — untracked shows by default.
-    Untracked,
-}
-
-impl ChipValue {}
-
-/// One rendered filter chip. Derived from `filters` on demand (never stored) so the chip row
-/// can't drift from the filter state; canonical order is scope first, flags after.
-#[derive(Debug, Clone)]
-pub struct Chip {
-    pub id: ChipId,
-    pub label: String,
 }
 
 /// The editor line for a valued chip, revealed below the picker's input row. The dir editor
@@ -530,244 +470,6 @@ pub enum PendingDeleteAction {
 }
 
 impl PickerState {
-    /// Render the chip row: the stored list, verbatim — insertion order *is* the storage
-    /// order, so row index = storage index. Labels are compact: the dir chip is just the path
-    /// with a trailing `/` (the slash implies "directory"; multi-root labels lead with the
-    /// root's basename), and the flags are two-or-three-char abbreviations (only `wd`
-    /// underlines — it reads as a stray token otherwise). The ignored/hidden chips render `+`
-    /// (include — Grep) or `-` (hide — Explorer) per the direction stored in the value.
-    pub fn chips(&self, workspace_paths: &[String]) -> Vec<Chip> {
-        self.chips
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let (id, label) = match v {
-                    ChipValue::Dir(d) => {
-                        // Multi-root scopes read like the status bar: `{root label}:
-                        // {path}/`, with the same disambiguated root labels. An empty
-                        // relative path is a whole-root scope — just the label.
-                        let label = if workspace_paths.len() > 1 {
-                            let labels = crate::labels::root_labels(workspace_paths);
-                            let root_label = labels
-                                .get(d.path_index as usize)
-                                .map(|s| s.as_str())
-                                .unwrap_or("?");
-                            if d.relative_path.is_empty() {
-                                root_label.to_string()
-                            } else {
-                                format!("{root_label}: {}/", d.relative_path)
-                            }
-                        } else {
-                            format!("{}/", d.relative_path)
-                        };
-                        (ChipId::Dir(i), label)
-                    }
-                    ChipValue::Glob(g) => (ChipId::Glob(i), g.clone()),
-                    ChipValue::Case(CaseMode::Insensitive) => (ChipId::Case, "aa".into()),
-                    ChipValue::Case(_) => (ChipId::Case, "Aa".into()),
-                    ChipValue::Word => (ChipId::Word, "wd".into()),
-                    ChipValue::Regex => (ChipId::Regex, ".*".into()),
-                    ChipValue::Ignored { hide } => {
-                        (ChipId::Ignored, if *hide { "-ig" } else { "+ig" }.into())
-                    }
-                    ChipValue::Hidden { hide } => {
-                        (ChipId::Hidden, if *hide { "-." } else { "+." }.into())
-                    }
-                    ChipValue::Changed => (ChipId::Changed, "Δ".into()),
-                    ChipValue::Untracked => (ChipId::Untracked, "-??".into()),
-                };
-                Chip { id, label }
-            })
-            .collect()
-    }
-
-    /// Fold the chip list into the wire format — the normalized, unordered `PickerFilters`
-    /// sent with every `picker/query`/`picker/view`.
-    #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-    pub fn wire_filters(&self) -> PickerFilters {
-        let mut f = PickerFilters::default();
-        for v in &self.chips {
-            match v {
-                ChipValue::Dir(d) => f.directories.push(d.clone()),
-                ChipValue::Glob(g) => f.globs.push(g.clone()),
-                ChipValue::Case(mode) => f.case = *mode,
-                ChipValue::Word => f.whole_word = true,
-                ChipValue::Regex => f.regex = true,
-                ChipValue::Ignored { hide: true } => f.hide_ignored = true,
-                ChipValue::Ignored { hide: false } => f.include_ignored = true,
-                ChipValue::Hidden { hide: true } => f.hide_hidden = true,
-                ChipValue::Hidden { hide: false } => f.include_hidden = true,
-                ChipValue::Changed => f.changed_only = true,
-                ChipValue::Untracked => f.hide_untracked = true,
-            }
-        }
-        f
-    }
-
-    /// Adopt a wire filter set (open/resume — `PickerViewResult::filters`), replacing the chip
-    /// list. The wire carries no order, so restored chips come back in canonical order (dirs,
-    /// globs, flags); everything added afterwards appends behind them — insertion order is
-    /// session-ephemeral.
-    #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-    pub fn adopt_filters(&mut self, f: &PickerFilters) {
-        let mut chips: Vec<ChipValue> = Vec::new();
-        chips.extend(f.directories.iter().cloned().map(ChipValue::Dir));
-        chips.extend(f.globs.iter().cloned().map(ChipValue::Glob));
-        if f.case != CaseMode::Smart {
-            chips.push(ChipValue::Case(f.case));
-        }
-        if f.whole_word {
-            chips.push(ChipValue::Word);
-        }
-        if f.regex {
-            chips.push(ChipValue::Regex);
-        }
-        if f.include_ignored || f.hide_ignored {
-            chips.push(ChipValue::Ignored {
-                hide: f.hide_ignored,
-            });
-        }
-        if f.include_hidden || f.hide_hidden {
-            chips.push(ChipValue::Hidden {
-                hide: f.hide_hidden,
-            });
-        }
-        if f.changed_only {
-            chips.push(ChipValue::Changed);
-        }
-        if f.hide_untracked {
-            chips.push(ChipValue::Untracked);
-        }
-        self.chips = chips;
-    }
-
-    /// The dir scope behind chip `i`, when chip `i` is a dir — the editor's pre-fill.
-    #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-    pub fn dir_value(&self, i: usize) -> Option<&ScopedPath> {
-        match self.chips.get(i) {
-            Some(ChipValue::Dir(d)) => Some(d),
-            _ => None,
-        }
-    }
-
-    /// The glob behind chip `i`, when chip `i` is a glob — the editor's pre-fill.
-    #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-    pub fn glob_value(&self, i: usize) -> Option<&str> {
-        match self.chips.get(i) {
-            Some(ChipValue::Glob(g)) => Some(g.as_str()),
-            _ => None,
-        }
-    }
-
-    /// Apply a glob editor commit: `None` clears the glob being edited (or cancels when it
-    /// wasn't editing one); duplicates collapse — committing an existing glob is a no-op (the
-    /// chip already says it), editing into one drops the edited entry; an in-place edit keeps
-    /// its position in the row. `edit` indexes the chip list. Returns whether the filters
-    /// changed (the caller follows up with the filter-change RPC).
-    #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-    pub fn commit_glob_edit(&mut self, normalized: Option<String>, edit: Option<usize>) -> bool {
-        let edit = edit.filter(|&i| matches!(self.chips.get(i), Some(ChipValue::Glob(_))));
-        let Some(g) = normalized else {
-            return match edit {
-                Some(i) => {
-                    self.chips.remove(i);
-                    true
-                }
-                None => false, // empty/useless new glob — treat as cancel
-            };
-        };
-        let value = ChipValue::Glob(g);
-        match edit {
-            Some(i) => {
-                if self
-                    .chips
-                    .iter()
-                    .enumerate()
-                    .any(|(j, v)| j != i && *v == value)
-                {
-                    self.chips.remove(i);
-                } else {
-                    self.chips[i] = value;
-                }
-                true
-            }
-            None => {
-                if self.chips.contains(&value) {
-                    false // already present — the chip says it; nothing to change
-                } else {
-                    self.chips.push(value);
-                    true
-                }
-            }
-        }
-    }
-
-    /// Apply a dir editor commit — same shape as [`PickerState::commit_glob_edit`]: `None`
-    /// clears the scope being edited (or cancels when adding), duplicates collapse, in-place
-    /// edits keep their position. `edit` indexes the chip list. Returns whether the filters
-    /// changed.
-    #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-    pub fn commit_dir_edit(&mut self, value: Option<ScopedPath>, edit: Option<usize>) -> bool {
-        let edit = edit.filter(|&i| matches!(self.chips.get(i), Some(ChipValue::Dir(_))));
-        let Some(d) = value else {
-            return match edit {
-                Some(i) => {
-                    self.chips.remove(i);
-                    true
-                }
-                None => false, // empty new scope in a single-root workspace — cancel
-            };
-        };
-        let value = ChipValue::Dir(d);
-        match edit {
-            Some(i) => {
-                if self
-                    .chips
-                    .iter()
-                    .enumerate()
-                    .any(|(j, v)| j != i && *v == value)
-                {
-                    self.chips.remove(i);
-                } else {
-                    self.chips[i] = value;
-                }
-                true
-            }
-            None => {
-                if self.chips.contains(&value) {
-                    false
-                } else {
-                    self.chips.push(value);
-                    true
-                }
-            }
-        }
-    }
-
-    /// Remove the chip — it disappears from the row and from the next `wire_filters` fold.
-    /// The caller follows up with a filter-change RPC.
-    #[allow(dead_code)] // view-model surface synced from the core; ui matches on it
-    pub fn remove_chip(&mut self, id: ChipId) {
-        match id {
-            ChipId::Dir(i) | ChipId::Glob(i) => {
-                if i < self.chips.len() {
-                    self.chips.remove(i);
-                }
-            }
-            ChipId::Case => self.chips.retain(|v| !matches!(v, ChipValue::Case(_))),
-            ChipId::Word => self.chips.retain(|v| *v != ChipValue::Word),
-            ChipId::Regex => self.chips.retain(|v| *v != ChipValue::Regex),
-            ChipId::Ignored => self
-                .chips
-                .retain(|v| !matches!(v, ChipValue::Ignored { .. })),
-            ChipId::Hidden => self
-                .chips
-                .retain(|v| !matches!(v, ChipValue::Hidden { .. })),
-            ChipId::Changed => self.chips.retain(|v| *v != ChipValue::Changed),
-            ChipId::Untracked => self.chips.retain(|v| *v != ChipValue::Untracked),
-        }
-    }
-
     /// True if the highlighted row is the synthetic "create" row (the Workspaces picker's
     /// "create new workspace" affordance). The selector uses this to route to `workspace/create`
     /// instead of the normal `picker/select` flow.
@@ -995,85 +697,6 @@ mod tests {
     use super::*;
     use crate::text_input::TextInput;
 
-    fn empty_state(kind: PickerKind, query: &str) -> PickerState {
-        PickerState {
-            open: true,
-            kind: Some(kind),
-            query: TextInput::new(query),
-            ..PickerState::default()
-        }
-    }
-
-    #[test]
-    fn adopted_filters_derive_chips_in_canonical_order() {
-        use aether_protocol::picker::{CaseMode, PickerFilters, ScopedPath};
-        // The wire carries no order, so adoption (open/resume) lays chips out canonically:
-        // dirs, globs (each in declaration order), flags after. Multi-root dir labels lead
-        // with the root's basename. Round-tripping back to the wire preserves the set.
-        let mut s = empty_state(PickerKind::Grep, "");
-        let wire = PickerFilters {
-            changed_only: true,
-            whole_word: true,
-            globs: vec!["*.rs".into(), "!*_test.rs".into()],
-            case: CaseMode::Insensitive,
-            include_hidden: true,
-            directories: vec![
-                ScopedPath {
-                    path_index: 1,
-                    relative_path: "src/app".into(),
-                    is_file: false,
-                },
-                ScopedPath {
-                    path_index: 0,
-                    relative_path: "docs".into(),
-                    is_file: false,
-                },
-            ],
-            ..Default::default()
-        };
-        s.adopt_filters(&wire);
-        let roots = vec!["/proj/alpha".to_string(), "/proj/beta".to_string()];
-        let labels: Vec<String> = s.chips(&roots).into_iter().map(|c| c.label).collect();
-        assert_eq!(
-            labels,
-            vec![
-                "beta: src/app/",
-                "alpha: docs/",
-                "*.rs",
-                "!*_test.rs",
-                "aa",
-                "wd",
-                "+.",
-                "Δ"
-            ]
-        );
-        assert_eq!(s.wire_filters(), wire, "wire → chips → wire round-trips");
-        // A whole-root scope is a dir chip with an empty relative path.
-        s.adopt_filters(&PickerFilters {
-            directories: vec![ScopedPath {
-                path_index: 1,
-                relative_path: String::new(),
-                is_file: false,
-            }],
-            ..Default::default()
-        });
-        let labels: Vec<String> = s.chips(&roots).into_iter().map(|c| c.label).collect();
-        assert_eq!(labels[0], "beta");
-    }
-
-    #[test]
-    fn commit_glob_edit_collapses_duplicates() {
-        let mut s = empty_state(PickerKind::Grep, "");
-        assert!(s.commit_glob_edit(Some("*.rs".into()), None));
-        // Committing the same glob again is a no-op — the chip already says it.
-        assert!(!s.commit_glob_edit(Some("*.rs".into()), None));
-        assert_eq!(s.wire_filters().globs, vec!["*.rs".to_string()]);
-        // Editing another glob *into* an existing one drops the edited entry.
-        assert!(s.commit_glob_edit(Some("*.md".into()), None));
-        assert!(s.commit_glob_edit(Some("*.rs".into()), Some(1)));
-        assert_eq!(s.wire_filters().globs, vec!["*.rs".to_string()]);
-    }
-
     #[test]
     fn root_candidates_filter_by_smartcase_prefix() {
         let labels: Vec<String> = ["beta", "beta-api", "Backend", "core"]
@@ -1126,31 +749,6 @@ mod tests {
         // No match: no ghost (the commit falls back to root_index).
         ed.root_filter = TextInput::new("zzz");
         assert_eq!(ed.root_ghost(&labels), None);
-    }
-
-    #[test]
-    fn remove_chip_resets_the_named_filter() {
-        use aether_protocol::picker::{CaseMode, PickerFilters};
-        let mut s = empty_state(PickerKind::Grep, "");
-        s.adopt_filters(&PickerFilters {
-            case: CaseMode::Sensitive,
-            whole_word: true,
-            globs: vec!["*.rs".into(), "!*.md".into()],
-            ..Default::default()
-        });
-        // Canonical adoption order: globs first, then flags — chip 0 is "*.rs".
-        s.remove_chip(ChipId::Glob(0));
-        assert_eq!(s.wire_filters().globs, vec!["!*.md".to_string()]);
-        s.remove_chip(ChipId::Case);
-        assert_eq!(s.wire_filters().case, CaseMode::Smart);
-        s.remove_chip(ChipId::Word);
-        assert!(!s.wire_filters().whole_word);
-        // Out-of-range glob removal is a no-op, not a panic (the chip row may have re-derived).
-        s.remove_chip(ChipId::Glob(7));
-        assert_eq!(s.wire_filters().globs, vec!["!*.md".to_string()]);
-        s.remove_chip(ChipId::Glob(0));
-        assert!(s.chips.is_empty());
-        assert!(s.wire_filters().is_default());
     }
 
     fn listing_entry(name: &str, is_dir: bool) -> aether_protocol::directory::DirectoryEntry {

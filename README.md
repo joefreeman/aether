@@ -39,7 +39,8 @@ Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to ea
 
 ## Keybindings
 
-Type `Space y` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
+Type `Space y` for the in-app searchable list, where `Alt-b` then a key (or a `Space` chord) shows
+what that key does. Holding the Shift key extends the selection (e.g.
 `Shift-w`); a leading **count** repeats a motion (e.g. `3w`). `Space` is the leader for
 app/file/code commands, `Space g` the sub-leader for git operations, `Space z` lists the work in
 progress (shells, agents, git operations) to go to or stop, and `Space v` reveals hover info at the

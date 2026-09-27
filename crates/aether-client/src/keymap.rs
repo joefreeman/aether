@@ -900,6 +900,177 @@ pub fn lookup(ctx: KeyContext, code: KeyCode, mods: Mods) -> Option<&'static Bin
     table(ctx).iter().find(|b| b.matches(code, mods))
 }
 
+/// The contexts the Keybindings picker lists, in its mode-major row order.
+const ENTRY_CONTEXTS: [KeyContext; 7] = [
+    KeyContext::Normal,
+    KeyContext::Global,
+    KeyContext::Insert,
+    KeyContext::Search,
+    KeyContext::Read,
+    KeyContext::Leader,
+    KeyContext::LeaderGit,
+];
+
+/// A context's `KeybindingEntry::mode` — half of a row's identity, so the rows and the key chip
+/// ([`KeyCapture`]) must spell it the same way. The `Space g` sub-leader lists as "Application"
+/// too: mode is the editor mode a chord is reachable from, and both leaders are reached from
+/// Normal. Its rows are told apart by the `Git` group and the `Space g …` label, not by a mode of
+/// their own.
+fn entry_mode(cx: KeyContext) -> &'static str {
+    match cx {
+        KeyContext::Normal => "Normal",
+        KeyContext::Global => "Any",
+        KeyContext::Insert => "Insert",
+        KeyContext::Search => "Search",
+        KeyContext::Read => "Read",
+        KeyContext::Leader | KeyContext::LeaderGit => "Application",
+    }
+}
+
+impl Binding {
+    /// Whether the binding is a Keybindings-picker row: grouped (an empty group marks an internal
+    /// alias), and not a leader trigger — `Space` alone does nothing you could look up.
+    fn is_listed(&self) -> bool {
+        !self.group.is_empty()
+            && !matches!(self.action, Action::BeginLeader | Action::BeginGitLeader)
+    }
+}
+
+/// A chord being captured for the Keybindings picker's key chip: the leader keys pressed so far.
+/// The capture follows the dispatcher — `Space` and `Space g` wait for another key, anything else
+/// ends the chord — so what it resolves to is what pressing those keys in the editor would fire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyCapture {
+    /// Nothing pressed yet: the next key is looked up in every mode.
+    Start,
+    /// `Space` pressed.
+    Leader,
+    /// `Space g` pressed.
+    LeaderGit,
+}
+
+/// What a key pressed during a [`KeyCapture`] did.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CaptureStep {
+    /// A leader key: the chord continues.
+    Continue(KeyCapture),
+    /// The chord is complete.
+    Done(aether_protocol::picker::KeyFilter),
+}
+
+impl KeyCapture {
+    /// The chord so far, as the chip shows it while waiting for the next key.
+    pub fn label(self) -> String {
+        match self {
+            KeyCapture::Start => "␣".into(),
+            KeyCapture::Leader => "Space ␣".into(),
+            KeyCapture::LeaderGit => "Space g ␣".into(),
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            KeyCapture::Start => "",
+            KeyCapture::Leader => "Space ",
+            KeyCapture::LeaderGit => "Space g ",
+        }
+    }
+
+    /// Feed the next key. Every key is a candidate — Esc and Enter included — because a first key
+    /// has nothing to cancel: a chip you didn't want is one Backspace away. Mid-chord, Esc stops
+    /// at the prefix instead (`Space` then Esc is every leader chord): the leader can never bind
+    /// Esc, since Esc belongs to the chord.
+    pub fn press(self, code: KeyCode, mods: Mods) -> CaptureStep {
+        use aether_protocol::picker::{KeyFilter, KeyFilterRow};
+        let row = |cx: KeyContext, b: &Binding| KeyFilterRow {
+            mode: entry_mode(cx).to_string(),
+            keys: b.key_label(),
+        };
+        // What the dispatcher fires for this key in each context it would be pressed in: the
+        // first match only, Global ahead of Normal and Insert, Read without Global.
+        let fired: Vec<(KeyContext, &'static Binding)> = match self {
+            KeyCapture::Start => [
+                (KeyContext::Normal, true),
+                (KeyContext::Insert, true),
+                (KeyContext::Read, false),
+                (KeyContext::Search, false),
+            ]
+            .into_iter()
+            .filter_map(|(cx, with_global)| {
+                let global = with_global
+                    .then(|| {
+                        lookup(KeyContext::Global, code, mods).map(|b| (KeyContext::Global, b))
+                    })
+                    .flatten();
+                global.or_else(|| lookup(cx, code, mods).map(|b| (cx, b)))
+            })
+            .collect(),
+            KeyCapture::Leader | KeyCapture::LeaderGit if code == KeyCode::Esc => {
+                let rows = [KeyContext::Leader, KeyContext::LeaderGit]
+                    .into_iter()
+                    .flat_map(|cx| table(cx).iter().map(move |b| (cx, b)))
+                    .filter(|(_, b)| b.is_listed() && b.key_label().starts_with(self.prefix()))
+                    .map(|(cx, b)| row(cx, b))
+                    .collect();
+                return CaptureStep::Done(KeyFilter {
+                    label: self.prefix().trim_end().to_string(),
+                    rows,
+                });
+            }
+            KeyCapture::Leader => lookup(KeyContext::Leader, code, mods)
+                .map(|b| (KeyContext::Leader, b))
+                .into_iter()
+                .collect(),
+            KeyCapture::LeaderGit => lookup(KeyContext::LeaderGit, code, mods)
+                .map(|b| (KeyContext::LeaderGit, b))
+                .into_iter()
+                .collect(),
+        };
+        for (_, b) in &fired {
+            match b.action {
+                Action::BeginLeader => return CaptureStep::Continue(KeyCapture::Leader),
+                Action::BeginGitLeader => return CaptureStep::Continue(KeyCapture::LeaderGit),
+                _ => {}
+            }
+        }
+        let mut rows: Vec<KeyFilterRow> = Vec::new();
+        for (cx, b) in fired {
+            let r = row(cx, b);
+            // Global fires in both Normal and Insert, but is one row.
+            if b.is_listed() && !rows.contains(&r) {
+                rows.push(r);
+            }
+        }
+        CaptureStep::Done(KeyFilter {
+            label: format!("{}{}", self.prefix(), pressed_label(code, mods)),
+            rows,
+        })
+    }
+}
+
+/// A pressed key as the key chip names it. Unlike [`Binding::key_label`], which names a *pattern*,
+/// this names a press, so Shift is spelled out — except on a punctuation character, which already
+/// is the shifted key, and which terminals report with Shift held while the GUI and web don't.
+fn pressed_label(code: KeyCode, mods: Mods) -> String {
+    let mut s = String::new();
+    if mods.ctrl {
+        s.push_str("Ctrl-");
+    }
+    if mods.alt {
+        s.push_str("Alt-");
+    }
+    let shift_shown = match code {
+        KeyCode::Char(c) => c.is_alphabetic(),
+        KeyCode::BackTab => false, // already "Shift-Tab"
+        _ => true,
+    };
+    if mods.shift && shift_shown {
+        s.push_str("Shift-");
+    }
+    s.push_str(&code_label(code));
+    s
+}
+
 /// Curated section order for the keybindings picker: getting-around → changing-text → finding →
 /// tools → app. This is deliberately independent of the binding tables' declaration order, so
 /// reordering `bind!` lines only shuffles rows *within* a group, never the section order here.
@@ -933,30 +1104,16 @@ const GROUP_ORDER: &[&str] = &[
 /// themselves are omitted. Built straight from the binding tables and shipped on `picker/view`, so
 /// every client's picker shows exactly its own keymap.
 pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
-    // The `Space g` sub-leader lists as "Application" too: mode is the editor mode a chord is
-    // reachable from, and both leaders are reached from Normal. Its rows are told apart by the
-    // `Git` group and the `Space g …` label, not by a mode of their own.
-    const MODES: [(&str, KeyContext); 7] = [
-        ("Normal", KeyContext::Normal),
-        ("Any", KeyContext::Global),
-        ("Insert", KeyContext::Insert),
-        ("Search", KeyContext::Search),
-        ("Read", KeyContext::Read),
-        ("Application", KeyContext::Leader),
-        ("Application", KeyContext::LeaderGit),
-    ];
     // One bucket per group, filled in scan order; reordered to GROUP_ORDER just before flattening.
     // A Vec scan beats a map: ~15 groups, built once per open.
     let mut groups: Vec<(&str, Vec<aether_protocol::picker::KeybindingEntry>)> = Vec::new();
-    for (mode, cx) in MODES {
+    for cx in ENTRY_CONTEXTS {
         for b in table(cx) {
-            if !b.group.is_empty()
-                && !matches!(b.action, Action::BeginLeader | Action::BeginGitLeader)
-            {
+            if b.is_listed() {
                 let entry = aether_protocol::picker::KeybindingEntry {
                     group: b.group.to_string(),
                     desc: b.desc.to_string(),
-                    mode: mode.to_string(),
+                    mode: entry_mode(cx).to_string(),
                     keys: b.key_label(),
                 };
                 match groups.iter_mut().find(|(g, _)| *g == b.group) {
@@ -1750,6 +1907,127 @@ mod tests {
                 Some(Action::JumplistStepInFile(Direction::Backward))
             ));
         }
+    }
+
+    /// Press `keys` through a fresh key capture.
+    fn capture(keys: &[(KeyCode, Mods)]) -> aether_protocol::picker::KeyFilter {
+        let mut capture = KeyCapture::Start;
+        for (i, &(code, mods)) in keys.iter().enumerate() {
+            match capture.press(code, mods) {
+                CaptureStep::Continue(next) => capture = next,
+                CaptureStep::Done(filter) => {
+                    assert_eq!(i, keys.len() - 1, "chord ended early at key {i}");
+                    return filter;
+                }
+            }
+        }
+        panic!("chord never ended: {keys:?}")
+    }
+
+    fn rows(filter: &aether_protocol::picker::KeyFilter) -> Vec<(&str, &str)> {
+        filter
+            .rows
+            .iter()
+            .map(|r| (r.mode.as_str(), r.keys.as_str()))
+            .collect()
+    }
+
+    /// Every row the Keybindings picker lists can be found by pressing its chord — the key chip
+    /// covers the whole keymap. A binding this fails for is one an earlier binding shadows: listed,
+    /// but never fired by its own keys.
+    #[test]
+    fn every_listed_binding_is_found_by_pressing_it() {
+        let space = (ch(' '), Mods::NONE);
+        let g = (ch('g'), Mods::NONE);
+        for cx in ENTRY_CONTEXTS {
+            for b in table(cx).iter().filter(|b| b.is_listed()) {
+                let mut keys = match cx {
+                    KeyContext::Leader => vec![space],
+                    KeyContext::LeaderGit => vec![space, g],
+                    _ => vec![],
+                };
+                keys.push((b.code, b.mods.display_mods()));
+                let filter = capture(&keys);
+                let row = (entry_mode(cx), b.key_label());
+                assert!(
+                    rows(&filter).contains(&(row.0, row.1.as_str())),
+                    "{row:?} ({}) not found by pressing it: got {:?}",
+                    b.desc,
+                    rows(&filter)
+                );
+            }
+        }
+    }
+
+    /// A key resolves to what it fires in each mode: the exact binding and not its Alt sibling or
+    /// its leader namesake, the Global row once however many modes it fires in, and a
+    /// Shift-tolerant binding for a Shift-held press while the chip names the press as made.
+    #[test]
+    fn key_capture_resolves_what_the_key_fires() {
+        let u = capture(&[(ch('u'), Mods::NONE)]);
+        assert_eq!(u.label, "u");
+        assert!(rows(&u).contains(&("Normal", "u")));
+        assert!(rows(&u).iter().all(|(_, k)| *k == "u"));
+
+        let undo = capture(&[(ch('z'), Mods::CTRL)]);
+        assert_eq!(undo.label, "Ctrl-z");
+        assert_eq!(rows(&undo).iter().filter(|r| r.0 == "Any").count(), 1);
+
+        let h = capture(&[(ch('h'), Mods::SHIFT)]);
+        assert_eq!(h.label, "Shift-h");
+        assert!(rows(&h).contains(&("Normal", "h")));
+
+        // `?` is shifted already: the terminal's Shift doesn't make it another key.
+        assert_eq!(capture(&[(ch('?'), Mods::SHIFT)]).label, "?");
+    }
+
+    /// `Space` and `Space g` wait for another key; Esc stops at the prefix and keeps every chord
+    /// under it. A first-key Esc is a key like any other.
+    #[test]
+    fn key_capture_follows_the_leader_chords() {
+        let space = (ch(' '), Mods::NONE);
+        let esc = (KeyCode::Esc, Mods::NONE);
+        assert_eq!(
+            KeyCapture::Start.press(space.0, space.1),
+            CaptureStep::Continue(KeyCapture::Leader)
+        );
+        let leader = capture(&[space, esc]);
+        assert_eq!(leader.label, "Space");
+        assert!(rows(&leader)
+            .iter()
+            .all(|(m, k)| *m == "Application" && k.starts_with("Space ")));
+        assert!(rows(&leader).iter().any(|(_, k)| k.starts_with("Space g ")));
+
+        let git = capture(&[space, (ch('g'), Mods::NONE), esc]);
+        assert_eq!(git.label, "Space g");
+        assert!(!git.rows.is_empty());
+        assert!(rows(&git).iter().all(|(_, k)| k.starts_with("Space g ")));
+
+        let bare_esc = capture(&[esc]);
+        assert_eq!(bare_esc.label, "Esc");
+        assert!(rows(&bare_esc).contains(&("Insert", "Esc")));
+    }
+
+    /// A key nothing is bound to resolves to no rows — the chip shows an empty list, not every row.
+    #[test]
+    fn key_capture_of_an_unbound_key_keeps_no_rows() {
+        let unbound = (b'a'..=b'z')
+            .map(|c| ch(c as char))
+            .find(|&code| {
+                [
+                    KeyContext::Normal,
+                    KeyContext::Global,
+                    KeyContext::Insert,
+                    KeyContext::Read,
+                    KeyContext::Search,
+                ]
+                .iter()
+                .all(|&cx| lookup(cx, code, Mods::CTRL_ALT).is_none())
+            })
+            .expect("some Ctrl-Alt letter is unbound");
+        let filter = capture(&[(unbound, Mods::CTRL_ALT)]);
+        assert!(filter.label.starts_with("Ctrl-Alt-"));
+        assert!(filter.rows.is_empty());
     }
 
     #[test]

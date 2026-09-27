@@ -2006,11 +2006,8 @@ fn render_item<'a>(
         } => {
             // The description leads (the group is the section header above the run, not row
             // text), a dim `(Mode)` follows for Insert/Search rows (default modes are elided,
-            // matching the haystack), and the chord sits right-aligned in frost blue. The wire
-            // indices are haystack-relative; the core splits them per segment (mode shifts by 1
-            // for the opening paren added here).
-            let seg =
-                aether_client::picker::keybinding_match_segments(desc, mode, keys, match_indices);
+            // and the chord sits right-aligned in frost blue. Only the description is matched, so
+            // the wire indices are its own.
             // Hover underlines the description alone — the row's "name"; underlining the dim
             // mode tag and the chord too reads as noise.
             let mut r = iced::widget::Row::new()
@@ -2018,7 +2015,7 @@ fn render_item<'a>(
                 .align_y(iced::Alignment::Center);
             r = r.push(highlighted_owned(
                 desc.clone(),
-                seg.desc,
+                match_indices.clone(),
                 p.fg_bright,
                 SANS,
                 hovered,
@@ -2028,7 +2025,7 @@ fn render_item<'a>(
             if aether_protocol::picker::KeybindingEntry::shows_mode(mode) {
                 r = r.push(highlighted_owned(
                     format!("({mode})"),
-                    seg.mode.iter().map(|i| i + 1).collect(),
+                    Vec::new(),
                     p.fg_dim,
                     SANS,
                     false,
@@ -2039,7 +2036,7 @@ fn render_item<'a>(
             r = r.push(iced::widget::Space::new().width(Length::Fill));
             r = r.push(highlighted_owned(
                 keys.clone(),
-                seg.keys,
+                Vec::new(),
                 p.accent,
                 SANS,
                 false,

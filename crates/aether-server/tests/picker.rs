@@ -134,11 +134,10 @@ fn keybindings_view_params(
     }
 }
 
-/// The Keybindings picker matches over the whole composed row — group, description, mode, and
-/// chord — and works *without* an active workspace (its rows are shipped by the client, and help
+/// The Keybindings picker matches the description alone, and works *without* an active workspace (its rows are shipped by the client, and help
 /// must be reachable from the pre-activation chooser, like the Workspaces picker).
 #[tokio::test]
-async fn keybindings_picker_matches_across_the_composed_row() {
+async fn keybindings_picker_matches_the_description() {
     let dir = tempfile::tempdir().unwrap();
     let dir_path = dir.path().to_path_buf();
     let server = spawn_for_test("kb-proj", vec![dir_path]).await.unwrap();
@@ -186,14 +185,13 @@ async fn keybindings_picker_matches_across_the_composed_row() {
         .collect();
     assert_eq!(spans, [(0, "Editing"), (2, "Pickers")]);
 
-    // A chord query: "ctrl" only matches the Ctrl-w row, and the match indices land in the
-    // keys segment of the composed haystack ("Delete word back Ctrl-w").
+    // Only the description is matched: "word" finds its row, highlighted within the description.
     let _: () = send_request::<PickerQuery>(
         &mut ws,
         &PickerQueryParams {
             filters: Default::default(),
             kind: PickerKind::Keybindings,
-            query: "ctrl".into(),
+            query: "word".into(),
             generation: 1,
         },
     )
@@ -201,38 +199,35 @@ async fn keybindings_picker_matches_across_the_composed_row() {
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.total_matches, 1);
     let PickerItem::Keybinding {
-        keys,
+        desc,
         match_indices,
         ..
     } = &update.items()[0]
     else {
         panic!("expected Keybinding item")
     };
-    assert_eq!(keys, "Ctrl-w");
-    assert_eq!(
-        match_indices,
-        &[17, 18, 19, 20],
-        "highlights 'Ctrl' in the chord"
-    );
+    assert_eq!(desc, "Delete word back");
+    assert_eq!(match_indices, &[7, 8, 9, 10]);
 
-    // A mode query: Insert/Search rows carry their mode in the haystack ("Newline and indent
-    // (Insert) Enter"), so "insert" narrows to them; default-mode rows elide theirs.
-    let _: () = send_request::<PickerQuery>(
-        &mut ws,
-        &PickerQueryParams {
-            filters: Default::default(),
-            kind: PickerKind::Keybindings,
-            query: "insert".into(),
-            generation: 2,
-        },
-    )
-    .await;
-    let update = expect_notification::<PickerUpdate>(&mut ws).await;
-    assert_eq!(update.total_matches, 1);
-    let PickerItem::Keybinding { desc, .. } = &update.items()[0] else {
-        panic!("expected Keybinding item")
-    };
-    assert_eq!(desc, "Newline and indent");
+    // The chord and the mode aren't searched: a chord is looked up by pressing it (the key chip),
+    // and "insert" names a mode no description mentions.
+    for (generation, query) in [(2, "ctrl"), (3, "insert")] {
+        let _: () = send_request::<PickerQuery>(
+            &mut ws,
+            &PickerQueryParams {
+                filters: Default::default(),
+                kind: PickerKind::Keybindings,
+                query: query.into(),
+                generation,
+            },
+        )
+        .await;
+        let update = expect_notification::<PickerUpdate>(&mut ws).await;
+        assert_eq!(
+            update.total_matches, 0,
+            "{query:?} matched outside the description"
+        );
+    }
 
     drop(server);
 }
@@ -257,6 +252,106 @@ async fn keybindings_picker_reviews_preserve_the_shipped_rows() {
     assert_eq!(view.total_candidates, 3, "re-view keeps the shipped rows");
     let update = expect_notification::<PickerUpdate>(&mut ws).await;
     assert_eq!(update.total_matches, 3);
+
+    drop(server);
+}
+
+/// Run a Keybindings `picker/query` and read back the matched rows' descriptions.
+async fn keybinding_descs(
+    ws: &mut Ws,
+    generation: u64,
+    query: &str,
+    filters: PickerFilters,
+) -> Vec<String> {
+    let _: () = send_request::<PickerQuery>(
+        ws,
+        &PickerQueryParams {
+            filters,
+            kind: PickerKind::Keybindings,
+            query: query.into(),
+            generation,
+        },
+    )
+    .await;
+    let update = expect_notification::<PickerUpdate>(ws).await;
+    update
+        .items()
+        .iter()
+        .map(|i| {
+            let PickerItem::Keybinding { desc, .. } = i else {
+                panic!("expected Keybinding item, got {i:?}")
+            };
+            desc.clone()
+        })
+        .collect()
+}
+
+/// The key chip keeps exactly the rows the client resolved the pressed chord to, by `(mode, keys)`
+/// — the same chord in another mode stays out — and narrows the fuzzy query rather than replacing
+/// it. A chord nothing is bound to shows nothing; dropping the chip brings every row back.
+#[tokio::test]
+async fn keybindings_key_chip_keeps_the_rows_the_chord_fires() {
+    use aether_protocol::picker::{KeyFilter, KeyFilterRow, KeybindingEntry};
+    let (server, mut ws) = setup_picker_workspace().await;
+    let rows: Vec<KeybindingEntry> = [
+        ("Selection", "Reverse selection", "Normal", "u"),
+        ("Selection", "Orient selection forward", "Normal", "Alt-u"),
+        ("Read", "Reverse the selection", "Read", "u"),
+        ("Edit", "Undo", "Any", "Ctrl-z"),
+        ("App", "Dismiss the current hint", "Application", "Space u"),
+    ]
+    .into_iter()
+    .map(|(group, desc, mode, keys)| KeybindingEntry {
+        group: group.into(),
+        desc: desc.into(),
+        mode: mode.into(),
+        keys: keys.into(),
+    })
+    .collect();
+    let _ = send_request::<PickerView>(
+        &mut ws,
+        &keybindings_view_params(PickerReset::All, Some(rows)),
+    )
+    .await;
+    let _ = expect_notification::<PickerUpdate>(&mut ws).await;
+
+    let key = |rows: &[(&str, &str)]| PickerFilters {
+        key: Some(KeyFilter {
+            label: "u".into(),
+            rows: rows
+                .iter()
+                .map(|(mode, keys)| KeyFilterRow {
+                    mode: (*mode).into(),
+                    keys: (*keys).into(),
+                })
+                .collect(),
+        }),
+        ..PickerFilters::default()
+    };
+    // Only Normal's `u` fires in Normal: Read's `u` row has the same keys, another mode.
+    assert_eq!(
+        keybinding_descs(&mut ws, 1, "", key(&[("Normal", "u")])).await,
+        ["Reverse selection"]
+    );
+    // Both modes named: both rows, in the shipped order.
+    assert_eq!(
+        keybinding_descs(&mut ws, 2, "", key(&[("Normal", "u"), ("Read", "u")])).await,
+        ["Reverse selection", "Reverse the selection"]
+    );
+    // The query narrows within the chip.
+    assert_eq!(
+        keybinding_descs(&mut ws, 3, "the", key(&[("Normal", "u"), ("Read", "u")])).await,
+        ["Reverse the selection"]
+    );
+    // A chord nothing is bound to: no rows, not every row.
+    assert!(keybinding_descs(&mut ws, 4, "", key(&[])).await.is_empty());
+    // No chip: everything is back.
+    assert_eq!(
+        keybinding_descs(&mut ws, 5, "", PickerFilters::default())
+            .await
+            .len(),
+        5
+    );
 
     drop(server);
 }

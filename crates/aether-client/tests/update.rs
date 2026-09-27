@@ -2077,6 +2077,66 @@ fn jumplist_chip_removal_requeries() {
     assert_eq!(params["filters"]["globs"], json!(null));
 }
 
+/// `Alt-b` in the keybindings picker captures the next key pressed — Esc and Tab included, which
+/// would otherwise dismiss the picker or move focus — as the key chip, and re-queries with it.
+/// While capturing, the pending chip is the selected one: that is what makes every shell forward
+/// the keys its query input would have kept.
+#[test]
+fn keybindings_key_chip_captures_the_next_key() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    let _ = s.open_picker(PickerKind::Keybindings, None, None, false, None);
+    let row = |s: &Session| -> Vec<String> {
+        let p = s.picker.as_ref().unwrap();
+        p.chip_row(&[]).into_iter().map(|c| c.label).collect()
+    };
+
+    let _ = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
+    assert_eq!(row(&s), ["␣"]);
+    assert_eq!(s.picker.as_ref().unwrap().chip_selected, Some(0));
+
+    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
+    assert!(s.picker.is_some(), "Esc was captured, not a dismiss");
+    assert_eq!(row(&s), ["Esc"]);
+    assert_eq!(s.picker.as_ref().unwrap().chip_selected, None);
+    let params = find_request(&fx, "picker/query").expect("a captured key re-queries");
+    assert_eq!(params["filters"]["key"]["label"], "Esc");
+    let rows = params["filters"]["key"]["rows"].as_array().unwrap();
+    assert!(rows.contains(&json!({"mode": "Insert", "keys": "Esc"})));
+
+    // A second capture replaces the chip in place; a leader chord waits for its next key.
+    let _ = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    assert_eq!(row(&s), ["Space ␣"]);
+    let fx = s.on_key(KeyCode::Char('u'), Mods::NONE, Some("u".into()));
+    assert_eq!(row(&s), ["Space u"]);
+    let params = find_request(&fx, "picker/query").unwrap();
+    assert_eq!(
+        params["filters"]["key"]["rows"],
+        json!([{"mode": "Application", "keys": "Space u"}])
+    );
+
+    // Backspace from the query selects the chip; a second removes it.
+    let _ = s.on_key(KeyCode::Backspace, Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Backspace, Mods::NONE, None);
+    assert!(row(&s).is_empty());
+    let params = find_request(&fx, "picker/query").unwrap();
+    assert_eq!(params["filters"]["key"], json!(null));
+}
+
+/// The key chip is the keybindings picker's alone: `Alt-b` elsewhere captures nothing.
+#[test]
+fn key_capture_is_a_no_op_outside_the_keybindings_picker() {
+    use aether_protocol::picker::PickerKind;
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.open_picker(PickerKind::Grep, None, None, false, None);
+    let _ = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
+    let p = s.picker.as_ref().unwrap();
+    assert!(p.key_capture.is_none());
+    assert!(p.chip_row(&[]).is_empty());
+}
+
 #[test]
 fn lsp_picker_centers_on_the_current_buffers_server() {
     use aether_protocol::lsp::LspServerRef;

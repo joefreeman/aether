@@ -182,6 +182,10 @@ pub struct PickerState {
     pub chip_selected: Option<usize>,
     /// Below-input editor line for valued chips (glob / dir); owns all keys while open.
     pub chip_editor: Option<ChipEditor>,
+    /// Keybindings: a chord being pressed for the key chip. Owns every key while set; renders as
+    /// the key chip, selected — which is also what parks each shell's focus off the query input,
+    /// so keys the input would have eaten (Tab, Ctrl-a, …) reach the capture.
+    pub key_capture: Option<crate::keymap::KeyCapture>,
     /// The filter set the server is currently running results against — what was last sent on a
     /// `picker/query`. Lets the live-preview path (an open glob/dir editor folding its
     /// in-progress value into the filters) skip a redundant re-query when a keystroke leaves the
@@ -254,6 +258,7 @@ impl PickerState {
             chips: Vec::new(),
             chip_selected: None,
             chip_editor: None,
+            key_capture: None,
             sent_filters: PickerFilters::default(),
             spinner_frame: 0,
             refetch_in_flight: false,
@@ -293,9 +298,21 @@ impl PickerState {
             .then(|| SPINNER_FRAMES[self.spinner_frame as usize % SPINNER_FRAMES.len()])
     }
 
-    /// The rendered chip row, derived from the stored list.
+    /// The rendered chip row, derived from the stored list. A key capture in progress shows as
+    /// the key chip, in the slot of the chip it will replace.
     pub fn chip_row(&self, workspace_paths: &[String]) -> Vec<Chip> {
-        chips::derive_chips(&self.chips, workspace_paths)
+        let mut row = chips::derive_chips(&self.chips, workspace_paths);
+        if let Some(capture) = self.key_capture {
+            let pending = Chip {
+                id: ChipId::Key,
+                label: capture.label(),
+            };
+            match row.iter().position(|c| c.id == ChipId::Key) {
+                Some(i) => row[i] = pending,
+                None => row.push(pending),
+            }
+        }
+        row
     }
 
     /// The wire filter set the active chips fold into — built per send.
@@ -351,6 +368,7 @@ impl PickerState {
         self.chips = chips::adopt_filters(f);
         self.chip_selected = None;
         self.chip_editor = None;
+        self.key_capture = None;
     }
 
     /// The dir scope behind chip `i`, when chip `i` is a dir — the editor's pre-fill.
@@ -1047,52 +1065,6 @@ pub enum ItemKey<'a> {
     Activity(&'a aether_protocol::activity::ActivityId),
 }
 
-/// A Keybinding row's `match_indices` split per rendered segment. The wire indices are char
-/// offsets into the row's composed haystack (`KeybindingEntry::haystack`, `{desc} [({mode}) ]
-/// {keys}` — the mode is present only for Insert/Search rows, see
-/// `KeybindingEntry::shows_mode`; the group is a section header, not row text); each field here
-/// is the subset that falls inside that segment, rebased to the segment's own chars — ready to
-/// feed a shell's per-span highlighter. Indices landing on the literal separators are dropped:
-/// the shells style separators dim and unhighlighted. `mode` stays empty for rows whose mode is
-/// elided.
-#[derive(Debug, Default, PartialEq)]
-pub struct KeybindingSegments {
-    pub desc: Vec<u32>,
-    pub mode: Vec<u32>,
-    pub keys: Vec<u32>,
-}
-
-/// Split a [`PickerItem::Keybinding`]'s haystack-relative `match_indices` into per-segment
-/// lists (see [`KeybindingSegments`]). The single source of the segment offsets — keep in
-/// lockstep with `KeybindingEntry::haystack` (the web shell mirrors this in TypeScript).
-pub fn keybinding_match_segments(
-    desc: &str,
-    mode: &str,
-    keys: &str,
-    match_indices: &[u32],
-) -> KeybindingSegments {
-    let (d, k) = (desc.chars().count() as u32, keys.chars().count() as u32);
-    // Segment start offsets within the haystack: `{desc} ({mode}) {keys}` / `{desc} {keys}`.
-    let m = if aether_protocol::picker::KeybindingEntry::shows_mode(mode) {
-        mode.chars().count() as u32
-    } else {
-        0
-    };
-    let mode_at = d + 2; // only meaningful when `m > 0`
-    let keys_at = if m > 0 { d + 2 + m + 2 } else { d + 1 };
-    let mut out = KeybindingSegments::default();
-    for &i in match_indices {
-        if i < d {
-            out.desc.push(i);
-        } else if m > 0 && (mode_at..mode_at + m).contains(&i) {
-            out.mode.push(i - mode_at);
-        } else if (keys_at..keys_at + k).contains(&i) {
-            out.keys.push(i - keys_at);
-        }
-    }
-    out
-}
-
 /// A shell or agent row's `match_indices` split per rendered field.
 ///
 /// The wire indices are char offsets into the row's composed haystack
@@ -1338,45 +1310,6 @@ mod tests {
         assert_eq!(seg.first, vec![0]);
         assert_eq!(seg.second, Vec::<u32>::new());
         assert_eq!(seg.third, Vec::<u32>::new());
-    }
-
-    #[test]
-    fn keybinding_match_segments_rebase_and_drop_separators() {
-        // Elided mode (Any). Haystack: "Delete word back Ctrl-w"
-        //                               0..............15  17..22
-        let seg = keybinding_match_segments("Delete word back", "Any", "Ctrl-w", &[0, 16, 17, 22]);
-        assert_eq!(seg.desc, vec![0]); // 'D' (16 lands on the separator space → dropped)
-        assert_eq!(seg.mode, Vec::<u32>::new()); // elided — nothing can land in it
-        assert_eq!(seg.keys, vec![0, 5]); // 'C', 'w'
-
-        // Shown mode (Insert). Haystack: "Delete word back (Insert) Ctrl-w"
-        //                                 0..............15  18...23  26..31
-        let seg = keybinding_match_segments(
-            "Delete word back",
-            "Insert",
-            "Ctrl-w",
-            &[17, 18, 23, 26, 31],
-        );
-        assert_eq!(seg.mode, vec![0, 5]); // 'I', 't' (17 lands on the '(' → dropped)
-        assert_eq!(seg.keys, vec![0, 5]); // 'C', 'w'
-
-        // Round-trip sanity: the haystacks really are composed the way the offsets assume.
-        let mut e = aether_protocol::picker::KeybindingEntry {
-            group: "Editing".into(),
-            desc: "Delete word back".into(),
-            mode: "Any".into(),
-            keys: "Ctrl-w".into(),
-        };
-        let hay: Vec<char> = e.haystack().chars().collect();
-        assert_eq!(hay[0], 'D');
-        assert_eq!(hay[17], 'C');
-        assert_eq!(hay[22], 'w');
-        e.mode = "Insert".into();
-        let hay: Vec<char> = e.haystack().chars().collect();
-        assert_eq!(hay[18], 'I');
-        assert_eq!(hay[23], 't');
-        assert_eq!(hay[26], 'C');
-        assert_eq!(hay[31], 'w');
     }
 
     #[test]

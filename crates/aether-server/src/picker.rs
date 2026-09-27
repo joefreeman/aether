@@ -690,23 +690,6 @@ impl GitCommitCandidate {
     }
 }
 
-/// One Keybindings-picker candidate — a [`KeybindingEntry`] the client shipped on `picker/view`
-/// (the binding tables live client-side; the server only matches and windows). `haystack` is the
-/// entry's canonical composition ([`KeybindingEntry::haystack`]), precomputed once at build so
-/// rerank doesn't re-format ~150 rows per keystroke.
-#[derive(Debug, Clone)]
-pub struct KeybindingCandidate {
-    pub entry: KeybindingEntry,
-    pub haystack: String,
-}
-
-impl From<KeybindingEntry> for KeybindingCandidate {
-    fn from(entry: KeybindingEntry) -> Self {
-        let haystack = entry.haystack();
-        KeybindingCandidate { entry, haystack }
-    }
-}
-
 /// How a candidate set turns a non-empty query into a ranked subset. Each `PickerCandidates`
 /// variant picks one; `rerank` and `build_window_items` dispatch on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -783,7 +766,9 @@ pub enum PickerCandidates {
     /// The client's keyboard shortcuts, shipped on open (`PickerViewParams::keybindings`) and
     /// preserved across scroll/resume re-views (the re-view sends no rows), like Diagnostics.
     /// Static for the picker's lifetime — bindings can't change under a running client.
-    Keybindings(Vec<KeybindingCandidate>),
+    /// The rows the client shipped on `picker/view` (the binding tables live client-side; the
+    /// server only matches and windows).
+    Keybindings(Vec<KeybindingEntry>),
     /// The client's jumplist, cloned from `ServerState.results` on every `picker/view` — cheap,
     /// in-memory, and the backing list persists regardless of the picker. Positional identity
     /// (`PickerItem::JumplistEntry::index`) is stable for the picker's lifetime: the list only
@@ -945,12 +930,14 @@ impl PickerCandidates {
             // Not used as a match haystack (GitChanges greps content via SubstringContent, not
             // `display_at`); kept defined for completeness.
             PickerCandidates::GitChanges(v) => &v[idx].relative_path,
-            PickerCandidates::Keybindings(v) => &v[idx].haystack,
+            // The description alone: the chord is found by pressing it (the key chip), and the mode
+            // and group are labels, not something to search.
+            PickerCandidates::Keybindings(v) => &v[idx].desc,
             PickerCandidates::Jumplist(v) => &v[idx].display,
             // The branch name alone. A held row's admin name is deliberately *not* matched: the
             // shells don't render it (a bare `⧉`), and matching on a string nobody can see puts
             // rows in the list with no visible cause — the same rule that keeps a Keybindings
-            // row's group out of `KeybindingEntry::haystack`. A detached tree still matches by
+            // row's group out of its match haystack. A detached tree still matches by
             // admin name, because there it *is* `row.name`.
             PickerCandidates::GitBranches(v) => &v[idx].row.name,
             PickerCandidates::GitLog(v) => &v[idx].haystack,
@@ -1138,7 +1125,7 @@ impl PickerCandidates {
                 }
             }
             PickerCandidates::Keybindings(v) => {
-                let e = &v[idx].entry;
+                let e = &v[idx];
                 PickerItem::Keybinding {
                     group: e.group.clone(),
                     desc: e.desc.clone(),
@@ -1347,9 +1334,9 @@ impl PickerCandidates {
                 PickerItem::Keybinding {
                     mode, keys, desc, ..
                 },
-            ) => v.iter().position(|c| {
-                c.entry.mode == *mode && c.entry.keys == *keys && c.entry.desc == *desc
-            }),
+            ) => v
+                .iter()
+                .position(|c| c.mode == *mode && c.keys == *keys && c.desc == *desc),
             // Positional identity: the captured list is a snapshot, stable for the picker's
             // lifetime (a re-capture resets the picker), so the index alone is the identity.
             (PickerCandidates::Jumplist(v), PickerItem::JumplistEntry { index, .. }) => {
@@ -2138,7 +2125,16 @@ impl PickerState {
             }
             _ => None,
         };
+        // Keybindings: the key chip keeps the rows the pressed chord fires. The client resolved
+        // the chord against its keymap; this only looks the rows up.
+        let key_filter = match &self.candidates {
+            PickerCandidates::Keybindings(_) => self.filters.key.as_ref(),
+            _ => None,
+        };
         let passes = |candidates: &PickerCandidates, i: usize| -> bool {
+            if let (Some(k), PickerCandidates::Keybindings(v)) = (key_filter, candidates) {
+                return k.keeps(&v[i]);
+            }
             let Some(ff) = files_filter.as_ref() else {
                 return true;
             };
@@ -2577,7 +2573,7 @@ impl PickerState {
             // Must agree with `group_header_at`'s `Label`: same discriminant convention as the
             // jumplist's label groups.
             PickerCandidates::WorkspaceSymbols(v) => Some((LABEL_KEY, v[ci].display_path.as_str())),
-            PickerCandidates::Keybindings(v) => Some((0, v[ci].entry.group.as_str())),
+            PickerCandidates::Keybindings(v) => Some((0, v[ci].group.as_str())),
             // Entries carry their source picker's header — capture makes grouping total
             // (`jumplist::assign_file_groups`), which the collapsible row space relies on
             // ("collapsible kinds key every row").
@@ -2637,7 +2633,7 @@ impl PickerState {
                 },
             }),
             PickerCandidates::Keybindings(v) => Some(GroupHeader::Label {
-                label: v[ci].entry.group.clone(),
+                label: v[ci].group.clone(),
             }),
             PickerCandidates::Jumplist(v) => v[ci].group.clone(),
             _ => None,
@@ -3130,14 +3126,11 @@ mod tests {
         PickerCandidates::Keybindings(
             entries
                 .into_iter()
-                .map(|(group, desc, mode, keys)| {
-                    KeybindingEntry {
-                        group: group.into(),
-                        desc: desc.into(),
-                        mode: mode.into(),
-                        keys: keys.into(),
-                    }
-                    .into()
+                .map(|(group, desc, mode, keys)| KeybindingEntry {
+                    group: group.into(),
+                    desc: desc.into(),
+                    mode: mode.into(),
+                    keys: keys.into(),
                 })
                 .collect(),
         )
@@ -3148,10 +3141,9 @@ mod tests {
         let c = keybinding_candidates();
         assert_eq!(c.kind(), PickerKind::Keybindings);
         assert_eq!(c.len(), 3);
-        // The haystack is the composed row — description + chord (and the mode, on the
-        // Insert/Search rows that show one). The group is a section header, not row text,
-        // so it isn't matched.
-        assert_eq!(c.display_at(0), "Delete word back Ctrl-w");
+        // The haystack is the description alone: the chord is found by pressing it (the key
+        // chip), and the mode and group are labels.
+        assert_eq!(c.display_at(0), "Delete word back");
         assert_eq!(c.match_strategy(), MatchStrategy::Fuzzy);
         match c.make_item(1, vec![0, 1]) {
             PickerItem::Keybinding {
@@ -3177,13 +3169,11 @@ mod tests {
     fn keybindings_group_metrics_and_query_keep_candidate_order() {
         // Two Editing rows then a Motion row — one section header per group run, mirroring the
         // client's `display_rows`, so the virtual-scroll row math lines up.
-        let kb = |group: &str, desc: &str, keys: &str| {
-            KeybindingCandidate::from(KeybindingEntry {
-                group: group.into(),
-                desc: desc.into(),
-                mode: "Any".into(),
-                keys: keys.into(),
-            })
+        let kb = |group: &str, desc: &str, keys: &str| KeybindingEntry {
+            group: group.into(),
+            desc: desc.into(),
+            mode: "Any".into(),
+            keys: keys.into(),
         };
         let cands = PickerCandidates::Keybindings(vec![
             kb("Editing", "Delete selection", "Ctrl-d"),
@@ -3213,13 +3203,11 @@ mod tests {
 
     #[test]
     fn window_spans_repeat_the_split_groups_header() {
-        let kb = |group: &str, desc: &str| {
-            KeybindingCandidate::from(KeybindingEntry {
-                group: group.into(),
-                desc: desc.into(),
-                mode: "Any".into(),
-                keys: "x".into(),
-            })
+        let kb = |group: &str, desc: &str| KeybindingEntry {
+            group: group.into(),
+            desc: desc.into(),
+            mode: "Any".into(),
+            keys: "x".into(),
         };
         let cands = PickerCandidates::Keybindings(vec![
             kb("Editing", "Delete selection"),

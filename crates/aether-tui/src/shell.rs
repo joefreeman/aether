@@ -2913,7 +2913,7 @@ impl Shell {
             p.items.push(item);
             p.synthetic_create_idx = Some(p.items.len() - 1);
         }
-        p.chips = core.chips.iter().map(chip_value_view).collect();
+        p.chips = core.chip_row(&self.session.workspace_paths);
         p.chip_selected = core.chip_selected;
         p.chip_editor = core
             .chip_editor
@@ -3101,22 +3101,6 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
 }
 
 // ---- chip view conversion (core chips -> the render model's types) --------------------------
-
-fn chip_value_view(v: &aether_client::chips::ChipValue) -> crate::picker::ChipValue {
-    use crate::picker::ChipValue as T;
-    use aether_client::chips::ChipValue as C;
-    match v {
-        C::Dir(d) => T::Dir(d.clone()),
-        C::Glob(g) => T::Glob(g.clone()),
-        C::Case(m) => T::Case(*m),
-        C::Word => T::Word,
-        C::Regex => T::Regex,
-        C::Ignored { hide } => T::Ignored { hide: *hide },
-        C::Hidden { hide } => T::Hidden { hide: *hide },
-        C::Changed => T::Changed,
-        C::Untracked => T::Untracked,
-    }
-}
 
 /// Workspace the core's chip editor into the TUI view model. `root_cursor` / `path_cursor` carry the
 /// shell-owned caret for whichever segment is focused (`None` → render that field's caret at end,

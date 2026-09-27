@@ -244,7 +244,7 @@ pub const BRANCH_MARK: &str = "⎇";
 /// the entry, and there is no `git worktree rename` at all), and it names nothing else on screen.
 /// In the ordinary case it simply repeats the branch. Matching on it while hiding it would be worse
 /// still — rows would appear with no visible cause, the same reason a Keybindings row's group stays
-/// out of [`aether_protocol::picker::KeybindingEntry::haystack`].
+/// out of its match haystack.
 ///
 /// **The rule: the admin name shows where it is a row's *identity*, and hides where it is an
 /// annotation on a branch row.** So it is still displayed and matched for a detached or prunable

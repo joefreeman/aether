@@ -100,6 +100,8 @@ pub enum PickerCmd {
     TaskDefinition,
     /// `Ctrl-d` in the activity picker — stop the highlighted work.
     StopActivity,
+    /// `Alt-b` in the keybindings picker — look a key up by pressing it.
+    FindByKey,
 }
 
 /// Session facts that condition a hint's display eligibility beyond the context id — the engine
@@ -374,6 +376,11 @@ pub static CURRICULUM: &[HintDef] = &[
         contexts: &[C::Picker(PickerKind::Tasks), C::Picker(PickerKind::TasksWorkspace)], keys: "Ctrl-g",
         trigger: Trigger::Picker(PickerCmd::TaskDefinition),
         text: "Use {} to go to where the selected task is defined" },
+    // Typing a key into the keybindings picker's query matches every description containing it;
+    // pressing it is the way to ask what it does.
+    HintDef { id: "keybindings-by-key", tier: 4, contexts: &[C::Picker(PickerKind::Keybindings)], keys: "Alt-b",
+        trigger: Trigger::Picker(PickerCmd::FindByKey),
+        text: "Use {} then press a key to see what it does" },
     // (Not the Jumplist, whose path chips are data-gated — the hint could name a chord that
     // isn't available for the current capture.)
     HintDef { id: "picker-scope", tier: 4,

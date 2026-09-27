@@ -427,8 +427,6 @@ interface RowDesc {
   primary: string;
   matches?: number[];
   meta?: string;
-  /** Fuzzy-match offsets into `meta` (code points), bolded like `matches` (keybinding chords). */
-  metaMatches?: number[];
   /** Coloured right-aligned meta (e.g. a git change's `+A -R` summary), rendered as separate spans
    *  in place of the plain `meta` text. Mutually exclusive with `meta`. */
   metaParts?: { text: string; cls: string }[];
@@ -782,33 +780,6 @@ function matched(text: string, indices?: number[]): DocumentFragment {
  *  as noise on every row. Mirrors the Rust protocol's `KeybindingEntry::shows_mode`. */
 function keybindingShowsMode(mode: string): boolean {
   return mode === "Insert" || mode === "Search";
-}
-
-/** Split a keybinding row's `match_indices` — code-point offsets into the composed haystack
- *  `"{desc} [({mode}) ]{keys}"` (the mode present only when `keybindingShowsMode`; the group is
- *  a section header, not row text) — into per-segment offsets, rebased to each segment's start;
- *  hits on the literal separators are dropped. Mirrors the Rust core's
- *  `keybinding_match_segments` (aether-client/src/picker.rs), which the wasm boundary can't call. */
-function keybindingMatchSegments(
-  desc: string,
-  mode: string,
-  keys: string,
-  matchIndices?: number[],
-): { desc: number[]; mode: number[]; keys: number[] } {
-  const d = [...desc].length;
-  const m = keybindingShowsMode(mode) ? [...mode].length : 0;
-  const k = [...keys].length;
-  // Segment start offsets within the haystack: `{desc} ({mode}) {keys}` / `{desc} {keys}`.
-  const modeAt = d + 2; // only meaningful when `m > 0`
-  const keysAt = m > 0 ? d + 2 + m + 2 : d + 1;
-  const out: { desc: number[]; mode: number[]; keys: number[] } =
-    { desc: [], mode: [], keys: [] };
-  for (const i of matchIndices ?? []) {
-    if (i < d) out.desc.push(i);
-    else if (m > 0 && i >= modeAt && i < modeAt + m) out.mode.push(i - modeAt);
-    else if (i >= keysAt && i < keysAt + k) out.keys.push(i - keysAt);
-  }
-  return out;
 }
 
 /** A commit's decorations as coloured spans — `(HEAD -> main, tag: v1.0, origin/main)`, brackets
@@ -1230,20 +1201,14 @@ export function describePickerItem(
     }
     case "keybinding": {
       // The description in base style (the group is the section header above the run, not row
-      // text), a dim `(mode)` for Insert/Search rows — matching the haystack — and the chord
-      // right-aligned as the meta (the row's flex gap renders the separator space). Fuzzy
-      // matches land in any segment; rebase the haystack offsets per segment (the mode's shift
-      // by 1 for the suffix's leading `(`).
-      const seg = keybindingMatchSegments(item.desc, item.mode, item.keys, item.match_indices);
-      const showsMode = keybindingShowsMode(item.mode);
+      // text), a dim `(mode)` for Insert/Search rows, and the chord right-aligned as the meta
+      // (the row's flex gap renders the separator space). Only the description is matched, so
+      // the wire offsets are its own.
       return {
         primary: item.desc,
-        matches: seg.desc,
-        ...(showsMode
-          ? { suffix: `(${item.mode})`, suffixMatches: seg.mode.map((i) => i + 1) }
-          : {}),
+        matches: item.match_indices,
+        ...(keybindingShowsMode(item.mode) ? { suffix: `(${item.mode})` } : {}),
         meta: item.keys,
-        metaMatches: seg.keys,
       };
     }
     case "jumplist_entry": {
@@ -5321,7 +5286,7 @@ export class Shell {
       } else if (d.meta) {
         const m = document.createElement("span");
         m.className = "picker-meta";
-        m.append(matched(d.meta, d.metaMatches));
+        m.append(d.meta);
         row.append(m);
       }
       if (d.dirty) {

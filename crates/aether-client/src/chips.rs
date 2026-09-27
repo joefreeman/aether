@@ -7,7 +7,7 @@
 //! open/resume ([`adopt_filters`]); insertion order is session-ephemeral.
 
 use aether_protocol::directory::DirectoryEntry;
-use aether_protocol::picker::{CaseMode, PickerFilters, PickerKind, ScopedPath};
+use aether_protocol::picker::{CaseMode, KeyFilter, PickerFilters, PickerKind, ScopedPath};
 
 /// Minimal editable text field (byte cursor), for the chip editor's segments. The picker query
 /// keeps its own inline pair; this exists so the editor's two fields don't triplicate the
@@ -55,6 +55,8 @@ pub enum ChipId {
     Hidden,
     Changed,
     Untracked,
+    /// The Keybindings picker's pressed chord — also the chip a capture in progress renders as.
+    Key,
 }
 
 /// One chip, by value — the element of the client's ordered filter state.
@@ -80,6 +82,8 @@ pub enum ChipValue {
     /// Hide untracked entries. Hide-only (untracked shows by default everywhere), so it's a plain
     /// on/off chip like `Changed`, not a `+`/`-` pair like `Ignored`/`Hidden`.
     Untracked,
+    /// A pressed chord and the Keybindings rows it fires. At most one: pressing another replaces it.
+    Key(KeyFilter),
 }
 
 impl ChipValue {
@@ -101,12 +105,12 @@ pub struct Chip {
 /// Grep takes everything; Files the scope chips + changed-only + the hidden visibility chip
 /// (its index includes hidden files, so `Alt-.` hides them — but not `ignored`, which would need
 /// a re-walk); the Explorer both visibility chips + changed-only; the Jumplist and workspace
-/// symbols the path-scope chips only. Static per kind — the Jumplist additionally gates on the
+/// symbols the path-scope chips only; the Keybindings picker the key chip only. Static per kind — the Jumplist additionally gates on the
 /// captured data ([`crate::picker::PickerState::filter_available`] wraps this with the server's
 /// `path_filterable` echo).
 pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
     match kind {
-        PickerKind::Grep => true,
+        PickerKind::Grep => id != ChipId::Key,
         PickerKind::Files => matches!(
             id,
             ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Changed | ChipId::Untracked | ChipId::Hidden
@@ -141,6 +145,7 @@ pub fn filter_applies(kind: PickerKind, id: ChipId) -> bool {
         // Ignored/hidden are meaningless (servers don't report gitignored files); changed/untracked
         // deferred.
         PickerKind::WorkspaceSymbols => matches!(id, ChipId::Dir(_) | ChipId::Glob(_)),
+        PickerKind::Keybindings => id == ChipId::Key,
         _ => false,
     }
 }
@@ -192,6 +197,7 @@ pub fn derive_chips(values: &[ChipValue], workspace_paths: &[String]) -> Vec<Chi
                 }
                 ChipValue::Changed => (ChipId::Changed, "Δ".into()),
                 ChipValue::Untracked => (ChipId::Untracked, "-??".into()),
+                ChipValue::Key(k) => (ChipId::Key, k.label.clone()),
             };
             Chip { id, label }
         })
@@ -215,6 +221,7 @@ pub fn wire_filters(values: &[ChipValue]) -> PickerFilters {
             ChipValue::Hidden { hide: false } => f.include_hidden = true,
             ChipValue::Changed => f.changed_only = true,
             ChipValue::Untracked => f.hide_untracked = true,
+            ChipValue::Key(k) => f.key = Some(k.clone()),
         }
     }
     f
@@ -251,6 +258,7 @@ pub fn adopt_filters(f: &PickerFilters) -> Vec<ChipValue> {
     if f.hide_untracked {
         chips.push(ChipValue::Untracked);
     }
+    chips.extend(f.key.iter().cloned().map(ChipValue::Key));
     chips
 }
 
@@ -283,7 +291,7 @@ pub fn apply_chip_toggle(values: &mut Vec<ChipValue>, id: ChipId, hide: bool) ->
         ChipId::Hidden => ChipValue::Hidden { hide },
         ChipId::Changed => ChipValue::Changed,
         ChipId::Untracked => ChipValue::Untracked,
-        ChipId::Dir(_) | ChipId::Glob(_) => return false,
+        ChipId::Dir(_) | ChipId::Glob(_) | ChipId::Key => return false,
     };
     match values.iter().position(|v| v.same_kind(&value)) {
         Some(i) => {
@@ -309,6 +317,16 @@ pub fn remove_chip(values: &mut Vec<ChipValue>, id: ChipId) {
         ChipId::Hidden => values.retain(|v| !matches!(v, ChipValue::Hidden { .. })),
         ChipId::Changed => values.retain(|v| *v != ChipValue::Changed),
         ChipId::Untracked => values.retain(|v| *v != ChipValue::Untracked),
+        ChipId::Key => values.retain(|v| !matches!(v, ChipValue::Key(_))),
+    }
+}
+
+/// Install a captured chord as the key chip, replacing the one before it in place — or appending,
+/// when there wasn't one.
+pub fn set_key_chip(values: &mut Vec<ChipValue>, key: KeyFilter) {
+    match values.iter().position(|v| matches!(v, ChipValue::Key(_))) {
+        Some(i) => values[i] = ChipValue::Key(key),
+        None => values.push(ChipValue::Key(key)),
     }
 }
 
@@ -1017,6 +1035,76 @@ mod tests {
         assert!(matches!(restored[0], ChipValue::Dir(_)));
         assert!(matches!(restored[1], ChipValue::Glob(_)));
         assert_eq!(wire_filters(&restored), wire);
+    }
+
+    #[test]
+    fn adopted_filters_render_in_canonical_order() {
+        // The wire carries no order, so adoption (open/resume) lays chips out canonically: dirs,
+        // globs (each in declaration order), flags after. Multi-root dir labels lead with the
+        // root's label; a whole-root scope is just the label.
+        let wire = PickerFilters {
+            changed_only: true,
+            whole_word: true,
+            globs: vec!["*.rs".into(), "!*_test.rs".into()],
+            case: CaseMode::Insensitive,
+            include_hidden: true,
+            directories: vec![
+                ScopedPath {
+                    path_index: 1,
+                    relative_path: "src/app".into(),
+                    is_file: false,
+                },
+                ScopedPath {
+                    path_index: 0,
+                    relative_path: String::new(),
+                    is_file: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let roots = vec!["/proj/alpha".to_string(), "/proj/beta".to_string()];
+        let labels: Vec<String> = derive_chips(&adopt_filters(&wire), &roots)
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "beta: src/app/",
+                "alpha",
+                "*.rs",
+                "!*_test.rs",
+                "aa",
+                "wd",
+                "+.",
+                "Δ"
+            ]
+        );
+    }
+
+    #[test]
+    fn key_chip_is_the_keybindings_pickers_and_replaces_in_place() {
+        use aether_protocol::picker::KeyFilterRow;
+        assert!(filter_applies(PickerKind::Keybindings, ChipId::Key));
+        assert!(!filter_applies(PickerKind::Keybindings, ChipId::Word));
+        assert!(!filter_applies(PickerKind::Grep, ChipId::Key));
+        let key = |label: &str| KeyFilter {
+            label: label.into(),
+            rows: vec![KeyFilterRow {
+                mode: "Normal".into(),
+                keys: label.into(),
+            }],
+        };
+        let mut chips = Vec::new();
+        set_key_chip(&mut chips, key("u"));
+        set_key_chip(&mut chips, key("Alt-u"));
+        assert_eq!(chips, [ChipValue::Key(key("Alt-u"))]);
+        let wire = wire_filters(&chips);
+        assert_eq!(wire.key, Some(key("Alt-u")));
+        assert_eq!(adopt_filters(&wire), chips);
+        assert_eq!(derive_chips(&chips, &[])[0].label, "Alt-u");
+        remove_chip(&mut chips, ChipId::Key);
+        assert!(wire_filters(&chips).is_default());
     }
 
     #[test]

@@ -4220,26 +4220,6 @@ fn picker_item_keybinding_is_tagged() {
 }
 
 #[test]
-fn keybinding_entry_haystack_composes_in_display_order() {
-    use aether_protocol::picker::KeybindingEntry;
-    // The composition is a wire contract: match_indices index into this exact string. The
-    // group is a section header, not row text, so it's absent; default modes (Normal / Any /
-    // Application) are elided too.
-    let mut e = KeybindingEntry {
-        group: "Editing".into(),
-        desc: "Delete word back".into(),
-        mode: "Any".into(),
-        keys: "Ctrl-w".into(),
-    };
-    assert_eq!(e.haystack(), "Delete word back Ctrl-w");
-    // Insert/Search-only bindings spell their mode out.
-    e.mode = "Insert".into();
-    assert_eq!(e.haystack(), "Delete word back (Insert) Ctrl-w");
-    e.mode = "Search".into();
-    assert_eq!(e.haystack(), "Delete word back (Search) Ctrl-w");
-}
-
-#[test]
 fn picker_view_params_keybindings_serialized_and_skipped_when_none() {
     use aether_protocol::picker::{KeybindingEntry, PickerKind, PickerReset, PickerViewParams};
     let p = PickerViewParams {
@@ -5614,7 +5594,7 @@ fn picker_filters_default_is_empty_object_and_absent_field_deserializes() {
 
 #[test]
 fn picker_filters_wire_shape() {
-    use aether_protocol::picker::{CaseMode, PickerFilters, ScopedPath};
+    use aether_protocol::picker::{CaseMode, KeyFilter, KeyFilterRow, PickerFilters, ScopedPath};
     let f = PickerFilters {
         case: CaseMode::Insensitive,
         whole_word: true,
@@ -5643,6 +5623,13 @@ fn picker_filters_wire_shape() {
                 is_file: true,
             },
         ],
+        key: Some(KeyFilter {
+            label: "Space g".into(),
+            rows: vec![KeyFilterRow {
+                mode: "Application".into(),
+                keys: "Space g s".into(),
+            }],
+        }),
     };
     let v = to_value(&f).unwrap();
     assert_eq!(
@@ -5664,10 +5651,32 @@ fn picker_filters_wire_shape() {
                 {"path_index": 0, "relative_path": ""},
                 {"path_index": 1, "relative_path": "src/main.rs", "is_file": true},
             ],
+            "key": {
+                "label": "Space g",
+                "rows": [{"mode": "Application", "keys": "Space g s"}],
+            },
         })
     );
     let back: PickerFilters = from_value(v).unwrap();
     assert_eq!(back, f);
+}
+
+#[test]
+fn picker_filters_key_chip_that_matches_nothing_keeps_its_empty_list() {
+    // An unbound key is a chip that shows no rows, not "no chip": the empty list must survive the
+    // wire rather than collapse into an absent field.
+    use aether_protocol::picker::{KeyFilter, PickerFilters};
+    let f = PickerFilters {
+        key: Some(KeyFilter {
+            label: "Ctrl-q".into(),
+            rows: vec![],
+        }),
+        ..PickerFilters::default()
+    };
+    let v = to_value(&f).unwrap();
+    assert_eq!(v, json!({"key": {"label": "Ctrl-q", "rows": []}}));
+    assert!(!f.is_default());
+    assert_eq!(from_value::<PickerFilters>(v).unwrap(), f);
 }
 
 #[test]

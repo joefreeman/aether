@@ -2248,13 +2248,7 @@ pub async fn picker_view(
         // carries them; a scroll/resume re-view sends none and `preserve_existing` keeps the
         // previously-shipped set.
         PickerKind::Keybindings => picker_state::PickerCandidates::Keybindings(
-            params
-                .keybindings
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            params.keybindings.clone().unwrap_or_default(),
         ),
         // Rebuilt from the live captured list on every view — a cheap in-memory clone, and the
         // backing list persists regardless of the picker, so there's nothing to resume. Opens

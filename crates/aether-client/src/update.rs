@@ -10,7 +10,9 @@ use super::effect::{
 use super::hints::{
     ContextId as HintCtx, HintFacts, HintView, PickerCmd, WireEvent as HintWireEvent,
 };
-use super::keymap::{lookup, Action, InsertWhere, KeyCode, KeyContext, Mods};
+use super::keymap::{
+    lookup, Action, CaptureStep, InsertWhere, KeyCapture, KeyCode, KeyContext, Mods,
+};
 use super::path_editor::{PathBase, PathEditor};
 
 /// What the two absolute-path fields open seeded with, so their completions are on screen before
@@ -5494,7 +5496,8 @@ impl Session {
             | PickerKind::GitChanges
             | PickerKind::GitChangesFile
             | PickerKind::Jumplist
-            | PickerKind::WorkspaceSymbols => self.picker_query_changed(),
+            | PickerKind::WorkspaceSymbols
+            | PickerKind::Keybindings => self.picker_query_changed(),
             PickerKind::Explorer => {
                 let filters = {
                     let Some(p) = &mut self.picker else {
@@ -5593,7 +5596,50 @@ impl Session {
         match id {
             ChipId::Glob(i) => self.open_glob_prompt(Some(i)),
             ChipId::Dir(i) => self.open_dir_prompt(Some(i)),
+            ChipId::Key => self.start_key_capture(),
             _ => self.toggle_picker_filter(id),
+        }
+    }
+
+    /// `Alt-b` in the Keybindings picker (or Enter on its key chip): the next key pressed — or
+    /// `Space`-led chord — becomes the key chip, in place of any before it.
+    fn start_key_capture(&mut self) -> Effects {
+        let workspace_paths = self.workspace_paths.clone();
+        let Some(p) = &mut self.picker else {
+            return Effects::none();
+        };
+        if !p.filter_available(ChipId::Key) {
+            return Effects::none();
+        }
+        p.key_capture = Some(KeyCapture::Start);
+        // Selected, so every shell parks focus off the query and forwards the keys its input
+        // would otherwise keep.
+        p.chip_selected = p
+            .chip_row(&workspace_paths)
+            .iter()
+            .position(|c| c.id == ChipId::Key);
+        self.observe_picker_cmd(PickerCmd::FindByKey)
+    }
+
+    /// A key pressed while the key chip is capturing.
+    fn on_key_capture_key(&mut self, code: KeyCode, mods: Mods) -> Effects {
+        let Some(p) = &mut self.picker else {
+            return Effects::none();
+        };
+        let Some(capture) = p.key_capture else {
+            return Effects::none();
+        };
+        match capture.press(code, mods) {
+            CaptureStep::Continue(next) => {
+                p.key_capture = Some(next);
+                Effects::none()
+            }
+            CaptureStep::Done(key) => {
+                p.key_capture = None;
+                p.chip_selected = None;
+                chips::set_key_chip(&mut p.chips, key);
+                self.apply_picker_filter_change()
+            }
         }
     }
 
@@ -6314,6 +6360,14 @@ impl Session {
 
     /// Keys while a picker is open: list navigation + query editing.
     pub fn on_picker_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
+        // A key chip being captured takes every key, Esc included — that is the point of it.
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.key_capture.is_some())
+        {
+            return self.on_key_capture_key(code, mods);
+        }
         // The chip editor line (glob/dir, revealed below the input) owns the keys while open.
         if self
             .picker
@@ -6790,6 +6844,9 @@ impl Session {
             }
             KeyCode::Char('g') if mods.alt && !mods.ctrl => {
                 return self.open_glob_prompt(None);
+            }
+            KeyCode::Char('b') if mods.alt && !mods.ctrl => {
+                return self.start_key_capture();
             }
             KeyCode::Char('p') if mods.alt && !mods.ctrl => {
                 // Only the kinds that actually have path scopes count as a demonstration —

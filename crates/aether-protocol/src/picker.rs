@@ -1011,10 +1011,9 @@ pub enum PickerItem {
     /// One keyboard shortcut in the Keybindings picker — the [`KeybindingEntry`] the client
     /// shipped on open, echoed back with match highlighting. Identity is `(mode, keys, desc)`
     /// (a chord can be bound in several modes, and an Alt-pair fold can reuse a description).
-    /// The matcher haystack is [`KeybindingEntry::haystack`] — the row segments composed in
-    /// display order — and `match_indices` are char offsets into *that* string; the client
-    /// rebuilds the same composition to map them back onto the segments it renders. Not a jump
-    /// target: informational only, no `PickerSelectResult` variant.
+    /// The matcher haystack is `desc` alone — a chord is looked up by pressing it (the key chip,
+    /// [`PickerFilters::key`]), and the mode and group are labels. Not a jump target:
+    /// informational only, no `PickerSelectResult` variant.
     Keybinding {
         /// The row's group — rendered as the section header above the group's run, not on the
         /// row itself (and so not part of the match haystack).
@@ -1026,7 +1025,7 @@ pub enum PickerItem {
         mode: String,
         /// Display chord, e.g. `Ctrl-w`, `Space f ␣`.
         keys: String,
-        /// Char offsets into [`KeybindingEntry::haystack`] covered by fuzzy matches.
+        /// Char offsets into `desc` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
     },
@@ -1166,28 +1165,13 @@ pub struct KeybindingEntry {
 }
 
 impl KeybindingEntry {
-    /// Whether `mode` is part of the rendered row (and therefore the haystack). Only Insert and
+    /// Whether `mode` is part of the rendered row. Only Insert and
     /// Search qualify — Normal, the shared `Any` keys, and the Space-leader Application chords
     /// read as the default, so spelling their mode out on every row would be noise. The mode
     /// still always rides the wire: it's the row's identity half and what a future
     /// palette-execution layer would gate on.
     pub fn shows_mode(mode: &str) -> bool {
         matches!(mode, "Insert" | "Search")
-    }
-
-    /// The canonical string the server matches against and `match_indices` index into (char
-    /// offsets): the row's segments in display order — `{desc} ({mode}) {keys}` when
-    /// [`Self::shows_mode`], else `{desc} {keys}`. The group is *not* part of the haystack: rows
-    /// render under a per-group section header (the grep-style grouping), not with an inline
-    /// group label, so a group match would highlight nothing visible. Defined here — in the
-    /// shared protocol crate — so the server's haystack and the client's index-to-segment
-    /// mapping can never drift.
-    pub fn haystack(&self) -> String {
-        if Self::shows_mode(&self.mode) {
-            format!("{} ({}) {}", self.desc, self.mode, self.keys)
-        } else {
-            format!("{} {}", self.desc, self.keys)
-        }
     }
 }
 
@@ -1276,8 +1260,8 @@ pub struct ScopedPath {
 /// `globs`/`directories` (against each captured entry's file identity — and only when the capture
 /// spans in-root files at all, see `PickerViewResult::path_filterable`); WorkspaceSymbols reads
 /// `globs`/`directories` (against each symbol's file — `directories` additionally prunes which
-/// projects' servers the query fans out to). Inapplicable fields are ignored, not errors — clients
-/// only offer the chips that apply.
+/// projects' servers the query fans out to); Keybindings reads `key`. Inapplicable fields are
+/// ignored, not errors — clients only offer the chips that apply.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PickerFilters {
     /// Grep: how the search pattern treats case.
@@ -1334,6 +1318,40 @@ pub struct PickerFilters {
     /// [`ScopedPath::is_file`] scope passes only that exact file. Repeatable, like `globs`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub directories: Vec<ScopedPath>,
+    /// Keybindings: keep only the rows a pressed key would fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<KeyFilter>,
+}
+
+/// The Keybindings picker's key chip: a chord the user *pressed*, resolved by the client — which
+/// owns the keymap and its dispatch order — into the rows that press would fire. The server never
+/// interprets a key: it keeps the rows named in `rows`, so an empty list is a key nothing is bound
+/// to, and shows no rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyFilter {
+    /// The chord as pressed (`Alt-u`, `Space g`), for the chip. Carried so a resumed picker can
+    /// re-render the chip without re-deriving it from `rows`.
+    pub label: String,
+    /// The rows the chord fires, by their `(mode, keys)` identity. The mode is part of it because
+    /// one key can fire in one mode and not another: Global shadows Normal, and a Shift-held press
+    /// fires a Shift-tolerant binding but not an exact one with the same label.
+    pub rows: Vec<KeyFilterRow>,
+}
+
+/// One row a [`KeyFilter`] keeps: [`KeybindingEntry::mode`] and [`KeybindingEntry::keys`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyFilterRow {
+    pub mode: String,
+    pub keys: String,
+}
+
+impl KeyFilter {
+    /// Whether the chip keeps this row.
+    pub fn keeps(&self, entry: &KeybindingEntry) -> bool {
+        self.rows
+            .iter()
+            .any(|r| r.mode == entry.mode && r.keys == entry.keys)
+    }
 }
 
 impl PickerFilters {

@@ -1348,8 +1348,7 @@ export type PickerItem =
       mode: string;
       /** The chord itself (e.g. "Ctrl-w"). */
       keys: string;
-      /** Code-point offsets into the composed haystack `"{group} > {desc} ({mode}) {keys}"` —
-       *  rebased per segment by the shell (mirrors aether-client `keybinding_match_segments`). */
+      /** Code-point offsets into `desc` — the only field matched. */
       match_indices?: number[];
     }
   | {

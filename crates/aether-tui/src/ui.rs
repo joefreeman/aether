@@ -2468,7 +2468,7 @@ fn search_prompt_lead(search: &SearchState) -> (Vec<Span<'static>>, u16) {
 }
 
 fn picker_chip_spans(state: &AppState, max_w: usize) -> (Vec<Span<'static>>, usize) {
-    let chips = state.picker.chips(&state.workspace_paths);
+    let chips = &state.picker.chips;
     if chips.is_empty() {
         return (Vec::new(), 0);
     }
@@ -2479,7 +2479,7 @@ fn picker_chip_spans(state: &AppState, max_w: usize) -> (Vec<Span<'static>>, usi
     let labels: Vec<String> = chips
         .iter()
         .map(|c| match c.id {
-            crate::picker::ChipId::Dir(_) => truncate_path_with_indices(&c.label, &[], 24).0,
+            aether_client::chips::ChipId::Dir(_) => truncate_path_with_indices(&c.label, &[], 24).0,
             _ => truncate_middle(&c.label, 24),
         })
         .collect();
@@ -2519,7 +2519,7 @@ fn picker_chip_spans(state: &AppState, max_w: usize) -> (Vec<Span<'static>>, usi
         };
         // Only the whole-word chip underlines: "wd" alone reads as a stray token; the other
         // abbreviations (Aa, +ig, Δ, …) carry enough shape on their own.
-        if chips[i].id == crate::picker::ChipId::Word {
+        if chips[i].id == aether_client::chips::ChipId::Word {
             style = style.add_modifier(Modifier::UNDERLINED);
         }
         total += label.width() + 1;
@@ -4272,9 +4272,8 @@ struct KeybindingRow<'a> {
 /// One Keybindings picker row: the description on the left (the group is the section header
 /// above the run, not row text), a dim `(mode)` for Insert/Search rows (default modes are
 /// elided, matching the haystack), and the key chord right-aligned at the row's edge in frost
-/// blue (matching the native client). `match_indices` are char offsets into the composed
-/// haystack (`{desc} [({mode}) ]{keys}`); `keybinding_match_segments` rebases them onto each
-/// rendered segment, so highlights land on segment text and never on the separators.
+/// blue (matching the native client). Only the description is matched, so `match_indices` are
+/// char offsets into `desc`.
 fn keybinding_item_spans(
     row: KeybindingRow<'_>,
     match_indices: &[u32],
@@ -4289,15 +4288,14 @@ fn keybinding_item_spans(
         .add_modifier(Modifier::BOLD);
     let dim = base.fg(picker_dim_fg(highlighted));
 
-    let seg = aether_client::picker::keybinding_match_segments(desc, mode, keys, match_indices);
     let shows_mode = aether_protocol::picker::KeybindingEntry::shows_mode(mode);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    push_styled_with_match_indices(&mut spans, desc, &seg.desc, base, match_style);
+    push_styled_with_match_indices(&mut spans, desc, match_indices, base, match_style);
     let mut used = desc.width() + keys.width();
     if shows_mode {
         spans.push(Span::styled(" (".to_string(), dim));
-        push_styled_with_match_indices(&mut spans, mode, &seg.mode, dim, match_style);
+        spans.push(Span::styled(mode.to_string(), dim));
         spans.push(Span::styled(")".to_string(), dim));
         used += 3 + mode.width();
     }
@@ -4307,13 +4305,7 @@ fn keybinding_item_spans(
         " ".repeat(max_width.saturating_sub(used)),
         base,
     ));
-    push_styled_with_match_indices(
-        &mut spans,
-        keys,
-        &seg.keys,
-        base.fg(c(th().accent)),
-        match_style,
-    );
+    spans.push(Span::styled(keys.to_string(), base.fg(c(th().accent))));
     spans
 }
 
@@ -10240,15 +10232,14 @@ mod tests {
     #[test]
     fn keybinding_row_reads_left_to_right_with_right_aligned_chord() {
         // A default mode (Normal) is elided, and the group renders as the section header, not
-        // row text. Index 17 in the composed haystack `Delete word Ctrl-w` is the `w` of the
-        // chord — the highlight must land on that char after the per-segment rebase.
+        // row text. Only the description is matched: index 7 is its `w`.
         let spans = keybinding_item_spans(
             KeybindingRow {
                 desc: "Delete word",
                 mode: "Normal",
                 keys: "Ctrl-w",
             },
-            &[17],
+            &[7],
             false,
             50,
         );
@@ -10264,10 +10255,10 @@ mod tests {
             .filter(|s| s.style.fg == Some(c(th().match_highlight)))
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(hl, "w", "keys-segment match styles the right char");
+        assert_eq!(hl, "w", "the description's match styles the right char");
         let desc = spans.first().expect("desc span");
         assert_eq!(desc.style.fg, Some(c(th().fg)));
-        // The chord's unmatched chars are frost blue, matching the native client.
+        // The chord is frost blue, matching the native client.
         let chord = spans
             .iter()
             .find(|s| s.content.contains("Ctrl-"))
@@ -10277,15 +10268,15 @@ mod tests {
 
     #[test]
     fn keybinding_row_spells_out_insert_and_search_modes() {
-        // Insert/Search rows keep their dim mode tag; haystack
-        // `Delete word (Insert) Ctrl-w` puts the chord's `w` at 26.
+        // Insert/Search rows keep their dim mode tag, and the description's highlight is
+        // unaffected by it.
         let spans = keybinding_item_spans(
             KeybindingRow {
                 desc: "Delete word",
                 mode: "Insert",
                 keys: "Ctrl-w",
             },
-            &[26],
+            &[7],
             false,
             50,
         );
@@ -10300,7 +10291,7 @@ mod tests {
             .filter(|s| s.style.fg == Some(c(th().match_highlight)))
             .map(|s| s.content.as_ref())
             .collect();
-        assert_eq!(hl, "w", "keys-segment match survives the mode prefix");
+        assert_eq!(hl, "w", "only the description highlights");
         let mode = spans
             .iter()
             .find(|s| s.content.contains("Insert"))
