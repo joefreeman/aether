@@ -477,6 +477,44 @@ async fn output_arrives_in_more_than_one_push() {
     );
 }
 
+/// A run's box appears when the run starts, not with its first output: a command that prints
+/// nothing for a while — `sleep`, a quiet build step — is on screen as soon as it is running.
+#[tokio::test]
+async fn a_run_appears_before_it_prints_anything() {
+    let (server, mut ws, _dir) = setup().await;
+    let shell = open_shell(&mut ws).await;
+    let (viewport_id, _) = shell_window(&mut ws, &shell).await;
+    let input = input_buffer_of(&server, &shell).await;
+    type_command(&mut ws, &shell, input, "sleep 30").await;
+    ws.clear_seen();
+    let _: ShellRunResult = send_request::<ShellRun>(
+        &mut ws,
+        &ShellRunParams {
+            view_id: shell.opened.view_id,
+        },
+    )
+    .await;
+    // The start's own push; the content push goes out ahead of it on the one ordered stream.
+    let started = expect_notification::<ShellRunChanged>(&mut ws).await;
+    assert!(started.run.is_some_and(|r| r.is_running()));
+    // Clearing the input pushes a window too, but from before the run existed — so look for one
+    // that shows the run's command.
+    let shown = ws
+        .saw::<ViewportLinesChanged>()
+        .into_iter()
+        .filter(|p| p.viewport_id == viewport_id)
+        .any(|p| headers(&p.window).iter().any(|h| h.trim() == "sleep 30"));
+    assert!(shown, "the new run's box was never pushed");
+
+    let _: ShellCancelResult = send_request::<ShellCancel>(
+        &mut ws,
+        &ShellCancelParams {
+            view_id: shell.opened.view_id,
+        },
+    )
+    .await;
+}
+
 /// A progress bar rewrites its line rather than spamming one per frame — the reason `cargo build`
 /// is readable in a transcript at all.
 #[tokio::test]

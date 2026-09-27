@@ -699,6 +699,10 @@ async fn spawn_run(
         // than guess at how long a command takes. Held for the run's whole life by the task below.
         (run, start_char, state_now, s.deferred.start())
     };
+    // The run's box is new content — a new element, its command row — so it rides the content push
+    // now, as an instant run's does. Left to the output flush, a command that prints nothing
+    // (`sleep`, a quiet build step) would not appear until it had finished.
+    push_transcript_changed(state, transcript).await;
     push_run_changed(state, view_id, state_now).await;
 
     tokio::spawn(run_task(
