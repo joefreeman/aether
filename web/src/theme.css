@@ -1075,11 +1075,12 @@ html, body, #app {
    syntax color reads fine on NORD3. Patch chrome is the same dim shade and needs the same lift. */
 .search-hit.hl-comment, .search-hit.hl-diff-meta { color: var(--fg); }
 .sel { background: var(--bg-visual); }
-/* Selected-whitespace indicators (terminal parity): a muted NORD3 glyph over the selection blue —
-   `·` for trailing spaces and `↵` for the consumed newline (width-neutral text), and `→` overlaid
-   on a tab, which keeps its literal `\t` so `tab-size` preserves its width. The `.sel`-compound
-   selectors outrank the `.hl-*` syntax colours, so the glyph is NORD3 even inside a highlight. */
-.sel.ws-dot, .sel.ws-nl { color: var(--fg-faint); }
+/* Whitespace indicators (terminal parity): a muted NORD3 glyph, over the selection blue when
+   selected — `·` for trailing spaces and `↵` for the consumed newline (width-neutral text), and `→`
+   overlaid on a tab, which keeps its literal `\t` so `tab-size` preserves its width. The
+   two-class selectors outrank the `.hl-*` syntax colours, so the glyph is NORD3 even inside a
+   highlight. */
+.row-text .ws-dot, .sel.ws-nl { color: var(--fg-faint); }
 .ws-tab { position: relative; }
 .ws-tab::before { content: "→"; position: absolute; left: 0; color: var(--fg-faint); pointer-events: none; }
 /* Under the block cursor the cell inverts (NORD4 fill); flip the `→` to NORD0 so it stays legible,

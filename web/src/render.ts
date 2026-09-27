@@ -188,8 +188,8 @@ function makeSpan(text: string, style: CellStyle, cursorClass: string): Node {
   return span;
 }
 
-/** A whitespace-indicator span (selected tab/trailing-space/newline). Reuses `makeSpan`'s styling
- *  (it carries the `sel` blue background) and tags it `ws-{kind}` so CSS paints the muted glyph. */
+/** A whitespace-indicator span (tab/trailing-space/newline). Reuses `makeSpan`'s styling (the `sel`
+ *  blue background when selected) and tags it `ws-{kind}` so CSS paints the muted glyph. */
 function wsSpan(text: string, style: CellStyle, kind: "tab" | "dot" | "nl", cursorClass: string): HTMLElement {
   const node = makeSpan(text, style, cursorClass);
   let span: HTMLElement;
@@ -368,9 +368,6 @@ function renderVisualRow(
 
   // Selection: inclusive line-local range mapped to this row.
   let selTrailing = false;
-  // Selected whitespace gets a muted indicator glyph (terminal parity): `→` for tabs, `·` for
-  // trailing spaces. Per code-point: "tab" | "dot" | null.
-  const wsGlyph: (null | "tab" | "dot")[] = new Array(n).fill(null);
   if (sel) {
     const localStart = sel.start - row.byte_offset;
     const localEnd = sel.end - row.byte_offset; // inclusive
@@ -380,18 +377,20 @@ function renderVisualRow(
       }
     }
     selTrailing = isLastRow && (sel.toEnd || localEnd >= byteLen);
-    // The row's trailing-whitespace run (code-point index it starts at) — only spaces from here
-    // on are glyphed; tabs are glyphed wherever they're selected.
-    let trailingWsStart = n;
-    for (let k = n - 1; k >= 0; k--) {
-      if (cps[k] === " " || cps[k] === "\t") trailingWsStart = k;
-      else break;
-    }
-    for (let i = 0; i < n; i++) {
-      if (!selected[i]) continue;
-      if (cps[i] === "\t") wsGlyph[i] = "tab";
-      else if (cps[i] === " " && i >= trailingWsStart) wsGlyph[i] = "dot";
-    }
+  }
+  // Whitespace indicator glyphs (terminal parity): `→` for tabs, `·` for trailing spaces. Selected,
+  // every tab and the spaces of the row's trailing run are glyphed; unselected, the line's own
+  // trailing whitespace (that run on its last row). Per code-point: "tab" | "dot" | null.
+  const wsGlyph: (null | "tab" | "dot")[] = new Array(n).fill(null);
+  let trailingWsStart = n;
+  for (let k = n - 1; k >= 0; k--) {
+    if (cps[k] === " " || cps[k] === "\t") trailingWsStart = k;
+    else break;
+  }
+  for (let i = 0; i < n; i++) {
+    const trailing = i >= trailingWsStart;
+    if (cps[i] === "\t" && (selected[i] || (trailing && isLastRow))) wsGlyph[i] = "tab";
+    else if (cps[i] === " " && trailing && (selected[i] || isLastRow)) wsGlyph[i] = "dot";
   }
 
   // Cursor: a single code point, when it falls inside this row's byte span.
@@ -449,7 +448,7 @@ function renderVisualRow(
     let j = i + 1;
     while (j < n && wsGlyph[j] === g && g !== "tab" && sameStyle(style, cellAt(j))) j++;
     if (g === "dot") {
-      // Trailing spaces → `·`, width-neutral, in NORD3 over the selection blue.
+      // Trailing spaces → `·`, width-neutral, in NORD3 (over the selection blue when selected).
       sink(wsSpan("·".repeat(j - i), style, "dot", cursorClass), style.emph);
     } else {
       sink(makeSpan(cps.slice(i, j).join(""), style, cursorClass), style.emph);

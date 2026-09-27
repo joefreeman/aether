@@ -882,6 +882,29 @@ describe("the buffer painter", () => {
     const w = windowOf(editor(0, 0, [line(0, "one"), line(1, "two")]));
     expect(painted(w)).toEqual(["text one", "text two"]);
   });
+
+  it("marks a line's trailing whitespace with no selection on it", () => {
+    const wrapped: LogicalLineRender = {
+      logical_line: 3,
+      visual_rows: [
+        { byte_offset: 0, continuation_indent: 0, segments: [{ text: "wrap ", highlights: [] }] },
+        { byte_offset: 5, continuation_indent: 0, segments: [{ text: "end", highlights: [] }] },
+      ],
+    };
+    const w = windowOf(
+      editor(0, 0, [line(0, "a"), line(1, "x y  "), line(2, "\tc\t "), wrapped]),
+    );
+    const container = renderOnly(w);
+    const glyphs = [...container.querySelectorAll(".row")].map((row) =>
+      [...row.querySelectorAll(".ws-dot, .ws-tab")]
+        .map((s) => (s.classList.contains("ws-tab") ? "→" : s.textContent))
+        .join(""),
+    );
+    // Inner whitespace stays plain, and so does the space a soft wrap broke at — only the line's
+    // own trailing run is marked.
+    expect(glyphs).toEqual(["", "··", "→·", "", ""]);
+    expect(container.querySelector(".ws-dot")?.classList.contains("sel")).toBe(false);
+  });
 });
 
 const replyBlocks = (heading: string, body: string): MdBlock[] =>

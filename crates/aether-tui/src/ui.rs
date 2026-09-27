@@ -6022,6 +6022,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             &clipped_diags,
             &clipped_sneak,
             body_width,
+            is_last_vrow_of_line,
         ));
         // The EOL cell after the last char: the newline glyph when selected, and/or a
         // diagnostic underline when one is clamped to the line end (it has no real char to
@@ -6314,6 +6315,7 @@ fn children_spans(
                     &[],
                     &[],
                     width,
+                    false,
                 );
                 // The band has to reach behind the text too, not just the padding around it.
                 for span in text_spans.iter_mut() {
@@ -7004,6 +7006,7 @@ fn build_spans(
     diagnostics: &[(u32, u32, DiagnosticSeverity)],
     sneak: &[(u32, u32, u32, Option<char>)],
     max_chars: u16,
+    line_end: bool,
 ) -> Vec<Span<'static>> {
     let truncated: String = text.chars().take(max_chars as usize).collect();
     let trunc_len = truncated.len();
@@ -7159,6 +7162,9 @@ fn build_spans(
         }
         i
     };
+    // Whether that run is the *line's* trailing whitespace — the row ends its line and nothing was
+    // cut off the right edge — which is glyphed selected or not.
+    let show_trailing = line_end && truncated.len() == text.len();
 
     // Walk char-by-char so we can substitute tabs with the right number of spaces — ratatui
     // would render a raw `\t` as a single zero-width control glyph and the rest of the line
@@ -7166,7 +7172,8 @@ fn build_spans(
     // highlight/selection byte ranges still apply to the *original* byte positions so they
     // keep working untouched. Selected whitespace (tabs, trailing spaces) gets a muted
     // indicator glyph (the faint shade) overlaid on the selection bg — `→` for tabs, `·` for trailing
-    // spaces — so the user can see the structure of what they've selected.
+    // spaces — so the user can see the structure of what they've selected. A line's trailing
+    // whitespace gets the same glyphs unselected too, so it never hides.
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut current_text = String::new();
     let mut current_style: Option<Style> = None;
@@ -7192,6 +7199,8 @@ fn build_spans(
         }
         let style = style_at(byte_idx);
         let in_sel = sel.is_some_and(|(s, e)| byte_idx >= s as usize && byte_idx < e as usize);
+        let trailing = byte_idx >= trailing_ws_start;
+        let glyphed = in_sel || (show_trailing && trailing);
         let pad = if c == '\t' {
             TAB_WIDTH - (display_col % TAB_WIDTH)
         } else {
@@ -7199,7 +7208,7 @@ fn build_spans(
         };
         display_col += char_display_width(c, display_col);
         if c == '\t' {
-            if in_sel {
+            if glyphed {
                 push_text(
                     &mut spans,
                     &mut current_text,
@@ -7227,7 +7236,7 @@ fn build_spans(
                     style,
                 );
             }
-        } else if c == ' ' && in_sel && byte_idx >= trailing_ws_start {
+        } else if c == ' ' && glyphed && trailing {
             push_text(
                 &mut spans,
                 &mut current_text,
@@ -10852,6 +10861,7 @@ mod tests {
             &[],
             &[],
             80,
+            false,
         ));
         assert_eq!(cells[0].2, Some(emph_bg), "plain emphasis cell");
         assert_eq!(
@@ -10919,6 +10929,35 @@ mod tests {
     }
 
     #[test]
+    fn build_spans_marks_a_lines_trailing_whitespace_unselected() {
+        let text =
+            |spans: &[Span<'static>]| cells_of(spans).iter().map(|c| c.0).collect::<String>();
+        let spans = |s: &str, max: u16, line_end: bool| {
+            build_spans(
+                s,
+                &[],
+                None,
+                &[],
+                &[],
+                Color::Reset,
+                &[],
+                &[],
+                &[],
+                max,
+                line_end,
+            )
+        };
+        // Inner whitespace stays plain; the trailing run is marked, tabs and spaces alike.
+        let cells = cells_of(&spans("x y\t ", 80, true));
+        assert_eq!(cells.iter().map(|c| c.0).collect::<String>(), "x y→·");
+        assert_eq!(cells[4].1, Some(c(th().fg_faint)), "muted glyph");
+        // A row a soft wrap broke at a space doesn't end its line, and a row cut off at the right
+        // edge doesn't show its end: neither run is the line's trailing whitespace.
+        assert_eq!(text(&spans("wrap ", 80, false)), "wrap ");
+        assert_eq!(text(&spans("ab  cd", 4, true)), "ab  ");
+    }
+
+    #[test]
     fn build_spans_paints_sneak_label_and_bands_the_prefix() {
         // "function", whole word [0,8), query "fu" → prefix [0,2), label 'j'.
         let sneak = [(0u32, 8u32, 2u32, Some('j'))];
@@ -10933,6 +10972,7 @@ mod tests {
             &[],
             &sneak,
             80,
+            false,
         ));
         // Col 0: the label glyph, dark-on-yellow.
         assert_eq!(cells[0].0, 'j', "label glyph painted over the first cell");
@@ -10964,6 +11004,7 @@ mod tests {
             &diags,
             &[],
             80,
+            false,
         ));
         for (col, (underlined, color)) in cells.into_iter().enumerate() {
             if col == 2 || col == 3 {
@@ -10993,6 +11034,7 @@ mod tests {
             &diags,
             &[],
             80,
+            false,
         ));
         assert_eq!(cells[1].1, Some(c(th().error)), "overlap shows error red");
         assert_eq!(

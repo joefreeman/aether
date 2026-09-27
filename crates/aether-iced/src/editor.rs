@@ -1416,7 +1416,9 @@ where
                 );
             };
             // Byte offset where the row's trailing whitespace run begins (row end if none) —
-            // only spaces from here on get the `·` glyph, matching the terminal client.
+            // only spaces from here on get the `·` glyph, matching the terminal client. On the
+            // line's last row the run is the line's own trailing whitespace, glyphed unselected
+            // too.
             let trailing_ws_start = {
                 let mut start = grid::row_end_byte(row);
                 for c in cells.iter().rev() {
@@ -1428,19 +1430,14 @@ where
                 }
                 start
             };
+            let line_end = row_idx + 1 == n_rows;
             for c in &cells {
                 // Selected whitespace gets a muted indicator glyph over the selection
                 // fill (terminal parity): `→` for tabs, `·` for trailing spaces. Drawn as its
                 // own run so the next text run repositions itself past the tab's full width.
                 let selected =
                     draw_sel && pos_in_selection(line.logical_line, c.byte, sel_min, sel_max);
-                let glyph = if selected && c.ch == '\t' {
-                    Some("→")
-                } else if selected && c.ch == ' ' && c.byte >= trailing_ws_start {
-                    Some("·")
-                } else {
-                    None
-                };
+                let glyph = ws_glyph(c.ch, selected, c.byte >= trailing_ws_start, line_end);
                 if let Some(g) = glyph {
                     flush(&mut run, run_start, run_kind, run_hit, renderer);
                     draw_run(
@@ -1616,23 +1613,15 @@ where
                         },
                         p.fg,
                     );
-                    // Re-draw the char — or, on selected whitespace, its `→`/`·`/`↵` glyph — under
+                    // Re-draw the char — or, on glyphed whitespace, its `→`/`·`/`↵` glyph — under
                     // the block in the background colour, so the cursor doesn't blank the indicator.
-                    let ws = draw_selection
-                        .then(|| {
-                            cursor_ws_glyph(
-                                window,
-                                grid::ElementLine::new(
-                                    self.content.focused_element,
-                                    cursor_pos.line,
-                                ),
-                                cursor_pos,
-                                sel_min,
-                                sel_max,
-                                self.content.tab_width,
-                            )
-                        })
-                        .flatten();
+                    let ws = cursor_ws_glyph(
+                        window,
+                        grid::ElementLine::new(self.content.focused_element, cursor_pos.line),
+                        cursor_pos,
+                        draw_selection.then_some((sel_min, sel_max)),
+                        self.content.tab_width,
+                    );
                     if let Some(g) = ws {
                         draw_run(
                             renderer,
@@ -2139,21 +2128,29 @@ fn pos_in_selection(line: u32, byte: u32, min: LogicalPosition, max: LogicalPosi
     after_min && before_max
 }
 
-/// The whitespace glyph to redraw (inverted) under the block cursor when it sits on selected
+/// The indicator glyph a whitespace char draws as, `→` for a tab and `·` for a space. Selected:
+/// every tab, and the spaces of the row's trailing run (`trailing`). Unselected: the line's own
+/// trailing whitespace — that run on the line's last row (`line_end`).
+fn ws_glyph(ch: char, selected: bool, trailing: bool, line_end: bool) -> Option<&'static str> {
+    match ch {
+        '\t' if selected || (trailing && line_end) => Some("→"),
+        ' ' if trailing && (selected || line_end) => Some("·"),
+        _ => None,
+    }
+}
+
+/// The whitespace glyph to redraw (inverted) under the block cursor when it sits on glyphed
 /// whitespace — the cursor is painted last, over the text, so without this it would blank the
-/// `→`/`·`/`↵` the text pass drew. Mirrors the per-row glyph rules. `None` when the cursor cell
-/// isn't selected whitespace.
+/// `→`/`·`/`↵` the text pass drew. Mirrors the per-row glyph rules; `sel` is the selection when
+/// one is drawn. `None` when the cursor cell draws no glyph.
 fn cursor_ws_glyph(
     window: &Window,
     at: grid::ElementLine,
     pos: LogicalPosition,
-    min: LogicalPosition,
-    max: LogicalPosition,
+    sel: Option<(LogicalPosition, LogicalPosition)>,
     tab_width: u32,
 ) -> Option<&'static str> {
-    if !pos_in_selection(pos.line, pos.col, min, max) {
-        return None;
-    }
+    let selected = sel.is_some_and(|(min, max)| pos_in_selection(pos.line, pos.col, min, max));
     let (_, line) = grid::window_lines(window)
         .into_iter()
         .find(|(there, _)| *there == at)?;
@@ -2162,11 +2159,11 @@ fn cursor_ws_glyph(
         .iter()
         .rposition(|r| r.byte_offset <= pos.col)?;
     let row = &line.visual_rows[row_idx];
+    let last_row = row_idx + 1 == line.visual_rows.len();
     let cells = grid::row_cells(row, tab_width);
     match cells.iter().find(|c| c.byte == pos.col) {
-        Some(c) if c.ch == '\t' => Some("→"),
-        Some(c) if c.ch == ' ' => {
-            // Only a space in the row's trailing-whitespace run gets the dot.
+        Some(c) => {
+            // The row's trailing-whitespace run.
             let mut start = grid::row_end_byte(row);
             for cc in cells.iter().rev() {
                 if cc.ch == ' ' || cc.ch == '\t' {
@@ -2175,11 +2172,10 @@ fn cursor_ws_glyph(
                     break;
                 }
             }
-            (c.byte >= start).then_some("·")
+            ws_glyph(c.ch, selected, c.byte >= start, last_row)
         }
-        Some(_) => None,
         // Past the row's last char: the consumed-newline cell, on the line's last row.
-        None => (row_idx + 1 == line.visual_rows.len()).then_some("↵"),
+        None => (selected && last_row).then_some("↵"),
     }
 }
 
@@ -2277,6 +2273,24 @@ mod tests {
         assert!(pos_in_selection(2, 7, p, p));
         assert!(!pos_in_selection(2, 6, p, p));
         assert!(!pos_in_selection(2, 8, p, p));
+    }
+
+    /// A line's own trailing whitespace is glyphed unselected; the rest only when selected, and a
+    /// space only ever in a trailing run.
+    #[test]
+    fn trailing_whitespace_is_glyphed_without_a_selection() {
+        // (selected, trailing, line_end)
+        assert_eq!(ws_glyph(' ', false, true, true), Some("·"));
+        assert_eq!(ws_glyph('\t', false, true, true), Some("→"));
+        // A run a soft wrap broke at isn't the line's.
+        assert_eq!(ws_glyph(' ', false, true, false), None);
+        assert_eq!(ws_glyph('\t', false, true, false), None);
+        assert_eq!(ws_glyph(' ', true, true, false), Some("·"));
+        // Inner whitespace: a selected tab, never a space.
+        assert_eq!(ws_glyph('\t', false, false, true), None);
+        assert_eq!(ws_glyph('\t', true, false, false), Some("→"));
+        assert_eq!(ws_glyph(' ', true, false, true), None);
+        assert_eq!(ws_glyph('x', true, true, true), None);
     }
 
     fn line_with(diags: Vec<(u32, u32, DiagnosticSeverity)>) -> LogicalLineRender {
