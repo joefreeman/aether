@@ -144,9 +144,9 @@ fn blank_run_before(text: &str, upto: usize) -> usize {
 /// The **append byte** of a block's span: the caret gap *before* this byte is "after the block's
 /// last content char" — its terminating newline when it has one, else one past the span.
 ///
-/// Where `a` lands in the reading view. Trailing blank lines are walked off first: separator blanks
+/// Where insert-at-end lands in the reading view. Trailing blank lines are walked off first: separator blanks
 /// belong to the gaps *between* blocks, but a loose list item's parser span swallows the one after
-/// it, so the raw last byte is the separator's newline and `a` would land a line low — typing there
+/// it, so the raw last byte is the separator's newline and insert-at-end would land a line low — typing there
 /// opens a new block in the gap instead of extending the item.
 ///
 /// Here rather than in a client because it needs the block's **text**, and a reading view carried
@@ -2662,7 +2662,7 @@ mod tests {
     }
 
     /// A loose list item's span swallows the blank line after it, so the raw last byte is the
-    /// *separator's* newline: `a` landed on the blank line between the bullets and typing opened a
+    /// *separator's* newline: insert-at-end landed on the blank line between the bullets and typing opened a
     /// new top-level block in the gap instead of extending the item.
     #[test]
     fn block_append_byte_parks_before_the_blocks_own_terminator() {

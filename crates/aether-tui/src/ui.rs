@@ -173,7 +173,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     if state.picker.open {
         draw_picker_overlay(f, state, chunks[0]);
     }
-    // Workspace settings overlay (Space .): centered modal listing the active workspace's roots.
+    // Workspace settings overlay: centered modal listing the active workspace's roots.
     if state.workspace_settings.is_some() {
         draw_workspace_settings_overlay(f, state, chunks[0]);
     }
@@ -7864,7 +7864,7 @@ fn buffer_status_color(kind: BufferStatusKind) -> Color {
 /// are skipped; the whole cluster is empty for files outside a repo. Reads `git_status`
 /// (server-computed).
 /// The work-in-progress indicator: `⟳ 3`, in the work colour. Empty when nothing is running. What
-/// the work is, `Space v` lists.
+/// the work is, the activity picker lists.
 fn work_status_spans(state: &AppState) -> Vec<Span<'static>> {
     let Some(n) = state.work_in_progress else {
         return Vec::new();

@@ -1268,29 +1268,35 @@ pub fn word_run(scope: &Scope, pos: LogicalPosition) -> (LogicalPosition, Logica
     (scope.pos_of(start), scope.pos_of(end))
 }
 
-/// Resolve the `w` / `Alt-w` "select word" gesture, returning the new `(position, anchor)`.
+/// Resolve the select-word gesture (`w` forward, `b` backward), returning the new
+/// `(position, anchor)`.
 ///
 /// "The word" is the run containing the cursor (`word_run_bounds` under `boundary`). The first
-/// press *grabs* that word — anchor to its start, cursor to its end — and a repeat press advances
-/// to the next word. Whether a press grabs or advances is decided by where the selection already
-/// sits:
+/// press *grabs* that word, oriented so the cursor leads in the direction of travel — forward puts
+/// the anchor on its start and the cursor on its end, backward the reverse — and a repeat press
+/// advances to the next word that way. Whether a press grabs or advances is decided by where the
+/// selection already sits:
 ///
 /// - **Hop** (`!extend`): advance only once the selection already covers exactly the current word,
-///   forward-oriented (`anchor == start && cursor == end`). A bare point cursor satisfies this
-///   only on a *single-char* word (`start == end`), so multi-char words are grabbed first and
-///   single-char words are stepped over — there's no way to tell a point resting on a one-char
-///   word apart from that word already being selected, so we keep moving to guarantee progress.
-/// - **Grow** (`extend`): advance once the cursor sits on its word's last char (`cursor == end`),
-///   keeping the anchor put so the selection grows by a word. A point on a single-char word is
-///   already on that edge, which is what keeps repeated `Shift-w` presses making progress.
+///   in either orientation, so `b` after `w` (or the reverse) steps on instead of just flipping the
+///   word it is on. A bare point cursor satisfies this only on a *single-char* word
+///   (`start == end`), so multi-char words are grabbed first and single-char words are stepped
+///   over — there's no way to tell a point resting on a one-char word apart from that word already
+///   being selected, so we keep moving to guarantee progress.
+/// - **Grow** (`extend`): advance once the cursor sits on its word's leading edge (its last char
+///   going forward, its first going backward), keeping the anchor put so the selection grows by a
+///   word. A point on a single-char word is already on that edge, which is what keeps repeated
+///   `Shift-w` / `Shift-b` presses making progress.
 ///
-/// On advance, a hop moves the anchor to the next word's start; a grow leaves it. When there is no
-/// next word the selection stays put (a stable end state rather than a destructive no-op).
+/// On advance, a hop moves the anchor to the new word's trailing edge; a grow leaves it. When there
+/// is no word further that way the selection stays put (a stable end state rather than a
+/// destructive no-op).
 pub fn resolve_select_word(
     scope: &Scope,
     position: LogicalPosition,
     anchor: LogicalPosition,
     boundary: WordBoundary,
+    direction: Direction,
     extend: bool,
 ) -> (LogicalPosition, LogicalPosition) {
     // Scope-local throughout: "no next word" then means none *in the element*, so `w` at its last
@@ -1300,26 +1306,48 @@ pub fn resolve_select_word(
     let cursor = scope.char_of(position);
     let anchor_char = scope.char_of(anchor);
     let (word_start, word_end) = word_run_bounds(rope, cursor, boundary);
-
-    let advance = if extend {
-        cursor == word_end
+    let forward = direction == Direction::Forward;
+    // The word's edges as (trailing, leading) for this direction of travel.
+    let (trail, lead) = if forward {
+        (word_start, word_end)
     } else {
-        anchor_char == word_start && cursor == word_end
+        (word_end, word_start)
     };
 
-    if !advance {
-        // Grab the whole word under the cursor: anchor to its start, cursor to its end.
-        (scope.pos_of(word_end), scope.pos_of(word_start))
+    let advance = if extend {
+        cursor == lead
     } else {
-        let next_start = word_forward_start(rope, cursor, boundary, 1);
-        if next_start >= total {
-            // No next word: leave the selection on the current word.
-            let new_anchor = if extend { anchor_char } else { word_start };
-            (scope.pos_of(word_end), scope.pos_of(new_anchor))
-        } else {
-            let (_, next_end) = word_run_bounds(rope, next_start, boundary);
-            let new_anchor = if extend { anchor_char } else { next_start };
-            (scope.pos_of(next_end), scope.pos_of(new_anchor))
+        let (lo, hi) = (cursor.min(anchor_char), cursor.max(anchor_char));
+        lo == word_start && hi == word_end
+    };
+
+    // The word the gesture lands on, as (start, end), when there is one further that way.
+    let target = if !advance {
+        None
+    } else if forward {
+        let next_start = word_forward_start(rope, word_end, boundary, 1);
+        (next_start < total).then(|| word_run_bounds(rope, next_start, boundary))
+    } else {
+        let prev_start = word_backward_start(rope, word_start, boundary, 1);
+        let found = prev_start < word_start
+            && char_cat(rope.char(prev_start), boundary) != CharCat::Whitespace;
+        found.then(|| word_run_bounds(rope, prev_start, boundary))
+    };
+
+    match target {
+        Some((start, end)) => {
+            let (new_trail, new_lead) = if forward { (start, end) } else { (end, start) };
+            let new_anchor = if extend { anchor_char } else { new_trail };
+            (scope.pos_of(new_lead), scope.pos_of(new_anchor))
+        }
+        // Grab the word under the cursor — or, with no word further that way, keep it selected.
+        None => {
+            let new_anchor = if extend && advance {
+                anchor_char
+            } else {
+                trail
+            };
+            (scope.pos_of(lead), scope.pos_of(new_anchor))
         }
     }
 }
@@ -2028,7 +2056,14 @@ mod scope_tests {
         let mut position = at(2, 0);
         let mut anchor = at(2, 0);
         for _ in 0..12 {
-            let (p, a) = resolve_select_word(&scope, position, anchor, WordBoundary::Word, false);
+            let (p, a) = resolve_select_word(
+                &scope,
+                position,
+                anchor,
+                WordBoundary::Word,
+                Direction::Forward,
+                false,
+            );
             position = p;
             anchor = a;
             assert!(

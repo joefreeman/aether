@@ -89,7 +89,7 @@ pub struct SearchStepParams {
     pub buffer_id: BufferId,
     /// `Forward` steps to the next match (`n`), `Backward` to the previous (`N`). Defaults to
     /// `Forward`, the common case, and is then omitted on the wire.
-    #[serde(default, skip_serializing_if = "is_forward")]
+    #[serde(default, skip_serializing_if = "crate::is_forward")]
     pub direction: Direction,
     /// Keep the current anchor and move only the cursor head onto the match (`Shift-n` /
     /// `Shift-Alt-n`), so the selection grows from the anchor to the match. When false the
@@ -117,11 +117,6 @@ fn default_nav_count() -> u32 {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_one(n: &u32) -> bool {
     *n == 1
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_forward(d: &Direction) -> bool {
-    matches!(d, Direction::Forward)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

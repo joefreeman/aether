@@ -17,7 +17,7 @@ pub const LEARNED_USES: u32 = 3;
 /// substitute for spaced repetition.
 pub const LEARNED_DAYS: u32 = 2;
 
-/// How much an explicit dismissal (`Space h`) adds to a hint's shows-without-follow fatigue
+/// How much an explicit dismissal adds to a hint's shows-without-follow fatigue
 /// counter — a deliberate "not now" outweighs a display period that merely lapsed (which adds 1).
 /// Shared so the server's fold-in and the client's optimistic mirror agree.
 pub const DISMISS_WEIGHT: f32 = 2.0;
@@ -66,7 +66,7 @@ pub enum HintEvent {
     Used,
     /// The trigger fired while its hint was on screen — a use that also resets fatigue.
     Followed,
-    /// The user explicitly dismissed the displayed hint (`Space h`): fatigue jumps by
+    /// The user explicitly dismissed the displayed hint: fatigue jumps by
     /// [`DISMISS_WEIGHT`] instead of the lapsed-display 1.
     Dismissed,
 }

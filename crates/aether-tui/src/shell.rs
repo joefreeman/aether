@@ -262,7 +262,7 @@ pub struct Shell {
     /// The (profile-resolved) WebSocket address every boot dial and reconnect dials.
     server_url: String,
     /// A window landed in a reading view this shell has not laid out yet, so its placement — the
-    /// content anchor of a `Space u`, or the subscribe's scroll — waits for `read_view` to measure
+    /// content anchor of a reader toggle, or the subscribe's scroll — waits for `read_view` to measure
     /// the document: a row cannot be found in rows nobody has counted.
     read_place_pending: bool,
     /// The focus last revealed, so the view scrolls only when the focus *changes* (manual
@@ -1565,7 +1565,7 @@ impl Shell {
                 self.sent_grid = Some(self.grid());
                 self.subscribe();
             }
-            // "Open another window" (both the `Space z` duplicate and "open picker item in a
+            // "Open another window" (both the new-window duplicate and "open picker item in a
             // new window") is GUI-only — a new OS window makes no sense for the terminal client,
             // which owns the one terminal it was launched in. Ignore it here.
             ShellAction::NewWindow(_) => {}
@@ -2392,7 +2392,7 @@ impl Shell {
         self.measured
             .elements
             .insert(self.session.view.focused_element, measured);
-        // A placement the window's adoption left for this layout: the content anchor a `Space u`
+        // A placement the window's adoption left for this layout: the content anchor a reader toggle
         // captured, else the subscribe's scroll — the same two answers the editor places by.
         if std::mem::take(&mut self.read_place_pending) {
             let scroll = self.subscribe_scroll;
@@ -4240,7 +4240,7 @@ mod scroll_tests {
     /// `prune_measured` takes the grid's copy the moment the view shows something else — an editor
     /// element is not the client's to lay out — while the layout cache, keyed by the document,
     /// stays valid. Coming back therefore *hit* the cache, skipped the layout, and never put the
-    /// measurement back, leaving the grid to place a document it had no heights for: `Space u`
+    /// measurement back, leaving the grid to place a document it had no heights for: toggling
     /// into the reader landed at row 0 however far down you were, and the anchor captured there
     /// next was line 0, so the way back was wrong too. The first switch always worked, which is
     /// what made it look intermittent.

@@ -181,7 +181,7 @@ fn a_blank_toast_body_degrades_to_a_plain_toast() {
 #[test]
 fn insert_entry_is_one_selection_edge_request() {
     let mut s = session();
-    let fx = key(&mut s, 'i');
+    let fx = key(&mut s, ',');
     assert_eq!(s.view.mode, aether_client::session::Mode::Insert);
 
     let (token, method, params) = the_request(&fx);
@@ -557,7 +557,7 @@ fn shift_arrow_in_insert_mode_does_not_extend_selection() {
     // Insert mode never holds a selection, so Shift+Arrow must not extend one (unlike Normal mode,
     // where Shift extends — see `shift_extends_symbol_navigation`). It just moves the caret.
     let mut s = session();
-    key(&mut s, 'i');
+    key(&mut s, ',');
     assert_eq!(s.view.mode, aether_client::session::Mode::Insert);
 
     let fx = s.on_key(KeyCode::Right, Mods::SHIFT, None);
@@ -3342,11 +3342,11 @@ fn editing_is_refused_while_disconnected_and_insert_drops_on_disconnect() {
     use aether_client::session::{ConnState, Mode};
     use aether_client::update::Event;
 
-    // Boot-connecting (or any non-Connected state): pressing `i` must NOT enter Insert — a live
+    // Boot-connecting (or any non-Connected state): pressing insert must NOT enter Insert — a live
     // insert cursor that silently drops keystrokes reads as a hang. It stays Normal with a hint.
     let mut s = session();
     s.conn = ConnState::Connecting;
-    let fx = key(&mut s, 'i');
+    let fx = key(&mut s, ',');
     assert_eq!(
         s.view.mode,
         Mode::Normal,
@@ -3369,7 +3369,7 @@ fn editing_is_refused_while_disconnected_and_insert_drops_on_disconnect() {
 
     // A mid-session disconnect drops out of Insert so the cursor doesn't sit in a dead insert mode.
     let mut s = session();
-    let _ = key(&mut s, 'i'); // connected → enters Insert
+    let _ = key(&mut s, ','); // connected → enters Insert
     assert_eq!(s.view.mode, Mode::Insert);
     let _ = s.on_event(Event::ConnectionLost);
     assert_eq!(
@@ -3624,8 +3624,8 @@ fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
         ))
     );
 
-    //...and `i` doesn't even change mode, so the next keystroke isn't text either.
-    let fx = s.on_key(KeyCode::Char('i'), Mods::NONE, Some("i".into()));
+    //...and insert doesn't even change mode, so the next keystroke isn't text either.
+    let fx = s.on_key(KeyCode::Char(','), Mods::NONE, Some(",".into()));
     assert!(no_request(&fx));
     assert!(matches!(s.view.mode, aether_client::session::Mode::Normal));
     // ...on the same key as the edit refusal: `i` then a delete is one toast, not two.
@@ -3784,8 +3784,8 @@ fn stash_picker_rows_preview_pop_apply_and_confirm_a_drop() {
     assert_eq!(params["oid"], json!("abc1234def"));
 }
 
-/// The tasks pickers. `Space .` asks about where you are — the focused buffer's file, and the view
-/// for when that is a shell — and `Space Alt-.` about the workspace. On a row, `Enter` opens a
+/// The tasks pickers. `Space t` asks about where you are — the focused buffer's file, and the view
+/// for when that is a shell — and `Space Alt-t` about the workspace. On a row, `Enter` opens a
 /// shell where the task is defined and runs its command, `Ctrl-e` opens it with the command typed
 /// but not run, and `Ctrl-g` asks where it is defined.
 #[test]
@@ -3794,15 +3794,15 @@ fn tasks_picker_runs_edits_and_finds_a_task() {
 
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = key(&mut s, '.');
-    let params = find_request(&fx, "picker/view").expect("Space . opens the tasks picker");
+    let fx = key(&mut s, 't');
+    let params = find_request(&fx, "picker/view").expect("Space t opens the tasks picker");
     assert_eq!(params["kind"], json!("tasks"));
     assert_eq!(params["buffer_id"], json!(s.view.buffer.buffer_id));
 
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('.'), Mods::ALT, Some('.'.to_string()));
-    let params = find_request(&fx, "picker/view").expect("Space Alt-. opens the workspace's");
+    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, Some('t'.to_string()));
+    let params = find_request(&fx, "picker/view").expect("Space Alt-t opens the workspace's");
     assert_eq!(params["kind"], json!("tasks_workspace"));
 
     let row = || PickerItem::Task {
@@ -4217,7 +4217,7 @@ fn ctrl_alt_g_unjoins_in_both_modes() {
     assert_eq!(method, "element/newline_and_indent");
     assert_eq!(params["park_before"], json!(true));
 
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     let fx = ctrl_alt(&mut s, 'g');
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "element/newline_and_indent");
@@ -4227,7 +4227,7 @@ fn ctrl_alt_g_unjoins_in_both_modes() {
 #[test]
 fn enter_is_newline_and_indent_in_insert() {
     let mut s = session();
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "element/newline_and_indent");
@@ -4240,7 +4240,7 @@ fn enter_is_newline_and_indent_in_insert() {
 fn paste_text_routes_by_mode() {
     // Insert: plain insert at the caret, exactly like the Ctrl-v gesture.
     let mut s = session();
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     let fx = s.paste_text("one\ntwo".into());
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "element/text");
@@ -4262,7 +4262,7 @@ fn paste_text_normalizes_line_endings_and_strips_controls() {
     // Terminals disagree on pasted newlines (CR, CRLF, LF) — all land as `\n`; other control
     // chars are filtered as typed input would be, tabs survive.
     let mut s = session();
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     let fx = s.paste_text("a\r\nb\rc\u{7}\td".into());
     let (_, _, params) = the_request(&fx);
     assert_eq!(params["text"], json!("a\nb\nc\td"));
@@ -4337,7 +4337,7 @@ fn symbol_highlight_follow_is_subscription_shaped() {
     );
 
     // Entering Insert unsubscribes (stale highlights must not linger)…
-    let fx = key(&mut s, 'i');
+    let fx = key(&mut s, ',');
     let params = find_request(&fx, "lsp/document_highlight").expect("Insert unsubscribes");
     assert_eq!(params["active"], false);
     // …and returning to Normal re-subscribes.
@@ -4365,7 +4365,7 @@ fn blame_follow_tracks_mode_transitions_only() {
     );
 
     // …Insert unfollows (typing must not thrash server-side blame recomputes)…
-    let fx = key(&mut s, 'i');
+    let fx = key(&mut s, ',');
     let params = find_request(&fx, "git/set_blame_follow").expect("Insert unfollows");
     assert_eq!(params["enabled"], false);
 
@@ -4453,7 +4453,7 @@ fn requests_are_emitted_in_dispatch_order() {
     // Sequenced flows lean on the ordering contract (requests hit the wire in emission
     // order); pin that a multi-effect dispatch keeps its tokens ascending.
     let mut s = session();
-    let fx = key(&mut s, 'i'); // one request
+    let fx = key(&mut s, ','); // one request
     let (t1, _, _) = the_request(&fx);
     s.view.mode = aether_client::session::Mode::Normal; // back out without a round-trip
     let fx = ctrl(&mut s, 'z');
@@ -5178,7 +5178,7 @@ fn pointer_selection_in_insert_mode_drops_to_normal() {
 
     // Single click (Char, no extend) → point cursor, stays in Insert.
     let mut s = session();
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     assert_eq!(s.view.mode, Mode::Insert);
     let _ = s.pointer_press(
         0,
@@ -5194,7 +5194,7 @@ fn pointer_selection_in_insert_mode_drops_to_normal() {
 
     // Double click (Word) → immediate selection, drops to Normal.
     let mut s = session();
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     let _ = s.pointer_press(
         0,
         LogicalPosition { line: 2, col: 3 },
@@ -5209,7 +5209,7 @@ fn pointer_selection_in_insert_mode_drops_to_normal() {
 
     // Shift-click (extend) → selection from the existing anchor, drops to Normal.
     let mut s = session();
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     let _ = s.pointer_press(
         0,
         LogicalPosition { line: 2, col: 3 },
@@ -5224,7 +5224,7 @@ fn pointer_selection_in_insert_mode_drops_to_normal() {
 
     // Char drag past the press anchor → selection, drops to Normal.
     let mut s = session();
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     let _ = s.pointer_press(
         0,
         LogicalPosition { line: 2, col: 3 },
@@ -6651,7 +6651,7 @@ fn toggle_wrap_flips_between_soft_and_none() {
 #[test]
 fn insert_tab_requests_an_indent_step() {
     let mut s = session();
-    key(&mut s, 'i');
+    key(&mut s, ',');
     assert_eq!(s.view.mode, aether_client::session::Mode::Insert);
 
     // Tab still indents in Insert: only Normal and Read vacated it for element focus, so a daily-use
@@ -6669,7 +6669,7 @@ fn insert_tab_requests_an_indent_step() {
 fn insert_alt_tier_sends_word_grain_requests() {
     use aether_client::keymap::Mods;
     let mut s = session();
-    key(&mut s, 'i');
+    key(&mut s, ',');
     assert_eq!(s.view.mode, aether_client::session::Mode::Insert);
 
     let fx = s.on_key(KeyCode::Backspace, Mods::ALT, None);
@@ -6720,11 +6720,11 @@ fn insert_home_end_move_to_the_line_ends() {
 }
 
 #[test]
-fn space_n_triggers_hover() {
+fn space_v_triggers_hover() {
     let mut s = session();
-    // The hover reveal is a leader chord; it moved from `t` to `n` when the shells picker took `t`.
+    // The hover reveal is a leader chord.
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('v'), Mods::NONE, None);
     let (_t, method, _p) = the_request(&fx);
     assert_eq!(method, "lsp/hover");
 }
@@ -6746,13 +6746,13 @@ fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
     // A ready server with no content for the cursor → the genuine "nothing here" message.
     let mut s = session();
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let token = the_request(&s.on_key(KeyCode::Char('n'), Mods::NONE, None)).0;
+    let token = the_request(&s.on_key(KeyCode::Char('v'), Mods::NONE, None)).0;
     let fx = s.on_rpc_result(token, Ok(json!({ "contents": null, "readiness": "ready" })));
     assert_eq!(info_toast(&fx).as_deref(), Some("No hover info"));
 
     // A server still starting → say so, not "No hover info".
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let token = the_request(&s.on_key(KeyCode::Char('n'), Mods::NONE, None)).0;
+    let token = the_request(&s.on_key(KeyCode::Char('v'), Mods::NONE, None)).0;
     let fx = s.on_rpc_result(
         token,
         Ok(json!({ "contents": null, "readiness": "starting" })),
@@ -6764,7 +6764,7 @@ fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
 
     // A crashed/stopped server → "unavailable".
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let token = the_request(&s.on_key(KeyCode::Char('n'), Mods::NONE, None)).0;
+    let token = the_request(&s.on_key(KeyCode::Char('v'), Mods::NONE, None)).0;
     let fx = s.on_rpc_result(
         token,
         Ok(json!({ "contents": null, "readiness": "unavailable" })),
@@ -6776,13 +6776,13 @@ fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
 }
 
 #[test]
-fn space_alt_n_shows_diagnostic_at_cursor() {
-    // Space Alt-n → diagnostic at cursor, paired with `Space n` (hover). With no diagnostics loaded
+fn space_alt_v_shows_diagnostic_at_cursor() {
+    // Space Alt-v → diagnostic at cursor, paired with `Space v` (hover). With no diagnostics loaded
     // it reports "none" via a toast (resolved locally — no RPC), which still proves the chord
     // reaches `show_diagnostic`.
     let mut s = session();
     let _ = key(&mut s, ' '); // leader
-    let fx = s.on_key(KeyCode::Char('n'), Mods::ALT, Some("n".to_string()));
+    let fx = s.on_key(KeyCode::Char('v'), Mods::ALT, Some("v".to_string()));
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
@@ -6791,7 +6791,7 @@ fn space_alt_n_shows_diagnostic_at_cursor() {
                 ..
             }
         )),
-        "Space Alt-n with no diagnostics toasts an info message"
+        "Space Alt-v with no diagnostics toasts an info message"
     );
 }
 
@@ -7801,14 +7801,14 @@ fn space_k_toggles_keep_and_guards_unsaved() {
     assert_eq!(params["transient"], json!(false));
 }
 
-/// Keep is per **view**, and `Space u` changes how the view is seen, not the view: a kept file
+/// Keep is per **view**, and the reader toggle changes how the view is seen, not the view: a kept file
 /// read is still kept, and `Space k` addresses the same view before and after the flip.
 #[test]
-fn space_u_leaves_the_views_keep_state_alone() {
+fn reader_toggle_leaves_the_views_keep_state_alone() {
     let mut s = md_session();
     s.view.view_transient = true; // a preview
     let view = s.view.view_id;
-    let fx = leader(&mut s, 'u');
+    let fx = leader(&mut s, '.');
     let token = the_read_request(&s, &fx, true);
     let _ = s.on_rpc_result(token, Ok(read_set(true)));
     assert_eq!(s.view.view_id, view, "the same view");
@@ -10584,15 +10584,15 @@ fn sneak_backspace_unwinds_and_esc_cancels() {
 }
 
 #[test]
-fn space_z_asks_the_shell_to_open_a_new_window() {
+fn space_n_asks_the_shell_to_open_a_new_window() {
     let mut s = session();
-    // `Space z` — was `Space Alt-x` until that chord became save-and-close.
+    // `Space n` opens another window.
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
-    let fx = s.on_key(KeyCode::Char('z'), Mods::NONE, Some("z".into()));
+    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, Some("n".into()));
     assert!(
         fx.0.iter()
             .any(|e| matches!(e, Effect::ShellAction(ShellAction::NewWindow(_)))),
-        "Space z should emit ShellAction::NewWindow"
+        "Space n should emit ShellAction::NewWindow"
     );
     // It's a pure shell hand-off — no server traffic, and crucially not a view/close (that's
     // `Space x`).
@@ -10767,31 +10767,31 @@ fn hints_intro_teaches_dismiss_then_toggle() {
     // The tutorial opening: the very first hint teaches dismissal.
     assert_eq!(hint_records(&fx)[0].0, "dismiss");
     let view = s.hint_view().unwrap();
-    assert_eq!(view.parts().1, "Space h");
+    assert_eq!(view.parts().1, "Space u");
 
     // Trying it advances the intro to the toggle hint — a follow, not a dismissal.
     key(&mut s, ' ');
-    let fx = key(&mut s, 'h');
+    let fx = key(&mut s, 'u');
     let recs = hint_records(&fx);
     assert!(
         recs.iter()
             .any(|(id, ev)| id == "dismiss" && ev == "followed"),
-        "Space h on the dismiss hint is its follow: {recs:?}"
+        "Space u on the dismiss hint is its follow: {recs:?}"
     );
     assert!(!recs.iter().any(|(_, ev)| ev == "dismissed"));
     let view = s.hint_view().expect("the intro continues");
-    assert_eq!(view.parts().1, "Space Alt-h", "the toggle hint is second");
+    assert_eq!(view.parts().1, "Space Alt-u", "the toggle hint is second");
 
     // Trying *that* follows the toggle hint, turns hints off, persists, and toasts the way back.
     key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
+    let fx = s.on_key(KeyCode::Char('u'), Mods::ALT, None);
     assert!(!s.hints_enabled);
     assert!(s.hint_view().is_none());
     let recs = hint_records(&fx);
     assert!(
         recs.iter()
             .any(|(id, ev)| id == "toggle" && ev == "followed"),
-        "Space Alt-h on the toggle hint is its follow: {recs:?}"
+        "Space Alt-u on the toggle hint is its follow: {recs:?}"
     );
     let settings: Vec<_> =
         fx.0.iter()
@@ -10812,23 +10812,23 @@ fn hints_intro_teaches_dismiss_then_toggle() {
 }
 
 #[test]
-fn hints_space_h_dismisses_and_rotates() {
+fn hints_space_u_dismisses_and_rotates() {
     let mut s = hint_session();
     adopt_hints(&mut s);
     // Advance past the dismiss hint (following it is the intro's special case); the toggle hint
     // is an ordinary dismissal target.
     key(&mut s, ' ');
-    key(&mut s, 'h');
+    key(&mut s, 'u');
     let before = s.hint_view().expect("the toggle hint is displayed");
-    assert_eq!(before.parts().1, "Space Alt-h");
+    assert_eq!(before.parts().1, "Space Alt-u");
 
     key(&mut s, ' ');
-    let fx = key(&mut s, 'h');
+    let fx = key(&mut s, 'u');
     let recs = hint_records(&fx);
     assert!(
         recs.iter()
             .any(|(id, ev)| id == "toggle" && ev == "dismissed"),
-        "Space h reports the dismissal: {recs:?}"
+        "Space u reports the dismissal: {recs:?}"
     );
     assert!(
         recs.iter().any(|(id, ev)| id == "dismiss" && ev == "used"),
@@ -10843,14 +10843,14 @@ fn hints_space_h_dismisses_and_rotates() {
 }
 
 #[test]
-fn hints_space_alt_h_toggles_and_persists() {
+fn hints_space_alt_u_toggles_and_persists() {
     let mut s = hint_session();
     adopt_hints(&mut s);
     assert!(s.hint_view().is_some());
 
-    // Space Alt-h off: the corner empties, the flip persists, and a toast names the way back.
+    // Space Alt-u off: the corner empties, the flip persists, and a toast names the way back.
     key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
+    let fx = s.on_key(KeyCode::Char('u'), Mods::ALT, None);
     assert!(!s.hints_enabled);
     assert!(s.hint_view().is_none());
     assert!(
@@ -10869,7 +10869,7 @@ fn hints_space_alt_h_toggles_and_persists() {
 
     // And back on.
     key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
+    let fx = s.on_key(KeyCode::Char('u'), Mods::ALT, None);
     assert!(s.hints_enabled);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "settings/set");
@@ -10891,11 +10891,11 @@ fn hints_following_the_displayed_binding_records_followed() {
     let fx = match shown_id.as_str() {
         "dismiss" => {
             key(&mut s, ' ');
-            key(&mut s, 'h')
+            key(&mut s, 'u')
         }
         "toggle" => {
             key(&mut s, ' ');
-            s.on_key(KeyCode::Char('h'), Mods::ALT, None)
+            s.on_key(KeyCode::Char('u'), Mods::ALT, None)
         }
         "help" => {
             key(&mut s, ' ');
@@ -10905,7 +10905,7 @@ fn hints_following_the_displayed_binding_records_followed() {
             key(&mut s, ' ');
             key(&mut s, 'q')
         }
-        "insert" => key(&mut s, 'i'),
+        "insert" => key(&mut s, ','),
         "motion-hjkl" => key(&mut s, 'j'),
         other => panic!("unexpected tier-0 hint in Normal: {other}"),
     };
@@ -10926,7 +10926,7 @@ fn hints_off_screen_binding_records_used() {
     let fx = if shown_id == "insert" {
         key(&mut s, 'j') // motion-hjkl
     } else {
-        key(&mut s, 'i') // insert — entering Insert also samples that context's hint (a Shown)
+        key(&mut s, ',') // insert — entering Insert also samples that context's hint (a Shown)
     };
     let used: Vec<_> = hint_records(&fx)
         .into_iter()
@@ -10957,7 +10957,7 @@ fn hints_setting_gates_view_and_traffic() {
     assert!(s.hint_view().is_none(), "the corner empties immediately");
     let fx = s.on_hint_tick(1_000_000_002_000);
     assert!(hint_records(&fx).is_empty(), "no traffic while off");
-    let fx = key(&mut s, 'i');
+    let fx = key(&mut s, ',');
     assert!(hint_records(&fx).is_empty(), "no observation while off");
 }
 
@@ -11552,7 +11552,7 @@ fn reader_subscribe(
 }
 
 /// The window for the same file presented as the **editor**: one editor element, no lines
-/// loaded. What `Space u` toggles to, and what the reader is recognised as *not* being.
+/// loaded. What the reader toggle flips to, and what the reader is recognised as *not* being.
 fn editor_subscribe(buffer_id: u64) -> aether_protocol::viewport::ViewportSubscribeResult {
     use aether_protocol::viewport::{Element, Window};
     aether_protocol::viewport::ViewportSubscribeResult {
@@ -11590,7 +11590,7 @@ fn read_set(read: bool) -> serde_json::Value {
     json!({ "read": read })
 }
 
-/// The `view/set_read` a `Space u` (or an edit transition) sends: naming the session's own view,
+/// The `view/set_read` a reader toggle (or an edit transition) sends: naming the session's own view,
 /// asking to read (`true`) or to edit. Returns its token.
 fn the_read_request(s: &Session, fx: &Effects, read: bool) -> u64 {
     let (token, _, params) = all_requests(fx)
@@ -11611,12 +11611,12 @@ fn the_read_request(s: &Session, fx: &Effects, read: bool) -> u64 {
     token
 }
 
-/// `Space u` on the session's markdown buffer — which asks the server to flip this client's mode
+/// The reader toggle on the session's markdown buffer — which asks the server to flip this client's mode
 /// to reading and re-subscribes once it has — and the window the subscribe answers with, over
 /// `text`. Returns the window adoption's effects.
 fn enter_reader(s: &mut Session, text: &str) -> Effects {
     let view = s.view.view_id;
-    let fx = leader(s, 'u');
+    let fx = leader(s, '.');
     let token = the_read_request(s, &fx, true);
     let fx = s.on_rpc_result(token, Ok(read_set(true)));
     assert!(
@@ -11627,7 +11627,7 @@ fn enter_reader(s: &mut Session, text: &str) -> Effects {
     adopt_reader_window(s, text)
 }
 
-/// A canned reading-view setup: `Space u` on a markdown buffer, the reader's window adopted.
+/// A canned reading-view setup: the reader toggle on a markdown buffer, the reader's window adopted.
 /// Layout: heading (line 0), paragraph (line 2), paragraph with a link (line 4).
 fn read_session() -> Session {
     let mut s = md_session();
@@ -11654,11 +11654,11 @@ fn blockless_read_session(text: &str) -> Session {
 }
 
 #[test]
-fn space_u_asks_to_read_and_the_window_delivers_it() {
+fn reader_toggle_asks_to_read_and_the_window_delivers_it() {
     use aether_client::session::Mode;
     let mut s = md_session();
     let view = s.view.view_id;
-    let fx = leader(&mut s, 'u');
+    let fx = leader(&mut s, '.');
     // The ask: a content anchor so the same lines stay on screen across the re-presentation,
     // then the flip of this client's mode. Nothing else is fetched — the re-subscribe's window
     // carries the document.
@@ -11689,7 +11689,7 @@ fn space_u_asks_to_read_and_the_window_delivers_it() {
     assert_eq!(read.elements.len(), 4);
 }
 
-/// `Space u` carries **where you are**: the content anchor the shell captures for the flip is
+/// The reader toggle carries **where you are**: the content anchor the shell captures for the flip is
 /// what the re-subscribe frames, and nothing the server answers with moves it — the view, its
 /// scroll memory and its cursor are all the same view's.
 #[test]
@@ -11699,7 +11699,7 @@ fn a_mode_flip_keeps_your_place() {
     let _ = adopt_reader_window(&mut s, "# Title\n\nFirst para.\n\nSecond para.\n");
 
     // The flip: the shell captures the anchor for where the reader is, then asks for source.
-    let fx = leader(&mut s, 'u');
+    let fx = leader(&mut s, '.');
     assert!(fx.0.iter().any(|e| matches!(e, Effect::SaveContentAnchor)));
     s.capture_scroll_anchor(VisualRow(0), 20, &Default::default());
     let anchored = s
@@ -11716,10 +11716,10 @@ fn a_mode_flip_keeps_your_place() {
 }
 
 #[test]
-fn space_u_on_non_markdown_toasts_and_stays_normal() {
+fn reader_toggle_on_non_markdown_toasts_and_stays_normal() {
     use aether_client::session::Mode;
     let mut s = session(); // language: None
-    let fx = leader(&mut s, 'u');
+    let fx = leader(&mut s, '.');
     assert_eq!(s.view.mode, Mode::Normal);
     assert!(s.view.read.is_none());
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Toast { .. })));
@@ -11776,10 +11776,10 @@ fn read_percent_selects_all_blocks() {
 }
 
 #[test]
-fn read_comma_collapses_the_block_selection() {
+fn read_quote_collapses_the_block_selection() {
     let mut s = read_session();
-    // A point cursor has nothing to collapse: `,` is swallowed.
-    assert!(no_request(&key(&mut s, ',')));
+    // A point cursor has nothing to collapse: the key is swallowed.
+    assert!(no_request(&key(&mut s, '\'')));
     // Build a real block selection: `x` selects the focused heading whole-line…
     let fx = key(&mut s, 'x');
     let (t, method, _p) = the_request(&fx);
@@ -11791,9 +11791,9 @@ fn read_comma_collapses_the_block_selection() {
             "anchor": {"line": 0, "col": 0},
         })),
     );
-    // …then `,` collapses to the cursor end without moving: a point `cursor/set` at the
+    // …then it collapses to the cursor end without moving: a point `cursor/set` at the
     // default Char grain (skipped on the wire).
-    let fx = key(&mut s, ',');
+    let fx = key(&mut s, '\'');
     let (_t, method, params) = the_request(&fx);
     assert_eq!(method, "element/set");
     assert_eq!(params["position"], json!({"line": 0, "col": 7}));
@@ -11951,28 +11951,28 @@ fn read_h_deselects_back_to_the_block() {
 }
 
 #[test]
-fn space_n_shows_the_focused_target_without_following() {
+fn space_v_shows_the_focused_target_without_following() {
     use aether_client::session::HoverText;
     let mut s = read_session();
     // On a plain block: quiet no-op.
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('v'), Mods::NONE, None);
     assert!(
         fx.0.is_empty(),
-        "Space n on a non-interactive block does nothing"
+        "Space v on a non-interactive block does nothing"
     );
     // On a focused link: the URL in the hover popover (whose own keys then apply — Ctrl-c
     // copies it via `keymap::hover_action`), no open, no cursor move.
     focus_the_link(&mut s);
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('v'), Mods::NONE, None);
     assert!(
         fx.0.iter().any(|e| matches!(
             e,
             Effect::ShowHover(HoverText::Blocks(b))
                 if b.len() == 1 && b[0].text == "https://x.y" && b[0].severity.is_none()
         )),
-        "Space t reveals the link target in the popover"
+        "Space v reveals the link target in the popover"
     );
     assert!(
         !fx.0
@@ -12146,10 +12146,10 @@ fn read_extended_selection_suppresses_the_display_target() {
 /// Which edge is the only thing said here. Finding the append point walks back over the block's
 /// trailing blank lines, which needs the block's text, so the landing is the server's.
 #[test]
-fn read_i_and_a_ask_for_the_blocks_edges() {
+fn read_insert_keys_ask_for_the_blocks_edges() {
     use aether_client::session::Mode;
     let mut s = read_session();
-    let fx = key(&mut s, 'i');
+    let fx = key(&mut s, ',');
     assert_eq!(s.view.mode, Mode::Insert);
     assert!(s.view.read.is_none());
     let (_t, method, p) = the_request_beside_open(&fx);
@@ -12158,7 +12158,7 @@ fn read_i_and_a_ask_for_the_blocks_edges() {
     assert_eq!(p["motion"]["at_end"], json!(false));
 
     let mut s = read_session();
-    let fx = key(&mut s, 'a');
+    let fx = key(&mut s, '.');
     assert_eq!(s.view.mode, Mode::Insert);
     let (_t, _m, p) = the_request_beside_open(&fx);
     assert_eq!(p["motion"]["at_end"], json!(true));
@@ -12166,7 +12166,7 @@ fn read_i_and_a_ask_for_the_blocks_edges() {
     // A document with no blocks is not a dead end: the same ask goes out, and the server lands on
     // the element's own edges.
     let mut s = blockless_read_session("");
-    let fx = key(&mut s, 'i');
+    let fx = key(&mut s, ',');
     assert_eq!(s.view.mode, Mode::Insert);
     let (_t, method, _p) = the_request_beside_open(&fx);
     assert_eq!(method, "element/move");
@@ -12206,7 +12206,7 @@ fn read_placeholder_names_the_loading_and_empty_states() {
 }
 
 #[test]
-fn read_i_extended_uses_the_editors_selection_edge() {
+fn read_insert_extended_uses_the_editors_selection_edge() {
     use aether_client::session::Mode;
     use aether_protocol::LogicalPosition;
     let mut s = read_session();
@@ -12214,7 +12214,7 @@ fn read_i_extended_uses_the_editors_selection_edge() {
     // Insert-entry motion instead of a client-computed Goto.
     s.view.buffer.cursor.anchor = LogicalPosition { line: 0, col: 0 };
     s.view.buffer.cursor.position = LogicalPosition { line: 2, col: 11 };
-    let fx = key(&mut s, 'i');
+    let fx = key(&mut s, ',');
     assert_eq!(s.view.mode, Mode::Insert);
     let (_t, method, p) = the_request_beside_open(&fx);
     assert_eq!(method, "element/move");
@@ -12316,7 +12316,7 @@ fn read_edit_transitions_ask_for_the_source() {
     use aether_client::session::Mode;
     let mut s = read_session();
     let view = s.view.view_id;
-    let fx = key(&mut s, 'i');
+    let fx = key(&mut s, ',');
     assert_eq!(s.view.mode, Mode::Insert);
     assert!(s.view.read.is_none(), "handed over to the editor at once");
     let token = the_read_request(&s, &fx, false);
@@ -12324,9 +12324,9 @@ fn read_edit_transitions_ask_for_the_source() {
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
     assert_eq!(s.view.view_id, view);
     assert_eq!(s.view.mode, Mode::Insert, "the transition's mode stands");
-    // Space u out of Read asks the same way.
+    // The reader toggle out of Read asks the same way.
     let mut s = read_session();
-    let fx = leader(&mut s, 'u');
+    let fx = leader(&mut s, '.');
     assert_eq!(s.view.mode, Mode::Normal);
     let _ = the_read_request(&s, &fx, false);
 }
@@ -12635,10 +12635,10 @@ fn enter_does_not_follow_a_link_the_selection_has_un_armed() {
 }
 
 #[test]
-fn space_v_toggles_back_to_the_editor() {
+fn reader_toggle_goes_back_to_the_editor() {
     use aether_client::session::Mode;
     let mut s = read_session();
-    let fx = leader(&mut s, 'u');
+    let fx = leader(&mut s, '.');
     assert_eq!(s.view.mode, Mode::Normal);
     assert!(s.view.read.is_none());
     // The reading position is framed first, then the anchor captured with it on screen, then
@@ -12661,9 +12661,9 @@ fn space_v_toggles_back_to_the_editor() {
     let _ = s.adopt_subscribe(editor_subscribe(id));
     assert_eq!(s.view.mode, Mode::Normal);
     assert!(s.view.read.is_none());
-    // `Space u` again asks to read, whatever the app default says.
+    // The reader toggle again asks to read, whatever the app default says.
     s.markdown_read_default = false;
-    let fx = leader(&mut s, 'u');
+    let fx = leader(&mut s, '.');
     let _ = the_read_request(&s, &fx, true);
 }
 
@@ -12714,7 +12714,7 @@ fn read_table_contains_no_editing_action() {
                     | Action::ReadBlockDepth { .. }
                     // The editor's adjust-the-value pair, re-declared in the Read table so
                     // `Ctrl-a`/`Ctrl-Alt-a` check and uncheck a task item on both sides of
-                    // `Space u`. In markdown they never touch a number.
+                    // the reader toggle. In markdown they never touch a number.
                     | Action::IncrementNumber
                     | Action::DecrementNumber
                     | Action::Scroll { .. }
@@ -12993,20 +12993,20 @@ fn read_click_activate_follows_a_link() {
     );
 }
 
-/// `Space n` on a footnote reference shows the definition's **text**, flattened from the parse.
+/// Hover on a footnote reference shows the definition's **text**, flattened from the parse.
 ///
 /// Not its source: the popover renders plain text, so slicing the definition's span showed its
 /// markup through and led with the `[^1]:` marker that names the very footnote you are standing
 /// on.
 #[test]
-fn space_n_shows_a_footnote_definition_as_text_not_source() {
+fn hover_shows_a_footnote_definition_as_text_not_source() {
     use aether_client::session::HoverText;
     let mut s = md_session();
     let _ = enter_reader(&mut s, "A claim[^1].\n\n[^1]: The **bold** definition.\n");
     // On the reference itself (its span starts at byte 7, which is line 0 column 7).
     s.view.buffer.cursor.position = aether_protocol::LogicalPosition { line: 0, col: 7 };
     s.on_key(KeyCode::Char(' '), Mods::NONE, None);
-    let fx = s.on_key(KeyCode::Char('n'), Mods::NONE, None);
+    let fx = s.on_key(KeyCode::Char('v'), Mods::NONE, None);
     let shown =
         fx.0.iter()
             .find_map(|e| match e {
@@ -14387,32 +14387,32 @@ fn shell_run_push(
     })
 }
 
-/// `Space Alt-t` always asks for a **new** shell — from an ordinary view and from inside a shell
-/// alike. The old "give me the idle one" heuristic went with the shells picker: `Space t` lists
+/// `Space Alt-h` always asks for a **new** shell — from an ordinary view and from inside a shell
+/// alike. The old "give me the idle one" heuristic went with the shells picker: `Space h` lists
 /// what you have, so the open key has one meaning and carries no parameters at all.
 #[test]
-fn space_alt_t_always_asks_for_a_new_shell() {
+fn space_alt_h_always_asks_for_a_new_shell() {
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "shell/open");
     assert_eq!(params, json!({}), "no `new` flag survives");
 
     let mut s = shell_session(1);
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     let (_, method, params) = the_request(&fx);
     assert_eq!(method, "shell/open");
     assert_eq!(params, json!({}));
 }
 
-/// `Space t` opens the shells picker — the other half of the pair.
+/// `Space h` opens the shells picker — the other half of the pair.
 #[test]
-fn space_t_opens_the_shells_picker() {
+fn space_h_opens_the_shells_picker() {
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = key(&mut s, 't');
+    let fx = key(&mut s, 'h');
     let params = find_request(&fx, "picker/view").expect("the shells picker opens");
     assert_eq!(params["kind"], "shells");
 }
@@ -14456,7 +14456,7 @@ fn space_b_lists_buffers_and_alt_b_makes_a_scratch() {
 fn opening_a_shell_focuses_the_input_and_enters_insert() {
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = s.on_key(KeyCode::Char('t'), Mods::ALT, None);
+    let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     let (token, method, _) = the_request(&fx);
     assert_eq!(method, "shell/open");
 
@@ -14713,13 +14713,13 @@ fn a_refused_submit_says_what_is_in_the_way() {
         Err(aether_client::transport::RpcError {
             method: "shell/run",
             code: aether_protocol::error::ErrorCode::SHELL_BUSY.code(),
-            message: "Shell 1 is running sleep 100 — Space v to stop it".into(),
+            message: "Shell 1 is running sleep 100".into(),
         }),
     );
     let toasts = toast_messages(&fx);
     assert_eq!(
         toasts,
-        vec!["Already running — Shell 1 is running sleep 100 — Space v to stop it".to_string()]
+        vec!["Already running — Shell 1 is running sleep 100".to_string()]
     );
     assert!(!has_error_toast(&fx), "busy is not a failure");
 }
@@ -14748,18 +14748,18 @@ fn git_work() -> serde_json::Value {
     json!({"id": {"kind": "git", "repo_id": "/p"}, "owner": "p", "label": "Pushing"})
 }
 
-/// `Space v` lists the workspace's work in progress. `Ctrl-d` stops the highlighted row and leaves
+/// `Space z` lists the workspace's work in progress. `Ctrl-d` stops the highlighted row and leaves
 /// the picker open — the row leaves by itself once it has stopped — and a stop that found nothing
 /// left says so, while one that landed says nothing.
 #[test]
-fn space_v_lists_work_and_ctrl_d_stops_a_row() {
+fn space_z_lists_work_and_ctrl_d_stops_a_row() {
     use aether_protocol::activity::ActivityId;
     use aether_protocol::picker::{PickerItem, PickerKind};
 
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let fx = key(&mut s, 'v');
-    let params = find_request(&fx, "picker/view").expect("Space v opens the activity picker");
+    let fx = key(&mut s, 'z');
+    let params = find_request(&fx, "picker/view").expect("Space z opens the activity picker");
     assert_eq!(params["kind"], json!("activity"));
 
     let row = |id: ActivityId| PickerItem::Activity {
@@ -15351,6 +15351,31 @@ fn shift(s: &mut Session, c: char) -> Effects {
     )
 }
 
+/// `w` and `b` are one gesture in two directions: both ask the server to select a word, `b`
+/// naming the backward walk (forward is the wire default, so `w` names none). `r` repeats `b`
+/// backward.
+#[test]
+fn w_and_b_select_words_forward_and_backward() {
+    let mut s = session();
+    let (_, method, params) = the_request(&key(&mut s, 'w'));
+    assert_eq!(method, "element/select_word");
+    assert!(params.get("direction").is_none(), "{params}");
+
+    let (_, method, params) = the_request(&key(&mut s, 'b'));
+    assert_eq!(method, "element/select_word");
+    assert_eq!(params["direction"], json!("backward"));
+    assert_eq!(params["extend"], json!(false));
+
+    let (_, method, params) = the_request(&shift(&mut s, 'b'));
+    assert_eq!(method, "element/select_word");
+    assert_eq!(params["direction"], json!("backward"));
+    assert_eq!(params["extend"], json!(true));
+
+    let (_, method, params) = the_request(&key(&mut s, 'r'));
+    assert_eq!(method, "element/select_word");
+    assert_eq!(params["direction"], json!("backward"));
+}
+
 /// `r` replays the request as it was made: Shift is part of the request, so `Shift-w r` keeps
 /// extending and `w r` keeps not extending. It used to read Shift off the repeat key itself —
 /// which is bound without Shift, so a repeat could never extend, and `Shift-w r` threw the
@@ -15496,7 +15521,7 @@ fn ctrl_r_in_insert_replays_the_typing_inline() {
     let _ = key(&mut s, 'b');
     let _ = esc(&mut s);
 
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     assert_eq!(s.view.mode, Mode::Insert);
     let reqs = requests_of(&mut s, &[(KeyCode::Char('r'), Mods::CTRL, None)]);
     let methods: Vec<&str> = reqs.iter().map(|(m, _)| *m).collect();
@@ -15554,7 +15579,7 @@ fn history_and_wholesale_edits_are_not_changes_and_abort_a_session() {
         "undo and format did not become the change"
     );
 
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     let _ = key(&mut s, 'a');
     let _ = ctrl(&mut s, 'z');
     let _ = key(&mut s, 'b');
@@ -15610,7 +15635,7 @@ fn a_buffer_switch_drops_a_half_recorded_session() {
     use aether_client::session::Mode;
     let mut s = session();
     let _ = ctrl(&mut s, 'l');
-    let _ = key(&mut s, 'i');
+    let _ = key(&mut s, ',');
     let _ = key(&mut s, 'a');
     assert_eq!(s.view.mode, Mode::Insert);
     let _ = s.adopt_switch(aether_protocol::view::ViewOpenResult {

@@ -1564,7 +1564,7 @@ fn a_measured_reply_extends_the_scrollable_height() {
     );
 }
 
-/// `Space u` from the editor lands the reading view with the focused block **on screen**.
+/// Toggling the reader from the editor lands the reading view with the focused block **on screen**.
 ///
 /// The switch captures a content anchor and this shell hands the whole placement to
 /// [`App::read_place_subscribed`] — `Message::Subscribed` stands the focus-change reveal down for
@@ -1651,7 +1651,7 @@ fn a_switch_into_the_reader_rests_the_focus_the_anchor_left_off_screen() {
 /// picked between them on `session.view.read`. The core clears that at the keystroke, before the
 /// shell runs the `SaveContentAnchor` the same keystroke produced, so the capture read the
 /// editor's mirror: untouched since before the reader opened, so zero. The anchor pinned the top
-/// of the document, and `Space u` back to the editor threw away however far down you had read.
+/// of the document, and toggling back to the editor threw away however far down you had read.
 ///
 /// The window is the honest witness — it still holds the prose — and is what both scroller
 /// questions ask now.
@@ -1700,7 +1700,7 @@ fn leaving_the_reader_anchors_where_the_reader_was() {
     app.read_view_h = 400.0;
     app.scroll_px = 0.0; // the editor's mirror: stale, and what this used to read
 
-    // `Space u` out of the reader: the core drops the reading view at the keystroke, *then* the
+    // Toggling out of the reader: the core drops the reading view at the keystroke, *then* the
     // shell runs the effect it produced.
     app.session.view.read = None;
     let _ = app.run_core(Effects::one(Effect::SaveContentAnchor));

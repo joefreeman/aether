@@ -191,7 +191,7 @@ fn app_settings(s: &Session) -> Value {
     })
 }
 
-/// The workspace-settings overlay (`Space .`), when open. Core-owned state + key handling
+/// The workspace-settings overlay, when open. Core-owned state + key handling
 /// (`on_workspace_settings_key`); the shell renders this projection and routes keys through the
 /// global keydown → `on_key`.
 ///
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn mode_tracks_session_state() {
         let mut s = WasmSession::new();
-        s.dispatch_key("i", "KeyI", false, false, false);
+        s.dispatch_key(",", "Comma", false, false, false);
         assert_eq!(build_view(s.session())["mode"], "insert");
     }
 }

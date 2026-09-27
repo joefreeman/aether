@@ -69,6 +69,7 @@ async fn select_word_snaps_then_walks_word_by_word() {
     let select_word = |extend| CursorSelectWordParams {
         buffer_id,
         boundary: WordBoundary::Word,
+        direction: Direction::Forward,
         extend,
         count: 1,
     };
@@ -110,6 +111,7 @@ async fn select_word_extend_grows_the_selection() {
     let select_word = |extend| CursorSelectWordParams {
         buffer_id,
         boundary: WordBoundary::Word,
+        direction: Direction::Forward,
         extend,
         count: 1,
     };
@@ -164,6 +166,7 @@ async fn select_big_word_spans_punctuation() {
         &CursorSelectWordParams {
             buffer_id,
             boundary: WordBoundary::BigWord,
+            direction: Direction::Forward,
             extend: false,
             count: 1,
         },
@@ -187,6 +190,7 @@ async fn select_word_first_press_grabs_word_even_at_its_start() {
         &CursorSelectWordParams {
             buffer_id,
             boundary: WordBoundary::Word,
+            direction: Direction::Forward,
             extend: false,
             count: 1,
         },
@@ -208,6 +212,7 @@ async fn select_word_steps_over_single_char_words() {
     let select = || CursorSelectWordParams {
         buffer_id,
         boundary: WordBoundary::Word,
+        direction: Direction::Forward,
         extend: false,
         count: 1,
     };
@@ -236,6 +241,7 @@ async fn select_word_count_selects_the_nth_word() {
         &CursorSelectWordParams {
             buffer_id,
             boundary: WordBoundary::Word,
+            direction: Direction::Forward,
             extend: false,
             count: 2,
         },
@@ -258,6 +264,7 @@ async fn select_word_on_last_word_is_a_stable_end_state() {
         &CursorSelectWordParams {
             buffer_id,
             boundary: WordBoundary::Word,
+            direction: Direction::Forward,
             extend: false,
             count: 1,
         },
@@ -272,6 +279,7 @@ async fn select_word_on_last_word_is_a_stable_end_state() {
         &CursorSelectWordParams {
             buffer_id,
             boundary: WordBoundary::Word,
+            direction: Direction::Forward,
             extend: false,
             count: 1,
         },
@@ -279,6 +287,163 @@ async fn select_word_on_last_word_is_a_stable_end_state() {
     .await;
     assert_eq!(st.anchor, LogicalPosition { line: 0, col: 0 });
     assert_eq!(st.position, LogicalPosition { line: 0, col: 1 });
+
+    drop(server);
+}
+
+/// One select-word press in `direction` from wherever the cursor is; returns `(anchor, position)`
+/// as `(line, col)` pairs so a walk reads as a list of selections.
+async fn select_word_step(
+    ws: &mut Ws,
+    buffer_id: BufferId,
+    direction: Direction,
+    extend: bool,
+) -> ((u32, u32), (u32, u32)) {
+    let st: CursorState = send_request::<CursorSelectWord>(
+        ws,
+        &CursorSelectWordParams {
+            buffer_id,
+            boundary: WordBoundary::Word,
+            direction,
+            extend,
+            count: 1,
+        },
+    )
+    .await;
+    (
+        (st.anchor.line, st.anchor.col),
+        (st.position.line, st.position.col),
+    )
+}
+
+async fn put_cursor(ws: &mut Ws, buffer_id: BufferId, line: u32, col: u32) {
+    let at = LogicalPosition { line, col };
+    let _: CursorState = send_request::<CursorSet>(
+        ws,
+        &CursorSetParams {
+            buffer_id,
+            position: at,
+            anchor: at,
+            granularity: Granularity::Char,
+        },
+    )
+    .await;
+}
+
+/// `b` mirrors `w`: the first press grabs the word under the cursor with the cursor on its
+/// *start*, each repeat steps to the previous word, and the buffer's first word is a stable end.
+#[tokio::test]
+async fn select_word_backward_snaps_then_walks_back() {
+    // "alpha beta gamma": cols 0..4 / 6..9 / 11..15.
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta gamma\n").await;
+    put_cursor(&mut ws, buffer_id, 0, 13).await;
+    let back = Direction::Backward;
+
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, false).await,
+        ((0, 15), (0, 11))
+    );
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, false).await,
+        ((0, 9), (0, 6))
+    );
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, false).await,
+        ((0, 4), (0, 0))
+    );
+    // Nowhere further back: "alpha" stays selected.
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, false).await,
+        ((0, 4), (0, 0))
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_word_backward_extend_grows_the_selection() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta gamma\n").await;
+    put_cursor(&mut ws, buffer_id, 0, 13).await;
+    let back = Direction::Backward;
+
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, true).await,
+        ((0, 15), (0, 11))
+    );
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, true).await,
+        ((0, 15), (0, 6))
+    );
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, true).await,
+        ((0, 15), (0, 0))
+    );
+
+    drop(server);
+}
+
+/// A selected word counts as "the word" in either orientation, so reversing direction steps on
+/// rather than spending a press flipping the word already selected.
+#[tokio::test]
+async fn select_word_reversing_direction_steps_instead_of_flipping() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("alpha beta gamma\n").await;
+    let (fwd, back) = (Direction::Forward, Direction::Backward);
+
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, fwd, false).await,
+        ((0, 0), (0, 4))
+    );
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, fwd, false).await,
+        ((0, 6), (0, 9))
+    );
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, false).await,
+        ((0, 4), (0, 0))
+    );
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, fwd, false).await,
+        ((0, 6), (0, 9))
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_word_backward_steps_over_single_char_words_and_lines() {
+    // "one\naa b": the point on the one-char "b" steps straight to "aa", then across the newline
+    // to "one".
+    let (server, mut ws, buffer_id) = setup_with_buffer("one\naa b\n").await;
+    put_cursor(&mut ws, buffer_id, 1, 3).await;
+    let back = Direction::Backward;
+
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, false).await,
+        ((1, 1), (1, 0))
+    );
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, false).await,
+        ((0, 2), (0, 0))
+    );
+
+    drop(server);
+}
+
+#[tokio::test]
+async fn select_word_backward_stops_at_leading_whitespace() {
+    // Only whitespace before "hi": there is no previous word, so "hi" stays selected.
+    let (server, mut ws, buffer_id) = setup_with_buffer("  hi\n").await;
+    put_cursor(&mut ws, buffer_id, 0, 3).await;
+    let back = Direction::Backward;
+
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, false).await,
+        ((0, 3), (0, 2))
+    );
+    assert_eq!(
+        select_word_step(&mut ws, buffer_id, back, false).await,
+        ((0, 3), (0, 2))
+    );
 
     drop(server);
 }
@@ -6378,6 +6543,7 @@ async fn every_motion_stays_inside_the_focused_element() {
             &CursorSelectWordParams {
                 buffer_id,
                 boundary: WordBoundary::Word,
+                direction: Direction::Forward,
                 extend: false,
                 count: 1,
             },
@@ -7825,6 +7991,7 @@ async fn every_counted_motion_is_all_or_nothing() {
         &CursorSelectWordParams {
             buffer_id,
             boundary: WordBoundary::Word,
+            direction: Direction::Forward,
             extend: false,
             count: 100,
         },

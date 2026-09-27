@@ -2,7 +2,7 @@
 //! through a turn, and the git operations you started.
 //!
 //! One list, whatever the kind, because the questions asked of it are the same — *is anything
-//! running, what, and stop it* — and the status bar's count, the picker (`Space v`) and the cancel
+//! running, what, and stop it* — and the status bar's count, the picker and the cancel
 //! each used to ask them of three separate states that could not agree on scope. The list is the
 //! server's to derive: it is read off the shells, conversations and git operations themselves, so
 //! it cannot disagree with them either.

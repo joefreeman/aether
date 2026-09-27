@@ -4967,7 +4967,7 @@ impl View {
     /// what kind of view it is looking at.
     ///
     /// A shell with no runs is a real state: the view is then just the input, which is what
-    /// `Space Alt-t` on a fresh shell shows.
+    /// a fresh new shell shows.
     /// Which element is a shell's input, if this view has one. By role, never by position: the
     /// input is the last element, and "last" is a different number after every run.
     pub fn input_element(&self) -> Option<aether_protocol::ui::FieldId> {

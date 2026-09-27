@@ -280,7 +280,7 @@ fn wait_for_server(port: u16) -> anyhow::Result<()> {
 }
 
 /// Build the web client's URL: the server's loopback base plus the shared
-/// [`aether_client::web_link`] query — the same builder the in-editor `Space Alt-z` copy uses,
+/// [`aether_client::web_link`] query — the same builder the in-editor copy-web-url gesture uses,
 /// so the CLI and the clients can't drift from what the web boot parses. The jump (0-based,
 /// protocol convention) becomes the 1-based `#L:C` fragment, and only means anything on a file.
 fn web_url(

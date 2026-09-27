@@ -151,11 +151,11 @@ impl RpcError {
     }
 
     /// A submit into a shell that is already running something. The message is what the client
-    /// toasts, so it names both the shell and the command in the way, and the key that stops it.
+    /// toasts, so it names both the shell and the command in the way.
     pub fn shell_busy(title: &str, command: &str) -> Self {
         Self::new(
             ErrorCode::SHELL_BUSY,
-            format!("{title} is running {command} — Space v to stop it"),
+            format!("{title} is running {command}"),
         )
     }
 
@@ -173,7 +173,7 @@ impl RpcError {
         )
     }
 
-    /// `Space .` from something with no file behind it — a scratch, a patch, a shell. Tasks are
+    /// The tasks picker from something with no file behind it — a scratch, a patch, a shell. Tasks are
     /// found from a file's directory, as a repo is found from a file; phrased as the remedy, like
     /// [`Self::repo_needs_file`].
     pub fn tasks_need_file() -> Self {

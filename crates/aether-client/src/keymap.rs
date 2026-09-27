@@ -128,8 +128,8 @@ pub enum KeyContext {
     ///
     /// Editing here is **block-grain**: the table binds block delete / change / open / paste, block
     /// depth, task toggle and undo/redo, all of which resolve against the markdown parse rather
-    /// than against lines. What it deliberately has no way to do is edit *characters* — `i`/`a`
-    /// leave the reading view for the source editor (`read_exit_for_edit`) rather than inserting
+    /// than against lines. What it deliberately has no way to do is edit *characters* — the insert
+    /// keys leave the reading view for the source editor (`read_exit_for_edit`) rather than inserting
     /// in place.
     ///
     /// That is also why `Global` is not consulted in Read mode: its edit chords are line-grain
@@ -142,7 +142,7 @@ pub enum KeyContext {
     /// single key row can hold. Cursor-local git *navigation* deliberately stays out of it —
     /// `c`/`Alt-c` (next/prev hunk) in Normal, `Space c`/`Space Alt-c` (the changes pickers,
     /// mirroring `Space d`'s diagnostics) and `Space m` (blame at the cursor, the third reveal next
-    /// to `Tab` and `Space n`).
+    /// to hover and diagnostic-at-cursor).
     LeaderGit,
     Global,
 }
@@ -236,9 +236,9 @@ impl ViewportPlace {
 pub enum Action {
     // ---- motions (extend = Shift) ----
     MoveChar(Direction),
-    /// Move to the next/previous word start. Normal mode binds only the backward direction
-    /// (`b` / `Alt-b`) because `w` there selects words via [`Action::SelectWord`]; Insert mode,
-    /// which has no selection, binds both on `Alt-←` / `Alt-→`.
+    /// Move to the next/previous word start. Normal mode binds neither direction — `w`/`b` there
+    /// select words via [`Action::SelectWord`] — while Insert mode, which has no selection, binds
+    /// both on `Alt-←` / `Alt-→`.
     MoveWord {
         dir: Direction,
         boundary: WordBoundary,
@@ -277,7 +277,10 @@ pub enum Action {
     },
 
     // ---- selection ----
+    /// `w`/`b` (and `Alt-` for big words) — select the word under the cursor, then step word by
+    /// word in `dir`, the cursor leading. Shift grows the selection instead of replacing it.
     SelectWord {
+        dir: Direction,
         boundary: WordBoundary,
     },
     SelectLine(Direction),
@@ -456,8 +459,8 @@ pub enum Action {
     /// Copy the active buffer's absolute (canonical) path to the system clipboard.
     CopyAbsolutePath,
     NewScratch,
-    /// `Space Alt-t` — a **new** shell. Always creates: `Space t` lists the ones you have, so the
-    /// open key has one meaning.
+    /// A **new** shell. Always creates: the shells picker lists the ones you have, so the open key
+    /// has one meaning.
     ShellOpen,
     /// `Space Alt-a` — a **new** agent conversation, with the first agent found on `PATH`. Always
     /// creates, for the reason [`Action::ShellOpen`] does.
@@ -481,7 +484,7 @@ pub enum Action {
     /// in — the window marks the input by role and carries no kind at all.
     SubmitInput,
     CloseView,
-    /// `Space z` — open another window onto the same workspace: the GUI spawns a fresh detached `ae
+    /// Open another window onto the same workspace: the GUI spawns a fresh detached `ae
     /// --gui` process dialling the same daemon; the web shell opens a new browser tab on the same
     /// URL. A new client lands on the workspace's MRU buffer (the one you're on), so it
     /// "duplicates" the current view; the two windows are independent thereafter (own
@@ -489,7 +492,7 @@ pub enum Action {
     /// it ignores the [`ShellAction::NewWindow`] it emits. The spawn names the workspace explicitly
     /// (`--workspace`), so the sibling never tethers to the file it lands on.
     NewWindow,
-    /// `Space Alt-z` — the share-link sibling of `Space z`: copy the web client's URL for the
+    /// The share-link sibling of [`Action::NewWindow`]: copy the web client's URL for the
     /// current buffer to the clipboard (`?workspace=&root=&file=` with the cursor as its `#L:C`
     /// fragment; `?view=` for a scratch). The shell prepends its own base
     /// ([`ShellAction::CopyWebUrl`]).
@@ -497,7 +500,7 @@ pub enum Action {
 
     // ---- git (the verbs live on the `Space g` sub-leader; see [`KeyContext::LeaderGit`]) ----
     /// `Space i` — toggle the inline diff. On the leader rather than the git sub-leader because
-    /// it's a *view* of the buffer you're in, like `Space u`'s reading view, not an operation on
+    /// it's a *view* of the buffer you're in, like the reading view, not an operation on
     /// the repo: nothing about it writes, and it reads as "inline" rather than as a git verb.
     ToggleDiffView,
     /// `c` / `Alt-c` in Normal — cursor-local hunk navigation, so *not* behind `Space g`: they're
@@ -605,7 +608,7 @@ pub enum Action {
 
     // ---- git (popovers) ----
     /// `Space m` — blame details for the cursor's line. Stays on the leader (not `Space g`) as the
-    /// third cursor-local *reveal*, beside `Space n` (hover) and `Space Alt-n` (diagnostic at cursor).
+    /// third cursor-local *reveal*, beside hover and diagnostic-at-cursor.
     ShowCommitInfo,
 
     // ---- pickers ----
@@ -630,7 +633,7 @@ pub enum Action {
     OpenHelp,
     /// `Space ;` — the workspace-settings overlay (roots + rename). Beside the app-wide settings on
     /// `Space ,`: same overlay family, narrower scope. Was `Space Alt-,`, which terminal emulators
-    /// tend to swallow before we see it, then `Space .` until the tasks pickers took that.
+    /// tend to swallow before we see it.
     OpenWorkspaceSettings,
     /// `Space,` — the application-settings overlay (global preferences, e.g. soft wrap). Font size
     /// lives here too (a stepped value row), not on a keybinding.
@@ -641,15 +644,15 @@ pub enum Action {
     ShowAppInfo,
 
     // ---- hints ----
-    /// `Space h` — dismiss the corner hint: down-weight it (a deliberate "not now") and show
+    /// Dismiss the corner hint: down-weight it (a deliberate "not now") and show
     /// another. No-op when the corner is empty.
     DismissHint,
-    /// `Space Alt-h` — toggle hints on/off (the same switch as the settings-overlay row),
+    /// Toggle hints on/off (the same switch as the settings-overlay row),
     /// persisted app-wide.
     ToggleHints,
 
     // ---- markdown reading view ----
-    /// `Space u` — toggle the markdown reading view on the current buffer (markdown only;
+    /// Toggle the markdown reading view on the current buffer (markdown only;
     /// remembered per buffer for the session).
     ToggleReadView,
     /// `j`/`k` — focus the next/previous block-grain element (the reading cursor; sends a
@@ -678,7 +681,7 @@ pub enum Action {
     /// `x`/`Alt-x` — the editor's line-select at block grain: plain presses walk block to block
     /// (whole-line normal form), Shift grows the selection.
     ReadSelectBlock(Direction),
-    /// `i`/`a` — to the editor, inserting at the selection's start / end: an extended selection
+    /// To the editor, inserting at the selection's start / end: an extended selection
     /// uses the editor's own Insert-entry motions; a bare reading position enters at the focused
     /// block's start / append position.
     ReadInsert {
@@ -1030,7 +1033,7 @@ macro_rules! bind {
 static NORMAL: &[Binding] = &[
     // ---- meta / selection ----
     bind!(N, KeyCode::Esc, Any, A::DropSearch, "Search", "Clear the active search"),
-    bind!(N, ch(','), Exact(Mods::NONE), A::CollapseSelection, "Selection", "Collapse selection"),
+    bind!(N, ch('\''), Exact(Mods::NONE), A::CollapseSelection, "Selection", "Collapse selection"),
     bind!(N, ch('u'), Exact(Mods::NONE), A::SwapAnchor { forward_only: false }, "Selection", "Reverse selection (swap cursor and anchor)"),
     bind!(N, ch('u'), Exact(Mods::ALT), A::SwapAnchor { forward_only: true }, "Selection", "Orient selection forward (cursor to end)"),
     bind!(N, ch('q'), Exact(Mods::NONE), A::TreeExpand, "Selection", "Expand selection to parent syntax node"),
@@ -1059,10 +1062,10 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('v'), IgnoreShift(Mods::ALT), A::PageMotion { dir: VerticalDirection::Up, half: true }, "Motion", "Cursor up half a page"),
 
     // ---- motions: words ----
-    bind!(N, ch('w'), IgnoreShift(Mods::ALT), A::SelectWord { boundary: WordBoundary::BigWord }, "Selection", "Select big word"),
-    bind!(N, ch('w'), IgnoreShift(Mods::NONE), A::SelectWord { boundary: WordBoundary::Word }, "Selection", "Select word"),
-    bind!(N, ch('b'), IgnoreShift(Mods::ALT), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::BigWord }, "Motion", "Big word backward"),
-    bind!(N, ch('b'), IgnoreShift(Mods::NONE), A::MoveWord { dir: Direction::Backward, boundary: WordBoundary::Word }, "Motion", "Small word backward"),
+    bind!(N, ch('w'), IgnoreShift(Mods::ALT), A::SelectWord { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Selection", "Select big word"),
+    bind!(N, ch('w'), IgnoreShift(Mods::NONE), A::SelectWord { dir: Direction::Forward, boundary: WordBoundary::Word }, "Selection", "Select word"),
+    bind!(N, ch('b'), IgnoreShift(Mods::ALT), A::SelectWord { dir: Direction::Backward, boundary: WordBoundary::BigWord }, "Selection", "Select big word backward"),
+    bind!(N, ch('b'), IgnoreShift(Mods::NONE), A::SelectWord { dir: Direction::Backward, boundary: WordBoundary::Word }, "Selection", "Select word backward"),
     bind!(N, ch('e'), IgnoreShift(Mods::ALT), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::BigWord }, "Motion", "Big word end"),
     bind!(N, ch('e'), IgnoreShift(Mods::NONE), A::MoveWordEnd { dir: Direction::Forward, boundary: WordBoundary::Word }, "Motion", "Small word end"),
 
@@ -1101,10 +1104,14 @@ static NORMAL: &[Binding] = &[
     bind!(N, ch('%'), IgnoreShift(Mods::NONE), A::SelectAll, "Selection", "Select all"),
 
     // ---- mode transitions ----
-    bind!(N, ch('i'), Exact(Mods::NONE), A::EnterInsert(InsertWhere::SelectionStart), "Mode", "Insert at selection start"),
-    bind!(N, ch('a'), Exact(Mods::NONE), A::EnterInsert(InsertWhere::SelectionEnd), "Mode", "Insert at selection end"),
-    bind!(N, ch('i'), Exact(Mods::ALT), A::EnterInsert(InsertWhere::FirstLineStart), "Mode", "Insert at first non-blank of line"),
-    bind!(N, ch('a'), Exact(Mods::ALT), A::EnterInsert(InsertWhere::LastLineEnd), "Mode", "Insert at last line end"),
+    // Punctuation, not letters: every other bare letter is a motion. `,`/`.` sit left/right of
+    // each other as the selection's start/end do, and their shifted `<`/`>` widen to the lines'
+    // first non-blank / last end. The shifted pair arrives with SHIFT from a terminal and without
+    // it from the GUI and web, so `IgnoreShift` accepts both.
+    bind!(N, ch(','), Exact(Mods::NONE), A::EnterInsert(InsertWhere::SelectionStart), "Mode", "Insert at selection start"),
+    bind!(N, ch('.'), Exact(Mods::NONE), A::EnterInsert(InsertWhere::SelectionEnd), "Mode", "Insert at selection end"),
+    bind!(N, ch('<'), IgnoreShift(Mods::NONE), A::EnterInsert(InsertWhere::FirstLineStart), "Mode", "Insert at first non-blank of line"),
+    bind!(N, ch('>'), IgnoreShift(Mods::NONE), A::EnterInsert(InsertWhere::LastLineEnd), "Mode", "Insert at last line end"),
 
     // ---- viewport scroll ----
     bind!(N, KeyCode::PageDown, Any, A::Scroll { dir: ScrollDir::Down, unit: ScrollUnit::Page }, "Scroll", "Scroll page down"),
@@ -1316,11 +1323,11 @@ static READ: &[Binding] = &[
     // The editor's whole-buffer / collapse pair at block grain. A whole-buffer selection is
     // already whole-line normal form, so `%` needs no read-side math — every block selected,
     // front matter included (structural ops on it still refuse server-side, as they do for an
-    // `x` selection swept over it). `,` drops a multi-block selection back to the cursor-end
+    // `x` selection swept over it). `'` drops a multi-block selection back to the cursor-end
     // block without moving — the only collapse that doesn't also step (`j`/`k`) or need a
     // whole-block span (`x`).
     bind!(R, ch('%'), IgnoreShift(Mods::NONE), A::SelectAll, "Read", "Select all blocks"),
-    bind!(R, ch(','), Exact(Mods::NONE), A::CollapseSelection, "Read", "Collapse selection to the cursor's block"),
+    bind!(R, ch('\''), Exact(Mods::NONE), A::CollapseSelection, "Read", "Collapse selection to the cursor's block"),
 
     // ---- undo/redo (the Global table's chords, whitelisted here — Read still skips Global,
     // whose other chords are edits; the curated-edit discipline) ----
@@ -1330,14 +1337,14 @@ static READ: &[Binding] = &[
     // "deepen this heading too" wants one key.
     bind!(R, ch('r'), Exact(Mods::CTRL), A::RepeatChange, "Edit", "Repeat last change"),
     // The editor's adjust-the-value pair, re-declared because Read skips Global. Same action, so
-    // the same key does the same thing on either side of `Space u`.
+    // the same key does the same thing on either side of the reader toggle.
     bind!(R, ch('a'), Exact(Mods::CTRL), A::IncrementNumber, "Edit", "Check task item"),
     bind!(R, ch('a'), Exact(Mods::CTRL_ALT), A::DecrementNumber, "Edit", "Uncheck task item"),
 
     // ---- to the editor (transitions; deliberately NOT recording a read-vs-source
-    // preference — Space u remains the "I prefer source" signal) ----
-    bind!(R, ch('i'), Exact(Mods::NONE), A::ReadInsert { at_end: false }, "Mode", "Edit: insert at block/selection start"),
-    bind!(R, ch('a'), Exact(Mods::NONE), A::ReadInsert { at_end: true }, "Mode", "Edit: insert at block/selection end"),
+    // preference — the reader toggle remains the "I prefer source" signal) ----
+    bind!(R, ch(','), Exact(Mods::NONE), A::ReadInsert { at_end: false }, "Mode", "Edit: insert at block/selection start"),
+    bind!(R, ch('.'), Exact(Mods::NONE), A::ReadInsert { at_end: true }, "Mode", "Edit: insert at block/selection end"),
     bind!(R, ch('e'), Exact(Mods::CTRL), A::ReadChange, "Edit", "Edit: rewrite selected block(s)"),
     bind!(R, ch('o'), Exact(Mods::CTRL), A::ReadOpenBlock { above: false }, "Edit", "Edit: open block below (list item in a list)"),
     bind!(R, ch('o'), Exact(Mods::CTRL_ALT), A::ReadOpenBlock { above: true }, "Edit", "Edit: open block above (list item in a list)"),
@@ -1404,11 +1411,11 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('f'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Files), "Files", "Find files"),
     bind!(L, ch('f'), Exact(Mods::ALT), A::OpenFilesInFileDir, "Files", "Find files in this file's directory"),
     // The three view-listing pickers share one rule with their `Alt` siblings: plain **lists** what
-    // you have, `Alt` **makes** a new one. `b` buffers, `t` shells (terminals), `a` agents.
+    // you have, `Alt` **makes** a new one. `b` buffers, `h` shells, `a` agents.
     bind!(L, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Buffers), "Files", "Switch buffer"),
     bind!(L, ch('b'), Exact(Mods::ALT), A::NewScratch, "Files", "New scratch"),
-    bind!(L, ch('t'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Shells), "App", "Switch shell"),
-    bind!(L, ch('t'), Exact(Mods::ALT), A::ShellOpen, "App", "New shell (run a command)"),
+    bind!(L, ch('h'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Shells), "App", "Switch shell"),
+    bind!(L, ch('h'), Exact(Mods::ALT), A::ShellOpen, "App", "New shell (run a command)"),
     bind!(L, ch('a'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Agents), "Agent", "Switch agent conversation"),
     bind!(L, ch('a'), Exact(Mods::ALT), A::AgentOpen, "Agent", "New agent conversation"),
     // `g` is the git sub-leader's prefix, so grep moved to `/` (and its selection-seeded sibling to
@@ -1424,23 +1431,19 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('d'), Exact(Mods::ALT), A::OpenPicker(PickerKind::DiagnosticsWorkspace), "Code", "Workspace diagnostics"),
     bind!(L, ch('j'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Jumplist), "Navigation", "Jumplist"),
     bind!(L, ch('j'), Exact(Mods::ALT), A::ClearJumplist, "Navigation", "Clear jumplist"),
-    // The cursor-reveals sit together: `n` type & docs, `Alt-n` diagnostic, `m` blame. Hover used to
+    // The cursor-reveals sit together: `v` type & docs, `Alt-v` diagnostic, `m` blame. Hover used to
     // be `Tab` — the odd one out of the three — and moved to the leader to free `Tab`/`Shift-Tab`
     // for moving between the editors of a multi-element view. Bare letters are motions; a reveal is
     // not one.
     //
-    // The trio sat on `t`/`Alt-t`/`m` until the three view pickers took the whole `a`/`b`/`t` row;
-    // `n` came free at the same moment, when the agent sub-leader moved to `Space v`.
-    //
     // One binding covers the reading view too — `A::Hover` resolves to the focused link's target
     // there — because "what is this thing?" is the same question either way.
-    bind!(L, ch('n'), Exact(Mods::NONE), A::Hover, "Code", "Hover: type & docs, or link target"),
-    bind!(L, ch('n'), Exact(Mods::ALT), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
+    bind!(L, ch('v'), Exact(Mods::NONE), A::Hover, "Code", "Hover: type & docs, or link target"),
+    bind!(L, ch('v'), Exact(Mods::ALT), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
     bind!(L, ch('m'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
     // The workspace's work in progress — shells, agents' turns, git operations — where each can be
-    // gone to or stopped (`Ctrl-d`). Was the `Space v` sub-leader, whose one verb was "stop what
-    // this view is running": the picker stops anything, from anywhere.
-    bind!(L, ch('v'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Activity), "App", "Work in progress: go to or stop it"),
+    // gone to or stopped (`Ctrl-d`). The picker stops anything, from anywhere.
+    bind!(L, ch('z'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Activity), "App", "Work in progress: go to or stop it"),
     bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
     bind!(L, ch('r'), Exact(Mods::NONE), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
     bind!(L, ch('o'), Exact(Mods::NONE), A::OpenPicker(PickerKind::DocumentSymbols), "Code", "Document symbols"),
@@ -1458,16 +1461,15 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('?'), IgnoreShift(Mods::NONE), A::ShowAppInfo, "App", "About / diagnostics"),
     bind!(L, ch(','), Exact(Mods::NONE), A::OpenAppSettings, "App", "Application settings"),
     bind!(L, ch(';'), Exact(Mods::NONE), A::OpenWorkspaceSettings, "Workspace", "Workspace settings"),
-    // Tasks: what `just`, `make`, mise and `package.json` define, each run as a new shell. `.` is
-    // Vim's "do it again", which is most of what running a task is. Plain lists what runs from
-    // here, Alt widens to the workspace — the `Space d`/`Space c` grammar.
-    bind!(L, ch('.'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Tasks), "Workspace", "Run a task from here"),
-    bind!(L, ch('.'), Exact(Mods::ALT), A::OpenPicker(PickerKind::TasksWorkspace), "Workspace", "Run a task from the workspace"),
+    // Tasks: what `just`, `make`, mise and `package.json` define, each run as a new shell. Plain
+    // lists what runs from here, Alt widens to the workspace — the `Space d`/`Space c` grammar.
+    bind!(L, ch('t'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Tasks), "Workspace", "Run a task from here"),
+    bind!(L, ch('t'), Exact(Mods::ALT), A::OpenPicker(PickerKind::TasksWorkspace), "Workspace", "Run a task from the workspace"),
     bind!(L, ch('y'), Exact(Mods::NONE), A::OpenHelp, "App", "Show keyboard shortcuts"),
     bind!(L, ch('x'), Exact(Mods::NONE), A::CloseView, "App", "Close view"),
     bind!(L, ch('x'), Exact(Mods::ALT), A::SaveAndClose, "App", "Save and close view"),
-    bind!(L, ch('z'), Exact(Mods::NONE), A::NewWindow, "App", "Open another window"),
-    bind!(L, ch('z'), Exact(Mods::ALT), A::CopyWebUrl, "App", "Copy web URL"),
+    bind!(L, ch('n'), Exact(Mods::NONE), A::NewWindow, "App", "Open another window"),
+    bind!(L, ch('n'), Exact(Mods::ALT), A::CopyWebUrl, "App", "Copy web URL"),
     bind!(L, ch('w'), Exact(Mods::ALT), A::OpenPath, "App", "Open file by absolute path"),
     bind!(L, ch('s'), Exact(Mods::NONE), A::Save, "App", "Save"),
     bind!(L, ch('s'), Exact(Mods::ALT), A::SaveAs, "App", "Save as"),
@@ -1475,7 +1477,7 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('k'), Exact(Mods::ALT), A::Reload, "App", "Reload from disk"),
     bind!(L, ch('p'), Exact(Mods::NONE), A::CopyRelativePath, "App", "Copy relative path"),
     bind!(L, ch('p'), Exact(Mods::ALT), A::CopyAbsolutePath, "App", "Copy absolute path"),
-    bind!(L, ch('u'), Exact(Mods::NONE), A::ToggleReadView, "Read", "Toggle Markdown reader / editor"),
+    bind!(L, ch('.'), Exact(Mods::NONE), A::ToggleReadView, "Read", "Toggle Markdown reader / editor"),
     // The inline diff sits beside the reading view, not under `Space g`: both are ways of looking
     // at the buffer you're already in, and neither writes anything. `i` for *inline* — `d` on the
     // git sub-leader now abandons a stopped merge, which is not a key to leave a view toggle's
@@ -1485,8 +1487,8 @@ static LEADER: &[Binding] = &[
     // it shows. Toggling is a many-times-a-session gesture and re-baselining a rare one, so the
     // cheap chord stays with the toggle.
     bind!(L, ch('i'), Exact(Mods::ALT), A::OpenPicker(PickerKind::GitBaseline), "Git", "Diff against…"),
-    bind!(L, ch('h'), Exact(Mods::NONE), A::DismissHint, "App", "Dismiss the current hint"),
-    bind!(L, ch('h'), Exact(Mods::ALT), A::ToggleHints, "App", "Toggle hints on/off"),
+    bind!(L, ch('u'), Exact(Mods::NONE), A::DismissHint, "App", "Dismiss the current hint"),
+    bind!(L, ch('u'), Exact(Mods::ALT), A::ToggleHints, "App", "Toggle hints on/off"),
 ];
 
 /// The `Space g` sub-leader: git operations on the repo. Same plain/Alt sibling convention as the
@@ -1770,7 +1772,7 @@ mod tests {
             .all(|e| e.keys.starts_with("Space ")));
         // Hover is a leader chord, and one binding serves both source and the reading view.
         assert!(entries.iter().any(|e| e.mode == "Application"
-            && e.keys == "Space n"
+            && e.keys == "Space v"
             && e.desc == "Hover: type & docs, or link target"));
         // The flat list dedupes the shared Ctrl-editing keys: each (mode, keys, desc) row —
         // the picker item identity — appears exactly once.
@@ -1928,12 +1930,12 @@ mod tests {
     }
 
     #[test]
-    fn reveal_bindings_are_space_n_alt_n_m() {
+    fn reveal_bindings_are_space_v_alt_v_m() {
         // All three cursor-reveals are leader chords. Hover was a bare `Tab` until `Tab` was needed
         // for moving between a multi-element view's editors — and a bare letter is a motion here,
         // so the leader is where a reveal belongs anyway.
         assert!(matches!(
-            lookup(KeyContext::Leader, ch('n'), Mods::NONE).map(|b| b.action),
+            lookup(KeyContext::Leader, ch('v'), Mods::NONE).map(|b| b.action),
             Some(Action::Hover)
         ));
         // `Tab` was reserved for element focus when hover moved off it; that reservation is now
@@ -1949,17 +1951,16 @@ mod tests {
         // Read still answers neither: block editing has its own navigation, and a reader is one
         // element until the markdown ladder gives it more.
         assert!(lookup(KeyContext::Read, KeyCode::Tab, Mods::NONE).is_none());
-        // Diagnostic-at-cursor and blame live on the Space leader (`Alt-n` / `m`); `Space j` is
-        // the jumplist picker. The pair moved from `t`/`Alt-t` to `n`/`Alt-n` when the three view
-        // pickers took `a`/`b`/`t`; plain answers "what is this", Alt "what is wrong with it".
+        // Diagnostic-at-cursor and blame live on the Space leader (`Alt-v` / `m`); `Space j` is
+        // the jumplist picker. Plain answers "what is this", Alt "what is wrong with it".
         assert!(matches!(
-            lookup(KeyContext::Leader, ch('n'), Mods::ALT).map(|b| b.action),
+            lookup(KeyContext::Leader, ch('v'), Mods::ALT).map(|b| b.action),
             Some(Action::ShowDiagnostic)
         ));
-        // `Space t` is now the shells picker, not a reveal.
+        // `Space n` is the new-window pair, not a reveal.
         assert!(matches!(
-            lookup(KeyContext::Leader, ch('t'), Mods::NONE).map(|b| b.action),
-            Some(Action::OpenPicker(PickerKind::Shells))
+            lookup(KeyContext::Leader, ch('n'), Mods::NONE).map(|b| b.action),
+            Some(Action::NewWindow)
         ));
         assert!(matches!(
             lookup(KeyContext::Leader, ch('j'), Mods::NONE).map(|b| b.action),
@@ -2126,13 +2127,13 @@ mod tests {
         assert!(git(ch('j'), Mods::NONE).is_none());
 
         // The old single-key homes stay free — a stale reflex does nothing rather than something
-        // else. `t`, `u` and `Alt-t` are the exceptions, spent on the shells picker, the reader
-        // toggle and a new shell: **inert landings**, the same argument that let the keybindings
-        // picker reclaim `y` below. `Alt-t` was the old git commit, and opening a shell writes
-        // nothing — it hands you a prompt, which is where a stale reflex stops.
+        // else. `t`, `u` and `Alt-t` are the exceptions, spent on the tasks pickers and hint
+        // dismissal: **inert landings**, the same argument that let the keybindings picker reclaim
+        // `y` below. `Alt-t` was the old git commit, and the workspace tasks picker runs nothing
+        // until a row is chosen, which is where a stale reflex stops.
         assert!(matches!(
             lookup(KeyContext::Leader, ch('t'), Mods::ALT).map(|b| b.action),
-            Some(Action::ShellOpen)
+            Some(Action::OpenPicker(PickerKind::TasksWorkspace))
         ));
         // `y` (once branches) has since been reclaimed by the keybindings picker. Acceptable
         // because the landing is inert: a stale reflex opens a searchable list of every binding,
@@ -2199,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn leader_punctuation_is_settings_tasks_and_grep() {
+    fn leader_punctuation_is_settings_reader_and_grep() {
         let l = |code, mods| lookup(KeyContext::Leader, code, mods).map(|b| b.action);
         // `,` app-wide, `;` this workspace: same overlay family, narrower scope on the second.
         // Neither may move onto an Alt-chord — terminals eat `Alt-,`.
@@ -2212,13 +2213,19 @@ mod tests {
             Some(Action::OpenWorkspaceSettings)
         ));
         assert!(l(ch(','), Mods::ALT).is_none());
-        // `.` runs a task: from here, and Alt from anywhere in the workspace.
+        // `.` toggles the reader; its Alt sibling is free.
         assert!(matches!(
             l(ch('.'), Mods::NONE),
+            Some(Action::ToggleReadView)
+        ));
+        assert!(l(ch('.'), Mods::ALT).is_none());
+        // Tasks run from `t`: from here, and Alt from anywhere in the workspace.
+        assert!(matches!(
+            l(ch('t'), Mods::NONE),
             Some(Action::OpenPicker(PickerKind::Tasks))
         ));
         assert!(matches!(
-            l(ch('.'), Mods::ALT),
+            l(ch('t'), Mods::ALT),
             Some(Action::OpenPicker(PickerKind::TasksWorkspace))
         ));
         // The shortcut reference sits on `y`; `/` is grep, mirroring Normal mode's `/` and `Alt-/`.
@@ -2495,9 +2502,12 @@ mod tests {
             Some(Action::RepeatMotion)
         ));
         assert!(lookup(KeyContext::Normal, ch('r'), Mods::SHIFT).is_none());
-        // `.` is now the leader's alone (`Space .`), and the repeat pair displaced swap and
-        // transform onto `u`, one letter over, in both editing contexts.
-        assert!(lookup(KeyContext::Normal, ch('.'), Mods::NONE).is_none());
+        // The repeat pair displaced swap and transform onto `u`, one letter over, in both
+        // editing contexts; `.` is insert-at-end, not a repeat.
+        assert!(matches!(
+            lookup(KeyContext::Normal, ch('.'), Mods::NONE).map(|b| b.action),
+            Some(Action::EnterInsert(InsertWhere::SelectionEnd))
+        ));
         assert!(lookup(KeyContext::Global, ch('.'), Mods::CTRL).is_none());
         let u = |ctx, mods| lookup(ctx, ch('u'), mods).map(|b| b.action);
         assert!(matches!(
@@ -2567,6 +2577,55 @@ mod tests {
 
     /// The insert-entering set is what opens a change recording — the mode flip alone cannot be
     /// the signal, because the block open and a shell's open flip it only on the server's answer.
+    #[test]
+    fn insert_keys_are_punctuation_and_letters_stay_motions() {
+        let n = |code, mods| lookup(KeyContext::Normal, code, mods).map(|b| b.action);
+        let r = |code, mods| lookup(KeyContext::Read, code, mods).map(|b| b.action);
+        assert!(matches!(
+            n(ch(','), Mods::NONE),
+            Some(Action::EnterInsert(InsertWhere::SelectionStart))
+        ));
+        assert!(matches!(
+            n(ch('.'), Mods::NONE),
+            Some(Action::EnterInsert(InsertWhere::SelectionEnd))
+        ));
+        // `<`/`>` are shifted on every layout: a terminal reports SHIFT, the GUI and web don't.
+        for mods in [Mods::NONE, Mods::SHIFT] {
+            assert!(matches!(
+                n(ch('<'), mods),
+                Some(Action::EnterInsert(InsertWhere::FirstLineStart))
+            ));
+            assert!(matches!(
+                n(ch('>'), mods),
+                Some(Action::EnterInsert(InsertWhere::LastLineEnd))
+            ));
+        }
+        assert!(matches!(
+            r(ch(','), Mods::NONE),
+            Some(Action::ReadInsert { at_end: false })
+        ));
+        assert!(matches!(
+            r(ch('.'), Mods::NONE),
+            Some(Action::ReadInsert { at_end: true })
+        ));
+        // Collapse moved to `'` in both contexts.
+        assert!(matches!(
+            n(ch('\''), Mods::NONE),
+            Some(Action::CollapseSelection)
+        ));
+        assert!(matches!(
+            r(ch('\''), Mods::NONE),
+            Some(Action::CollapseSelection)
+        ));
+        // The old letter homes are free, plain and Alt.
+        for c in ['a', 'i'] {
+            for mods in [Mods::NONE, Mods::ALT] {
+                assert!(n(ch(c), mods).is_none(), "Normal {c} {mods:?}");
+                assert!(r(ch(c), mods).is_none(), "Read {c} {mods:?}");
+            }
+        }
+    }
+
     #[test]
     fn enters_insert_covers_every_entry_key() {
         assert!(Action::EnterInsert(InsertWhere::SelectionStart).enters_insert());
@@ -2659,14 +2718,14 @@ mod tests {
             lookup(KeyContext::Read, ch('j'), Mods::CTRL).map(|b| b.action),
             Some(Action::MoveBlock { down: true, .. })
         ));
-        // `%` selects every block (the char already encodes Shift), `,` collapses the block
+        // `%` selects every block (the char already encodes Shift), `'` collapses the block
         // selection, and the Delete key deletes block(s) exactly like Ctrl-d.
         assert!(matches!(
             lookup(KeyContext::Read, ch('%'), shifted(Mods::NONE)).map(|b| b.action),
             Some(Action::SelectAll)
         ));
         assert!(matches!(
-            lookup(KeyContext::Read, ch(','), Mods::NONE).map(|b| b.action),
+            lookup(KeyContext::Read, ch('\''), Mods::NONE).map(|b| b.action),
             Some(Action::CollapseSelection)
         ));
         assert!(matches!(

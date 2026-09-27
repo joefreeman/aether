@@ -541,7 +541,7 @@ interface CoreView {
   read: ReadDoc | null;
 }
 
-/** The workspace-settings overlay (`Space .`), when open (view.rs `workspace_settings`). Core-owned
+/** The workspace-settings overlay, when open (view.rs `workspace_settings`). Core-owned
  * state + key handling (`on_workspace_settings_key`); the shell renders this and routes keys
  * through the global keydown → `on_key`. Selection: 0 = name field, then the roots, `input_index`
  * (the add-root input), the projects, and `add_project_index` (the add-project input). */
@@ -1402,7 +1402,7 @@ export class Shell {
   /** Last-applied (state, theme) key, so the <link> is only rewritten when it actually changes
    *  (this runs on every status render). */
   private faviconKey = "";
-  /** The workspace-settings overlay (Space .). Core-owned state (`session.workspace_settings`); the
+  /** The workspace-settings overlay. Core-owned state (`session.workspace_settings`); the
    *  name + add-root fields are persistent native `<input>`s (real caret/selection/IME) that own
    *  text editing and sync to the core (`workspace_settings_set_name` / `_set_add`); nav/commit/cancel
    *  keys route through their keydown → `on_key`. The labels + root rows are rebuilt each render. */
@@ -1786,7 +1786,7 @@ export class Shell {
     this.faviconEl.rel = "icon";
     document.head.appendChild(this.faviconEl);
     this.faviconDark.addEventListener("change", () => this.updateFavicon());
-    // The workspace-settings overlay (Space .): a persistent modal whose name + add-root fields are
+    // The workspace-settings overlay: a persistent modal whose name + add-root fields are
     // native <input>s (so they keep focus + caret across re-renders and handle IME); only the
     // labels + root rows are rebuilt each render. A backdrop click is swallowed (editor stays put).
     this.workspaceSettingsEl = document.createElement("div");
@@ -2702,7 +2702,7 @@ export class Shell {
       case "new_window": {
         // With a concrete file target (reading-view Ctrl-Enter): open the app on that file in
         // a new tab — the picker-row treatment. Without one: another tab on the same URL (the
-        // `Space z` duplicate). Keypress-initiated, so it's a user gesture and isn't
+        // new-window duplicate). Keypress-initiated, so it's a user gesture and isn't
         // popup-blocked.
         if (a.path) {
           const v = this.view();
@@ -2731,7 +2731,7 @@ export class Shell {
         }
         break;
       case "copy_web_url":
-        // `Space Alt-z`: our own origin is the base — we may be reached through a port-forward
+        // Our own origin is the base — we may be reached through a port-forward
         // the server's loopback address would misname. The core already toasts the copy.
         void navigator.clipboard
           ?.writeText(`${location.origin}${location.pathname}${a.path_query ?? ""}`)
@@ -2837,7 +2837,7 @@ export class Shell {
     // As content — the element the cursor is in and a line of its buffer — which is what a scroll
     // position is; a row is something only the client can count, once it has the tree.
     // A fresh jump target (no saved scroll) rests near the top — the cross-buffer counterpart of
-    // the in-buffer jump reveal. A pending content anchor (a wrap toggle, `Space u`) wins over
+    // the in-buffer jump reveal. A pending content anchor (a wrap toggle, a reader toggle) wins over
     // both: the window loads around it and the view is placed by it when the window arrives.
     const anchor = this.session.relayout_anchor_position() as ScrollPosition | null;
     const scroll: ScrollPosition = anchor ??
@@ -2922,7 +2922,7 @@ export class Shell {
     // fighting it — every cursor move fires `RevealCursor`, and in code-heavy documents the
     // grid estimate diverges linearly from the real layout, dragging focus off screen. Gated on
     // the core's state, not this shell's flag: the reveal that frames the cursor as the reading
-    // view is *left* (`Space u`) arrives before the render that clears the flag, and it is the
+    // view is *left* (the reader toggle) arrives before the render that clears the flag, and it is the
     // editor's grid that reveal positions.
     const v = this.view();
     if (v.read !== null) return;
@@ -4075,7 +4075,7 @@ export class Shell {
     return span;
   }
 
-  /** The workspace-settings overlay (`Space .`): the editable workspace name, the roots list, and an
+  /** The workspace-settings overlay: the editable workspace name, the roots list, and an
    *  add-root input row — all rendered from the core's `session.workspace_settings`. Keyboard-driven
    *  (Alt-j/k navigate, Enter rename/add, Del then y remove, Esc close); keys route through the
    *  global keydown → `on_key`, so this only paints. Mirrors the TUI/iced overlays. */
@@ -4810,7 +4810,7 @@ export class Shell {
     const fileQuery = (pathIndex: number, relativePath: string): string => {
       const params = new URLSearchParams();
       // A temporary context can't be named in a link — its id is recycled and it dies with its last
-      // buffer — so its files are addressed absolutely, the `?path=` the CLI and `Space Alt-z` emit.
+      // buffer — so its files are addressed absolutely, the `?path=` the CLI and copy-web-URL emit.
       // The server resolves the context from the path (joining this very one while it lives).
       const root = ephemeral ? v.workspace_paths[pathIndex] : undefined;
       if (root) {
@@ -4917,7 +4917,7 @@ export class Shell {
       if (v.workspace) params.set("workspace", v.workspace);
       params.set("view", String(v.view_id));
     }
-    // …and a scratch in a temporary context has no address at all (the core's `Space Alt-z` refuses
+    // …and a scratch in a temporary context has no address at all (the core's copy-web-URL refuses
     // it for the same reason): leave the URL bare, so a reload offers the chooser rather than
     // reopening something that isn't there.
     // Record the presentation for markdown buffers, so a refresh restores what's on screen —
@@ -5543,7 +5543,7 @@ export class Shell {
       }
     }
     // The work in progress — shells, agents' turns, git operations — as a count in its own colour
-    // and its own section, after the git group. What the work is, `Space v` lists.
+    // and its own section, after the git group. What the work is, the activity picker lists.
     if (v.work_in_progress) {
       const el = document.createElement("span");
       el.className = "status-work";

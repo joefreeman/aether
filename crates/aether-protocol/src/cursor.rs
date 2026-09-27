@@ -160,7 +160,7 @@ pub enum Motion {
         edge: SelectionEdge,
     },
     /// An edge of the **block** the reading cursor is in: its first byte, or the caret gap after
-    /// its last content char. `i` and `a` in the reading view.
+    /// its last content char. The reading view's insert-at-start / insert-at-end.
     ///
     /// Server-side for [`SelectionEdge`]'s reason and one more. Finding the append point means
     /// walking back over the block's trailing blank lines, which needs the block's *text* — and a
@@ -373,12 +373,13 @@ pub struct CursorSelectLineParams {
 
 // ---- cursor/select_word -------------------------------------------------------------------------
 
-/// `w` / `Alt-w` — select a word. The first press grabs the word under the cursor (anchor to its
-/// start, cursor to its end); a repeat press advances to the next word. With `extend` the advance
-/// keeps the existing anchor, growing the selection by a word instead of replacing it. Single-char
-/// words are stepped over rather than dwelt on (a point cursor on a one-char word is
-/// indistinguishable from that word already being selected, so the gesture keeps moving forward).
-/// Returns the new cursor state. See `resolve_select_word` server-side for the exact rule.
+/// Select a word, walking in `direction`. The first press grabs the word under the cursor, oriented
+/// so the cursor leads (forward: anchor at its start, cursor at its end; backward: the reverse); a
+/// repeat press advances to the next (or previous) word. With `extend` the advance keeps the
+/// existing anchor, growing the selection by a word instead of replacing it. Single-char words are
+/// stepped over rather than dwelt on (a point cursor on a one-char word is indistinguishable from
+/// that word already being selected, so the gesture keeps moving). Returns the new cursor state.
+/// See `resolve_select_word` server-side for the exact rule.
 pub struct CursorSelectWord;
 impl RpcMethod for CursorSelectWord {
     const NAME: &'static str = "element/select_word";
@@ -390,6 +391,9 @@ impl RpcMethod for CursorSelectWord {
 pub struct CursorSelectWordParams {
     pub buffer_id: BufferId,
     pub boundary: WordBoundary,
+    /// Which way a repeat press walks. Defaults to `Forward` and is then omitted on the wire.
+    #[serde(default, skip_serializing_if = "crate::is_forward")]
+    pub direction: Direction,
     pub extend: bool,
     /// Repeat the select this many times (`0` = `1`) — the repeat loop lives server-side, so
     /// `3w` selects the third word (or, with `extend`, grows the selection by three words).

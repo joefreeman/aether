@@ -351,7 +351,7 @@ pub async fn agent_prompt(
         if c.is_running() {
             return Err(RpcError::new(
                 ErrorCode::AGENT_BUSY,
-                format!("{} is working — Space v to stop it", c.title),
+                format!("{} is working", c.title),
             ));
         }
 

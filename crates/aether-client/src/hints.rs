@@ -115,7 +115,7 @@ pub struct HintFacts {
     /// picker is the mandatory chooser: its Esc *exits* rather than closing the picker, so the
     /// picker-dismiss hint would mislead there and is suppressed.
     pub mandatory_chooser: bool,
-    /// The current buffer is markdown — gates the `reader` entry-point hint (`Space u` teaches
+    /// The current buffer is markdown — gates the `reader` entry-point hint (the toggle teaches
     /// nothing on a buffer the reading view refuses).
     pub markdown_buffer: bool,
     /// The reading view's focused block contains interactive elements (links, footnote refs,
@@ -139,7 +139,7 @@ pub enum Trigger {
 /// One curriculum entry. `keys` is an authored label (an action can have several bindings, and
 /// hints are curated anyway); a keymap test cross-checks the trigger still matches a real binding
 /// so a renamed action can't leave a stale hint behind. Label style: spaces separate the presses
-/// of a *sequence* (`Space h`, `s ␣`); slashes separate *alternatives* (`h/j/k/l`, `Alt-j/k`).
+/// of a *sequence* (`Space f`, `s ␣`); slashes separate *alternatives* (`h/j/k/l`, `Alt-j/k`).
 pub struct HintDef {
     pub id: &'static str,
     /// Curriculum tier: survival → files → editing → workspace/code → git & picker deep-cuts.
@@ -190,10 +190,10 @@ pub static CURRICULUM: &[HintDef] = &[
         keys: "Enter",
         trigger: Trigger::Picker(PickerCmd::OpenWorkspace),
         text: "Use {} to open the selected workspace" },
-    HintDef { id: "dismiss", tier: 0, contexts: &[C::Normal], keys: "Space h",
+    HintDef { id: "dismiss", tier: 0, contexts: &[C::Normal], keys: "Space u",
         trigger: Trigger::Action(|a| matches!(a, Action::DismissHint)),
         text: "Use {} to dismiss a hint" },
-    HintDef { id: "toggle", tier: 0, contexts: &[C::Normal], keys: "Space Alt-h",
+    HintDef { id: "toggle", tier: 0, contexts: &[C::Normal], keys: "Space Alt-u",
         trigger: Trigger::Action(|a| matches!(a, Action::ToggleHints)),
         text: "Use {} to toggle hints off/on" },
     HintDef { id: "help", tier: 0, contexts: &[C::Normal], keys: "Space y",
@@ -202,7 +202,7 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "quit", tier: 0, contexts: &[C::Normal], keys: "Space q",
         trigger: Trigger::Action(|a| matches!(a, Action::Quit)),
         text: "Use {} to quit" },
-    HintDef { id: "insert", tier: 0, contexts: &[C::Normal], keys: "i",
+    HintDef { id: "insert", tier: 0, contexts: &[C::Normal], keys: ",/.",
         trigger: Trigger::Action(|a| matches!(a, Action::EnterInsert(_))),
         text: "Use {} to insert text" },
     HintDef { id: "leave-insert", tier: 0, contexts: &[C::Insert], keys: "Esc",
@@ -230,7 +230,7 @@ pub static CURRICULUM: &[HintDef] = &[
         text: "Use {} to undo" },
 
     // ---- tier 2: selection-first editing ----
-    HintDef { id: "select-word", tier: 2, contexts: &[C::Normal], keys: "w",
+    HintDef { id: "select-word", tier: 2, contexts: &[C::Normal], keys: "w/b",
         trigger: Trigger::Action(|a| matches!(a, Action::SelectWord { .. })),
         text: "Use {} to select the word under the cursor" },
     HintDef { id: "select-line", tier: 2, contexts: &[C::Normal], keys: "x",
@@ -259,7 +259,7 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "goto-def", tier: 3, contexts: &[C::Normal], keys: "Enter",
         trigger: Trigger::Action(|a| matches!(a, Action::Activate)),
         text: "Use {} to go to the definition" },
-    HintDef { id: "hover", tier: 3, contexts: &[C::Normal], keys: "Space n",
+    HintDef { id: "hover", tier: 3, contexts: &[C::Normal], keys: "Space v",
         trigger: Trigger::Action(|a| matches!(a, Action::Hover)),
         text: "Use {} to see types & docs under the cursor" },
     HintDef { id: "diagnostics", tier: 3, contexts: &[C::Normal], keys: "d",
@@ -292,11 +292,11 @@ pub static CURRICULUM: &[HintDef] = &[
     // `read-source` shares the entry point's trigger but is deliberately a *separate* hint:
     // merged, the ladder would gate the way OUT of a view the app can open by default
     // (`markdown_read_default`), and each side's copy teaches a different destination.
-    // Shared learning still holds — one `Space u` press records a use on both.
-    HintDef { id: "reader", tier: 3, contexts: &[C::Normal], keys: "Space u",
+    // Shared learning still holds — one toggle press records a use on both.
+    HintDef { id: "reader", tier: 3, contexts: &[C::Normal], keys: "Space .",
         trigger: Trigger::Action(|a| matches!(a, Action::ToggleReadView)),
         text: "Use {} to open the markdown reading view" },
-    HintDef { id: "read-source", tier: 3, contexts: &[C::Read], keys: "Space u",
+    HintDef { id: "read-source", tier: 3, contexts: &[C::Read], keys: "Space .",
         trigger: Trigger::Action(|a| matches!(a, Action::ToggleReadView)),
         text: "Use {} to view the markdown source" },
     HintDef { id: "read-step", tier: 3, contexts: &[C::Read], keys: "j/k",
@@ -313,7 +313,7 @@ pub static CURRICULUM: &[HintDef] = &[
     // Same key and same action as `hover`, distinguished by context: over the reading view the
     // question "what is this?" is answered by the link's target rather than by the type. The id is
     // kept because hint ids are a persistence contract — a user's progress is stored against them.
-    HintDef { id: "read-peek", tier: 3, contexts: &[C::Read], keys: "Space n",
+    HintDef { id: "read-peek", tier: 3, contexts: &[C::Read], keys: "Space v",
         trigger: Trigger::Action(|a| matches!(a, Action::Hover)),
         text: "Use {} to preview the selection's target" },
     HintDef { id: "read-back", tier: 3, contexts: &[C::Read], keys: "Backspace",
@@ -609,13 +609,13 @@ impl HintEngine {
         )
     }
 
-    /// The user explicitly dismissed the displayed hint (`Space h`): bump its fatigue by
+    /// The user explicitly dismissed the displayed hint: bump its fatigue by
     /// [`DISMISS_WEIGHT`] (a deliberate "not now" outweighs a lapsed display period), rotate to
     /// another hint, and report the dismissal so the server's counter matches.
     ///
     /// This owns the *learning* of the dismiss binding too (the generic `run_action` observation
     /// skips [`Action::DismissHint`] — it would rotate a followed intro hint before the dismissal
-    /// ran, dismissing its replacement): every `Space h` press demonstrates the binding, and
+    /// ran, dismissing its replacement): every dismiss press demonstrates the binding, and
     /// pressing it while the dismiss hint itself is on screen is that hint's *follow* — the
     /// intro's "try it now" moment — not a dismissal to hold against it.
     pub fn dismiss(&mut self, ctx: Option<ContextId>, enabled: bool) -> Vec<WireEvent> {
@@ -1351,7 +1351,7 @@ mod tests {
             }]
         );
 
-        // Pressing Space h on it is the follow that advances the intro — not a dismissal.
+        // Pressing dismiss on it is the follow that advances the intro — not a dismissal.
         let (mut e, _) = engine();
         let evs = e.dismiss(Some(C::Normal), true);
         assert!(evs.contains(&WireEvent {

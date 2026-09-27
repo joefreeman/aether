@@ -1762,7 +1762,7 @@ pub fn resolve_scroll_anchor(
 /// Without this the reading view had no cursor row at all, and the anchor's whole first clause —
 /// *pin the cursor if it is visible* — was dead there: every capture fell through to the top line,
 /// and a cursor anchor captured in a file's editor resolved against its reader to "wherever the
-/// first thing is loaded", which is the top of the document. `Space u` threw the position away in
+/// first thing is loaded", which is the top of the document. The reader toggle threw the position away in
 /// both directions.
 fn position_row(
     window: &Window,
@@ -3899,7 +3899,7 @@ mod prose_tests {
         );
     }
 
-    /// `Space u` keeps the cursor where it was on screen, in **both** directions.
+    /// The reader toggle keeps the cursor where it was on screen, in **both** directions.
     ///
     /// A file's editor and its reader are two views over one buffer, and switching captures a
     /// content anchor across the re-presentation: the cursor's screen offset when the cursor is

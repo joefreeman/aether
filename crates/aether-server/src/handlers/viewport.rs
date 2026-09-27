@@ -146,7 +146,7 @@ pub async fn viewport_subscribe(
                 };
                 // The buffer this subscribe presents is a candidate too: what the collector
                 // decides about a buffer someone is showing is only whether its *hidden* views
-                // go — a `Space u` away from a preview leaves that preview to close itself.
+                // go — a reader toggle away from a preview leaves that preview to close itself.
                 for shown in shown_buffers {
                     if !buffers.contains(&shown) {
                         buffers.push(shown);

@@ -184,13 +184,13 @@ pub struct PendingPermission {
 }
 
 impl PendingPermission {
-    /// The option `Space v a` answers with: the first that allows. `None` when the agent offered
+    /// The option an accept answers with: the first that allows. `None` when the agent offered
     /// no allowing option, in which case there is nothing to accept.
     pub fn accept(&self) -> Option<&PermissionOption> {
         self.options.iter().find(|o| o.kind.allows())
     }
 
-    /// The option `Space v d` answers with: the first that rejects.
+    /// The option a reject answers with: the first that rejects.
     pub fn reject(&self) -> Option<&PermissionOption> {
         self.options.iter().find(|o| o.kind.rejects())
     }
@@ -501,7 +501,7 @@ pub fn speaker_row(block: &Block) -> Vec<Element> {
 ///
 /// The options are **buttons** — [`aether_protocol::ui::Element::Action`] — so `Tab` reaches them
 /// and `Enter` answers, and a pointer can simply press one. They were a row of coloured words with
-/// two keybindings (`Space v a`, `Space v d`) pointing at them from the client's keymap, which is
+/// two keybindings pointing at them from the client's keymap, which is
 /// the arrangement the action vocabulary exists to end: what a view can do is the view's to say.
 ///
 /// The wording stays the agent's own, as it always was. What the shell reads is

@@ -938,7 +938,7 @@ pub async fn view_set_transient(
     Ok(ViewSetTransientResult { transient })
 }
 
-/// `view/set_read` — flip how this client sees a markdown file: the `Space u` toggle. The mode
+/// `view/set_read` — flip how this client sees a markdown file: the reader toggle. The mode
 /// is the client's, and the file remembers it as its last showing; the client re-subscribes and
 /// the window comes back as prose or as lines accordingly. The session records how each file was
 /// last shown; `set_read_mode` marks it dirty and the flush at the end of this request writes it.

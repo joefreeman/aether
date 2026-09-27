@@ -92,7 +92,7 @@ pub struct AgentPromptResult {
 
 // ---- agent/cancel ------------------------------------------------------------------------------
 
-/// Stop the conversation's running turn — reached by `Ctrl-d` on its row in the activity picker (`Space v`), through [`crate::activity::ActivityCancel`]. The agent is asked to stop; unfinished tool
+/// Stop the conversation's running turn — reached by `Ctrl-d` on its row in the activity picker, through [`crate::activity::ActivityCancel`]. The agent is asked to stop; unfinished tool
 /// calls are marked cancelled and any pending permission request is answered `cancelled`, which is
 /// what the protocol requires of a client that cancels.
 pub struct AgentCancel;
@@ -117,8 +117,8 @@ pub struct AgentCancelResult {
 
 // ---- agent/respond -----------------------------------------------------------------------------
 
-/// Answer a tool call's pending permission request — `Space v a` / `Space v d`, or `Enter` on the
-/// block in Normal mode.
+/// Answer a tool call's pending permission request — `Enter` on the block in Normal
+/// mode.
 ///
 /// The options are the agent's, not ours: it supplies their ids and labels, and this returns one
 /// of them. That is why the answer is an opaque `option` string rather than an enum, and why this
@@ -254,8 +254,8 @@ pub struct PermissionOption {
     pub id: String,
     /// The agent's own wording. A shell paints this; it never invents its own.
     pub label: String,
-    /// Whether this option allows or rejects, so a shell can style the two differently and bind
-    /// `Space v a` / `Space v d` to the right ones without parsing labels.
+    /// Whether this option allows or rejects, so a shell can style the two differently and act on
+    /// the right one without parsing labels.
     pub kind: PermissionKind,
 }
 

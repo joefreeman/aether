@@ -22,10 +22,10 @@ pub type RunId = u64;
 
 // ---- shell/open --------------------------------------------------------------------------------
 
-/// Mint a shell — `Space Alt-t`.
+/// Mint a shell.
 ///
 /// **Creates**, unless [`ShellOpenParams::reuse`] names a shell by what it shows. "New" is the
-/// explicit half of the pair: `Space t` opens the shells picker, which is how you get back to one
+/// explicit half of the pair: the shells picker is which is how you get back to one
 /// you already have. The old "focused idle shell, else the MRU idle one, else a new one" heuristic
 /// went with the picker — it existed because there was no way to *list* the shells, and it made the
 /// same key mean two different things depending on state the user could not see. `reuse` is not
@@ -37,7 +37,7 @@ impl RpcMethod for ShellOpen {
     type Result = ShellOpenResult;
 }
 
-/// All optional: `{}` is `Space Alt-t`'s empty shell where a new one starts. The fields are what
+/// All optional: `{}` is the new-shell key's empty shell where a new one starts. The fields are what
 /// makes a **task** a shortcut for starting a shell rather than a mechanism of its own — the tasks
 /// picker opens one in the task's directory with its command typed, and runs it unless asked not
 /// to, in the shell that ran it last if there is one (`reuse`).
@@ -133,8 +133,8 @@ pub struct ShellRunResult {
 
 // ---- shell/cancel ------------------------------------------------------------------------------
 
-/// Stop the shell's running command — reached by `Ctrl-d` on its row in the activity picker
-/// (`Space v`), through [`crate::activity::ActivityCancel`], and by the run's own cancel button
+/// Stop the shell's running command — reached by `Ctrl-d` on its row in the activity picker,
+/// through [`crate::activity::ActivityCancel`], and by the run's own cancel button
 /// ([`crate::ui::ViewAction::Cancel`]). Kills the whole process group, so a `cargo build` goes
 /// with the `sh` that started it. What is queued behind it starts next.
 pub struct ShellCancel;

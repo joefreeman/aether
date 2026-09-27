@@ -359,7 +359,7 @@ impl TextField {
     }
 }
 
-/// The workspace-settings overlay state (`Space .`), migrated from the TUI's shell-local
+/// The workspace-settings overlay state, migrated from the TUI's shell-local
 /// `WorkspaceSettingsState` into the core so every shell renders it. Shows an editable
 /// workspace-name field, then the active workspace's roots, then an always-present "add root" input
 /// row; `selected` is the focused field.
@@ -946,7 +946,7 @@ pub enum RepeatTarget {
 /// What `Ctrl-r` replays: the last change, as the steps that made it.
 ///
 /// A plain edit (`Ctrl-d`, `Ctrl-l`, a resolved surround) is one step. An **insert session** is the
-/// run from the key that entered Insert (`i`, `Ctrl-e`, `Ctrl-o`, …) through everything typed or
+/// run from the key that entered Insert (insert, change, open line, …) through everything typed or
 /// done in it to the `Esc` that left, recorded as one change because that is the unit a repeat is
 /// asked for: "do that again" after `Ctrl-e foo Esc` means the change *and* the text. Replayed
 /// against the current selection — never bundled with the motion that made the selection, so `r`
@@ -1415,7 +1415,7 @@ pub struct Session {
     pub prompt: Option<Prompt>,
     /// An open picker overlay; owns the keyboard while open.
     pub picker: Option<PickerState>,
-    /// The workspace-settings overlay (`Space .`); owns the keyboard while open.
+    /// The workspace-settings overlay; owns the keyboard while open.
     pub workspace_settings: Option<WorkspaceSettings>,
     /// The application-settings overlay (`Space,`); owns the keyboard while open.
     pub app_settings: Option<AppSettingsOverlay>,
@@ -1766,7 +1766,7 @@ pub fn lsp_toast_group(language: &str, workspace_root: &str) -> String {
 ///
 /// Grouped, and deliberately on one key for the whole reason rather than per buffer or per
 /// gesture: the message is the same whichever edit asked, so holding `Ctrl-j` down — or trying
-/// `i`, then a delete, then a line move — refreshes one warning in place instead of stacking a
+/// insert, then a delete, then a line move — refreshes one warning in place instead of stacking a
 /// column of identical ones. Built here so the sites that refuse can't drift apart on either the
 /// wording or the key.
 pub fn read_only_toast() -> Effects {
@@ -1868,13 +1868,13 @@ impl Session {
                         id: AppSettingId::Hints,
                         label: "Hints",
                         control: AppSettingControl::Toggle(self.hints_enabled),
-                        hint: "Suggest things to try in the corner (Space h dismisses one, Space Alt-h toggles)",
+                        hint: "Suggest things to try in the corner",
                     },
                     AppSettingRow {
                         id: AppSettingId::MarkdownRead,
                         label: "Markdown reading view",
                         control: AppSettingControl::Toggle(self.markdown_read_default),
-                        hint: "Open Markdown files rendered for reading (Space u toggles per file)",
+                        hint: "Open Markdown files rendered for reading",
                     },
                     AppSettingRow {
                         id: AppSettingId::MarkdownWidth,
@@ -1996,7 +1996,7 @@ impl Session {
 
     /// How much the workspace has in progress — shells running a command, agents working through
     /// a turn, git operations — or `None` when nothing is. The status bar's one work indicator is
-    /// this count and a glyph; what the work *is* lives in `Space v`, which lists it.
+    /// this count and a glyph; what the work *is* lives in the activity picker, which lists it.
     pub fn work_in_progress(&self) -> Option<usize> {
         (!self.activity.is_empty()).then_some(self.activity.len())
     }

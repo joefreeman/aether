@@ -464,6 +464,7 @@ pub async fn cursor_select_word(
             working.position,
             working.anchor,
             params.boundary,
+            params.direction,
             params.extend,
         );
         CursorState {

@@ -5462,7 +5462,7 @@ fn row(name: &str, command: &str, file: &str) -> (String, String, String) {
     (name.into(), command.into(), file.into())
 }
 
-/// `Space .` lists what runs from where you are: the file's own directory first, then each one up
+/// The tasks picker lists what runs from where you are: the file's own directory first, then each one up
 /// to the root — and nothing from a directory beside it.
 #[tokio::test]
 async fn tasks_picker_lists_the_tasks_from_the_files_directory_upward() {
@@ -5509,7 +5509,7 @@ async fn tasks_picker_lists_the_tasks_from_the_files_directory_upward() {
     drop(server);
 }
 
-/// `Space Alt-.` lists every task in the workspace, a directory's before its subdirectories'.
+/// The workspace tasks picker lists every task in the workspace, a directory's before its subdirectories'.
 #[tokio::test]
 async fn tasks_workspace_picker_lists_every_task() {
     let (server, mut ws, _dir) = setup_tasks_workspace().await;
@@ -5606,7 +5606,7 @@ async fn tasks_picker_is_empty_without_runner_files() {
 }
 
 /// "Here" is a file's directory and nothing stands in for one: from a scratch — or with nothing
-/// named at all — `Space .` is refused with the remedy, as the Git pickers refuse without a file to
+/// named at all — the tasks picker is refused with the remedy, as the Git pickers refuse without a file to
 /// find a repo from. The workspace-wide list needs no file.
 #[tokio::test]
 async fn tasks_picker_needs_a_file() {

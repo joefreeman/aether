@@ -53,7 +53,7 @@ pub struct ViewOpenParams {
     /// outline, a reference, a grep hit) stays on the page. A client sends `Some` only when its
     /// route decided: a followed `#anchor` asks to read, the web shell's `as=` URL for what it
     /// recorded, a history step for the mode it left. Ignored for any file that is not markdown,
-    /// and for a view a driver built. `Space u` flips the mode in place with
+    /// and for a view a driver built. The reader toggle flips the mode in place with
     /// [`ViewSetRead`] instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read: Option<bool>,
@@ -337,7 +337,7 @@ pub struct ViewClosedParams {
 // ---- view/set_read ----------------------------------------------------------------------------
 
 /// Flip how **this client** sees a markdown file: read it as the rendered document, or edit its
-/// source — the `Space u` toggle.
+/// source — the reader toggle.
 ///
 /// A presentation mode of the file for one client, kept server-side beside the cursor (both are
 /// "this client's relationship to this buffer"): the server composes the window, and since the

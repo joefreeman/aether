@@ -1357,6 +1357,7 @@ fn cursor_select_word_params_shape() {
     let v = to_value(CursorSelectWordParams {
         buffer_id: 3,
         boundary: WordBoundary::Word,
+        direction: Direction::Forward,
         extend: true,
         count: 1,
     })
@@ -1370,6 +1371,7 @@ fn cursor_select_word_params_shape() {
     let v = to_value(CursorSelectWordParams {
         buffer_id: 3,
         boundary: WordBoundary::BigWord,
+        direction: Direction::Forward,
         extend: false,
         count: 4,
     })
@@ -1379,7 +1381,21 @@ fn cursor_select_word_params_shape() {
         json!({"buffer_id": 3, "boundary": "WORD", "extend": false, "count": 4})
     );
 
-    // Omitted count defaults to 1.
+    // Backward rides along; forward (the default) is omitted, as above.
+    let v = to_value(CursorSelectWordParams {
+        buffer_id: 3,
+        boundary: WordBoundary::Word,
+        direction: Direction::Backward,
+        extend: false,
+        count: 1,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({"buffer_id": 3, "boundary": "word", "direction": "backward", "extend": false})
+    );
+
+    // Omitted count defaults to 1, omitted direction to forward.
     let p: CursorSelectWordParams = from_value(json!({
         "buffer_id": 3,
         "boundary": "word",
@@ -1387,6 +1403,7 @@ fn cursor_select_word_params_shape() {
     }))
     .unwrap();
     assert_eq!(p.count, 1);
+    assert_eq!(p.direction, Direction::Forward);
 }
 
 #[test]
@@ -2099,7 +2116,7 @@ fn view_open_params_carry_a_view_an_element_and_a_read_flag() {
     assert_eq!(back.element, None);
 }
 
-/// `view/set_read` — the `Space u` toggle: a view and a mode in, the mode out.
+/// `view/set_read` — the reader toggle: a view and a mode in, the mode out.
 #[test]
 fn view_set_read_shape() {
     use aether_protocol::view::{ViewSetRead, ViewSetReadParams, ViewSetReadResult};
@@ -4999,8 +5016,8 @@ fn picker_item_shell_is_tagged() {
     assert_eq!(back, fresh);
 }
 
-/// The tasks pickers are two kinds with one row: from here (`Space .`) and the whole workspace
-/// (`Space Alt-.`). A task row carries what to run and where, the file it came from twice (the path
+/// The tasks pickers are two kinds with one row: from here and the whole workspace.
+/// A task row carries what to run and where, the file it came from twice (the path
 /// to open, and the path to show), and a description only when the task has one.
 #[test]
 fn picker_tasks_kinds_and_row_shape() {
@@ -7578,7 +7595,7 @@ fn an_action_is_an_inline_leaf() {
 }
 
 /// `shell/open` answers with an open plus the element to type into. Its params are all optional:
-/// `Space Alt-t` sends `{}`, and a task sends where to start, what to type and whether to run it.
+/// A new shell sends `{}`, and a task sends where to start, what to type and whether to run it.
 ///
 /// The `new` flag is gone with the reuse heuristic: the key always mints a shell, and returning to
 /// one you have is the shells picker. An old client's `{"new": true}` still parses — serde ignores

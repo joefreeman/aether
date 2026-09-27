@@ -222,7 +222,7 @@ pub enum Event {
     /// `Enter` in a composed view resolved (or didn't) to the file the line under the cursor
     /// named — a patch line's blob, a shell line's `path:line:col`.
     LineFollowed(Result<aether_protocol::view::ViewFollowLineResult, String>),
-    /// `Space Alt-t` answered with the shell to show and which of its elements to type into.
+    /// A new shell's open answered with the shell to show and which of its elements to type into.
     ShellOpened(Result<aether_protocol::shell::ShellOpenResult, RpcError>),
     /// A submit landed, or was refused — the refusal is the interesting half, since it names the
     /// command in the way and the typed text is deliberately still there.
@@ -233,7 +233,7 @@ pub enum Event {
     /// finished, which is said; a stop that did land says nothing — the row leaves the list, and
     /// the finish arrives as a push.
     ActivityCancelled(Result<aether_protocol::activity::ActivityCancelResult, RpcError>),
-    /// `view/set_read` (`Space u`, an edit transition out of the reader) resolved: the mode is
+    /// `view/set_read` (the reader toggle, an edit transition out of the reader) resolved: the mode is
     /// flipped server-side, so re-subscribe and adopt whatever window comes back — or report the
     /// failure.
     ReadSet(Result<aether_protocol::view::ViewSetReadResult, String>),
@@ -902,7 +902,7 @@ impl Session {
             // metadata block or the message — nothing to follow, and deliberately silent: `Enter`
             // is a common key and a toast for pressing it on the subject line would be noise.
             // The shell is now on screen; the caret goes into its input, in Insert, so
-            // `Space Alt-t`, type, `Enter` reads like a REPL. The focused element is set before the
+            // New shell, type, `Enter` reads like a REPL. The focused element is set before the
             // resubscribe so the server is told which element to focus rather than being asked to
             // guess from a scroll the client may not have adopted yet.
             // The same landing a shell gets: adopt, focus the input, and start typing. Both are
@@ -2272,7 +2272,7 @@ impl Session {
             },
 
             // Selections open in place: the window shows one buffer, and the one being
-            // replaced is a `Space v` away (buffers persist server-side). Opens are
+            // replaced is still in the buffers picker (buffers persist server-side). Opens are
             // transient previews — switching away from one closes it.
             Event::PickerSelected { result: Ok(result) } => match result {
                 PickerSelectResult::File { path } => self.open_path_at(path, None, None),
@@ -3657,7 +3657,7 @@ impl Session {
     /// an element of that kind under the cursor puts the session in the reading view over the
     /// document it carries, re-adopting whenever that changes (an edit, an undo, another client's
     /// change — all of them arrive as a pushed window, so nothing is fetched); an ordinary editor
-    /// takes the reading view down. Nothing else decides which view is showing: `Space u` and the
+    /// takes the reading view down. Nothing else decides which view is showing: the reader toggle and the
     /// edit transitions only *ask*, through the subscribe, and adopt whatever comes back.
     ///
     /// There is no half-loaded case to guard any more. A prose element has no wire rows, so the
@@ -4348,7 +4348,7 @@ impl Session {
         fx
     }
 
-    /// Copy the web client's URL for the current view (`Space Alt-z`): a file buffer becomes the
+    /// Copy the web client's URL for the current view: a file buffer becomes the
     /// root-relative `?workspace=&root=&file=` link with the cursor as its 1-based `#L:C`
     /// fragment (a shared-cursor link — the web boot jumps there); a scratch becomes a
     /// `?workspace=&view=` link. A file with no workspace to be relative to — one outside every
@@ -5845,7 +5845,7 @@ impl Session {
 
     /// Enter / row click: act on the highlighted item. Directories and roots navigate within
     /// the open explorer; everything else closes the panel and runs `picker/select`.
-    /// The [`WindowTarget`] that duplicates the current view (`Space z`): a real workspace lands
+    /// The [`WindowTarget`] that duplicates the current view: a real workspace lands
     /// the sibling on its MRU buffer (`WindowOpen::Workspace`); an ephemeral file context passes the
     /// buffer's path (the ephemeral id isn't CLI-addressable); a pathless ephemeral scratch can't be
     /// reproduced, so the sibling opens the chooser.
@@ -5862,7 +5862,7 @@ impl Session {
         WindowTarget {
             workspace,
             // The same context, not just the same workspace: duplicating a window on a worktree and
-            // landing on the main checkout would be a surprising `Space z`.
+            // landing on the main checkout would be a surprising new window.
             worktrees: self.window_worktrees(),
             open,
         }
@@ -8450,7 +8450,7 @@ impl Session {
         }
     }
 
-    /// Open the workspace-settings overlay (`Space .`), seeded from the active workspace's name and
+    /// Open the workspace-settings overlay, seeded from the active workspace's name and
     /// roots. Focus lands on the always-present add-root input row at the bottom, since most opens
     /// (especially the post-create flow) are to add a root; the name field is above the roots and
     /// reached with Alt-k. Migrated from the TUI's `open_workspace_settings`.
@@ -9267,10 +9267,10 @@ impl Session {
             AppSettingId::UiFontSize => {
                 self.set_ui_font_size(step_font_size(self.ui_font_size, true, true))
             }
-            // Hints: same flip (and toast) as `Space Alt-h`.
+            // Hints: same flip (and toast) as the hints-toggle key.
             AppSettingId::Hints => self.toggle_hints(),
             // Markdown reading view default: applies to files never presented (the server
-            // remembers how each file was last shown; `Space u` re-presents without touching the
+            // remembers how each file was last shown; the reader toggle re-presents without touching the
             // setting). Flip + persist.
             AppSettingId::MarkdownRead => {
                 self.markdown_read_default = !self.markdown_read_default;
@@ -9310,9 +9310,9 @@ impl Session {
         }
     }
 
-    /// Flip hints on/off, persist, and announce it. Shared by `Space Alt-h` and the settings
+    /// Flip hints on/off, persist, and announce it. Shared by the hints-toggle key and the settings
     /// row. The toast is the affordance: turning hints off just empties a corner, which reads as
-    /// nothing happening — and the off-message names the chord, so off is discoverably
+    /// nothing happening — and the off-message points at the same key, so off is discoverably
     /// reversible.
     fn toggle_hints(&mut self) -> Effects {
         self.hints_enabled = !self.hints_enabled;
@@ -10080,7 +10080,7 @@ impl Session {
         // `Effect::Exit` tearing the process down, rather than queuing behind it and being lost.
         let hint_ctx = self.hint_env();
         let enabled = self.hints_enabled;
-        // `Space h` owns its hint learning inside the engine's `dismiss` — observing it here
+        // Dismissal owns its hint learning inside the engine's `dismiss` — observing it here
         // would rotate a followed intro hint before the dismissal ran, dismissing its
         // replacement instead.
         let evs = if matches!(action, Action::DismissHint) {
@@ -10346,8 +10346,7 @@ impl Session {
         match action {
             // ---- motions ----
             A::MoveChar(direction) => self.move_motion(Motion::Char { direction, count }, extend),
-            // `b` / `Alt-b` in Normal (backward only — `w` there selects words via
-            // `CursorSelectWord`), `Alt-←` / `Alt-→` in Insert (both directions).
+            // `Alt-←` / `Alt-→` in Insert — Normal's `w`/`b` select words via `CursorSelectWord`.
             A::MoveWord { dir, boundary } => self.move_motion(
                 Motion::Word {
                     direction: dir,
@@ -10489,10 +10488,11 @@ impl Session {
             }
 
             // ---- selection ----
-            A::SelectWord { boundary } => self.request_str::<CursorSelectWord>(
+            A::SelectWord { dir, boundary } => self.request_str::<CursorSelectWord>(
                 CursorSelectWordParams {
                     buffer_id,
                     boundary,
+                    direction: dir,
                     extend,
                     count,
                 },
@@ -11146,7 +11146,7 @@ impl Session {
                 aether_protocol::agent::AgentOpenParams { agent: None },
                 Event::AgentOpened,
             ),
-            // Always a new shell: returning to one you have is `Space t`, the shells picker.
+            // Always a new shell: returning to one you have is the shells picker.
             A::ShellOpen => self.request::<aether_protocol::shell::ShellOpen>(
                 aether_protocol::shell::ShellOpenParams::default(),
                 Event::ShellOpened,
@@ -11407,7 +11407,7 @@ impl Session {
         }
     }
 
-    /// Toggle the reading view on the current buffer (`Space u`): ask the server for the other
+    /// Toggle the reading view on the current buffer: ask the server for the other
     /// kind, which it remembers for the file. Non-markdown buffers toast instead.
     fn toggle_read_view(&mut self) -> Effects {
         if self.view.buffer.language.as_deref() != Some("markdown") {
@@ -11572,14 +11572,14 @@ impl Session {
         }
     }
 
-    /// `i`/`a`: to the editor, inserting at the selection's start / end. An extended
+    /// To the editor, inserting at the selection's start / end. An extended
     /// selection uses the editor's own Insert-entry motions (`SelectionEdge`, resolved
     /// server-side); a bare reading position enters at the focused block's start, or its
     /// append position — the caret gap before the block's terminating newline (buffer end
     /// when the last block has none).
     ///
     /// A document with no blocks at all (empty, or nothing but blank lines) has no focus to
-    /// resolve, so the *document* is the target: `i` at its start, `a` at its end. Without that
+    /// resolve, so the *document* is the target: its start, or its end. Without that
     /// fallback the reading view is a dead end on exactly the buffer you most want to type
     /// into — nothing on screen and every edit transition a silent no-op.
     fn read_insert(&mut self, at_end: bool) -> Effects {
@@ -11597,7 +11597,7 @@ impl Session {
                 // normal form, so its last char *is* the terminating newline and "one past the
                 // last char" is column 0 of the separator line below — typing there wedges the
                 // text into the gap between blocks. The bare-position branch above parks before
-                // that newline, and `a` has to mean the same thing either way.
+                // that newline, and insert-at-end has to mean the same thing either way.
                 InsertWhere::LastLineEnd
             } else {
                 InsertWhere::SelectionStart
@@ -12407,7 +12407,7 @@ impl Session {
         )
     }
 
-    /// `i`/`a`/`Alt-i`/`Alt-a` — collapse to the chosen selection edge. One RPC: the server owns
+    /// Insert entry — collapse to the chosen selection edge. One RPC: the server owns
     /// the selection, so it resolves the edge (`Motion::SelectionEdge` — formerly a
     /// set-cursor-then-adjust chain).
     fn enter_insert_at(&mut self, where_: InsertWhere) -> Effects {
@@ -13306,7 +13306,7 @@ mod tests {
         })
     }
 
-    /// `Space Alt-z` on a file buffer: the root-relative `?workspace=&file=` link the web boot
+    /// Copy-web-URL on a file buffer: the root-relative `?workspace=&file=` link the web boot
     /// parses, with the cursor as its 1-based `#L:C` fragment, plus the confirmation toast.
     /// The base is deliberately absent — the shell prepends its own.
     #[test]

@@ -289,7 +289,7 @@ async fn opening_a_shell_lands_in_its_input() {
 ///
 /// It used to hand the idle one back — a rule that existed only because there was no way to *list*
 /// the shells, and that made the same key open a new shell or an old one depending on state the
-/// user could not see. `Space t` is that list now, so `Space Alt-t` has one meaning and the params
+/// user could not see. The shells picker is that list now, so the new-shell key has one meaning and the params
 /// carry no flag at all.
 #[tokio::test]
 async fn every_open_mints_the_next_shell() {

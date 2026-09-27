@@ -396,7 +396,7 @@ impl WasmSession {
         self.inner.subscribe_focus()
     }
 
-    /// Where a pending content anchor (a wrap toggle, `Space u`) says the next subscribe should
+    /// Where a pending content anchor (a wrap toggle, a reader toggle) says the next subscribe should
     /// open — a `ScrollPosition`, or `null` when none is pending. The subscribe loads a window
     /// around it so `resolve_scroll_anchor` can place the view exactly once the window arrives.
     pub fn relayout_anchor_position(&self) -> Result<JsValue, JsValue> {
@@ -1129,7 +1129,7 @@ fn action_value(a: &ShellAction) -> Value {
         ShellAction::ToggleWrap => json!({ "name": "toggle_wrap" }),
         // The shell opens a new tab: with a concrete file target (the reading view's
         // Ctrl-Enter) it builds a same-app URL for that file; without one it duplicates the
-        // current tab (`Space z`). The picker's Ctrl-Enter never reaches here (rows are
+        // current tab. The picker's Ctrl-Enter never reaches here (rows are
         // `<a>` links, handled shell-side by `onPickerInputKey`).
         ShellAction::NewWindow(target) => {
             let mut v = json!({ "name": "new_window" });
@@ -1253,10 +1253,10 @@ mod tests {
 
     #[test]
     fn entering_insert_mode_dispatches_through_the_core() {
-        // `i` enters Insert mode — proves a key crosses into the core and produces a real effect
+        // Insert entry — proves a key crosses into the core and produces a real effect
         // list (the whole point of Phase 1's boundary), without needing a live server.
         let mut s = WasmSession::new();
-        let _effects = s.dispatch_key("i", "KeyI", false, false, false);
+        let _effects = s.dispatch_key(",", "Comma", false, false, false);
         assert_eq!(s.inner.view.mode, aether_client::session::Mode::Insert);
     }
 

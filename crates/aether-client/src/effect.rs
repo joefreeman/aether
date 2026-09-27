@@ -36,14 +36,14 @@ pub enum ShellAction {
         relative: String,
     },
     /// Open a [`WindowTarget`] in a *new* window. Two entry points build the target in the core:
-    /// `Space z` ([`crate::keymap::Action::NewWindow`]) duplicates the current view, and
+    /// [`crate::keymap::Action::NewWindow`] duplicates the current view, and
     /// `Ctrl-Enter` in a picker opens the highlighted item (the native sibling of the web client's
     /// Ctrl/Cmd-Enter "open in a new tab"). The GUI shell spawns a fresh detached `ae --gui` seeded
     /// from the target; the TUI ignores it (no window to spawn); the web shell opens a new browser
     /// tab on the same URL (`window.open`) — its Ctrl-Enter is handled shell-side, so the picker
     /// path never reaches here on the web.
     NewWindow(WindowTarget),
-    /// Copy the web client's URL for the current view (`Space Alt-z`). `path_query` is the
+    /// Copy the web client's URL for the current view. `path_query` is the
     /// `?workspace=…` query (+ optional `#L:C` fragment) from [`crate::web_link`]; the shell
     /// prepends its own base and writes the clipboard — the native shells derive `http://…`
     /// from the server address they dialed, the web shell uses its own origin (which may be a
@@ -54,7 +54,7 @@ pub enum ShellAction {
 
 /// A resolved target for opening a *new* window ([`ShellAction::NewWindow`]). The core resolves
 /// everything the spawning shell needs into plain strings/ids — the shell only turns it into a fresh
-/// `ae` invocation. Built by [`crate::update`]'s `current_view_target` (`Space z`) or
+/// `ae` invocation. Built by [`crate::update`]'s `current_view_target` (new window) or
 /// `picker_item_target` (`Ctrl-Enter`), the latter's item set mirroring the web client's `pickerItemUrl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowTarget {
@@ -66,7 +66,7 @@ pub struct WindowTarget {
     /// base. Carried as the binding *set* rather than the server's internal context id, because the
     /// id is internal — activation takes the set and derives it.
     ///
-    /// Deliberately not a CLI flag. `Space z` opens a window in-process (the GUI) or a tab (the
+    /// Deliberately not a CLI flag. A new window opens a window in-process (the GUI) or a tab (the
     /// web), so this never has to survive a command line; and a user-facing `--worktree` beside a
     /// path positional would raise "is that path relative to the checkout or the tree?", which has
     /// no non-arbitrary answer. Reaching a context by hand is what the branch picker is for.
@@ -89,7 +89,7 @@ pub enum WindowOpen {
     /// views are daemon-global. Stale-id-safe: the shell falls back to the MRU/scratch if the id is
     /// gone (the daemon restarted).
     View(aether_protocol::ViewId),
-    /// No specific file: activate the workspace and land on its MRU buffer (the `Space z`
+    /// No specific file: activate the workspace and land on its MRU buffer (the new-window
     /// duplicate, and the Workspaces picker's "open this workspace in a new window").
     Workspace,
 }

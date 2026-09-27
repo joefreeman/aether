@@ -16,8 +16,8 @@ use crossterm::execute;
 use std::io::stdout;
 use std::time::Instant;
 
-/// Editor's modal-edit state — toggled by the user's keybindings (`i` enters Insert, `Esc`
-/// returns to Normal, etc.). Lives entirely client-side; the server has no notion of mode.
+/// Editor's modal-edit state — toggled by the user's keybindings (entering Insert, `Esc`
+/// returning to Normal, etc.). Lives entirely client-side; the server has no notion of mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EditorMode {
     #[default]
@@ -235,7 +235,7 @@ pub struct AppState {
     /// the editor window. Synced from the session each frame; the layout itself is cached
     /// shell-side by `(buffer, revision, cols)`.
     pub read: Option<ReadViewState>,
-    /// Active workspace-settings overlay (`Space .`). When `Some`, draws a centered modal listing
+    /// Active workspace-settings overlay. When `Some`, draws a centered modal listing
     /// the workspace's roots, with a permanent add-root input row at the bottom. Closed by Esc.
     pub workspace_settings: Option<WorkspaceSettingsState>,
     /// Active application-settings overlay (`Space ,`). When `Some`, draws a centered modal

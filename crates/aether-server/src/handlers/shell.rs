@@ -88,7 +88,7 @@ pub async fn shell_open(
             (transcript, true)
         }
         // Always a new one otherwise. Returning to a shell you already have is the shells
-        // picker's job (`Space t`), which is a list you can see — unlike the reuse heuristic this
+        // picker's job, which is a list you can see — unlike the reuse heuristic this
         // replaced, where the same key opened a new shell or an old one depending on which was
         // idle.
         None => {
@@ -117,7 +117,7 @@ pub async fn shell_open(
     }
 
     // A matched shell still running the line: switched to, and nothing more — stopping it is a
-    // decision for the activity picker (`Space v`), not a side effect of asking again.
+    // decision for the activity picker, not a side effect of asking again.
     let busy = {
         let s = state.lock().await;
         s.try_doc_of(transcript)

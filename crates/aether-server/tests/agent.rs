@@ -1735,7 +1735,7 @@ async fn an_agent_view_cannot_be_made_transient() {
 //
 // A conversation is mostly machinery, and the machinery is mostly not what you came to read: tool
 // calls arrive folded, so what is on screen is the turn — what you asked, what the agent said —
-// with a titled rule per thing it did. `Tab` walks those rules and `Space v e` opens one up.
+// with a titled rule per thing it did. `Tab` walks those rules and `Enter` opens one up.
 
 /// Subscribe and return the window, at a size that fits everything the tests below produce.
 async fn window_of(

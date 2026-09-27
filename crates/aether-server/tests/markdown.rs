@@ -1318,7 +1318,7 @@ async fn block_content_stops_before_the_terminator() {
     drop(server);
 }
 
-/// `i` and `a` land at the block's start and at its append point.
+/// Insert-at-start and insert-at-end land at the block's start and at its append point.
 #[tokio::test]
 async fn block_edge_lands_at_the_blocks_start_and_append_point() {
     use aether_protocol::cursor::{CursorMoveParams, Motion};
@@ -2000,7 +2000,7 @@ async fn open_as(ws: &mut Ws, buffer_id: u64, read: Option<bool>) -> ViewOpenRes
     .await
 }
 
-/// Flip how this client sees `view` — `Space u`.
+/// Flip how this client sees `view` — the reader toggle.
 async fn set_read(ws: &mut Ws, view: aether_protocol::ViewId, read: bool) -> bool {
     send_request::<aether_protocol::view::ViewSetRead>(
         ws,
@@ -2161,7 +2161,7 @@ async fn activate_test_proj(ws: &mut Ws) {
     .await;
 }
 
-/// A file has **one** view, and reading is how a client sees it: `Space u` flips the mode in
+/// A file has **one** view, and reading is how a client sees it: the reader toggle flips the mode in
 /// place — the same view, the same buffer — and the file reopens as it was left. Closing the view
 /// closes the file, memory and all: a fresh open starts from the setting again.
 #[tokio::test]
@@ -2437,7 +2437,7 @@ mod view_transience {
         (server, ws, open)
     }
 
-    /// `Space u` is not a keep: a preview flipped to source is still a preview, and goes with
+    /// The reader toggle is not a keep: a preview flipped to source is still a preview, and goes with
     /// the buffer once hidden — the file is no longer open.
     #[tokio::test]
     async fn flipping_the_mode_does_not_keep_a_preview() {

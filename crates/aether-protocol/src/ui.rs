@@ -160,7 +160,7 @@ pub enum Element {
     ///
     /// The vocabulary's answer to "this view can be acted on", as [`Element::Editor`] is its answer
     /// to "this is text to edit". Before it, every affordance a view grew took a *keybinding* with
-    /// it — `Space v a`/`d` to answer an agent, `Space g s`/`u` to stage — so the keymap grew a row
+    /// it — one to answer an agent, `Space g s`/`u` to stage — so the keymap grew a row
     /// per view kind and the mouse could reach none of them. What a view can do is a fact about the
     /// view, so the view says it, and one key activates whatever is focused.
     ///

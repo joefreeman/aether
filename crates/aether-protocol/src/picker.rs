@@ -233,7 +233,7 @@ pub enum PickerKind {
     /// you are standing in — "where you are" is the selection, not a glyph on the row. So the row
     /// carries no `current` flag: nothing renders one.
     GitBaseline,
-    /// The tasks runnable **from here** (`Space .`): the justfile, Makefile, `mise.toml` and
+    /// The tasks runnable **from here**: the justfile, Makefile, `mise.toml` and
     /// `package.json` tasks in the directory of the file you are looking at and in each directory
     /// above it up to its workspace root, nearest first. That is the set the runners themselves
     /// resolve — `just` and `npm run` take the nearest file upward, mise merges every ancestor's
@@ -251,10 +251,10 @@ pub enum PickerKind {
     /// Rebuilt on every fresh open — discovery reads a handful of small files — and preserved
     /// across a scroll re-view, like the other snapshot kinds.
     Tasks,
-    /// Every task in the workspace (`Space Alt-.`) — the modal sibling of [`Self::Tasks`], found
+    /// Every task in the workspace — the modal sibling of [`Self::Tasks`], found
     /// through the workspace's file index rather than by walking up from a file.
     TasksWorkspace,
-    /// The workspace's work in progress (`Space v`): shells running a command, agents working
+    /// The workspace's work in progress: shells running a command, agents working
     /// through a turn, git operations — the list `activity/changed` carries, as rows
     /// ([`PickerItem::Activity`]). `Enter` goes to a shell's or conversation's view (a
     /// `picker/select` answering `View`); `Ctrl-d` stops the row's work (`activity/cancel`) and the
@@ -563,7 +563,7 @@ pub enum AgentRowState {
         activity: Option<String>,
     },
     /// Blocked on us: the agent has asked permission and the turn cannot proceed until it is
-    /// answered (`Space v a` / `Space v d`).
+    /// answered.
     AwaitingPermission,
     /// No agent behind the conversation — restored from disk and not yet reconnected (an agent is
     /// a subprocess, and one starts on the first prompt), or one whose process has gone.

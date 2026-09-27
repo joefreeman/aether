@@ -41,8 +41,8 @@ Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to ea
 
 Type `Space y` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
 `Shift-w`); a leading **count** repeats a motion (e.g. `3w`). `Space` is the leader for
-app/file/code commands, `Space g` the sub-leader for git operations, `Space v` lists the work in
-progress (shells, agents, git operations) to go to or stop, and `Space n` reveals hover info at the
+app/file/code commands, `Space g` the sub-leader for git operations, `Space z` lists the work in
+progress (shells, agents, git operations) to go to or stop, and `Space v` reveals hover info at the
 cursor. What a view offers to *do* — answering an agent, folding a tool call — is a button in the
 view itself: `Tab` reaches it and `Enter` presses it.
 
@@ -53,8 +53,8 @@ view itself: `Tab` reaches it and `Enter` presses it.
 | `h`/`l` | Character left/right |
 | `j`/`Alt-j` | Logical/visual line down |
 | `k`/`Alt-k` | Logical/visual line up |
-| `w`/`Alt-w` | Select small/big word |
-| `b`/`Alt-b` | Small/big word backward |
+| `w`/`Alt-w` | Select small/big word (repeat: the next one) |
+| `b`/`Alt-b` | Select small/big word (repeat: the previous one) |
 | `e`/`Alt-e` | Small/big word end |
 | `0`, `Home` | Logical line start |
 | `Alt-l`, `End` | Logical line end |
@@ -87,7 +87,7 @@ These move the view, not the cursor, and work the same in the reading view.
 
 | Key | Action |
 | --- | --- |
-| `,` | Collapse selection |
+| `'` | Collapse selection |
 | `u`/`Alt-u` | Reverse selection (swap cursor and anchor) / orient it forward |
 | `%` | Select all |
 | `q`/`Alt-q` | Expand/contract selection to syntax node |
@@ -149,13 +149,13 @@ both following the file's own indent style. `Alt-←`/`Alt-→` move by word, an
 
 | Key | Action |
 | --- | --- |
-| `i`/`a` | Insert at selection start/end |
-| `Alt-i`/`Alt-a` | Insert at first non-blank of line/last line end |
+| `,`/`.` | Insert at selection start/end |
+| `<`/`>` | Insert at first non-blank of line/last line end |
 | `Esc` | Leave insert mode |
 
 ### Markdown reading view
 
-`Space u` renders the current Markdown file — headings, tables, images, links and highlighted
+`Space .` renders the current Markdown file — headings, tables, images, links and highlighted
 code fences — as a read-only view with its own keys. The reading position *is* the cursor, so
 toggling back lands where you were reading. Reading is how *this window* sees the file: another
 window on the same file is not affected. Opening a file lands in whichever way it was last shown,
@@ -167,7 +167,7 @@ configured; the rest of the reading view works without one.
 
 | Key | Action |
 | --- | --- |
-| `Space u` | Toggle the reading view |
+| `Space .` | Toggle the reading view |
 | `j`/`k` | Focus next/previous element |
 | `l`/`h` | Focus next/previous link in the block |
 | `o`/`Alt-o` | Next/previous heading |
@@ -175,15 +175,15 @@ configured; the rest of the reading view works without one.
 | `z`/`Alt-z` | Undo/redo the reading-position move |
 | `Enter` | Follow the link, open the image, jump to the footnote, or toggle a task's checkbox |
 | `Ctrl-Enter` | Follow a relative link in a new window (GUI and browser: a terminal has no window to open it in, and no way to send the chord) |
-| `Space n` | Show the link's or image's target |
+| `Space v` | Show the link's or image's target |
 | `x`/`Alt-x`, `Shift-j`/`Shift-k` | Select blocks — as in the editor, plain `x` walks and Shift extends |
 | `u`/`Alt-u` | Reverse the selection / orient it forward |
-| `%`/`,` | Select every block / collapse the selection to the cursor's block |
+| `%`/`'` | Select every block / collapse the selection to the cursor's block |
 | `Ctrl-c` | Copy the selection, the link URL, or the element's Markdown source |
 | `Ctrl-z`/`Ctrl-Alt-z` | Undo / redo |
 | `Ctrl-r` | Repeat the last change on the focused block(s) |
 | `Ctrl-a`/`Ctrl-Alt-a` | Check / uncheck the focused task item |
-| `i`/`a` | Edit: insert at block/selection start / end |
+| `,`/`.` | Edit: insert at block/selection start / end |
 | `Ctrl-e` | Edit: rewrite the selected block(s) |
 | `Ctrl-o`/`Ctrl-Alt-o` | Edit: open a new block below / above — a list item inside a list, a paragraph elsewhere |
 | `Ctrl-j`/`Ctrl-k` | Move block(s) down / up (`Ctrl-Alt-j`/`k` moves paragraphs in the editor) |
@@ -199,7 +199,7 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | --- | --- |
 | `Space f`/`Space Alt-f` | Find files / in this file's directory |
 | `Space b`/`Space Alt-b` | Switch buffer / new scratch |
-| `Space t`/`Space Alt-t` | Switch shell / a new shell to run a command in |
+| `Space h`/`Space Alt-h` | Switch shell / a new shell to run a command in |
 | `Space a`/`Space Alt-a` | Switch agent conversation / a new one |
 | `Space /`/`Space Alt-/` | Grep workspace / for current selection |
 | `Space e`/`Space Alt-e` | File explorer / at workspace root |
@@ -209,17 +209,17 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space s`/`Space Alt-s` | Save / save as |
 | `Space k`/`Space Alt-k` | Keep this document — in a review, the file under the cursor / reload from disk |
 | `Space x`/`Space Alt-x` | Close view / save and close it |
-| `Space z`/`Space Alt-z` | Open another window / copy this view's web URL |
-| `Space .`/`Space Alt-.` | Run a task from here / from anywhere in the workspace — `Ctrl-e` edits its command first, `Ctrl-g` goes to its definition |
+| `Space n`/`Space Alt-n` | Open another window / copy this view's web URL |
+| `Space t`/`Space Alt-t` | Run a task from here / from anywhere in the workspace — `Ctrl-e` edits its command first, `Ctrl-g` goes to its definition |
 | `Space ,`/`Space ;` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
-| `Space v` | Work in progress — shells, agents, git operations: `Enter` goes to it, `Ctrl-d` stops it |
-| `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
+| `Space z` | Work in progress — shells, agents, git operations: `Enter` goes to it, `Ctrl-d` stops it |
+| `Space u`/`Space Alt-u` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save and quit |
 | `Space y`/`Space ?` | Show keyboard shortcuts / about this build |
 
 ### Shells and agents
 
-`Space t` and `Space a` switch between them, `Space Alt-t` and `Space Alt-a` make new ones. Both
+`Space h` and `Space a` switch between them, `Space Alt-h` and `Space Alt-a` make new ones. Both
 views are a transcript with an input at the bottom, and that input is a real editor element —
 every motion, edit and selection key works in it. Two keys mean something different while the
 caret is there:
@@ -233,10 +233,10 @@ caret is there:
 caret out to the transcript and back, where `Enter` opens the file the line under the cursor names
 and edits are refused.
 
-A task is a shortcut for starting a shell. `Space .` lists the justfile recipes, Makefile targets,
+A task is a shortcut for starting a shell. `Space t` lists the justfile recipes, Makefile targets,
 `package.json` scripts and mise tasks defined in the current file's directory and each directory
 above it, nearest first — it needs a file open, as the Git commands need one to find their
-repository; `Space Alt-.` lists every one in the workspace. `Enter` runs it where it is
+repository; `Space Alt-t` lists every one in the workspace. `Enter` runs it where it is
 defined, in the shell that last ran that command there if one is open (or was, before a restart)
 — otherwise in a new one.
 
@@ -272,11 +272,11 @@ scopes — plain takes the change under the cursor (or the selected lines), Alt 
 
 | Chord | Action |
 | --- | --- |
-| `Space n` | Hover (type & docs, or a link's target) |
+| `Space v` | Hover (type & docs, or a link's target) |
 | `Enter` | Follow what's under the cursor: the definition — or, in a patch or a shell's output, the file that line names. In a shell's input, run the command |
 | `Space r` | Go to references |
 | `d`/`Alt-d` | Next/previous diagnostic |
-| `Space Alt-n` | Diagnostic at cursor |
+| `Space Alt-v` | Diagnostic at cursor |
 | `Space d`/`Space Alt-d` | Diagnostics: this file / workspace |
 | `Space o`/`Space Alt-o` | Document / workspace symbols |
 | `Space l` | LSP servers (status, restart) |

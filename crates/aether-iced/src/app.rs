@@ -80,7 +80,7 @@ impl std::fmt::Debug for Bootstrap {
 pub struct ConnectingBootstrap {
     pub workspace: Option<String>,
     /// Which **context** of that workspace to enter: repo id → worktree admin name, empty for the
-    /// base. Passed as a struct field because `Space z` opens another window *in this process* —
+    /// base. Passed as a struct field because a new window opens another window *in this process* —
     /// there is no command line for it to survive, and so no user-facing flag to explain.
     pub worktrees: Vec<(String, String)>,
     pub file: Option<String>,
@@ -374,7 +374,7 @@ pub enum Message {
     RpcResult(u64, Result<serde_json::Value, crate::connection::RpcError>),
     /// A Markdown link in the hover popover was clicked — open it in the OS handler.
     OpenLink(String),
-    /// This window asked for another one (`Space z`, or Ctrl-Enter on a picker row). Emitted by the
+    /// This window asked for another one (new window, or Ctrl-Enter on a picker row). Emitted by the
     /// app, handled by [`Shell::update`] — a window can't open its sibling, only the shell that owns
     /// the map can.
     OpenWindow(WindowTarget),
@@ -1162,7 +1162,7 @@ impl App {
                     let measure = self.read_measure(ReadThen::Placement);
                     return Task::batch([measure, self.run_core(read_fx)]);
                 }
-                // A wrap toggle or a `Space u` left a content anchor pending: restore the view to
+                // A wrap toggle or a reader toggle left a content anchor pending: restore the view to
                 // it (the same content on screen across the re-presentation), superseding the
                 // reveal the subscribe would otherwise do.
                 if let Some(px) = self.resolve_anchor_px() {
@@ -2311,7 +2311,7 @@ impl App {
         self.fetch_in_flight = false;
         self.refetch_queued = false;
         self.pending_reveal.abandon();
-        // A pending content anchor (a wrap toggle, `Space u`) wins: load a window around its
+        // A pending content anchor (a wrap toggle, a reader toggle) wins: load a window around its
         // reference line so it resolves precisely once the window arrives. Otherwise restore the
         // buffer's saved scroll, else open near the cursor.
         let scroll = self
@@ -2742,7 +2742,7 @@ impl App {
     /// and the content anchor for the switch is captured after it, while the reader is still on
     /// screen and `read_scroll_px` is still where the reader is. Asking the session read the
     /// editor's mirror instead — untouched since before the reader opened, so usually zero — and
-    /// `Space u` back to the editor pinned the top of the document however far down you were.
+    /// Toggling back to the editor pinned the top of the document however far down you were.
     fn reader_scroller(&self) -> bool {
         self.session.window_shows_prose()
     }
@@ -3012,12 +3012,12 @@ impl App {
     }
 
     /// The reading view's half of `Message::Subscribed`, once measured: restore a pending
-    /// content anchor (the same document's editor, `Space u`), else the subscribe's remembered
+    /// content anchor (the same document's editor, via the reader toggle), else the subscribe's remembered
     /// position — then rest the focused block, which **either** can leave off screen.
     ///
     /// The reveal runs after the anchor, not instead of it. `Message::Subscribed` stands the
     /// focus-change trigger down for the reading view and leaves the placement to this, so an
-    /// anchor that returned here was the last word: `Space u` from an editor whose cursor was
+    /// anchor that returned here was the last word: toggling from an editor whose cursor was
     /// scrolled out of sight opened the reader on that same content with the focused block
     /// somewhere off screen and nothing left to bring it back. Resting it costs nothing when the
     /// anchor already did the right thing — [`read_layout::reveal_offset`] answers `None` for a
@@ -3530,7 +3530,7 @@ impl App {
             .into()
     }
 
-    /// The workspace-settings dialog (`Space .`): a centred modal with the editable workspace name,
+    /// The workspace-settings dialog: a centred modal with the editable workspace name,
     /// the list of roots, and an add-root input row — rendered from the core's
     /// `session.workspace_settings`. Keyboard-driven (keys route through `session.on_key`, which the
     /// core handles): Alt-j/k navigate, Enter renames / adds, Delete (then y) removes, Esc closes.
@@ -5076,7 +5076,7 @@ impl App {
             }
         }
         // The work in progress — shells, agents' turns, git operations — as a count in its own
-        // colour and its own section, after the git cluster. What the work is, `Space v` lists.
+        // colour and its own section, after the git cluster. What the work is, the activity picker lists.
         if let Some(n) = self.session.work_in_progress() {
             let seg = format!("⟳ {n}");
             left = left.push(section_divider(&self.ui(), p));
@@ -7677,7 +7677,7 @@ async fn connect_and_bootstrap(args: ConnectingBootstrap) -> Result<Bootstrap, B
     let activated = handle
         .rpc::<WorkspaceActivate>(WorkspaceActivateParams {
             // A window spawned from inside the editor names the context it should open in
-            // (`Space z`, `Ctrl-Enter` on a branch row). A fresh launch names none, and unset —
+            // (new window, `Ctrl-Enter` on a branch row). A fresh launch names none, and unset —
             // not empty — means "wherever this workspace was last used", which is the whole of
             // "come back where I was" given windows have no identity across a restart.
             worktrees: (!args.worktrees.is_empty())
@@ -7911,7 +7911,7 @@ impl Shell {
         ])
     }
 
-    /// `Space z` / Ctrl-Enter on a picker row: another window on the same daemon, seeded from the
+    /// New window / Ctrl-Enter on a picker row: another window on the same daemon, seeded from the
     /// target the core resolved. It boots exactly like a fresh launch would (dial, then adopt),
     /// which is why the target maps onto a `Connecting` bootstrap rather than a bespoke path.
     ///
@@ -8915,7 +8915,7 @@ mod tests {
         })
     }
 
-    /// `Space z` / Ctrl-Enter seeds the new window from the target the core resolved: the same
+    /// New window / Ctrl-Enter seeds the new window from the target the core resolved: the same
     /// workspace, the same file, the same 0-based jump — and never tethered, because the tether is
     /// the CLI's `$EDITOR` contract, not something a window opened from inside the editor inherits.
     #[test]
@@ -8950,7 +8950,7 @@ mod tests {
         assert_eq!(opened.server_url, "ws://127.0.0.1:2385");
     }
 
-    /// `Space z` reaches the shell as a message *from* a window, because an app can't open its own
+    /// A new window reaches the shell as a message *from* a window, because an app can't open its own
     /// sibling. The shell must intercept it rather than routing it into the app that sent it.
     #[test]
     fn a_windows_open_request_is_intercepted_by_the_shell() {

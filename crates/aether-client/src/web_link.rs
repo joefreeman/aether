@@ -1,7 +1,7 @@
 //! Web-client share links — the `?workspace=&root=&file=` / `?path=` / `?dir=` (+ 1-based `#L:C`)
 //! URL scheme the web shell boots from and its picker links use (`web/src/shell.ts`: the boot
 //! parser and `pickerItemUrl`/`fileQuery`). One builder shared by the core's copy-web-url gesture
-//! (`Space Alt-z`) and the `ae --web` launcher, so every producer emits exactly what the boot
+//! and the `ae --web` launcher, so every producer emits exactly what the boot
 //! parses. Only the query + fragment live here: the base is the caller's — the CLI knows the
 //! server's loopback address, the web shell its own origin (which may be a port-forward the
 //! server address would misname).
