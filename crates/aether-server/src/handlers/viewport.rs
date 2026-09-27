@@ -1369,6 +1369,18 @@ pub async fn viewport_invoke_action(
             .await?;
             s = state.lock().await;
         }
+        // A shell run's own stop button: through the shell handler, which is where a run is
+        // stopped the way the activity picker stops it, and where a queued line is taken out.
+        ViewAction::Cancel { run } => {
+            let view_id = s.viewports[&params.viewport_id].view_id;
+            drop(s);
+            if !crate::handlers::shell_cancel_run(state, view_id, run).await? {
+                return Err(RpcError::invalid_params(format!(
+                    "run {run} is neither running nor waiting"
+                )));
+            }
+            s = state.lock().await;
+        }
     }
 
     let window = render_viewport(&s, params.viewport_id, SneakLabels::Shown);

@@ -191,12 +191,61 @@ fn body(window: &aether_protocol::viewport::Window) -> Vec<String> {
         .collect()
 }
 
-/// The text of every chrome row in the view — the commands the runs ran.
+/// The text of every chrome row in the view — the commands the runs ran, without the mark each
+/// stands behind (see [`marks`]).
 fn headers(window: &aether_protocol::viewport::Window) -> Vec<String> {
     chrome_nodes(window)
         .iter()
-        .map(|n| chrome_text(n))
+        .map(|n| {
+            let text = chrome_text(n);
+            match text
+                .strip_prefix('\u{25cf}')
+                .or(text.strip_prefix('\u{25cb}'))
+            {
+                Some(command) => command.to_string(),
+                None => text,
+            }
+        })
         .collect()
+}
+
+/// The role each command row's mark is drawn in, in view order — how every run stands: `ok`,
+/// `running`, `warning` (cancelled), `error`, or `queued`.
+fn marks(window: &aether_protocol::viewport::Window) -> Vec<&'static str> {
+    chrome_nodes(window)
+        .iter()
+        .filter_map(|n| {
+            let text = chrome_text(n);
+            let role = n.highlight_runs().first()?.kind.clone();
+            let queued = text.starts_with('\u{25cb}');
+            (queued || text.starts_with('\u{25cf}')).then(|| match role.as_str() {
+                _ if queued => "queued",
+                "status.ok" => "ok",
+                "status.running" => "running",
+                "status.warning" => "warning",
+                "status.error" => "error",
+                other => panic!("a mark in an unknown role {other}"),
+            })
+        })
+        .collect()
+}
+
+/// The title nodes of every box in the view, in order.
+fn window_titles(window: &aether_protocol::viewport::Window) -> Vec<Vec<Element>> {
+    fn walk(n: &Element, out: &mut Vec<Vec<Element>>) {
+        if let Element::Column {
+            title, children, ..
+        } = n
+        {
+            if !title.is_empty() {
+                out.push(title.clone());
+            }
+            children.iter().for_each(|c| walk(c, out));
+        }
+    }
+    let mut out = Vec::new();
+    walk(&window.root, &mut out);
+    out
 }
 
 /// The name on every box in the view, in order — where each run ran and how it went.
@@ -360,23 +409,252 @@ async fn an_empty_input_is_refused() {
     );
 }
 
-/// One run at a time, and typing ahead of it costs nothing: the refusal names the command in the
-/// way and leaves the text where it is.
+// ---- the queue ----------------------------------------------------------------------------------
+
+/// Every stop button in the view, as `(the element whose box wears it, the run it stops)`, in view
+/// order — the owner found as the client finds it, by the box the button is on.
+fn cancel_buttons(window: &aether_protocol::viewport::Window) -> Vec<(u32, u64)> {
+    use aether_protocol::ui::ViewAction;
+    use aether_protocol::viewport::Element;
+    fn walk(n: &Element, out: &mut Vec<(u32, u64)>) {
+        if let Element::Column {
+            title, children, ..
+        } = n
+        {
+            let owner = n.content().first().and_then(|e| e.field_id());
+            for t in title {
+                if let (
+                    Element::Action {
+                        action: ViewAction::Cancel { run },
+                        ..
+                    },
+                    Some(owner),
+                ) = (t, owner)
+                {
+                    out.push((owner, *run));
+                }
+            }
+            children.iter().for_each(|c| walk(c, out));
+        }
+    }
+    let mut out = Vec::new();
+    walk(&window.root, &mut out);
+    out
+}
+
+/// Press the stop button on run `run`'s box, as `Tab` to it and `Enter` would.
+async fn press_cancel(
+    ws: &mut Ws,
+    viewport_id: u64,
+    window: &aether_protocol::viewport::Window,
+    run: u64,
+) -> aether_protocol::viewport::Window {
+    let (element, _) = cancel_buttons(window)
+        .into_iter()
+        .find(|(_, r)| *r == run)
+        .unwrap_or_else(|| panic!("run {run} wears no stop button: {:?}", titles(window)));
+    let pressed: ViewportWindowResult = send_request::<ViewportInvokeAction>(
+        ws,
+        &ViewportInvokeActionParams {
+            viewport_id,
+            element,
+            action: aether_protocol::ui::ViewAction::Cancel { run },
+        },
+    )
+    .await;
+    pressed.window
+}
+
+/// Submit `line` from the input, answering the run it started or queued.
+async fn submit_run(
+    ws: &mut Ws,
+    server: &aether_server::ServerHandle,
+    shell: &ShellOpenResult,
+    line: &str,
+) -> u64 {
+    submit(ws, server, shell, line)
+        .await
+        .run
+        .expect("a run, started or queued")
+}
+
+/// Read pushes until run `run` reports that it is over.
+async fn finished(ws: &mut Ws, run: u64) -> RunState {
+    loop {
+        let state = finished_run(ws).await;
+        if state.run == run {
+            return state;
+        }
+    }
+}
+
+/// A line entered while a run is going waits its turn in a box of its own, rather than being
+/// refused: the input is taken, the box says it is queued, and it runs once the one ahead of it
+/// is over — here, stopped by its own button, which leaves it cancelled and kept, as the activity
+/// picker's stop does.
 #[tokio::test]
-async fn typing_ahead_survives_a_refused_submit() {
+async fn a_line_entered_while_one_runs_waits_its_turn() {
     let (server, mut ws, _dir) = setup().await;
     let shell = open_shell(&mut ws).await;
+    let first = submit_run(&mut ws, &server, &shell, "sleep 100").await;
+    let next = submit_run(&mut ws, &server, &shell, "echo next").await;
     let input = input_buffer_of(&server, &shell).await;
-    type_command(&mut ws, &shell, input, "sleep 100").await;
-    let _: ShellRunResult = send_request::<ShellRun>(
+    assert_eq!(input_text(&mut ws, input).await, "", "the line was taken");
+
+    let (viewport_id, window) = shell_window(&mut ws, &shell).await;
+    let names = titles(&window);
+    assert_eq!(
+        names.len(),
+        3,
+        "the run, the queued line, the input: {names:?}"
+    );
+    assert_eq!(marks(&window), vec!["running", "queued"], "{names:?}");
+    assert_eq!(
+        headers(&window)
+            .iter()
+            .filter(|h| !h.is_empty())
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["sleep 100".to_string(), "echo next".to_string()],
+        "each box holds its command"
+    );
+    assert_eq!(
+        cancel_buttons(&window),
+        vec![(0, first), (1, next)],
+        "both can be stopped, from their own boxes"
+    );
+
+    press_cancel(&mut ws, viewport_id, &window, first).await;
+    let stopped = finished(&mut ws, first).await;
+    assert_eq!(stopped.status, RunStatus::Cancelled);
+    let ran = finished(&mut ws, next).await;
+    assert_eq!(ran.status, RunStatus::Exited { code: 0 });
+
+    let (_, window) = shell_window(&mut ws, &shell).await;
+    assert_eq!(
+        marks(&window),
+        vec!["warning", "ok"],
+        "the stopped run stays, marked as stopped on purpose"
+    );
+    assert!(body(&window).contains(&"next".to_string()));
+    assert!(cancel_buttons(&window).is_empty(), "nothing left to stop");
+}
+
+/// A queued line taken out before it starts leaves no trace, and the lines around it keep their
+/// place in the queue.
+#[tokio::test]
+async fn a_queued_line_can_be_taken_out() {
+    let (server, mut ws, _dir) = setup().await;
+    let shell = open_shell(&mut ws).await;
+    let first = submit_run(&mut ws, &server, &shell, "sleep 100").await;
+    let dropped = submit_run(&mut ws, &server, &shell, "echo dropped").await;
+    let kept = submit_run(&mut ws, &server, &shell, "echo kept").await;
+
+    let (viewport_id, window) = shell_window(&mut ws, &shell).await;
+    let window = press_cancel(&mut ws, viewport_id, &window, dropped).await;
+    let commands: Vec<String> = headers(&window)
+        .into_iter()
+        .filter(|h| !h.is_empty())
+        .collect();
+    assert_eq!(commands, vec!["sleep 100", "echo kept"], "gone at once");
+    assert_eq!(cancel_buttons(&window), vec![(0, first), (1, kept)]);
+
+    // Pressing it again finds nothing to take out, and says so.
+    let err = send_request_expect_err::<ViewportInvokeAction>(
         &mut ws,
-        &ShellRunParams {
+        &ViewportInvokeActionParams {
+            viewport_id,
+            element: 1,
+            action: aether_protocol::ui::ViewAction::Cancel { run: dropped },
+        },
+    )
+    .await;
+    assert!(err.contains("neither running nor waiting"), "{err}");
+
+    let _: ShellCancelResult = send_request::<ShellCancel>(
+        &mut ws,
+        &ShellCancelParams {
             view_id: shell.opened.view_id,
         },
     )
     .await;
+    assert_eq!(
+        finished(&mut ws, kept).await.status,
+        RunStatus::Exited { code: 0 }
+    );
+    let (_, window) = shell_window(&mut ws, &shell).await;
+    assert!(
+        !body(&window).contains(&"dropped".to_string()),
+        "it never ran"
+    );
+    assert!(body(&window).contains(&"kept".to_string()));
+}
 
-    type_command(&mut ws, &shell, input, "echo next").await;
+/// A directory change is applied the moment it is entered, running or not: it runs nothing, so it
+/// waits for nothing. A line queued before it still runs where its box said it would; one queued
+/// after it runs in the new directory.
+#[tokio::test]
+async fn a_directory_change_is_never_queued() {
+    let (server, mut ws, dir) = setup().await;
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    let sub = root.join("sub").to_string_lossy().into_owned();
+    let shell = open_shell(&mut ws).await;
+    submit_run(&mut ws, &server, &shell, "sleep 100").await;
+    let before = submit_run(&mut ws, &server, &shell, "pwd").await;
+
+    let moved = submit(&mut ws, &server, &shell, "./sub").await;
+    assert_eq!(moved.run, None, "applied, not queued");
+    let after = submit_run(&mut ws, &server, &shell, "pwd").await;
+    let (_, window) = shell_window(&mut ws, &shell).await;
+    let names = titles(&window);
+    assert_eq!(names.len(), 4, "{names:?}");
+    assert!(names[1].starts_with(&*root.to_string_lossy()) && !names[1].starts_with(&sub));
+    assert!(names[2].starts_with(&sub), "{names:?}");
+    assert_eq!(names[3], sub, "the input is already there: {names:?}");
+
+    let _: ShellCancelResult = send_request::<ShellCancel>(
+        &mut ws,
+        &ShellCancelParams {
+            view_id: shell.opened.view_id,
+        },
+    )
+    .await;
+    finished(&mut ws, before).await;
+    finished(&mut ws, after).await;
+    let (_, window) = shell_window(&mut ws, &shell).await;
+    let lines = body(&window);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.as_str() == root.to_string_lossy())
+            .count(),
+        1,
+        "{lines:?}"
+    );
+    assert!(lines.contains(&sub), "{lines:?}");
+}
+
+/// A queued line is checked when its turn comes, not when it was entered: behind a run, what it
+/// names may be what that run makes. One still refused then becomes a run that says why, and the
+/// queue carries on past it. A line that does not parse never will, so that is refused at once.
+#[tokio::test]
+async fn a_queued_line_is_checked_when_its_turn_comes() {
+    let (server, mut ws, _dir) = setup().await;
+    let shell = open_shell(&mut ws).await;
+    let maker = submit_run(
+        &mut ws,
+        &server,
+        &shell,
+        "sh -c \"sleep 0.3; printf '#!/bin/sh\\necho made\\n' > made; chmod +x made\"",
+    )
+    .await;
+    let made = submit_run(&mut ws, &server, &shell, "./made").await;
+    let never = submit_run(&mut ws, &server, &shell, "./never").await;
+    let last = submit_run(&mut ws, &server, &shell, "echo last").await;
+
+    let input = input_buffer_of(&server, &shell).await;
+    type_command(&mut ws, &shell, input, "echo \"unterminated").await;
     let err = send_request_expect_err::<ShellRun>(
         &mut ws,
         &ShellRunParams {
@@ -384,30 +662,40 @@ async fn typing_ahead_survives_a_refused_submit() {
         },
     )
     .await;
-    assert!(err.contains("Shell 1 is running sleep 100"), "{err}");
     assert!(
-        err.contains("Space v to stop it"),
-        "and says how to stop it: {err}"
+        !err.is_empty(),
+        "a syntax error is refused even behind a run"
+    );
+
+    assert_eq!(
+        finished(&mut ws, maker).await.status,
+        RunStatus::Exited { code: 0 }
     );
     assert_eq!(
-        input_text(&mut ws, input).await,
-        "echo next",
-        "the text you typed ahead is still there"
+        finished(&mut ws, made).await.status,
+        RunStatus::Exited { code: 0 }
+    );
+    assert_eq!(finished(&mut ws, never).await.status, RunStatus::Refused);
+    assert_eq!(
+        finished(&mut ws, last).await.status,
+        RunStatus::Exited { code: 0 }
     );
 
-    let cancelled: ShellCancelResult = send_request::<ShellCancel>(
-        &mut ws,
-        &ShellCancelParams {
-            view_id: shell.opened.view_id,
-        },
-    )
-    .await;
-    assert!(cancelled.cancelled);
+    let (_, window) = shell_window(&mut ws, &shell).await;
+    let lines = body(&window);
+    assert!(lines.contains(&"made".to_string()), "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l.contains("never")),
+        "the refusal is the run's output: {lines:?}"
+    );
+    assert!(lines.contains(&"last".to_string()), "{lines:?}");
+    assert_eq!(marks(&window), vec!["ok", "ok", "error", "ok"]);
 }
 
-/// The exit status names the run's box, where it is read without running anything else.
+/// How a run went is the mark before its command, read without running anything else; how long it
+/// took is flush right on the box's border.
 #[tokio::test]
-async fn an_exit_code_lands_on_the_runs_box() {
+async fn how_a_run_went_is_marked_on_its_box() {
     let (server, mut ws, _dir) = setup().await;
     let shell = open_shell(&mut ws).await;
     let run = run_and_wait(&mut ws, &server, &shell, "sh -c \"exit 3\"").await;
@@ -415,21 +703,25 @@ async fn an_exit_code_lands_on_the_runs_box() {
 
     let (_, window) = shell_window(&mut ws, &shell).await;
     let (titles, headers) = (titles(&window), headers(&window));
-    // The run's box is named with the outcome, and the command row says the same thing — the
-    // command *was* `exit 3`.
+    // The run failed, so its mark says so; the command row is otherwise what ran — the command
+    // *was* `exit 3`.
+    assert_eq!(marks(&window), vec!["error"], "{headers:?}");
+    let title = window_titles(&window).remove(0);
+    let (_, right) = aether_protocol::ui::split_title(&title);
     assert!(
-        titles.iter().any(|t| t.contains("exit 3")),
-        "the outcome names the box: {titles:?}"
+        right
+            .iter()
+            .map(Element::text_content)
+            .collect::<String>()
+            .ends_with("ms"),
+        "the duration, flush right: {titles:?}"
     );
     assert!(
         headers.iter().any(|h| h.trim() == "sh -c \"exit 3\""),
         "and the command row is what ran: {headers:?}"
     );
     assert!(
-        !titles
-            .iter()
-            .chain(&headers)
-            .any(|h| h.contains("Space v to stop it")),
+        cancel_buttons(&window).is_empty(),
         "a finished run offers nothing to stop: {titles:?} {headers:?}"
     );
 }
@@ -758,8 +1050,8 @@ async fn every_run_and_the_input_sit_in_their_own_box() {
             })
             .collect()
     };
-    assert_eq!(texts(boxes[0].2), vec!["echo first", "<editor>"]);
-    assert_eq!(texts(boxes[1].2), vec!["echo second", "<editor>"]);
+    assert_eq!(texts(boxes[0].2), vec!["\u{25cf}echo first", "<editor>"]);
+    assert_eq!(texts(boxes[1].2), vec!["\u{25cf}echo second", "<editor>"]);
     assert_eq!(
         texts(boxes[2].2),
         vec!["<editor>"],
@@ -768,10 +1060,6 @@ async fn every_run_and_the_input_sit_in_their_own_box() {
     // And the names, in order: each run's directory and outcome, then the input's directory alone.
     let titles = titles(&window);
     assert_eq!(titles.len(), 3, "{titles:?}");
-    assert!(
-        titles[0].contains("ok") || titles[0].contains("exit"),
-        "{titles:?}"
-    );
     let directory = titles[2].clone();
     for title in &titles {
         assert!(
@@ -1010,11 +1298,7 @@ async fn a_pipeline_runs_and_reports_its_first_failing_stage() {
     let run = run_and_wait(&mut ws, &server, &shell, "false | cat").await;
     assert_eq!(run.status, RunStatus::Exited { code: 1 });
     let (_, window) = shell_window(&mut ws, &shell).await;
-    assert!(
-        titles(&window)[1].contains("exit 1"),
-        "{:?}",
-        titles(&window)
-    );
+    assert_eq!(marks(&window), vec!["ok", "error"]);
 }
 
 /// `&&` runs the next only on success, `||` only on failure, `;` regardless; the line's status is
@@ -1176,7 +1460,7 @@ async fn cancelling_kills_every_stage_of_a_pipeline() {
     let run = tokio::time::timeout(std::time::Duration::from_secs(5), finished_run(&mut ws))
         .await
         .expect("the cancel must not wait the sleep out");
-    assert_eq!(run.status, RunStatus::Killed);
+    assert_eq!(run.status, RunStatus::Cancelled);
 }
 
 // ---- persistence --------------------------------------------------------------------------------
@@ -1349,10 +1633,10 @@ async fn a_shell_survives_a_server_restart() {
         "the transcript, then what was being typed"
     );
     let names = titles(&window);
-    assert!(names[0].contains("ok"), "{names:?}");
-    assert!(
-        names[2].contains("killed"),
-        "the run that was going: {names:?}"
+    assert_eq!(
+        marks(&window)[..3],
+        ["ok", "ok", "error"],
+        "the run that was going comes back killed: {names:?}"
     );
     assert!(
         names.last().unwrap().ends_with("sub"),
@@ -1605,7 +1889,7 @@ async fn cancelling_kills_the_run_and_its_group() {
     .await;
     assert!(cancelled.cancelled);
     let run = finished_run(&mut ws).await;
-    assert_eq!(run.status, RunStatus::Killed);
+    assert_eq!(run.status, RunStatus::Cancelled);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(90),
         "the cancel must not have waited the sleep out"
@@ -1922,7 +2206,7 @@ async fn a_running_shell_is_work_in_progress_until_cancelled() {
     let stopped: ActivityCancelResult =
         send_request::<ActivityCancel>(&mut ws, &ActivityCancelParams { id: id.clone() }).await;
     assert!(stopped.cancelled);
-    assert_eq!(finished_run(&mut ws).await.status, RunStatus::Killed);
+    assert_eq!(finished_run(&mut ws).await.status, RunStatus::Cancelled);
     loop {
         if expect_notification::<ActivityChanged>(&mut ws)
             .await

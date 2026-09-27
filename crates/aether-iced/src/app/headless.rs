@@ -342,7 +342,7 @@ fn input(element: u32, buffer: u64, lines: Vec<LogicalLineRender>) -> ViewElemen
 /// of its own named only for the directory. Every box closes itself.
 fn shell_view() -> Window {
     use aether_protocol::ui::{Band, Edges, Sides};
-    let boxed = |title: &str, children: Vec<ViewElement>| {
+    let boxed = |title: Vec<ViewElement>, children: Vec<ViewElement>| {
         ViewElement::titled(
             Edges {
                 border: Sides::all(1),
@@ -350,22 +350,54 @@ fn shell_view() -> Window {
                 collapse: false,
             },
             Band::Chrome,
-            vec![ViewElement::text(title, Vec::new())],
+            title,
             children,
         )
     };
+    // A finished run's title: the directory, and its duration flush right.
+    let done = || {
+        vec![
+            ViewElement::text("~/proj", Vec::new()),
+            ViewElement::Fill { glyph: '─' },
+            ViewElement::text("1.2s", Vec::new()),
+        ]
+    };
+    // A command row as the server builds it: the run's mark in its status role, then the command.
+    let command = |text: &str, role: &str| {
+        ViewElement::chrome(vec![ViewElement::row(vec![
+            ViewElement::text(
+                "\u{25cf}",
+                vec![aether_protocol::viewport::Highlight {
+                    start: 0,
+                    end: "\u{25cf}".len() as u32,
+                    kind: role.into(),
+                }],
+            ),
+            ViewElement::Space { cols: 1 },
+            ViewElement::text(text, Vec::new()),
+        ])])
+    };
     window_of(vec![
         boxed(
-            "~/proj  ok",
-            vec![chrome("echo one"), editor(0, 7, 0, vec![line(0, "one")])],
+            done(),
+            vec![
+                command("echo one", "status.ok"),
+                editor(0, 7, 0, vec![line(0, "one")]),
+            ],
         ),
         chrome(""),
         boxed(
-            "~/proj  ok",
-            vec![chrome("echo two"), editor(1, 7, 1, vec![line(1, "two")])],
+            done(),
+            vec![
+                command("echo two", "status.error"),
+                editor(1, 7, 1, vec![line(1, "two")]),
+            ],
         ),
         chrome(""),
-        boxed("~/proj", vec![input(2, 8, vec![line(0, "cargo build")])]),
+        boxed(
+            vec![ViewElement::text("~/proj", Vec::new())],
+            vec![input(2, 8, vec![line(0, "cargo build")])],
+        ),
     ])
 }
 
@@ -1104,10 +1136,10 @@ fn a_shell_paints_its_runs_then_its_input() {
             .position(|r| r.trim() == needle)
             .unwrap_or_else(|| panic!("no row reading {needle:?}:\n{}", rows.join("\n")))
     };
-    let first_title = row_of("~/proj  ok");
-    let first_command = row_of("echo one");
+    let first_title = row_of("~/proj 1.2s");
+    let first_command = row_of("\u{25cf} echo one");
     let first_out = row_of("one");
-    let second_command = row_of("echo two");
+    let second_command = row_of("\u{25cf} echo two");
     let second_out = row_of("two");
     let input = row_of("cargo build");
     assert!(

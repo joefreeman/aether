@@ -25,6 +25,10 @@ use std::path::{Path, PathBuf};
 pub struct Transcript {
     /// The runs, oldest first. One element of the view each.
     pub runs: Vec<Run>,
+    /// Lines submitted while a run was going, in the order they start. One element each, between
+    /// the runs and the input — and a line leaves here for the end of `runs` keeping its id, so
+    /// the element it was is the element it becomes.
+    pub queue: std::collections::VecDeque<Queued>,
     /// The document holding the command being typed. Internal: never listed, never backed up,
     /// never session-recorded, never dirty (see `Document::internal`). Dropped with the view.
     pub input: BufferId,
@@ -58,6 +62,7 @@ impl Transcript {
     pub fn new(input: BufferId, cwd: PathBuf, title: String) -> Self {
         Transcript {
             runs: Vec::new(),
+            queue: std::collections::VecDeque::new(),
             input,
             cwd,
             prev_cwd: None,
@@ -71,7 +76,7 @@ impl Transcript {
     }
 
     /// The run in flight, if any. **One at a time per shell**, so this is a `find` rather than a
-    /// filter: a second `Enter` while it is `Some` is refused.
+    /// filter: a second `Enter` while it is `Some` queues its line behind it.
     pub fn active(&self) -> Option<&Run> {
         self.runs.iter().find(|r| r.status == RunStatus::Running)
     }
@@ -80,6 +85,13 @@ impl Transcript {
         self.runs
             .iter_mut()
             .find(|r| r.status == RunStatus::Running)
+    }
+
+    /// Whether a line submitted now would have to wait: something is running, or something is
+    /// already waiting — a line never jumps the queue, even in the moment between one run ending
+    /// and the next starting.
+    pub fn is_busy(&self) -> bool {
+        self.active().is_some() || !self.queue.is_empty()
     }
 
     pub fn run(&self, id: RunId) -> Option<&Run> {
@@ -93,18 +105,48 @@ impl Transcript {
     /// Append a run starting at `start_line` of the transcript, in the shell's current directory,
     /// and answer its id.
     pub fn push_run(&mut self, command: String, start_line: u32, cancel: CancelHandle) -> RunId {
-        let id = self.next_run;
-        self.next_run += 1;
-        self.runs.push(Run {
+        let id = self.mint_id();
+        let cwd = self.cwd.clone();
+        self.runs
+            .push(Run::started(id, command, cwd, start_line, cancel));
+        id
+    }
+
+    /// Queue a line behind whatever is running, to run in the shell's current directory — the one
+    /// its box will name while it waits — and answer the id it will run as.
+    pub fn enqueue(&mut self, command: String) -> RunId {
+        let id = self.mint_id();
+        self.queue.push_back(Queued {
             id,
             command,
             cwd: self.cwd.clone(),
-            start_line,
-            end_line_exclusive: start_line,
-            status: RunStatus::Running,
-            elapsed_ms: None,
-            cancel: Some(cancel),
         });
+        id
+    }
+
+    /// Take the next queued line out of the queue and start it as a run at `start_line` — **one
+    /// step**, so there is no moment at which the line is neither waiting nor running and another
+    /// could start ahead of it. `None` while a run is going or when nothing is waiting.
+    pub fn start_next(&mut self, start_line: u32, cancel: CancelHandle) -> Option<&Run> {
+        if self.active().is_some() {
+            return None;
+        }
+        let q = self.queue.pop_front()?;
+        self.runs
+            .push(Run::started(q.id, q.command, q.cwd, start_line, cancel));
+        self.runs.last()
+    }
+
+    /// Take a queued line out before it starts. False when it is not waiting any more.
+    pub fn unqueue(&mut self, id: RunId) -> bool {
+        let before = self.queue.len();
+        self.queue.retain(|q| q.id != id);
+        self.queue.len() != before
+    }
+
+    fn mint_id(&mut self) -> RunId {
+        let id = self.next_run;
+        self.next_run += 1;
         id
     }
 
@@ -119,7 +161,9 @@ impl Transcript {
 
     /// Everything a restart needs to bring this shell back: the transcript text and the runs over
     /// it, where it is, what it has assigned, and what was being typed. A run still going is
-    /// recorded as killed — the process will not survive the server that started it.
+    /// recorded as killed — the process will not survive the server that started it — and what
+    /// was queued behind it is not recorded at all: it was waiting on a run that is not coming
+    /// back.
     pub fn snapshot(&self, text: &str, input: &str) -> ShellSnapshot {
         ShellSnapshot {
             version: 1,
@@ -178,11 +222,12 @@ impl Transcript {
         (t, snap.text)
     }
 
-    /// Ask every unfinished run's process group to stop — closing the view, and shutting the
-    /// server down. A shell whose view is gone has nobody to report to, and a `cargo build` that
-    /// outlives the window it was started from is exactly the orphan the process group exists to
-    /// prevent.
+    /// Ask every unfinished run's process group to stop, and drop what is waiting — closing the
+    /// view, and shutting the server down. A shell whose view is gone has nobody to report to, and
+    /// a `cargo build` that outlives the window it was started from is exactly the orphan the
+    /// process group exists to prevent. The queue goes first, or the stop would start the next.
     pub fn cancel_all(&mut self) {
+        self.queue.clear();
         for run in &mut self.runs {
             if let Some(handle) = run.cancel.take() {
                 let _ = handle.send(true);
@@ -322,6 +367,19 @@ impl ShellSnapshot {
     }
 }
 
+/// A line waiting for the run ahead of it — parsed when it was submitted, and checked against the
+/// world only when it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queued {
+    /// The id it will run as.
+    pub id: RunId,
+    /// As submitted, trimmed.
+    pub command: String,
+    /// Where it will run: the shell's directory when it was submitted, which its box says while it
+    /// waits. A directory change submitted after it moves the shell, not the lines already queued.
+    pub cwd: PathBuf,
+}
+
 /// One command, and what became of it.
 #[derive(Debug)]
 pub struct Run {
@@ -345,6 +403,25 @@ pub struct Run {
 }
 
 impl Run {
+    fn started(
+        id: RunId,
+        command: String,
+        cwd: PathBuf,
+        start_line: u32,
+        cancel: CancelHandle,
+    ) -> Self {
+        Run {
+            id,
+            command,
+            cwd,
+            start_line,
+            end_line_exclusive: start_line,
+            status: RunStatus::Running,
+            elapsed_ms: None,
+            cancel: Some(cancel),
+        }
+    }
+
     pub fn is_running(&self) -> bool {
         self.status == RunStatus::Running
     }
@@ -359,81 +436,112 @@ impl Run {
     }
 }
 
-/// The name on one run's box, drawn on its top border: where it ran and — once it is over — how
-/// it went and how long it took.
+/// The name on one run's box, drawn on its top border: where it ran, and — flush right — how long
+/// it took once it is over, or the button that stops it while it is going. How it went is the mark
+/// beside the command ([`command_row`]), not words on the border.
 ///
 /// A title rather than a row of its own because the input at the foot of the transcript wears the
 /// same one with nothing yet to report ([`input_title`]): press `Enter` and the box you were
-/// typing in gains an outcome and a duration, the line you typed becomes the row under its title,
-/// and the output follows. The command moves up into the history in the shape it already had,
-/// rather than being re-set into a different one.
+/// typing in gains a stop button, the line you typed becomes the row under its title, and the
+/// output follows. The command moves up into the history in the shape it already had, rather than
+/// being re-set into a different one.
 ///
 /// Styled with a patch's own roles, deliberately: a shell is another composed view, and inventing
 /// a palette for it would add roles to the one part of the theme with no cross-shell parity test.
 pub fn run_title(run: &Run) -> Vec<Element> {
-    box_title(&run.cwd, Some(run))
+    let mut title = input_title(&run.cwd);
+    if run.is_running() {
+        title.extend(flush_right(cancel_button(run.id)));
+    } else if let Some(ms) = run.elapsed_ms {
+        let elapsed = format_elapsed(ms);
+        let highlights = vec![highlight(0, elapsed.len(), crate::patch::META)];
+        title.extend(flush_right(Element::text(elapsed, highlights)));
+    }
+    title
+}
+
+/// The name on a queued line's box: where it will run, and the button that takes it out of the
+/// queue. That it is waiting is its mark ([`Mark::Queued`]).
+pub fn queued_title(q: &Queued) -> Vec<Element> {
+    let mut title = input_title(&q.cwd);
+    title.extend(flush_right(cancel_button(q.id)));
+    title
 }
 
 /// The name on the input's box: the directory alone — the box a run's title will finish the
 /// moment this input is submitted. See [`run_title`].
 pub fn input_title(cwd: &Path) -> Vec<Element> {
-    box_title(cwd, None)
+    let dir = display_path(cwd);
+    let highlights = vec![highlight(0, dir.len(), crate::patch::META)];
+    vec![Element::text(dir, highlights)]
 }
 
-/// The chrome inside one run's box: what ran, bare, on the row under the box's title. The input's
-/// box has none — the line you type into is the only thing in it.
-pub fn command_row(run: &Run) -> Vec<Element> {
-    use crate::patch::FILE;
-    // A multi-line command (`Alt-Enter`) still has to fit one row, and a visible break marker
-    // reads better than a silently truncated first line.
-    let command = run.command.replace('\n', " ⏎ ");
-    let highlights = vec![highlight(0, command.len(), FILE)];
-    vec![Element::chrome(vec![Element::row(vec![Element::text(
-        command, highlights,
-    )])])]
+/// Where a box's command stands: the circle before it on the command row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Queued,
+    Run(RunStatus),
 }
 
-/// The inline nodes a box's title is made of: where it ran and — for a finished run — how it went
-/// and how long it took. One builder for both shapes, so the input's title and a run's can never
-/// drift apart in anything but the outcome.
-///
-/// No rule and no padding of its own: what surrounds a title on the border row is the border's
-/// business, and each shell draws that in its own alphabet.
-fn box_title(cwd: &Path, run: Option<&Run>) -> Vec<Element> {
-    use crate::patch::{ADDED, META, REMOVED};
+/// The roles a run's mark is drawn in — named for what they say, not for a colour, and resolved by
+/// every shell through the theme like any other highlight.
+pub const STATUS_OK: &str = "status.ok";
+pub const STATUS_RUNNING: &str = "status.running";
+pub const STATUS_WARNING: &str = "status.warning";
+pub const STATUS_ERROR: &str = "status.error";
 
-    let mut text = String::new();
-    let mut highlights = Vec::new();
-    let mut push = |s: &str, role: &'static str| {
-        let start = text.len();
-        text.push_str(s);
-        highlights.push(highlight(start, text.len(), role));
-    };
-
-    push(&display_path(cwd), META);
-    if let Some(run) = run {
-        match run.status {
-            RunStatus::Running => {
-                push("  ", META);
-                push("running · Space v to stop it", META);
-            }
-            status => {
-                let role = if status == (RunStatus::Exited { code: 0 }) {
-                    ADDED
-                } else {
-                    REMOVED
-                };
-                push("  ", META);
-                push(&status.label(), role);
-                if let Some(ms) = run.elapsed_ms {
-                    push("  ", META);
-                    push(&format_elapsed(ms), META);
-                }
-            }
+impl Mark {
+    /// The glyph and the role it is drawn in: a filled circle once a run has started — blue while
+    /// it goes, then green, yellow if it was stopped on purpose, red for everything else that is
+    /// not a clean finish — and a hollow one while it waits.
+    pub fn glyph(self) -> (&'static str, &'static str) {
+        match self {
+            Mark::Queued => ("\u{25cb}", crate::patch::META),
+            Mark::Run(status) => (
+                "\u{25cf}",
+                match status {
+                    RunStatus::Running => STATUS_RUNNING,
+                    RunStatus::Exited { code: 0 } => STATUS_OK,
+                    RunStatus::Cancelled => STATUS_WARNING,
+                    RunStatus::Exited { .. }
+                    | RunStatus::Killed
+                    | RunStatus::Truncated
+                    | RunStatus::Refused => STATUS_ERROR,
+                },
+            ),
         }
     }
+}
 
-    vec![Element::text(text, highlights)]
+/// The chrome inside one run's box: its mark, then what ran, bare, on the row under the box's
+/// title. The input's box has none — the line you type into is the only thing in it.
+pub fn command_row(command: &str, mark: Mark) -> Vec<Element> {
+    use crate::patch::FILE;
+    // A multi-line command still has to fit one row, and a visible break marker reads better than
+    // a silently truncated first line.
+    let command = command.replace('\n', " ⏎ ");
+    let (glyph, role) = mark.glyph();
+    let highlights = vec![highlight(0, command.len(), FILE)];
+    vec![Element::chrome(vec![Element::row(vec![
+        Element::text(glyph, vec![highlight(0, glyph.len(), role)]),
+        Element::Space { cols: 1 },
+        Element::text(command, highlights),
+    ])])]
+}
+
+/// `node` set against the far end of a title's border — see `Element::Column`'s `title`.
+fn flush_right(node: Element) -> [Element; 2] {
+    [Element::Fill { glyph: '─' }, node]
+}
+
+/// The button on the box of a run that is not over yet: stops it if it is going, takes it out of
+/// the queue if it is waiting.
+fn cancel_button(run: RunId) -> Element {
+    Element::Action {
+        action: aether_protocol::ui::ViewAction::Cancel { run },
+        label: vec![Element::text("\u{d7}", Vec::new())],
+        enabled: true,
+    }
 }
 
 fn highlight(start: usize, end: usize, kind: &str) -> aether_protocol::viewport::Highlight {
@@ -508,60 +616,130 @@ mod tests {
         nodes.iter().map(Element::text_content).collect()
     }
 
-    /// A run's box says where it ran and — once it is over — how it went and how long it took, on
-    /// its border; and what ran, bare, on the row inside it.
+    /// A run's box says where it ran on its border, and — flush right — the button that stops it
+    /// while it goes, then how long it took; how it went is the mark before the command inside.
     #[test]
-    fn a_runs_box_names_the_directory_and_the_outcome_and_holds_the_command() {
+    fn a_runs_box_names_the_directory_and_holds_the_mark_and_the_command() {
         let running = run("cargo build", RunStatus::Running, None);
-        let title = title_text(&run_title(&running));
-        assert!(title.starts_with("/tmp/project"), "{title:?}");
-        assert!(
-            title.contains("Space v to stop it"),
-            "a running command says how to stop it: {title:?}"
-        );
-        let rows: Vec<String> = command_row(&running)
+        let title = run_title(&running);
+        let (left, right) = aether_protocol::ui::split_title(&title);
+        assert_eq!(title_text(left), "/tmp/project");
+        assert_eq!(cancel_of(right), Some(1), "the stop button, flush right");
+        let rows: Vec<String> = command_row(&running.command, Mark::Run(running.status))
             .iter()
             .map(Element::text_content)
             .collect();
-        assert_eq!(rows, vec!["cargo build".to_string()], "the command, bare");
+        assert_eq!(
+            rows,
+            vec!["\u{25cf}cargo build".to_string()],
+            "the mark, then the command"
+        );
 
         let done = run("cargo build", RunStatus::Exited { code: 101 }, Some(1500));
-        let title = title_text(&run_title(&done));
-        assert!(title.contains("exit 101"), "{title}");
-        assert!(title.contains("1.5s"), "{title}");
-        assert!(
-            !title.contains("Space v to stop it"),
-            "nothing to stop: {title}"
-        );
+        let title = run_title(&done);
+        let (left, right) = aether_protocol::ui::split_title(&title);
+        assert_eq!(title_text(left), "/tmp/project", "no outcome in words");
+        assert_eq!(title_text(right), "1.5s", "the duration, flush right");
+        assert_eq!(cancel_of(&title), None, "nothing to stop");
     }
 
-    /// The roles are the patch's, not new ones: a failing run reads in the same red a removed
-    /// line does, and a clean one in the same green.
+    /// The run a title's cancel button names, if it has one.
+    fn cancel_of(nodes: &[Element]) -> Option<RunId> {
+        nodes.iter().find_map(|n| match n {
+            Element::Action {
+                action: aether_protocol::ui::ViewAction::Cancel { run },
+                ..
+            } => Some(*run),
+            _ => None,
+        })
+    }
+
+    /// A queued line waits under the directory it was submitted in, says so, and can be taken out;
+    /// when its turn comes it starts as the run it was queued as — same id, same directory — so
+    /// its element is the same element.
     #[test]
-    fn a_titles_outcome_takes_the_patchs_own_roles() {
-        let roles = |status| {
-            run_title(&run("x", status, Some(10)))
+    fn a_queued_line_starts_as_the_run_it_was_queued_as() {
+        let (handle, _token) = crate::process::cancel_channel();
+        let mut t = Transcript::new(9, PathBuf::from("/tmp/a"), "Shell 1".into());
+        assert!(!t.is_busy());
+        let first = t.push_run("sleep 1".into(), 0, handle);
+        assert!(t.is_busy());
+        let second = t.enqueue("echo two".into());
+        t.cwd = PathBuf::from("/tmp/b");
+        let third = t.enqueue("echo three".into());
+
+        let title = queued_title(&t.queue[0]);
+        assert_eq!(title_text(&title), "/tmp/a", "{title:?}");
+        assert_eq!(cancel_of(&title), Some(second));
+
+        let (handle, _token) = crate::process::cancel_channel();
+        assert!(
+            t.start_next(0, handle).is_none(),
+            "nothing starts while a run is going"
+        );
+        t.run_mut(first).unwrap().status = RunStatus::Killed;
+
+        assert!(t.unqueue(second), "taken out before it started");
+        assert!(!t.unqueue(second), "and only once");
+        let (handle, _token) = crate::process::cancel_channel();
+        let started = t.start_next(3, handle).expect("the next in line");
+        assert_eq!(started.id, third);
+        assert_eq!(started.cwd, PathBuf::from("/tmp/b"));
+        assert_eq!((started.start_line, started.end_line_exclusive), (3, 3));
+        assert!(t.queue.is_empty());
+        assert_eq!(t.active().map(|r| r.id), Some(third));
+    }
+
+    /// Closing a shell drops what was waiting before it stops what is running, or the stop would
+    /// start the next line.
+    #[test]
+    fn cancel_all_drops_the_queue() {
+        let (handle, _token) = crate::process::cancel_channel();
+        let mut t = Transcript::new(9, PathBuf::from("/tmp"), "Shell 1".into());
+        t.push_run("sleep 100".into(), 0, handle);
+        t.enqueue("echo later".into());
+        t.cancel_all();
+        assert!(t.queue.is_empty());
+    }
+
+    /// The mark says how a run stands: blue while it goes, green for a clean finish, yellow for
+    /// a stop someone asked for, red for every other way of not finishing cleanly, and hollow and
+    /// muted while it waits its turn. The command itself is always the file role — the heaviest
+    /// thing in the box.
+    #[test]
+    fn a_runs_mark_says_how_it_stands() {
+        let role = |mark| {
+            let row = command_row("x", mark);
+            let roles: Vec<String> = row
                 .iter()
                 .flat_map(|e| e.highlight_runs())
                 .map(|h| h.kind.clone())
-                .collect::<Vec<_>>()
+                .collect();
+            assert_eq!(roles.last().map(String::as_str), Some(crate::patch::FILE));
+            roles[0].clone()
         };
-        assert!(roles(RunStatus::Exited { code: 0 }).contains(&crate::patch::ADDED.to_string()));
-        assert!(roles(RunStatus::Exited { code: 1 }).contains(&crate::patch::REMOVED.to_string()));
-        assert!(roles(RunStatus::Killed).contains(&crate::patch::REMOVED.to_string()));
-        // And the command itself is always the file role — the heaviest thing in the box.
-        let command_roles: Vec<String> = command_row(&run("x", RunStatus::Killed, None))
-            .iter()
-            .flat_map(|e| e.highlight_runs())
-            .map(|h| h.kind.clone())
-            .collect();
-        assert!(command_roles.contains(&crate::patch::FILE.to_string()));
+        assert_eq!(role(Mark::Run(RunStatus::Running)), STATUS_RUNNING);
+        assert_eq!(role(Mark::Run(RunStatus::Exited { code: 0 })), STATUS_OK);
+        assert_eq!(role(Mark::Run(RunStatus::Cancelled)), STATUS_WARNING);
+        for failed in [
+            RunStatus::Exited { code: 1 },
+            RunStatus::Killed,
+            RunStatus::Truncated,
+            RunStatus::Refused,
+        ] {
+            assert_eq!(role(Mark::Run(failed)), STATUS_ERROR, "{failed:?}");
+        }
+        assert_eq!(role(Mark::Queued), crate::patch::META);
+        assert_ne!(
+            Mark::Queued.glyph().0,
+            Mark::Run(RunStatus::Running).glyph().0
+        );
     }
 
     /// A multi-line command still occupies one row.
     #[test]
     fn a_multiline_command_stays_one_row() {
-        let rows = command_row(&run("echo one\necho two", RunStatus::Running, None));
+        let rows = command_row("echo one\necho two", Mark::Queued);
         let text: String = rows.iter().map(Element::text_content).collect();
         assert!(!text.contains('\n'), "{text}");
         assert!(text.contains("echo one ⏎ echo two"), "{text}");

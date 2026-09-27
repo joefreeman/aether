@@ -5646,8 +5646,9 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     };
 
     // A box's border row, *inside* its own rails: the horizontal fill, and — on a top border whose
-    // box is named — one rule cell, a space, the title, a space, then the rule on to the far
-    // corner. The corners where this meets the rails are drawn by `enclose`, which owns the frame
+    // box is named — a space, the title, a space, then the rule on to the far corner. The space is
+    // the gutter's cell, so the title starts in the column the box's content does. What a title
+    // sets flush right (`split_title`) ends a space and one rule cell short of the far corner. The corners where this meets the rails are drawn by `enclose`, which owns the frame
     // — two mechanisms each drawing part of one box is how the rail ended up painted twice.
     //
     // A title over-long for its box is cut where any chrome row is, by `fit`: the rule it was
@@ -5666,11 +5667,27 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         if title.is_empty() {
             return Line::from(vec![Span::styled("─".repeat(cols as usize), ink)]);
         }
-        let title_cols = title.iter().map(inline_cols).sum::<usize>() as u16;
-        let mut spans = vec![Span::styled("─ ".to_string(), ink)];
-        spans.extend(children_spans(title, title_cols, bg, lit));
-        spans.push(Span::styled(" ".to_string(), Style::default().bg(bg)));
-        spans.push(Span::styled("─".repeat(cols as usize), ink));
+        let (left, right) = aether_protocol::ui::split_title(title);
+        let width = |nodes: &[Element]| nodes.iter().map(inline_cols).sum::<usize>();
+        let (left_cols, right_cols) = (width(left), width(right));
+        let space = || Span::styled(" ".to_string(), Style::default().bg(bg));
+        let mut spans = vec![space()];
+        spans.extend(children_spans(left, left_cols as u16, bg, lit));
+        spans.push(space());
+        if right.is_empty() {
+            spans.push(Span::styled("─".repeat(cols as usize), ink));
+        } else {
+            // Space, name, space, rule, space, right, space, one rule cell: the rule takes what
+            // is left, and at least a cell of it, so the two halves never run together.
+            let rule = (cols as usize)
+                .saturating_sub(left_cols + right_cols + 5)
+                .max(1);
+            spans.push(Span::styled("─".repeat(rule), ink));
+            spans.push(space());
+            spans.extend(children_spans(right, right_cols as u16, bg, lit));
+            spans.push(space());
+            spans.push(Span::styled("─".to_string(), ink));
+        }
         Line::from(fit(spans, cols, bg))
     };
 
@@ -12144,7 +12161,23 @@ mod painter_tests {
                 first_buffer_line: 0,
                 lines,
             };
-        let boxed = |title: &str, children: Vec<Element>| {
+        // A run's command row as the server builds it: its mark, a space, the command.
+        let command = |text: &str| {
+            UiElement::chrome(vec![UiElement::row(vec![
+                UiElement::text("\u{25cf}", Vec::new()),
+                UiElement::Space { cols: 1 },
+                UiElement::text(text, Vec::new()),
+            ])])
+        };
+        // A finished run's title: the directory, and its duration flush right.
+        let done = || {
+            vec![
+                UiElement::text("~/proj", Vec::new()),
+                UiElement::Fill { glyph: '─' },
+                UiElement::text("1.2s", Vec::new()),
+            ]
+        };
+        let boxed = |title: Vec<Element>, children: Vec<Element>| {
             use aether_protocol::ui::{Band, Edges, Sides};
             UiElement::titled(
                 Edges {
@@ -12153,7 +12186,7 @@ mod painter_tests {
                     collapse: false,
                 },
                 Band::Chrome,
-                vec![UiElement::text(title, Vec::new())],
+                title,
                 children,
             )
         };
@@ -12163,9 +12196,9 @@ mod painter_tests {
             title: Vec::new(),
             children: vec![
                 boxed(
-                    "~/proj  ok",
+                    done(),
                     vec![
-                        chrome("echo one"),
+                        command("echo one"),
                         editor(
                             0,
                             7,
@@ -12176,9 +12209,9 @@ mod painter_tests {
                 ),
                 chrome(""),
                 boxed(
-                    "~/proj  ok",
+                    done(),
                     vec![
-                        chrome("echo two"),
+                        command("echo two"),
                         editor(
                             1,
                             7,
@@ -12189,7 +12222,7 @@ mod painter_tests {
                 ),
                 chrome(""),
                 boxed(
-                    "~/proj",
+                    vec![UiElement::text("~/proj", Vec::new())],
                     vec![editor(
                         2,
                         8,
@@ -12218,9 +12251,9 @@ mod painter_tests {
                 .position(|r| r.trim().trim_matches(|c: char| c == '│' || c == ' ') == needle)
                 .unwrap_or_else(|| panic!("no row reading {needle:?}:\n{}", rows.join("\n")))
         };
-        let first_command = row_of("echo one");
+        let first_command = row_of("\u{25cf} echo one");
         let first_out = row_of("one");
-        let second_command = row_of("echo two");
+        let second_command = row_of("\u{25cf} echo two");
         let second_out = row_of("two");
         let input = row_of("cargo build");
         assert!(
@@ -12232,11 +12265,25 @@ mod painter_tests {
             rows.join("\n")
         );
         // The name is on the border row itself and costs the box no row: a run's box opens one
-        // row above its command, and that row carries the name between two stretches of rule.
+        // row above its command, and that row carries the name — in the column the box's content
+        // starts in — and the duration flush against the far corner, rule between.
         let opening = &rows[first_command - 1];
         assert!(
-            opening.starts_with("┌─ ~/proj  ok ─") && opening.trim_end().ends_with('┐'),
+            opening.starts_with("┌ ~/proj ─") && opening.trim_end().ends_with("─ 1.2s ─┐"),
             "the box's top border is named: {opening:?}"
+        );
+        assert_eq!(
+            opening.find("~/proj").map(|b| opening[..b].chars().count()),
+            rows[first_command]
+                .find('\u{25cf}')
+                .map(|b| rows[first_command][..b].chars().count()),
+            "the name lines up with the mark under it:\n{}",
+            rows.join("\n")
+        );
+        assert_eq!(
+            opening.chars().count(),
+            rows[first_command].chars().count(),
+            "the border is as wide as the box"
         );
         // Between one run's last output row and the next run's command: the first box's own
         // closing border, a blank row of ground, then the second's named opening one. Two boxes,
@@ -12259,14 +12306,14 @@ mod painter_tests {
             rows[first_out + 1]
         );
         assert!(
-            rows[first_out + 3].starts_with("┌─ ~/proj"),
+            rows[first_out + 3].starts_with("┌ ~/proj"),
             "and the second opens its own: {:?}",
             rows[first_out + 3]
         );
         // The input's box is named too, and holds nothing above the line you type.
         assert!(
-            rows[input - 1].starts_with("┌─ ~/proj ─"),
-            "the input's box says where you are: {:?}",
+            rows[input - 1].starts_with("┌ ~/proj ─") && rows[input - 1].ends_with("──┐"),
+            "the input's box says where you are, and nothing else: {:?}",
             rows[input - 1]
         );
         assert!(
@@ -12327,6 +12374,86 @@ mod painter_tests {
         assert!(
             rows[command + 1].trim_start().starts_with('└'),
             "and the box closes right under the command:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// A queued line is a box that has said nothing yet: its hollow mark and its command on the
+    /// one row inside, and its stop button flush right on the title — which is what `Tab` stops on
+    /// even though the box holds no line a cursor could.
+    #[test]
+    fn a_queued_line_paints_its_stop_button_flush_right_on_the_title() {
+        use aether_protocol::ui::{Band, Edges, Sides, ViewAction};
+        let queued = UiElement::titled(
+            Edges {
+                border: Sides::all(1),
+                padding: Sides::ZERO,
+                collapse: false,
+            },
+            Band::Chrome,
+            vec![
+                UiElement::text("~/proj", Vec::new()),
+                UiElement::Fill { glyph: '─' },
+                UiElement::Action {
+                    action: ViewAction::Cancel { run: 3 },
+                    label: vec![UiElement::text("\u{d7}", Vec::new())],
+                    enabled: true,
+                },
+            ],
+            vec![
+                UiElement::chrome(vec![UiElement::row(vec![
+                    UiElement::text("\u{25cb}", Vec::new()),
+                    UiElement::Space { cols: 1 },
+                    UiElement::text("cargo test", Vec::new()),
+                ])]),
+                Element::Editor {
+                    collapsed: false,
+                    element: 0,
+                    buffer: 7,
+                    rows: 0,
+                    first_row: ElementRow::ZERO,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Field,
+                    first_buffer_line: 0,
+                    lines: Vec::new(),
+                },
+            ],
+        );
+        let root = Element::Column {
+            edges: aether_protocol::ui::Edges::NONE,
+            band: aether_protocol::ui::Band::None,
+            title: Vec::new(),
+            children: vec![queued],
+        };
+        let ring = aether_client::grid::focus_ring(&root);
+        assert!(
+            matches!(
+                ring.as_slice(),
+                [aether_client::grid::Stop::Action {
+                    element: 0,
+                    action: ViewAction::Cancel { run: 3 },
+                    ..
+                }]
+            ),
+            "the button is the box's one stop"
+        );
+        let state = crate::app::test_state(editor_over(root, 0));
+        let rows = painted(&state);
+        let command = rows
+            .iter()
+            .position(|r| {
+                r.trim().trim_matches(|c: char| c == '│' || c == ' ') == "\u{25cb} cargo test"
+            })
+            .unwrap_or_else(|| panic!("no command row:\n{}", rows.join("\n")));
+        assert!(
+            rows[command - 1].starts_with("┌ ~/proj ─")
+                && rows[command - 1].trim_end().ends_with("─ [\u{d7}] ─┐"),
+            "the button is flush right on the border:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows[command + 1].trim_start().starts_with('└'),
+            "and nothing has been said yet:\n{}",
             rows.join("\n")
         );
     }

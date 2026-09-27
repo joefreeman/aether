@@ -135,13 +135,7 @@ pub async fn shell_open(
             run_line(state, ctx, opened.view_id, line)
                 .await
                 .err()
-                .map(|e| {
-                    if e.code == aether_protocol::error::ErrorCode::SHELL_BUSY.code() {
-                        NotRun::Busy { message: e.message }
-                    } else {
-                        NotRun::Refused { message: e.message }
-                    }
-                })
+                .map(|e| NotRun::Refused { message: e.message })
         }
     };
     // A run is an element *above* the input, so the number the landing named the input by now
@@ -512,29 +506,27 @@ pub async fn shell_run(
 /// Run a line in the shell `view_id` presents: `line`, or — `None` — what is typed in its input,
 /// which is then cleared. A `line` given leaves the input alone, refusal included: the words a
 /// refusal would select are not in it.
+///
+/// A line goes into the queue and [`advance`] starts it — at once when nothing is ahead of it,
+/// otherwise when everything ahead has finished. Both halves go through the one path, so a line
+/// run straight away and a line that waited cannot come to be started differently.
 async fn run_line(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     view_id: ViewId,
     line: Option<String>,
 ) -> Result<ShellRunResult, RpcError> {
-    let params = ShellRunParams { view_id };
     let from_input = line.is_none();
     let client_id = ctx.client_id;
-    let (transcript, input, source, cwd, prev_cwd, env, workspace, current_file) = {
+    let (transcript, input, source, busy, cwd, prev_cwd, env, workspace, current_file) = {
         let s = state.lock().await;
         let transcript = s
-            .try_presenting_buffer(params.view_id)
-            .ok_or_else(|| RpcError::view_not_found(params.view_id))?;
+            .try_presenting_buffer(view_id)
+            .ok_or_else(|| RpcError::view_not_found(view_id))?;
         let t = s
             .try_doc_of(transcript)
             .and_then(|d| d.transcript())
-            .ok_or_else(|| RpcError::not_a_shell(params.view_id))?;
-        // One run at a time. Refused with a code of its own so the client can say which command is
-        // in the way and offer the key that stops it — and, crucially, leave the typed text alone.
-        if let Some(active) = t.active() {
-            return Err(RpcError::shell_busy(&t.title, &active.command));
-        }
+            .ok_or_else(|| RpcError::not_a_shell(view_id))?;
         let source = match line {
             Some(line) => line,
             None => s.doc_of(t.input).text.to_string(),
@@ -546,17 +538,18 @@ async fn run_line(
             transcript,
             t.input,
             source,
+            t.is_busy(),
             t.cwd.clone(),
             t.prev_cwd.clone(),
             t.env.clone(),
             s.active_workspace(client_id).and_then(|w| w.name.clone()),
-            current_file(&s, client_id),
+            current_file(&s, transcript),
         )
     };
 
     // Parsed and checked against the world before anything is touched — and outside the lock,
     // because "is this on PATH" and "is that a directory" are filesystem questions.
-    let accepted = aether_shell::parse(&source).and_then(|program| {
+    let checked = aether_shell::parse(&source).map(|program| {
         aether_shell::validate(
             &program,
             aether_shell::Context {
@@ -567,9 +560,17 @@ async fn run_line(
             &ServerWorld { env: &env },
         )
     });
-    let accepted = match accepted {
-        Ok(accepted) => accepted,
-        Err(refusal) => {
+    use aether_shell::Accepted;
+    // A line that does not parse never will, so it is refused whatever is running. One that names
+    // something not there is refused only when it would start now: behind a run, the thing it
+    // names may be what that run makes, so a queued line is asked again when its turn comes. A
+    // directory change is applied now either way — it runs nothing, so there is nothing to wait
+    // for, and what you type next should already be where you moved to.
+    let change_dir = match checked {
+        Ok(Ok(Accepted::ChangeDir(dir))) => Some(dir),
+        Ok(Ok(_)) => None,
+        Ok(Err(_)) if busy => None,
+        Err(refusal) | Ok(Err(refusal)) => {
             // The word at fault is selected so that typing replaces it; the text stays.
             if from_input {
                 select_in_input(state, client_id, input, refusal.span).await;
@@ -619,47 +620,42 @@ async fn run_line(
         }
     }
 
-    use aether_shell::Accepted;
-    match accepted {
-        // The two things a shell does itself, with no process behind them. A directory change
-        // leaves no box: the directory in the input's title is where you now are, and that is
-        // the whole of what happened. An assignment is a run like any other — a box, with
-        // nothing to say — so the transcript records that it was made.
-        Accepted::ChangeDir(dir) => {
-            {
-                let mut s = state.lock().await;
-                s.with_transcript(transcript, |t| {
-                    let from = std::mem::replace(&mut t.cwd, dir);
-                    t.prev_cwd = Some(from);
-                });
-            }
-            // The rebuilt title is content, so it rides the ordinary content push.
-            push_transcript_changed(state, transcript).await;
-            Ok(ShellRunResult { run: None })
+    // A directory change leaves no box: the directory in the input's title is where you now are,
+    // and that is the whole of what happened.
+    if let Some(dir) = change_dir {
+        {
+            let mut s = state.lock().await;
+            s.with_transcript(transcript, |t| change_directory(t, dir));
         }
-        Accepted::Assign(vars) => {
-            {
-                let mut s = state.lock().await;
-                s.with_transcript(transcript, |t| {
-                    for (name, value) in vars {
-                        t.assign(name, value);
-                    }
-                });
-            }
-            let run = record_instant_run(state, params.view_id, transcript, command).await?;
-            Ok(ShellRunResult { run: Some(run) })
-        }
-        Accepted::Run(plan) => {
-            spawn_run(state, params.view_id, transcript, command, plan, cwd, env).await
-        }
+        // The rebuilt title is content, so it rides the ordinary content push.
+        push_transcript_changed(state, transcript).await;
+        return Ok(ShellRunResult { run: None });
     }
+
+    let run = {
+        let mut s = state.lock().await;
+        s.with_transcript(transcript, |t| t.enqueue(command))
+            .ok_or_else(|| RpcError::not_a_shell(view_id))?
+    };
+    // Waiting behind a run: its box is new content, and nothing else happens until its turn.
+    if !advance(state.clone(), view_id, transcript).await {
+        push_transcript_changed(state, transcript).await;
+    }
+    Ok(ShellRunResult { run: Some(run) })
 }
 
-/// What `%` names: the file most recently looked at in this client's workspace — a real file,
-/// not a patch, a revision or a shell.
-fn current_file(s: &ServerState, client_id: ClientId) -> Option<PathBuf> {
-    let workspace = s.active_workspace(client_id)?.id.clone();
-    let entry = s.workspaces.get(&workspace)?;
+/// Move the shell to `dir`, remembering where it was for `-`.
+fn change_directory(t: &mut crate::shell::Transcript, dir: PathBuf) {
+    let from = std::mem::replace(&mut t.cwd, dir);
+    t.prev_cwd = Some(from);
+}
+
+/// What `%` names: the file most recently looked at in the shell's workspace — a real file, not a
+/// patch, a revision or a shell. Asked of the workspace rather than of a client, because a queued
+/// line asks it when its turn comes, and nobody pressed anything then.
+fn current_file(s: &ServerState, transcript: BufferId) -> Option<PathBuf> {
+    let workspace = s.buffer_workspaces.get(&transcript)?;
+    let entry = s.workspaces.get(workspace)?;
     entry.mru_views.iter().find_map(|v| {
         let buffer = s.try_view(*v)?.presenting;
         let doc = s.try_doc_of(buffer)?;
@@ -670,85 +666,166 @@ fn current_file(s: &ServerState, client_id: ClientId) -> Option<PathBuf> {
     })
 }
 
-/// Start `plan` running as run `command` of the transcript, and answer once it is going.
-async fn spawn_run(
-    state: &SharedState,
+/// Start what is next in `transcript`'s queue, if nothing is running — and, for a line that is over
+/// the moment it starts, the one after it, until a process is going or the queue is empty.
+/// Answers whether it started anything, having pushed whatever that changed.
+///
+/// Called after a line is queued and after a run finishes, which between them are every moment
+/// the answer can change. The line is checked against the world **here**, when it starts, rather
+/// than when it was typed: behind a build, the file it names may be one the build writes. One that
+/// is refused now becomes a run that says why, and the queue carries on past it.
+///
+/// Boxed with its `Send` spelled out, because it and [`run_task`] start each other.
+fn advance(
+    state: SharedState,
     view_id: ViewId,
     transcript: BufferId,
-    command: String,
-    plan: aether_shell::Plan,
-    cwd: PathBuf,
-    env: std::collections::HashMap<String, String>,
-) -> Result<ShellRunResult, RpcError> {
-    let (handle, token) = crate::process::cancel_channel();
-    let (run, start_char, state_now, deferred) = {
-        let mut s = state.lock().await;
-        let start_char = s.doc_of(transcript).text.len_chars();
-        let start_line = s.doc_of(transcript).content_lines();
-        let run = s
-            .with_transcript(transcript, |t| {
-                t.push_run(command.clone(), start_line, handle)
-            })
-            .ok_or_else(|| RpcError::not_a_shell(view_id))?;
-        let state_now = s
-            .try_doc_of(transcript)
-            .and_then(|d| d.transcript())
-            .and_then(|t| t.run(run))
-            .map(|r| r.state());
-        // Registered as outstanding work, so a caller can wait for the server to go quiet rather
-        // than guess at how long a command takes. Held for the run's whole life by the task below.
-        (run, start_char, state_now, s.deferred.start())
-    };
-    // The run's box is new content — a new element, its command row — so it rides the content push
-    // now, as an instant run's does. Left to the output flush, a command that prints nothing
-    // (`sleep`, a quiet build step) would not appear until it had finished.
-    push_transcript_changed(state, transcript).await;
-    push_run_changed(state, view_id, state_now).await;
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+    Box::pin(async move {
+        let mut started = false;
+        loop {
+            let (handle, token) = crate::process::cancel_channel();
+            let begun = {
+                let mut s = state.lock().await;
+                let ready = s
+                    .try_doc_of(transcript)
+                    .and_then(|d| d.transcript())
+                    .is_some_and(|t| t.active().is_none() && !t.queue.is_empty());
+                if !ready {
+                    return started;
+                }
+                let start_char = s.doc_of(transcript).text.len_chars();
+                let start_line = s.doc_of(transcript).content_lines();
+                let current_file = current_file(&s, transcript);
+                let begun = s
+                    .with_transcript(transcript, |t| {
+                        let (id, command, cwd) = {
+                            let run = t.start_next(start_line, handle)?;
+                            (run.id, run.command.clone(), run.cwd.clone())
+                        };
+                        Some((id, command, cwd, t.prev_cwd.clone(), t.env.clone()))
+                    })
+                    .flatten();
+                // Registered as outstanding work, so a caller can wait for the server to go quiet
+                // rather than guess at how long a command takes. Held for the run's whole life by
+                // the task below.
+                begun.map(|b| (b, current_file, start_char, s.deferred.start()))
+            };
+            let Some(((run, command, cwd, prev_cwd, env), current_file, start_char, deferred)) =
+                begun
+            else {
+                return started;
+            };
+            started = true;
 
-    tokio::spawn(run_task(
-        state.clone(),
-        view_id,
-        transcript,
-        run,
-        plan,
-        cwd,
-        env,
-        token,
-        start_char,
-        deferred,
-    ));
-    Ok(ShellRunResult { run: Some(run) })
+            let checked = aether_shell::parse(&command).and_then(|program| {
+                aether_shell::validate(
+                    &program,
+                    aether_shell::Context {
+                        cwd: &cwd,
+                        prev_cwd: prev_cwd.as_deref(),
+                        current_file: current_file.as_deref(),
+                    },
+                    &ServerWorld { env: &env },
+                )
+            });
+            // Stopped in the moment it took to check: whatever it was, it does not happen.
+            let cancelled = *token.borrow();
+            use aether_shell::Accepted;
+            match checked {
+                Ok(Accepted::Run(plan)) => {
+                    let running = {
+                        let s = state.lock().await;
+                        s.try_doc_of(transcript)
+                            .and_then(|d| d.transcript())
+                            .and_then(|t| t.run(run))
+                            .map(|r| r.state())
+                    };
+                    // The run's box is new content — a new element, its command row — so it rides
+                    // the content push now. Left to the output flush, a command that prints
+                    // nothing (`sleep`, a quiet build step) would not appear until it had finished.
+                    push_transcript_changed(&state, transcript).await;
+                    push_run_changed(&state, view_id, running).await;
+                    tokio::spawn(run_task(
+                        state.clone(),
+                        view_id,
+                        transcript,
+                        run,
+                        plan,
+                        cwd,
+                        env,
+                        token,
+                        start_char,
+                        deferred,
+                    ));
+                    return true;
+                }
+                // Reached only by a line that named a directory not there when it was queued: it
+                // moves the shell as one typed now would, and leaves no box — the run it started
+                // as said nothing, so it owns no line and goes without disturbing any other's.
+                Ok(Accepted::ChangeDir(dir)) => {
+                    {
+                        let mut s = state.lock().await;
+                        s.with_transcript(transcript, |t| {
+                            t.runs.retain(|r| r.id != run);
+                            if !cancelled {
+                                change_directory(t, dir);
+                            }
+                        });
+                    }
+                    push_transcript_changed(&state, transcript).await;
+                }
+                // An assignment is a run like any other — a box, with nothing to say — so the
+                // transcript records that it was made. Over the moment it starts.
+                Ok(Accepted::Assign(vars)) => {
+                    let status = if cancelled {
+                        RunStatus::Cancelled
+                    } else {
+                        let mut s = state.lock().await;
+                        s.with_transcript(transcript, |t| {
+                            for (name, value) in vars {
+                                t.assign(name, value);
+                            }
+                        });
+                        RunStatus::Exited { code: 0 }
+                    };
+                    let finished = finish(&state, transcript, run, status, 0).await;
+                    push_transcript_changed(&state, transcript).await;
+                    push_run_changed(&state, view_id, finished).await;
+                }
+                Err(refusal) => {
+                    {
+                        let mut s = state.lock().await;
+                        let text = format!("{}\n", refusal.message);
+                        s.extend_transcript(transcript, start_char, &text);
+                    }
+                    let finished = finish(&state, transcript, run, RunStatus::Refused, 0).await;
+                    push_transcript_changed(&state, transcript).await;
+                    push_run_changed(&state, view_id, finished).await;
+                }
+            }
+            drop(deferred);
+        }
+    })
 }
 
-/// Record a run that is over the moment it starts — an assignment: no output, exit 0, no time
-/// taken.
-async fn record_instant_run(
+/// Record how run `run` ended, and answer its final state.
+async fn finish(
     state: &SharedState,
-    view_id: ViewId,
     transcript: BufferId,
-    command: String,
-) -> Result<RunId, RpcError> {
-    let (run, finished) = {
-        let mut s = state.lock().await;
-        let start_line = s.doc_of(transcript).content_lines();
-        let (handle, _token) = crate::process::cancel_channel();
-        let run = s
-            .with_transcript(transcript, |t| t.push_run(command, start_line, handle))
-            .ok_or_else(|| RpcError::not_a_shell(view_id))?;
-        let finished = s
-            .with_transcript(transcript, |t| {
-                let r = t.run_mut(run)?;
-                r.status = RunStatus::Exited { code: 0 };
-                r.elapsed_ms = Some(0);
-                r.cancel = None;
-                Some(r.state())
-            })
-            .flatten();
-        (run, finished)
-    };
-    push_transcript_changed(state, transcript).await;
-    push_run_changed(state, view_id, finished).await;
-    Ok(run)
+    run: RunId,
+    status: RunStatus,
+    elapsed_ms: u64,
+) -> Option<RunState> {
+    let mut s = state.lock().await;
+    s.with_transcript(transcript, |t| {
+        let r = t.run_mut(run)?;
+        r.status = status;
+        r.elapsed_ms = Some(elapsed_ms);
+        r.cancel = None;
+        Some(r.state())
+    })
+    .flatten()
 }
 
 /// Select `span` (a byte range of the input's text) for `client_id`, and tell it so.
@@ -874,6 +951,49 @@ pub async fn shell_cancel(
     Ok(ShellCancelResult { cancelled })
 }
 
+/// Stop run `run` of the shell `view_id` presents if it is going, or take it out of the queue if it
+/// is waiting — what a run's cancel button does. A running one ends exactly as `shell/cancel` ends
+/// it, killed and kept; a queued one leaves no trace, since nothing happened. False when it is
+/// neither any more.
+pub async fn shell_cancel_run(
+    state: &SharedState,
+    view_id: ViewId,
+    run: RunId,
+) -> Result<bool, RpcError> {
+    let unqueued = {
+        let mut s = state.lock().await;
+        let transcript = s
+            .try_presenting_buffer(view_id)
+            .ok_or_else(|| RpcError::view_not_found(view_id))?;
+        let t = s
+            .try_doc_of(transcript)
+            .and_then(|d| d.transcript())
+            .ok_or_else(|| RpcError::not_a_shell(view_id))?;
+        if t.queue.iter().any(|q| q.id == run) {
+            s.with_transcript(transcript, |t| t.unqueue(run));
+            Some(transcript)
+        } else if t.active().is_some_and(|r| r.id == run) {
+            // The same stop the activity picker's makes, so the two cannot end a run differently.
+            return Ok(s
+                .with_transcript(transcript, |t| {
+                    t.active_mut()
+                        .and_then(|r| r.cancel.take())
+                        .is_some_and(|handle| handle.send(true).is_ok())
+                })
+                .unwrap_or(false));
+        } else {
+            None
+        }
+    };
+    match unqueued {
+        Some(transcript) => {
+            push_transcript_changed(state, transcript).await;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 // ---- running -----------------------------------------------------------------------------------
 
 /// Run one accepted line and stream its output into the transcript.
@@ -897,6 +1017,7 @@ async fn run_task(
     _deferred: DeferredToken,
 ) {
     let started = Instant::now();
+    let token_seen = token.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let capped = Arc::new(AtomicBool::new(false));
     let runner = tokio::spawn({
@@ -917,6 +1038,9 @@ async fn run_task(
             execute_plan(plan, &cwd, &env, token, &mut on_chunk).await
         }
     });
+    // Kept to ask afterwards whether the stop was ours: a cancel reads as one however the command
+    // took the signal — killed by it, or exiting with a code of its own on the way out.
+    let asked_to_stop = token_seen;
 
     let mut out = crate::process::OutputText::default();
     let mut flushed = Flushed::default();
@@ -948,30 +1072,23 @@ async fn run_task(
     }
     flush(&state, transcript, start_char, &out, &mut flushed).await;
 
-    let status = match (capped, code) {
-        (true, _) => RunStatus::Truncated,
-        (false, Some(code)) => RunStatus::Exited { code },
-        // No code means a signal, and the only thing signalling here is our own cancel — either
-        // `shell/cancel` or the view closing. Read from the outcome rather than from the token so
-        // a command that genuinely died of a signal reads the same way, which it should.
-        (false, None) => RunStatus::Killed,
+    let status = match (capped, *asked_to_stop.borrow(), code) {
+        (true, _, _) => RunStatus::Truncated,
+        // Stopped because someone asked — `shell/cancel`, the stop button, the view closing.
+        (false, true, _) => RunStatus::Cancelled,
+        (false, false, Some(code)) => RunStatus::Exited { code },
+        // No code and nobody here asked: a signal from outside, which is a failure.
+        (false, false, None) => RunStatus::Killed,
     };
     let elapsed = started.elapsed().as_millis() as u64;
-    let finished = {
-        let mut s = state.lock().await;
-        s.with_transcript(transcript, |t| {
-            let r = t.run_mut(run)?;
-            r.status = status;
-            r.elapsed_ms = Some(elapsed);
-            r.cancel = None;
-            Some(r.state())
-        })
-        .flatten()
-    };
+    let finished = finish(&state, transcript, run, status, elapsed).await;
     // The rebuilt header is content, so it rides the ordinary content push; the run state rides
     // its own, for the status indicator and the toast.
     push_transcript_changed(&state, transcript).await;
     push_run_changed(&state, view_id, finished).await;
+    // Whatever was waiting on this one goes next, however this one went. Before `_deferred` is
+    // dropped, so a server waiting to go quiet does not see a gap between the two.
+    advance(state, view_id, transcript).await;
 }
 
 /// Run a plan's pipelines in order, honouring `&&` and `||`, and answer the line's exit code —

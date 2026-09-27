@@ -14,7 +14,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { renderBuffer } from "./render";
+import { renderBuffer, splitTitle } from "./render";
 import { MEASURABLE_BLOCKS, renderReply } from "./read";
 import { editorsOf, focusRing, paintedRows, totalRows } from "./protocol";
 import { WHOLE_ROWS } from "./protocol";
@@ -515,9 +515,17 @@ describe("the box stylesheet", () => {
     expect(title, "a blank cell either side of the name").toContain("padding: 0 1ch");
     expect(title, "the plain row's shade").toContain("background-color: var(--bg)");
     expect(
-      rule(".row.box-edge.patch-chrome .title {"),
+      rule(".row.box-edge.patch-chrome .title,"),
       "and the chrome band's, on a box that declares one",
     ).toContain("background-color: var(--bg-app)");
+    expect(
+      rule(".row.box-edge.patch-chrome .title,"),
+      "for both halves of the name",
+    ).toContain(".row.box-edge.patch-chrome .title-end");
+    expect(title, "in the column the box's content starts in").toContain("margin-left: -1ch");
+    const end = rule(".row.box-edge .title-end {");
+    expect(end, "pushed against the far corner").toContain("margin-left: auto");
+    expect(end, "a cell of rule short of it").toContain("margin-right: 1ch");
     expect(
       css.indexOf(".row.box-edge .title {"),
       "the mask must follow the rule it masks, or the gradient paints over it",
@@ -551,31 +559,37 @@ describe("the buffer painter", () => {
       ...(editor(2, 0, [line(0, "cargo build")]) as ViewNode & { node: "editor" }),
       role: "input",
     };
-    // Each run in a box of its own, closed on all four sides and named on its top border.
-    const boxed = (name: string, children: ViewNode[]): ViewNode => ({
+    // Each run in a box of its own, closed on all four sides and named on its top border — the
+    // directory, and the duration flush right.
+    const boxed = (title: ViewNode[], children: ViewNode[]): ViewNode => ({
       node: "column",
       edges: { border: { top: 1, right: 1, bottom: 1, left: 1 } },
       band: "chrome",
-      title: [{ node: "text", text: name }],
+      title,
       children,
     });
+    const done: ViewNode[] = [
+      { node: "text", text: "~/proj" },
+      { node: "fill", glyph: "─" },
+      { node: "text", text: "1.2s" },
+    ];
     const w = windowOf({
       node: "column",
       children: [
-        boxed("~/proj  ok", [chrome("echo one"), editor(0, 0, [line(0, "one")])]),
+        boxed(done, [chrome("echo one"), editor(0, 0, [line(0, "one")])]),
         chrome(""),
-        boxed("~/proj  ok", [chrome("echo two"), editor(1, 1, [line(1, "two")])]),
+        boxed(done, [chrome("echo two"), editor(1, 1, [line(1, "two")])]),
         chrome(""),
-        boxed("~/proj", [input]),
+        boxed([{ node: "text", text: "~/proj" }], [input]),
       ],
     });
     expect(painted(w)).toEqual([
-      "edge ~/proj  ok",
+      "edge ~/proj1.2s",
       "chrome echo one",
       "text one",
       "edge ",
       "chrome ",
-      "edge ~/proj  ok",
+      "edge ~/proj1.2s",
       "chrome echo two",
       "text two",
       "edge ",
@@ -584,6 +598,48 @@ describe("the buffer painter", () => {
       "text cargo build",
       "edge ",
     ]);
+  });
+
+  /// A title's `fill` is the rule between what reads from the left and what is set flush right:
+  /// the two halves land in spans of their own, and the fill itself draws nothing.
+  it("sets what follows a title's fill flush right", () => {
+    const container = document.createElement("div");
+    const w = windowOf({
+      node: "column",
+      children: [
+        {
+          node: "column",
+          edges: { border: { top: 1, right: 1, bottom: 1, left: 1 } },
+          band: "chrome",
+          title: [
+            { node: "text", text: "~/proj" },
+            { node: "fill", glyph: "─" },
+            { node: "action", action: { do: "cancel", run: 3 }, label: [{ node: "text", text: "×" }] },
+          ],
+          children: [editor(0, 0, [line(0, "one")])],
+        },
+      ],
+    });
+    renderBuffer(container, {
+      window: w,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      contentTopPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+    });
+    const edge = container.querySelector(".row.box-edge.top")!;
+    expect(edge.querySelector(".title")?.textContent).toBe("~/proj");
+    const end = edge.querySelector(".title-end");
+    expect(end?.textContent).toBe("[×]");
+    expect(end?.querySelector(".action.hl-diff-removed"), "a stop reads as one").not.toBeNull();
+    expect(splitTitle([{ node: "text", text: "a" }])).toEqual([[{ node: "text", text: "a" }], []]);
   });
 
   /// A new shell is a real state: just the line you type into.

@@ -7509,6 +7509,12 @@ fn invoke_action_shape() {
     );
     let back: ViewportInvokeActionParams = from_value(toggle).unwrap();
     assert!(matches!(back.action, ViewAction::Expand { expand: None }));
+    // A shell run's cancel names the run, not the element: a queued run's element moves up when
+    // one ahead of it is taken out.
+    assert_eq!(
+        to_value(ViewAction::Cancel { run: 7 }).unwrap(),
+        json!({ "do": "cancel", "run": 7 })
+    );
 
     // How a shell paints one is **derived**, never sent: three shells cannot be told different
     // things about which of two buttons you should hesitate over.
@@ -7524,6 +7530,7 @@ fn invoke_action_shape() {
         ViewAction::Expand { expand: None }.kind(),
         ActionKind::Toggle
     );
+    assert_eq!(ViewAction::Cancel { run: 1 }.kind(), ActionKind::Reject);
     assert_eq!(ActionKind::Accept.role(), "diff.added");
     assert_eq!(ActionKind::Reject.role(), "diff.removed");
 }
@@ -7725,9 +7732,19 @@ fn shell_run_changed_shape() {
         ),
         (RunStatus::Killed, json!({"kind": "killed"}), "killed"),
         (
+            RunStatus::Cancelled,
+            json!({"kind": "cancelled"}),
+            "cancelled",
+        ),
+        (
             RunStatus::Truncated,
             json!({"kind": "truncated"}),
             "truncated",
+        ),
+        (
+            RunStatus::Refused,
+            json!({"kind": "refused"}),
+            "not accepted",
         ),
     ] {
         assert_eq!(to_value(status).unwrap(), wire, "{status:?}");

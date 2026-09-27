@@ -54,8 +54,13 @@ pub enum Element {
         edges: Edges,
         #[serde(default, skip_serializing_if = "Band::is_none")]
         band: Band,
-        /// What the box's **top border** says, drawn on the border row itself: a rule cell after
-        /// the corner, a space, these nodes, a space, then the rule on to the far corner.
+        /// What the box's **top border** says, drawn on the border row itself: the corner, a
+        /// space, these nodes — starting in the column the box's content starts in — a space, then
+        /// the rule on to the far corner.
+        ///
+        /// A [`Element::Fill`] among them is **the rule itself**: what follows it is set flush
+        /// against the far corner (`┌ ~/proj ──── 3.2s ─┐`), with a space and one cell of rule
+        /// between it and the corner. [`split_title`] is the one reading of that.
         ///
         /// Inline nodes — the kinds a [`Element::Row`] holds — so a title is styled by the same
         /// [`Highlight`] runs everything else is, through the theme table a shell already has.
@@ -596,6 +601,16 @@ fn is_yes(b: &bool) -> bool {
     *b
 }
 
+/// A box title's two halves: what reads from the left, and what is set flush right — the nodes
+/// either side of its first [`Element::Fill`], which is the rule running between them. A title
+/// with no fill is all left.
+pub fn split_title(title: &[Element]) -> (&[Element], &[Element]) {
+    match title.iter().position(|e| matches!(e, Element::Fill { .. })) {
+        Some(at) => (&title[..at], &title[at + 1..]),
+        None => (title, &[]),
+    }
+}
+
 /// What invoking an [`Element::Action`] does.
 ///
 /// **A closed enum, not an opaque id.** A view rebuilds constantly — an agent view on every event
@@ -619,6 +634,10 @@ pub enum ViewAction {
     },
     /// Stage or unstage the change this element windows.
     Stage { stage: bool },
+    /// Stop a shell's run, or take it out of the queue before it starts. Named by the run's id
+    /// rather than by the element: a queued run's element moves up when one ahead of it is taken
+    /// out, and an id is still the run it was when the button was drawn.
+    Cancel { run: u64 },
 }
 
 impl ViewAction {
@@ -638,7 +657,9 @@ impl ViewAction {
     pub fn kind(&self) -> ActionKind {
         match self {
             ViewAction::Permission { allow: true } => ActionKind::Accept,
-            ViewAction::Permission { allow: false } => ActionKind::Reject,
+            ViewAction::Permission { allow: false } | ViewAction::Cancel { .. } => {
+                ActionKind::Reject
+            }
             ViewAction::Expand { .. } => ActionKind::Toggle,
             ViewAction::Stage { .. } => ActionKind::Neutral,
         }

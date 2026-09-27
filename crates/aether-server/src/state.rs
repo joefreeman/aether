@@ -2195,7 +2195,7 @@ impl ServerState {
             .expect("u32 range is non-empty")
     }
 
-    /// Whether any shell is running a command right now.
+    /// Whether any shell is running a command right now, or has one waiting to.
     ///
     /// Pins the idle reaper open beside the unsaved-work check: an auto-started server that reaped
     /// itself mid-`cargo build` would kill the build and lose its output, which is the same class
@@ -2205,7 +2205,7 @@ impl ServerState {
         self.documents
             .values()
             .filter_map(|d| d.transcript())
-            .any(|t| t.active().is_some())
+            .any(|t| t.is_busy())
     }
 
     /// Stop every shell's running command — the server is going away, and a process group that
@@ -4959,7 +4959,7 @@ impl View {
         }
     }
 
-    /// A shell: one element per run, each introduced by its header, and the **input** last.
+    /// A shell: one element per run, then one per queued line, and the **input** last.
     ///
     /// The input is an element like any other — it windows an ordinary editable document, which is
     /// what makes typing into it work with no new edit path — and is marked
@@ -4992,37 +4992,65 @@ impl View {
         // the box rather than inside it.
         let gap =
             || std::sync::Arc::new(vec![aether_protocol::viewport::Element::chrome(Vec::new())]);
-        let mut elements: Vec<ElementBinding> = t
-            .runs
-            .iter()
-            .enumerate()
-            .map(|(i, run)| ElementBinding {
+        // A run's box, or a queued line's: its mark and its command inside it, the directory as
+        // the box's own name on the border above it.
+        use crate::shell::Mark;
+        let run_box = |i: usize, lines: ElementLines, command: &str, mark: Mark, title: Vec<_>| {
+            ElementBinding {
                 buffer_id: view_buffer,
-                lines: ElementLines::Range {
-                    start: run.start_line,
-                    end_exclusive: run.end_line_exclusive,
-                },
+                lines,
                 decorations: None,
                 // A blank row of ground before every box but the first.
                 chrome_before: if i == 0 { Default::default() } else { gap() },
-                // Inside the box, the command alone; the directory and the outcome are the box's
-                // own name, on the border above it.
-                chrome_above: std::sync::Arc::new(crate::shell::command_row(run)),
+                chrome_above: std::sync::Arc::new(crate::shell::command_row(command, mark)),
                 laid_out_by: LayoutOwner::Server,
                 prose: false,
                 role: aether_protocol::ui::ElementRole::Field,
                 edges: boxed,
                 box_group: Some(i as u32),
                 collapsible: false,
-                title: std::sync::Arc::new(crate::shell::run_title(run)),
+                title: std::sync::Arc::new(title),
                 band: Band::Chrome,
+            }
+        };
+        let mut elements: Vec<ElementBinding> = t
+            .runs
+            .iter()
+            .enumerate()
+            .map(|(i, run)| {
+                let lines = ElementLines::Range {
+                    start: run.start_line,
+                    end_exclusive: run.end_line_exclusive,
+                };
+                let title = crate::shell::run_title(run);
+                run_box(i, lines, &run.command, Mark::Run(run.status), title)
             })
             .collect();
+        // Queued lines next, in the order they will start: each has said nothing yet, so it
+        // windows no lines — an empty range where the transcript ends, which is where its output
+        // will begin once it runs. Its element is the one it becomes, since it starts as the next
+        // run and runs come first.
+        let end = t.runs.last().map_or(0, |r| r.end_line_exclusive);
+        for q in &t.queue {
+            let lines = ElementLines::Range {
+                start: end,
+                end_exclusive: end,
+            };
+            let title = crate::shell::queued_title(q);
+            elements.push(run_box(
+                elements.len(),
+                lines,
+                &q.command,
+                Mark::Queued,
+                title,
+            ));
+        }
+        let boxes = elements.len();
         elements.push(ElementBinding {
             buffer_id: t.input,
             lines: ElementLines::Whole,
             decorations: None,
-            chrome_before: if t.runs.is_empty() {
+            chrome_before: if boxes == 0 {
                 Default::default()
             } else {
                 gap()
@@ -5033,7 +5061,7 @@ impl View {
             prose: false,
             role: aether_protocol::ui::ElementRole::Input,
             edges: boxed,
-            box_group: Some(t.runs.len() as u32),
+            box_group: Some(boxes as u32),
             collapsible: false,
             title: std::sync::Arc::new(crate::shell::input_title(&t.cwd)),
             band: Band::Chrome,

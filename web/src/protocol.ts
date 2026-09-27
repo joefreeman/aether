@@ -269,12 +269,14 @@ export type ViewNode =
 export type ViewActionSpec =
   | { do: "permission"; allow: boolean }
   | { do: "expand"; expand?: boolean }
-  | { do: "stage"; stage: boolean };
+  | { do: "stage"; stage: boolean }
+  | { do: "cancel"; run: number };
 
 /** Mirrors `ui::ActionKind::role` — the highlight role a button's label paints in. Derived, not
  *  sent, so all three shells agree about which of two buttons you should hesitate over. */
 export function actionRole(a: ViewActionSpec): string {
   if (a.do === "permission") return a.allow ? "diff.added" : "diff.removed";
+  if (a.do === "cancel") return "diff.removed";
   return "diff.meta";
 }
 

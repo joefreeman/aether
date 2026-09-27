@@ -101,9 +101,11 @@ pub struct ShellOpenResult {
 /// trims it, refuses an empty or whitespace-only input, clears the input through the ordinary
 /// edit path, appends a run and starts it.
 ///
-/// One run at a time per shell: submitting while one is active fails with
-/// [`crate::error::ErrorCode::SHELL_BUSY`], and the typed text is deliberately left alone so
-/// typing ahead costs nothing.
+/// One run at a time per shell: a line submitted while one is going — or while others are already
+/// waiting — is **queued** behind them, a box of its own saying so, and starts when everything
+/// ahead of it has finished, however that went. A queued line is only parsed at `Enter`; whether
+/// its command and files are there is asked when it starts, since what runs ahead of it may be
+/// what makes them. A directory change is the exception: it is applied at once, queue or not.
 pub struct ShellRun;
 impl RpcMethod for ShellRun {
     const NAME: &'static str = "shell/run";
@@ -120,9 +122,9 @@ pub struct ShellRunParams {
     pub view_id: ViewId,
 }
 
-/// What the line became. `run` is the run it started, or `None` for a line that changed the
-/// shell's state without running anything — a directory change, which moves the directory in the
-/// input's title and leaves no box behind.
+/// What the line became. `run` is the run it started or queued, or `None` for a line that changed
+/// the shell's state without running anything — a directory change, which moves the directory in
+/// the input's title and leaves no box behind.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellRunResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,8 +134,9 @@ pub struct ShellRunResult {
 // ---- shell/cancel ------------------------------------------------------------------------------
 
 /// Stop the shell's running command — reached by `Ctrl-d` on its row in the activity picker
-/// (`Space v`), through [`crate::activity::ActivityCancel`]. Kills the whole process group, so a
-/// `cargo build` goes with the `sh` that started it.
+/// (`Space v`), through [`crate::activity::ActivityCancel`], and by the run's own cancel button
+/// ([`crate::ui::ViewAction::Cancel`]). Kills the whole process group, so a `cargo build` goes
+/// with the `sh` that started it. What is queued behind it starts next.
 pub struct ShellCancel;
 impl RpcMethod for ShellCancel {
     const NAME: &'static str = "shell/cancel";
@@ -208,11 +211,18 @@ pub enum RunStatus {
     Exited {
         code: i32,
     },
-    /// Killed — by `shell/cancel`, by the view closing, or by a signal.
+    /// Killed by a signal nobody here asked for — or caught going by a restart, which is the
+    /// same thing to the command.
     Killed,
+    /// Stopped because someone asked: `shell/cancel`, the run's own stop button, the view
+    /// closing. Apart from `Killed` because a stop you asked for is not a failure.
+    Cancelled,
     /// Output hit the per-run cap and the group was killed. Distinct from `Killed` because the
     /// transcript is *incomplete*, which is a thing the reader has to be told.
     Truncated,
+    /// A queued line the shell would not accept once its turn came — a command or file that was
+    /// still not there. Nothing ran; the run's output says why.
+    Refused,
 }
 
 impl RunStatus {
@@ -223,7 +233,9 @@ impl RunStatus {
             RunStatus::Exited { code: 0 } => "ok".into(),
             RunStatus::Exited { code } => format!("exit {code}"),
             RunStatus::Killed => "killed".into(),
+            RunStatus::Cancelled => "cancelled".into(),
             RunStatus::Truncated => "truncated".into(),
+            RunStatus::Refused => "not accepted".into(),
         }
     }
 }

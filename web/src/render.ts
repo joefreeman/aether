@@ -90,6 +90,10 @@ const HL_CLASS: Record<string, string> = {
   "diff.file": "diff-file",
   "diff.added": "diff-added",
   "diff.removed": "diff-removed",
+  "status.ok": "status-ok",
+  "status.running": "status-running",
+  "status.warning": "status-warning",
+  "status.error": "status-error",
 };
 
 export function highlightClass(kind: string): string | null {
@@ -609,14 +613,27 @@ function edgeRow(
   rowEl.appendChild(g);
   const content = document.createElement("span");
   content.className = "content";
-  if (title.length) {
+  // What reads from the left, and what is set flush right against the far corner.
+  const [left, right] = splitTitle(title);
+  for (const [half, cls] of [
+    [left, "title"],
+    [right, "title-end"],
+  ] as const) {
+    if (!half.length) continue;
     const named = document.createElement("span");
-    named.className = "title";
-    appendInline(named, title.flatMap(inlineOf), lit);
+    named.className = cls;
+    appendInline(named, half.flatMap(inlineOf), lit);
     content.appendChild(named);
   }
   rowEl.appendChild(content);
   return rowEl;
+}
+
+/** A box title's two halves — mirrors `ui::split_title`: the nodes either side of its first `fill`,
+ *  which is the rule running between them. A title with no fill is all left. */
+export function splitTitle(title: ViewNode[]): [ViewNode[], ViewNode[]] {
+  const at = title.findIndex((n) => n.node === "fill");
+  return at < 0 ? [title, []] : [title.slice(0, at), title.slice(at + 1)];
 }
 
 /** A generated patch's file or hunk separator, the patch's summary caption, or the blank space

@@ -975,10 +975,10 @@ impl Session {
                 }
                 Effects::none()
             }
-            // Busy is not a failure: the run you asked for is queued in your head, not lost, and
-            // the text you typed is still in the input. A refusal is not one either: the line did
-            // not pass, the word at fault is already selected, and the message says why. Anything
-            // else is an error.
+            // Busy is not a failure: the prompt you asked for is queued in your head, not lost, and
+            // the text you typed is still in the input (a shell queues the line itself, so this is
+            // an agent mid-turn). A refusal is not one either: the line did not pass, the word at
+            // fault is already selected, and the message says why. Anything else is an error.
             Event::InputSubmitted(Err(e))
                 if e.code == ErrorCode::SHELL_BUSY.code()
                     || e.code == ErrorCode::AGENT_BUSY.code() =>

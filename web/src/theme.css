@@ -810,6 +810,12 @@ html, body, #app {
 .hl-diff-file { color: var(--fg); font-weight: 600; }
 .hl-diff-added { color: var(--git-added); }
 .hl-diff-removed { color: var(--git-deleted); }
+/* A shell run's mark: the status colours every other dot uses. Mirrors `Theme::syntax`'s
+   `status.*` roles, held to them by `the_web_mirrors_every_status_role`. */
+.hl-status-ok { color: var(--ok); }
+.hl-status-running { color: var(--info); }
+.hl-status-warning { color: var(--warning); }
+.hl-status-error { color: var(--error); }
 
 .row.deleted-phantom { background: var(--git-deleted-bg); color: var(--git-deleted); }
 .row.deleted-phantom.staged { background: var(--git-staged-deleted-bg); color: var(--git-staged-deleted); }
@@ -948,18 +954,30 @@ html, body, #app {
    rule. There is nothing under the gutter here to protect (a border row has no text and no change
    bar), so it steps out of the way and the rule runs unbroken. */
 .row.box-edge .gutter { background-color: transparent; }
-/* A box's name, on the border it opens with: `┌─ name ────┐` in the terminal, and here the rule
-   with the name laid over it. The gutter is the one rule cell after the corner; the padding is
-   the space either side of the name, and the opaque background is what stops the rule running
+/* A box's name, on the border it opens with: `┌ name ────┐` in the terminal, and here the rule
+   with the name laid over it. The padding is the space either side of the name, and the opaque background is what stops the rule running
    under it — the rule is one gradient across the whole row, and splitting a gradient in two would
    mean teaching the `--rule-from`/`--rule-to` rails to count characters.
 
    The shade is the row's own, so the mask cannot be a different colour from what it masks. */
+.row.box-edge .content { display: flex; }
 .row.box-edge .title {
+  padding: 0 1ch;
+  /* Back over the gutter's cell, so the name starts in the column the box's content does — the
+     terminal's `┌ name ─…┐`. The padding is then that cell, masked. */
+  margin-left: -1ch;
+  background-color: var(--bg);
+}
+/* What a title sets flush right (`splitTitle`): against the far corner, a space and one cell of
+   rule short of it — `─ 3.2s ─┐`. */
+.row.box-edge .title-end {
+  margin-left: auto;
+  margin-right: 1ch;
   padding: 0 1ch;
   background-color: var(--bg);
 }
-.row.box-edge.patch-chrome .title { background-color: var(--bg-app); }
+.row.box-edge.patch-chrome .title,
+.row.box-edge.patch-chrome .title-end { background-color: var(--bg-app); }
 /* The rail's own share of the join: down from the rule where it opens, up to it where it closes,
    straight through where it tees. Detached draws no rail — a plain rule with nothing to meet. */
 .row.box-edge.opens {

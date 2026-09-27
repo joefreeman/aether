@@ -550,6 +550,13 @@ impl Theme {
             // foreground text on chrome, not a changed line.
             "diff.added" => color(self.git_added),
             "diff.removed" => color(self.git_deleted),
+            // How a shell run stands, as the circle beside its command says it: the status
+            // colours every other dot in the editor already uses, so a run reads like the LSP
+            // dot beside it — blue while it goes, then green, yellow or red.
+            "status.ok" => color(self.ok),
+            "status.running" => color(self.info),
+            "status.warning" => color(self.warning),
+            "status.error" => color(self.error),
             _ => return None,
         })
     }
@@ -954,6 +961,32 @@ mod tests {
             progress: indexing.to_vec(),
         };
         assert_eq!(LspDot::for_server(&server), LspDot::Busy);
+    }
+
+    /// A shell run's mark is coloured through the `status.*` roles, which the browser resolves
+    /// through its own class table and stylesheet. This holds that half to the core's: every role
+    /// has a class, and the class's rule names the very colour the core paints, in both themes.
+    #[test]
+    fn the_web_mirrors_every_status_role() {
+        let render = include_str!("../../../web/src/render.ts");
+        let css = include_str!("../../../web/src/theme.css");
+        for t in [Theme::DARK, Theme::LIGHT] {
+            for (role, var, rgb) in [
+                ("status.ok", "ok", t.ok),
+                ("status.running", "info", t.info),
+                ("status.warning", "warning", t.warning),
+                ("status.error", "error", t.error),
+            ] {
+                assert_eq!(t.syntax(role).and_then(|s| s.color), Some(rgb), "{role}");
+                let class = role.replace('.', "-");
+                assert!(
+                    render.contains(&format!("\"{role}\": \"{class}\"")),
+                    "web/src/render.ts has no class for {role}"
+                );
+                let rule = format!(".hl-{class} {{ color: var(--{var}); }}");
+                assert!(css.contains(&rule), "web/src/theme.css has no `{rule}`");
+            }
+        }
     }
 
     /// The browser shell paints the dot through CSS, so its half of the table is hand-mirrored:

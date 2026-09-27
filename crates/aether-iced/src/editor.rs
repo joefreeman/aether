@@ -29,9 +29,13 @@ pub const PAD: f32 = 8.0;
 /// Change-bar gutter width, in cells (TUI's `GUTTER_WIDTH`).
 pub const GUTTER_COLS: u32 = 1;
 /// Where a box's name starts on its top border, as a column offset from where the rows inside the
-/// box start their content: one cell of rule after the corner, then a space. The terminal's
-/// `┌─ name ─…┐` spelled in cells, so the two shells put it in the same column.
-const TITLE_COL: u32 = 1;
+/// box start their content: the same column, the gutter's cell being the space after the corner.
+/// The terminal's `┌ name ─…┐` spelled in cells, so the two shells put it in the same column.
+const TITLE_COL: u32 = 0;
+
+/// One half of a box's title as the painter walks it: the nodes, where a column of them lands, and
+/// the column they start at.
+type TitleHalf<'a> = (&'a [ViewElement], &'a dyn Fn(u32) -> f32, u32);
 
 /// Scrollbar rail/thumb width in px — the shared buffer/chrome tier, so the editor bar matches
 /// the picker/popover bars (and stays a step heavier than the read view's inline panel bars).
@@ -724,25 +728,42 @@ where
                     } else {
                         bounds.x + bounds.width
                     };
-                    // A box is named on the border it opens with. The name lands a rule cell and a
-                    // space in from the corner, and the rule is drawn as the two segments either
-                    // side of it rather than as one run masked afterwards — a mask is a second
-                    // opinion about what colour is behind the row, and the band is not always the
-                    // same shade.
+                    // A box is named on the border it opens with. The name lands a space in from
+                    // the corner, in the column the box's content starts in, and the rule is drawn
+                    // as the segments either side of it rather than as one run masked afterwards —
+                    // a mask is a second opinion about what colour is behind the row, and the band
+                    // is not always the same shade.
                     let title = match side {
                         grid::Side::Top => owner.title(),
                         grid::Side::Bottom => &[],
                     };
-                    let cols = title_cols(title);
-                    // Untitled: rail to rail, leaving the very cell the vertical line is in, which
-                    // is what closes the corner. Named: the same rule in two pieces, one cell of
-                    // it after the corner and the rest from a space past the name's last column.
-                    let segments = if cols == 0 {
-                        [(from, to), (to, to)]
+                    // What reads from the left, and what is set flush right: the right half ends a
+                    // space and one rule cell short of the far corner, as the terminal's does.
+                    let (left, right) = aether_protocol::ui::split_title(title);
+                    let (left_cols, right_cols) = (title_cols(left), title_cols(right));
+                    let far = if abs_row.rails.right > 0 {
+                        bounds.x + bounds.width - cell.width
                     } else {
-                        [
-                            (from, text_x(0)),
-                            (text_x(TITLE_COL + cols + 1).clamp(from, to), to),
+                        to
+                    };
+                    let right_x0 = far - (right_cols + 2) as f32 * cell.width;
+                    let right_x = |dcol: u32| right_x0 + dcol as f32 * cell.width;
+                    // Untitled: rail to rail, leaving the very cell the vertical line is in, which
+                    // is what closes the corner. Named: the same rule in pieces — the corner's own
+                    // cell, then from a space past the name's last column to a space before what
+                    // is flush right, then its last cell into the far corner.
+                    let corner =
+                        (text_x(0) - (GUTTER_COLS - TITLE_COL) as f32 * cell.width).clamp(from, to);
+                    let after_left = text_x(TITLE_COL + left_cols + 1).clamp(from, to);
+                    let segments = if left_cols + right_cols == 0 {
+                        vec![(from, to)]
+                    } else if right.is_empty() {
+                        vec![(from, corner), (after_left, to)]
+                    } else {
+                        vec![
+                            (from, corner),
+                            (after_left, (right_x0 - cell.width).clamp(after_left, to)),
+                            ((far - cell.width).clamp(after_left, to), to),
                         ]
                     };
                     for (a, b) in segments {
@@ -763,57 +784,60 @@ where
                         width: (to - content_left).max(0.0),
                         ..content_clip
                     };
-                    let mut col = TITLE_COL;
-                    for leaf in title.iter().flat_map(ViewElement::inline) {
-                        match leaf {
-                            ViewElement::Space { cols } => col += u32::from(*cols),
-                            // A button the view declared. Filled when it is the one `Enter` would
-                            // press, outlined in its kind's colour otherwise — the same two states
-                            // the terminal draws, in the vocabulary pixels have.
-                            ViewElement::Action {
-                                action,
-                                label,
-                                enabled,
-                            } => {
-                                let text = aether_protocol::ui::ViewAction::labelled(label);
-                                let cols = text.chars().count() as u32;
-                                if lit.is_some_and(|n| std::ptr::eq(n, leaf)) {
-                                    fill(
+                    let halves: [TitleHalf; 2] = [(left, &text_x, TITLE_COL), (right, &right_x, 0)];
+                    for (half, x_of, first_col) in halves {
+                        let mut col = first_col;
+                        for leaf in half.iter().flat_map(ViewElement::inline) {
+                            match leaf {
+                                ViewElement::Space { cols } => col += u32::from(*cols),
+                                // A button the view declared. Filled when it is the one `Enter`
+                                // would press, outlined in its kind's colour otherwise — the same
+                                // two states the terminal draws, in the vocabulary pixels have.
+                                ViewElement::Action {
+                                    action,
+                                    label,
+                                    enabled,
+                                } => {
+                                    let text = aether_protocol::ui::ViewAction::labelled(label);
+                                    let cols = text.chars().count() as u32;
+                                    if lit.is_some_and(|n| std::ptr::eq(n, leaf)) {
+                                        fill(
+                                            renderer,
+                                            Rectangle {
+                                                x: x_of(col),
+                                                y,
+                                                width: cols as f32 * cell.width,
+                                                height: cell.height,
+                                            },
+                                            p.bg_selection,
+                                        );
+                                    }
+                                    let role = if *enabled {
+                                        action.kind().role()
+                                    } else {
+                                        "diff.meta"
+                                    };
+                                    draw_runs(
                                         renderer,
-                                        Rectangle {
-                                            x: text_x(col),
-                                            y,
-                                            width: cols as f32 * cell.width,
-                                            height: cell.height,
-                                        },
-                                        p.bg_selection,
+                                        &text,
+                                        &[aether_protocol::viewport::Highlight {
+                                            start: 0,
+                                            end: text.len() as u32,
+                                            kind: role.into(),
+                                        }],
+                                        x_of,
+                                        col,
+                                        y,
+                                        title_clip,
                                     );
+                                    col += cols;
                                 }
-                                let role = if *enabled {
-                                    action.kind().role()
-                                } else {
-                                    "diff.meta"
-                                };
-                                draw_runs(
-                                    renderer,
-                                    &text,
-                                    &[aether_protocol::viewport::Highlight {
-                                        start: 0,
-                                        end: text.len() as u32,
-                                        kind: role.into(),
-                                    }],
-                                    &text_x,
-                                    col,
-                                    y,
-                                    title_clip,
-                                );
-                                col += cols;
+                                ViewElement::Text { text, highlights } => {
+                                    draw_runs(renderer, text, highlights, x_of, col, y, title_clip);
+                                    col += text.chars().count() as u32;
+                                }
+                                _ => {}
                             }
-                            ViewElement::Text { text, highlights } => {
-                                draw_runs(renderer, text, highlights, &text_x, col, y, title_clip);
-                                col += text.chars().count() as u32;
-                            }
-                            _ => {}
                         }
                     }
                     continue;
@@ -1860,13 +1884,22 @@ fn row_text(item: &grid::PaintedRow<'_>, tab_width: u32) -> String {
         grid::PaintedRow::Chrome(chrome) => out.push_str(&inline_text(chrome.inline())),
         // A box edge is a rule, not words — except the border a named box opens with, which
         // carries the name, and that is the only text on it.
+        // What is set flush right reads after a space, as it would to someone looking.
         grid::PaintedRow::Edge {
             owner,
             side: grid::Side::Top,
             ..
-        } => out.push_str(&inline_text(
-            owner.title().iter().flat_map(ViewElement::inline).collect(),
-        )),
+        } => {
+            let (left, right) = aether_protocol::ui::split_title(owner.title());
+            let text = |half: &[ViewElement]| {
+                inline_text(half.iter().flat_map(ViewElement::inline).collect())
+            };
+            out.push_str(&text(left));
+            if !right.is_empty() {
+                out.push(' ');
+                out.push_str(&text(right));
+            }
+        }
         grid::PaintedRow::Edge { .. } => {}
         grid::PaintedRow::Baseline { row, .. } => out.push_str(&row.text),
         grid::PaintedRow::Text { row, .. } => {
