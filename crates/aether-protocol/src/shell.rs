@@ -169,6 +169,10 @@ impl NotificationMethod for ShellRunChanged {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellRunChangedParams {
     pub view_id: ViewId,
+    /// The shell's name (`Shell 2`), for a client that is not showing it to say which shell it
+    /// means — two can be running the same command in different directories.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
     /// The run that just started, or the finished state of the one that just ended. `None` is not
     /// sent — a finish carries its outcome so a client that is looking elsewhere can say how it
     /// went — except where the shell is closing.

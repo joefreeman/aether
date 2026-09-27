@@ -7367,11 +7367,16 @@ impl Session {
                 // Say how it went only when you are looking somewhere else: a shell on screen has
                 // the outcome in the run's own header, and a toast repeating it is noise. Grouped
                 // by view so a shell you keep re-running replaces its own notice rather than
-                // stacking a column of them.
+                // stacking a column of them. Titled with the shell — two can be running the same
+                // command in different directories — and the command and how it went below.
                 match finished.filter(|_| p.view_id != self.view.view_id) {
                     Some(run) => Effects::toast_grouped_detail(
-                        run.command.clone(),
-                        run.status.label(),
+                        if p.title.is_empty() {
+                            "Shell".to_string()
+                        } else {
+                            p.title.clone()
+                        },
+                        format!("{} ({})", run.command, run.status.label()),
                         match run.status {
                             aether_protocol::shell::RunStatus::Exited { code: 0 } => {
                                 ToastKind::Success

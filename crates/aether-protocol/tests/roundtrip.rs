@@ -7630,10 +7630,13 @@ fn shell_run_changed_shape() {
     assert_eq!(ShellRunChanged::NAME, "shell/run_changed");
     let params = |run| ShellRunChangedParams {
         view_id: aether_protocol::ViewId(7),
+        title: "Shell 2".into(),
         run,
     };
     let idle = to_value(params(None)).unwrap();
-    assert_eq!(idle, json!({ "view_id": 7 }));
+    assert_eq!(idle, json!({ "view_id": 7, "title": "Shell 2" }));
+    // An older server's push, without the name, still parses.
+    from_value::<ShellRunChangedParams>(json!({ "view_id": 7 })).unwrap();
     assert!(from_value::<ShellRunChangedParams>(idle)
         .unwrap()
         .run

@@ -1206,10 +1206,20 @@ async fn push_run_changed(state: &SharedState, view_id: ViewId, run: Option<RunS
     for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
-    let params = ShellRunChangedParams { view_id, run };
-    let value = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
     let pushes: PendingPushes = {
         let s = state.lock().await;
+        let title = s
+            .try_presenting_buffer(view_id)
+            .and_then(|b| s.try_doc_of(b))
+            .and_then(|d| d.transcript())
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        let params = ShellRunChangedParams {
+            view_id,
+            title,
+            run,
+        };
+        let value = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         s.clients
             .values()
             .map(|sess| {

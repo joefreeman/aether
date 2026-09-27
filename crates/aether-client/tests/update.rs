@@ -14381,6 +14381,7 @@ fn shell_run_push(
         method: aether_protocol::shell::ShellRunChanged::NAME.into(),
         params: json!({
             "view_id": view_id,
+            "title": format!("Shell {view_id}"),
             "run": {"run": 1, "command": command, "status": status},
         }),
     })
@@ -14871,7 +14872,8 @@ fn a_finished_run_is_announced_only_when_you_are_looking_elsewhere() {
     ));
     assert_eq!(
         toast_messages(&fx),
-        vec!["cargo build — exit 1".to_string()]
+        vec!["Shell 99 — cargo build (exit 1)".to_string()],
+        "named for the shell as well as the command"
     );
 }
 
