@@ -6802,6 +6802,25 @@ fn info_toast(fx: &Effects) -> Option<String> {
 }
 
 #[test]
+fn repeated_hover_with_nothing_to_show_refreshes_one_toast() {
+    // Pressed again on the same spot, the answer is the same: it must replace, not stack.
+    let mut s = session();
+    let mut groups = Vec::new();
+    for _ in 0..2 {
+        s.on_key(KeyCode::Char(' '), Mods::NONE, None);
+        let token = the_request(&s.on_key(KeyCode::Char('v'), Mods::NONE, None)).0;
+        let fx = s.on_rpc_result(token, Ok(json!({ "contents": null, "readiness": "ready" })));
+        groups.extend(fx.0.into_iter().filter_map(|e| match e {
+            Effect::Toast { group, .. } => Some(group),
+            _ => None,
+        }));
+    }
+    assert_eq!(groups.len(), 2);
+    assert!(groups[0].is_some());
+    assert_eq!(groups[0], groups[1]);
+}
+
+#[test]
 fn hover_reports_server_readiness_instead_of_a_blank_no_info() {
     // A ready server with no content for the cursor → the genuine "nothing here" message.
     let mut s = session();

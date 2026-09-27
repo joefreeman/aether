@@ -896,7 +896,11 @@ impl Session {
             // resolved is an error, not an empty answer.
             Event::Shown(Ok(shown)) => match shown.opened {
                 Some(open) => self.adopt_open(open),
-                None => Effects::toast(nothing_to_commit(shown.baseline.as_ref()), ToastKind::Info),
+                None => Effects::toast_grouped(
+                    nothing_to_commit(shown.baseline.as_ref()),
+                    ToastKind::Info,
+                    "working-changes",
+                ),
             },
             Event::Shown(Err(e)) => self.open_failed(e),
 
@@ -929,9 +933,11 @@ impl Session {
             // Nothing to say when it worked — the block's chrome stops showing the question, which
             // is the feedback. Saying nothing happened is worth a word, though: it means the agent
             // stopped asking before you answered.
-            Event::AgentAnswered(Ok(r)) if !r.answered => {
-                Effects::toast("Nothing was waiting for an answer", ToastKind::Info)
-            }
+            Event::AgentAnswered(Ok(r)) if !r.answered => Effects::toast_grouped(
+                "Nothing was waiting for an answer",
+                ToastKind::Info,
+                "agent-answer",
+            ),
             Event::AgentAnswered(Ok(_)) => Effects::none(),
             Event::AgentAnswered(Err(e)) => {
                 Effects::error_detail("Couldn't answer that", e.message)
@@ -997,7 +1003,7 @@ impl Session {
                 Effects::error_detail("Couldn't run that", e.message)
             }
             Event::ActivityCancelled(Ok(r)) if !r.cancelled => {
-                Effects::toast("It had already finished", ToastKind::Info)
+                Effects::toast_grouped("It had already finished", ToastKind::Info, "cancel")
             }
             Event::ActivityCancelled(Ok(_)) => Effects::none(),
             Event::ActivityCancelled(Err(e)) => {
@@ -1291,7 +1297,9 @@ impl Session {
             },
 
             Event::Definition(Ok(r)) => match lsp_readiness_message(r.readiness) {
-                Some((msg, why)) => Effects::toast_detail(msg, why, ToastKind::Info),
+                Some((msg, why)) => {
+                    Effects::toast_grouped_detail(msg, why, ToastKind::Info, "definition")
+                }
                 None => match r.location {
                     Some(location) => {
                         // Land the identifier selected (anchor at its start, cursor on its last
@@ -1301,7 +1309,9 @@ impl Session {
                         let end = location.end;
                         self.open_path_at(location.path, Some(end), (end != start).then_some(start))
                     }
-                    None => Effects::toast("No definition found", ToastKind::Info),
+                    None => {
+                        Effects::toast_grouped("No definition found", ToastKind::Info, "definition")
+                    }
                 },
             },
             Event::Definition(Err(e)) => Effects::error_detail("Go to definition failed", e),
@@ -1331,7 +1341,7 @@ impl Session {
                         title: msg.into(),
                         body: (!why.is_empty()).then(|| why.to_string()),
                         kind: ToastKind::Info,
-                        group: None,
+                        group: Some("hover".into()),
                     });
                     fx
                 }
@@ -1352,7 +1362,7 @@ impl Session {
                     }),
                 };
                 let mut fx = match note {
-                    Some(n) => Effects::toast(n, ToastKind::Info),
+                    Some(n) => Effects::toast_grouped(n, ToastKind::Info, "format"),
                     None => Effects::none(),
                 };
                 fx.push(Effect::RevealCursor(RevealStyle::Follow));
@@ -1372,7 +1382,7 @@ impl Session {
                 }])))
             }
             Event::CommitLookup(Ok(CommitDetails::Note(note))) => {
-                Effects::toast(note, ToastKind::Info)
+                Effects::toast_grouped(note, ToastKind::Info, "commit-lookup")
             }
             Event::CommitLookup(Err(e)) => Effects::error_detail("Commit info failed", e),
 
@@ -1428,7 +1438,11 @@ impl Session {
                     // only refuse *after* we'd opened a buffer and made the user write a message.
                     // Amending is exempt: rewording the previous commit stages nothing.
                     if prepared.staged.is_empty() && !amend {
-                        return Effects::toast("Nothing staged to commit", ToastKind::Info);
+                        return Effects::toast_grouped(
+                            "Nothing staged to commit",
+                            ToastKind::Info,
+                            "commit",
+                        );
                     }
                     let summary = if amend {
                         "Amending".to_string()
@@ -1542,9 +1556,11 @@ impl Session {
                         ToastKind::Success,
                     ),
                     // Pressing the way-out key on a repo that isn't stuck should say so, not fail.
-                    GitAbortStatus::NothingInProgress => {
-                        Effects::toast("Nothing in progress to abandon", ToastKind::Info)
-                    }
+                    GitAbortStatus::NothingInProgress => Effects::toast_grouped(
+                        "Nothing in progress to abandon",
+                        ToastKind::Info,
+                        "git-abort",
+                    ),
                     GitAbortStatus::BlockedByDirtyBuffers => Effects::toast_detail(
                         format!("{} unsaved file(s)", res.blocked.len()),
                         "Save first, then retry",
@@ -1869,9 +1885,11 @@ impl Session {
                         let (title, detail) = fetch_summary(r.upstream.as_ref());
                         Effects::toast_detail(title, detail, ToastKind::Success)
                     }
-                    GitFetchStatus::NoRemote => {
-                        Effects::toast("No remote configured", ToastKind::Info)
-                    }
+                    GitFetchStatus::NoRemote => Effects::toast_grouped(
+                        "No remote configured",
+                        ToastKind::Info,
+                        "git-remote",
+                    ),
                     // Acknowledged, not celebrated or mourned: the user asked for this.
                     GitFetchStatus::Cancelled => Effects::toast("Fetch cancelled", ToastKind::Info),
                     GitFetchStatus::Refused => Effects::error_detail("Fetch refused", r.message),
@@ -1886,7 +1904,7 @@ impl Session {
                         Effects::toast_detail(title, detail, ToastKind::Success)
                     }
                     GitPushStatus::NothingToPush => {
-                        Effects::toast("Nothing to push", ToastKind::Info)
+                        Effects::toast_grouped("Nothing to push", ToastKind::Info, "git-remote")
                     }
                     // The one refusal with a next step worth naming. Git's own wording here is
                     // several lines of hint text; what the user needs is the number and the verb.
@@ -1903,9 +1921,11 @@ impl Session {
                         "Nothing to push",
                         ToastKind::Warning,
                     ),
-                    GitPushStatus::NoRemote => {
-                        Effects::toast("No remote configured", ToastKind::Info)
-                    }
+                    GitPushStatus::NoRemote => Effects::toast_grouped(
+                        "No remote configured",
+                        ToastKind::Info,
+                        "git-remote",
+                    ),
                     GitPushStatus::AmbiguousRemote => Effects::toast_detail(
                         "Several remotes and no upstream",
                         "Set one with git push -u",
@@ -1919,12 +1939,13 @@ impl Session {
 
             Event::PullDone(result) => match result {
                 Ok(r) => match r.status {
-                    GitPullStatus::UpToDate => Effects::toast(
+                    GitPullStatus::UpToDate => Effects::toast_grouped(
                         match r.upstream.as_ref() {
                             Some(u) => format!("Already up to date with {}", u.name),
                             None => "Already up to date".to_string(),
                         },
                         ToastKind::Info,
+                        "git-remote",
                     ),
                     // The three moves read differently on purpose: the user's local history was
                     // left alone, gained a merge commit, or was rewritten, and which one happened
@@ -1976,9 +1997,11 @@ impl Session {
                         "Nothing to pull",
                         ToastKind::Warning,
                     ),
-                    GitPullStatus::NoRemote => {
-                        Effects::toast("No remote configured", ToastKind::Info)
-                    }
+                    GitPullStatus::NoRemote => Effects::toast_grouped(
+                        "No remote configured",
+                        ToastKind::Info,
+                        "git-remote",
+                    ),
                     GitPullStatus::BlockedByDirtyBuffers => Effects::toast_detail(
                         format!("{} unsaved file(s)", r.blocked.len()),
                         "Save first, then retry",
@@ -2140,7 +2163,7 @@ impl Session {
                         // Includes the "this file has no conflicts at all" case: one sentence
                         // answers both.
                         ResolveConflictStatus::NoConflict => {
-                            Effects::toast("No conflict here", ToastKind::Info)
+                            Effects::toast_grouped("No conflict here", ToastKind::Info, "conflict")
                         }
                     }
                 }
@@ -4324,7 +4347,11 @@ impl Session {
     /// buffers have no path, so it warns instead.
     fn copy_buffer_path(&mut self, absolute: bool) -> Effects {
         let Some(path) = self.view.buffer.path.as_deref() else {
-            return Effects::toast("A scratch has no path", ToastKind::Warning);
+            return Effects::toast_grouped(
+                "A scratch has no path",
+                ToastKind::Warning,
+                "copy-path",
+            );
         };
         let text = if absolute {
             path.to_string()
@@ -4387,10 +4414,11 @@ impl Session {
             // A scratch is reachable only by its view id, which is scoped to the workspace it lives
             // in — and a temporary context is not something a link can name (its id is recycled).
             None if !named => {
-                return Effects::toast_detail(
+                return Effects::toast_grouped_detail(
                     "No web URL",
                     "This scratch isn't in a workspace",
                     ToastKind::Warning,
+                    "copy-path",
                 )
             }
             None => web_link(
@@ -4627,7 +4655,7 @@ impl Session {
                 title: "No diagnostics on this line".into(),
                 body: None,
                 kind: ToastKind::Info,
-                group: None,
+                group: Some("line-diagnostics".into()),
             });
             return fx;
         }
@@ -6183,13 +6211,14 @@ impl Session {
                     if checkout.is_current {
                         // Already here. A detached row has no branch to name, so it says where you
                         // are instead of what you are on.
-                        return Effects::toast(
+                        return Effects::toast_grouped(
                             if detached_at.is_some() {
                                 format!("Already in {name}")
                             } else {
                                 format!("Already on {name}")
                             },
                             ToastKind::Info,
+                            "branch-switch",
                         );
                     }
                     // An empty admin name is the main checkout, which is exactly what
@@ -6200,7 +6229,11 @@ impl Session {
                 }
                 // Already here: say so rather than spawning a git that would do nothing.
                 if *is_head {
-                    return Effects::toast(format!("Already on {name}"), ToastKind::Info);
+                    return Effects::toast_grouped(
+                        format!("Already on {name}"),
+                        ToastKind::Info,
+                        "branch-switch",
+                    );
                 }
                 let (repo_id, name) = (repo_id.clone(), name.clone());
                 // Close first: a checkout is a terminal action, and the list it was showing is
@@ -6240,9 +6273,10 @@ impl Session {
             // operation belongs to a repo rather than to anything on screen, so there is nowhere to
             // go, and saying so beats a key that does nothing.
             PickerItem::Activity { id, label, .. } if id.view_id().is_none() => {
-                return Effects::toast(
+                return Effects::toast_grouped(
                     format!("{label} has no view to open — Ctrl-d stops it"),
                     ToastKind::Info,
+                    "activity",
                 );
             }
             PickerItem::Keybinding { .. } => {
@@ -7776,7 +7810,7 @@ impl Session {
                     title: "Settings updated".to_string(),
                     body: None,
                     kind: ToastKind::Info,
-                    group: None,
+                    group: Some("settings-updated".into()),
                 });
                 fx
             }
@@ -10911,10 +10945,11 @@ impl Session {
             }
             A::Reload => {
                 if self.view.buffer.path.is_none() {
-                    return Effects::toast_detail(
+                    return Effects::toast_grouped_detail(
                         "A scratch has no path",
                         "There's nothing on disk to reload",
                         ToastKind::Warning,
+                        "reload",
                     );
                 }
                 self.reload(false)
@@ -11140,10 +11175,11 @@ impl Session {
             // multi-repo workspace (an operation in one repo blocks starting one in another), which
             // is the same simplification the single indicator already makes.
             A::GitFetch | A::GitPush | A::GitPull if self.git_operation.is_some() => {
-                Effects::toast_detail(
+                Effects::toast_grouped_detail(
                     "A git operation is already running",
                     "Stop it first",
                     ToastKind::Info,
+                    "git-operation",
                 )
             }
 
@@ -11242,10 +11278,11 @@ impl Session {
                 // then *refuse* — losing the message to a keystroke meant to resume it.
                 if let Some(pending) = self.pending_commit.clone() {
                     if pending.buffer_id == self.view.buffer.buffer_id {
-                        return Effects::toast_detail(
+                        return Effects::toast_grouped_detail(
                             "Already writing this commit",
                             "Close the view to commit",
                             ToastKind::Info,
+                            "commit",
                         );
                     }
                     let mut fx = self.request_str::<ViewOpen>(
@@ -11260,7 +11297,7 @@ impl Session {
                         title: "Commit message already open".to_string(),
                         body: None,
                         kind: ToastKind::Info,
-                        group: None,
+                        group: Some("commit".into()),
                     });
                     return fx;
                 }

@@ -158,7 +158,13 @@ pub enum Effect {
     /// its lifetime — instead of stacking a new one, so a status that evolves (an LSP server's
     /// "Restarting" → "ready", the diff toggle, the reconnect lifecycle) updates a single toast in
     /// place. `None` (the default, via [`Effects::toast`]/[`Effects::error`]) always stacks a fresh
-    /// toast — the right behaviour for discrete confirmations (saves, copies, deletes).
+    /// toast.
+    ///
+    /// The test: would pressing the same key again produce this toast again? Then group it, keyed
+    /// by what was asked about — "nothing here" answers (no hover, nothing to push), refusals of a
+    /// no-op (already on that branch), toggles — so a repeat refreshes one toast instead of piling
+    /// up copies. Leave it ungrouped when each toast reports a distinct event (saved, committed,
+    /// deleted a branch): two of those on screen mean two things happened.
     Toast {
         title: String,
         body: Option<String>,
