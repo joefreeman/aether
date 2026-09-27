@@ -2293,6 +2293,85 @@ impl ServerState {
         }
     }
 
+    /// Every document whose file is at or under `canonical`, with that path — what a move of
+    /// `canonical` carries along. Across all workspaces: a document is shared by every workspace
+    /// holding its file.
+    pub fn documents_under_path(&self, canonical: &Path) -> Vec<(DocumentId, PathBuf)> {
+        self.documents
+            .values()
+            .filter_map(|d| {
+                let path = d.canonical_path.as_ref()?;
+                path.starts_with(canonical).then(|| (d.id, path.clone()))
+            })
+            .collect()
+    }
+
+    /// Rewrite the records that name a file **by path** after `from` moved to `to`: dormant
+    /// session rows, jumplist targets and nav trails, in every loaded workspace. Documents are not
+    /// among them — they move through `follow_document_path`, which this deliberately leaves to
+    /// the caller. Returns the workspaces whose session must be rewritten.
+    ///
+    /// A root-relative record re-resolves against its workspace's roots, so a move across roots
+    /// changes its index; one whose new path falls outside every root is left as it was — naming a
+    /// file that is gone, which each of these records already tolerates.
+    pub fn rebase_path_records(&mut self, from: &Path, to: &Path) -> Vec<String> {
+        let mut dirtied = Vec::new();
+        for (name, ws) in self.workspaces.iter_mut() {
+            let roots = ws.paths.clone();
+            let mut dormant_moved = false;
+            for d in &mut ws.dormant_views {
+                if let DormantSource::File(path) = &mut d.source {
+                    if let Some(new) = moved_path(path, from, to) {
+                        *path = new;
+                        dormant_moved = true;
+                    }
+                }
+            }
+            if dormant_moved {
+                dirtied.push(name.clone());
+            }
+            if let Some(list) = ws.jumplist.as_mut() {
+                for entry in &mut list.entries {
+                    if let crate::jumplist::JumplistTarget::File {
+                        path_index,
+                        relative_path,
+                        abs_path,
+                    } = &mut entry.target
+                    {
+                        let Some(new) = moved_path(Path::new(abs_path.as_str()), from, to) else {
+                            continue;
+                        };
+                        if path_index.is_some() {
+                            if let Some((i, rel)) = root_relative(&roots, &new) {
+                                *path_index = Some(i);
+                                *relative_path = Some(rel);
+                            }
+                        }
+                        *abs_path = new.display().to_string();
+                    }
+                }
+            }
+            let trails = ws.nav_history.values_mut().chain(ws.last_nav.as_mut());
+            for entry in trails.flat_map(|t| t.back.iter_mut().chain(t.forward.iter_mut())) {
+                let (Some(i), Some(rel)) = (entry.path_index, entry.relative_path.as_deref())
+                else {
+                    continue;
+                };
+                let Some(root) = roots.get(i as usize) else {
+                    continue;
+                };
+                let Some(new) = moved_path(&root.join(rel), from, to) else {
+                    continue;
+                };
+                if let Some((i, rel)) = root_relative(&roots, &new) {
+                    entry.path_index = Some(i);
+                    entry.relative_path = Some(rel);
+                }
+            }
+        }
+        dirtied
+    }
+
     /// Buffer ids in `workspace` whose backing file is at or under `canonical` — an exact match for
     /// a file, or a path-prefix match for a directory. Used by `path/delete` to find the buffers a
     /// deletion would close (and to screen them for unsaved changes first).
@@ -4730,7 +4809,29 @@ impl Editable<'_> {
 /// The language name for a path, or `None` if we have no grammar for it. Detection itself lives
 /// in [`syntax::config_for_path`] — file-name rules plus the registry's alias table — so there's
 /// no second extension list here to drift out of step with the one languages are registered in.
-fn detect_language(path: &Path) -> Option<String> {
+/// Where `path` lands when `from` moves to `to`: `to` itself when it *is* `from`, the same place
+/// under `to` when it is inside it, and `None` when the move doesn't touch it. Component-wise, so
+/// moving `a/foo` leaves `a/foobar` alone.
+pub fn moved_path(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(from).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(rest)
+    })
+}
+
+/// `path` as a root index and root-relative path, against the longest of `roots` containing it.
+fn root_relative(roots: &[PathBuf], path: &Path) -> Option<(u32, String)> {
+    roots
+        .iter()
+        .enumerate()
+        .filter_map(|(i, root)| Some((i, root, path.strip_prefix(root).ok()?)))
+        .max_by_key(|(_, root, _)| root.components().count())
+        .map(|(i, _, rel)| (i as u32, rel.to_string_lossy().into_owned()))
+}
+
+pub(crate) fn detect_language(path: &Path) -> Option<String> {
     Some(syntax::config_for_path(path)?.name.to_string())
 }
 
@@ -7144,6 +7245,127 @@ mod workspace_state_tests {
     /// `buffers_under_path` (the `path/delete` screen) matches a file exactly and matches a
     /// directory by path-prefix — component-wise, so `/ws/src` doesn't catch `/ws/srcfoo` — and is
     /// scoped to the named workspace.
+    #[test]
+    fn moved_path_follows_the_file_and_what_is_under_it() {
+        let (from, to) = (Path::new("/ws/a/foo"), Path::new("/ws/b/bar"));
+        assert_eq!(moved_path(from, from, to), Some(to.to_path_buf()));
+        assert_eq!(
+            moved_path(Path::new("/ws/a/foo/x/y.rs"), from, to),
+            Some(PathBuf::from("/ws/b/bar/x/y.rs"))
+        );
+        assert_eq!(
+            moved_path(Path::new("/ws/a/foobar"), from, to),
+            None,
+            "a sibling that merely shares the prefix string stays put"
+        );
+        assert_eq!(moved_path(Path::new("/ws/a"), from, to), None);
+    }
+
+    /// The records that name a file by path — dormant rows, jumplist targets, nav trails — move
+    /// with it, re-resolving root-relative ones against the roots (so a move across roots changes
+    /// the index), and leave everything outside the move alone.
+    #[test]
+    fn rebase_path_records_moves_dormant_rows_jumplists_and_nav_trails() {
+        use crate::jumplist::{Jumplist, JumplistEntry, JumplistTarget};
+        let mut s = ServerState::new();
+        let mut ws = workspace_entry("proj", vec![PathBuf::from("/r0"), PathBuf::from("/r1")]);
+        let dormant = |path: &str, n: u64| DormantView {
+            id: n,
+            view: ViewId(n),
+            read: false,
+            transient: false,
+            source: DormantSource::File(PathBuf::from(path)),
+            shell: None,
+        };
+        ws.dormant_views = vec![dormant("/r0/sub/a.rs", 1), dormant("/r0/other.rs", 2)];
+        let file = |i: u32, rel: &str| JumplistEntry {
+            target: JumplistTarget::File {
+                path_index: Some(i),
+                relative_path: Some(rel.into()),
+                abs_path: format!("/r{i}/{rel}"),
+            },
+            position: None,
+            anchor: None,
+            group: None,
+            display: rel.into(),
+            view: None,
+        };
+        ws.jumplist = Some(Jumplist {
+            source: aether_protocol::picker::PickerKind::Files,
+            query: String::new(),
+            grouped: false,
+            entries: vec![file(0, "sub/a.rs"), file(0, "other.rs")],
+        });
+        let nav = |rel: &str| NavEntry {
+            view_id: ViewId(9),
+            buffer_id: 9,
+            path_index: Some(0),
+            relative_path: Some(rel.into()),
+            virtual_key: None,
+            element: None,
+            cursor: CursorState::default(),
+            read: None,
+        };
+        ws.nav_history.insert(
+            uuid::Uuid::new_v4(),
+            NavHistory {
+                back: vec![nav("sub/a.rs")],
+                forward: vec![nav("other.rs")],
+            },
+        );
+        s.workspaces.insert("proj".into(), ws);
+
+        // `sub` moves from the first root to the second.
+        let dirtied = s.rebase_path_records(Path::new("/r0/sub"), Path::new("/r1/moved"));
+        assert_eq!(dirtied, vec!["proj".to_string()]);
+
+        let ws = &s.workspaces["proj"];
+        let paths: Vec<_> = ws.dormant_views.iter().map(|d| d.path().unwrap()).collect();
+        assert_eq!(
+            paths,
+            [Path::new("/r1/moved/a.rs"), Path::new("/r0/other.rs")]
+        );
+        let targets: Vec<_> = ws
+            .jumplist
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.target.clone())
+            .collect();
+        assert_eq!(
+            targets[0],
+            JumplistTarget::File {
+                path_index: Some(1),
+                relative_path: Some("moved/a.rs".into()),
+                abs_path: "/r1/moved/a.rs".into(),
+            }
+        );
+        assert_eq!(
+            targets[1],
+            JumplistTarget::File {
+                path_index: Some(0),
+                relative_path: Some("other.rs".into()),
+                abs_path: "/r0/other.rs".into(),
+            }
+        );
+        let trail = ws.nav_history.values().next().unwrap();
+        assert_eq!(
+            (
+                trail.back[0].path_index,
+                trail.back[0].relative_path.as_deref()
+            ),
+            (Some(1), Some("moved/a.rs"))
+        );
+        assert_eq!(
+            (
+                trail.forward[0].path_index,
+                trail.forward[0].relative_path.as_deref()
+            ),
+            (Some(0), Some("other.rs"))
+        );
+    }
+
     #[test]
     fn buffers_under_path_matches_file_and_dir_prefix() {
         let mut s = ServerState::new();

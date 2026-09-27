@@ -109,7 +109,9 @@ use aether_protocol::lsp::{
 };
 use aether_protocol::nav::NavStepResult;
 use aether_protocol::nav::{NavStep, NavStepParams};
-use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
+use aether_protocol::path::{
+    PathDelete, PathDeleteParams, PathDeleteResult, PathRename, PathRenameParams, PathRenameResult,
+};
 use aether_protocol::picker::{
     BufferDirtyState, CaseMode, GroupHeader, GroupRunRows, MatchOptions, PickerFilters,
     PickerGroupAction, PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery,
@@ -436,6 +438,12 @@ pub enum Event {
         noun: &'static str,
         result: Result<PathDeleteResult, String>,
     },
+    /// `path/rename` (Explorer/Files `Ctrl-r`) resolved. `retry` is what re-opens the prompt on a
+    /// refusal: the source, its noun, and the root + path that were typed.
+    PathRenamed {
+        retry: (String, &'static str, u32, String),
+        result: Result<PathRenameResult, String>,
+    },
     /// `view/set_transient` (the `Space k` keep toggle) resolved. `result` is the view's transient
     /// flag as the server left it and the toast confirms it (`view_transient` itself also rides
     /// the `view/state` push); errors surface as an error toast.
@@ -530,7 +538,8 @@ pub enum Event {
 /// ones exist precisely to reach outside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathEditorOwner {
-    /// The save-as prompt (`Alt-s`) — root-relative, files included.
+    /// The save-as prompt (`Alt-s`), or the rename prompt built on the same editor — root-relative,
+    /// files included. One owner for both: only one prompt is ever open.
     SaveAs,
     /// The workspace-settings add-project row — root-relative, directories only.
     AddProject,
@@ -565,10 +574,7 @@ impl Session {
     /// and the key router can't disagree about which one they mean.
     fn path_editor_mut(&mut self, owner: PathEditorOwner) -> Option<&mut PathEditor> {
         match owner {
-            PathEditorOwner::SaveAs => match self.prompt.as_mut() {
-                Some(Prompt::SaveAs(ed)) => Some(ed),
-                _ => None,
-            },
+            PathEditorOwner::SaveAs => self.prompt.as_mut()?.rooted_path_editor_mut(),
             PathEditorOwner::AddProject => self
                 .workspace_settings
                 .as_mut()
@@ -2804,34 +2810,22 @@ impl Session {
             }
             Event::PathDeleted { noun, result } => match result {
                 Err(e) => Effects::error_detail("Delete failed", e),
-                Ok(_) => {
-                    // Any close of *our* buffer rides the `view/closed` push (it switches us
-                    // to the server's successor). Here we just confirm and re-list the picker.
-                    let mut fx = Effects::toast(format!("Trashed {noun}"), ToastKind::Success);
-                    if let Some(kind) = self.picker.as_ref().map(|p| p.kind) {
-                        if kind == PickerKind::Explorer {
-                            // Re-list the current directory but keep the query — re-running it
-                            // re-reads the dir server-side (the trashed entry drops out) without
-                            // resetting where the user was filtering.
-                            fx = fx.and(self.picker_query_changed());
-                        } else if kind == PickerKind::Files {
-                            // Same idea, different mechanism: Files' candidates come from the
-                            // workspace index, so re-running the query server-side wouldn't drop
-                            // the trashed entry — the list has to be re-bound, which a `Keep`
-                            // re-view does (`Arc::ptr_eq` fails against the re-walked index). A
-                            // fresh *open* would re-bind too, but it would also wipe the query and
-                            // chips, which is a surprising thing for a delete to do. Only the
-                            // highlight resets, since the row under it just vanished.
-                            if let Some(p) = self.picker.as_mut() {
-                                p.selected = 0;
-                            }
-                            fx = fx
-                                .and(Effects::one(Effect::PickerScrollReset))
-                                .and(self.picker_refetch(0, false));
-                        }
-                    }
-                    fx
+                // Any close of *our* buffer rides the `view/closed` push (it switches us to the
+                // server's successor). Here we just confirm and re-list the picker.
+                Ok(_) => Effects::toast(format!("Trashed {noun}"), ToastKind::Success)
+                    .and(self.relist_path_picker()),
+            },
+            Event::PathRenamed { retry, result } => match result {
+                // Back to the prompt with what was typed, so a taken name is one edit from a
+                // retry rather than a fresh `Ctrl-r` and retyping.
+                Err(e) => {
+                    let (from, noun, path_index, input) = retry;
+                    Effects::error_detail("Rename failed", e)
+                        .and(self.open_rename(from, noun, path_index, input))
                 }
+                // Buffers on the moved path relabel from their own `buffer/state` push.
+                Ok(_) => Effects::toast(format!("Renamed {}", retry.1), ToastKind::Success)
+                    .and(self.relist_path_picker()),
             },
             Event::KeepToggled {
                 requested,
@@ -4601,11 +4595,11 @@ impl Session {
                 }
                 Effects::none()
             }
-            Prompt::SaveAs(editor) => {
+            p @ (Prompt::SaveAs(_) | Prompt::Rename { .. }) => {
                 // Text editing (insert / delete / caret) is owned by the shell's input, which syncs
                 // the value via `save_as_set_input` / `save_as_set_root_filter`. The command keys
                 // route through `on_save_as_key` — put the editor back so it can read/mutate it.
-                self.prompt = Some(Prompt::SaveAs(editor));
+                self.prompt = Some(p);
                 self.on_save_as_key(code, mods, text)
             }
             Prompt::OpenPath(editor) => {
@@ -5212,10 +5206,14 @@ impl Session {
 
     /// Replace the save-as prompt's path-field text wholesale (each shell's input owns editing and
     /// syncs the value here). Re-derives the directory suggestion listing when the dir portion
-    /// moved. No-op unless a save-as prompt is open.
+    /// moved. No-op unless a save-as (or rename) prompt is open.
     pub fn save_as_set_input(&mut self, text: String) -> Effects {
         let workspace_paths = self.workspace_paths.clone();
-        let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
+        let Some(ed) = self
+            .prompt
+            .as_mut()
+            .and_then(Prompt::rooted_path_editor_mut)
+        else {
             return Effects::none();
         };
         if ed.input.text == text {
@@ -5234,7 +5232,11 @@ impl Session {
     /// newly chosen root. No-op unless a save-as prompt is open.
     pub fn save_as_set_root_filter(&mut self, text: String) -> Effects {
         let workspace_paths = self.workspace_paths.clone();
-        let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
+        let Some(ed) = self
+            .prompt
+            .as_mut()
+            .and_then(Prompt::rooted_path_editor_mut)
+        else {
             return Effects::none();
         };
         if ed.root_filter.text == text {
@@ -5255,7 +5257,11 @@ impl Session {
     pub fn save_as_set_field(&mut self, root: bool) -> Effects {
         let workspace_paths = self.workspace_paths.clone();
         let labels = super::labels::root_labels(&workspace_paths);
-        let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
+        let Some(ed) = self
+            .prompt
+            .as_mut()
+            .and_then(Prompt::rooted_path_editor_mut)
+        else {
             return Effects::none();
         };
         if workspace_paths.len() <= 1 {
@@ -6518,6 +6524,15 @@ impl Session {
             {
                 return self.picker_stage_delete();
             }
+            // Ctrl-r: rename or move the highlighted Files/Explorer entry, through a path prompt
+            // pre-filled with where it is now.
+            KeyCode::Char('r')
+                if mods.ctrl
+                    && !mods.alt
+                    && matches!(p.kind, PickerKind::Files | PickerKind::Explorer) =>
+            {
+                return self.picker_stage_rename();
+            }
             // Ctrl-d in the view picker closes the highlighted row in place (no open) — a live
             // buffer or a dormant (session-restored) one alike, the server resolves which. It shares
             // the `Ctrl-d` key with the delete-file gesture above but not the kind (Views vs
@@ -7106,7 +7121,7 @@ impl Session {
         fx.and(self.sync_live_filters())
     }
 
-    /// Command keys while the save-as prompt is open. Mirrors [`Self::on_chip_editor_key`] — the
+    /// Command keys while the save-as (or rename) prompt is open — only the commit differs. Mirrors [`Self::on_chip_editor_key`] — the
     /// editor reads as one `root: path` field: Tab / Alt-l accept the focused segment's ghost,
     /// `:` on a completed root moves into the path, Alt-j/k cycle the focused segment's matches,
     /// Alt-Backspace pops a path segment (then, at an empty path, the root selection), plain
@@ -7114,10 +7129,15 @@ impl Session {
     /// confirms the root and moves on); Esc cancels.
     fn on_save_as_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
         let workspace_paths = self.workspace_paths.clone();
-        let Some(Prompt::SaveAs(ed)) = self.prompt.as_mut() else {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return Effects::none();
+        };
+        let renaming = matches!(prompt, Prompt::Rename { .. });
+        let Some(ed) = prompt.rooted_path_editor_mut() else {
             return Effects::none();
         };
         match path_editor_key(ed, &workspace_paths, code, mods, text) {
+            PathEditorKey::Commit if renaming => self.commit_rename(),
             PathEditorKey::Commit => self.commit_save_as(),
             PathEditorKey::Cancel => {
                 self.prompt = None;
@@ -7563,6 +7583,9 @@ impl Session {
                         self.view.buffer.path = Some(new_path);
                     }
                 }
+                // A move can change what the file is (`notes.txt` → `notes.md`); the server
+                // re-derives it and always sends its current answer.
+                self.view.buffer.language = p.language;
                 self.adopt_external_flags(p.buffer_id, p.externally_modified, p.externally_deleted)
             }
             LspDiagnosticsChanged::NAME => {
@@ -8275,36 +8298,7 @@ impl Session {
             }
         }
 
-        let staged = {
-            let Some(p) = &self.picker else {
-                return Effects::none();
-            };
-            let Some(item) = p.selected_item() else {
-                return Effects::none();
-            };
-            match item {
-                PickerItem::DirEntry { name, is_dir, .. } => p.explorer_listing_dir().map(|dir| {
-                    let noun = if *is_dir { "directory" } else { "file" };
-                    (
-                        format!("{}/{name}", dir.trim_end_matches('/')),
-                        noun,
-                        name.clone(),
-                    )
-                }),
-                PickerItem::File {
-                    path_index,
-                    relative_path,
-                    ..
-                } => self.workspace_paths.get(*path_index as usize).map(|root| {
-                    (
-                        format!("{}/{relative_path}", root.trim_end_matches('/')),
-                        "file",
-                        relative_path.clone(),
-                    )
-                }),
-                _ => None,
-            }
-        };
+        let staged = self.picker_selected_path();
         let Some((path, noun, name)) = staged else {
             return Effects::none();
         };
@@ -8313,6 +8307,139 @@ impl Session {
             action: ConfirmAction::DeletePath { path, noun },
         });
         Effects::none()
+    }
+
+    /// The highlighted Files/Explorer row as a path on disk: `(absolute path, noun, display name)`.
+    /// The absolute path comes from the picker's listed directory (Explorer) or the entry's
+    /// workspace root (Files). `None` for any other row. What delete and rename both act on.
+    fn picker_selected_path(&self) -> Option<(String, &'static str, String)> {
+        let p = self.picker.as_ref()?;
+        match p.selected_item()? {
+            PickerItem::DirEntry { name, is_dir, .. } => p.explorer_listing_dir().map(|dir| {
+                let noun = if *is_dir { "directory" } else { "file" };
+                (
+                    format!("{}/{name}", dir.trim_end_matches('/')),
+                    noun,
+                    name.clone(),
+                )
+            }),
+            PickerItem::File {
+                path_index,
+                relative_path,
+                ..
+            } => self.workspace_paths.get(*path_index as usize).map(|root| {
+                (
+                    format!("{}/{relative_path}", root.trim_end_matches('/')),
+                    "file",
+                    relative_path.clone(),
+                )
+            }),
+            _ => None,
+        }
+    }
+
+    /// `Ctrl-r` on a Files/Explorer row: open the rename prompt over it, pre-filled with the
+    /// entry's own root-relative path (see [`Prompt::Rename`]). The picker stays open underneath
+    /// and re-lists once the rename lands.
+    pub fn picker_stage_rename(&mut self) -> Effects {
+        let Some((from, noun, _)) = self.picker_selected_path() else {
+            return Effects::none();
+        };
+        let Some((path_index, relative)) = strip_longest_root(&from, &self.workspace_paths) else {
+            return Effects::none();
+        };
+        self.open_rename(from, noun, path_index, relative)
+    }
+
+    /// Open (or re-open, after a refusal) the rename prompt for `from` with `input` in the path
+    /// field under root `path_index`.
+    fn open_rename(
+        &mut self,
+        from: String,
+        noun: &'static str,
+        path_index: u32,
+        input: String,
+    ) -> Effects {
+        let workspace_paths = self.workspace_paths.clone();
+        // Files are offered: they are where the directory completion ends, and seeing a name that
+        // is taken is how you avoid choosing it.
+        let mut editor = PathEditor::new(input, ChipEditorField::Path, path_index, true);
+        editor.sync_dir_listing(&workspace_paths);
+        self.prompt = Some(Prompt::Rename {
+            from,
+            noun,
+            editor: Box::new(editor),
+        });
+        self.refresh_save_as_listing()
+    }
+
+    /// Commit the rename prompt: move `from` to the typed path under the chosen root — or, for a
+    /// leading `/`, to that absolute path, which must still be inside a root. An empty path keeps
+    /// the prompt open; the path it already names closes it with nothing to do.
+    fn commit_rename(&mut self) -> Effects {
+        let workspace_paths = self.workspace_paths.clone();
+        let Some(Prompt::Rename { from, noun, editor }) = self.prompt.as_ref() else {
+            return Effects::none();
+        };
+        let (from, noun) = (from.clone(), *noun);
+        let raw = editor.input.text.trim().to_string();
+        if raw.is_empty() {
+            return Effects::none();
+        }
+        let target = if raw.starts_with('/') {
+            strip_longest_root(&raw, &workspace_paths)
+        } else {
+            editor.save_target(&workspace_paths)
+        };
+        let Some((path_index, relative)) = target else {
+            if raw.starts_with('/') {
+                self.prompt = None;
+                return Effects::error_detail(
+                    "Outside the workspace",
+                    format!("{raw} isn't under any of this workspace's roots"),
+                );
+            }
+            return Effects::none(); // an invalid root — the editor is already showing it
+        };
+        let Some(root) = workspace_paths.get(path_index as usize) else {
+            return Effects::none();
+        };
+        let to = format!(
+            "{}/{}",
+            root.trim_end_matches('/'),
+            relative.trim_start_matches('/')
+        );
+        self.prompt = None;
+        if to.trim_end_matches('/') == from {
+            return Effects::none();
+        }
+        let retry = (from.clone(), noun, path_index, relative);
+        self.request_str::<PathRename>(PathRenameParams { from, to }, move |result| {
+            Event::PathRenamed { retry, result }
+        })
+    }
+
+    /// Re-list the open Files/Explorer picker after a path under it changed on disk (a delete or a
+    /// rename), keeping the query.
+    fn relist_path_picker(&mut self) -> Effects {
+        match self.picker.as_ref().map(|p| p.kind) {
+            // Re-list the current directory but keep the query — re-running it re-reads the dir
+            // server-side without resetting where the user was filtering.
+            Some(PickerKind::Explorer) => self.picker_query_changed(),
+            // Same idea, different mechanism: Files' candidates come from the workspace index, so
+            // re-running the query server-side wouldn't change them — the list has to be re-bound,
+            // which a `Keep` re-view does (`Arc::ptr_eq` fails against the re-walked index). A
+            // fresh *open* would re-bind too, but it would also wipe the query and chips, which is
+            // a surprising thing for a delete or a rename to do. Only the highlight resets, since
+            // the row under it just went.
+            Some(PickerKind::Files) => {
+                if let Some(p) = self.picker.as_mut() {
+                    p.selected = 0;
+                }
+                Effects::one(Effect::PickerScrollReset).and(self.picker_refetch(0, false))
+            }
+            _ => Effects::none(),
+        }
     }
 
     /// `Ctrl-d` in any of the three view-listing pickers: close the highlighted row without
@@ -9071,7 +9198,9 @@ impl Session {
                 // the same Alt-l / Alt-j/k / Alt-Backspace vocabulary, so a hint written for one is
                 // true of the other. A separate `OpenPath` variant would only split the curriculum
                 // in two to say the same thing twice.
-                Prompt::SaveAs(_) | Prompt::OpenPath(_) => Some(HintCtx::SaveAs),
+                Prompt::SaveAs(_) | Prompt::Rename { .. } | Prompt::OpenPath(_) => {
+                    Some(HintCtx::SaveAs)
+                }
                 _ => None,
             };
         }
@@ -9911,7 +10040,7 @@ impl Session {
     fn accept_prompt(&mut self) -> Effects {
         match self.prompt.take() {
             Some(Prompt::Confirm { action, .. }) => self.run_confirm(action),
-            Some(p @ (Prompt::SaveAs(_) | Prompt::OpenPath(_))) => {
+            Some(p @ (Prompt::SaveAs(_) | Prompt::Rename { .. } | Prompt::OpenPath(_))) => {
                 // Submit via the same path as Enter.
                 self.prompt = Some(p);
                 self.on_prompt_key(KeyCode::Enter, Mods::default(), None)

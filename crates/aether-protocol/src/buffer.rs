@@ -204,4 +204,9 @@ pub struct BufferStateParams {
     /// save/reload (the client only adopts a differing path).
     #[serde(default)]
     pub path: Option<String>,
+    /// The buffer's language, re-derived from the path when it moves — a rename from `notes.txt`
+    /// to `notes.md` changes what the file is. Always the document's current answer, so the client
+    /// adopts it as sent.
+    #[serde(default)]
+    pub language: Option<String>,
 }

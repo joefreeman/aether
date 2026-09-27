@@ -7316,7 +7316,15 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Line::from(vec![Span::raw(format!(" {}? [y/N]", confirm.message))])
     } else if let Some(prompt) = state.save_prompt.as_ref() {
         // Save-prompt overlay: status row hosts the prompt regardless of underlying screen.
-        Line::from(draw_save_prompt_spans(prompt, state, SAVE_AS_LABEL, area.width as usize).0)
+        Line::from(
+            draw_save_prompt_spans(
+                prompt,
+                state,
+                save_prompt_label(prompt),
+                area.width as usize,
+            )
+            .0,
+        )
     } else if let Some(prompt) = state.open_path_prompt.as_ref() {
         // Open-from-path overlay: a single-line path input in the status row.
         Line::from(draw_save_prompt_spans(prompt, state, OPEN_PATH_LABEL, area.width as usize).0)
@@ -7586,7 +7594,17 @@ fn draw_toast_overlay(f: &mut Frame, state: &AppState, area: Rect) {
 /// Status-row labels for the two prompts that share the builder below. Both carry their own leading
 /// and trailing space — they're pushed as-is, and the caret offset counts their width.
 const SAVE_AS_LABEL: &str = " save as: ";
+const RENAME_LABEL: &str = " rename to: ";
 const OPEN_PATH_LABEL: &str = " open: ";
+
+/// The rooted path prompt's label: save-as and rename share the editor, not the verb.
+fn save_prompt_label(prompt: &crate::save_prompt::SavePromptState) -> &'static str {
+    if prompt.renaming {
+        RENAME_LABEL
+    } else {
+        SAVE_AS_LABEL
+    }
+}
 
 fn draw_save_prompt_spans(
     prompt: &crate::save_prompt::SavePromptState,
@@ -8284,8 +8302,12 @@ fn place_terminal_cursor(f: &mut Frame, state: &AppState, buffer_area: Rect, sta
     if let Some(prompt) = state.save_prompt.as_ref() {
         // The span builder reports the caret offset of the focused segment (root or path), so the
         // terminal cursor lands in sync with the rendered text.
-        let (_, cursor_off) =
-            draw_save_prompt_spans(prompt, state, SAVE_AS_LABEL, status_area.width as usize);
+        let (_, cursor_off) = draw_save_prompt_spans(
+            prompt,
+            state,
+            save_prompt_label(prompt),
+            status_area.width as usize,
+        );
         let max_col = status_area
             .x
             .saturating_add(status_area.width.saturating_sub(1));
@@ -8902,6 +8924,46 @@ mod tests {
         let screen = rows.join("\n");
         for needle in ["Aether", "Version", "0.9.9", "Instance", "Profile", "dev"] {
             assert!(screen.contains(needle), "{needle:?} missing from\n{screen}");
+        }
+    }
+
+    /// Save-as and rename are one editor in the status row; only the label says which.
+    #[test]
+    fn the_rename_prompt_is_the_save_prompt_under_its_own_label() {
+        let prompt = |renaming: bool| crate::save_prompt::SavePromptState {
+            field: crate::picker::ChipEditorField::Path,
+            input: crate::text_input::TextInput::new("src/main.rs"),
+            root_filter: Default::default(),
+            root_selected: 0,
+            root_index: 0,
+            multi_root: false,
+            listing: Vec::new(),
+            listing_dir_abs: String::new(),
+            listing_state: crate::picker::DirListingState::Loaded,
+            suggestion_idx: 0,
+            renaming,
+        };
+        for (renaming, label, other) in [
+            (true, "rename to: ", "save as: "),
+            (false, "save as: ", "rename to: "),
+        ] {
+            use ratatui::{backend::TestBackend, Terminal};
+            let mut st = picker_app(crate::picker::PickerState::default());
+            st.save_prompt = Some(prompt(renaming));
+            let mut terminal = Terminal::new(TestBackend::new(TEST_COLS, 1)).unwrap();
+            terminal.draw(|f| draw_status(f, &st, f.area())).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let text: String = (0..buf.area.width)
+                .map(|x| buf.cell((x, 0)).map_or(" ", |c| c.symbol()))
+                .collect();
+            assert!(
+                text.contains(&format!("{label}src/main.rs")),
+                "{label:?} missing in\n{text}"
+            );
+            assert!(
+                !text.contains(other),
+                "{other:?} should not show in\n{text}"
+            );
         }
     }
 

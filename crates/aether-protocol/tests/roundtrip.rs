@@ -2971,6 +2971,26 @@ fn path_delete_round_trips() {
 }
 
 #[test]
+fn path_rename_round_trips() {
+    use aether_protocol::path::{PathRename, PathRenameParams, PathRenameResult};
+    assert_eq!(PathRename::NAME, "path/rename");
+    let p = PathRenameParams {
+        from: "/ws/src/foo.rs".into(),
+        to: "/ws/lib/bar.rs".into(),
+    };
+    assert_eq!(
+        to_value(&p).unwrap(),
+        json!({"from": "/ws/src/foo.rs", "to": "/ws/lib/bar.rs"})
+    );
+    let r = PathRenameResult {
+        moved_buffer_ids: vec![3, 7],
+    };
+    assert_eq!(to_value(&r).unwrap(), json!({"moved_buffer_ids": [3, 7]}));
+    let empty: PathRenameResult = from_value(json!({})).unwrap();
+    assert!(empty.moved_buffer_ids.is_empty());
+}
+
+#[test]
 fn workspace_remove_root_result_shape() {
     use aether_protocol::workspace::{WorkspaceRemoveRoot, WorkspaceRemoveRootResult};
     assert_eq!(WorkspaceRemoveRoot::NAME, "workspace/remove_root");
@@ -5799,8 +5819,10 @@ fn buffer_state_params_external_flags_round_trip() {
         externally_modified: true,
         externally_deleted: false,
         path: Some("/p/bar.md".into()),
+        language: Some("markdown".into()),
     };
     let v = to_value(&p).unwrap();
+    assert_eq!(v["language"], "markdown");
     assert_eq!(v["externally_modified"], true);
     assert_eq!(v["externally_deleted"], false);
     assert_eq!(v["path"], "/p/bar.md");

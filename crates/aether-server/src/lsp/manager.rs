@@ -335,30 +335,51 @@ impl LspManager {
         document: DocumentId,
         uri: &str,
     ) -> Option<LspServerKey> {
+        let key = self.detach(buffer_id, document, uri)?;
+        self.reap_if_idle(&key).then_some(key)
+    }
+
+    /// [`Self::notify_close`] without the reap: drop `buffer_id`'s hold on its server (sending
+    /// `didClose` when it was the document's last holder) and return the server's key, leaving the
+    /// server up even when nothing holds it any more.
+    ///
+    /// For a document moving to a new path, which leaves its old URI and then joins the new one's
+    /// server — often the same server. Reaping in between would kill the process the re-attach is
+    /// about to use; the caller reaps with [`Self::reap_if_idle`] once it has re-attached.
+    pub fn detach(
+        &mut self,
+        buffer_id: BufferId,
+        document: DocumentId,
+        uri: &str,
+    ) -> Option<LspServerKey> {
         let key = self.doc_server.remove(&buffer_id)?;
-        let idle = {
-            let h = self.servers.get_mut(&key)?;
-            h.registered_buffers.remove(&buffer_id);
-            if let Some(holders) = h.open_documents.get_mut(&document) {
-                holders.remove(&buffer_id);
-                if holders.is_empty() {
-                    h.open_documents.remove(&document);
-                    if let Some(client) = &h.client {
-                        let _ = lifecycle::did_close(client, uri);
-                    }
+        let h = self.servers.get_mut(&key)?;
+        h.registered_buffers.remove(&buffer_id);
+        if let Some(holders) = h.open_documents.get_mut(&document) {
+            holders.remove(&buffer_id);
+            if holders.is_empty() {
+                h.open_documents.remove(&document);
+                if let Some(client) = &h.client {
+                    let _ = lifecycle::did_close(client, uri);
                 }
             }
+        }
+        Some(key)
+    }
+
+    /// Shut `key`'s server down if nothing holds it — no pin, no open document, no registered
+    /// buffer. Returns whether it went.
+    pub fn reap_if_idle(&mut self, key: &LspServerKey) -> bool {
+        let idle = self.servers.get(key).is_some_and(|h| {
             h.pinned_by.is_empty() && h.open_documents.is_empty() && h.registered_buffers.is_empty()
-        };
+        });
         if idle {
             // Last buffer gone → shut the server down. Dropping the handle drops its `Child`
             // (`kill_on_drop`). The old reader task will observe EOF and try a `Crashed` update,
             // but `set_status` finds no handle and no-ops; a later reopen gets a fresh generation.
-            self.servers.remove(&key);
-            Some(key)
-        } else {
-            None
+            self.servers.remove(key);
         }
+        idle
     }
 
     /// The current status of the language server backing `buffer_id`, if one is attached. Lets a

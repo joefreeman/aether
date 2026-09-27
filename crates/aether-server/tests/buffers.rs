@@ -4614,6 +4614,293 @@ async fn path_delete_proceeds_once_the_dirty_buffer_is_saved() {
     drop(server);
 }
 
+// ---- path/rename --------------------------------------------------------------------------------
+
+async fn rename(ws: &mut Ws, from: &std::path::Path, to: &std::path::Path) -> PathRenameResult {
+    send_request::<PathRename>(
+        ws,
+        &PathRenameParams {
+            from: from.to_string_lossy().into(),
+            to: to.to_string_lossy().into(),
+        },
+    )
+    .await
+}
+
+async fn rename_err(ws: &mut Ws, from: &std::path::Path, to: &std::path::Path) -> Value {
+    send_request_expect_error::<PathRename>(
+        ws,
+        &PathRenameParams {
+            from: from.to_string_lossy().into(),
+            to: to.to_string_lossy().into(),
+        },
+    )
+    .await
+}
+
+/// The document path the server holds for `buffer_id`.
+async fn doc_path(
+    server: &aether_server::ServerHandle,
+    buffer_id: u64,
+) -> Option<std::path::PathBuf> {
+    let s = server.state.lock().await;
+    s.try_doc_of(buffer_id)
+        .and_then(|d| d.canonical_path.clone())
+}
+
+/// Renaming a file moves it on disk, and the buffer open on it follows — the same buffer, now
+/// naming the new path — while a neighbour is untouched.
+#[tokio::test]
+async fn path_rename_moves_a_file_and_its_buffer_follows() {
+    let (server, mut ws, root) = setup_delete_workspace().await;
+    let moving = open_named(&mut ws, "doomed.txt").await;
+    let keep = open_named(&mut ws, "keep.txt").await;
+
+    let res = rename(&mut ws, &root.join("doomed.txt"), &root.join("spared.txt")).await;
+
+    assert!(!root.join("doomed.txt").exists(), "the old name is gone");
+    assert_eq!(
+        std::fs::read_to_string(root.join("spared.txt")).unwrap(),
+        "doomed\n"
+    );
+    assert_eq!(res.moved_buffer_ids, vec![moving]);
+    assert_eq!(
+        doc_path(&server, moving).await,
+        Some(root.join("spared.txt"))
+    );
+    assert_eq!(doc_path(&server, keep).await, Some(root.join("keep.txt")));
+    assert_eq!(
+        buffer_text(&mut ws, moving).await,
+        "doomed\n",
+        "same buffer, same text"
+    );
+    drop(server);
+}
+
+/// Unsaved work follows the move rather than blocking it: the buffer stays dirty, and its next
+/// in-place save lands at the new path — never recreating the old one.
+#[tokio::test]
+async fn path_rename_carries_unsaved_changes_to_the_new_path() {
+    let (server, mut ws, root) = setup_delete_workspace().await;
+    let nested = open_named(&mut ws, "sub/nested.txt").await;
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        &InputTextParams {
+            buffer_id: nested,
+            text: "edited ".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+
+    let _ = rename(
+        &mut ws,
+        &root.join("sub/nested.txt"),
+        &root.join("sub/moved.txt"),
+    )
+    .await;
+    {
+        let s = server.state.lock().await;
+        assert!(s.doc_of(nested).dirty, "the move is not a save");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("sub/moved.txt")).unwrap(),
+        "nested\n",
+        "the file moved as it was on disk"
+    );
+
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        &BufferSaveParams {
+            buffer_id: nested,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("sub/moved.txt")).unwrap(),
+        "edited nested\n"
+    );
+    assert!(
+        !root.join("sub/nested.txt").exists(),
+        "the old path stays gone"
+    );
+    drop(server);
+}
+
+/// A directory moves whole, into a parent that doesn't exist yet, and every buffer under it follows
+/// to the same place beneath the new name.
+#[tokio::test]
+async fn path_rename_moves_a_directory_and_the_buffers_under_it() {
+    let (server, mut ws, root) = setup_delete_workspace().await;
+    let nested = open_named(&mut ws, "sub/nested.txt").await;
+    let keep = open_named(&mut ws, "keep.txt").await;
+
+    let res = rename(&mut ws, &root.join("sub"), &root.join("deeper/renamed")).await;
+
+    assert!(!root.join("sub").exists());
+    assert!(root.join("deeper/renamed/nested.txt").exists());
+    assert_eq!(res.moved_buffer_ids, vec![nested]);
+    assert_eq!(
+        doc_path(&server, nested).await,
+        Some(root.join("deeper/renamed/nested.txt"))
+    );
+    assert_eq!(doc_path(&server, keep).await, Some(root.join("keep.txt")));
+    drop(server);
+}
+
+/// Every viewer hears the move: a `buffer/state` push carrying the new path, and the language the
+/// new name implies.
+#[tokio::test]
+async fn path_rename_tells_viewers_the_new_path_and_language() {
+    let (server, mut ws, root) = setup_delete_workspace().await;
+    let id = open_named(&mut ws, "keep.txt").await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(id)).await;
+
+    let _ = rename(&mut ws, &root.join("keep.txt"), &root.join("keep.rs")).await;
+
+    let state =
+        expect_notification_within::<BufferState>(&mut ws, std::time::Duration::from_secs(5)).await;
+    assert_eq!(state.buffer_id, id);
+    let expected = root.join("keep.rs").display().to_string();
+    assert_eq!(state.path.as_deref(), Some(expected.as_str()));
+    assert_eq!(state.language.as_deref(), Some("rust"));
+    drop(server);
+}
+
+/// The new name decides what the file is: `.txt` → `.rs` picks up Rust and parses it (in the
+/// background), and back again drops both.
+#[tokio::test]
+async fn path_rename_re_derives_the_language_from_the_new_name() {
+    let (server, mut ws, root) = setup_delete_workspace().await;
+    let id = open_named(&mut ws, "keep.txt").await;
+    {
+        let s = server.state.lock().await;
+        assert_eq!(s.doc_of(id).language, None);
+    }
+
+    let _ = rename(&mut ws, &root.join("keep.txt"), &root.join("keep.rs")).await;
+    settled(&server).await;
+    {
+        let s = server.state.lock().await;
+        let doc = s.doc_of(id);
+        assert_eq!(doc.language.as_deref(), Some("rust"));
+        assert!(doc.syntax.is_some(), "the deferred parse landed");
+        assert!(!doc.syntax_pending);
+    }
+
+    let _ = rename(&mut ws, &root.join("keep.rs"), &root.join("keep.txt")).await;
+    settled(&server).await;
+    let s = server.state.lock().await;
+    assert_eq!(s.doc_of(id).language, None);
+    assert!(s.doc_of(id).syntax.is_none());
+    drop(s);
+    drop(server);
+}
+
+/// Save-as goes through the same path-following: a buffer saved under a name that says Rust
+/// becomes Rust, where it used to keep the language of the name it was opened under.
+#[tokio::test]
+async fn save_as_re_derives_the_language_from_the_new_name() {
+    let (server, mut ws, _root) = setup_delete_workspace().await;
+    let id = open_named(&mut ws, "keep.txt").await;
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        &mut ws,
+        &BufferSaveParams {
+            buffer_id: id,
+            path_index: Some(0),
+            relative_path: Some("kept.rs".into()),
+            overwrite: false,
+        },
+    )
+    .await;
+    settled(&server).await;
+    let s = server.state.lock().await;
+    assert_eq!(s.doc_of(id).language.as_deref(), Some("rust"));
+    assert!(s.doc_of(id).syntax.is_some());
+    drop(s);
+    drop(server);
+}
+
+/// A rename never overwrites: an existing target refuses, and both files survive as they were.
+#[tokio::test]
+async fn path_rename_refuses_an_existing_target() {
+    let (server, mut ws, root) = setup_delete_workspace().await;
+    let err = rename_err(&mut ws, &root.join("doomed.txt"), &root.join("keep.txt")).await;
+    assert_eq!(err["code"], -32016, "WOULD_OVERWRITE");
+    assert_eq!(
+        std::fs::read_to_string(root.join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("doomed.txt")).unwrap(),
+        "doomed\n"
+    );
+    drop(server);
+}
+
+/// A path an open document is bound to but that isn't on disk yet (a new, unsaved file) is taken
+/// all the same: moving something there would put two documents on one file.
+#[tokio::test]
+async fn path_rename_refuses_a_target_an_unsaved_new_file_owns() {
+    let (server, mut ws, root) = setup_delete_workspace().await;
+    let _: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            path_index: Some(0),
+            relative_path: Some("fresh.txt".into()),
+            create_if_missing: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let err = rename_err(&mut ws, &root.join("doomed.txt"), &root.join("fresh.txt")).await;
+    assert_eq!(err["code"], -32017, "PATH_OWNED_BY_BUFFER");
+    assert!(root.join("doomed.txt").exists());
+    drop(server);
+}
+
+/// The boundary and the roots: neither end may leave the workspace, a root can't be renamed from
+/// here, and a directory can't be moved inside itself.
+#[tokio::test]
+async fn path_rename_refuses_what_it_must() {
+    let (server, mut ws, root) = setup_delete_workspace().await;
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = std::fs::canonicalize(outside_dir.path()).unwrap();
+
+    let out = rename_err(&mut ws, &root.join("keep.txt"), &outside.join("keep.txt")).await;
+    assert!(
+        out["message"].as_str().unwrap().contains("outside"),
+        "{out}"
+    );
+    assert!(root.join("keep.txt").exists());
+
+    let root_err = rename_err(&mut ws, &root, &root.join("elsewhere")).await;
+    assert!(
+        root_err["message"]
+            .as_str()
+            .unwrap()
+            .contains("workspace root"),
+        "{root_err}"
+    );
+
+    let into_self = rename_err(&mut ws, &root.join("sub"), &root.join("sub/inner")).await;
+    assert!(
+        into_self["message"]
+            .as_str()
+            .unwrap()
+            .contains("into itself"),
+        "{into_self}"
+    );
+    assert!(root.join("sub/nested.txt").exists());
+    drop(server);
+}
+
 /// Every subscribe says which element holds the cursor — an ordinary view included, where it is
 /// element 0 over the very buffer subscribed to.
 ///

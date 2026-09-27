@@ -1086,7 +1086,7 @@ impl Shell {
             return match prompt {
                 // Multi-root save-as has a leading root-typeahead segment; focus follows the core
                 // editor's `field`. Single-root workspaces only ever have the path segment.
-                Prompt::SaveAs(ed) => Some(
+                Prompt::SaveAs(ed) | Prompt::Rename { editor: ed, .. } => Some(
                     if ed.multi_root(&self.session.workspace_paths)
                         && ed.field == aether_client::chips::ChipEditorField::Root
                     {
@@ -1152,13 +1152,19 @@ impl Shell {
     fn overlay_field_value(&self, field: crate::overlay_input::OverlayField) -> String {
         use crate::overlay_input::OverlayField;
         match field {
-            OverlayField::SaveAs => match &self.session.prompt {
-                Some(Prompt::SaveAs(ed)) => ed.input.text.clone(),
-                _ => String::new(),
+            OverlayField::SaveAs => match self.session.prompt.as_ref() {
+                Some(p) => p
+                    .rooted_path_editor()
+                    .map(|ed| ed.input.text.clone())
+                    .unwrap_or_default(),
+                None => String::new(),
             },
-            OverlayField::SaveAsRoot => match &self.session.prompt {
-                Some(Prompt::SaveAs(ed)) => ed.root_filter.text.clone(),
-                _ => String::new(),
+            OverlayField::SaveAsRoot => match self.session.prompt.as_ref() {
+                Some(p) => p
+                    .rooted_path_editor()
+                    .map(|ed| ed.root_filter.text.clone())
+                    .unwrap_or_default(),
+                None => String::new(),
             },
             OverlayField::OpenPath => match &self.session.prompt {
                 Some(Prompt::OpenPath(ed)) => ed.input.text.clone(),
@@ -3011,13 +3017,17 @@ impl Shell {
                     action: crate::app::ConfirmAction::OverwriteSaveAs,
                 });
             }
-            Some(Prompt::SaveAs(ed)) => {
-                st.save_prompt = Some(save_as_view(
-                    ed,
-                    ed.multi_root(&workspace_paths),
-                    save_root_cursor,
-                    save_path_cursor,
-                ));
+            Some(p @ (Prompt::SaveAs(_) | Prompt::Rename { .. })) => {
+                let ed = p.rooted_path_editor().expect("a rooted path prompt");
+                st.save_prompt = Some(crate::save_prompt::SavePromptState {
+                    renaming: matches!(p, Prompt::Rename { .. }),
+                    ..save_as_view(
+                        ed,
+                        ed.multi_root(&workspace_paths),
+                        save_root_cursor,
+                        save_path_cursor,
+                    )
+                });
             }
             Some(Prompt::OpenPath(ed)) => {
                 // The same projection as save-as — it is the same editor. `multi_root` is forced
@@ -3188,6 +3198,7 @@ fn save_as_view(
             c::DirListingState::Failed => t::DirListingState::Failed,
         },
         suggestion_idx: e.suggestion_idx,
+        renaming: false,
     }
 }
 

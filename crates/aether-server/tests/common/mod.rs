@@ -77,7 +77,9 @@ pub use aether_protocol::lsp::{
     LspRestartServerParams, LspServerStatus, LspStatus, LspStatusChanged,
 };
 pub use aether_protocol::nav::{NavGoto, NavGotoParams, NavStep, NavStepParams, NavStepResult};
-pub use aether_protocol::path::{PathDelete, PathDeleteParams, PathDeleteResult};
+pub use aether_protocol::path::{
+    PathDelete, PathDeleteParams, PathDeleteResult, PathRename, PathRenameParams, PathRenameResult,
+};
 pub use aether_protocol::picker::{
     BufferDirtyState, CaseMode, GroupHeader, MatchOptions, PickerFilters, PickerGroupAction,
     PickerHide, PickerHideParams, PickerItem, PickerKind, PickerQuery, PickerQueryParams,

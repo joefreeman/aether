@@ -289,10 +289,11 @@ type ConfirmKind =
 
 type PromptView =
   | { kind: "confirm"; confirm: ConfirmKind }
-  /** Save-as: a root + path completion editor mirroring the dir chip editor — the focused segment
-   *  is a native `<input>` over a gray ghost-suggestion span; the core owns the completion/validity
-   *  logic and feeds the ghosts + validity back through the view. */
-  | ({ kind: "saveas" } & PathEditorView)
+  /** Save-as (and rename, the same editor under another `title` and `verb`): a root + path
+   *  completion editor mirroring the dir chip editor — the focused segment is a native `<input>`
+   *  over a gray ghost-suggestion span; the core owns the completion/validity logic and feeds the
+   *  ghosts + validity back through the view. */
+  | ({ kind: "saveas"; title: string; verb: string } & PathEditorView)
   | { kind: "lspinfo"; status: LspServerStatus }
   /** Application info (`Space ?`). Pre-composed by the core into titled sections of label/value
    *  rows, so all three shells show identical content; `warn` marks the client/server build
@@ -1265,6 +1266,9 @@ export class Shell {
    *  mounted as an input, the other as a clickable span, rebuilt only when the structure changes. */
   private readonly saveAsEl: HTMLElement;
   private readonly saveAsFieldEl: HTMLElement;
+  /** The save-as overlay's heading and primary button — worded per prompt (save-as / rename). */
+  private readonly saveAsTitleEl: HTMLElement;
+  private readonly saveAsVerbEl: HTMLElement;
   private readonly saveAsRootInput: HTMLInputElement;
   private readonly saveAsPathInput: HTMLInputElement;
   private saveAsRootGhost: HTMLElement | null = null;
@@ -1507,7 +1511,7 @@ export class Shell {
     saveModal.className = "modal";
     const saveMsg = document.createElement("div");
     saveMsg.className = "modal-message";
-    saveMsg.textContent = "Save as";
+    this.saveAsTitleEl = saveMsg;
     this.saveAsFieldEl = document.createElement("div");
     this.saveAsFieldEl.className = "modal-field saveas-field";
     // Cancel/Save affordances mirroring the confirm modal (and the native client): Cancel is the
@@ -1521,7 +1525,7 @@ export class Shell {
     saveCancel.addEventListener("click", () => this.saveAsCommand("Escape"));
     const saveOk = document.createElement("span");
     saveOk.className = "modal-btn primary";
-    saveOk.textContent = "Save";
+    this.saveAsVerbEl = saveOk;
     saveOk.addEventListener("click", () => this.saveAsCommand("Enter"));
     saveButtons.append(saveCancel, saveOk);
     saveModal.append(saveMsg, this.saveAsFieldEl, saveButtons);
@@ -3924,6 +3928,8 @@ export class Shell {
    *  structure is rebuilt only when it changes (open / multi-root / field switch) — never per keystroke,
    *  which would drop a live input's caret — while ghosts, validity and text sync every render. */
   private renderSaveAs(p: Extract<PromptView, { kind: "saveas" }>): void {
+    this.saveAsTitleEl.textContent = p.title;
+    this.saveAsVerbEl.textContent = p.verb;
     const structKey = `${p.multi_root}|${p.field}`;
     if (structKey !== this.saveAsStructKey) {
       this.rebuildSaveAsField(p);

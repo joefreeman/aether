@@ -51,6 +51,8 @@ pub struct SavePromptState {
     pub listing_state: DirListingState,
     /// Position within the filtered match set producing the current path ghost.
     pub suggestion_idx: usize,
+    /// The rename prompt rather than save-as — the same editor under another label.
+    pub renaming: bool,
 }
 
 impl SavePromptState {
@@ -210,6 +212,7 @@ mod tests {
             listing_dir_abs: String::new(),
             listing_state: DirListingState::Loaded,
             suggestion_idx: 0,
+            renaming: false,
         }
     }
 

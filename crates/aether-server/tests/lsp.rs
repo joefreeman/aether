@@ -1888,6 +1888,74 @@ async fn lsp_diagnostics_clear_on_undo() {
     drop(server);
 }
 
+/// A renamed file stays with its language server: the same server (never reaped and relaunched in
+/// between) closes the old URI and opens the new one, and its diagnostics come back under the new
+/// name. Renamed to something no server speaks, it leaves — taking the old URI's diagnostics and,
+/// with nothing left to serve, the server.
+#[tokio::test]
+async fn a_renamed_file_follows_its_language_server() {
+    use aether_server::{DummyDiagnostic, DummyLspConfig, DummyRange};
+    let dir = lay_out(&[("main.rs", "fn main() {}\n")]);
+    let dummy = DummyLspConfig {
+        diagnostics: vec![DummyDiagnostic {
+            range: DummyRange::on(0, 0, 1),
+            severity: 1,
+            message: "flagged".into(),
+        }],
+        ..Default::default()
+    };
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "rename-rust",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
+    let open: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let buffer_id = open.buffer_id;
+    wait_for_buffer_diag_present(&mut ws, buffer_id, true).await;
+    await_lsp_state(&server, "the rust server", |v| v.len() == 1 && v[0].ready).await;
+
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let _: PathRenameResult = send_request::<PathRename>(
+        &mut ws,
+        &PathRenameParams {
+            from: root.join("main.rs").to_string_lossy().into(),
+            to: root.join("renamed.rs").to_string_lossy().into(),
+        },
+    )
+    .await;
+    {
+        let s = server.state.lock().await;
+        let view = aether_server::lsp_view(&s);
+        assert!(
+            view.len() == 1 && view[0].ready && view[0].open_buffers == 1,
+            "the same, still-ready server holds the moved buffer: {view:?}"
+        );
+    }
+    wait_for_buffer_diag_present(&mut ws, buffer_id, true).await;
+
+    let _: PathRenameResult = send_request::<PathRename>(
+        &mut ws,
+        &PathRenameParams {
+            from: root.join("renamed.rs").to_string_lossy().into(),
+            to: root.join("renamed.txt").to_string_lossy().into(),
+        },
+    )
+    .await;
+    wait_for_buffer_diag_present(&mut ws, buffer_id, false).await;
+    await_lsp_state(&server, "the server to go", |v| v.is_empty()).await;
+    drop(server);
+}
+
 /// Regression test: toggle-comment edits the buffer directly (not via the shared `apply_edit`)
 /// and must send `didChange` like every other mutation — otherwise the language server keeps
 /// analyzing the pre-toggle text and everything position-based (document highlights, hover,

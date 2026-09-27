@@ -716,7 +716,7 @@ pub async fn buffer_save(
     //
     // I/O happens under the lock; in v1 that's acceptable (single client). For multi-client
     // we'd clone the rope, drop the lock, write, then re-lock to update state.
-    let (saved_at_unix_ms, revision) = {
+    let (saved_at_unix_ms, revision, follow) = {
         let mut s = state.lock().await;
         let active_workspace_name = s.active_workspace_or_err(ctx.client_id)?.id.clone();
         if let Some(owner) = s.document_for_path(&target) {
@@ -774,8 +774,12 @@ pub async fn buffer_save(
         let buf = s
             .try_doc_of_mut(params.buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let old_path = buf.canonical_path.clone();
         let saved_at = buf.save_to_disk(target).map_err(RpcError::file_io)?;
-        (saved_at, buf.revision)
+        let (revision, doc_id, moved) = (buf.revision, buf.id, buf.canonical_path != old_path);
+        // A save-as put the document somewhere new: everything its old path decided follows.
+        let follow = moved.then(|| follow_document_path(&mut s, doc_id, old_path.as_deref()));
+        (saved_at, revision, follow)
     };
 
     // Broadcast buffer/state to all clients with viewports on this buffer, and re-push any
@@ -813,11 +817,185 @@ pub async fn buffer_save(
     for (sender, notif) in picker_pushes {
         let _ = sender.send(notif).await;
     }
+    if let Some(follow) = follow {
+        follow.run(state).await;
+    }
 
     Ok(BufferSaveResult {
         saved_at_unix_ms,
         revision,
     })
+}
+
+/// What re-pointing a document at a new path leaves to do once the state lock is released: the
+/// pushes, and the background work an open of a file at that path would also have started.
+/// Returned by [`follow_document_path`]; [`Self::run`] it after dropping the lock.
+#[must_use = "a follow-up that isn't run leaves the moved document unparsed and unannounced"]
+#[derive(Default)]
+pub(crate) struct PathFollowUp {
+    pushes: PendingPushes,
+    lsp_launches: Vec<LspLaunch>,
+    parses: Vec<(BufferId, crate::state::DeferredToken)>,
+    baselines: Vec<(BufferId, std::path::PathBuf, crate::state::DeferredToken)>,
+    symbols: Vec<BufferId>,
+    watch: Vec<std::path::PathBuf>,
+    watcher: Option<std::sync::Arc<crate::watcher::WatcherHandle>>,
+}
+
+impl PathFollowUp {
+    /// Fold another document's follow-up into this one — a directory move re-points several.
+    pub(crate) fn extend(&mut self, other: PathFollowUp) {
+        self.pushes.extend(other.pushes);
+        self.lsp_launches.extend(other.lsp_launches);
+        self.parses.extend(other.parses);
+        self.baselines.extend(other.baselines);
+        self.symbols.extend(other.symbols);
+        self.watch.extend(other.watch);
+        self.watcher = self.watcher.take().or(other.watcher);
+    }
+
+    pub(crate) fn push(&mut self, more: PendingPushes) {
+        self.pushes.extend(more);
+    }
+
+    pub(crate) async fn run(self, state: &SharedState) {
+        if let Some(w) = &self.watcher {
+            for path in &self.watch {
+                crate::watcher::watch_buffer_parent(w, path);
+            }
+        }
+        for (key, spec, generation) in self.lsp_launches {
+            tokio::spawn(crate::lsp::manager::launch(
+                state.clone(),
+                key,
+                spec,
+                generation,
+            ));
+        }
+        for (id, token) in self.parses {
+            tokio::spawn(finish_pending_parse(state.clone(), id, token));
+        }
+        for (id, path, token) in self.baselines {
+            tokio::spawn(finish_git_baseline(state.clone(), id, path, token));
+        }
+        for id in self.symbols {
+            spawn_document_symbol_refresh(state.clone(), id);
+        }
+        for (sender, notif) in self.pushes {
+            let _ = sender.send(notif).await;
+        }
+    }
+}
+
+/// Bring everything derived from a document's path in line with the path it now has, after it
+/// moved from `old` (`None`: it had none — a scratch's first save-as). The one place a document
+/// changes files, shared by save-as (which leaves the old file behind) and `path/rename` (which
+/// doesn't), so the two can't disagree about what a new path means.
+///
+/// The document keeps its id, text, undo and every buffer and view on it; what follows the path:
+///
+/// - **Language and syntax**, re-derived from the new name as an open would. A scratch that the
+///   name says nothing about keeps the language it was given. A change re-parses in the
+///   background, like a large file's open.
+/// - **Language server**: each attachment leaves the old URI's server and joins the new one's,
+///   by the same trust rules an open applies, and its diagnostics and outline — the old URI's —
+///   are dropped until the new server reports.
+/// - **Git baseline**: re-resolved for the new path, in the background.
+/// - **Unsaved backup**: the one under the old path goes; the next flush writes the new one.
+/// - **Every viewer** hears the new path and language (`buffer/state`), and the view pickers
+///   relabel.
+///
+/// Records that name the *path* rather than the document — dormant session rows, jumplists, nav
+/// trails — are the caller's: after a save-as the old file is still there for them to name.
+pub(crate) fn follow_document_path(
+    s: &mut ServerState,
+    doc_id: DocumentId,
+    old: Option<&std::path::Path>,
+) -> PathFollowUp {
+    let mut follow = PathFollowUp {
+        watcher: s.watcher.clone(),
+        ..Default::default()
+    };
+    let Some(new) = s
+        .documents
+        .get(&doc_id)
+        .and_then(|d| d.canonical_path.clone())
+    else {
+        return follow;
+    };
+    let buffers = s.buffers_of_document(doc_id);
+
+    // Leave the old URI's server (`didClose` goes once the document's last holder has left), but
+    // don't reap it yet: the new path usually wants the same server back.
+    let mut left = std::collections::HashSet::new();
+    if let Some(old) = old {
+        let uri = crate::lsp::uri::path_to_uri(old);
+        for &id in &buffers {
+            left.extend(s.lsp.detach(id, doc_id, &uri));
+        }
+    }
+
+    // The unsaved backup is keyed by path: drop the old one, and have the next flush write the
+    // content under the new path (it would otherwise think the backup current).
+    if let (Some(old), Some(root)) = (old, s.backups_path.as_deref()) {
+        crate::backup::delete(&crate::backup::file_backup_path(root, old));
+    }
+
+    let doc = s
+        .documents
+        .get_mut(&doc_id)
+        .expect("resolved above under the same lock");
+    doc.backed_up_revision = None;
+    // A name that says nothing keeps a scratch's chosen language; a file's name is its answer.
+    let language = crate::state::detect_language(&new).or_else(|| match old {
+        None => doc.language.clone(),
+        Some(_) => None,
+    });
+    if language != doc.language {
+        doc.language = language;
+        doc.syntax = None;
+        doc.syntax_pending = doc.language.is_some();
+        if doc.syntax_pending {
+            if let Some(&id) = buffers.first() {
+                follow.parses.push((id, s.deferred.start()));
+            }
+        }
+    }
+
+    for &id in &buffers {
+        let Some(workspace) = s.buffer_workspaces.get(&id).cloned() else {
+            continue;
+        };
+        follow
+            .lsp_launches
+            .extend(attach_language_server(s, id, &workspace, &new));
+        s.document_symbols.remove(&id);
+        follow.symbols.push(id);
+        // Cleared with a refresh, so the gutter and the counts drop the old URI's markers now.
+        follow.push(set_diagnostics_and_refresh(s, id, Vec::new()));
+        let baseline = if git_baseline_eligible(s, &workspace, &new) {
+            follow.baselines.push((id, new.clone(), s.deferred.start()));
+            crate::git::load_repo_identity(&new, &s.git_baseline_choices)
+        } else {
+            crate::git::GitBaseline::default()
+        };
+        follow.push(attach_git_baseline(s, id, baseline));
+        s.dirty_session_for_buffer(id);
+    }
+    // Only now: a server the move left behind with nothing to serve goes.
+    let mut reaped = false;
+    for key in &left {
+        reaped |= s.lsp.reap_if_idle(key);
+    }
+    if reaped {
+        follow.push(refresh_lsp_server_pickers(s));
+    }
+    if let Some(&id) = buffers.first() {
+        follow.push(collect_buffer_state_pushes(s, id));
+    }
+    follow.push(refresh_view_pickers(s));
+    follow.watch.push(new);
+    follow
 }
 
 pub async fn buffer_reload(
@@ -2583,14 +2761,9 @@ async fn view_open_inner(
     // already have one if a previous server-side session allocated state. Look it up anyway for
     // consistency with the reopen path.
     let cursor = resolve_open_cursor(&mut s, client_id, id, clamped_jump, clamped_anchor);
-    // External buffers (path outside the active workspace's roots) are guests: no language server
-    // (see the trust reasoning at `lsp_launch` below).
-    let external = !s
-        .workspaces
-        .get(&active_workspace_name)
-        .is_some_and(|p| p.contains(&canonical));
     // Git eligibility is the *wider* test ([`WorkspaceEntry::git_eligible`]): containment, or
-    // inside the working tree of a repo a root reaches. The two deliberately differ — a file in
+    // inside the working tree of a repo a root reaches, where a language server needs containment
+    // ([`attach_language_server`]). The two deliberately differ — a file in
     // your own repo should show its diff and be stageable however you reached it, while attaching
     // a language server to it is an act of trust that containment, not the repo, still governs.
     // Skipping the baseline for a true external also avoids repo discovery walking up out of the
@@ -2649,63 +2822,7 @@ async fn view_open_inner(
         s.git_both_hunks.insert(id, git_both);
     }
 
-    // LSP, for *internal* files in a *trusted* workspace. Discover a workspace root within it and
-    // ensure a server keyed to that workspace + root, launching one if needed. `ensure` returns a
-    // launch request when it created a fresh (Starting) handle; we spawn the handshake after
-    // releasing the lock. `notify_open` is a no-op until the server is ready — the launch task opens
-    // every registered buffer once the handshake lands.
-    //
-    // Two exclusions, for the same reason from different directions:
-    //
-    // - **External files** (outside every root) get no server: we never launch one in untrusted
-    //   territory, and we don't attach them to another workspace's running server either — that
-    //   would put two buffers (this guest + the owning workspace's) on one server for the same URI,
-    //   the very ambiguity per-workspace keying exists to avoid.
-    // - **Temporary workspaces** get no server *even though their files are now inside a root*. That
-    //   root is synthesized from the file's own directory to make the pickers work
-    //   (`adopt_ephemeral_root`), and it must not be read as an act of trust: `ae /tmp/whatever.rs`
-    //   is precisely the case where you don't want a language server executing over content you
-    //   haven't vouched for. Trust follows the workspace you configured, not the file you opened —
-    //   which is why this asks the workspace rather than deriving it from containment, as the
-    //   external check does. (Git is deliberately *not* excluded: reading a repo's index is not the
-    //   same risk as launching a binary, and diff/blame on a file you opened in passing is useful.)
-    let untrusted_workspace = s
-        .workspaces
-        .get(&active_workspace_name)
-        .is_some_and(|w| w.is_ephemeral());
-    let mut lsp_launch: Option<(
-        crate::lsp::manager::LspServerKey,
-        crate::lsp::config::LspServerSpec,
-        u64,
-    )> = None;
-    if !external && !untrusted_workspace {
-        if let Some(language) = s.doc_of(id).language.clone() {
-            if let Some(spec) = crate::lsp::config::server_spec(&language) {
-                let roots = s
-                    .workspaces
-                    .get(&active_workspace_name)
-                    .map(|p| p.paths.clone())
-                    .unwrap_or_default();
-                let root = crate::lsp::manager::discover_root(
-                    &canonical,
-                    spec.root_markers,
-                    crate::lsp::config::workspace_marker(&language),
-                    &roots,
-                );
-                let key = crate::lsp::manager::LspServerKey::new(root, &language);
-                if let Some(generation) = s.lsp.ensure(&key, spec.command) {
-                    lsp_launch = Some((key.clone(), spec, generation));
-                }
-                s.lsp.register_doc(id, &key);
-                let uri = crate::lsp::uri::path_to_uri(&canonical);
-                let text = s.doc_of(id).text.to_string();
-                let version = s.doc_of(id).revision as i64;
-                let document = s.buffers[&id].document;
-                s.lsp
-                    .notify_open(id, document, &key, &uri, &language, version, &text);
-            }
-        }
-    }
+    let lsp_launch = attach_language_server(&mut s, id, &active_workspace_name, &canonical);
 
     let cursor = match client_id {
         Some(c) => wrap_for_response(&s, c, id, cursor),
@@ -2790,6 +2907,89 @@ async fn view_open_inner(
     }
     tracing::debug!(buffer_id = id, path = %canonical.display(), "buffer opened");
     Ok(result)
+}
+
+/// A language server the caller spawns the handshake for once the state lock is released —
+/// [`crate::lsp::manager::launch`]'s arguments.
+pub(crate) type LspLaunch = (
+    crate::lsp::manager::LspServerKey,
+    crate::lsp::config::LspServerSpec,
+    u64,
+);
+
+/// Attach buffer `id`, a file at `canonical` held by `workspace`, to its language server: register
+/// it and send `didOpen`, ensuring the server exists first. Returns the launch to spawn when that
+/// created a fresh one. A no-op for a file no server should see (below) or no server exists for.
+///
+/// Shared by the open and by a document moving to a new path (`follow_document_path`), so a moved
+/// file is trusted — or not — by exactly the rules an open applies.
+pub(crate) fn attach_language_server(
+    s: &mut ServerState,
+    id: BufferId,
+    workspace: &str,
+    canonical: &std::path::Path,
+) -> Option<LspLaunch> {
+    // External buffers (path outside the workspace's roots) are guests: no language server.
+    let external = !s
+        .workspaces
+        .get(workspace)
+        .is_some_and(|p| p.contains(canonical));
+
+    // LSP, for *internal* files in a *trusted* workspace. Discover a workspace root within it and
+    // ensure a server keyed to that workspace + root, launching one if needed. `ensure` returns a
+    // launch request when it created a fresh (Starting) handle; we spawn the handshake after
+    // releasing the lock. `notify_open` is a no-op until the server is ready — the launch task opens
+    // every registered buffer once the handshake lands.
+    //
+    // Two exclusions, for the same reason from different directions:
+    //
+    // - **External files** (outside every root) get no server: we never launch one in untrusted
+    //   territory, and we don't attach them to another workspace's running server either — that
+    //   would put two buffers (this guest + the owning workspace's) on one server for the same URI,
+    //   the very ambiguity per-workspace keying exists to avoid.
+    // - **Temporary workspaces** get no server *even though their files are now inside a root*. That
+    //   root is synthesized from the file's own directory to make the pickers work
+    //   (`adopt_ephemeral_root`), and it must not be read as an act of trust: `ae /tmp/whatever.rs`
+    //   is precisely the case where you don't want a language server executing over content you
+    //   haven't vouched for. Trust follows the workspace you configured, not the file you opened —
+    //   which is why this asks the workspace rather than deriving it from containment, as the
+    //   external check does. (Git is deliberately *not* excluded: reading a repo's index is not the
+    //   same risk as launching a binary, and diff/blame on a file you opened in passing is useful.)
+    let untrusted_workspace = s
+        .workspaces
+        .get(workspace)
+        .is_some_and(|w| w.is_ephemeral());
+    let mut lsp_launch: Option<LspLaunch> = None;
+    if !external && !untrusted_workspace {
+        if let Some(language) = s.doc_of(id).language.clone() {
+            if let Some(spec) = crate::lsp::config::server_spec(&language) {
+                let roots = s
+                    .workspaces
+                    .get(workspace)
+                    .map(|p| p.paths.clone())
+                    .unwrap_or_default();
+                let root = crate::lsp::manager::discover_root(
+                    canonical,
+                    spec.root_markers,
+                    crate::lsp::config::workspace_marker(&language),
+                    &roots,
+                );
+                let key = crate::lsp::manager::LspServerKey::new(root, &language);
+                if let Some(generation) = s.lsp.ensure(&key, spec.command) {
+                    lsp_launch = Some((key.clone(), spec, generation));
+                }
+                s.lsp.register_doc(id, &key);
+                let uri = crate::lsp::uri::path_to_uri(canonical);
+                let text = s.doc_of(id).text.to_string();
+                let version = s.doc_of(id).revision as i64;
+                let document = s.buffers[&id].document;
+                s.lsp
+                    .notify_open(id, document, &key, &uri, &language, version, &text);
+            }
+        }
+    }
+
+    lsp_launch
 }
 
 /// Whether this path gets a Git baseline at all in `workspace`. One definition, so the on-demand

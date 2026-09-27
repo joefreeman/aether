@@ -1136,6 +1136,7 @@ fn buffer_state_push_follows_a_save_as_rename() {
                 externally_modified: false,
                 externally_deleted: false,
                 path: path.map(Into::into),
+                language: Some("markdown".into()),
             })
             .unwrap(),
         })
@@ -1145,6 +1146,11 @@ fn buffer_state_push_follows_a_save_as_rename() {
     let _ = s.on_event(push(Some("/p/sub/bar.md")));
     assert_eq!(s.view.buffer.path.as_deref(), Some("/p/sub/bar.md"));
     assert_eq!(s.view.buffer.label.name, "sub/bar.md");
+    assert_eq!(
+        s.view.buffer.language.as_deref(),
+        Some("markdown"),
+        "the language rides along — a move can change it"
+    );
 
     // An in-place save (same path) is a no-op for the label; a legacy push (no path) too.
     let _ = s.on_event(push(Some("/p/sub/bar.md")));
@@ -5122,6 +5128,121 @@ fn trashing_from_the_files_picker_relists_without_clearing_the_query() {
     assert_eq!(
         p.selected, 0,
         "but the highlight resets — its row just went"
+    );
+}
+
+/// An Explorer session over `/proj/src` with `main.rs` highlighted.
+fn explorer_on_main_rs() -> Session {
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    let mut s = session();
+    s.workspace_paths = vec!["/proj".into()];
+    let _ = s.open_picker(PickerKind::Explorer, None, None, false, None);
+    let p = s.picker.as_mut().unwrap();
+    p.directory = Some("/proj/src".into());
+    p.items = vec![PickerItem::DirEntry {
+        name: "main.rs".into(),
+        is_dir: false,
+        match_indices: vec![],
+        git_status: None,
+    }];
+    p.total_matches = 1;
+    p.offset = 0;
+    p.selected = 0;
+    s
+}
+
+/// `Ctrl-r` on an Explorer row opens the rename prompt pre-filled with where the entry is now,
+/// root-relative; `Enter` on an edited path asks the server to move it, both ends absolute.
+#[test]
+fn ctrl_r_in_the_explorer_renames_the_highlighted_entry() {
+    use aether_client::session::Prompt;
+    let mut s = explorer_on_main_rs();
+
+    let _ = ctrl(&mut s, 'r');
+    let Some(Prompt::Rename { from, noun, editor }) = &s.prompt else {
+        panic!("Ctrl-r opens the rename prompt, got {:?}", s.prompt);
+    };
+    assert_eq!(from, "/proj/src/main.rs");
+    assert_eq!(*noun, "file");
+    assert_eq!(editor.input.text, "src/main.rs", "pre-filled root-relative");
+    assert!(s.picker.is_some(), "the picker stays open underneath");
+
+    let _ = s.save_as_set_input("lib/entry.rs".into());
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    let params = find_request(&fx, "path/rename").expect("Enter sends path/rename");
+    assert_eq!(params["from"], json!("/proj/src/main.rs"));
+    assert_eq!(params["to"], json!("/proj/lib/entry.rs"));
+    assert!(s.prompt.is_none(), "the prompt closes on submit");
+}
+
+/// The Files picker's rows are root-relative already; the prompt starts from the same path.
+#[test]
+fn ctrl_r_in_the_files_picker_renames_the_highlighted_file() {
+    use aether_client::session::Prompt;
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    let mut s = session();
+    s.workspace_paths = vec!["/proj".into()];
+    let _ = s.open_picker(PickerKind::Files, None, None, false, None);
+    {
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![PickerItem::File {
+            path_index: 0,
+            relative_path: "src/main.rs".into(),
+            match_indices: vec![],
+            git_status: None,
+        }];
+        p.total_matches = 1;
+        p.offset = 0;
+        p.selected = 0;
+    }
+    let _ = ctrl(&mut s, 'r');
+    let Some(Prompt::Rename { from, editor, .. }) = &s.prompt else {
+        panic!("Ctrl-r opens the rename prompt, got {:?}", s.prompt);
+    };
+    assert_eq!(from, "/proj/src/main.rs");
+    assert_eq!(editor.input.text, "src/main.rs");
+}
+
+/// Submitting the path the entry already has is not a rename: the prompt closes, nothing is sent.
+#[test]
+fn renaming_to_the_same_path_sends_nothing() {
+    let mut s = explorer_on_main_rs();
+    let _ = ctrl(&mut s, 'r');
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    assert!(find_request(&fx, "path/rename").is_none());
+    assert!(s.prompt.is_none());
+}
+
+/// A refused rename (the name is taken, say) comes back to the prompt holding what was typed, so
+/// the fix is one edit rather than `Ctrl-r` and retyping. A successful one re-lists the picker.
+#[test]
+fn a_refused_rename_reopens_the_prompt_with_the_typed_path() {
+    use aether_client::session::Prompt;
+    use aether_client::update::Event;
+    let mut s = explorer_on_main_rs();
+    let _ = ctrl(&mut s, 'r');
+    let _ = s.save_as_set_input("src/taken.rs".into());
+    let _ = s.on_key(KeyCode::Enter, Mods::NONE, None);
+
+    let _ = s.on_event(Event::PathRenamed {
+        retry: ("/proj/src/main.rs".into(), "file", 0, "src/taken.rs".into()),
+        result: Err("would overwrite existing file".into()),
+    });
+    let Some(Prompt::Rename { from, editor, .. }) = &s.prompt else {
+        panic!("the prompt comes back, got {:?}", s.prompt);
+    };
+    assert_eq!(from, "/proj/src/main.rs");
+    assert_eq!(editor.input.text, "src/taken.rs");
+
+    s.prompt = None;
+    let fx = s.on_event(Event::PathRenamed {
+        retry: ("/proj/src/main.rs".into(), "file", 0, "src/free.rs".into()),
+        result: Ok(serde_json::from_value(json!({})).unwrap()),
+    });
+    assert!(s.prompt.is_none());
+    assert!(
+        find_request(&fx, "picker/query").is_some(),
+        "the Explorer re-lists, keeping its query"
     );
 }
 

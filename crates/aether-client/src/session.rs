@@ -314,6 +314,20 @@ pub enum Prompt {
     /// [`super::update`]'s `save_as_set_input` / `save_as_set_root_filter`; the core keeps the value
     /// and the command keys. See [`crate::path_editor::PathEditor`].
     SaveAs(Box<crate::path_editor::PathEditor>),
+    /// The rename prompt (`Ctrl-r` on a Files or Explorer row): the save-as editor, pre-filled with
+    /// the entry's own root-relative path, so editing the name renames it, editing the directories
+    /// moves it, and the root field moves it to another root. `Enter` sends `path/rename`.
+    ///
+    /// Shares the save-as editor's plumbing throughout — the shells' field sync
+    /// (`save_as_set_input` / `save_as_set_root_filter`), the command keys, the listing — through
+    /// [`Prompt::rooted_path_editor`], so the two can't drift; only the commit differs.
+    Rename {
+        /// Absolute path of the file or directory being renamed.
+        from: String,
+        /// "file" or "directory", for the prompt title and the toasts.
+        noun: &'static str,
+        editor: Box<crate::path_editor::PathEditor>,
+    },
     /// LSP server detail (from the LspServers picker): info rows + `r` to restart.
     LspInfo(Box<LspServerStatus>),
     /// Application info & diagnostics (`Space ?`): build identity, live instance, on-disk paths.
@@ -335,6 +349,26 @@ pub enum Prompt {
     /// ephemeral context when nothing is active), `Esc` cancels. Text editing is shell-owned and
     /// synced via [`super::update`]'s `open_path_set_input`; the core keeps the value.
     OpenPath(Box<crate::path_editor::PathEditor>),
+}
+
+impl Prompt {
+    /// The root-relative path editor a prompt is built on — the save-as and rename prompts'. One
+    /// accessor, so every path that syncs, lists or routes keys for "the path prompt" treats the
+    /// two alike.
+    pub fn rooted_path_editor(&self) -> Option<&crate::path_editor::PathEditor> {
+        match self {
+            Prompt::SaveAs(editor) | Prompt::Rename { editor, .. } => Some(editor),
+            _ => None,
+        }
+    }
+
+    /// [`Self::rooted_path_editor`], mutably.
+    pub fn rooted_path_editor_mut(&mut self) -> Option<&mut crate::path_editor::PathEditor> {
+        match self {
+            Prompt::SaveAs(editor) | Prompt::Rename { editor, .. } => Some(editor),
+            _ => None,
+        }
+    }
 }
 
 /// A single editable text field. The workspace-settings overlay holds two (name + add-root). Text

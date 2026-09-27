@@ -198,12 +198,12 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 
 | Chord | Action |
 | --- | --- |
-| `Space f`/`Space Alt-f` | Find files / in this file's directory |
+| `Space f`/`Space Alt-f` | Find files / in this file's directory — `Ctrl-r` renames or moves the highlighted file, `Ctrl-d` trashes it |
 | `Space b`/`Space Alt-b` | Switch buffer / new scratch |
 | `Space h`/`Space Alt-h` | Switch shell / a new shell to run a command in |
 | `Space a`/`Space Alt-a` | Switch agent conversation / a new one |
 | `Space /`/`Space Alt-/` | Grep workspace / for current selection |
-| `Space e`/`Space Alt-e` | File explorer / at workspace root |
+| `Space e`/`Space Alt-e` | File explorer / at workspace root — `Ctrl-r` renames or moves the highlighted entry, `Ctrl-d` trashes it |
 | `Space w`/`Space Alt-w` | Switch workspace / open file by absolute path |
 | `Space j`/`Space Alt-j` | Jumplist (`Ctrl-j` in any picker captures its results into it) / clear it |
 | `Space p`/`Space Alt-p` | Copy relative/absolute path |

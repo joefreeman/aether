@@ -81,7 +81,9 @@ use aether_protocol::lsp::{
     LspSymbolPathChanged, LspSymbolPathChangedParams, SymbolCrumb,
 };
 use aether_protocol::nav::{NavGotoParams, NavStepParams, NavStepResult};
-use aether_protocol::path::{PathDeleteParams, PathDeleteResult};
+use aether_protocol::path::{
+    PathDeleteParams, PathDeleteResult, PathRenameParams, PathRenameResult,
+};
 use aether_protocol::picker::{
     AgentRowState, BufferDirtyState, GroupHeader, MatchOptions, PickerGroupAction,
     PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerReset, PickerSelectParams,

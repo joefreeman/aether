@@ -45,7 +45,7 @@ use aether_protocol::lsp::{
     LspRestartServer,
 };
 use aether_protocol::nav::{NavGoto, NavStep};
-use aether_protocol::path::PathDelete;
+use aether_protocol::path::{PathDelete, PathRename};
 use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerSetGroup, PickerView};
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
@@ -514,6 +514,7 @@ async fn dispatch(
         WorkspaceRename::NAME => run!(WorkspaceRename, handlers::workspace_rename),
         WorkspaceDelete::NAME => run!(WorkspaceDelete, handlers::workspace_delete),
         PathDelete::NAME => run!(PathDelete, handlers::path_delete),
+        PathRename::NAME => run!(PathRename, handlers::path_rename),
         ViewOpen::NAME => run!(ViewOpen, handlers::view_open),
         BufferSave::NAME => run!(BufferSave, handlers::buffer_save),
         BufferReload::NAME => run!(BufferReload, handlers::buffer_reload),

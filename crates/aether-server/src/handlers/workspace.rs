@@ -2439,6 +2439,120 @@ pub async fn path_delete(
     })
 }
 
+/// `path/rename`: move a file or directory, and have everything open on it follow. See
+/// [`aether_protocol::path::PathRename`] for the contract.
+///
+/// The filesystem move and the re-pointing happen under one hold of the lock, so nothing observes
+/// the file at its new path with a document still naming the old one — in particular not the
+/// watcher, whose removal event for the old path then finds no document to flag as deleted, and
+/// whose creation event for the new one matches the recorded mtime (a rename keeps it) and is
+/// recognised as nobody's edit.
+pub async fn path_rename(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: PathRenameParams,
+) -> Result<PathRenameResult, RpcError> {
+    let client_id = ctx.client_id;
+    let raw_from = std::path::PathBuf::from(&params.from);
+    let from = std::fs::canonicalize(&raw_from).map_err(|e| {
+        RpcError::invalid_path(format!("canonicalizing {}: {e}", raw_from.display()))
+    })?;
+    // The target mostly doesn't exist, and nor may its parents: resolve the deepest existing
+    // ancestor and re-attach the rest, as save-as does.
+    let raw_to = std::path::PathBuf::from(&params.to);
+    let (Some(parent), Some(file_name)) = (raw_to.parent(), raw_to.file_name()) else {
+        return Err(RpcError::invalid_path(format!(
+            "{} has no file name",
+            raw_to.display()
+        )));
+    };
+    let to = canonicalize_partial(parent)
+        .map_err(|e| RpcError::invalid_path(format!("canonicalizing {}: {e}", parent.display())))?
+        .join(file_name);
+
+    let mut s = state.lock().await;
+    let workspace = s.active_workspace_or_err(client_id)?;
+    for path in [&from, &to] {
+        if !workspace.contains(path) {
+            return Err(RpcError::invalid_path(format!(
+                "{} is outside the workspace's access boundary",
+                path.display()
+            )));
+        }
+        if workspace.paths.iter().any(|p| p == path) {
+            return Err(RpcError::invalid_params(format!(
+                "{} is a workspace root — edit it in workspace settings instead",
+                path.display()
+            )));
+        }
+    }
+    if to == from {
+        return Ok(PathRenameResult {
+            moved_buffer_ids: Vec::new(),
+        });
+    }
+    if to.starts_with(&from) {
+        return Err(RpcError::invalid_params(format!(
+            "can't move {} into itself",
+            from.display()
+        )));
+    }
+    // Refuse rather than overwrite. The one existing target allowed is the source under another
+    // spelling: a case-only rename on a case-insensitive filesystem, where `to` "exists" because
+    // it is the very file being renamed.
+    if std::fs::symlink_metadata(&to).is_ok()
+        && std::fs::canonicalize(&to).ok().as_deref() != Some(from.as_path())
+    {
+        return Err(RpcError::would_overwrite(to.display()));
+    }
+    // A document bound to a path that isn't on disk yet (a new file, unsaved) owns it all the
+    // same: moving something there would put two documents on one file.
+    if let Some((owner, _)) = s.documents_under_path(&to).into_iter().next() {
+        if let Some(buffer) = s.buffers_of_document(owner).into_iter().next() {
+            return Err(RpcError::path_owned_by_buffer(buffer));
+        }
+    }
+
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir).map_err(RpcError::file_io)?;
+    }
+    std::fs::rename(&from, &to).map_err(|e| {
+        RpcError::file_io(format!(
+            "moving {} to {}: {e}",
+            from.display(),
+            to.display()
+        ))
+    })?;
+
+    let mut follow = PathFollowUp::default();
+    let mut moved_buffer_ids = Vec::new();
+    for (doc_id, old) in s.documents_under_path(&from) {
+        let Some(new) = crate::state::moved_path(&old, &from, &to) else {
+            continue;
+        };
+        if let Some(doc) = s.documents.get_mut(&doc_id) {
+            doc.canonical_path = Some(new);
+        }
+        moved_buffer_ids.extend(s.buffers_of_document(doc_id));
+        follow.extend(follow_document_path(&mut s, doc_id, Some(&old)));
+    }
+    for workspace in s.rebase_path_records(&from, &to) {
+        s.dirty_session(&workspace);
+    }
+    // The Files index would otherwise keep listing the old path until the watcher's rescan.
+    for w in s.workspaces.values() {
+        if w.contains(&from) || w.contains(&to) {
+            w.workspace_index.invalidate();
+        }
+    }
+    follow.push(refresh_view_pickers(&mut s));
+    drop(s);
+    follow.run(state).await;
+    tracing::info!(from = %from.display(), to = %to.display(), moved = moved_buffer_ids.len(), "path renamed");
+    moved_buffer_ids.sort_unstable();
+    Ok(PathRenameResult { moved_buffer_ids })
+}
+
 /// Enumerate the workspaces configured on disk under `$XDG_CONFIG_HOME/aether/workspaces/`. The
 /// caller uses this to populate the workspace picker. Doesn't indicate which workspace (if any) the
 /// caller has active — the client tracks that locally.

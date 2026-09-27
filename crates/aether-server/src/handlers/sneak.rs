@@ -542,6 +542,7 @@ pub(crate) fn collect_buffer_state_pushes(s: &ServerState, buffer_id: BufferId) 
             externally_deleted: buf.externally_deleted,
             // Lets a save-as rename follow to every other client viewing this shared buffer.
             path: buf.canonical_path.as_ref().map(|p| p.display().to_string()),
+            language: buf.language.clone(),
         };
         let params = serde_json::to_value(params).unwrap_or(serde_json::Value::Null);
         pushes.extend(clients.into_iter().filter_map(|cid| {

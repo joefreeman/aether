@@ -915,7 +915,7 @@ impl App {
         // them, exactly like the chip editor — focus the active one so its caret shows and plain
         // typing flows through `on_input`. The root segment only exists in multi-root workspaces.
         match &self.session.prompt {
-            Some(Prompt::SaveAs(ed)) => {
+            Some(Prompt::SaveAs(ed) | Prompt::Rename { editor: ed, .. }) => {
                 let multi_root = ed.multi_root(&self.session.workspace_paths);
                 return Some(
                     if multi_root && ed.field == crate::chips::ChipEditorField::Root {
@@ -2129,7 +2129,7 @@ impl App {
             }
         }
         match &self.session.prompt {
-            Some(Prompt::SaveAs(ed)) => {
+            Some(Prompt::SaveAs(ed) | Prompt::Rename { editor: ed, .. }) => {
                 let multi_root = ed.multi_root(&self.session.workspace_paths);
                 return Some(
                     if multi_root && ed.field == crate::chips::ChipEditorField::Root {
@@ -4448,7 +4448,12 @@ impl App {
             ]
             .spacing(14)
             .into(),
-            Prompt::SaveAs(ed) => {
+            Prompt::SaveAs(ed) | Prompt::Rename { editor: ed, .. } => {
+                // The rename prompt is this editor under another title and verb.
+                let (title, verb) = match prompt {
+                    Prompt::Rename { noun, .. } => (format!("Rename {noun}"), "Rename"),
+                    _ => ("Save as".to_string(), "Save"),
+                };
                 // The save-as editor mirrors the dir chip editor's directory-completion UX: in
                 // multi-root workspaces a leading root-filter segment (smartcase typeahead + gray
                 // ghost), a `:` separator, then the root-relative path; single-root shows just the
@@ -4531,10 +4536,7 @@ impl App {
                     _ => Message::Noop,
                 });
                 column![
-                    text("Save as")
-                        .size(ui.body())
-                        .font(SANS)
-                        .color(p.fg_bright),
+                    text(title).size(ui.body()).font(SANS).color(p.fg_bright),
                     container(field)
                         .padding([5, 8])
                         .width(Length::Fill)
@@ -4552,7 +4554,7 @@ impl App {
                     row![
                         iced::widget::Space::new().width(Length::Fill),
                         btn("Cancel", None, BtnRole::Default, PromptMsg::Cancel),
-                        btn("Save", None, BtnRole::Primary, PromptMsg::Accept),
+                        btn(verb, None, BtnRole::Primary, PromptMsg::Accept),
                     ]
                     .spacing(8),
                 ]

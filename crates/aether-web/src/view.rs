@@ -389,7 +389,19 @@ fn prompt(
         Some(Prompt::Confirm { kind, .. }) => {
             json!({ "kind": "confirm", "confirm": confirm_kind(kind) })
         }
-        Some(Prompt::SaveAs(ed)) => path_prompt(ed, workspace_paths, "saveas"),
+        // Save-as and rename are one editor, and one overlay in the browser: only the words differ.
+        Some(Prompt::SaveAs(ed)) => {
+            let mut v = path_prompt(ed, workspace_paths, "saveas");
+            v["title"] = json!("Save as");
+            v["verb"] = json!("Save");
+            v
+        }
+        Some(Prompt::Rename { noun, editor, .. }) => {
+            let mut v = path_prompt(editor, workspace_paths, "saveas");
+            v["title"] = json!(format!("Rename {noun}"));
+            v["verb"] = json!("Rename");
+            v
+        }
         Some(Prompt::LspInfo(status)) => json!({ "kind": "lspinfo", "status": jv(status) }),
         // App info: ship the *composed sections*, not the raw snapshot. Row selection, ordering and
         // wording are the core's (shared with the native shells); the browser only paints them, so
