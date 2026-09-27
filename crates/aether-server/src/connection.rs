@@ -11,6 +11,7 @@
 use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::{ClientSession, SharedState};
+use aether_protocol::activity::ActivityCancel;
 use aether_protocol::agent::{AgentCancel, AgentOpen, AgentPrompt, AgentRespond};
 use aether_protocol::app::AppInfoGet;
 use aether_protocol::buffer::{BufferContent, BufferCopy, BufferCut, BufferReload, BufferSave};
@@ -51,8 +52,8 @@ use aether_protocol::settings::{SettingsGet, SettingsSet};
 use aether_protocol::shell::{ShellCancel, ShellOpen, ShellRun};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::syntax::SyntaxHighlightSnippet;
+use aether_protocol::view::ViewSubmitInput;
 use aether_protocol::view::{ViewClose, ViewFollowLine, ViewOpen, ViewSetRead, ViewSetTransient};
-use aether_protocol::view::{ViewInterrupt, ViewSubmitInput};
 use aether_protocol::viewport::{
     ViewSave, ViewportFocusElement, ViewportInvokeAction, ViewportNavigateChange, ViewportResize,
     ViewportSetWrap, ViewportSubscribe, ViewportWindow, ViewportWindowAtCursor,
@@ -394,6 +395,15 @@ fn parse_request(text: &str) -> Option<Request> {
     }
 }
 
+async fn client_workspace(state: &SharedState, client_id: ClientId) -> Option<String> {
+    state
+        .lock()
+        .await
+        .clients
+        .get(&client_id)
+        .and_then(|c| c.active_workspace.clone())
+}
+
 async fn process_request(
     request: Request,
     state: &SharedState,
@@ -409,7 +419,13 @@ async fn process_request(
     // log, and those are exactly the two halves worth telling apart when a gesture does nothing.
     tracing::trace!(%method, "request");
 
+    let workspace_before = client_workspace(state, ctx.client_id).await;
     let result = dispatch(state, ctx, &method, params).await;
+    // A client that has changed workspace was told about the work of the one it left: tell it the
+    // new one's. Here rather than in each handler that can switch, so no route can forget.
+    if client_workspace(state, ctx.client_id).await != workspace_before {
+        handlers::push_activity_to(state, ctx.client_id).await;
+    }
 
     // One session write per request, after the handler has released the lock. Handlers say *what*
     // changed (`ServerState::sessions_dirty`) rather than each remembering to persist, so a method
@@ -617,7 +633,7 @@ async fn dispatch(
         ShellRun::NAME => run!(ShellRun, handlers::shell_run),
         ShellCancel::NAME => run!(ShellCancel, handlers::shell_cancel),
         ViewSubmitInput::NAME => run!(ViewSubmitInput, handlers::view_submit_input),
-        ViewInterrupt::NAME => run!(ViewInterrupt, handlers::view_interrupt),
+        ActivityCancel::NAME => run!(ActivityCancel, handlers::activity_cancel),
         AgentOpen::NAME => run!(AgentOpen, handlers::agent_open),
         AgentPrompt::NAME => run!(AgentPrompt, handlers::agent_prompt),
         AgentCancel::NAME => run!(AgentCancel, handlers::agent_cancel),

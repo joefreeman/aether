@@ -92,7 +92,7 @@ pub struct AgentPromptResult {
 
 // ---- agent/cancel ------------------------------------------------------------------------------
 
-/// Stop the conversation's running turn — reached by `Space v c` through [`crate::view::ViewInterrupt`]. The agent is asked to stop; unfinished tool
+/// Stop the conversation's running turn — reached by `Ctrl-d` on its row in the activity picker (`Space v`), through [`crate::activity::ActivityCancel`]. The agent is asked to stop; unfinished tool
 /// calls are marked cancelled and any pending permission request is answered `cancelled`, which is
 /// what the protocol requires of a client that cancels.
 pub struct AgentCancel;

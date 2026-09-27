@@ -1462,6 +1462,13 @@ fn render_item<'a>(
             ui,
             p,
         ),
+        // `Shell 2   cargo test` — what the work belongs to, then what it is doing.
+        PickerItem::Activity {
+            owner,
+            label,
+            match_indices,
+            ..
+        } => composed_row([owner, label, ""], match_indices, None, hovered, ui, p),
         // `test   web/justfile   Run the tests` — the shell row's shape, with no badge.
         PickerItem::Task {
             name,

@@ -65,6 +65,7 @@
   --warning: var(--nord13);
   --info: var(--nord8);
   --ok: var(--nord14);
+  --work: var(--nord15); /* the status bar's work-in-progress indicator */
   /* Buffer-state dot (status bar + favicon; shell.ts bufferStateColor mirrors these) */
   --state-deleted: var(--nord11);
   --state-changed: var(--nord12);
@@ -195,6 +196,7 @@
   --warning: #9a7522; /* NORD13 darkened — yellow is unreadable on Snow Storm */
   --info: #3e7a8f;
   --ok: #5a7547; /* NORD14 darkened */
+  --work: #8d6488; /* NORD15 darkened */
   --state-deleted: var(--nord11);
   --state-changed: #ab5f38; /* NORD12 darkened */
   --state-unsaved: var(--nord10);
@@ -465,6 +467,7 @@ html, body, #app {
 /* Dimmed (in-index) shades for a staged change summary, mirroring the inline-diff convention. */
 .git-staged-added { color: var(--git-staged-added); }
 .git-staged-deleted { color: var(--git-staged-deleted); }
+.status-work { color: var(--work); }
 .git-branch { color: var(--accent-alt); }  /* Frost blue — secondary, distinct from the nord4 path */
 /* A linked worktree, marked `⧉` — the warning colour the branch picker uses for a worktree-held
    branch (`.picker-meta-warn`), so the mark reads the same wherever it appears. */

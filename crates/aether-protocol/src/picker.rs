@@ -254,6 +254,13 @@ pub enum PickerKind {
     /// Every task in the workspace (`Space Alt-.`) — the modal sibling of [`Self::Tasks`], found
     /// through the workspace's file index rather than by walking up from a file.
     TasksWorkspace,
+    /// The workspace's work in progress (`Space v`): shells running a command, agents working
+    /// through a turn, git operations — the list `activity/changed` carries, as rows
+    /// ([`PickerItem::Activity`]). `Enter` goes to a shell's or conversation's view (a
+    /// `picker/select` answering `View`); `Ctrl-d` stops the row's work (`activity/cancel`) and the
+    /// picker stays open. Live: rebuilt on every view and re-pushed as work starts and finishes,
+    /// so a stopped row leaves the list by itself.
+    Activity,
 }
 
 impl PickerKind {
@@ -667,6 +674,20 @@ pub enum PickerItem {
         /// materialises it on select. It has no live run, so `running` is always false here.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         dormant: bool,
+        /// Char offsets into the composed haystack described above.
+        #[serde(default)]
+        match_indices: Vec<u32>,
+    },
+    /// One piece of work in progress ([`PickerKind::Activity`]). Identity is `id`.
+    ///
+    /// The fuzzy haystack is `"{owner}  {label}"` — a **wire contract**, split by the same
+    /// `row_match_segments` as [`Self::Shell`]'s.
+    Activity {
+        id: crate::activity::ActivityId,
+        /// `Shell 2`, `Agent 1`, or the repo's directory name.
+        owner: String,
+        /// The command, the tool call, or the git operation.
+        label: String,
         /// Char offsets into the composed haystack described above.
         #[serde(default)]
         match_indices: Vec<u32>,

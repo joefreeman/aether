@@ -5134,33 +5134,92 @@ fn picker_item_agent_is_tagged() {
     assert_eq!(*state, AgentRowState::Idle);
 }
 
-/// `view/interrupt` names a view and answers whether anything stopped — the total counterpart of
-/// `view/submit_input`, and the one answer the client's "Nothing is running here" is built on.
+/// `activity/*`: the workspace's work in progress as one list, and one cancel for any of it. An id
+/// names the thing the work belongs to — a shell's or a conversation's view, or a repo — tagged,
+/// since a view id alone cannot say which kind it is.
 #[test]
-fn view_interrupt_shape() {
-    use aether_protocol::view::{ViewInterrupt, ViewInterruptParams, ViewInterruptResult};
-    assert_eq!(ViewInterrupt::NAME, "view/interrupt");
-    // Stopping a run edits no document; declaring otherwise would have a read-only client decline
-    // the key locally. A `const` block, like the rest of the `MUTATES_TEXT` pins.
-    const {
-        assert!(
-            !ViewInterrupt::MUTATES_TEXT,
-            "a view's read-only document must not make `Space v c` a local no-op"
-        )
+fn activity_shapes() {
+    use aether_protocol::activity::{
+        Activity, ActivityCancel, ActivityCancelParams, ActivityCancelResult, ActivityChanged,
+        ActivityChangedParams, ActivityId,
     };
-    let p = to_value(ViewInterruptParams {
-        view_id: aether_protocol::ViewId(9),
-    })
-    .unwrap();
-    assert_eq!(p, json!({ "view_id": 9 }));
+    use aether_protocol::picker::{PickerItem, PickerKind};
+    assert_eq!(ActivityChanged::NAME, "activity/changed");
+    assert_eq!(ActivityCancel::NAME, "activity/cancel");
+    // Stopping edits no document a client holds; declaring otherwise would have a read-only view
+    // decline the key locally.
+    const { assert!(!ActivityCancel::MUTATES_TEXT) };
+
+    let shell = Activity {
+        id: ActivityId::Shell {
+            view_id: aether_protocol::ViewId(4),
+        },
+        owner: "Shell 2".into(),
+        label: "cargo test".into(),
+    };
+    let git = Activity {
+        id: ActivityId::Git {
+            repo_id: "/w/aether".into(),
+        },
+        owner: "aether".into(),
+        label: "Pushing".into(),
+    };
     assert_eq!(
-        to_value(ViewInterruptResult { interrupted: true }).unwrap(),
-        json!({ "interrupted": true })
+        to_value(ActivityChangedParams {
+            items: vec![shell.clone(), git.clone()]
+        })
+        .unwrap(),
+        json!({"items": [
+            {"id": {"kind": "shell", "view_id": 4}, "owner": "Shell 2", "label": "cargo test"},
+            {"id": {"kind": "git", "repo_id": "/w/aether"}, "owner": "aether", "label": "Pushing"},
+        ]})
+    );
+    // Nothing running is an empty list, and an absent one parses as that.
+    assert_eq!(
+        from_value::<ActivityChangedParams>(json!({})).unwrap(),
+        ActivityChangedParams::default()
     );
     assert_eq!(
-        to_value(ViewInterruptResult::default()).unwrap(),
-        json!({ "interrupted": false })
+        to_value(ActivityCancelParams {
+            id: ActivityId::Agent {
+                view_id: aether_protocol::ViewId(7)
+            }
+        })
+        .unwrap(),
+        json!({"id": {"kind": "agent", "view_id": 7}})
     );
+    assert_eq!(
+        to_value(ActivityCancelResult::default()).unwrap(),
+        json!({"cancelled": false})
+    );
+    assert_eq!(shell.id.view_id(), Some(aether_protocol::ViewId(4)));
+    assert_eq!(git.id.view_id(), None, "a git operation has no view");
+
+    // The picker row carries the id whole, beside the two strings its haystack joins.
+    assert_eq!(to_value(PickerKind::Activity).unwrap(), json!("activity"));
+    assert_eq!(
+        to_value(PickerItem::Activity {
+            id: git.id.clone(),
+            owner: git.owner.clone(),
+            label: git.label.clone(),
+            match_indices: vec![0],
+        })
+        .unwrap(),
+        json!({
+            "kind": "activity",
+            "id": {"kind": "git", "repo_id": "/w/aether"},
+            "owner": "aether",
+            "label": "Pushing",
+            "match_indices": [0],
+        })
+    );
+    let ts = include_str!("../../../web/src/protocol.ts");
+    for needle in ["\"activity\"", "kind: \"activity\""] {
+        assert!(
+            ts.contains(needle),
+            "web/src/protocol.ts must declare `{needle}`"
+        );
+    }
 }
 
 #[test]

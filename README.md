@@ -41,8 +41,8 @@ Prebuilt binaries for **Linux** and **macOS** (Apple Silicon) are attached to ea
 
 Type `Space y` for the in-app searchable list. Holding the Shift key extends the selection (e.g.
 `Shift-w`); a leading **count** repeats a motion (e.g. `3w`). `Space` is the leader for
-app/file/code commands, `Space g` the sub-leader for git operations, `Space v` the sub-leader for
-the verbs of the view you are in (stop what it is running), and `Space n` reveals hover info at the
+app/file/code commands, `Space g` the sub-leader for git operations, `Space v` lists the work in
+progress (shells, agents, git operations) to go to or stop, and `Space n` reveals hover info at the
 cursor. What a view offers to *do* — answering an agent, folding a tool call — is a button in the
 view itself: `Tab` reaches it and `Enter` presses it.
 
@@ -212,7 +212,7 @@ Search, jump history and the scroll/placement keys behave as they do in normal m
 | `Space z`/`Space Alt-z` | Open another window / copy this view's web URL |
 | `Space .`/`Space Alt-.` | Run a task from here / from anywhere in the workspace — `Ctrl-e` edits its command first, `Ctrl-g` goes to its definition |
 | `Space ,`/`Space ;` | Application settings (soft wrap, font sizes, …) / this workspace's (roots, projects) |
-| `Space v c` | Stop what this view is running — a shell's command, an agent's turn |
+| `Space v` | Work in progress — shells, agents, git operations: `Enter` goes to it, `Ctrl-d` stops it |
 | `Space h`/`Space Alt-h` | Dismiss the current hint / turn hints off |
 | `Space q`/`Space Alt-q` | Quit / save and quit |
 | `Space y`/`Space ?` | Show keyboard shortcuts / about this build |

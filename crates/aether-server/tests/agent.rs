@@ -1075,14 +1075,13 @@ async fn a_permission_request_repushes_the_agents_picker() {
     wait_for_idle(&server, open.opened.view_id).await;
 }
 
-/// `view/interrupt` — `Space v c` — stops a turn without naming an agent.
-///
-/// The same key stops a shell's run; the client cannot tell the two apart and does not need to.
-/// A conversation with nothing in flight answers `interrupted: false`, which is what produces the
-/// client's one "Nothing is running here".
+/// `activity/cancel` stops a conversation's turn — `Ctrl-d` on its row in the activity picker. A
+/// conversation with nothing in flight answers `cancelled: false` rather than erroring.
 #[tokio::test]
-async fn view_interrupt_stops_a_turn() {
-    use aether_protocol::view::{ViewInterrupt, ViewInterruptParams, ViewInterruptResult};
+async fn cancelling_a_conversations_work_stops_its_turn() {
+    use aether_protocol::activity::{
+        ActivityCancel, ActivityCancelParams, ActivityCancelResult, ActivityId,
+    };
     let script = Script {
         steps: vec![Step::Ask {
             id: "t1",
@@ -1093,15 +1092,13 @@ async fn view_interrupt_stops_a_turn() {
     let (server, mut ws, _dir, _t) = setup(script).await;
     let open = open_agent(&mut ws).await;
 
+    let id = ActivityId::Agent {
+        view_id: open.opened.view_id,
+    };
     // Idle: nothing to stop, and not an error.
-    let idle: ViewInterruptResult = send_request::<ViewInterrupt>(
-        &mut ws,
-        &ViewInterruptParams {
-            view_id: open.opened.view_id,
-        },
-    )
-    .await;
-    assert!(!idle.interrupted);
+    let idle: ActivityCancelResult =
+        send_request::<ActivityCancel>(&mut ws, &ActivityCancelParams { id: id.clone() }).await;
+    assert!(!idle.cancelled);
 
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "go").await;
@@ -1126,14 +1123,9 @@ async fn view_interrupt_stops_a_turn() {
         tokio::task::yield_now().await;
     }
 
-    let stopped: ViewInterruptResult = send_request::<ViewInterrupt>(
-        &mut ws,
-        &ViewInterruptParams {
-            view_id: open.opened.view_id,
-        },
-    )
-    .await;
-    assert!(stopped.interrupted);
+    let stopped: ActivityCancelResult =
+        send_request::<ActivityCancel>(&mut ws, &ActivityCancelParams { id }).await;
+    assert!(stopped.cancelled);
     wait_for_idle(&server, open.opened.view_id).await;
 }
 

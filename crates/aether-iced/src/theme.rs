@@ -53,6 +53,7 @@ pub struct Palette {
     pub warning: Color,
     pub info: Color,
     pub ok: Color,
+    pub work: Color,
 
     // ---- Buffer-state dot ----
     pub state_deleted: Color,
@@ -131,6 +132,7 @@ impl Palette {
             warning: color(t.warning),
             info: color(t.info),
             ok: color(t.ok),
+            work: color(t.work),
             state_deleted: color(t.state_deleted),
             state_changed: color(t.state_changed),
             state_unsaved: color(t.state_unsaved),

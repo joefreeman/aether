@@ -98,6 +98,8 @@ pub enum PickerCmd {
     EditTask,
     /// `Ctrl-g` in a tasks picker — go to where the task is defined.
     TaskDefinition,
+    /// `Ctrl-d` in the activity picker — stop the highlighted work.
+    StopActivity,
 }
 
 /// Session facts that condition a hint's display eligibility beyond the context id — the engine
@@ -360,6 +362,9 @@ pub static CURRICULUM: &[HintDef] = &[
     HintDef { id: "worktree-create", tier: 4, contexts: &[C::Picker(PickerKind::GitBranches)], keys: "Ctrl-o",
         trigger: Trigger::Picker(PickerCmd::CreateWorktree),
         text: "Use {} to create a worktree for the selected branch" },
+    HintDef { id: "activity-stop", tier: 4, contexts: &[C::Picker(PickerKind::Activity)], keys: "Ctrl-d",
+        trigger: Trigger::Picker(PickerCmd::StopActivity),
+        text: "Use {} to stop the selected work" },
     // A tasks picker's rows run on Enter; the other two ways in are its least guessable keys.
     HintDef { id: "task-edit", tier: 4,
         contexts: &[C::Picker(PickerKind::Tasks), C::Picker(PickerKind::TasksWorkspace)], keys: "Ctrl-e",

@@ -51,7 +51,6 @@ import type {
   CursorState,
   DiagnosticCounts,
   FocusStop,
-  GitOperation,
   GroupHeader,
   GroupSpan,
   LogicalPosition,
@@ -524,12 +523,9 @@ interface CoreView {
   externally_deleted: boolean;
   /** The view has unsaved edits — the core's one answer (`ViewState::unsaved`). */
   unsaved: boolean;
-  /** The long-running git operation in flight, or null. Only user-initiated ones appear. */
-  git_operation: GitOperation | null;
-  /** What to say about shells running commands — the focused shell's command, or "N running"
-   *  for the ones elsewhere. Composed by the core (`Session::work_indicator`), so this is the
-   *  whole string bar its glyph. Null when nothing is running. */
-  work_indicator: string | null;
+  /** How much the workspace has in progress — shells, agents' turns, git operations
+   *  (`Session::work_in_progress`). Null when nothing is running. */
+  work_in_progress: number | null;
   diagnostics: DiagnosticCounts;
   lsp: LspServerStatus | null;
   search: SearchView;
@@ -1019,6 +1015,17 @@ export function describePickerItem(
         suffix: composedTail(parts),
         suffixMatches: composedTailMatches(parts, seg),
         ...(badge ? { metaParts: [badge] } : {}),
+      };
+    }
+    case "activity": {
+      // `Shell 2   cargo test` — what the work belongs to, then what it is doing, dim.
+      const parts: [string, string, string] = [item.owner, item.label, ""];
+      const seg = rowMatchSegments(parts, item.match_indices);
+      return {
+        primary: item.owner,
+        matches: seg.first,
+        suffix: composedTail(parts),
+        suffixMatches: composedTailMatches(parts, seg),
       };
     }
     case "task": {
@@ -5463,29 +5470,8 @@ export class Shell {
       fileGroup.append(commit);
     }
     left.append(fileGroup);
-    // The running-shell indicator sits beside git's, in the same slot and the same shade: both
-    // answer "something is happening that you are waiting on".
-    if (v.work_indicator) {
-      const el = document.createElement("span");
-      el.className = "status-git git-branch";
-      el.textContent = `⟳ ${v.work_indicator}`;
-      used += [...el.textContent].length + DIVIDER_COLS;
-      left.append(sectionDivider(), el);
-    }
-    // An operation in flight replaces the whole git group: while a push runs, its progress is the
-    // only thing about git worth the width, and the branch hasn't moved.
-    const op = v.git_operation;
-    if (op) {
-      const el = document.createElement("span");
-      el.className = "status-git git-branch";
-      // Mirrors `GitOperationKind::label` in the core, which the native shells call directly.
-      const label = { fetch: "Fetching", push: "Pushing", pull: "Pulling" }[op.kind];
-      el.textContent = op.detail ? `⟳ ${label}  ${op.detail}` : `⟳ ${label}`;
-      used += [...el.textContent].length + DIVIDER_COLS;
-      left.append(sectionDivider(), el);
-    }
     // Git group: `⎇ branch  +u(s) ~u(s) -u(s)` (unstaged then staged-in-parens; zero omitted).
-    const gs = op ? undefined : v.window?.git_status;
+    const gs = v.window?.git_status;
     if (gs) {
       const gitGroup = document.createElement("span");
       gitGroup.className = "status-git-group";
@@ -5555,6 +5541,15 @@ export class Shell {
         used += DIVIDER_COLS;
         left.append(sectionDivider(), gitGroup);
       }
+    }
+    // The work in progress — shells, agents' turns, git operations — as a count in its own colour
+    // and its own section, after the git group. What the work is, `Space v` lists.
+    if (v.work_in_progress) {
+      const el = document.createElement("span");
+      el.className = "status-work";
+      el.textContent = `⟳ ${v.work_in_progress}`;
+      used += [...el.textContent].length + DIVIDER_COLS;
+      left.append(sectionDivider(), el);
     }
 
     const right = document.createElement("span");

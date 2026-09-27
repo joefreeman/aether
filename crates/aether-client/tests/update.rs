@@ -14713,75 +14713,111 @@ fn a_refused_submit_says_what_is_in_the_way() {
         Err(aether_client::transport::RpcError {
             method: "shell/run",
             code: aether_protocol::error::ErrorCode::SHELL_BUSY.code(),
-            message: "Shell 1 is running sleep 100 — Space v c stops it".into(),
+            message: "Shell 1 is running sleep 100 — Space v to stop it".into(),
         }),
     );
     let toasts = toast_messages(&fx);
     assert_eq!(
         toasts,
-        vec!["Already running — Shell 1 is running sleep 100 — Space v c stops it".to_string()]
+        vec!["Already running — Shell 1 is running sleep 100 — Space v to stop it".to_string()]
     );
     assert!(!has_error_toast(&fx), "busy is not a failure");
 }
 
-/// `Space v c` stops whatever the view you are looking at is running.
-///
-/// One request whatever the view is — the client makes no guess about the kind, so a file view
-/// sends it too and the server's `interrupted: false` is what produces the toast. That is the
-/// whole reason "Not a shell" is gone: there was never a way for the client to know.
-#[test]
-fn space_v_c_interrupts_the_focused_view() {
-    let mut s = shell_session(1);
-    let _ = s.on_event(shell_run_push(10, "sleep 100", json!({"kind": "running"})));
-    let _ = key(&mut s, ' ');
-    let _ = key(&mut s, 'v');
-    let fx = key(&mut s, 'c');
-    let (_, method, params) = the_request(&fx);
-    assert_eq!(method, "view/interrupt");
-    assert_eq!(params["view_id"], 10);
+/// `activity/changed`: the workspace's work in progress, whole.
+fn activity_push(items: serde_json::Value) -> aether_client::update::Event {
+    use aether_client::update::Event;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: aether_protocol::activity::ActivityChanged::NAME.into(),
+        params: json!({ "items": items }),
+    })
+}
 
-    // A file view asks all the same — and the answer is what says nothing was running.
+fn shell_work(view_id: u64, command: &str) -> serde_json::Value {
+    json!({"id": {"kind": "shell", "view_id": view_id}, "owner": format!("Shell {view_id}"),
+           "label": command})
+}
+
+fn agent_work(view_id: u64) -> serde_json::Value {
+    json!({"id": {"kind": "agent", "view_id": view_id}, "owner": "Agent 1", "label": "thinking"})
+}
+
+fn git_work() -> serde_json::Value {
+    json!({"id": {"kind": "git", "repo_id": "/p"}, "owner": "p", "label": "Pushing"})
+}
+
+/// `Space v` lists the workspace's work in progress. `Ctrl-d` stops the highlighted row and leaves
+/// the picker open — the row leaves by itself once it has stopped — and a stop that found nothing
+/// left says so, while one that landed says nothing.
+#[test]
+fn space_v_lists_work_and_ctrl_d_stops_a_row() {
+    use aether_protocol::activity::ActivityId;
+    use aether_protocol::picker::{PickerItem, PickerKind};
+
     let mut s = session();
     let _ = key(&mut s, ' ');
-    let _ = key(&mut s, 'v');
-    let fx = key(&mut s, 'c');
-    let (token, method, _) = the_request(&fx);
-    assert_eq!(method, "view/interrupt");
-    let fx = s.on_rpc_result(token, Ok(json!({ "interrupted": false })));
+    let fx = key(&mut s, 'v');
+    let params = find_request(&fx, "picker/view").expect("Space v opens the activity picker");
+    assert_eq!(params["kind"], json!("activity"));
+
+    let row = |id: ActivityId| PickerItem::Activity {
+        id,
+        owner: "Shell 1".into(),
+        label: "sleep 100".into(),
+        match_indices: Vec::new(),
+    };
+    let open = |s: &mut aether_client::session::Session, id: ActivityId| {
+        let _ = s.open_picker(PickerKind::Activity, None, None, false, None);
+        let p = s.picker.as_mut().unwrap();
+        p.items = vec![row(id)];
+        p.selected = 0;
+    };
+    let shell = ActivityId::Shell {
+        view_id: ViewId(10),
+    };
+
+    let mut s = session();
+    open(&mut s, shell.clone());
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None);
+    let (token, method, params) = the_request(&fx);
+    assert_eq!(method, "activity/cancel");
+    assert_eq!(params["id"], json!({"kind": "shell", "view_id": 10}));
+    assert!(s.picker.is_some(), "the picker stays open");
+    let fx = s.on_rpc_result(token, Ok(json!({ "cancelled": true })));
+    assert!(
+        toast_messages(&fx).is_empty(),
+        "a stop that landed is silent"
+    );
+
+    let mut s = session();
+    open(&mut s, shell.clone());
+    let fx = s.on_key(KeyCode::Char('d'), Mods::CTRL, None);
+    let (token, _, _) = the_request(&fx);
+    let fx = s.on_rpc_result(token, Ok(json!({ "cancelled": false })));
     assert_eq!(
         toast_messages(&fx),
-        vec!["Nothing is running here".to_string()]
+        vec!["It had already finished".to_string()]
     );
-}
 
-/// A stop that landed says nothing: the finish arrives as a push.
-#[test]
-fn a_landed_interrupt_is_silent() {
-    let mut s = shell_session(1);
-    let _ = s.on_event(shell_run_push(10, "sleep 100", json!({"kind": "running"})));
-    let _ = key(&mut s, ' ');
-    let _ = key(&mut s, 'v');
-    let fx = key(&mut s, 'c');
-    let (token, _, _) = the_request(&fx);
-    let fx = s.on_rpc_result(token, Ok(json!({ "interrupted": true })));
-    assert!(toast_messages(&fx).is_empty());
-}
-
-/// `Esc` in the view sub-leader cancels the chord rather than acting: no verb is bound to it, and
-/// an unbound key clears the pending prefix.
-#[test]
-fn esc_cancels_the_view_sub_leader() {
-    let mut s = shell_session(1);
-    let _ = s.on_event(shell_run_push(10, "sleep 100", json!({"kind": "running"})));
-    let _ = key(&mut s, ' ');
-    let _ = key(&mut s, 'v');
-    let fx = s.on_key(KeyCode::Esc, Mods::NONE, None);
-    assert!(no_request(&fx), "Esc is not a verb in the table");
-    // …and the chord is gone: the next `c` is an ordinary Normal-mode key, not the interrupt.
-    let fx = key(&mut s, 'c');
-    assert!(
-        find_request(&fx, "view/interrupt").is_none(),
-        "the pending chord was cancelled"
+    // Enter goes to the view the work belongs to; a git operation has none, and says so.
+    let mut s = session();
+    open(&mut s, shell);
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    assert!(find_request(&fx, "picker/select").is_some());
+    let mut s = session();
+    open(
+        &mut s,
+        ActivityId::Git {
+            repo_id: "/p".into(),
+        },
+    );
+    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+    assert!(find_request(&fx, "picker/select").is_none());
+    assert_eq!(
+        toast_messages(&fx),
+        vec!["sleep 100 has no view to open — Ctrl-d stops it".to_string()]
     );
 }
 
@@ -14875,6 +14911,17 @@ fn a_finished_run_is_announced_only_when_you_are_looking_elsewhere() {
         vec!["Shell 99 — cargo build (exit 1)".to_string()],
         "named for the shell as well as the command"
     );
+
+    // A clean exit is the success colour, and says nothing more than the command.
+    let fx = s.on_event(shell_run_push(
+        99,
+        "cargo build",
+        json!({"kind": "exited", "code": 0}),
+    ));
+    assert_eq!(
+        toast_messages(&fx),
+        vec!["Shell 99 — cargo build".to_string()]
+    );
 }
 
 /// `Up`/`Down` in the input recall commands; on the transcript they stay ordinary motions.
@@ -14963,39 +15010,30 @@ fn a_rejected_line_is_not_accepted_and_not_recalled() {
     assert!(s.history.list(HistoryKind::Shell).is_empty());
 }
 
-/// The status indicator names the command you are waiting on, and counts the ones you are not.
+/// The status bar's work indicator is a count of everything the workspace is running — shells,
+/// agents' turns and git operations alike, the view you are looking at included.
 #[test]
-fn the_work_indicator_names_the_focused_run_and_counts_the_rest() {
+fn the_work_indicator_counts_everything_running() {
     let mut s = shell_session(1);
-    assert_eq!(s.work_indicator(), None, "nothing running");
+    assert_eq!(s.work_in_progress(), None, "nothing running");
 
-    let _ = s.on_event(shell_run_push(
-        10,
-        "cargo build",
-        json!({"kind": "running"}),
-    ));
+    let _ = s.on_event(activity_push(json!([shell_work(10, "cargo build")])));
     assert_eq!(
-        s.work_indicator().as_deref(),
-        Some("cargo build"),
-        "the shell in front of you is named by its command"
+        s.work_in_progress(),
+        Some(1),
+        "the shell in front of you counts too"
     );
 
-    let _ = s.on_event(shell_run_push(99, "npm test", json!({"kind": "running"})));
-    assert_eq!(
-        s.work_indicator().as_deref(),
-        Some("cargo build"),
-        "the focused one still wins"
-    );
+    let _ = s.on_event(activity_push(json!([
+        shell_work(10, "cargo build"),
+        shell_work(99, "npm test"),
+        agent_work(12),
+        git_work(),
+    ])));
+    assert_eq!(s.work_in_progress(), Some(4));
 
-    // Focused shell finishes; the other is counted rather than named.
-    let _ = s.on_event(shell_run_push(
-        10,
-        "cargo build",
-        json!({"kind": "exited", "code": 0}),
-    ));
-    assert_eq!(s.work_indicator().as_deref(), Some("1 running"));
-    let _ = s.on_event(shell_run_push(99, "npm test", json!({"kind": "killed"})));
-    assert_eq!(s.work_indicator(), None);
+    let _ = s.on_event(activity_push(json!([])));
+    assert_eq!(s.work_in_progress(), None);
 }
 
 /// A composed view containing a prose element is **not** the reading view.
@@ -15126,20 +15164,6 @@ fn the_external_change_notice_is_raised_once_per_buffer() {
 
 // ---- closing something that is still going -------------------------------------------------------
 
-/// A `agent/turn_changed` push, as the server sends it.
-fn agent_turn_push(view_id: u64, running: bool) -> aether_client::update::Event {
-    use aether_client::update::Event;
-    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
-    Event::ServerPush(Notification {
-        jsonrpc: JsonRpc,
-        method: aether_protocol::agent::AgentTurnChanged::NAME.into(),
-        params: json!({
-            "view_id": view_id,
-            "turn": { "running": running },
-        }),
-    })
-}
-
 /// `Space x` on a shell with a command in flight asks first — closing the view kills the process
 /// group, which is the same class of loss as discarding unsaved text.
 ///
@@ -15149,7 +15173,7 @@ fn agent_turn_push(view_id: u64, running: bool) -> aether_client::update::Event 
 fn closing_a_running_shell_confirms_and_an_idle_one_does_not() {
     use aether_client::session::{ConfirmKind, Prompt};
     let mut s = shell_session(1);
-    let _ = s.on_event(shell_run_push(10, "sleep 100", json!({"kind": "running"})));
+    let _ = s.on_event(activity_push(json!([shell_work(10, "sleep 100")])));
     let _ = key(&mut s, ' ');
     let fx = key(&mut s, 'x');
     assert!(fx.0.is_empty(), "the confirm stages, nothing is sent");
@@ -15177,7 +15201,7 @@ fn closing_a_running_shell_confirms_and_an_idle_one_does_not() {
 fn closing_a_busy_agent_confirms() {
     use aether_client::session::{ConfirmKind, Prompt};
     let mut s = shell_session(1);
-    let _ = s.on_event(agent_turn_push(10, true));
+    let _ = s.on_event(activity_push(json!([agent_work(10)])));
     let _ = key(&mut s, ' ');
     let fx = key(&mut s, 'x');
     assert!(fx.0.is_empty());
@@ -15195,8 +15219,8 @@ fn closing_a_busy_agent_confirms() {
 
     // The turn ending clears it.
     let mut s = shell_session(1);
-    let _ = s.on_event(agent_turn_push(10, true));
-    let _ = s.on_event(agent_turn_push(10, false));
+    let _ = s.on_event(activity_push(json!([agent_work(10)])));
+    let _ = s.on_event(activity_push(json!([])));
     let _ = key(&mut s, ' ');
     let fx = key(&mut s, 'x');
     assert!(s.prompt.is_none());

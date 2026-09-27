@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod activity;
 pub mod agent;
 pub mod app;
 pub mod buffer;

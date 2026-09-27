@@ -131,7 +131,8 @@ pub struct ShellRunResult {
 
 // ---- shell/cancel ------------------------------------------------------------------------------
 
-/// Stop the shell's running command — reached by `Space v c` through [`crate::view::ViewInterrupt`]. Kills the whole process group, so a
+/// Stop the shell's running command — reached by `Ctrl-d` on its row in the activity picker
+/// (`Space v`), through [`crate::activity::ActivityCancel`]. Kills the whole process group, so a
 /// `cargo build` goes with the `sh` that started it.
 pub struct ShellCancel;
 impl RpcMethod for ShellCancel {

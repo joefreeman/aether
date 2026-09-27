@@ -879,6 +879,8 @@ pub enum ItemKey<'a> {
         path: &'a str,
         name: &'a str,
     },
+    /// A piece of work in progress, by what it belongs to.
+    Activity(&'a aether_protocol::activity::ActivityId),
 }
 
 pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
@@ -971,6 +973,7 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
             path: path.as_str(),
             name: name.as_str(),
         },
+        PickerItem::Activity { id, .. } => ItemKey::Activity(id),
         PickerItem::Group { header, .. } => match header {
             aether_protocol::picker::GroupHeader::File {
                 path_index,

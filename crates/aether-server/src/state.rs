@@ -64,9 +64,10 @@ pub struct ServerState {
     /// one per repo, since they all contend for the same refs anyway.
     ///
     /// Holds the cancel handle so `git/cancel` can reach a `git push` that is sitting in a TCP
-    /// timeout. Only **user-initiated** operations are registered: the periodic fetcher runs
+    /// timeout, and the kind, so the workspace's work in progress (`activity/*`) can say what is
+    /// running. Only **user-initiated** operations are registered: the periodic fetcher runs
     /// unannounced and uncancellable, which is what keeps it out of the way.
-    pub git_operations: HashMap<PathBuf, crate::git_cli::CancelHandle>,
+    pub git_operations: HashMap<PathBuf, GitOperationEntry>,
     /// Serialises worktree creation and removal per **repo family**, keyed by canonicalized
     /// common dir. See [`Self::worktree_lock`].
     pub worktree_locks: HashMap<PathBuf, Arc<Mutex<()>>>,
@@ -657,6 +658,12 @@ pub struct DormantView {
     /// For a shell, what its snapshot says — the picker row's directory, last command and outcome.
     /// `None` for every other source, and for a snapshot that could not be read.
     pub shell: Option<crate::shell::SnapshotSummary>,
+}
+
+/// One registered git operation — see [`ServerState::git_operations`].
+pub struct GitOperationEntry {
+    pub cancel: crate::git_cli::CancelHandle,
+    pub kind: aether_protocol::git::GitOperationKind,
 }
 
 /// The thing a [`DormantView`] materializes into.

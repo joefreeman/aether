@@ -1130,24 +1130,23 @@ fn a_shell_paints_its_runs_then_its_input() {
     snapshot(&mut sim, &app, "shell-runs");
 }
 
-/// The running-shell indicator reaches the status bar, in the git operation's slot.
+/// The work in progress reaches the status bar as a count.
 #[test]
 fn a_running_shell_shows_in_the_status_bar() {
     let mut session = session_showing(shell_view());
-    session.shell_runs.insert(
-        session.view.view_id,
-        aether_protocol::shell::RunState {
-            run: 1,
-            command: "cargo build".into(),
-            status: aether_protocol::shell::RunStatus::Running,
+    session.activity.push(aether_protocol::activity::Activity {
+        id: aether_protocol::activity::ActivityId::Shell {
+            view_id: session.view.view_id,
         },
-    );
+        owner: "Shell 1".into(),
+        label: "cargo build".into(),
+    });
     let app = app_with(session);
     let mut sim = simulate(&app);
     let rows = rows(&mut sim);
     assert!(
-        rows.iter().any(|r| r.contains("\u{27f3} cargo build")),
-        "the indicator names the command you are waiting on:\n{}",
+        rows.iter().any(|r| r.contains("\u{27f3} 1")),
+        "the indicator counts the work in progress:\n{}",
         rows.join("\n")
     );
     snapshot(&mut sim, &app, "shell-indicator");

@@ -81,13 +81,8 @@ pub fn build_view(s: &Session) -> Value {
         // The view has unsaved edits — the core's one answer (`ViewState::unsaved`), so the
         // favicon cannot hold a second opinion about what "unsaved" means.
         "unsaved": s.view.unsaved(),
-        // The long-running git operation in flight, if any. The repo id it also carries stays in
-        // the core — the shell only paints the indicator; `Space g x` is dispatched core-side.
-        "git_operation": s.git_operation.as_ref().map(|(_, op)| jv(op)),
-        // What the status bar says about shells — the focused shell's running command, or a count
-        // of the ones running elsewhere. Composed in the core so all three shells say the same
-        // thing; the browser only paints it.
-        "work_indicator": s.work_indicator(),
+        // How much the workspace has in progress — the status bar's `⟳ 3`.
+        "work_in_progress": s.work_in_progress(),
         // Raw blame fields (from the server's `git/blame_changed` push): the TS shell formats
         // the label — "3w ago" needs a clock, and the shell already has one for its own chrome.
         "blame": s.view.blame.as_ref().map(|(line, b)| json!({
@@ -503,7 +498,6 @@ fn pending(p: &Pending) -> Value {
         // The git sub-leader is a leader with a prefix already typed; the shell only tests for a
         // non-null `pending` to pick the awaiting-key cursor, so this needs no TS counterpart.
         Pending::LeaderGit => json!({ "kind": "leader", "prefix": "g" }),
-        Pending::LeaderView => json!({ "kind": "leader", "prefix": "v" }),
         Pending::Find {
             dir,
             till,

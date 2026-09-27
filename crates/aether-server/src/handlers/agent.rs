@@ -351,7 +351,7 @@ pub async fn agent_prompt(
         if c.is_running() {
             return Err(RpcError::new(
                 ErrorCode::AGENT_BUSY,
-                format!("{} is working — Space v c stops it", c.title),
+                format!("{} is working — Space v to stop it", c.title),
             ));
         }
 
@@ -1212,9 +1212,10 @@ async fn push_agent_rows(state: &SharedState) {
 
 /// Push `agent/turn_changed` to every connected client, and re-push every open agents picker.
 ///
-/// Every client, like `git/operation_changed` and `shell/run_changed`: a conversation belongs to
-/// the workspace rather than to whoever pressed `Enter`, and a client with the view open wants the
-/// indicator whether or not it started the turn.
+/// Every client on the conversation's workspace, like `shell/run_changed`: a conversation belongs to
+/// the workspace rather than to whoever pressed `Enter`, and a client with the view open wants to
+/// hear how the turn went whether or not it started it. A client on another workspace has no row
+/// for it to belong to. The workspace's work in progress rides along ([`push_activity`]).
 ///
 /// The picker re-push rides here for the reason it rides `push_run_changed`: this is the funnel a
 /// turn transition passes through, and the row's badge is what changed. Permission raised and
@@ -1225,11 +1226,11 @@ async fn push_turn_changed(state: &SharedState, view_id: ViewId, turn: Option<Tu
     let value = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
     let pushes: PendingPushes = {
         let s = state.lock().await;
-        s.clients
-            .values()
-            .map(|sess| {
+        clients_of_view(&s, view_id)
+            .into_iter()
+            .map(|sender| {
                 (
-                    sess.outbound.clone(),
+                    sender,
                     Notification {
                         jsonrpc: JsonRpc,
                         method: AgentTurnChanged::NAME.into(),
@@ -1242,4 +1243,5 @@ async fn push_turn_changed(state: &SharedState, view_id: ViewId, turn: Option<Tu
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
+    push_activity(state).await;
 }

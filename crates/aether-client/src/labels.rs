@@ -551,6 +551,7 @@ pub fn picker_placeholder(kind: Option<PickerKind>) -> &'static str {
         PickerKind::Jumplist => "Filter the jumplist…",
         PickerKind::Tasks => "Run a task…",
         PickerKind::TasksWorkspace => "Run a workspace task…",
+        PickerKind::Activity => "Find running work…",
     }
 }
 
@@ -928,6 +929,7 @@ mod tests {
             Jumplist,
             Tasks,
             TasksWorkspace,
+            Activity,
         ] {
             let p = picker_placeholder(Some(kind));
             assert!(p.ends_with('…'), "{kind:?} prompt should trail off: {p:?}");

@@ -2975,6 +2975,22 @@ fn picker_item_spans(
             max_width,
         );
     }
+    // `Shell 2   cargo test` — what the work belongs to, then what it is doing, dim.
+    if let PickerItem::Activity {
+        owner,
+        label,
+        match_indices,
+        ..
+    } = item
+    {
+        return composed_row_spans(
+            [owner, label, ""],
+            match_indices,
+            None,
+            highlighted,
+            max_width,
+        );
+    }
     // `test   web/justfile   Run the tests` — the shell row's shape: the name leads, where it is
     // defined and what it does follow dim.
     if let PickerItem::Task {
@@ -3279,6 +3295,7 @@ fn picker_item_spans(
         | PickerItem::GitStash { .. }
         | PickerItem::GitBaseline { .. }
         | PickerItem::Task { .. }
+        | PickerItem::Activity { .. }
         | PickerItem::Group { .. } => unreachable!("handled above"),
     };
     let (base, match_style) = if italic {
@@ -7321,13 +7338,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             )
         });
 
-        // Left: the Git change counts sit next to the file label (they're about the file's VCS
-        // state). Diagnostics moved to the right segment, by the position indicator.
-        let mut git_spans = git_status_spans(state);
-        // The shell's activity indicator sits beside git's, in the same slot and the same shade:
-        // both answer "something is happening that you are waiting on", and a second place for
-        // that would be a second place to look.
-        git_spans.extend(shell_status_spans(state));
+        // Left, after the file label and each behind its own divider: the Git cluster (it's about
+        // the file's VCS state), then the work in progress. Diagnostics moved to the right
+        // segment, by the position indicator.
+        let left_sections = vec![git_status_spans(state), work_status_spans(state)];
 
         // Right segment, left→right: search/grep counters, diagnostic counts, the position /
         // selection indicator, then the LSP glyph pinned to the far edge. A double space precedes
@@ -7389,7 +7403,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
                 tethered: state.ed().tethered,
             },
             status_dot,
-            git_spans,
+            left_sections,
             &conn_status,
             &state.symbol_path,
             right_spans,
@@ -7665,7 +7679,7 @@ struct StatusLabel<'a> {
 fn build_editor_status_spans(
     label: StatusLabel<'_>,
     status_dot: Option<Span<'static>>,
-    left_badges: Vec<Span<'static>>,
+    left_sections: Vec<Vec<Span<'static>>>,
     status: &crate::app::StatusMessage,
     symbol_path: &[SymbolCrumb],
     right_spans: Vec<Span<'static>>,
@@ -7755,14 +7769,17 @@ fn build_editor_status_spans(
             )
         };
         const SEP_W: usize = 3;
-        // Git cluster sits after the file label.
-        let badge_w: usize = left_badges.iter().map(|s| s.content.width()).sum();
-        if badge_w > 0 && used + SEP_W + badge_w <= left_max {
-            spans.push(separator());
-            used += SEP_W;
-            for s in left_badges {
-                used += s.content.width();
-                spans.push(s);
+        // The sections after the file label — the work in progress, the Git cluster — each behind
+        // its own divider, and each only if it fits whole.
+        for section in left_sections {
+            let w: usize = section.iter().map(|s| s.content.width()).sum();
+            if w > 0 && used + SEP_W + w <= left_max {
+                spans.push(separator());
+                used += SEP_W;
+                for s in section {
+                    used += s.content.width();
+                    spans.push(s);
+                }
             }
         }
         // Status message (now the connection indicator), truncated to whatever's left. Divided like
@@ -7829,17 +7846,14 @@ fn buffer_status_color(kind: BufferStatusKind) -> Color {
 /// one unstaged + two staged additions, `+3` three unstaged, `+(3)` three staged). Empty classes
 /// are skipped; the whole cluster is empty for files outside a repo. Reads `git_status`
 /// (server-computed).
-/// The running-shell indicator: the focused shell's command, or a count of the shells running
-/// elsewhere. Empty when nothing is running.
-///
-/// Rendered from the core's one composition of the text, so the terminal, the GUI and the browser
-/// cannot drift into three phrasings of it.
-fn shell_status_spans(state: &AppState) -> Vec<Span<'static>> {
-    let Some(label) = state.shell_indicator.as_ref() else {
+/// The work-in-progress indicator: `⟳ 3`, in the work colour. Empty when nothing is running. What
+/// the work is, `Space v` lists.
+fn work_status_spans(state: &AppState) -> Vec<Span<'static>> {
+    let Some(n) = state.work_in_progress else {
         return Vec::new();
     };
-    let style = Style::default().bg(c(th().bg_panel)).fg(c(th().accent_alt));
-    vec![Span::styled(format!("⟳ {label}"), style)]
+    let style = Style::default().bg(c(th().bg_panel)).fg(c(th().work));
+    vec![Span::styled(format!("⟳ {n}"), style)]
 }
 
 fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
@@ -7852,18 +7866,6 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
     let Some(status) = ed.git_status.as_ref() else {
         return parts;
     };
-    // An operation in flight takes the branch's place in the cluster: while a push is running,
-    // "Pushing… Writing objects: 47%" is the only thing about git worth the width, and the branch
-    // it's pushing hasn't changed. Reads from the session, not the buffer, because the operation
-    // belongs to the repo rather than to whatever file happens to be open.
-    if let Some(op) = state.git_operation.as_ref() {
-        let mut label = format!("⟳ {}", op.kind.label());
-        if !op.detail.is_empty() {
-            label.push_str(&format!("  {}", op.detail));
-        }
-        parts.push(Span::styled(label, meta));
-        return parts;
-    }
     if let Some(branch) = &status.branch {
         // `⧉` for a linked worktree — the glyph the branch picker also marks a worktree-held
         // branch with. The *colours* diverged with the merge: there the mark is an accent, because
@@ -8800,8 +8802,7 @@ mod tests {
             workspace_paths: vec!["/tmp/demo".into()],
             root_labels: vec![String::new()],
             tether: None,
-            git_operation: None,
-            shell_indicator: None,
+            work_in_progress: None,
             viewport_cols: TEST_COLS as u32,
             viewport_rows: TEST_ROWS as u32,
             should_quit: false,
@@ -10296,22 +10297,40 @@ mod tests {
         spans.iter().map(|s| s.content.width()).sum()
     }
 
-    /// The running-shell indicator takes the same slot and shade the git operation does: one
-    /// place to look for "something you are waiting on".
+    /// The work in progress is a count in its own colour, and its own section: after the Git
+    /// cluster and divided from it, rather than run into it.
     #[test]
-    fn the_shell_indicator_sits_in_the_git_slot() {
+    fn the_work_indicator_is_a_count_in_its_own_section() {
         let mut state = crate::app::test_state(crate::app::test_editor_state());
         assert!(
-            shell_status_spans(&state).is_empty(),
+            work_status_spans(&state).is_empty(),
             "nothing running, nothing drawn"
         );
-        state.shell_indicator = Some("cargo build".into());
-        let spans = shell_status_spans(&state);
-        assert_eq!(spans_text(&spans), "⟳ cargo build");
-        assert_eq!(spans[0].style.fg, Some(c(th().accent_alt)));
+        state.work_in_progress = Some(3);
+        let spans = work_status_spans(&state);
+        assert_eq!(spans_text(&spans), "⟳ 3");
+        assert_eq!(spans[0].style.fg, Some(c(th().work)));
 
-        state.shell_indicator = Some("2 running".into());
-        assert_eq!(spans_text(&shell_status_spans(&state)), "⟳ 2 running");
+        let status = crate::app::StatusMessage::default();
+        let line = build_editor_status_spans(
+            StatusLabel {
+                workspace_prefix: "",
+                file_label: &status_label("a.rs"),
+                transient: false,
+                tethered: false,
+            },
+            None,
+            vec![vec![Span::raw("⎇  main")], spans],
+            &status,
+            &[],
+            Vec::new(),
+            80,
+        );
+        let sep = aether_client::labels::SECTION_SEPARATOR;
+        assert_eq!(
+            spans_text(&line).trim_end(),
+            format!("a.rs {sep} ⎇  main {sep} ⟳ 3")
+        );
     }
 
     #[test]
@@ -10673,7 +10692,7 @@ mod tests {
                 tethered: false,
             },
             None,
-            vec![Span::raw("⎇  main")],
+            vec![vec![Span::raw("⎇  main")]],
             &status,
             &[crumb("impl Foo"), crumb("fn bar")],
             vec![Span::raw("12:5")],

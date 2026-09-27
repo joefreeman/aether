@@ -675,6 +675,11 @@ pub(crate) fn refresh_shell_pickers(s: &mut ServerState) -> PendingPushes {
 
 /// Rebuild and re-push every subscribed agents picker — a turn started or ended, a permission was
 /// raised or answered, or a handle was dropped.
+/// Rebuild and re-push every open activity picker — see [`crate::handlers::push_activity`].
+pub(crate) fn refresh_activity_pickers(s: &mut ServerState) -> PendingPushes {
+    refresh_kind_pickers(s, PickerKind::Activity)
+}
+
 pub(crate) fn refresh_agent_pickers(s: &mut ServerState) -> PendingPushes {
     refresh_kind_pickers(s, PickerKind::Agents)
 }
@@ -735,6 +740,15 @@ fn build_view_candidates(
         PickerKind::Agents => {
             picker_state::PickerCandidates::Agents(build_agent_candidates(s, client_id))
         }
+        PickerKind::Activity => picker_state::PickerCandidates::Activity(
+            crate::handlers::activity_for(s, client_id)
+                .into_iter()
+                .map(|activity| picker_state::ActivityCandidate {
+                    haystack: join_haystack([&activity.owner, &activity.label, ""]),
+                    activity,
+                })
+                .collect(),
+        ),
         _ => picker_state::PickerCandidates::Buffers(build_buffer_candidates(s, client_id)),
     }
 }
@@ -1913,7 +1927,8 @@ fn re_view_build(kind: PickerKind) -> ReViewBuild {
         | PickerKind::Explorer
         | PickerKind::Workspaces
         | PickerKind::LspServers
-        | PickerKind::Jumplist => ReViewBuild::Rebuild,
+        | PickerKind::Jumplist
+        | PickerKind::Activity => ReViewBuild::Rebuild,
     }
 }
 
@@ -1965,7 +1980,7 @@ pub async fn picker_view(
             let git_status = std::sync::Arc::new(build_file_git_status(&files, &roots));
             picker_state::PickerCandidates::Files { files, git_status }
         }
-        PickerKind::Buffers | PickerKind::Shells | PickerKind::Agents => {
+        PickerKind::Buffers | PickerKind::Shells | PickerKind::Agents | PickerKind::Activity => {
             let s = state.lock().await;
             build_view_candidates(&s, client_id, params.kind)
         }

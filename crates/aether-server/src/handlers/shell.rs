@@ -117,7 +117,7 @@ pub async fn shell_open(
     }
 
     // A matched shell still running the line: switched to, and nothing more — stopping it is a
-    // decision for `Space v c`, not a side effect of asking again.
+    // decision for the activity picker (`Space v`), not a side effect of asking again.
     let busy = {
         let s = state.lock().await;
         s.try_doc_of(transcript)
@@ -862,7 +862,7 @@ pub async fn shell_cancel(
     {
         return Err(RpcError::not_a_shell(params.view_id));
     }
-    // Taking the handle rather than merely signalling through it: a second `Space v c` after the
+    // Taking the handle rather than merely signalling through it: a second cancel after the
     // run has ended must not signal a pid the system has since reused.
     let cancelled = s
         .with_transcript(transcript, |t| {
@@ -1193,11 +1193,12 @@ async fn push_transcript_changed(state: &SharedState, transcript: BufferId) {
     }
 }
 
-/// Push `shell/run_changed` to every connected client, and re-push every open shells picker.
+/// Push `shell/run_changed` to every client on the shell's workspace, re-push every open shells
+/// picker, and tell every client its workspace's work in progress ([`push_activity`]).
 ///
-/// Every client, like `git/operation_changed`: a shell belongs to the workspace rather than to
-/// whoever pressed `Enter`, and a client with the view open wants the indicator whether or not it
-/// started the run.
+/// Every client on the workspace: a shell belongs to the workspace rather than to whoever pressed
+/// `Enter`, and a client not showing it wants to hear how the run went whether or not it started
+/// it. A client on another workspace has no row for it to belong to.
 ///
 /// The picker re-push rides here because this is the one funnel a run transition passes through,
 /// and a row's badge (`● running` → `✓ 0  3.2s`) is exactly what just changed. Recency ordering
@@ -1224,11 +1225,11 @@ async fn push_run_changed(state: &SharedState, view_id: ViewId, run: Option<RunS
             run,
         };
         let value = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
-        s.clients
-            .values()
-            .map(|sess| {
+        clients_of_view(&s, view_id)
+            .into_iter()
+            .map(|sender| {
                 (
-                    sess.outbound.clone(),
+                    sender,
                     Notification {
                         jsonrpc: JsonRpc,
                         method: ShellRunChanged::NAME.into(),
@@ -1241,6 +1242,7 @@ async fn push_run_changed(state: &SharedState, view_id: ViewId, run: Option<RunS
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
+    push_activity(state).await;
 }
 
 // ---- view/follow_line ----------------------------------------------------------------------------
@@ -1459,72 +1461,6 @@ pub async fn view_submit_input(
             Ok(ViewSubmitInputResult {
                 submitted: sent.sent,
                 history: sent.sent.then_some(HistoryKind::Agent),
-            })
-        }
-    }
-}
-
-// ---- view/interrupt ------------------------------------------------------------------------------
-
-/// **Total** over the kinds of composed view: what "stop what this is doing" means here.
-///
-/// The sibling of [`view_submit_input`], and for the same reason — the client cannot tell a shell
-/// from an agent view, so it asks one question and the server routes it. A shell's run is
-/// cancelled, an agent's turn is cancelled, and anything else — a file, an idle shell, an idle
-/// conversation — answers `interrupted: false`, which is what the client's one "Nothing is running
-/// here" toast is built on.
-pub async fn view_interrupt(
-    state: &SharedState,
-    ctx: &mut ConnectionCtx,
-    params: aether_protocol::view::ViewInterruptParams,
-) -> Result<aether_protocol::view::ViewInterruptResult, RpcError> {
-    use aether_protocol::view::ViewInterruptResult;
-
-    enum Stop {
-        Shell,
-        Agent,
-        Nothing,
-    }
-    let stop = {
-        let s = state.lock().await;
-        let Some(view_buffer) = s.try_presenting_buffer(params.view_id) else {
-            return Ok(ViewInterruptResult::default());
-        };
-        match s.try_doc_of(view_buffer).and_then(|d| d.generated.as_ref()) {
-            Some(Generated::Shell(_)) => Stop::Shell,
-            Some(Generated::Agent(_)) => Stop::Agent,
-            Some(Generated::Patch(_)) | None => Stop::Nothing,
-        }
-    };
-
-    // Straight through to the cancel bodies: the two methods keep their own shapes (the tests that
-    // pin them are about those), and this only decides which one the key meant.
-    match stop {
-        Stop::Nothing => Ok(ViewInterruptResult::default()),
-        Stop::Shell => {
-            let r = shell_cancel(
-                state,
-                ctx,
-                ShellCancelParams {
-                    view_id: params.view_id,
-                },
-            )
-            .await?;
-            Ok(ViewInterruptResult {
-                interrupted: r.cancelled,
-            })
-        }
-        Stop::Agent => {
-            let r = crate::handlers::agent_cancel(
-                state,
-                ctx,
-                aether_protocol::agent::AgentCancelParams {
-                    view_id: params.view_id,
-                },
-            )
-            .await?;
-            Ok(ViewInterruptResult {
-                interrupted: r.cancelled,
             })
         }
     }

@@ -144,11 +144,6 @@ pub enum KeyContext {
     /// mirroring `Space d`'s diagnostics) and `Space m` (blame at the cursor, the third reveal next
     /// to `Tab` and `Space n`).
     LeaderGit,
-    /// The `Space v` sub-leader: the verbs of the **view** you are in — stop what it is running,
-    /// and answer what an agent is asking. A second sub-leader rather than `Alt`-variants on the
-    /// leader because answering must never be one key away from a typo, and because the leader's
-    /// twenty-six letters were spent.
-    LeaderView,
     Global,
 }
 
@@ -333,8 +328,6 @@ pub enum Action {
     /// `Space g` — arm the git sub-leader ([`KeyContext::LeaderGit`]): the next keystroke names a
     /// git operation. Like the leader itself, an unbound key just cancels.
     BeginGitLeader,
-    /// `Space v` — arm the view sub-leader ([`KeyContext::LeaderView`]).
-    BeginViewLeader,
 
     // ---- edits ----
     Backspace,
@@ -469,11 +462,6 @@ pub enum Action {
     /// `Space Alt-a` — a **new** agent conversation, with the first agent found on `PATH`. Always
     /// creates, for the reason [`Action::ShellOpen`] does.
     AgentOpen,
-    /// `Space v c` — stop whatever the focused view is running: a shell's command, an agent's turn.
-    /// **Total** — the server decides what the view is, and a view running nothing answers so,
-    /// which is the one toast this can produce ("Nothing is running here"). Same shape as
-    /// `Space g x`.
-    Interrupt,
 
     /// Submit what is typed in a composed view's **input** element.
     ///
@@ -837,7 +825,6 @@ impl Binding {
         match self.ctx {
             KeyContext::Leader => s.push_str("Space "),
             KeyContext::LeaderGit => s.push_str("Space g "),
-            KeyContext::LeaderView => s.push_str("Space v "),
             _ => {}
         }
         let m = self.mods.display_mods();
@@ -887,7 +874,6 @@ pub fn all() -> impl Iterator<Item = &'static Binding> {
         KeyContext::Read,
         KeyContext::Leader,
         KeyContext::LeaderGit,
-        KeyContext::LeaderView,
     ]
     .into_iter()
     .flat_map(|cx| table(cx).iter())
@@ -903,7 +889,6 @@ pub fn table(ctx: KeyContext) -> &'static [Binding] {
         KeyContext::Read => READ,
         KeyContext::Leader => LEADER,
         KeyContext::LeaderGit => LEADER_GIT,
-        KeyContext::LeaderView => LEADER_VIEW,
         KeyContext::Global => GLOBAL,
     }
 }
@@ -948,7 +933,7 @@ pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
     // The `Space g` sub-leader lists as "Application" too: mode is the editor mode a chord is
     // reachable from, and both leaders are reached from Normal. Its rows are told apart by the
     // `Git` group and the `Space g …` label, not by a mode of their own.
-    const MODES: [(&str, KeyContext); 8] = [
+    const MODES: [(&str, KeyContext); 7] = [
         ("Normal", KeyContext::Normal),
         ("Any", KeyContext::Global),
         ("Insert", KeyContext::Insert),
@@ -956,7 +941,6 @@ pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
         ("Read", KeyContext::Read),
         ("Application", KeyContext::Leader),
         ("Application", KeyContext::LeaderGit),
-        ("Application", KeyContext::LeaderView),
     ];
     // One bucket per group, filled in scan order; reordered to GROUP_ORDER just before flattening.
     // A Vec scan beats a map: ~15 groups, built once per open.
@@ -964,10 +948,7 @@ pub fn keybinding_entries() -> Vec<aether_protocol::picker::KeybindingEntry> {
     for (mode, cx) in MODES {
         for b in table(cx) {
             if !b.group.is_empty()
-                && !matches!(
-                    b.action,
-                    Action::BeginLeader | Action::BeginGitLeader | Action::BeginViewLeader
-                )
+                && !matches!(b.action, Action::BeginLeader | Action::BeginGitLeader)
             {
                 let entry = aether_protocol::picker::KeybindingEntry {
                     group: b.group.to_string(),
@@ -1022,10 +1003,7 @@ pub fn hover_action(code: KeyCode, mods: Mods) -> Option<HoverAction> {
 }
 
 use Action as A;
-use KeyContext::{
-    Global as G, Insert as I, Leader as L, LeaderGit as LG, LeaderView as LV, Normal as N,
-    Read as R,
-};
+use KeyContext::{Global as G, Insert as I, Leader as L, LeaderGit as LG, Normal as N, Read as R};
 use ModPattern::{Any, Exact, IgnoreShift};
 
 const fn ch(c: char) -> KeyCode {
@@ -1459,7 +1437,10 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('n'), Exact(Mods::NONE), A::Hover, "Code", "Hover: type & docs, or link target"),
     bind!(L, ch('n'), Exact(Mods::ALT), A::ShowDiagnostic, "Code", "Diagnostic at cursor"),
     bind!(L, ch('m'), Exact(Mods::NONE), A::ShowCommitInfo, "Git", "Blame commit details"),
-    bind!(L, ch('v'), Exact(Mods::NONE), A::BeginViewLeader, "Leader", "View sub-leader chord"),
+    // The workspace's work in progress — shells, agents' turns, git operations — where each can be
+    // gone to or stopped (`Ctrl-d`). Was the `Space v` sub-leader, whose one verb was "stop what
+    // this view is running": the picker stops anything, from anywhere.
+    bind!(L, ch('v'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Activity), "App", "Work in progress: go to or stop it"),
     bind!(L, ch('l'), Exact(Mods::NONE), A::OpenPicker(PickerKind::LspServers), "Code", "LSP servers"),
     bind!(L, ch('r'), Exact(Mods::NONE), A::OpenPicker(PickerKind::References), "Code", "Go to references"),
     bind!(L, ch('o'), Exact(Mods::NONE), A::OpenPicker(PickerKind::DocumentSymbols), "Code", "Document symbols"),
@@ -1533,22 +1514,6 @@ static LEADER: &[Binding] = &[
 /// git in it: while the baseline is the saved file, `r` reverts a hunk to *disk*, i.e. discards its
 /// unsaved edits. Staging and unstaging are refused there (and under a pinned revision) — see
 /// `ApplyHunkStatus::NotAgainstHead`.
-/// The `Space v` sub-leader: the verbs of the **view** you are in.
-///
-/// `c` stops whatever it is running — one key for a shell's command and an agent's turn, because
-/// the client cannot tell the two apart and does not need to (see [`Action::Interrupt`]).
-///
-/// Answering an agent, folding a tool call and staging a hunk used to be chords here. They are
-/// **buttons in the view** now ([`aether_protocol::ui::Element::Action`]): `Tab` reaches them and
-/// `Enter` presses them, so the wording is the view's and the keymap grows nothing per view kind.
-/// What is left is the one verb that belongs to the view itself rather than to anything in it.
-///
-/// `Esc` is deliberately unbound here, as in every leader table: it cancels the pending chord.
-#[rustfmt::skip]
-static LEADER_VIEW: &[Binding] = &[
-    bind!(LV, ch('c'), Exact(Mods::NONE), A::Interrupt, "Agent", "Stop what this view is running"),
-];
-
 #[rustfmt::skip]
 static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('s'), Exact(Mods::NONE), A::StageChange { scope: ApplyScope::Cursor }, "Git", "Stage change (hunk/selection)"),

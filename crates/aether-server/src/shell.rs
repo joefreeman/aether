@@ -415,7 +415,7 @@ fn box_title(cwd: &Path, run: Option<&Run>) -> Vec<Element> {
         match run.status {
             RunStatus::Running => {
                 push("  ", META);
-                push("running · Space v c stops it", META);
+                push("running · Space v to stop it", META);
             }
             status => {
                 let role = if status == (RunStatus::Exited { code: 0 }) {
@@ -516,7 +516,7 @@ mod tests {
         let title = title_text(&run_title(&running));
         assert!(title.starts_with("/tmp/project"), "{title:?}");
         assert!(
-            title.contains("Space v c"),
+            title.contains("Space v to stop it"),
             "a running command says how to stop it: {title:?}"
         );
         let rows: Vec<String> = command_row(&running)
@@ -529,7 +529,10 @@ mod tests {
         let title = title_text(&run_title(&done));
         assert!(title.contains("exit 101"), "{title}");
         assert!(title.contains("1.5s"), "{title}");
-        assert!(!title.contains("Space v c"), "nothing to stop: {title}");
+        assert!(
+            !title.contains("Space v to stop it"),
+            "nothing to stop: {title}"
+        );
     }
 
     /// The roles are the patch's, not new ones: a failing run reads in the same red a removed

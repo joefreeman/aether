@@ -2561,8 +2561,15 @@ async fn begin_operation(
     let (handle, token) = crate::git_cli::cancel_channel();
     {
         let mut s = state.lock().await;
-        s.git_operations.insert(workdir.to_path_buf(), handle);
+        s.git_operations.insert(
+            workdir.to_path_buf(),
+            crate::state::GitOperationEntry {
+                cancel: handle,
+                kind,
+            },
+        );
     }
+    crate::handlers::push_activity(state).await;
     push_operation(
         state,
         workdir,
@@ -2619,23 +2626,27 @@ impl OperationReporter {
             s.git_operations.remove(&self.workdir);
         }
         push_operation(state, &self.workdir, None).await;
+        crate::handlers::push_activity(state).await;
     }
 }
 
-/// Push one `git/operation_changed` to every connected client. Repo-scoped rather than
-/// client-scoped: any client with this repo open wants the indicator, and the operation isn't
-/// owned by whoever happened to start it.
+/// Push one `git/operation_changed` to every client whose workspace can see the repo. Repo-scoped
+/// rather than client-scoped: any client with this repo open wants the indicator, and the operation
+/// isn't owned by whoever happened to start it — but a client in a workspace without the repo has
+/// nothing to show it against.
 async fn push_operation(state: &SharedState, workdir: &Path, operation: Option<GitOperation>) {
+    let repo_id = path_string(workdir);
     let params = GitOperationChangedParams {
-        repo_id: path_string(workdir),
+        repo_id: repo_id.clone(),
         operation,
     };
     let value = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
     let pushes: PendingPushes = {
         let s = state.lock().await;
         s.clients
-            .values()
-            .map(|sess| {
+            .iter()
+            .filter(|(client_id, _)| resolve_repo(&s, **client_id, &repo_id).is_ok())
+            .map(|(_, sess)| {
                 (
                     sess.outbound.clone(),
                     Notification {
@@ -2685,7 +2696,7 @@ pub async fn git_cancel(
     let repo = resolve_repo(&s, ctx.client_id, &params.repo_id)?;
     let cancelled = match s.git_operations.get(Path::new(&repo.repo_id)) {
         // A send failure means the runner has already gone, which is the same race as no entry.
-        Some(handle) => handle.send(true).is_ok(),
+        Some(op) => op.cancel.send(true).is_ok(),
         None => false,
     };
     Ok(GitCancelResult { cancelled })

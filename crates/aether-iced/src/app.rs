@@ -4996,30 +4996,10 @@ impl App {
             left = left.push(t(" *".into(), p.fg_muted));
             used += 2;
         }
-        // The running-shell indicator sits beside git's, in the same slot and the same shade: both
-        // answer "something is happening that you are waiting on". The text is the core's, so the
-        // three shells cannot phrase it three ways.
-        if let Some(label) = self.session.work_indicator() {
-            let seg = format!("⟳ {label}");
-            left = left.push(section_divider(&self.ui(), p));
-            used += DIVIDER_COLS + seg.chars().count();
-            left = left.push(t(seg, p.accent_alt));
-        }
-        // An operation in flight replaces the whole git cluster: while a push runs, its progress
-        // is the only thing about git worth the width, and the branch hasn't moved.
-        if let Some((_, op)) = self.session.git_operation.as_ref() {
-            let mut seg = format!("⟳ {}", op.kind.label());
-            if !op.detail.is_empty() {
-                seg.push_str(&format!("  {}", op.detail));
-            }
-            left = left.push(section_divider(&self.ui(), p));
-            used += DIVIDER_COLS + seg.chars().count();
-            left = left.push(t(seg, p.accent_alt));
-        }
         // Git cluster: `⎇  branch  +u(s) ~u(s) -u(s)` — per-class counts combine unstaged with
         // the staged count in parens, each omitted when zero. Introduced, like every following
         // section, by a dim `·` divider.
-        else if let Some(gs) = self
+        if let Some(gs) = self
             .session
             .view
             .window
@@ -5094,6 +5074,14 @@ impl App {
                 used += tok.chars().count() + 2;
                 left = left.push(t(format!("  {tok}"), color));
             }
+        }
+        // The work in progress — shells, agents' turns, git operations — as a count in its own
+        // colour and its own section, after the git cluster. What the work is, `Space v` lists.
+        if let Some(n) = self.session.work_in_progress() {
+            let seg = format!("⟳ {n}");
+            left = left.push(section_divider(&self.ui(), p));
+            used += DIVIDER_COLS + seg.chars().count();
+            left = left.push(t(seg, p.work));
         }
 
         let mut right = row![].spacing(10);

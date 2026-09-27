@@ -229,11 +229,10 @@ pub enum Event {
     InputSubmitted(Result<aether_protocol::view::ViewSubmitInputResult, RpcError>),
     AgentOpened(Result<aether_protocol::agent::AgentOpenResult, RpcError>),
     AgentAnswered(Result<aether_protocol::agent::AgentRespondResult, RpcError>),
-    /// `Space v c` answered. `interrupted: false` is the whole of what the client knows about
-    /// "nothing was running" — for a file, an idle shell and an idle conversation alike — and is
-    /// what the toast is built on. A stop that *did* land says nothing: the finish arrives as a
-    /// push.
-    Interrupted(Result<aether_protocol::view::ViewInterruptResult, RpcError>),
+    /// `Ctrl-d` in the activity picker answered. `cancelled: false` means the work had already
+    /// finished, which is said; a stop that did land says nothing — the row leaves the list, and
+    /// the finish arrives as a push.
+    ActivityCancelled(Result<aether_protocol::activity::ActivityCancelResult, RpcError>),
     /// `view/set_read` (`Space u`, an edit transition out of the reader) resolved: the mode is
     /// flipped server-side, so re-subscribe and adopt whatever window comes back — or report the
     /// failure.
@@ -995,11 +994,13 @@ impl Session {
                 self.pending_shell_submit = None;
                 Effects::error_detail("Couldn't run that", e.message)
             }
-            Event::Interrupted(Ok(r)) if !r.interrupted => {
-                Effects::toast("Nothing is running here", ToastKind::Info)
+            Event::ActivityCancelled(Ok(r)) if !r.cancelled => {
+                Effects::toast("It had already finished", ToastKind::Info)
             }
-            Event::Interrupted(Ok(_)) => Effects::none(),
-            Event::Interrupted(Err(e)) => Effects::error_detail("Couldn't stop it", e.message),
+            Event::ActivityCancelled(Ok(_)) => Effects::none(),
+            Event::ActivityCancelled(Err(e)) => {
+                Effects::error_detail("Couldn't stop it", e.message)
+            }
             // Same landing as any other switch, and the same silence when the line leads nowhere:
             // `Enter` is a common key, and being told off for pressing it on a line of output
             // would be noise.
@@ -4230,14 +4231,21 @@ impl Session {
     }
 
     /// What closing the **current** view would put at risk — the `Space x` side of
-    /// [`close_confirm_for`]. `shell_runs` / `agent_turns` are keyed by view id and hold only
-    /// views of that kind, so asking them is also asking what kind of view this is.
+    /// [`close_confirm_for`]. The work in progress names the view it belongs to and says what kind
+    /// of work it is, so asking it is also asking what kind of view this is.
     fn closing_current_view(&self) -> Closing {
+        use aether_protocol::activity::ActivityId;
+        let view_id = self.view.view_id;
+        let busy = |kind: fn(&ActivityId) -> bool| {
+            self.activity
+                .iter()
+                .any(|a| a.id.view_id() == Some(view_id) && kind(&a.id))
+        };
         Closing {
             label: self.view.view_label.joined(),
             unsaved: self.view.unsaved(),
-            running_shell: self.shell_runs.contains_key(&self.view.view_id),
-            busy_agent: self.agent_turns.contains_key(&self.view.view_id),
+            running_shell: busy(|id| matches!(id, ActivityId::Shell { .. })),
+            busy_agent: busy(|id| matches!(id, ActivityId::Agent { .. })),
         }
     }
 
@@ -6182,6 +6190,15 @@ impl Session {
             // A task is a shortcut for starting a shell: Enter opens one where the task runs, with
             // its command, and runs it.
             PickerItem::Task { .. } => return self.open_task(item, true),
+            // Going to a piece of work is going to its view, which `picker/select` answers — a git
+            // operation belongs to a repo rather than to anything on screen, so there is nowhere to
+            // go, and saying so beats a key that does nothing.
+            PickerItem::Activity { id, label, .. } if id.view_id().is_none() => {
+                return Effects::toast(
+                    format!("{label} has no view to open — Ctrl-d stops it"),
+                    ToastKind::Info,
+                );
+            }
             PickerItem::Keybinding { .. } => {
                 // Informational — a shortcut row isn't a jump target and Enter doesn't fire the
                 // binding, so it does nothing: the picker stays open (no close, no `picker/select`).
@@ -6619,6 +6636,20 @@ impl Session {
                         }
                     });
                 return observed.and(select).and(self.close_picker());
+            }
+            // The activity picker: `Ctrl-d` stops the row's work, and the picker stays open — the
+            // row leaves by itself once it has stopped, and whatever else is running is still
+            // listed. The pickers' "remove this row" chord, as it closes a view in the view pickers.
+            KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Activity => {
+                let Some(PickerItem::Activity { id, .. }) = p.selected_item() else {
+                    return Effects::none();
+                };
+                let id = id.clone();
+                let observed = self.observe_picker_cmd(PickerCmd::StopActivity);
+                return observed.and(self.request::<aether_protocol::activity::ActivityCancel>(
+                    aether_protocol::activity::ActivityCancelParams { id },
+                    Event::ActivityCancelled,
+                ));
             }
             // All three view-listing pickers: the row names a view, and `Ctrl-d` closes it.
             KeyCode::Char('d')
@@ -7323,15 +7354,7 @@ impl Session {
                 let Ok(p) = serde_json::from_value::<AgentTurnChangedParams>(n.params) else {
                     return Effects::none();
                 };
-                let finished = p.turn.clone().filter(|t| !t.running);
-                match p.turn.filter(|t| t.running) {
-                    Some(turn) => {
-                        self.agent_turns.insert(p.view_id, turn);
-                    }
-                    None => {
-                        self.agent_turns.remove(&p.view_id);
-                    }
-                }
+                let finished = p.turn.filter(|t| !t.running);
                 // Say how it went only when you are looking somewhere else, and only when there is
                 // something to say: a turn that simply ended is not news, and the conversation on
                 // screen shows its own state. Grouped by view so one conversation replaces its own
@@ -7350,20 +7373,21 @@ impl Session {
                     None => Effects::none(),
                 }
             }
+            // The workspace's work in progress, whole — what the status bar counts and the close
+            // confirm asks about.
+            aether_protocol::activity::ActivityChanged::NAME => {
+                use aether_protocol::activity::ActivityChangedParams;
+                if let Ok(p) = serde_json::from_value::<ActivityChangedParams>(n.params) {
+                    self.activity = p.items;
+                }
+                Effects::none()
+            }
             aether_protocol::shell::ShellRunChanged::NAME => {
                 use aether_protocol::shell::ShellRunChangedParams;
                 let Ok(p) = serde_json::from_value::<ShellRunChangedParams>(n.params) else {
                     return Effects::none();
                 };
-                let finished = p.run.clone().filter(|r| !r.is_running());
-                match p.run.filter(|r| r.is_running()) {
-                    Some(run) => {
-                        self.shell_runs.insert(p.view_id, run);
-                    }
-                    None => {
-                        self.shell_runs.remove(&p.view_id);
-                    }
-                }
+                let finished = p.run.filter(|r| !r.is_running());
                 // Say how it went only when you are looking somewhere else: a shell on screen has
                 // the outcome in the run's own header, and a toast repeating it is noise. Grouped
                 // by view so a shell you keep re-running replaces its own notice rather than
@@ -7376,7 +7400,14 @@ impl Session {
                         } else {
                             p.title.clone()
                         },
-                        format!("{} ({})", run.command, run.status.label()),
+                        // A clean exit says so by the toast's colour alone; anything else names how
+                        // it ended, which the colour cannot tell apart.
+                        match run.status {
+                            aether_protocol::shell::RunStatus::Exited { code: 0 } => {
+                                run.command.clone()
+                            }
+                            status => format!("{} ({})", run.command, status.label()),
+                        },
                         match run.status {
                             aether_protocol::shell::RunStatus::Exited { code: 0 } => {
                                 ToastKind::Success
@@ -9965,13 +9996,6 @@ impl Session {
                 // An unbound key (or Esc) cancels the chord, exactly like the leader.
                 return Effects::none();
             }
-            Pending::LeaderView => {
-                self.view.pending = Pending::None;
-                if let Some(b) = lookup(KeyContext::LeaderView, code, mods) {
-                    return self.run_action(b.action, 1, false, mods.shift);
-                }
-                return Effects::none();
-            }
             Pending::None => {}
         }
 
@@ -10660,10 +10684,6 @@ impl Session {
                 self.view.pending = Pending::LeaderGit;
                 Effects::none()
             }
-            A::BeginViewLeader => {
-                self.view.pending = Pending::LeaderView;
-                Effects::none()
-            }
 
             // ---- edits ----
             A::Backspace => self.edit::<InputBackspace>(BufferOnlyParams { buffer_id }),
@@ -11130,19 +11150,6 @@ impl Session {
             A::ShellOpen => self.request::<aether_protocol::shell::ShellOpen>(
                 aether_protocol::shell::ShellOpenParams::default(),
                 Event::ShellOpened,
-            ),
-            // Stopping names the *view*, exactly as `Space g x` names the repo: the thing in front
-            // of you is the one you meant, and something you are not looking at is not what
-            // `Space v c` should reach into.
-            //
-            // One action for both kinds, and no client-side guess about which kind this is: the
-            // server answers `interrupted: false` for a view running nothing — a file, an idle
-            // shell, an idle conversation alike — and that one answer produces the one toast.
-            A::Interrupt => self.request::<aether_protocol::view::ViewInterrupt>(
-                aether_protocol::view::ViewInterruptParams {
-                    view_id: self.view.view_id,
-                },
-                Event::Interrupted,
             ),
             // Reached from Normal-mode `Enter` (`Activate`) with the input focused. The guard is
             // kept so that nothing can submit from anywhere else, whatever dispatches it.

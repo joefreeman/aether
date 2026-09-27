@@ -97,7 +97,7 @@ pub fn shed_build_environment() {
 }
 
 /// How long a cancelled group gets to exit on `SIGTERM` before `SIGKILL`. Long enough for a
-/// shell to run a trap and for git to unlink a lock file; short enough that `Space v c` feels
+/// shell to run a trap and for git to unlink a lock file; short enough that a cancel feels
 /// like it worked.
 const KILL_GRACE: Duration = Duration::from_millis(300);
 

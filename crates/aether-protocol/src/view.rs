@@ -466,38 +466,3 @@ pub struct ViewSubmitInputResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::history::HistoryKind>,
 }
-
-// ---- view/interrupt ------------------------------------------------------------------------------
-
-/// Stop whatever the view is running — `Space v c`.
-///
-/// **Total over the kinds of composed view**, the counterpart of [`ViewSubmitInput`]: a shell has
-/// a run and an agent has a turn, the client cannot tell the two apart (the window marks the input
-/// by [`crate::ui::ElementRole`] and carries no view kind), so it asks one question and the server
-/// decides what stopping means here. A view running nothing — a file, an idle shell, an idle
-/// conversation — answers `interrupted: false` rather than erroring, and the client says "nothing
-/// is running here" off that one answer instead of guessing from what it thinks the view is.
-///
-/// [`crate::shell::ShellCancel`] and [`crate::agent::AgentCancel`] remain methods in their own
-/// right, for the reason `shell/run` and `agent/prompt` do: the shapes differ, and the tests that
-/// pin them are about those shapes rather than about the key that reaches them.
-pub struct ViewInterrupt;
-impl RpcMethod for ViewInterrupt {
-    const NAME: &'static str = "view/interrupt";
-    type Params = ViewInterruptParams;
-    type Result = ViewInterruptResult;
-    // Stopping a run edits nothing: the transcript grows by the runner's own writes, and the
-    // buffer the view presents is read-only either way.
-    const MUTATES_TEXT: bool = false;
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ViewInterruptParams {
-    pub view_id: crate::ViewId,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ViewInterruptResult {
-    /// False when nothing was running — including a view that could never run anything.
-    pub interrupted: bool,
-}

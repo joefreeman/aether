@@ -155,6 +155,10 @@ pub struct Ws {
     ///
     /// Stored as `(method, params)` because `Notification` isn't `Clone`.
     seen: Vec<(String, serde_json::Value)>,
+    /// The notifications a wait for a *reply* read past, in arrival order, until something takes
+    /// them — see [`expect_notification_or_backlog`]. Without it, a push that raced ahead of a reply
+    /// was gone for good, and a test waiting for it next waited forever.
+    backlog: std::collections::VecDeque<(String, serde_json::Value)>,
 }
 
 impl Ws {
@@ -170,6 +174,7 @@ impl Ws {
             inner,
             next_id: 1,
             seen: Vec::new(),
+            backlog: std::collections::VecDeque::new(),
         }
     }
 
@@ -205,6 +210,7 @@ impl Ws {
     /// Forget the notifications seen so far, so a later [`Ws::saw`] speaks only about what follows.
     pub fn clear_seen(&mut self) {
         self.seen.clear();
+        self.backlog.clear();
     }
 
     /// Read the next frame, logging notifications as they go past and every opened view.
@@ -419,11 +425,11 @@ pub async fn await_response<M: RpcMethod>(ws: &mut Ws, id: u64) -> M::Result {
             ClientInbound::Error(e) if e.id == id => {
                 panic!("request {id} ({}) returned error: {:?}", M::NAME, e.error);
             }
-            ClientInbound::Notification(_)
-            | ClientInbound::Response(_)
-            | ClientInbound::Error(_) => {
-                // Another request's reply, or a push — logged on the way past (see `Ws::seen`).
-            }
+            // A push — logged on the way past (see `Ws::seen`), and kept for whoever waits for it
+            // next (see `Ws::backlog`).
+            ClientInbound::Notification(n) => ws.backlog.push_back((n.method, n.params)),
+            // Another request's reply.
+            ClientInbound::Response(_) | ClientInbound::Error(_) => {}
         }
     }
 }
@@ -493,14 +499,39 @@ pub async fn send_request_expect_err<M: RpcMethod>(ws: &mut Ws, params: &M::Para
 }
 
 /// Read frames until one matching notification arrives. Panics if the stream ends first.
+/// How long a test waits for a push before failing. Generous — the slowest pushes are a real
+/// command finishing — because the point is only that a push that never comes fails the test
+/// rather than hanging the whole suite.
+const NOTIFICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The next `N` to arrive from here on — pushes a reply-wait already read past are *not* offered;
+/// see [`expect_notification_or_backlog`] for the variant that takes those first.
 pub async fn expect_notification<N: NotificationMethod>(ws: &mut Ws) -> N::Params {
-    loop {
-        if let ClientInbound::Notification(n) = ws.next_inbound().await {
-            if n.method == N::NAME {
-                return serde_json::from_value(n.params).expect("typed params");
+    let wait = async {
+        loop {
+            if let ClientInbound::Notification(n) = ws.next_inbound().await {
+                if n.method == N::NAME {
+                    return serde_json::from_value(n.params).expect("typed params");
+                }
             }
         }
+    };
+    match tokio::time::timeout(NOTIFICATION_TIMEOUT, wait).await {
+        Ok(p) => p,
+        Err(_) => panic!("timed out waiting for notification {}", N::NAME),
     }
+}
+
+/// The next `N`, taking first the ones a reply-wait read past ([`Ws::backlog`]) and not yet taken —
+/// so a push that raced ahead of a reply is still found. Other backlogged pushes before it are
+/// dropped from the backlog (they stay in [`Ws::saw`]).
+pub async fn expect_notification_or_backlog<N: NotificationMethod>(ws: &mut Ws) -> N::Params {
+    while let Some((method, params)) = ws.backlog.pop_front() {
+        if method == N::NAME {
+            return serde_json::from_value(params).expect("typed params");
+        }
+    }
+    expect_notification::<N>(ws).await
 }
 
 // -------- cursor + input ------------------------------------------------------------------------

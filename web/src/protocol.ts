@@ -1100,7 +1100,8 @@ export type PickerKind =
   | "git_stash"
   | "git_baseline"
   | "tasks"
-  | "tasks_workspace";
+  | "tasks_workspace"
+  | "activity";
 
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
@@ -1109,6 +1110,12 @@ export type SymbolKind =
   | "constructor" | "enum" | "interface" | "function" | "variable" | "constant" | "string"
   | "number" | "boolean" | "array" | "object" | "key" | "null" | "enum_member" | "struct"
   | "event" | "operator" | "type_parameter" | "unknown";
+
+/** Mirrors aether-protocol::activity::ActivityId (serde tag = "kind", snake_case). */
+export type ActivityId =
+  | { kind: "shell"; view_id: number }
+  | { kind: "agent"; view_id: number }
+  | { kind: "git"; repo_id: string };
 
 /** Mirrors aether-protocol::picker::AgentRowState (serde tag = "state", snake_case). A badge on
  *  the agents-picker row, never a sort key. */
@@ -1138,6 +1145,15 @@ export type PickerItem =
       exit?: number;
       elapsed_ms?: number;
       dormant?: boolean;
+      match_indices?: number[];
+    }
+  /** A piece of work in progress (`activity`). Haystack is `"{owner}  {label}"`, composed like the
+   *  shell row's. `id` names what it belongs to — a shell's or agent's view, or a repo. */
+  | {
+      kind: "activity";
+      id: ActivityId;
+      owner: string;
+      label: string;
       match_indices?: number[];
     }
   /** A task (`tasks` / `tasks_workspace`). Haystack is `"{name}  {display_path}  {description}"`,

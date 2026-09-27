@@ -164,10 +164,11 @@ async fn run_and_wait(
     finished_run(ws).await
 }
 
-/// Read pushes until a run reports that it is over.
+/// Read pushes until a run reports that it is over — including one that arrived while an earlier
+/// request was waiting for its reply, which a fast command's finish often does.
 async fn finished_run(ws: &mut Ws) -> RunState {
     loop {
-        let p = expect_notification::<ShellRunChanged>(ws).await;
+        let p = expect_notification_or_backlog::<ShellRunChanged>(ws).await;
         if let Some(run) = p.run.filter(|r| !r.is_running()) {
             return run;
         }
@@ -384,7 +385,10 @@ async fn typing_ahead_survives_a_refused_submit() {
     )
     .await;
     assert!(err.contains("Shell 1 is running sleep 100"), "{err}");
-    assert!(err.contains("Space v c"), "and says how to stop it: {err}");
+    assert!(
+        err.contains("Space v to stop it"),
+        "and says how to stop it: {err}"
+    );
     assert_eq!(
         input_text(&mut ws, input).await,
         "echo next",
@@ -425,7 +429,7 @@ async fn an_exit_code_lands_on_the_runs_box() {
         !titles
             .iter()
             .chain(&headers)
-            .any(|h| h.contains("Space v c")),
+            .any(|h| h.contains("Space v to stop it")),
         "a finished run offers nothing to stop: {titles:?} {headers:?}"
     );
 }
@@ -1871,19 +1875,19 @@ async fn a_run_transition_repushes_the_shells_picker() {
     assert_eq!(command.as_deref(), Some("false"));
 }
 
-/// `view/interrupt` — `Space v c` — stops a shell's run without naming a shell.
-///
-/// The client cannot tell a shell from an agent view, so it asks one question of whatever it is
-/// looking at. **Total**: a file view answers `interrupted: false` rather than erroring, and that
-/// one answer is what the client's "Nothing is running here" is built on — unlike `shell/cancel`,
-/// which is a shell's own method and refuses anything else.
+/// The workspace's work in progress lists a running shell — pushed to the client, and as a row of
+/// the activity picker — and `activity/cancel` stops it, after which the list is empty again. A
+/// second cancel finds nothing to stop, which is an answer rather than an error.
 #[tokio::test]
-async fn view_interrupt_stops_a_run_and_answers_false_for_anything_else() {
-    use aether_protocol::view::{ViewInterrupt, ViewInterruptParams, ViewInterruptResult};
+async fn a_running_shell_is_work_in_progress_until_cancelled() {
+    use aether_protocol::activity::{
+        ActivityCancel, ActivityCancelParams, ActivityCancelResult, ActivityChanged, ActivityId,
+    };
     let (server, mut ws, _dir) = setup().await;
     let shell = open_shell(&mut ws).await;
     let input = input_buffer_of(&server, &shell).await;
     type_command(&mut ws, &shell, input, "sleep 100").await;
+    ws.clear_seen();
     let _: ShellRunResult = send_request::<ShellRun>(
         &mut ws,
         &ShellRunParams {
@@ -1891,38 +1895,93 @@ async fn view_interrupt_stops_a_run_and_answers_false_for_anything_else() {
         },
     )
     .await;
+    let id = ActivityId::Shell {
+        view_id: shell.opened.view_id,
+    };
+    let listed = loop {
+        let p = expect_notification::<ActivityChanged>(&mut ws).await;
+        if !p.items.is_empty() {
+            break p.items;
+        }
+    };
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+    assert_eq!(
+        (listed[0].owner.as_str(), listed[0].label.as_str()),
+        ("Shell 1", "sleep 100")
+    );
 
-    let stopped: ViewInterruptResult = send_request::<ViewInterrupt>(
-        &mut ws,
-        &ViewInterruptParams {
-            view_id: shell.opened.view_id,
-        },
-    )
-    .await;
-    assert!(stopped.interrupted);
+    let picker: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut ws, &view_params(PickerKind::Activity)).await;
+    let rows = picker.update.expect("a window").items().to_vec();
+    assert!(
+        matches!(rows.as_slice(), [PickerItem::Activity { id: row, .. }] if *row == id),
+        "{rows:?}"
+    );
+
+    let stopped: ActivityCancelResult =
+        send_request::<ActivityCancel>(&mut ws, &ActivityCancelParams { id: id.clone() }).await;
+    assert!(stopped.cancelled);
     assert_eq!(finished_run(&mut ws).await.status, RunStatus::Killed);
+    loop {
+        if expect_notification::<ActivityChanged>(&mut ws)
+            .await
+            .items
+            .is_empty()
+        {
+            break;
+        }
+    }
+    let again: ActivityCancelResult =
+        send_request::<ActivityCancel>(&mut ws, &ActivityCancelParams { id }).await;
+    assert!(!again.cancelled, "nothing left to stop");
+}
 
-    // An idle shell: nothing to stop, and no error either.
-    let again: ViewInterruptResult = send_request::<ViewInterrupt>(
-        &mut ws,
-        &ViewInterruptParams {
-            view_id: shell.opened.view_id,
-        },
-    )
-    .await;
-    assert!(!again.interrupted);
+/// Work belongs to its workspace: a client on another workspace is told nothing of a shell it has
+/// no row for — neither the work in progress nor how the run went.
+#[tokio::test]
+async fn another_workspaces_shell_is_not_its_business() {
+    use aether_protocol::activity::ActivityChanged;
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let mut server = aether_server::spawn_for_test_multi(vec![
+        ("a".to_string(), vec![a.path().canonicalize().unwrap()]),
+        ("b".to_string(), vec![b.path().canonicalize().unwrap()]),
+    ])
+    .await
+    .unwrap();
+    server.keep_alive(());
+    let mut on_a = Ws::connect(&server).await;
+    let mut on_b = Ws::connect(&server).await;
+    for (ws, name) in [(&mut on_a, "a"), (&mut on_b, "b")] {
+        let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+            ws,
+            &WorkspaceActivateParams {
+                worktrees: None,
+                name: name.into(),
+                open_last: false,
+            },
+        )
+        .await;
+    }
+    on_b.clear_seen();
 
-    // A file view: the same answer, which is the point of the method being total.
-    let open: ViewOpenResult =
-        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
-    let on_a_file: ViewInterruptResult = send_request::<ViewInterrupt>(
-        &mut ws,
-        &ViewInterruptParams {
-            view_id: view_of(open.buffer_id),
-        },
-    )
-    .await;
-    assert!(!on_a_file.interrupted);
+    let shell = open_shell(&mut on_a).await;
+    run_and_wait(&mut on_a, &server, &shell, "echo hi").await;
+    settled(&server).await;
+    // Anything pushed to `b` by now arrives ahead of this answer.
+    let _: aether_protocol::picker::PickerViewResult =
+        send_request::<PickerView>(&mut on_b, &view_params(PickerKind::Activity)).await;
+    assert!(
+        on_b.saw::<ShellRunChanged>().is_empty(),
+        "b heard how a's run went"
+    );
+    assert!(
+        on_b.saw::<ActivityChanged>()
+            .iter()
+            .all(|p| p.items.is_empty()),
+        "b was told a's shell was running"
+    );
 }
 
 /// `shell/run` and `shell/cancel` on something that is not a shell are refused rather than

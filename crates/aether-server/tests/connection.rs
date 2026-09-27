@@ -726,8 +726,14 @@ async fn rejects_path_outside_workspace() {
         .await
         .unwrap();
 
-    let text = next_text(&mut ws).await;
-    let v: Value = serde_json::from_str(&text).unwrap();
+    // The reply, past any push that arrives first — activating a workspace sends its work in
+    // progress, and the writer lets replies overtake pushes, so it can land either side.
+    let v: Value = loop {
+        let v: Value = serde_json::from_str(&next_text(&mut ws).await).unwrap();
+        if v.get("id").is_some() {
+            break v;
+        }
+    };
     assert_eq!(v["error"]["code"], -32010, "expected INVALID_PATH");
 
     std::fs::remove_file(&outside).ok();

@@ -167,6 +167,9 @@ pub struct Theme {
     pub warning: Rgb,
     pub info: Rgb,
     pub ok: Rgb,
+    /// The status bar's work-in-progress indicator (`⟳ 3`). Purple, which nothing else in the
+    /// status bar uses, so it reads apart from the git cluster's blue beside it.
+    pub work: Rgb,
 
     // ---- Buffer-state dot (status bar + web favicon) ----
     /// Gone on disk.
@@ -309,6 +312,7 @@ impl Theme {
         warning: NORD13,
         info: NORD8,
         ok: NORD14,
+        work: NORD15,
         state_deleted: NORD11,
         state_changed: NORD12,
         state_unsaved: NORD9,
@@ -408,7 +412,8 @@ impl Theme {
         error: NORD11,
         warning: rgb(0x9a7522), // NORD13 darkened — yellow is unreadable on Snow Storm
         info: rgb(0x3e7a8f),
-        ok: rgb(0x5a7547), // NORD14 darkened
+        ok: rgb(0x5a7547),   // NORD14 darkened
+        work: rgb(0x8d6488), // NORD15 darkened
         state_deleted: NORD11,
         state_changed: rgb(0xab5f38), // NORD12 darkened
         state_unsaved: NORD10,
