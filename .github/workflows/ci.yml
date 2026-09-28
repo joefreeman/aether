@@ -12,6 +12,8 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # A hung test otherwise runs to GitHub's 6-hour default before anything says so.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 

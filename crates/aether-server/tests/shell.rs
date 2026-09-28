@@ -791,7 +791,7 @@ async fn a_run_appears_before_it_prints_anything() {
     )
     .await;
     // The start's own push; the content push goes out ahead of it on the one ordered stream.
-    let started = expect_notification::<ShellRunChanged>(&mut ws).await;
+    let started = expect_notification_or_backlog::<ShellRunChanged>(&mut ws).await;
     assert!(started.run.is_some_and(|r| r.is_running()));
     // Clearing the input pushes a window too, but from before the run existed — so look for one
     // that shows the run's command.
@@ -2183,7 +2183,7 @@ async fn a_running_shell_is_work_in_progress_until_cancelled() {
         view_id: shell.opened.view_id,
     };
     let listed = loop {
-        let p = expect_notification::<ActivityChanged>(&mut ws).await;
+        let p = expect_notification_or_backlog::<ActivityChanged>(&mut ws).await;
         if !p.items.is_empty() {
             break p.items;
         }
@@ -2208,7 +2208,7 @@ async fn a_running_shell_is_work_in_progress_until_cancelled() {
     assert!(stopped.cancelled);
     assert_eq!(finished_run(&mut ws).await.status, RunStatus::Cancelled);
     loop {
-        if expect_notification::<ActivityChanged>(&mut ws)
+        if expect_notification_or_backlog::<ActivityChanged>(&mut ws)
             .await
             .items
             .is_empty()
