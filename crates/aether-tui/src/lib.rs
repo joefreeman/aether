@@ -125,28 +125,76 @@ fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
+    // Input modes off and the queue drained *before* raw mode goes: out of raw mode the tty echoes
+    // whatever arrives, so a mouse report still in flight printed as `^[[<35;198;50M` and the
+    // shell then read the rest as a command.
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags
+    );
+    drain_terminal_input();
     disable_raw_mode()?;
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
-    let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
     execute!(
         terminal.backend_mut(),
         SetCursorStyle::DefaultUserShape,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
-    drain_terminal_input();
     Ok(())
 }
 
-/// Discard any bytes the terminal queued as input but we never read. Mouse tracking (enabled for the
-/// whole session, including the pre-connection "Connecting…" splash) makes the terminal stream
-/// motion reports; if the app exits while some are still queued — a fast fatal boot, or plain
-/// mouse movement during teardown — those bytes outlive us and the shell that regains the terminal
-/// reads them as a garbled command (`^[[<35;208;51M` → "command not found"). Flush the input queue
-/// *after* mouse capture is disabled so nothing leaks. Safe: a raw-mode full-screen app accumulates
-/// no shell-bound type-ahead, so there's nothing legitimate to preserve.
+/// How long [`drain_terminal_input`] waits for the terminal to answer its fence. Every terminal
+/// answers a device-attributes query at once; this only bounds exit on one that never does.
+const DRAIN_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Discard every byte the terminal sent us that we never read. Call it with raw mode still on, and
+/// after mouse capture is disabled.
+///
+/// Mouse tracking (on for the whole session, including the pre-connection "Connecting…" splash)
+/// streams motion reports, and the ones that outlive us land in the shell as a garbled command.
+/// Flushing the input queue alone isn't enough: a report the terminal wrote just before it read
+/// our "disable" is still in the pty when the flush runs, and arrives after it. So fence first —
+/// ask for the primary device attributes and read until the answer comes back. The terminal
+/// answers in order, so once the reply is in, everything it sent before the disable is too. Safe:
+/// a raw-mode full-screen app accumulates no shell-bound type-ahead, so there's nothing
+/// legitimate to preserve.
 fn drain_terminal_input() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty");
+    if let Ok(mut tty) = tty {
+        if tty.write_all(b"\x1b[c").and_then(|()| tty.flush()).is_ok() {
+            let deadline = std::time::Instant::now() + DRAIN_FENCE_TIMEOUT;
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                let mut fd = libc::pollfd {
+                    fd: tty.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid, initialised pollfd, and its count.
+                let ready = unsafe { libc::poll(&mut fd, 1, left.as_millis() as libc::c_int) };
+                if ready <= 0 {
+                    break;
+                }
+                match tty.read(&mut buf) {
+                    Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+                if ends_with_device_attributes(&seen) {
+                    break;
+                }
+            }
+        }
+    }
     // SAFETY: `tcflush` on the stdin fd is a simple libc call with no memory effects; TCIFLUSH
     // discards unread input only (never our already-written output).
     unsafe {
@@ -154,19 +202,62 @@ fn drain_terminal_input() {
     }
 }
 
+/// Whether `input` ends in a primary device attributes reply, `ESC [ ? Ps ; … c`. Nothing else a
+/// terminal sends us has that shape: SGR mouse reports are `ESC [ <`, and the kitty flags reply
+/// ends in `u`.
+fn ends_with_device_attributes(input: &[u8]) -> bool {
+    let Some((b'c', body)) = input.split_last() else {
+        return false;
+    };
+    let params = body
+        .iter()
+        .rev()
+        .take_while(|b| b.is_ascii_digit() || **b == b';')
+        .count();
+    body[..body.len() - params].ends_with(b"\x1b[?")
+}
+
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Same order as `restore_terminal`: drained before raw mode goes, or the tty echoes it.
+        let _ = execute!(
+            stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            PopKeyboardEnhancementFlags
+        );
+        drain_terminal_input();
         let _ = disable_raw_mode();
         let _ = execute!(
             stdout(),
-            PopKeyboardEnhancementFlags,
-            DisableBracketedPaste,
-            DisableMouseCapture,
             SetCursorStyle::DefaultUserShape,
             LeaveAlternateScreen
         );
-        drain_terminal_input();
         original(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ends_with_device_attributes;
+
+    #[test]
+    fn a_device_attributes_reply_ends_the_drain() {
+        assert!(ends_with_device_attributes(b"\x1b[?62;22c"));
+        assert!(ends_with_device_attributes(b"\x1b[<35;198;50M\x1b[?65;1;9c"));
+        assert!(ends_with_device_attributes(b"\x1b[?c"));
+    }
+
+    #[test]
+    fn other_replies_do_not() {
+        // Still waiting: nothing yet, a mouse report, a kitty flags reply, a reply cut short.
+        assert!(!ends_with_device_attributes(b""));
+        assert!(!ends_with_device_attributes(b"c"));
+        assert!(!ends_with_device_attributes(b"\x1b[<35;198;50M"));
+        assert!(!ends_with_device_attributes(b"\x1b[?1u"));
+        assert!(!ends_with_device_attributes(b"\x1b[?62;22"));
+        // A mouse report's parameters followed by a stray `c` isn't a reply either.
+        assert!(!ends_with_device_attributes(b"\x1b[<35;1c"));
+    }
 }
