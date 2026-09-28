@@ -244,7 +244,7 @@ pub enum PickerKind {
     ///
     /// Rows are [`PickerItem::Task`]. A task is a shortcut for starting a shell, so `Enter` is not a
     /// `picker/select`: the client opens a shell in the task's directory with its command
-    /// ([`crate::shell::ShellOpenParams`]), and `Ctrl-e` does the same without running it, so the
+    /// ([`crate::shell::ShellStartParams`]), and `Ctrl-e` does the same without running it, so the
     /// command can be given arguments first. `picker/select` answers `Ctrl-g`: the definition, as a
     /// `FileAt`.
     ///

@@ -95,9 +95,9 @@ pub use aether_protocol::settings::{
     AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
 };
 pub use aether_protocol::shell::{
-    NotRun, RunState, RunStatus, ShellCancel, ShellCancelParams, ShellCancelResult, ShellOpen,
-    ShellOpenParams, ShellOpenResult, ShellRun, ShellRunChanged, ShellRunChangedParams,
-    ShellRunParams, ShellRunResult,
+    NotRun, RunState, RunStatus, ShellCancel, ShellCancelParams, ShellCancelResult, ShellRun,
+    ShellRunChanged, ShellRunChangedParams, ShellRunParams, ShellRunResult, ShellStart,
+    ShellStartParams, ShellStartResult,
 };
 pub use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,

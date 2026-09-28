@@ -7625,20 +7625,20 @@ fn an_action_is_an_inline_leaf() {
     );
 }
 
-/// `shell/open` answers with an open plus the element to type into. Its params are all optional:
+/// `shell/start` answers with an open plus the element to type into. Its params are all optional:
 /// A new shell sends `{}`, and a task sends where to start, what to type and whether to run it.
 ///
 /// The `new` flag is gone with the reuse heuristic: the key always mints a shell, and returning to
 /// one you have is the shells picker. An old client's `{"new": true}` still parses — serde ignores
 /// what it does not know — so a stale build asking for a new shell gets exactly that.
 #[test]
-fn shell_open_shape() {
-    use aether_protocol::shell::{ShellOpen, ShellOpenParams, ShellOpenResult};
-    assert_eq!(ShellOpen::NAME, "shell/open");
-    assert_eq!(to_value(ShellOpenParams::default()).unwrap(), json!({}));
-    from_value::<ShellOpenParams>(json!({})).unwrap();
-    from_value::<ShellOpenParams>(json!({"new": true})).unwrap();
-    let task = ShellOpenParams {
+fn shell_start_shape() {
+    use aether_protocol::shell::{ShellStart, ShellStartParams, ShellStartResult};
+    assert_eq!(ShellStart::NAME, "shell/start");
+    assert_eq!(to_value(ShellStartParams::default()).unwrap(), json!({}));
+    from_value::<ShellStartParams>(json!({})).unwrap();
+    from_value::<ShellStartParams>(json!({"new": true})).unwrap();
+    let task = ShellStartParams {
         cwd: Some("/w/web".into()),
         input: Some("npm run build".into()),
         run: true,
@@ -7658,10 +7658,10 @@ fn shell_open_shape() {
         .unwrap(),
         json!({"kind": "busy", "message": "Shell 2 is running just test"})
     );
-    let typed: ShellOpenParams = from_value(json!({"input": "just test"})).unwrap();
+    let typed: ShellStartParams = from_value(json!({"input": "just test"})).unwrap();
     assert!(!typed.run && typed.cwd.is_none());
 
-    let result = ShellOpenResult {
+    let result = ShellStartResult {
         opened: ViewOpenResult {
             view_id: aether_protocol::ViewId(4),
             scroll: None,
@@ -7697,7 +7697,7 @@ fn shell_open_shape() {
     assert_eq!(v["opened"]["title"], "Shell 1");
     assert_eq!(v["opened"]["read_only"], true);
     assert_eq!(v["input"], 1);
-    let back: ShellOpenResult = from_value(v).unwrap();
+    let back: ShellStartResult = from_value(v).unwrap();
     assert_eq!(back.input, 1);
 }
 
@@ -7868,7 +7868,7 @@ const _: () = assert!(!aether_protocol::view::ViewFollowLine::MUTATES_TEXT);
 /// `agent/*`'s wire shapes, pinned.
 ///
 /// Three of these encode a decision rather than a convenience, and a change to any of them is a
-/// change to what the client is allowed to know: `agent/open` says *where the key was pressed*
+/// change to what the client is allowed to know: `agent/start` says *where the key was pressed*
 /// rather than whether to make a new conversation, `agent/respond` says *which way* rather than
 /// which option, and `view/submit_input` says nothing about the kind of view at all. All three
 /// exist because the client cannot tell a shell from an agent view — the window marks an input by
@@ -7879,10 +7879,10 @@ fn the_agent_wire_says_which_agent_not_what_you_are_looking_at() {
 
     // Nothing at all in the ordinary case: the open always creates, and `agent: None` means the
     // first one found on `PATH`. `from_view` went with the reuse heuristic it decided.
-    let anywhere = to_value(AgentOpenParams::default()).unwrap();
+    let anywhere = to_value(AgentStartParams::default()).unwrap();
     assert_eq!(anywhere, json!({}));
 
-    let named = to_value(AgentOpenParams {
+    let named = to_value(AgentStartParams {
         agent: Some("claude".into()),
     })
     .unwrap();

@@ -11,8 +11,8 @@ mod common;
 use common::*;
 
 use aether_protocol::agent::{
-    AgentCancel, AgentCancelParams, AgentOpen, AgentOpenParams, AgentOpenResult, AgentPrompt,
-    AgentPromptParams, AgentPromptResult, AgentRespond, AgentRespondParams,
+    AgentCancel, AgentCancelParams, AgentPrompt, AgentPromptParams, AgentPromptResult,
+    AgentRespond, AgentRespondParams, AgentStart, AgentStartParams, AgentStartResult,
 };
 use aether_protocol::viewport::{
     FocusStep, FocusTarget, ViewportFocusElement, ViewportFocusElementParams,
@@ -41,7 +41,7 @@ async fn setup(
 
     let started = dummy::start(script);
     let transcript = started.transcript.clone();
-    // One connection per test: the transport is taken the first time `agent/open` reaches for it.
+    // One connection per test: the transport is taken the first time `agent/start` reaches for it.
     let slot = Mutex::new(Some(started.transport));
     {
         let mut s = server.state.lock().await;
@@ -65,15 +65,15 @@ async fn setup(
     (server, ws, dir, transcript)
 }
 
-/// Open a conversation. Always a new one: `agent/open` takes no "reuse" question any more —
+/// Open a conversation. Always a new one: `agent/start` takes no "reuse" question any more —
 /// returning to a conversation you have is the agents picker's job.
-async fn open_agent(ws: &mut Ws) -> AgentOpenResult {
-    send_request::<AgentOpen>(ws, &AgentOpenParams { agent: None }).await
+async fn start_agent(ws: &mut Ws) -> AgentStartResult {
+    send_request::<AgentStart>(ws, &AgentStartParams { agent: None }).await
 }
 
 /// The buffer the view's input element windows, found by its **role** rather than by the index the
 /// open reported — that index moves as blocks are appended above it.
-async fn input_buffer_of(server: &aether_server::ServerHandle, open: &AgentOpenResult) -> u64 {
+async fn input_buffer_of(server: &aether_server::ServerHandle, open: &AgentStartResult) -> u64 {
     let s = server.state.lock().await;
     let view = s.try_view(open.opened.view_id).expect("the agent's view");
     view.elements
@@ -107,7 +107,7 @@ async fn input_text(ws: &mut Ws, input: u64) -> String {
 async fn prompt_and_wait(
     ws: &mut Ws,
     server: &aether_server::ServerHandle,
-    open: &AgentOpenResult,
+    open: &AgentStartResult,
     text: &str,
 ) {
     let input = input_buffer_of(server, open).await;
@@ -149,7 +149,7 @@ async fn wait_for_idle(server: &aether_server::ServerHandle, view_id: aether_pro
 /// window is built from, without needing a viewport for the assertions that are about structure.
 async fn blocks(
     server: &aether_server::ServerHandle,
-    open: &AgentOpenResult,
+    open: &AgentStartResult,
 ) -> Vec<(String, String)> {
     let s = server.state.lock().await;
     let view_buffer = s.try_presenting_buffer(open.opened.view_id).expect("view");
@@ -175,7 +175,7 @@ async fn blocks(
 #[tokio::test]
 async fn open_lands_the_caret_in_the_input() {
     let (server, mut ws, _dir, _t) = setup(Script::default()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
 
     // The open reports which element is the input, and the scroll it hands back names the same
     // one — a client that simply obeys the scroll lands in the right place.
@@ -183,7 +183,7 @@ async fn open_lands_the_caret_in_the_input() {
     let view = s.try_view(open.opened.view_id).expect("view");
     assert!(
         view.elements[open.input as usize].role.is_input(),
-        "agent/open pointed at an element that is not the input"
+        "agent/start pointed at an element that is not the input"
     );
     assert_eq!(open.opened.scroll.expect("a scroll").element, open.input);
     // A fresh conversation is the input and nothing else.
@@ -195,7 +195,7 @@ async fn open_lands_the_caret_in_the_input() {
 #[tokio::test]
 async fn prompting_reads_and_clears_the_input() {
     let (server, mut ws, _dir, transcript) = setup(Script::default()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
 
     type_prompt(&mut ws, input, "  hello agent  ").await;
@@ -221,7 +221,7 @@ async fn prompting_reads_and_clears_the_input() {
 #[tokio::test]
 async fn an_empty_prompt_is_a_no_op_not_an_error() {
     let (server, mut ws, _dir, transcript) = setup(Script::default()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "   \n  ").await;
 
@@ -254,7 +254,7 @@ async fn message_chunks_with_one_id_become_one_block() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let blocks = blocks(&server, &open).await;
@@ -285,7 +285,7 @@ async fn chunks_without_an_id_append_to_the_open_block() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let blocks = blocks(&server, &open).await;
@@ -311,7 +311,7 @@ async fn a_thought_and_a_message_are_different_blocks() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let kinds: Vec<_> = blocks(&server, &open)
@@ -342,7 +342,7 @@ async fn a_tool_call_update_merges_rather_than_replacing() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let blocks = blocks(&server, &open).await;
@@ -377,7 +377,7 @@ async fn a_tool_call_grows_after_a_later_block_exists() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let blocks = blocks(&server, &open).await;
@@ -415,7 +415,7 @@ async fn a_diff_renders_as_a_patch() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let blocks = blocks(&server, &open).await;
@@ -447,7 +447,7 @@ async fn a_new_file_diff_says_so() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let s = server.state.lock().await;
@@ -489,7 +489,7 @@ async fn a_permission_request_blocks_the_turn_until_it_is_answered() {
         ..Script::default()
     };
     let (server, mut ws, _dir, transcript) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "go").await;
     let _: AgentPromptResult = send_request::<AgentPrompt>(
@@ -560,7 +560,7 @@ async fn answering_twice_answers_once() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "go").await;
     let _: AgentPromptResult = send_request::<AgentPrompt>(
@@ -664,7 +664,7 @@ async fn the_agent_reads_unsaved_buffer_text() {
     )
     .await;
 
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "read it").await;
 
     let read = transcript.lock().unwrap().reads.first().cloned();
@@ -727,7 +727,7 @@ async fn an_agent_write_lands_in_the_open_buffer_and_is_undoable() {
     )
     .await;
 
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "write it").await;
 
     assert_eq!(transcript.lock().unwrap().writes, vec![Ok(())]);
@@ -768,7 +768,7 @@ async fn block_documents_are_internal() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let s = server.state.lock().await;
@@ -791,7 +791,7 @@ async fn block_documents_are_internal() {
     }
 }
 
-/// `agent/open` **always creates** — from anywhere, an idle conversation included.
+/// `agent/start` **always creates** — from anywhere, an idle conversation included.
 ///
 /// It used to hand back the idle one, a rule that existed only because there was no way to *list*
 /// the conversations: the same key opened a new one or an old one depending on state the user
@@ -825,9 +825,9 @@ async fn every_open_mints_the_next_conversation() {
     )
     .await;
 
-    let first = open_agent(&mut ws).await;
+    let first = start_agent(&mut ws).await;
     // A second open: a second conversation, numbered after the first.
-    let second = open_agent(&mut ws).await;
+    let second = start_agent(&mut ws).await;
     assert_ne!(
         first.opened.view_id, second.opened.view_id,
         "the second open returned the same conversation"
@@ -857,7 +857,7 @@ async fn a_second_prompt_during_a_turn_is_refused_and_keeps_the_text() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "first").await;
     let _: AgentPromptResult = send_request::<AgentPrompt>(
@@ -927,7 +927,7 @@ async fn cancelling_ends_the_turn_and_answers_the_open_question() {
         ..Script::default()
     };
     let (server, mut ws, _dir, transcript) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "go").await;
     let _: AgentPromptResult = send_request::<AgentPrompt>(
@@ -995,7 +995,7 @@ async fn a_permission_request_repushes_the_agents_picker() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
 
     // The resting row: connected, nothing in flight.
     let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Agents)).await;
@@ -1090,7 +1090,7 @@ async fn cancelling_a_conversations_work_stops_its_turn() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
 
     let id = ActivityId::Agent {
         view_id: open.opened.view_id,
@@ -1148,7 +1148,7 @@ async fn prose_is_bare_and_the_machinery_is_boxed() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "fix it").await;
 
     let s = server.state.lock().await;
@@ -1202,7 +1202,8 @@ async fn a_test_server_with_no_dummy_launches_nothing() {
     )
     .await;
 
-    let refused = send_request_result::<AgentOpen>(&mut ws, &AgentOpenParams { agent: None }).await;
+    let refused =
+        send_request_result::<AgentStart>(&mut ws, &AgentStartParams { agent: None }).await;
     let err = refused.expect_err("a test server launched an agent");
     assert_eq!(
         err.get("code").and_then(|c| c.as_i64()),
@@ -1244,7 +1245,7 @@ async fn an_idle_conversation_burns_no_cpu() {
     let (server, mut ws, _dir, _t) = setup(Script::default()).await;
     let baseline = cpu_over(1000).await;
 
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     // Let the handshake settle, so what we measure is the resting state.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let burnt = cpu_over(1000).await;
@@ -1316,7 +1317,7 @@ async fn the_agents_reply_is_prose_on_the_wire() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let s = server.state.lock().await;
@@ -1417,7 +1418,7 @@ async fn a_plan_keeps_each_entrys_state() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "plan it").await;
 
     let blocks = blocks(&server, &open).await;
@@ -1453,7 +1454,7 @@ async fn a_tool_calls_box_is_named_by_the_agent_not_by_us() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "test it").await;
 
     let s = server.state.lock().await;
@@ -1498,7 +1499,7 @@ async fn a_block_has_no_trailing_blank_line() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "a prompt").await;
 
     let s = server.state.lock().await;
@@ -1575,7 +1576,7 @@ async fn a_conversation_survives_a_server_restart() {
         }
         let mut ws = Ws::connect(&server).await;
         activate_p(&mut ws).await;
-        let open = open_agent(&mut ws).await;
+        let open = start_agent(&mut ws).await;
         prompt_and_wait(&mut ws, &server, &open, "why are semicolons dropped?").await;
         let input = input_buffer_of(&server, &open).await;
         type_prompt(&mut ws, input, "typed ahead").await;
@@ -1699,11 +1700,11 @@ async fn activate_p(ws: &mut Ws) {
 async fn an_agent_view_cannot_be_made_transient() {
     use aether_protocol::view::{ViewSetTransient, ViewSetTransientParams, ViewSetTransientResult};
     let (server, mut ws, _dir, _t) = setup(Script::default()).await;
-    let agent = open_agent(&mut ws).await;
+    let agent = start_agent(&mut ws).await;
     assert!(
         !agent.opened.transient,
         "a conversation is created kept — an open that says nothing would be a preview, so \
-         `agent/open` says so"
+         `agent/start` says so"
     );
 
     let answered: ViewSetTransientResult = send_request::<ViewSetTransient>(
@@ -1821,7 +1822,7 @@ fn one_call_and_a_reply() -> Script {
 #[tokio::test]
 async fn a_tool_call_arrives_folded_and_its_output_stays_off_the_wire() {
     let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let (_, window) = window_of(&mut ws, open.opened.view_id).await;
@@ -1894,7 +1895,7 @@ fn window_titles(window: &Window) -> Vec<String> {
 #[tokio::test]
 async fn a_folded_call_is_reached_by_its_disclosure_not_by_the_cursor() {
     let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
@@ -1971,7 +1972,7 @@ async fn a_call_awaiting_permission_refuses_to_fold() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "go").await;
     let _: AgentPromptResult = send_request::<AgentPrompt>(
@@ -2032,7 +2033,7 @@ async fn two_viewports_fold_independently() {
     // Per viewport, like the diff toggle: two shells on one conversation are two people reading,
     // and opening a call on one screen must not open it on the other.
     let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     // Two *connections*, because that is what two shells are — a second subscribe on one
@@ -2140,7 +2141,7 @@ async fn changes_step_only_the_blocks_that_touched_a_file() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let (viewport_id, _) = window_of(&mut ws, open.opened.view_id).await;
@@ -2261,7 +2262,7 @@ async fn the_outline_is_the_turns() {
         ..Script::default()
     };
     let (server, mut ws, _dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "what does this parse?").await;
     prompt_and_wait(&mut ws, &server, &open, "now fix it\nplease").await;
     let (viewport_id, _) = window_of(&mut ws, open.opened.view_id).await;
@@ -2427,7 +2428,7 @@ async fn focused_element(server: &aether_server::ServerHandle, viewport_id: u64)
 #[tokio::test]
 async fn a_line_motion_walks_out_of_its_block() {
     let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
@@ -2526,7 +2527,7 @@ async fn a_line_motion_walks_out_of_its_block() {
 #[tokio::test]
 async fn extending_clamps_where_moving_crosses() {
     let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let (viewport_id, _) = window_of(&mut ws, open.opened.view_id).await;
@@ -2590,7 +2591,7 @@ async fn a_permission_question_arrives_as_buttons_on_the_focus_ring() {
         ..Script::default()
     };
     let (server, mut ws, _dir, transcript) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "go").await;
     let _: AgentPromptResult = send_request::<AgentPrompt>(
@@ -2682,7 +2683,7 @@ async fn a_permission_question_arrives_as_buttons_on_the_focus_ring() {
 #[tokio::test]
 async fn the_fold_is_a_button_on_the_box() {
     let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
@@ -2730,7 +2731,7 @@ async fn the_fold_is_a_button_on_the_box() {
 #[tokio::test]
 async fn a_block_cannot_be_opened_as_its_own_view() {
     let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     // Every element of the conversation, the input included: none of them is a document you can
@@ -2786,7 +2787,7 @@ async fn following_a_tool_call_lands_in_the_file_it_touched() {
         ..Script::default()
     };
     let (server, mut ws, dir, _t) = setup(script).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     // Give the call a location, as a real agent does when it says where it worked.
@@ -2854,7 +2855,7 @@ async fn following_a_tool_call_lands_in_the_file_it_touched() {
 #[tokio::test]
 async fn a_line_motion_never_stops_where_no_cursor_is_drawn() {
     let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
@@ -2936,7 +2937,7 @@ async fn a_line_motion_never_stops_where_no_cursor_is_drawn() {
 #[tokio::test]
 async fn the_focus_ring_and_the_cursor_rule_agree() {
     let (server, mut ws, _dir, _t) = setup(one_call_and_a_reply()).await;
-    let open = open_agent(&mut ws).await;
+    let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
 
     let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;

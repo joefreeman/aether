@@ -5023,14 +5023,14 @@ async fn setup_three_kinds() -> (aether_server::ServerHandle, Ws, aether_protoco
     .await;
     let file: ViewOpenResult =
         send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
-    let _ = send_request::<aether_protocol::shell::ShellOpen>(
+    let _ = send_request::<aether_protocol::shell::ShellStart>(
         &mut ws,
-        &aether_protocol::shell::ShellOpenParams::default(),
+        &aether_protocol::shell::ShellStartParams::default(),
     )
     .await;
-    let _ = send_request::<aether_protocol::agent::AgentOpen>(
+    let _ = send_request::<aether_protocol::agent::AgentStart>(
         &mut ws,
-        &aether_protocol::agent::AgentOpenParams { agent: None },
+        &aether_protocol::agent::AgentStartParams { agent: None },
     )
     .await;
     (server, ws, view_of(file.buffer_id))
@@ -5124,9 +5124,9 @@ async fn shell_and_agent_rows_carry_their_own_fields() {
 /// touches the buffers list.
 #[tokio::test]
 async fn the_shells_picker_is_ordered_by_recency() {
-    use aether_protocol::shell::{ShellOpen, ShellOpenParams};
+    use aether_protocol::shell::{ShellStart, ShellStartParams};
     let (server, mut ws, file_view) = setup_three_kinds().await;
-    let second = send_request::<ShellOpen>(&mut ws, &ShellOpenParams::default()).await;
+    let second = send_request::<ShellStart>(&mut ws, &ShellStartParams::default()).await;
 
     assert_eq!(
         names(&rows_of(&mut ws, PickerKind::Shells).await),

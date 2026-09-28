@@ -122,7 +122,7 @@ fn picker_rows(
 }
 
 /// The shells picker's rows for `client_id`, in its order: live views most-recently-used first, then
-/// the restored-but-unopened ones. What `shell/open`'s `reuse` searches, so a task lands on the
+/// the restored-but-unopened ones. What `shell/start`'s `reuse` searches, so a task lands on the
 /// first matching row you would see.
 pub(crate) fn shell_rows(
     s: &ServerState,

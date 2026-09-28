@@ -12,8 +12,8 @@
 
 use super::*;
 use aether_protocol::agent::{
-    AgentCancelParams, AgentCancelResult, AgentOpenParams, AgentOpenResult, AgentPromptParams,
-    AgentPromptResult, AgentRespondParams, AgentRespondResult, AgentTurnChanged,
+    AgentCancelParams, AgentCancelResult, AgentPromptParams, AgentPromptResult, AgentRespondParams,
+    AgentRespondResult, AgentStartParams, AgentStartResult, AgentTurnChanged,
     AgentTurnChangedParams, Answer, StopReason, TurnState,
 };
 use aether_protocol::ViewId;
@@ -29,13 +29,13 @@ use crate::agent::{
 /// and nobody reads past this.
 const MAX_CONVERSATION_CHARS: usize = 8 * 1024 * 1024;
 
-// ---- agent/open --------------------------------------------------------------------------------
+// ---- agent/start -------------------------------------------------------------------------------
 
-pub async fn agent_open(
+pub async fn agent_start(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: AgentOpenParams,
-) -> Result<AgentOpenResult, RpcError> {
+    params: AgentStartParams,
+) -> Result<AgentStartResult, RpcError> {
     let client_id = ctx.client_id;
 
     // Always a new one. Returning to a conversation you already have is the agents picker's job
@@ -291,7 +291,7 @@ async fn present(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     view_buffer: BufferId,
-) -> Result<AgentOpenResult, RpcError> {
+) -> Result<AgentStartResult, RpcError> {
     let input_buffer = {
         let s = state.lock().await;
         s.try_doc_of(view_buffer)
@@ -301,7 +301,7 @@ async fn present(
     };
     let (opened, input) =
         crate::handlers::shell::land_in_field(state, ctx, view_buffer, input_buffer).await?;
-    Ok(AgentOpenResult { opened, input })
+    Ok(AgentStartResult { opened, input })
 }
 
 fn next_agent_number(s: &ServerState, workspace: &str) -> u32 {

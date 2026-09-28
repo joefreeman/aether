@@ -227,11 +227,11 @@ pub enum Event {
     /// named — a patch line's blob, a shell line's `path:line:col`.
     LineFollowed(Result<aether_protocol::view::ViewFollowLineResult, String>),
     /// A new shell's open answered with the shell to show and which of its elements to type into.
-    ShellOpened(Result<aether_protocol::shell::ShellOpenResult, RpcError>),
+    ShellStarted(Result<aether_protocol::shell::ShellStartResult, RpcError>),
     /// A submit landed, or was refused — the refusal is the interesting half, since it names the
     /// command in the way and the typed text is deliberately still there.
     InputSubmitted(Result<aether_protocol::view::ViewSubmitInputResult, RpcError>),
-    AgentOpened(Result<aether_protocol::agent::AgentOpenResult, RpcError>),
+    AgentStarted(Result<aether_protocol::agent::AgentStartResult, RpcError>),
     AgentAnswered(Result<aether_protocol::agent::AgentRespondResult, RpcError>),
     /// `Ctrl-d` in the activity picker answered. `cancelled: false` means the work had already
     /// finished, which is said; a stop that did land says nothing — the row leaves the list, and
@@ -919,7 +919,7 @@ impl Session {
             // guess from a scroll the client may not have adopted yet.
             // The same landing a shell gets: adopt, focus the input, and start typing. Both are
             // composed views whose last element is a field, and the arrival should feel identical.
-            Event::AgentOpened(Ok(r)) => {
+            Event::AgentStarted(Ok(r)) => {
                 let input = r.input;
                 let same_view = r.opened.view_id == self.view.view_id;
                 let fx = self.adopt_open(r.opened);
@@ -930,10 +930,10 @@ impl Session {
                 }
                 fx
             }
-            Event::AgentOpened(Err(e)) if e.code == ErrorCode::AGENT_UNAVAILABLE.code() => {
+            Event::AgentStarted(Err(e)) if e.code == ErrorCode::AGENT_UNAVAILABLE.code() => {
                 Effects::toast_detail("No agent available", e.message, ToastKind::Info)
             }
-            Event::AgentOpened(Err(e)) => {
+            Event::AgentStarted(Err(e)) => {
                 Effects::error_detail("Couldn't start an agent", e.message)
             }
             // Nothing to say when it worked — the block's chrome stops showing the question, which
@@ -948,7 +948,7 @@ impl Session {
             Event::AgentAnswered(Err(e)) => {
                 Effects::error_detail("Couldn't answer that", e.message)
             }
-            Event::ShellOpened(Ok(r)) => {
+            Event::ShellStarted(Ok(r)) => {
                 let input = r.input;
                 let same_view = r.opened.view_id == self.view.view_id;
                 let mut fx = self.adopt_open(r.opened);
@@ -980,7 +980,9 @@ impl Session {
                 }
                 fx
             }
-            Event::ShellOpened(Err(e)) => Effects::error_detail("Couldn't open a shell", e.message),
+            Event::ShellStarted(Err(e)) => {
+                Effects::error_detail("Couldn't start a shell", e.message)
+            }
             // The server says which recall list the line belongs to, so the client files it
             // without ever learning what sort of view it was typed in.
             Event::InputSubmitted(Ok(r)) => {
@@ -6329,14 +6331,14 @@ impl Session {
             return Effects::none();
         };
         let hide = self.close_picker();
-        hide.and(self.request::<aether_protocol::shell::ShellOpen>(
-            aether_protocol::shell::ShellOpenParams {
+        hide.and(self.request::<aether_protocol::shell::ShellStart>(
+            aether_protocol::shell::ShellStartParams {
                 cwd: Some(dir),
                 input: Some(command),
                 run,
                 reuse: true,
             },
-            Event::ShellOpened,
+            Event::ShellStarted,
         ))
     }
 
@@ -11364,14 +11366,14 @@ impl Session {
             // Always a new conversation: returning to one you have is `Space a`, the agents
             // picker. `agent: None` takes the first agent found on `PATH` — there is no type
             // choice yet.
-            A::AgentOpen => self.request::<aether_protocol::agent::AgentOpen>(
-                aether_protocol::agent::AgentOpenParams { agent: None },
-                Event::AgentOpened,
+            A::NewAgent => self.request::<aether_protocol::agent::AgentStart>(
+                aether_protocol::agent::AgentStartParams { agent: None },
+                Event::AgentStarted,
             ),
             // Always a new shell: returning to one you have is the shells picker.
-            A::ShellOpen => self.request::<aether_protocol::shell::ShellOpen>(
-                aether_protocol::shell::ShellOpenParams::default(),
-                Event::ShellOpened,
+            A::NewShell => self.request::<aether_protocol::shell::ShellStart>(
+                aether_protocol::shell::ShellStartParams::default(),
+                Event::ShellStarted,
             ),
             // Reached from Normal-mode `Enter` (`Activate`) with the input focused. The guard is
             // kept so that nothing can submit from anywhere else, whatever dispatches it.

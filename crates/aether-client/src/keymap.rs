@@ -459,12 +459,12 @@ pub enum Action {
     /// Copy the active buffer's absolute (canonical) path to the system clipboard.
     CopyAbsolutePath,
     NewScratch,
-    /// A **new** shell. Always creates: the shells picker lists the ones you have, so the open key
-    /// has one meaning.
-    ShellOpen,
+    /// A **new** shell. Always creates: the shells picker lists the ones you have, so the new-shell
+    /// key has one meaning.
+    NewShell,
     /// `Space Alt-a` — a **new** agent conversation, with the first agent found on `PATH`. Always
-    /// creates, for the reason [`Action::ShellOpen`] does.
-    AgentOpen,
+    /// creates, for the reason [`Action::NewShell`] does.
+    NewAgent,
 
     /// Submit what is typed in a composed view's **input** element.
     ///
@@ -1572,9 +1572,9 @@ static LEADER: &[Binding] = &[
     bind!(L, ch('b'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Buffers), "Files", "Switch buffer"),
     bind!(L, ch('b'), Exact(Mods::ALT), A::NewScratch, "Files", "New scratch"),
     bind!(L, ch('h'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Shells), "App", "Switch shell"),
-    bind!(L, ch('h'), Exact(Mods::ALT), A::ShellOpen, "App", "New shell (run a command)"),
+    bind!(L, ch('h'), Exact(Mods::ALT), A::NewShell, "App", "New shell (run a command)"),
     bind!(L, ch('a'), Exact(Mods::NONE), A::OpenPicker(PickerKind::Agents), "Agent", "Switch agent conversation"),
-    bind!(L, ch('a'), Exact(Mods::ALT), A::AgentOpen, "Agent", "New agent conversation"),
+    bind!(L, ch('a'), Exact(Mods::ALT), A::NewAgent, "Agent", "New agent conversation"),
     // `g` is the git sub-leader's prefix, so grep moved to `/` (and its selection-seeded sibling to
     // `Alt-/`) — the workspace-scoped echo of Normal's `/` and `Alt-/`. `Space Alt-g` is left
     // unbound on purpose: `g` should read as "git" with no exception to remember.

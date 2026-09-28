@@ -232,7 +232,7 @@ pub struct ServerState {
     /// Language-server sessions (one per workspace-root × language) and the buffers synced against
     /// them. See [`crate::lsp::manager`].
     pub lsp: crate::lsp::manager::LspManager,
-    /// Where `agent/open` gets an agent from. See [`AgentLauncher`] — the point of it being an
+    /// Where `agent/start` gets an agent from. See [`AgentLauncher`] — the point of it being an
     /// enum rather than an optional dummy is that a test server cannot fall through to launching
     /// a real one.
     pub agent_launcher: AgentLauncher,

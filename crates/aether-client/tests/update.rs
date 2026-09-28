@@ -3892,7 +3892,7 @@ fn tasks_picker_runs_edits_and_finds_a_task() {
     let mut s = session();
     open(&mut s);
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
-    let params = find_request(&fx, "shell/open").expect("Enter opens a shell");
+    let params = find_request(&fx, "shell/start").expect("Enter opens a shell");
     assert_eq!(
         *params,
         json!({"cwd": "/p/web", "input": "just test", "run": true, "reuse": true})
@@ -3903,7 +3903,7 @@ fn tasks_picker_runs_edits_and_finds_a_task() {
     let mut s = session();
     open(&mut s);
     let fx = s.on_key(KeyCode::Char('e'), Mods::CTRL, None);
-    let params = find_request(&fx, "shell/open").expect("Ctrl-e opens a shell");
+    let params = find_request(&fx, "shell/start").expect("Ctrl-e opens a shell");
     assert_eq!(
         *params,
         json!({"cwd": "/p/web", "input": "just test", "reuse": true})
@@ -3944,7 +3944,7 @@ fn a_refused_task_opens_its_shell_and_says_why() {
     }];
     p.selected = 0;
     let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
-    let token = request_token(&fx, "shell/open").expect("Enter opens a shell");
+    let token = request_token(&fx, "shell/start").expect("Enter opens a shell");
     let fx = s.on_rpc_result(
         token,
         Ok(json!({
@@ -14596,14 +14596,14 @@ fn space_alt_h_always_asks_for_a_new_shell() {
     let _ = key(&mut s, ' ');
     let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     let (_, method, params) = the_request(&fx);
-    assert_eq!(method, "shell/open");
+    assert_eq!(method, "shell/start");
     assert_eq!(params, json!({}), "no `new` flag survives");
 
     let mut s = shell_session(1);
     let _ = key(&mut s, ' ');
     let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     let (_, method, params) = the_request(&fx);
-    assert_eq!(method, "shell/open");
+    assert_eq!(method, "shell/start");
     assert_eq!(params, json!({}));
 }
 
@@ -14631,7 +14631,7 @@ fn space_a_lists_agents_and_alt_a_makes_one() {
     let _ = key(&mut s, ' ');
     let fx = s.on_key(KeyCode::Char('a'), Mods::ALT, None);
     let (_, method, params) = the_request(&fx);
-    assert_eq!(method, "agent/open");
+    assert_eq!(method, "agent/start");
     assert_eq!(params, json!({}), "no `from_view`, no `agent`");
 }
 
@@ -14658,7 +14658,7 @@ fn opening_a_shell_focuses_the_input_and_enters_insert() {
     let _ = key(&mut s, ' ');
     let fx = s.on_key(KeyCode::Char('h'), Mods::ALT, None);
     let (token, method, _) = the_request(&fx);
-    assert_eq!(method, "shell/open");
+    assert_eq!(method, "shell/start");
 
     let _ = s.on_rpc_result(
         token,

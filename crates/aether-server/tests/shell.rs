@@ -10,7 +10,7 @@ use common::*;
 
 // ---- fixtures -----------------------------------------------------------------------------------
 
-/// A workspace with one file in it, ready for `shell/open`.
+/// A workspace with one file in it, ready for `shell/start`.
 async fn setup() -> (aether_server::ServerHandle, Ws, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
@@ -30,17 +30,17 @@ async fn setup() -> (aether_server::ServerHandle, Ws, tempfile::TempDir) {
     (server, ws, dir)
 }
 
-/// Open a shell. Always a new one: `shell/open` takes no "reuse" question any more — returning to
+/// Open a shell. Always a new one: `shell/start` takes no "reuse" question any more — returning to
 /// a shell you have is the shells picker's job.
-async fn open_shell(ws: &mut Ws) -> ShellOpenResult {
-    send_request::<ShellOpen>(ws, &ShellOpenParams::default()).await
+async fn start_shell(ws: &mut Ws) -> ShellStartResult {
+    send_request::<ShellStart>(ws, &ShellStartParams::default()).await
 }
 
 /// Subscribe a viewport to a shell's view, wide and tall enough to hold everything these tests
 /// produce, and load the whole thing.
 async fn shell_window(
     ws: &mut Ws,
-    open: &ShellOpenResult,
+    open: &ShellStartResult,
 ) -> (u64, aether_protocol::viewport::Window) {
     let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         ws,
@@ -67,7 +67,7 @@ async fn shell_window(
 }
 
 /// Type `text` into the shell's input, exactly as a keystroke would.
-async fn type_command(ws: &mut Ws, open: &ShellOpenResult, input_buffer: u64, text: &str) {
+async fn type_command(ws: &mut Ws, open: &ShellStartResult, input_buffer: u64, text: &str) {
     let _: EditResult = send_request::<InputText>(
         ws,
         &InputTextParams {
@@ -85,7 +85,7 @@ async fn type_command(ws: &mut Ws, open: &ShellOpenResult, input_buffer: u64, te
 /// The buffer the shell's input element windows, found by its **role** rather than by the index
 /// the open reported — that index moves as runs are appended above it, which is exactly the sort
 /// of drift the role exists to remove.
-async fn input_buffer_of(server: &aether_server::ServerHandle, open: &ShellOpenResult) -> u64 {
+async fn input_buffer_of(server: &aether_server::ServerHandle, open: &ShellStartResult) -> u64 {
     let s = server.state.lock().await;
     let view = s.try_view(open.opened.view_id).expect("the shell's view");
     view.elements
@@ -98,7 +98,7 @@ async fn input_buffer_of(server: &aether_server::ServerHandle, open: &ShellOpenR
 /// Where run `nth`'s output starts in the transcript.
 async fn run_start(
     server: &aether_server::ServerHandle,
-    open: &ShellOpenResult,
+    open: &ShellStartResult,
     nth: usize,
 ) -> u32 {
     let s = server.state.lock().await;
@@ -149,7 +149,7 @@ async fn input_text(ws: &mut Ws, input: u64) -> String {
 async fn run_and_wait(
     ws: &mut Ws,
     server: &aether_server::ServerHandle,
-    open: &ShellOpenResult,
+    open: &ShellStartResult,
     command: &str,
 ) -> RunState {
     let input = input_buffer_of(server, open).await;
@@ -262,7 +262,7 @@ fn titles(window: &aether_protocol::viewport::Window) -> Vec<String> {
 #[tokio::test]
 async fn opening_a_shell_lands_in_its_input() {
     let (server, mut ws, _dir) = setup().await;
-    let open = open_shell(&mut ws).await;
+    let open = start_shell(&mut ws).await;
     assert_eq!(open.opened.title.as_deref(), Some("Shell 1"));
     assert!(open.opened.read_only, "the transcript is not editable");
     assert!(!open.opened.is_patch, "and it is not a patch either");
@@ -285,7 +285,79 @@ async fn opening_a_shell_lands_in_its_input() {
     assert_eq!(input_text(&mut ws, input).await, "echo hi");
 }
 
-/// `shell/open` **always creates**, even when the shell you have is idle.
+/// Coming back to a shell by any open — its picker row, the MRU, history — lands in its input, the
+/// way `shell/start` does, however it was last left.
+///
+/// A plain `view/open` used to restore the remembered scroll, or none on a first visit, and a
+/// fresh subscribe focuses whatever element the scroll names: the first run's output, with the
+/// view at the top of the transcript rather than at the line you type into.
+#[tokio::test]
+async fn returning_to_a_shell_lands_in_its_input() {
+    let (server, mut ws, _dir) = setup().await;
+    let open = start_shell(&mut ws).await;
+    let (_, _) = shell_window(&mut ws, &open).await;
+    let _ = run_and_wait(&mut ws, &server, &open, "echo hi").await;
+    // Last seen scrolled to the top, over the run — the memory a reopen would otherwise restore.
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: open.opened.view_id,
+            cols: 80,
+            rows: 1,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let _: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
+    let back: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(open.opened.view_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    let scroll = back.scroll.expect("a shell opens somewhere definite");
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: back.view_id,
+            cols: 80,
+            rows: 200,
+            overscan_rows: 0,
+            scroll,
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let input = sub
+        .window
+        .root
+        .input_element()
+        .expect("the window says which element is the input");
+    assert_ne!(input, 0, "the run sits above the input");
+    assert_eq!(scroll.element, input, "the open scrolls to the input");
+    assert_eq!(sub.focus.element, input, "and the subscribe focuses it");
+    assert_eq!(focused_element(&server, sub.viewport_id).await, input);
+}
+
+/// `shell/start` **always creates**, even when the shell you have is idle.
 ///
 /// It used to hand the idle one back — a rule that existed only because there was no way to *list*
 /// the shells, and that made the same key open a new shell or an old one depending on state the
@@ -294,15 +366,15 @@ async fn opening_a_shell_lands_in_its_input() {
 #[tokio::test]
 async fn every_open_mints_the_next_shell() {
     let (_server, mut ws, _dir) = setup().await;
-    let first = open_shell(&mut ws).await;
-    let second = open_shell(&mut ws).await;
+    let first = start_shell(&mut ws).await;
+    let second = start_shell(&mut ws).await;
     assert_ne!(
         second.opened.view_id, first.opened.view_id,
         "an idle shell came back instead of a new one"
     );
     assert_eq!(second.opened.title.as_deref(), Some("Shell 2"));
 
-    let third = open_shell(&mut ws).await;
+    let third = start_shell(&mut ws).await;
     assert_ne!(third.opened.view_id, second.opened.view_id);
     assert_eq!(third.opened.title.as_deref(), Some("Shell 3"));
 }
@@ -317,7 +389,7 @@ async fn a_shell_runs_in_the_project_root() {
     let _: ViewportSubscribeResult =
         send_request::<ViewportSubscribe>(&mut ws, &transient_sub_params(open.buffer_id)).await;
 
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let run = run_and_wait(&mut ws, &server, &shell, "pwd").await;
     assert_eq!(run.status, RunStatus::Exited { code: 0 });
 
@@ -351,7 +423,7 @@ async fn a_shell_runs_in_the_project_root() {
 #[tokio::test]
 async fn a_run_reads_and_clears_the_input() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let input = input_buffer_of(&server, &shell).await;
     type_command(&mut ws, &shell, input, "  echo hello  ").await;
 
@@ -381,7 +453,7 @@ async fn a_run_reads_and_clears_the_input() {
 #[tokio::test]
 async fn an_empty_input_is_refused() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let err = send_request_expect_err::<ShellRun>(
         &mut ws,
         &ShellRunParams {
@@ -469,7 +541,7 @@ async fn press_cancel(
 async fn submit_run(
     ws: &mut Ws,
     server: &aether_server::ServerHandle,
-    shell: &ShellOpenResult,
+    shell: &ShellStartResult,
     line: &str,
 ) -> u64 {
     submit(ws, server, shell, line)
@@ -495,7 +567,7 @@ async fn finished(ws: &mut Ws, run: u64) -> RunState {
 #[tokio::test]
 async fn a_line_entered_while_one_runs_waits_its_turn() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let first = submit_run(&mut ws, &server, &shell, "sleep 100").await;
     let next = submit_run(&mut ws, &server, &shell, "echo next").await;
     let input = input_buffer_of(&server, &shell).await;
@@ -545,7 +617,7 @@ async fn a_line_entered_while_one_runs_waits_its_turn() {
 #[tokio::test]
 async fn a_queued_line_can_be_taken_out() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let first = submit_run(&mut ws, &server, &shell, "sleep 100").await;
     let dropped = submit_run(&mut ws, &server, &shell, "echo dropped").await;
     let kept = submit_run(&mut ws, &server, &shell, "echo kept").await;
@@ -599,7 +671,7 @@ async fn a_directory_change_is_never_queued() {
     let root = dir.path().canonicalize().unwrap();
     std::fs::create_dir(root.join("sub")).unwrap();
     let sub = root.join("sub").to_string_lossy().into_owned();
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     submit_run(&mut ws, &server, &shell, "sleep 100").await;
     let before = submit_run(&mut ws, &server, &shell, "pwd").await;
 
@@ -641,7 +713,7 @@ async fn a_directory_change_is_never_queued() {
 #[tokio::test]
 async fn a_queued_line_is_checked_when_its_turn_comes() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let maker = submit_run(
         &mut ws,
         &server,
@@ -697,7 +769,7 @@ async fn a_queued_line_is_checked_when_its_turn_comes() {
 #[tokio::test]
 async fn how_a_run_went_is_marked_on_its_box() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let run = run_and_wait(&mut ws, &server, &shell, "sh -c \"exit 3\"").await;
     assert_eq!(run.status, RunStatus::Exited { code: 3 });
 
@@ -730,7 +802,7 @@ async fn how_a_run_went_is_marked_on_its_box() {
 #[tokio::test]
 async fn output_arrives_in_more_than_one_push() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let (viewport_id, _) = shell_window(&mut ws, &shell).await;
     let input = input_buffer_of(&server, &shell).await;
     type_command(
@@ -778,7 +850,7 @@ async fn output_arrives_in_more_than_one_push() {
 #[tokio::test]
 async fn a_run_appears_before_it_prints_anything() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let (viewport_id, _) = shell_window(&mut ws, &shell).await;
     let input = input_buffer_of(&server, &shell).await;
     type_command(&mut ws, &shell, input, "sleep 30").await;
@@ -816,7 +888,7 @@ async fn a_run_appears_before_it_prints_anything() {
 #[tokio::test]
 async fn a_carriage_return_rewrites_the_line_it_lands_in() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let run = run_and_wait(
         &mut ws,
         &server,
@@ -841,7 +913,7 @@ async fn a_carriage_return_rewrites_the_line_it_lands_in() {
 #[tokio::test]
 async fn ansi_escapes_never_reach_the_transcript() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(
         &mut ws,
         &server,
@@ -857,7 +929,7 @@ async fn ansi_escapes_never_reach_the_transcript() {
 #[tokio::test]
 async fn both_streams_land_in_the_transcript() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(
         &mut ws,
         &server,
@@ -881,7 +953,7 @@ async fn both_streams_land_in_the_transcript() {
 async fn a_silent_run_shows_no_output() {
     use aether_protocol::ui::Element;
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "true").await;
     run_and_wait(&mut ws, &server, &shell, "echo hi").await;
     let (viewport_id, window) = shell_window(&mut ws, &shell).await;
@@ -944,7 +1016,7 @@ async fn a_silent_run_shows_no_output() {
 #[tokio::test]
 async fn a_second_run_appends_without_moving_the_first() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "echo first").await;
     let before = {
         let s = server.state.lock().await;
@@ -994,7 +1066,7 @@ async fn a_second_run_appends_without_moving_the_first() {
 async fn every_run_and_the_input_sit_in_their_own_box() {
     use aether_protocol::ui::Element;
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "echo first").await;
     run_and_wait(&mut ws, &server, &shell, "echo second").await;
 
@@ -1090,7 +1162,7 @@ async fn input_selection(
 }
 
 /// Submit what is in the input and expect a refusal: the error object the server answered.
-async fn refused(ws: &mut Ws, shell: &ShellOpenResult) -> serde_json::Value {
+async fn refused(ws: &mut Ws, shell: &ShellStartResult) -> serde_json::Value {
     send_request_expect_error::<ShellRun>(
         ws,
         &ShellRunParams {
@@ -1109,7 +1181,7 @@ fn pos(line: u32, col: u32) -> aether_protocol::LogicalPosition {
 #[tokio::test]
 async fn an_unknown_command_is_refused_and_selected() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let input = input_buffer_of(&server, &shell).await;
     type_command(&mut ws, &shell, input, "lss -la").await;
 
@@ -1161,7 +1233,7 @@ async fn each_kind_of_refusal_names_its_word() {
     ];
     for (line, message, (start, end)) in cases {
         // A fresh shell per case, so each starts from an empty input in the same directory.
-        let shell = open_shell(&mut ws).await;
+        let shell = start_shell(&mut ws).await;
         let input = input_buffer_of(&server, &shell).await;
         type_command(&mut ws, &shell, input, line).await;
         let err = refused(&mut ws, &shell).await;
@@ -1179,7 +1251,7 @@ async fn each_kind_of_refusal_names_its_word() {
 async fn submit(
     ws: &mut Ws,
     server: &aether_server::ServerHandle,
-    shell: &ShellOpenResult,
+    shell: &ShellStartResult,
     line: &str,
 ) -> ShellRunResult {
     let input = input_buffer_of(server, shell).await;
@@ -1202,7 +1274,7 @@ async fn a_path_shaped_word_changes_directory() {
     let root = dir.path().canonicalize().unwrap();
     std::fs::create_dir(root.join("sub")).unwrap();
     let sub = root.join("sub").to_string_lossy().into_owned();
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
 
     let moved = submit(&mut ws, &server, &shell, "./sub").await;
     assert_eq!(moved.run, None, "nothing ran");
@@ -1243,7 +1315,7 @@ async fn a_path_shaped_word_changes_directory() {
 #[tokio::test]
 async fn an_assignment_persists_across_runs() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
 
     let run = run_and_wait(&mut ws, &server, &shell, "GREETING=hello").await;
     assert_eq!(run.status, RunStatus::Exited { code: 0 });
@@ -1269,7 +1341,7 @@ async fn an_assignment_persists_across_runs() {
 #[tokio::test]
 async fn the_users_shell_is_just_a_command() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let run = run_and_wait(&mut ws, &server, &shell, "sh -c \"exit 1\"").await;
     assert_eq!(run.status, RunStatus::Exited { code: 1 });
     run_and_wait(&mut ws, &server, &shell, "sh -c \"echo hi | tr a-z A-Z\"").await;
@@ -1289,7 +1361,7 @@ async fn the_users_shell_is_just_a_command() {
 #[tokio::test]
 async fn a_pipeline_runs_and_reports_its_first_failing_stage() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let run = run_and_wait(&mut ws, &server, &shell, "printf \"b\\na\\n\" | sort").await;
     assert_eq!(run.status, RunStatus::Exited { code: 0 });
     let (_, window) = shell_window(&mut ws, &shell).await;
@@ -1306,7 +1378,7 @@ async fn a_pipeline_runs_and_reports_its_first_failing_stage() {
 #[tokio::test]
 async fn lists_short_circuit() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let run = run_and_wait(&mut ws, &server, &shell, "false && echo no").await;
     assert_eq!(run.status, RunStatus::Exited { code: 1 });
     let run = run_and_wait(&mut ws, &server, &shell, "false || echo fallback").await;
@@ -1324,7 +1396,7 @@ async fn lists_short_circuit() {
 async fn redirections_write_and_read_files() {
     let (server, mut ws, dir) = setup().await;
     std::fs::write(dir.path().join("in.txt"), "b\na\n").unwrap();
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "echo hi > out.txt").await;
     run_and_wait(&mut ws, &server, &shell, "echo more >> out.txt").await;
     run_and_wait(&mut ws, &server, &shell, "cat out.txt").await;
@@ -1350,7 +1422,7 @@ async fn redirections_write_and_read_files() {
 #[tokio::test]
 async fn a_prefix_assignment_is_for_that_command_only() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "FOO=bar sh -c \"echo \\$FOO\"").await;
     let (_, window) = shell_window(&mut ws, &shell).await;
     assert_eq!(body(&window)[0], "bar");
@@ -1366,7 +1438,7 @@ async fn a_prefix_assignment_is_for_that_command_only() {
 #[tokio::test]
 async fn the_current_file_word_names_the_file_being_looked_at() {
     let (server, mut ws, dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let input = input_buffer_of(&server, &shell).await;
     type_command(&mut ws, &shell, input, "cat %").await;
     assert_eq!(
@@ -1384,7 +1456,7 @@ async fn the_current_file_word_names_the_file_being_looked_at() {
     )
     .await;
     // Back to the shell, which is now the most recent view — and not a file.
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "cat %").await;
     let (_, window) = shell_window(&mut ws, &shell).await;
     assert_eq!(body(&window)[0], "hello");
@@ -1397,7 +1469,7 @@ async fn globs_expand_recursively() {
     std::fs::create_dir_all(dir.path().join("src/deep")).unwrap();
     std::fs::write(dir.path().join("src/x.rs"), "").unwrap();
     std::fs::write(dir.path().join("src/deep/y.rs"), "").unwrap();
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "printf \"%s\\n\" **/*.rs").await;
     let (_, window) = shell_window(&mut ws, &shell).await;
     assert_eq!(
@@ -1411,7 +1483,7 @@ async fn globs_expand_recursively() {
 async fn pwd_and_type_are_builtins() {
     let (server, mut ws, dir) = setup().await;
     let root = dir.path().canonicalize().unwrap();
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "pwd").await;
     run_and_wait(&mut ws, &server, &shell, "type ls pwd").await;
     let run = run_and_wait(&mut ws, &server, &shell, "type nope").await;
@@ -1430,7 +1502,7 @@ async fn pwd_and_type_are_builtins() {
 async fn a_vanished_directory_is_reported() {
     let (server, mut ws, dir) = setup().await;
     std::fs::create_dir(dir.path().join("sub")).unwrap();
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     submit(&mut ws, &server, &shell, "./sub").await;
     std::fs::remove_dir(dir.path().join("sub")).unwrap();
     let run = run_and_wait(&mut ws, &server, &shell, "pwd").await;
@@ -1447,7 +1519,7 @@ async fn a_vanished_directory_is_reported() {
 #[tokio::test]
 async fn cancelling_kills_every_stage_of_a_pipeline() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     submit(&mut ws, &server, &shell, "sleep 100 | cat").await;
     let cancelled: ShellCancelResult = send_request::<ShellCancel>(
         &mut ws,
@@ -1513,7 +1585,7 @@ async fn a_shell_survives_a_server_restart() {
         .unwrap();
         let mut ws = Ws::connect(&server).await;
         activate_p(&mut ws).await;
-        let shell = open_shell(&mut ws).await;
+        let shell = start_shell(&mut ws).await;
         run_and_wait(&mut ws, &server, &shell, "echo one").await;
         run_and_wait(&mut ws, &server, &shell, "GREETING=hello").await;
         submit(&mut ws, &server, &shell, "./sub").await;
@@ -1609,7 +1681,7 @@ async fn a_shell_survives_a_server_restart() {
         "…and not of the buffers picker: {buffer_rows:?}"
     );
 
-    let fresh = open_shell(&mut ws).await;
+    let fresh = start_shell(&mut ws).await;
     assert_eq!(fresh.opened.title.as_deref(), Some("Shell 2"));
 
     let restored: ViewOpenResult = send_request::<ViewOpen>(
@@ -1621,7 +1693,7 @@ async fn a_shell_survives_a_server_restart() {
     )
     .await;
     assert_eq!(restored.title.as_deref(), Some("Shell 1"));
-    let shell = ShellOpenResult {
+    let shell = ShellStartResult {
         opened: restored,
         input: 0,
         not_run: None,
@@ -1675,7 +1747,7 @@ async fn a_shell_survives_a_server_restart() {
 #[tokio::test]
 async fn the_input_is_not_highlighted_as_bash() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let input = input_buffer_of(&server, &shell).await;
     let s = server.state.lock().await;
     assert_eq!(s.doc_of(input).language, None);
@@ -1687,7 +1759,7 @@ async fn the_input_is_not_highlighted_as_bash() {
 #[tokio::test]
 async fn the_caret_stays_in_the_input_across_a_run() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let (viewport_id, window) = shell_window(&mut ws, &shell).await;
     assert_eq!(
         window.root.input_element(),
@@ -1731,7 +1803,7 @@ async fn the_caret_stays_in_the_input_across_a_run() {
 #[tokio::test]
 async fn the_outline_steps_the_runs_and_changes_step_nothing() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "echo first").await;
     run_and_wait(&mut ws, &server, &shell, "echo second").await;
     let (viewport_id, _) = shell_window(&mut ws, &shell).await;
@@ -1858,7 +1930,7 @@ async fn the_outline_steps_the_runs_and_changes_step_nothing() {
 #[tokio::test]
 async fn cancelling_kills_the_run_and_its_group() {
     let (server, mut ws, dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let marker = dir.path().join("survivor");
     let input = input_buffer_of(&server, &shell).await;
     type_command(
@@ -1917,7 +1989,7 @@ async fn cancelling_kills_the_run_and_its_group() {
 #[tokio::test]
 async fn closing_a_shell_kills_its_run() {
     let (server, mut ws, dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let marker = dir.path().join("survivor");
     let input = input_buffer_of(&server, &shell).await;
     type_command(
@@ -1969,7 +2041,7 @@ async fn closing_a_shell_kills_its_run() {
 #[tokio::test]
 async fn a_runaway_run_is_capped() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let run = run_and_wait(&mut ws, &server, &shell, "yes 0123456789abcdef").await;
     assert_eq!(run.status, RunStatus::Truncated);
 
@@ -1995,7 +2067,7 @@ async fn a_runaway_run_is_capped() {
 #[tokio::test]
 async fn the_input_is_never_listed_never_saved_and_never_dirty() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let input = input_buffer_of(&server, &shell).await;
     type_command(&mut ws, &shell, input, "cargo build").await;
 
@@ -2056,7 +2128,7 @@ async fn the_input_is_never_listed_never_saved_and_never_dirty() {
 #[tokio::test]
 async fn typing_a_command_does_not_make_the_shell_look_modified() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let input = input_buffer_of(&server, &shell).await;
     let (_, window) = shell_window(&mut ws, &shell).await;
     assert!(!window.other_elements_dirty);
@@ -2074,7 +2146,7 @@ async fn typing_a_command_does_not_make_the_shell_look_modified() {
 #[tokio::test]
 async fn a_running_command_pins_the_server_open() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let input = input_buffer_of(&server, &shell).await;
     {
         let s = server.state.lock().await;
@@ -2112,7 +2184,7 @@ async fn a_running_command_pins_the_server_open() {
 #[tokio::test]
 async fn a_run_transition_repushes_the_shells_picker() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let _ = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Shells)).await;
 
     let input = input_buffer_of(&server, &shell).await;
@@ -2168,7 +2240,7 @@ async fn a_running_shell_is_work_in_progress_until_cancelled() {
         ActivityCancel, ActivityCancelParams, ActivityCancelResult, ActivityChanged, ActivityId,
     };
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let input = input_buffer_of(&server, &shell).await;
     type_command(&mut ws, &shell, input, "sleep 100").await;
     ws.clear_seen();
@@ -2250,7 +2322,7 @@ async fn another_workspaces_shell_is_not_its_business() {
     }
     on_b.clear_seen();
 
-    let shell = open_shell(&mut on_a).await;
+    let shell = start_shell(&mut on_a).await;
     run_and_wait(&mut on_a, &server, &shell, "echo hi").await;
     settled(&server).await;
     // Anything pushed to `b` by now arrives ahead of this answer.
@@ -2288,7 +2360,7 @@ async fn shell_rpcs_refuse_a_view_that_is_not_a_shell() {
 async fn follow(
     ws: &mut Ws,
     server: &aether_server::ServerHandle,
-    open: &ShellOpenResult,
+    open: &ShellStartResult,
     line: u32,
 ) -> ViewFollowLineResult {
     // The viewport is what says which element the cursor is in; element 0 is the first run.
@@ -2315,7 +2387,7 @@ async fn enter_follows_a_path_printed_by_a_command() {
         "fn main() {}\nlet x = 1;\nlet y = 2;\n",
     )
     .unwrap();
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     // The shapes a compiler prints, one per line.
     run_and_wait(
         &mut ws,
@@ -2361,7 +2433,7 @@ async fn following_an_output_line_opens_a_preview_and_never_demotes() {
     let (server, mut ws, dir) = setup().await;
     std::fs::create_dir(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "printf \"src/main.rs:1:1\\n\"").await;
 
     let opened = follow(&mut ws, &server, &shell, 0)
@@ -2390,7 +2462,7 @@ async fn following_an_output_line_opens_a_preview_and_never_demotes() {
 #[tokio::test]
 async fn enter_on_something_that_only_looks_like_a_path_does_nothing() {
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &shell, "printf \"10:30:45 done\\n\"").await;
     let followed = follow(&mut ws, &server, &shell, 0).await;
     assert!(followed.opened.is_none());
@@ -2425,7 +2497,7 @@ async fn history_skips_a_closed_shell() {
     let (_server, mut ws, _dir) = setup().await;
     let a: aether_protocol::view::ViewOpenResult =
         send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", None)).await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     // Into the shell from the file, then back to the file from the shell: two history entries,
     // the shell's on top.
     let _: aether_protocol::view::ViewOpenResult = send_request::<ViewOpen>(
@@ -2479,10 +2551,10 @@ async fn history_skips_a_closed_shell() {
 async fn a_shell_view_cannot_be_made_transient() {
     use aether_protocol::view::{ViewSetTransient, ViewSetTransientParams, ViewSetTransientResult};
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     assert!(
         !shell.opened.transient,
-        "a shell is created kept — an open that says nothing would be a preview, so `shell/open` \
+        "a shell is created kept — an open that says nothing would be a preview, so `shell/start` \
          says so"
     );
 
@@ -2520,7 +2592,7 @@ async fn a_shell_view_cannot_be_made_transient() {
 async fn space_k_on_a_shells_input_keeps_nothing() {
     use aether_protocol::view::{ViewSetTransient, ViewSetTransientParams, ViewSetTransientResult};
     let (server, mut ws, _dir) = setup().await;
-    let shell = open_shell(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
     let (viewport_id, _) = shell_window(&mut ws, &shell).await;
     let input_element = {
         let s = server.state.lock().await;
@@ -2601,13 +2673,13 @@ async fn space_k_on_a_shells_input_keeps_nothing() {
 /// A shell opened in a directory with a line to run starts there and runs it at once — a task is
 /// exactly this. The line goes through the input like a typed one, so the input is clear after.
 #[tokio::test]
-async fn a_shell_opened_with_a_command_runs_it_where_asked() {
+async fn a_shell_started_with_a_command_runs_it_where_asked() {
     let (server, mut ws, dir) = setup().await;
     let sub = dir.path().canonicalize().unwrap().join("sub");
     std::fs::create_dir(&sub).unwrap();
-    let open: ShellOpenResult = send_request::<ShellOpen>(
+    let open: ShellStartResult = send_request::<ShellStart>(
         &mut ws,
-        &ShellOpenParams {
+        &ShellStartParams {
             cwd: Some(sub.to_string_lossy().into_owned()),
             input: Some("pwd".into()),
             run: true,
@@ -2640,11 +2712,11 @@ async fn a_shell_opened_with_a_command_runs_it_where_asked() {
 
 /// Without `run`, the line waits in the input — `Ctrl-e` on a task, to add arguments first.
 #[tokio::test]
-async fn a_shell_opened_with_a_command_but_no_run_leaves_it_typed() {
+async fn a_shell_started_with_a_command_but_no_run_leaves_it_typed() {
     let (server, mut ws, _dir) = setup().await;
-    let open: ShellOpenResult = send_request::<ShellOpen>(
+    let open: ShellStartResult = send_request::<ShellStart>(
         &mut ws,
-        &ShellOpenParams {
+        &ShellStartParams {
             cwd: None,
             input: Some("echo hi".into()),
             run: false,
@@ -2668,9 +2740,9 @@ async fn a_shell_opened_with_a_command_but_no_run_leaves_it_typed() {
 #[tokio::test]
 async fn a_refused_line_still_opens_its_shell() {
     let (server, mut ws, _dir) = setup().await;
-    let open: ShellOpenResult = send_request::<ShellOpen>(
+    let open: ShellStartResult = send_request::<ShellStart>(
         &mut ws,
-        &ShellOpenParams {
+        &ShellStartParams {
             cwd: None,
             input: Some("lss -la".into()),
             run: true,
@@ -2697,9 +2769,9 @@ async fn a_refused_line_still_opens_its_shell() {
 async fn opening_a_shell_in_a_missing_directory_is_refused() {
     let (_server, mut ws, dir) = setup().await;
     let missing = dir.path().join("nope");
-    let err = send_request_expect_error::<ShellOpen>(
+    let err = send_request_expect_error::<ShellStart>(
         &mut ws,
-        &ShellOpenParams {
+        &ShellStartParams {
             cwd: Some(missing.to_string_lossy().into_owned()),
             input: None,
             run: false,
@@ -2718,10 +2790,10 @@ async fn opening_a_shell_in_a_missing_directory_is_refused() {
 
 // ---- reuse: the shell that last ran a task's line ------------------------------------------------
 
-/// `shell/open` as the tasks picker sends it: here, this line, run it, and use the shell that ran
+/// `shell/start` as the tasks picker sends it: here, this line, run it, and use the shell that ran
 /// it last if there is one.
-fn task_params(dir: &std::path::Path, line: &str, run: bool) -> ShellOpenParams {
-    ShellOpenParams {
+fn task_params(dir: &std::path::Path, line: &str, run: bool) -> ShellStartParams {
+    ShellStartParams {
         cwd: Some(dir.to_string_lossy().into_owned()),
         input: Some(line.into()),
         run,
@@ -2747,14 +2819,14 @@ async fn run_count(
 async fn a_task_reruns_in_the_shell_that_last_ran_it() {
     let (server, mut ws, dir) = setup().await;
     let root = dir.path().canonicalize().unwrap();
-    let first: ShellOpenResult =
-        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    let first: ShellStartResult =
+        send_request::<ShellStart>(&mut ws, &task_params(&root, "echo hi", true)).await;
     finished_run(&mut ws).await;
     let input = input_buffer_of(&server, &first).await;
     type_command(&mut ws, &first, input, "draft").await;
 
-    let again: ShellOpenResult =
-        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    let again: ShellStartResult =
+        send_request::<ShellStart>(&mut ws, &task_params(&root, "echo hi", true)).await;
     assert_eq!(again.opened.view_id, first.opened.view_id, "the same shell");
     assert_eq!(again.not_run, None);
     finished_run(&mut ws).await;
@@ -2775,10 +2847,10 @@ async fn a_shell_matches_a_task_by_its_directory_and_last_command() {
     std::fs::create_dir(root.join("sub")).unwrap();
 
     // Typed by hand in a plain shell, which starts at the root.
-    let plain = open_shell(&mut ws).await;
+    let plain = start_shell(&mut ws).await;
     run_and_wait(&mut ws, &server, &plain, "echo hi").await;
-    let task: ShellOpenResult =
-        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    let task: ShellStartResult =
+        send_request::<ShellStart>(&mut ws, &task_params(&root, "echo hi", true)).await;
     assert_eq!(
         task.opened.view_id, plain.opened.view_id,
         "a hand-typed run counts"
@@ -2786,8 +2858,8 @@ async fn a_shell_matches_a_task_by_its_directory_and_last_command() {
     finished_run(&mut ws).await;
 
     // The same line elsewhere is another task.
-    let sub: ShellOpenResult =
-        send_request::<ShellOpen>(&mut ws, &task_params(&root.join("sub"), "echo hi", true)).await;
+    let sub: ShellStartResult =
+        send_request::<ShellStart>(&mut ws, &task_params(&root.join("sub"), "echo hi", true)).await;
     assert_ne!(
         sub.opened.view_id, plain.opened.view_id,
         "another directory"
@@ -2796,8 +2868,8 @@ async fn a_shell_matches_a_task_by_its_directory_and_last_command() {
 
     // Something else run in the matched shell lets it go.
     run_and_wait(&mut ws, &server, &plain, "echo other").await;
-    let after: ShellOpenResult =
-        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    let after: ShellStartResult =
+        send_request::<ShellStart>(&mut ws, &task_params(&root, "echo hi", true)).await;
     assert_ne!(
         after.opened.view_id, plain.opened.view_id,
         "no longer its last command"
@@ -2812,10 +2884,10 @@ async fn a_shell_matches_a_task_by_its_directory_and_last_command() {
 async fn a_busy_task_shell_is_switched_to_and_not_rerun() {
     let (server, mut ws, dir) = setup().await;
     let root = dir.path().canonicalize().unwrap();
-    let first: ShellOpenResult =
-        send_request::<ShellOpen>(&mut ws, &task_params(&root, "sleep 30", true)).await;
-    let again: ShellOpenResult =
-        send_request::<ShellOpen>(&mut ws, &task_params(&root, "sleep 30", true)).await;
+    let first: ShellStartResult =
+        send_request::<ShellStart>(&mut ws, &task_params(&root, "sleep 30", true)).await;
+    let again: ShellStartResult =
+        send_request::<ShellStart>(&mut ws, &task_params(&root, "sleep 30", true)).await;
     assert_eq!(again.opened.view_id, first.opened.view_id);
     assert!(
         matches!(&again.not_run, Some(NotRun::Busy { message }) if message.contains("sleep 30")),
@@ -2843,14 +2915,14 @@ async fn a_busy_task_shell_is_switched_to_and_not_rerun() {
 async fn editing_a_task_puts_its_line_in_the_matched_shell() {
     let (server, mut ws, dir) = setup().await;
     let root = dir.path().canonicalize().unwrap();
-    let first: ShellOpenResult =
-        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    let first: ShellStartResult =
+        send_request::<ShellStart>(&mut ws, &task_params(&root, "echo hi", true)).await;
     finished_run(&mut ws).await;
     let input = input_buffer_of(&server, &first).await;
     type_command(&mut ws, &first, input, "draft").await;
 
-    let edit: ShellOpenResult =
-        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", false)).await;
+    let edit: ShellStartResult =
+        send_request::<ShellStart>(&mut ws, &task_params(&root, "echo hi", false)).await;
     assert_eq!(edit.opened.view_id, first.opened.view_id);
     assert_eq!(input_text(&mut ws, input).await, "echo hi");
     assert_eq!(run_count(&server, first.opened.view_id).await, 1);
@@ -2875,8 +2947,8 @@ async fn a_task_reuses_a_restored_shell() {
         .unwrap();
         let mut ws = Ws::connect(&server).await;
         activate_p(&mut ws).await;
-        let _: ShellOpenResult =
-            send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+        let _: ShellStartResult =
+            send_request::<ShellStart>(&mut ws, &task_params(&root, "echo hi", true)).await;
         finished_run(&mut ws).await;
         wait_for_snapshot(&backups, 1, "echo hi").await;
         drop(ws);
@@ -2902,8 +2974,8 @@ async fn a_task_reuses_a_restored_shell() {
     let mut ws = Ws::connect(&server).await;
     activate_p(&mut ws).await;
 
-    let again: ShellOpenResult =
-        send_request::<ShellOpen>(&mut ws, &task_params(&root, "echo hi", true)).await;
+    let again: ShellStartResult =
+        send_request::<ShellStart>(&mut ws, &task_params(&root, "echo hi", true)).await;
     assert_eq!(
         again.opened.title.as_deref(),
         Some("Shell 1"),

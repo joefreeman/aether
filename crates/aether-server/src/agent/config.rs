@@ -11,7 +11,7 @@
 /// One launchable agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentSpec {
-    /// Stable across restarts: what a session file and `agent/open { agent }` name.
+    /// Stable across restarts: what a session file and `agent/start { agent }` name.
     pub id: &'static str,
     /// What the picker row and the input's box call it.
     pub name: &'static str,
@@ -21,7 +21,7 @@ pub struct AgentSpec {
     pub args: &'static [&'static str],
 }
 
-/// The agents we know, in the order they are offered. First that resolves wins when `agent/open`
+/// The agents we know, in the order they are offered. First that resolves wins when `agent/start`
 /// names none.
 ///
 /// Both entries mirror the constructors the ACP SDK ships (`AcpAgent::claude_agent()` and
@@ -59,7 +59,7 @@ pub fn available() -> Vec<&'static AgentSpec> {
     KNOWN_AGENTS.iter().filter(|a| on_path(a.program)).collect()
 }
 
-/// The agent `agent/open` uses when it was given no id: the first available.
+/// The agent `agent/start` uses when it was given no id: the first available.
 pub fn default_agent() -> Option<&'static AgentSpec> {
     available().into_iter().next()
 }
@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn ids_are_unique() {
-        // The id is what a session file records and what `agent/open` names; two rows sharing one
+        // The id is what a session file records and what `agent/start` names; two rows sharing one
         // would make restore pick whichever happened to be first.
         let mut ids: Vec<_> = KNOWN_AGENTS.iter().map(|a| a.id).collect();
         ids.sort_unstable();

@@ -12,7 +12,7 @@ use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::{ClientSession, SharedState};
 use aether_protocol::activity::ActivityCancel;
-use aether_protocol::agent::{AgentCancel, AgentOpen, AgentPrompt, AgentRespond};
+use aether_protocol::agent::{AgentCancel, AgentPrompt, AgentRespond, AgentStart};
 use aether_protocol::app::AppInfoGet;
 use aether_protocol::buffer::{BufferContent, BufferCopy, BufferCut, BufferReload, BufferSave};
 use aether_protocol::cursor::{
@@ -49,7 +49,7 @@ use aether_protocol::path::{PathDelete, PathRename};
 use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerSetGroup, PickerView};
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
-use aether_protocol::shell::{ShellCancel, ShellOpen, ShellRun};
+use aether_protocol::shell::{ShellCancel, ShellRun, ShellStart};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::syntax::SyntaxHighlightSnippet;
 use aether_protocol::view::ViewSubmitInput;
@@ -630,12 +630,12 @@ async fn dispatch(
         GitPull::NAME => run!(GitPull, handlers::git_pull),
         GitCancel::NAME => run!(GitCancel, handlers::git_cancel),
         ViewFollowLine::NAME => run!(ViewFollowLine, handlers::view_follow_line),
-        ShellOpen::NAME => run!(ShellOpen, handlers::shell_open),
+        ShellStart::NAME => run!(ShellStart, handlers::shell_start),
         ShellRun::NAME => run!(ShellRun, handlers::shell_run),
         ShellCancel::NAME => run!(ShellCancel, handlers::shell_cancel),
         ViewSubmitInput::NAME => run!(ViewSubmitInput, handlers::view_submit_input),
         ActivityCancel::NAME => run!(ActivityCancel, handlers::activity_cancel),
-        AgentOpen::NAME => run!(AgentOpen, handlers::agent_open),
+        AgentStart::NAME => run!(AgentStart, handlers::agent_start),
         AgentPrompt::NAME => run!(AgentPrompt, handlers::agent_prompt),
         AgentCancel::NAME => run!(AgentCancel, handlers::agent_cancel),
         AgentRespond::NAME => run!(AgentRespond, handlers::agent_respond),

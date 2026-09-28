@@ -20,23 +20,23 @@ use serde::{Deserialize, Serialize};
 /// diff or the plan. Not a global id: a block is only ever named alongside the view it belongs to.
 pub type BlockId = u64;
 
-// ---- agent/open --------------------------------------------------------------------------------
+// ---- agent/start -------------------------------------------------------------------------------
 
-/// Mint an agent conversation — `Space Alt-a`.
+/// Start an agent conversation — `Space Alt-a`.
 ///
-/// **Always creates**, exactly as [`crate::shell::ShellOpen`] does and for the same reason: the
-/// agents picker (`Space a`) is how you return to a conversation you already have, so the open key
-/// has one meaning. The "focused idle conversation, else the MRU idle one" heuristic and the
+/// **Always creates**, exactly as [`crate::shell::ShellStart`] does and for the same reason: the
+/// agents picker (`Space a`) is how you return to a conversation you already have, so the new-agent
+/// key has one meaning. The "focused idle conversation, else the MRU idle one" heuristic and the
 /// `from_view` field it was decided from are both gone.
-pub struct AgentOpen;
-impl RpcMethod for AgentOpen {
-    const NAME: &'static str = "agent/open";
-    type Params = AgentOpenParams;
-    type Result = AgentOpenResult;
+pub struct AgentStart;
+impl RpcMethod for AgentStart {
+    const NAME: &'static str = "agent/start";
+    type Params = AgentStartParams;
+    type Result = AgentStartResult;
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AgentOpenParams {
+pub struct AgentStartParams {
     /// Which agent to launch, by the id of a row in the server's table. `None` takes the first
     /// that resolves on `PATH` — which is the whole of the choice for a machine with one agent
     /// installed, and the reason this is not a required parameter.
@@ -45,11 +45,11 @@ pub struct AgentOpenParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentOpenResult {
-    /// The opened view, in the same shape `git/show` and `shell/open` return — so the client's
+pub struct AgentStartResult {
+    /// The opened view, in the same shape `git/show` and `shell/start` return — so the client's
     /// adopt path is identical and nothing about a conversation needs its own opening ceremony.
     pub opened: crate::view::ViewOpenResult,
-    /// Which element of the view is the input, so the open can land the cursor there without
+    /// Which element of the view is the input, so the start can land the cursor there without
     /// re-deriving it from a window it has not received yet. The same number the window's
     /// [`crate::ui::ElementRole::Input`] marks.
     pub input: FieldId,

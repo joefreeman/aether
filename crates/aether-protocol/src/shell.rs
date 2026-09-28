@@ -20,21 +20,21 @@ use serde::{Deserialize, Serialize};
 /// named alongside the view it belongs to.
 pub type RunId = u64;
 
-// ---- shell/open --------------------------------------------------------------------------------
+// ---- shell/start -------------------------------------------------------------------------------
 
-/// Mint a shell.
+/// Start a shell.
 ///
-/// **Creates**, unless [`ShellOpenParams::reuse`] names a shell by what it shows. "New" is the
-/// explicit half of the pair: the shells picker is which is how you get back to one
-/// you already have. The old "focused idle shell, else the MRU idle one, else a new one" heuristic
+/// **Creates**, unless [`ShellStartParams::reuse`] names a shell by what it shows. "Start" rather
+/// than "open" because opening is `view/open`'s: showing a view that exists, which is how the
+/// shells picker gets you back to one you already have. The old "focused idle shell, else the MRU idle one, else a new one" heuristic
 /// went with the picker — it existed because there was no way to *list* the shells, and it made the
 /// same key mean two different things depending on state the user could not see. `reuse` is not
 /// that: it matches a directory and a last command, which the shells picker's rows display.
-pub struct ShellOpen;
-impl RpcMethod for ShellOpen {
-    const NAME: &'static str = "shell/open";
-    type Params = ShellOpenParams;
-    type Result = ShellOpenResult;
+pub struct ShellStart;
+impl RpcMethod for ShellStart {
+    const NAME: &'static str = "shell/start";
+    type Params = ShellStartParams;
+    type Result = ShellStartResult;
 }
 
 /// All optional: `{}` is the new-shell key's empty shell where a new one starts. The fields are what
@@ -42,7 +42,7 @@ impl RpcMethod for ShellOpen {
 /// picker opens one in the task's directory with its command typed, and runs it unless asked not
 /// to, in the shell that ran it last if there is one (`reuse`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ShellOpenParams {
+pub struct ShellStartParams {
     /// Absolute directory to start in, in place of the one a new shell would pick. Must exist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -76,17 +76,17 @@ pub enum NotRun {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShellOpenResult {
+pub struct ShellStartResult {
     /// The opened view, in the same shape `git/show` returns — so the client's adopt path is
     /// identical and nothing about a shell needs its own opening ceremony.
     pub opened: crate::view::ViewOpenResult,
-    /// Which element of the view is the input, so the open can land the cursor there without
+    /// Which element of the view is the input, so the start can land the cursor there without
     /// re-deriving it from the window it has not received yet. The same number the window's
     /// [`crate::ui::ElementRole::Input`] marks.
     pub input: FieldId,
     /// Why an asked-for run did not start. The shell is open regardless — for a refusal in a new
     /// shell, with the text still in its input and the word at fault selected, exactly as a refused
-    /// `Enter` leaves it: failing the whole open would throw away the one place the line can be
+    /// `Enter` leaves it: failing the whole start would throw away the one place the line can be
     /// fixed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_run: Option<NotRun>,

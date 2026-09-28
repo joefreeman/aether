@@ -8,8 +8,8 @@
 
 use super::*;
 use aether_protocol::shell::{
-    NotRun, RunId, RunState, RunStatus, ShellCancelParams, ShellCancelResult, ShellOpenParams,
-    ShellOpenResult, ShellRunChanged, ShellRunChangedParams, ShellRunParams, ShellRunResult,
+    NotRun, RunId, RunState, RunStatus, ShellCancelParams, ShellCancelResult, ShellRunChanged,
+    ShellRunChangedParams, ShellRunParams, ShellRunResult, ShellStartParams, ShellStartResult,
 };
 use aether_protocol::ViewId;
 use std::path::PathBuf;
@@ -36,13 +36,13 @@ const MAX_BYTES: usize = 16 * 1024 * 1024;
 /// What the transcript says when a run was stopped for producing too much.
 const TRUNCATED: &str = "[output truncated — the run exceeded this shell's output limit]";
 
-// ---- shell/open --------------------------------------------------------------------------------
+// ---- shell/start -------------------------------------------------------------------------------
 
-pub async fn shell_open(
+pub async fn shell_start(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
-    params: ShellOpenParams,
-) -> Result<ShellOpenResult, RpcError> {
+    params: ShellStartParams,
+) -> Result<ShellStartResult, RpcError> {
     let cwd = match params.cwd {
         Some(dir) => {
             let dir = PathBuf::from(dir);
@@ -109,7 +109,7 @@ pub async fn shell_open(
     }
     let (mut opened, mut input) = land_in_input(state, ctx, transcript).await?;
     if !run {
-        return Ok(ShellOpenResult {
+        return Ok(ShellStartResult {
             opened,
             input,
             not_run: None,
@@ -148,14 +148,14 @@ pub async fn shell_open(
             scroll.element = moved;
         }
     }
-    Ok(ShellOpenResult {
+    Ok(ShellStartResult {
         opened,
         input,
         not_run,
     })
 }
 
-/// A shell `shell/open`'s `reuse` found.
+/// A shell `shell/start`'s `reuse` found.
 enum Found {
     /// Open now, by its transcript.
     Live(BufferId),

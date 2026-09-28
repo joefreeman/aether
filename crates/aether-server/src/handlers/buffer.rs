@@ -1252,6 +1252,13 @@ pub async fn record_nav_origin(state: &SharedState, client_id: ClientId, from: O
 
 /// A plain (re)open with no jump restores the saved scroll, so reopening a file lands where you
 /// left it — while the cursor is still where that scroll left it ([`ServerState::restorable_scroll`]).
+///
+/// Except a view with an input — a shell, a conversation — which always opens *at* it, however it
+/// was reached (its picker row, the MRU, history) and however it was left: the line you type into
+/// is its end, and what you come back to it for. A fresh subscribe focuses the element the scroll
+/// names, so this is also what puts the caret there, and a shell clamps a scroll past the end to
+/// the bottom of the view. The remembered scroll is a top-of-screen anchor, and restoring one
+/// focused whichever run happened to sit at the top.
 fn open_scroll(
     s: &ServerState,
     client_id: Option<ClientId>,
@@ -1260,6 +1267,13 @@ fn open_scroll(
 ) -> Option<ScrollPosition> {
     if jump_to.is_some() {
         return None;
+    }
+    if let Some(input) = s.views.get(&view).and_then(|v| v.input_element()) {
+        return Some(ScrollPosition {
+            element: input,
+            line: 0,
+            sub_row: 0.0,
+        });
     }
     client_id.and_then(|c| s.restorable_scroll(c, view))
 }
