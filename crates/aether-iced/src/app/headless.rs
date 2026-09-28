@@ -1859,7 +1859,8 @@ fn a_quote_paints_one_panel() {
         [b[0], b[1], b[2]]
     };
     let mut sim = simulate(&app);
-    // The status bar shares this shade (it is the panel shade too), so the scan stops above it.
+    // The status bar is painted in the page shade the banding scan looks for, so the scan stops
+    // above it.
     let status = seen(&mut sim)
         .into_iter()
         .find(|s| s.visible && s.text.contains("1:1"))

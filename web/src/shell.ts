@@ -3007,7 +3007,16 @@ export class Shell {
   private onScroll(): void {
     // The popover tracks its line via CSS `position: sticky` (it lives in the buffer's spacer), so
     // scrolling needs no repositioning here — just the window prefetch.
+    this.syncStatusLift();
     this.ensureCovered();
+  }
+
+  /** The status bar's shadow reads as "there is more below", so it goes when there isn't: the
+   *  view scrolled to its end, or not scrollable at all. The 1px slack absorbs fractional
+   *  `scrollTop` under zoom. */
+  private syncStatusLift(): void {
+    const el = this.bufferEl;
+    this.statusEl.classList.toggle("at-end", el.scrollHeight - el.clientHeight - el.scrollTop <= 1);
   }
 
   /** **Fetch whatever the screen reaches and hasn't got.** Cheap when it has: the core answers
@@ -3616,6 +3625,7 @@ export class Shell {
     }
     // Everything the screen reaches, loaded — asked here so no path that changes the window or the
     // scroll has to remember to ask. See `ensureCovered`.
+    this.syncStatusLift();
     this.ensureCovered();
   }
 

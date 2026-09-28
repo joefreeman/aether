@@ -7310,6 +7310,12 @@ fn theme_for(kind: &str) -> Style {
     st
 }
 
+/// The status row's ground, shared by every span on it: the app's ground rather than the panel
+/// shade, matching the GUI and browser status bars.
+fn status_bg() -> Color {
+    c(th().bg_app)
+}
+
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     let line = if let Some(confirm) = state.confirm_prompt.as_ref() {
         // Confirm prompt always wins the status row — it can layer over save_prompt.
@@ -7372,7 +7378,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             Span::styled(
                 BUFFER_STATUS_DOT.to_string(),
                 Style::default()
-                    .bg(c(th().bg_panel))
+                    .bg(status_bg())
                     .fg(buffer_status_color(kind)),
             )
         });
@@ -7385,7 +7391,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         // Right segment, left→right: search/grep counters, diagnostic counts, the position /
         // selection indicator, then the LSP glyph pinned to the far edge. A double space precedes
         // each group so they don't run together.
-        let base = Style::default().bg(c(th().bg_panel)).fg(c(th().fg));
+        let base = Style::default().bg(status_bg()).fg(c(th().fg));
         let mut right_spans: Vec<Span<'static>> = Vec::new();
         let gap = |spans: &mut Vec<Span<'static>>| {
             if !spans.is_empty() {
@@ -7449,7 +7455,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             area.width as usize,
         ))
     };
-    let p = Paragraph::new(line).style(Style::default().bg(c(th().bg_panel)).fg(c(th().fg)));
+    let p = Paragraph::new(line).style(Style::default().bg(status_bg()).fg(c(th().fg)));
     f.render_widget(p, area);
 }
 
@@ -7613,16 +7619,16 @@ fn draw_save_prompt_spans(
     _total_width: usize,
 ) -> (Vec<Span<'static>>, u16) {
     use crate::picker::ChipEditorField;
-    let base_style = Style::default().bg(c(th().bg_panel)).fg(c(th().fg));
+    let base_style = Style::default().bg(status_bg()).fg(c(th().fg));
     // The chosen-root label / `:` separator share the explorer's committed-prefix blue.
-    let prefix_style = Style::default().bg(c(th().bg_panel)).fg(c(th().accent));
+    let prefix_style = Style::default().bg(status_bg()).fg(c(th().accent));
     // Ghost / suggestion text (`ghost_text`). The faint shade won't do — it's only ~17
     // brightness off the panel and reads as invisible on the status bar; nor the `DIM` modifier
     // (some terminals ignore it for bright foregrounds). So the role is a mid-tone readable on
     // the panel yet plainly dimmer than the body text — off-palette in both modes.
-    let ghost_style = Style::default().bg(c(th().bg_panel)).fg(c(th().ghost_text));
+    let ghost_style = Style::default().bg(status_bg()).fg(c(th().ghost_text));
     // An invalid segment (root matching no label / path whose parent doesn't exist) renders red.
-    let invalid_style = Style::default().bg(c(th().bg_panel)).fg(c(th().error));
+    let invalid_style = Style::default().bg(status_bg()).fg(c(th().error));
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut w: usize = 0;
@@ -7702,7 +7708,7 @@ fn status_message_style(msg: &crate::app::StatusMessage) -> Style {
         StatusKind::Warning => t.warning,
         StatusKind::Error => t.error,
     };
-    Style::default().bg(c(t.bg_panel)).fg(c(fg))
+    Style::default().bg(status_bg()).fg(c(fg))
 }
 
 /// The status row's leading label: an optional `[workspace] ` prefix, the file label (its name and,
@@ -7744,7 +7750,7 @@ fn build_editor_status_spans(
     // Empty for every buffer that is not a file at a revision, which is all of them but one kind.
     let commit = file_label.commit_suffix().unwrap_or_default();
     let file_label = file_label.name.as_str();
-    let base_style = Style::default().bg(c(th().bg_panel)).fg(c(th().fg));
+    let base_style = Style::default().bg(status_bg()).fg(c(th().fg));
     // A transient (preview) buffer slants the file label (root + path — not the workspace name)
     // instead of spending row width on an explicit marker. Terminals without italic support
     // just show it upright.
@@ -7901,12 +7907,12 @@ fn work_status_spans(state: &AppState) -> Vec<Span<'static>> {
     let Some(n) = state.work_in_progress else {
         return Vec::new();
     };
-    let style = Style::default().bg(c(th().bg_panel)).fg(c(th().work));
+    let style = Style::default().bg(status_bg()).fg(c(th().work));
     vec![Span::styled(format!("⟳ {n}"), style)]
 }
 
 fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
-    let bg = Style::default().bg(c(th().bg_panel));
+    let bg = Style::default().bg(status_bg());
     let meta = bg.fg(c(th().accent_alt)); // branch / base: the secondary accent, distinct from the body-text path
     let mut parts: Vec<Span<'static>> = Vec::new();
     let Some(ed) = state.editor.as_ref() else {
@@ -8008,7 +8014,7 @@ fn git_status_spans(state: &AppState) -> Vec<Span<'static>> {
 /// `✗ 2`). Empty when the buffer has none. A space sits between each glyph and its count (the
 /// `✗`/`⚠` glyphs read wide), and the severity segments are separated by a space.
 fn diagnostic_count_spans(state: &AppState) -> Vec<Span<'static>> {
-    let bg = Style::default().bg(c(th().bg_panel));
+    let bg = Style::default().bg(status_bg());
     let mut parts: Vec<Span<'static>> = Vec::new();
     let Some(counts) = state
         .editor
@@ -8048,7 +8054,7 @@ fn lsp_indicator_span(state: &AppState) -> Option<Span<'static>> {
     let dot = LspDot::for_server(status);
     Some(Span::styled(
         lsp_glyph(dot).to_string(),
-        Style::default().bg(c(th().bg_panel)).fg(lsp_dot_color(dot)),
+        Style::default().bg(status_bg()).fg(lsp_dot_color(dot)),
     ))
 }
 

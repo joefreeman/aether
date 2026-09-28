@@ -101,7 +101,7 @@ pub struct Theme {
     /// document is read, not edited, and it sits on the ground like every other thing that is not
     /// a row of the buffer.
     pub bg: Rgb,
-    /// Status line, panels, picker surfaces.
+    /// Panels and picker surfaces.
     pub bg_panel: Rgb,
     /// Chrome selection: picker active row, chips, in-chrome selections.
     pub bg_selection: Rgb,

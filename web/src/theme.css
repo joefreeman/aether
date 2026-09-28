@@ -39,7 +39,7 @@
                         and rendered prose — the reading page and an agent's reply */
   --bg: var(--nord0); /* the editor well: rows of buffer text, gutter included — and the code
                          panels in a rendered document, which are text of that kind */
-  --bg-panel: var(--nord1); /* status line, panels, picker surfaces */
+  --bg-panel: var(--nord1); /* panels, picker surfaces */
   --bg-selection: var(--nord2); /* chrome selection: picker active row, chips */
   --bg-visual: var(--nord10); /* content selection: visual mode, and the reader's blocks */
   --fill-dim: var(--nord3); /* muted fills: search-hit tint, sneak word band */
@@ -418,7 +418,9 @@ html, body, #app {
   display: flex;
   justify-content: space-between;
   gap: 12px;
-  background: var(--bg-panel);
+  /* The ground, not the panel shade: the shadow is what sets the bar off from a view scrolled
+     short of its end, and at the end it should read as part of the ground below the content. */
+  background: var(--bg-app);
   color: var(--fg);
   font: var(--ui-font-size)/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   padding: 2px 8px;
@@ -428,7 +430,10 @@ html, body, #app {
   position: relative;
   z-index: 5;
   box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.15);
+  transition: box-shadow 120ms;
 }
+/* Nothing below the screen: nothing for the bar to sit above. */
+#status.at-end { box-shadow: none; }
 /* Flex row of groups (file + git) with a gap between them; the file group shrinks/ellipsises so
    the git group keeps its space. `min-width: 0` lets the file group truncate below its content. */
 .status-left { display: flex; align-items: baseline; gap: 12px; overflow: hidden; min-width: 0; }

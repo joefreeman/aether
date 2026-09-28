@@ -5194,19 +5194,33 @@ impl App {
         // indicator and language-server dot) always gets its natural width and can never be pushed
         // off the end — clipping the whole row instead meant an overlong breadcrumb shoved the
         // position out of the window entirely, losing the more useful of the two.
+        let at_end = if self.reader_scroller() {
+            // Unmeasured yet reads as "at the end": no shadow beats one that flickers off.
+            self.read_scroll_px >= self.read_scroll_max.unwrap_or(0.0) - 0.5
+        } else {
+            self.scroll_px >= self.max_scroll_px() - 0.5
+        };
         let bar = container(
             row![container(left).width(Length::Fill).clip(true), right,].width(Length::Fill),
         )
         .padding([3, STATUS_PAD_X as u16])
         .width(Length::Fill)
         .style(move |_| container::Style {
-            background: Some(p.bg_panel.into()),
+            // The ground, not the panel shade: the shadow sets the bar off from a view scrolled
+            // short of its end, and at the end it reads as part of the ground below the content.
+            background: Some(p.bg_app.into()),
             text_color: Some(p.fg),
             // A subtle lift above the pane: the bar sits at the bottom, so the shadow casts upward.
-            shadow: iced::Shadow {
-                color: iced::Color::from_rgba8(0, 0, 0, 0.15),
-                offset: iced::Vector::new(0.0, -1.0),
-                blur_radius: 4.0,
+            // It reads as "there is more below", so it goes when there isn't — the view scrolled
+            // to its end, or not scrollable at all.
+            shadow: if at_end {
+                iced::Shadow::default()
+            } else {
+                iced::Shadow {
+                    color: iced::Color::from_rgba8(0, 0, 0, 0.15),
+                    offset: iced::Vector::new(0.0, -1.0),
+                    blur_radius: 4.0,
+                }
             },
             ..container::Style::default()
         });
