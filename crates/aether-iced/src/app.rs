@@ -2498,7 +2498,9 @@ impl App {
         )
     }
 
-    /// The viewport grid for the current cell metrics + editor area, as sent to the server.
+    /// The viewport grid for the current cell metrics + editor area, as sent to the server. Always
+    /// less [`PAD`], padded view or not: the grid is the viewport's, and moving between an ordinary
+    /// buffer and a composed view must not resize it.
     fn current_grid(&self) -> Option<(u32, u32)> {
         let cell = self.cell?;
         let cols = ((self.view_size.width / cell.width) as u32).saturating_sub(GUTTER_COLS);
@@ -2548,9 +2550,14 @@ impl App {
 
     // ---- scroll / view sync -----------------------------------------------------------------
 
+    /// The view's breathing room above its first row and below its last — see [`editor::pad_of`].
+    fn pad(&self) -> f32 {
+        editor::pad_of(self.session.view.window.as_ref())
+    }
+
     fn visible_rows(&self) -> u32 {
         match self.cell {
-            Some(cell) => (((self.view_size.height - PAD) / cell.height) as u32).max(1),
+            Some(cell) => (((self.view_size.height - self.pad()) / cell.height) as u32).max(1),
             None => 1,
         }
     }
@@ -2591,7 +2598,7 @@ impl App {
 
     fn max_scroll_px(&self) -> f32 {
         match (&self.session.view.window, self.cell) {
-            (Some(w), Some(_)) => (PAD * 2.0
+            (Some(w), Some(_)) => (self.pad() * 2.0
                 + self.px_of_units(grid::total_rows(&w.root, &self.measured) as f32)
                 - self.view_size.height)
                 .max(0.0),
@@ -2767,7 +2774,7 @@ impl App {
         let px = if self.reader_scroller() {
             self.read_viewport_px()
         } else {
-            self.view_size.height - PAD
+            self.view_size.height - self.pad()
         };
         (self.units_of_px(px).round().max(0.0) as u32).max(UNITS_PER_ROW)
     }
@@ -3058,7 +3065,11 @@ impl App {
         ) else {
             return Task::none();
         };
-        let top_row = VisualRow(self.units_of_px(self.scroll_px - PAD).floor().max(0.0) as u32);
+        let top_row = VisualRow(
+            self.units_of_px(self.scroll_px - self.pad())
+                .floor()
+                .max(0.0) as u32,
+        );
         let visible = self.visible_units();
         // The client lays the view out from the tree, so it knows which elements the viewport
         // reaches and which of their rows; it asks for those — a screen either side, so the next
@@ -3224,7 +3235,7 @@ impl App {
             return false;
         };
         let h = cell.height;
-        let top = PAD + self.px_of_units(row.get() as f32);
+        let top = self.pad() + self.px_of_units(row.get() as f32);
         let view_h = self.view_size.height;
         // Already fully visible → don't disturb the view.
         if top >= self.scroll_px && top + h <= self.scroll_px + view_h {
@@ -3239,7 +3250,7 @@ impl App {
             return false;
         };
         let h = cell.height;
-        let top = PAD + self.px_of_units(row.get() as f32);
+        let top = self.pad() + self.px_of_units(row.get() as f32);
         // Overscroll by half a row so the cursor lands just inside the edge.
         let margin = h / 2.0;
         let view_h = self.view_size.height;
@@ -3303,7 +3314,7 @@ impl App {
         ) else {
             return false;
         };
-        let top = PAD + self.px_of_units(row.get() as f32);
+        let top = self.pad() + self.px_of_units(row.get() as f32);
         self.scroll_to_px(top - self.view_size.height * place.fraction(), true);
         true
     }
@@ -4774,7 +4785,7 @@ impl App {
                 }
                 None => HoverPlace::Bottom(view_h - MARGIN),
                 Some((row, _, _)) => {
-                    let line_top = PAD + self.px_of_units(row.get() as f32) - self.scroll_px;
+                    let line_top = self.pad() + self.px_of_units(row.get() as f32) - self.scroll_px;
                     let line_bottom = line_top + cell.height;
                     // Orientation is decided once (the first frame, line on-screen) and retained, so
                     // the popover never flips sides mid-scroll: below if it fits there, else above if
@@ -6023,7 +6034,7 @@ impl App {
                 let left = (place.inset.left + editor::GUTTER_COLS) as f32 * cell.width;
                 let right = (place.inset.right as f32 * cell.width) + theme::SCROLLBAR_W;
                 Some(crate::prose::Placed {
-                    y: editor::PAD + self.px_of_units(place.row.get() as f32) - self.scroll_px,
+                    y: self.pad() + self.px_of_units(place.row.get() as f32) - self.scroll_px,
                     // The inset is the *outer* container's, so the stamped one's bounds are the
                     // element's own box: what the probe reads is the height of the prose, and
                     // nothing about where the pane put it.

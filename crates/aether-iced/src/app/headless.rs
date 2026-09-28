@@ -517,16 +517,24 @@ fn following_the_output_asks_for_the_rows_it_lands_on() {
 }
 
 /// A plain file: one editor element and no chrome at all, windowing lines partway down the file
-/// so nothing lands on the cursor's line 0 and every row paints the plain editor background.
+/// so nothing lands on the cursor's line 0 and every row paints the plain editor background. The
+/// root is the editor itself, not a column of one — the shape the server sends an ordinary buffer.
 fn plain_file() -> Window {
-    window_of(vec![editor(
+    Window {
+        root: plain_file_editor(),
+        ..window_of(Vec::new())
+    }
+}
+
+fn plain_file_editor() -> ViewElement {
+    editor(
         0,
         7,
         10,
         (10..14)
             .map(|n| line(n, &format!("fn f{n}() {{}}")))
             .collect(),
-    )])
+    )
 }
 
 /// Two files whose hunks start at the same line number — what a patch of two hunks looks like.
@@ -865,6 +873,65 @@ fn editor_rows_are_the_well_and_the_pane_around_them_is_the_ground() {
         );
 
         snapshot(&mut sim, &app, name);
+    }
+}
+
+/// An ordinary buffer's breathing room above its first row and below its last is the **well**,
+/// and a composed view has none.
+///
+/// The margin used to sit on the ground under every view, so a file's rows started a band of the
+/// lighter shade below the top of the pane — and a patch or a shell carried the same band above
+/// chrome that already frames it.
+#[test]
+fn only_an_ordinary_buffer_has_breathing_room_and_it_is_the_well() {
+    let first_row_y = |app: &App| {
+        let mut sim = simulate(app);
+        seen(&mut sim)
+            .into_iter()
+            .find(|s| s.visible && s.text == "fn f10() {}")
+            .expect("the first row is on the frame")
+            .bounds
+    };
+    let app = app_showing(plain_file());
+    let plain = first_row_y(&app);
+    // The same editor, but the root is a column of it — the shape of every composed view.
+    let composed = first_row_y(&app_showing(window_of(vec![plain_file_editor()])));
+    assert!(
+        (plain.y - composed.y - crate::editor::PAD).abs() < 0.5,
+        "the file sits PAD below where the composed view starts ({} vs {})",
+        plain.y,
+        composed.y
+    );
+
+    let p = crate::theme::palette(app.session.theme);
+    let rgb = |c: iced::Color| {
+        let b = c.into_rgba8();
+        [b[0], b[1], b[2]]
+    };
+    let mut sim = simulate(&app);
+    let last = seen(&mut sim)
+        .into_iter()
+        .find(|s| s.visible && s.text == "fn f13() {}")
+        .expect("the last row is on the frame")
+        .bounds;
+    let frame = pixels(&mut sim, &app);
+    let scale = frame.0 as f32 / WIDTH;
+    for (y, which) in [
+        (plain.y - crate::editor::PAD / 2.0, "above the first row"),
+        (
+            last.y + last.height + crate::editor::PAD / 2.0,
+            "below the last row",
+        ),
+    ] {
+        let y = (y * scale) as usize;
+        assert!(
+            !columns_painted(&frame, y, rgb(p.bg)).is_empty(),
+            "the breathing room {which} is the editor well"
+        );
+        assert!(
+            columns_painted(&frame, y, rgb(p.bg_app)).is_empty(),
+            "…and none of it {which} is ground"
+        );
     }
 }
 
@@ -1560,8 +1627,9 @@ fn an_agent_reply_renders_as_prose() {
             .expect("the reply has a container of its own in the layer")
     };
 
-    // Where the grid put the element — the layer's whole job.
-    let want_y = crate::editor::PAD + origin as f32 / crate::app::UNITS_PER_ROW as f32 * row_px;
+    // Where the grid put the element — the layer's whole job. A conversation is composed, so no
+    // breathing room sits above its first row.
+    let want_y = origin as f32 / crate::app::UNITS_PER_ROW as f32 * row_px;
     assert!(
         (bounds.y - want_y).abs() < 1.0,
         "the reply is at {} rather than at its origin {want_y}",

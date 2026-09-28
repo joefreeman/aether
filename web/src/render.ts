@@ -714,11 +714,12 @@ export interface RenderOpts {
   awaitingKey: boolean;
   /** Full content width in px for native horizontal scroll (no-wrap), or 0 to fit the container. */
   contentWidthPx: number;
-  /** Full-document scroll height in px (`totalRows` × row height, plus padding) — sizes the
-   *  scroller. */
+  /** Full-document scroll height in px (`totalRows` × row height, plus `padPx` either end) —
+   *  sizes the scroller. */
   spacerHeightPx: number;
-  /** Where row 0 of the view sits inside the scroller — the padding above it. */
-  contentTopPx: number;
+  /** The breathing room above row 0 and below the last row, painted as the editor's well: where
+   *  row 0 sits inside the scroller. 0 for a view that has none — see `grid::padded`. */
+  padPx: number;
   /** One row's height in px: what the rows nothing is loaded at are sized by. */
   rowHeightPx: number;
   /** What the shell measured of elements it laid out itself — see `Measured`. */
@@ -749,7 +750,7 @@ export function renderBuffer(
     awaitingKey,
     contentWidthPx,
     spacerHeightPx,
-    contentTopPx,
+    padPx,
     rowHeightPx,
     measured,
     blame,
@@ -919,7 +920,7 @@ export function renderBuffer(
   // natively; `contentWidthPx` widens the content past the container so the widest line is reachable.
   const content = document.createElement("div");
   content.className = "buffer-content";
-  content.style.top = `${contentTopPx}px`;
+  content.style.top = `${padPx}px`;
   const widthCss = contentWidthPx > 0 ? `max(100%, ${contentWidthPx}px)` : "";
   content.style.width = widthCss;
   content.appendChild(frag);
@@ -933,6 +934,8 @@ export function renderBuffer(
     container.replaceChildren(spacer);
   }
   spacer.style.height = `${spacerHeightPx}px`;
+  spacer.classList.toggle("padded", padPx > 0);
+  spacer.style.setProperty("--buffer-pad", `${padPx}px`);
   spacer.style.width = widthCss;
   const oldContent = spacer.querySelector(":scope > .buffer-content");
   if (oldContent) oldContent.replaceWith(content);

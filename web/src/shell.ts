@@ -80,7 +80,7 @@ const CONTINUATION_MARKER_WIDTH = 2;
 // title bar has no width budget of its own, so long paths (an external goto-def target's absolute
 // path) are segment-elided to this cap, consistently with the native clients.
 const TITLE_LABEL_MAX = 60;
-const BUFFER_PAD = 8; // px of breathing room above the first line / below the last (virtual)
+const BUFFER_PAD = 8; // px of breathing room above an ordinary buffer's first line / below its last
 /** The resolution this shell counts the view's vertical layout in — see `Measured`: a thousand
  *  units to one editor row, so a reading-view block measured off the DOM lands where it was drawn
  *  (a fiftieth of a pixel at any sane row height) while every row the server laid out stays an
@@ -2483,7 +2483,7 @@ export class Shell {
           // screen) if there is one; otherwise reveal the cursor as before.
           const row = this.session.resolve_scroll_anchor();
           if (row != null) {
-            this.scrollTopTo(this.pxOfUnits(row), false);
+            this.scrollTopTo(this.scrollTopOf(row), false);
             break;
           }
           // A shell whose output is arriving while you were at the end: follow it. The caret is in
@@ -2492,7 +2492,7 @@ export class Shell {
             this.unitsOfPx(this.bufferEl.scrollTop),
             this.visibleUnits(),
           );
-          if (tail != null) this.scrollTopTo(this.pxOfUnits(tail), false);
+          if (tail != null) this.scrollTopTo(this.scrollTopOf(tail), false);
           else this.revealCursor();
           break;
         }
@@ -2787,7 +2787,7 @@ export class Shell {
     // Restore the view to the content anchor captured before the toggle (same content on screen
     // across the reflow); fall back to revealing the cursor when none is pending.
     const row = this.session.resolve_scroll_anchor();
-    if (row != null) this.scrollTopTo(this.pxOfUnits(row), false);
+    if (row != null) this.scrollTopTo(this.scrollTopOf(row), false);
     else this.revealCursor();
     // A reflow changes every element's height, so the rows this viewport had loaded need not
     // reach the bottom of it any more. See `onScroll`.
@@ -2855,11 +2855,11 @@ export class Shell {
     // re-presentation — and supersedes the reveal.
     const anchored = this.session.resolve_scroll_anchor();
     if (anchored != null) {
-      this.bufferEl.scrollTop = this.pxOfUnits(anchored);
+      this.bufferEl.scrollTop = this.scrollTopOf(anchored);
     } else {
       const row = this.session.subscribe_top_row(scroll.element, scroll.line, scroll.sub_row);
       if (row != null) {
-        this.bufferEl.scrollTop = this.pxOfUnits(row);
+        this.bufferEl.scrollTop = this.scrollTopOf(row);
       }
       // The reading view frames its focused *block*, not the cursor's row — the placement above
       // has just overridden the reveal the render made, so make it again from where the view now
@@ -2936,7 +2936,7 @@ export class Shell {
     const visible = this.visibleUnits();
     if (cursorRow >= top && cursorRow + UNITS_PER_ROW <= top + visible) return; // already visible
     const above = Math.floor(visible * CURSOR_REST_FRACTION);
-    this.scrollTopTo(this.pxOfUnits(cursorRow - above), true);
+    this.scrollTopTo(this.scrollTopOf(cursorRow - above), true);
   }
 
   /** Native scroll event: fetch a new window when the view nears the loaded window's edge. */
@@ -3124,7 +3124,7 @@ export class Shell {
     const row = this.revealRow();
     if (row === null) return;
     const above = Math.floor(this.visibleUnits() * fraction);
-    this.scrollTopTo(this.pxOfUnits(row - above), true);
+    this.scrollTopTo(this.scrollTopOf(row - above), true);
   }
 
   private revealCursor(): void {
@@ -3134,9 +3134,9 @@ export class Shell {
     const visible = this.visibleUnits();
     const margin = UNITS_PER_ROW / 2;
     if (cursorRow < top) {
-      this.scrollTopTo(this.pxOfUnits(cursorRow - margin), true);
+      this.scrollTopTo(this.scrollTopOf(cursorRow - margin), true);
     } else if (cursorRow + UNITS_PER_ROW > top + visible) {
-      this.scrollTopTo(this.pxOfUnits(cursorRow - visible + UNITS_PER_ROW + margin), true);
+      this.scrollTopTo(this.scrollTopOf(cursorRow - visible + UNITS_PER_ROW + margin), true);
     }
     const v = this.snapshot;
     if (v && v.wrap === "none") {
@@ -3337,15 +3337,23 @@ export class Shell {
     this.measured = this.session.measured() as Measured;
   }
 
-  /** Where the scrolled content's offset 0 sits in the scroller: the editor grid starts below its
-   *  padding; the reading view's document is the scrolled content itself, padding and all. */
+  /** Where the scrolled content's offset 0 sits in the scroller: an ordinary buffer's grid starts
+   *  below its padding, a composed view's has none (`grid::padded`); the reading view's document is
+   *  the scrolled content itself, padding and all. */
   private contentTop(): number {
-    return this.readActive ? 0 : BUFFER_PAD;
+    return this.readActive || !this.session.padded() ? 0 : BUFFER_PAD;
   }
 
   /** A view offset (in the core's units) as a `scrollTop`. */
   private pxOfUnits(units: number): number {
     return (units / UNITS_PER_ROW) * this.cell.h + this.contentTop();
+  }
+
+  /** The `scrollTop` that puts view offset `units` at the top of the viewport. The same as
+   *  `pxOfUnits` except at the very top: the padding above row 0 is part of the top, so scrolling
+   *  to row 0 shows it rather than scrolling it off. */
+  private scrollTopOf(units: number): number {
+    return units <= 0 ? 0 : this.pxOfUnits(units);
   }
 
   /** A `scrollTop` as a view offset in the core's units, to the unit. */
@@ -3575,6 +3583,7 @@ export class Shell {
     this.bufferEl.classList.toggle("hscroll", v.wrap === "none");
     // Coding ligatures: the `ligatures` app setting flips the JetBrains Mono `calt`/`liga` features.
     this.bufferEl.classList.toggle("ligatures-off", !v.ligatures);
+    const pad = this.contentTop();
     this.replyBoxes = renderBuffer(this.bufferSurface(), {
       window: v.window,
       cursor: v.buffer.cursor,
@@ -3582,8 +3591,8 @@ export class Shell {
       awaitingKey: v.pending !== null || (v.count ?? 0) > 0 || v.sneak_active,
       contentWidthPx: v.wrap === "none" ? this.cell.w * (v.window.max_line_width + 2) : 0,
       spacerHeightPx:
-        (this.session.total_rows() / this.measured.units_per_row) * this.cell.h + BUFFER_PAD * 2,
-      contentTopPx: BUFFER_PAD,
+        (this.session.total_rows() / this.measured.units_per_row) * this.cell.h + pad * 2,
+      padPx: pad,
       rowHeightPx: this.cell.h,
       measured: this.measured,
       // The blame data arrives via the server's `git/blame_changed` push (blame follow) and

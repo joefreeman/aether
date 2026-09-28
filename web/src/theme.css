@@ -389,6 +389,14 @@ html, body, #app {
    absolutely-positioned content down. (Not `overflow`, which would break the popover's sticky.) */
 .buffer-spacer { position: relative; width: 100%; display: flow-root; }
 .buffer-content { position: absolute; left: 0; right: 0; will-change: top; }
+/* An ordinary buffer's breathing room above its first row and below its last: part of the file, so
+   it is the well the rows paint rather than the ground showing between them. A background, not
+   pseudo-elements, so it sits under everything in the spacer — the hover popover included. */
+.buffer-spacer.padded {
+  background:
+    linear-gradient(var(--bg), var(--bg)) top / 100% var(--buffer-pad) no-repeat,
+    linear-gradient(var(--bg), var(--bg)) bottom / 100% var(--buffer-pad) no-repeat;
+}
 
 /* Offscreen, focusable (not display:none) so it can hold focus and receive native paste events. */
 .clipboard-capture {

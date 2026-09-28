@@ -432,6 +432,16 @@ impl WasmSession {
         })
     }
 
+    /// Whether the view gets its breathing room above the first row and below the last — see
+    /// `grid::padded`. `false` with no window.
+    pub fn padded(&self) -> bool {
+        self.inner
+            .view
+            .window
+            .as_ref()
+            .is_some_and(|w| aether_client::grid::padded(&w.root))
+    }
+
     /// **The row a reveal scrolls to**: the stop `Tab` reached, else the cursor's line. `null`
     /// when neither can be located, which for the cursor means its line is not loaded — fetch a
     /// window around it and reveal then.

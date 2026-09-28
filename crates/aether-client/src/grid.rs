@@ -310,6 +310,18 @@ impl Measured {
     }
 }
 
+/// Whether the view gets breathing room above its first row and below its last — the pixel shells'
+/// margin, painted as the editor's well so it reads as part of the file rather than as a gap.
+///
+/// An ordinary buffer does: its tree is one bare editor field, which the server composes for that
+/// case and no other. A composed view does not — a patch, a shell or a conversation already frames
+/// its elements in chrome and boxes, and a strip of well above the first of them is a stray band
+/// that belongs to nothing. Nor does a view that is only a shell's or an agent's input line, which
+/// is the same bare editor under a different role.
+pub fn padded(root: &Element) -> bool {
+    matches!(root, Element::Editor { role, .. } if role.is_field())
+}
+
 /// Units the whole view occupies: chrome, one row each, every server-laid-out editor's height, and
 /// every client-laid-out element as measured — all at the shell's resolution.
 ///
@@ -2041,6 +2053,25 @@ mod tests {
             first_buffer_line,
             lines,
         }
+    }
+
+    /// Only an ordinary buffer — a bare editor field at the root — gets breathing room: not the
+    /// same editor inside a column (every composed view), and not a lone input line (an empty
+    /// shell's or agent's view).
+    #[test]
+    fn only_a_bare_field_is_padded() {
+        assert!(padded(&editor(
+            0,
+            0,
+            1,
+            vec![line(0, vec![row(0, 0, "a")])]
+        )));
+        assert!(!padded(&Element::column(vec![editor(0, 0, 1, vec![])])));
+        let mut input = editor(0, 0, 1, vec![]);
+        if let Element::Editor { role, .. } = &mut input {
+            *role = aether_protocol::ui::ElementRole::Input;
+        }
+        assert!(!padded(&input));
     }
 
     #[test]

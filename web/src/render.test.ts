@@ -69,7 +69,7 @@ function painted(
     awaitingKey: false,
     contentWidthPx: 0,
     spacerHeightPx: 0,
-    contentTopPx: 0,
+    padPx: 0,
     rowHeightPx: 0,
     measured: opts.measured ?? WHOLE_ROWS,
     blame: null,
@@ -189,7 +189,7 @@ describe("column layout", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -228,7 +228,7 @@ describe("column layout", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -275,7 +275,7 @@ describe("boxes", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -337,7 +337,7 @@ describe("the well and the ground", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -373,7 +373,7 @@ describe("the well and the ground", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -627,7 +627,7 @@ describe("the buffer painter", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -704,7 +704,7 @@ describe("the buffer painter", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 10,
       measured: WHOLE_ROWS,
       blame: null,
@@ -743,7 +743,7 @@ describe("the buffer painter", () => {
         awaitingKey: false,
         contentWidthPx: 0,
         spacerHeightPx: 0,
-        contentTopPx: 0,
+        padPx: 0,
         rowHeightPx: 10,
         measured,
         blame: null,
@@ -820,7 +820,7 @@ describe("the buffer painter", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -862,7 +862,7 @@ describe("the buffer painter", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -922,7 +922,7 @@ const renderOnly = (window: BufferWindow): HTMLElement => {
     awaitingKey: false,
     contentWidthPx: 0,
     spacerHeightPx: 0,
-    contentTopPx: 0,
+    padPx: 0,
     rowHeightPx: 0,
     measured: WHOLE_ROWS,
     blame: null,
@@ -1021,7 +1021,7 @@ describe("a prose element", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -1108,7 +1108,7 @@ describe("a folded element", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -1175,7 +1175,7 @@ describe("a declared action", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -1255,7 +1255,7 @@ describe("a declared action", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -1283,7 +1283,7 @@ describe("a declared action", () => {
       awaitingKey: false,
       contentWidthPx: 0,
       spacerHeightPx: 0,
-      contentTopPx: 0,
+      padPx: 0,
       rowHeightPx: 0,
       measured: WHOLE_ROWS,
       blame: null,
@@ -1370,5 +1370,41 @@ describe("editorsOf", () => {
     } as unknown as ViewNode;
 
     expect(editorsOf(root).map((e) => e.element)).toEqual([0]);
+  });
+});
+
+describe("breathing room", () => {
+  const paint = (padPx: number): HTMLElement => {
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window: windowOf(editor(0, 0, [line(0, "a")])),
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 20 + padPx * 2,
+      padPx,
+      rowHeightPx: 20,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: false,
+      focusedElement: 0,
+    });
+    return container.querySelector(".buffer-spacer") as HTMLElement;
+  };
+
+  /** The margin is the editor's well, so the spacer paints it — the rows start below it, and the
+   *  ground must not show through above them. */
+  it("paints the padding as part of the editor and starts the rows below it", () => {
+    const spacer = paint(8);
+    expect(spacer.classList.contains("padded")).toBe(true);
+    expect(spacer.style.getPropertyValue("--buffer-pad")).toBe("8px");
+    expect((spacer.querySelector(".buffer-content") as HTMLElement).style.top).toBe("8px");
+  });
+
+  it("paints nothing for a view that has none", () => {
+    const spacer = paint(0);
+    expect(spacer.classList.contains("padded")).toBe(false);
+    expect((spacer.querySelector(".buffer-content") as HTMLElement).style.top).toBe("0px");
   });
 });

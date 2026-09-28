@@ -24,8 +24,19 @@ use iced::advanced::{layout, mouse, renderer, text, Clipboard, Layout, Shell, Wi
 use iced::keyboard;
 use iced::{Color, Element, Event, Font, Length, Point, Rectangle, Size};
 
-/// Breathing room above the first line / below the last, in px (web client's `BUFFER_PAD`).
+/// Breathing room above an ordinary buffer's first line / below its last, in px (web client's
+/// `BUFFER_PAD`). Only a view [`grid::padded`] says so gets it — read it through [`pad_of`].
 pub const PAD: f32 = 8.0;
+
+/// The breathing room `window` gets above its first row and below its last, in px: [`PAD`] for an
+/// ordinary buffer, none for a composed view or no window at all.
+pub fn pad_of(window: Option<&Window>) -> f32 {
+    if window.is_some_and(|w| grid::padded(&w.root)) {
+        PAD
+    } else {
+        0.0
+    }
+}
 /// Change-bar gutter width, in cells (TUI's `GUTTER_WIDTH`).
 pub const GUTTER_COLS: u32 = 1;
 /// Where a box's name starts on its top border, as a column offset from where the rows inside the
@@ -245,7 +256,8 @@ where
         let bounds = layout.bounds();
         let unit_px = self.unit_px(cell);
         for (abs_row, item) in grid::painted_rows(window, self.content.measured) {
-            let y = bounds.y + PAD + abs_row.row.get() as f32 * unit_px - self.content.scroll_px;
+            let y =
+                bounds.y + self.pad() + abs_row.row.get() as f32 * unit_px - self.content.scroll_px;
             if y + cell.height < bounds.y || y > bounds.y + bounds.height {
                 continue;
             }
@@ -454,6 +466,26 @@ where
             return;
         };
         let scroll = self.content.scroll_px;
+        let pad = self.pad();
+        // An ordinary buffer's breathing room is part of the file, not a gap in it: the well, the
+        // same as the rows it frames.
+        if pad > 0.0 {
+            let bottom = bounds.y
+                + pad
+                + grid::total_rows(&window.root, self.content.measured) as f32 * self.unit_px(cell)
+                - scroll;
+            for y in [bounds.y - scroll, bottom] {
+                let band = Rectangle {
+                    x: bounds.x,
+                    y,
+                    width: bounds.width,
+                    height: pad,
+                };
+                if let Some(band) = band.intersection(&bounds) {
+                    fill(renderer, band, p.bg);
+                }
+            }
+        }
         let unit_px = self.unit_px(cell);
         let cursor_pos = self.content.cursor.position;
         let (sel_min, sel_max) = selection_endpoints(&self.content.cursor);
@@ -581,7 +613,7 @@ where
         // reply is not text you can put a cursor in.
         for (abs_row, item) in &painted {
             let (abs_row, item) = (*abs_row, item);
-            let y = bounds.y + PAD + abs_row.row.get() as f32 * unit_px - scroll;
+            let y = bounds.y + pad + abs_row.row.get() as f32 * unit_px - scroll;
             let inset = abs_row.inset.left;
             let text_x = |dcol: u32| text_x_in(inset, dcol);
             // Per row, because two files in one view can sit in boxes of different depths: what
@@ -1562,7 +1594,7 @@ where
 
         // Cursor, on top — off `caret`, which is `None` whenever a caret is not what is focused.
         if let Some((row, dcol, width)) = caret {
-            let y = bounds.y + PAD + row.get() as f32 * unit_px - scroll;
+            let y = bounds.y + pad + row.get() as f32 * unit_px - scroll;
             // The box holding the cursor's row, read off the same list the row was painted from.
             // Drawn without it, the block landed at the pane's edge while the row it belongs to
             // sat two columns in — a second cursor, in a place nothing else was.
@@ -1672,7 +1704,7 @@ where
         // taller than the viewport. Geometry from the shared `scrollbar::thumb` (same as the TUI
         // and picker); appearance pulled from the theme's scrollable catalog — the exact style
         // the picker/popover scrollbars use, so they match including hover/drag highlighting.
-        let content_h = PAD * 2.0
+        let content_h = self.pad() * 2.0
             + grid::total_rows(&window.root, self.content.measured) as f32 * self.unit_px(cell);
         if let Some((thumb_y, thumb_h)) = crate::core::scrollbar::thumb(
             bounds.height as f64,
@@ -1759,6 +1791,11 @@ fn scrollbar_rail<Theme: iced::widget::scrollable::Catalog>(
 }
 
 impl<'a, Message> EditorView<'a, Message> {
+    /// This view's breathing room above its first row and below its last — see [`pad_of`].
+    fn pad(&self) -> f32 {
+        pad_of(self.content.window)
+    }
+
     /// Pixels per unit of the shared vertical layout: an editor row is one cell tall, at
     /// `measured.row()` units.
     fn unit_px(&self, cell: Size) -> f32 {
@@ -1767,8 +1804,9 @@ impl<'a, Message> EditorView<'a, Message> {
 
     /// Pixel position → (absolute visual row in layout units, display col).
     fn cell_at(&self, position: Point, bounds: Rectangle, cell: Size) -> (i64, u32) {
-        let row = ((self.content.scroll_px + (position.y - bounds.y) - PAD) / self.unit_px(cell))
-            .floor() as i64;
+        let row = ((self.content.scroll_px + (position.y - bounds.y) - self.pad())
+            / self.unit_px(cell))
+        .floor() as i64;
         let col = ((position.x - bounds.x + self.content.scroll_x_px) / cell.width).floor() as i64
             - GUTTER_COLS as i64;
         (row, col.max(0) as u32)
@@ -1779,7 +1817,7 @@ impl<'a, Message> EditorView<'a, Message> {
     /// TUI and picker; this returns just the pieces the drag math needs.
     fn scrollbar_metrics(&self, state: &State, bounds: Rectangle) -> Option<(f32, f32)> {
         let (cell, window) = (state.cell?, self.content.window?);
-        let content_h = PAD * 2.0
+        let content_h = self.pad() * 2.0
             + grid::total_rows(&window.root, self.content.measured) as f32 * self.unit_px(cell);
         let (_, thumb_h) = crate::core::scrollbar::thumb(
             bounds.height as f64,
