@@ -628,4 +628,30 @@ mod tests {
         let levels = compute_indent_levels(&iq, &tree, src.as_bytes(), cursor_byte, 3);
         assert_eq!(levels, 1);
     }
+
+    /// The vendored protobuf query: a new line gains a level per enclosing body — message, enum,
+    /// service, an rpc's options — while an `rpc` ended by `;` adds none.
+    #[test]
+    fn proto_bodies_indent_and_single_line_rpc_does_not() {
+        let cfg = crate::syntax::get_config("proto").unwrap();
+        let iq = cfg
+            .indent_query
+            .as_ref()
+            .expect("proto indents query compiles");
+        let src = "message M {\n  int32 a = 1;\n  enum E {\n    X = 0;\n  }\n}\nservice S {\n  rpc Get (M) returns (M);\n  rpc Put (M) returns (M) {\n    option deprecated = true;\n  }\n}\n";
+        let tree = crate::syntax::make_parser(cfg).parse(src, None).unwrap();
+        assert!(!tree.root_node().has_error());
+        let after = |needle: &str| src.find(needle).unwrap() + needle.len();
+        let levels = |needle: &str, line| {
+            compute_indent_levels(iq, &tree, src.as_bytes(), after(needle), line)
+        };
+        assert_eq!(levels("= 1;", 2), 1, "inside a message body");
+        assert_eq!(levels("X = 0;", 4), 2, "inside an enum nested in a message");
+        assert_eq!(
+            levels("returns (M);", 8),
+            1,
+            "after a one-line rpc, still one level (the service)"
+        );
+        assert_eq!(levels("= true;", 10), 2, "inside an rpc's options body");
+    }
 }

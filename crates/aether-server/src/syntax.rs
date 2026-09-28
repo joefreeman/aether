@@ -85,6 +85,8 @@ static QUIVER: OnceLock<LanguageConfig> = OnceLock::new();
 static SQL: OnceLock<LanguageConfig> = OnceLock::new();
 static TERRAFORM: OnceLock<LanguageConfig> = OnceLock::new();
 static DOCKERFILE: OnceLock<LanguageConfig> = OnceLock::new();
+static PROTO: OnceLock<LanguageConfig> = OnceLock::new();
+static JUST: OnceLock<LanguageConfig> = OnceLock::new();
 
 /// Everything that distinguishes one injection-free language from another: the grammar, its
 /// queries, and the editing metadata copied into the resulting [`LanguageConfig`]. Named fields
@@ -278,7 +280,7 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 block_comment: Some(("<!--", "-->")),
             },
         )),
-        "javascript" | "js" | "jsx" | "mjs" | "cjs" => Some(simple(
+        "javascript" | "js" | "jsx" | "mjs" | "cjs" | "node" => Some(simple(
             &JAVASCRIPT,
             LanguageSpec {
                 name: "javascript",
@@ -314,7 +316,7 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 block_comment: Some(("/*", "*/")),
             },
         )),
-        "python" | "py" => Some(simple(
+        "python" | "py" | "python3" => Some(simple(
             &PYTHON,
             LanguageSpec {
                 name: "python",
@@ -476,6 +478,45 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
                 block_comment: None,
             }
         })),
+        "proto" | "protobuf" => Some(simple(
+            &PROTO,
+            LanguageSpec {
+                name: "proto",
+                language: tree_sitter_proto::LANGUAGE,
+                // The crate exports no queries; both are vendored under `queries/proto/`.
+                highlights: include_str!("../queries/proto/highlights.scm"),
+                indents: Some(include_str!("../queries/proto/indents.scm")),
+                // The protobuf style guide's two spaces.
+                default_indent: IndentStyle::Spaces(2),
+                line_comment: Some("//"),
+                block_comment: Some(("/*", "*/")),
+            },
+        )),
+        // `just` doubles as the extension of a module file (`mod foo` loads `foo.just`); the
+        // canonical `justfile` spelling has none and is reached by the file rule below.
+        // Registered by hand for its injections query: a recipe body parses as bash, or as the
+        // language its shebang names, and a backtick as bash. The shebang's name is the
+        // interpreter's (`#!/usr/bin/env python3` → `python3`), which is why `python3` and `node`
+        // are aliases above.
+        "just" | "justfile" => Some(JUST.get_or_init(|| {
+            let language: Language = codebook_tree_sitter_just::LANGUAGE.into();
+            let query = Query::new(&language, codebook_tree_sitter_just::HIGHLIGHTS_QUERY)
+                .expect("just highlights query compiles");
+            let injection_query =
+                Query::new(&language, codebook_tree_sitter_just::INJECTIONS_QUERY)
+                    .expect("just injection query compiles");
+            LanguageConfig {
+                name: "just",
+                language,
+                query,
+                injection_query: Some(injection_query),
+                indent_query: None,
+                // `just --fmt` indents recipe bodies by four.
+                default_indent: IndentStyle::Spaces(4),
+                line_comment: Some("#"),
+                block_comment: None,
+            }
+        })),
         _ => None,
     }
 }
@@ -484,8 +525,7 @@ pub fn get_config(name: &str) -> Option<&'static LanguageConfig> {
 /// against the lowercased name, so the literals in [`FILE_RULES`] must themselves be lowercase.
 enum FileRule {
     /// The complete file name — the rule for names that carry a dot of their own (`go.mod`,
-    /// `cargo.lock`). Nothing needs it yet, so only the tests construct it.
-    #[allow(dead_code)]
+    /// `.justfile`), or that must not take variants along (`commit_editmsg`).
     Name(&'static str),
     /// The part before the first `.`, so per-target variants come along: `dockerfile` matches
     /// `Dockerfile`, `Dockerfile.dev` and `Dockerfile.prod` alike.
@@ -511,6 +551,9 @@ impl FileRule {
 const FILE_RULES: &[(FileRule, &str)] = &[
     (FileRule::Stem("dockerfile"), "dockerfile"),
     (FileRule::Stem("containerfile"), "dockerfile"),
+    // `justfile`, `Justfile` and the hidden `.justfile` — whose stem is empty, hence the `Name`.
+    (FileRule::Name("justfile"), "just"),
+    (FileRule::Name(".justfile"), "just"),
     // git's message buffers. `Name`, not `Stem`: these are exact names, and a stem rule would
     // also claim things like `commit_editmsg.bak`.
     (FileRule::Name("commit_editmsg"), "gitcommit"),
@@ -1058,8 +1101,14 @@ mod tests {
         assert_eq!(lang("/w/Dockerfile.dev"), Some("dockerfile"));
         assert_eq!(lang("/w/Containerfile"), Some("dockerfile"));
         assert_eq!(lang("/w/web.Dockerfile"), Some("dockerfile"));
+        assert_eq!(lang("/w/justfile"), Some("just"));
+        assert_eq!(lang("/w/Justfile"), Some("just"));
+        assert_eq!(lang("/w/.justfile"), Some("just"));
+        assert_eq!(lang("/w/tools.just"), Some("just"));
+        assert_eq!(lang("/w/api/v1/service.proto"), Some("proto"));
         // Neither rule nor alias: no grammar.
         assert_eq!(lang("/w/.dockerignore"), None);
+        assert_eq!(lang("/w/justfile.bak"), None);
         assert_eq!(lang("/w/notes.xyz"), None);
         assert_eq!(lang("/w/LICENSE"), None);
         assert_eq!(lang("/w/some/dir/"), None);
@@ -1264,6 +1313,77 @@ mod tests {
         );
     }
 
+    /// The kind of the innermost highlight covering the first byte of `needle`.
+    fn kind_at(highlights: &[Highlight], source: &str, needle: &str) -> Option<String> {
+        let pos = source.find(needle).unwrap() as u32;
+        highlights
+            .iter()
+            .find(|h| h.start <= pos && h.end > pos)
+            .map(|h| h.kind.clone())
+    }
+
+    #[test]
+    fn proto_highlights_declarations_types_and_literals() {
+        let cfg = get_config("proto").unwrap();
+        let mut parser = make_parser(cfg);
+        let source = "syntax = \"proto3\";\n// users\nmessage User {\n  repeated string name = 1;\n}\nservice Users {\n  rpc Get (User) returns (User);\n}\n";
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error(), "sample parses cleanly");
+        let hl = highlights_for_range(cfg, &tree, &[], source, 0, source.len());
+        let kind = |needle| kind_at(&hl, source, needle);
+        for (needle, want) in [
+            ("message", "keyword"),
+            ("repeated", "keyword"),
+            ("returns", "keyword"),
+            ("User {", "type"),
+            ("string", "type"),
+            ("Get", "function"),
+            ("\"proto3\"", "string"),
+            ("1;", "number"),
+            // `(comment) @spell` precedes `(comment) @comment` in the vendored query; `spell`
+            // must not win the tie.
+            ("// users", "comment"),
+        ] {
+            assert!(
+                kind(needle).is_some_and(|k| k.starts_with(want)),
+                "{needle:?} → {want}, got {:?}",
+                kind(needle)
+            );
+        }
+    }
+
+    #[test]
+    fn just_highlights_recipes_and_injects_bodies() {
+        let cfg = get_config("just").unwrap();
+        let mut parser = make_parser(cfg);
+        let source = "# Run it\nset shell := [\"bash\", \"-c\"]\n\ntest: build\n    if true; then cargo test; fi\n\nplot:\n    #!/usr/bin/env python3\n    import sys\n";
+        let tree = parser.parse(source, None).unwrap();
+        assert!(!tree.root_node().has_error(), "sample parses cleanly");
+        let injections = compute_injections(cfg, &tree, source);
+        let hl = highlights_for_range(cfg, &tree, &injections, source, 0, source.len());
+        let kind = |needle| kind_at(&hl, source, needle);
+        for (needle, want) in [
+            ("# Run", "comment"),
+            ("set", "keyword"),
+            ("\"bash\"", "string"),
+            ("test:", "function"),
+            ("build\n", "function"),
+            // The plain body runs in the shell, so it's bash — `then` is a bash keyword.
+            ("then", "keyword"),
+            // The shebang body runs under python.
+            ("import", "keyword"),
+        ] {
+            assert!(
+                kind(needle).is_some_and(|k| k.starts_with(want)),
+                "{needle:?} → {want}, got {:?}",
+                kind(needle)
+            );
+        }
+        let mut layers: Vec<_> = injections.iter().map(|l| l.config.name).collect();
+        layers.sort();
+        assert_eq!(layers, ["bash", "python"]);
+    }
+
     /// Every registered canonical language loads, parses, and produces at least one highlight
     /// span on a small representative snippet. Catches grammar/query ABI mismatches at test
     /// time rather than the first time a user opens a file of that type.
@@ -1293,6 +1413,11 @@ mod tests {
                 "resource \"aws_instance\" \"web\" {\n  count = 1\n}\n",
             ),
             ("dockerfile", "FROM alpine:3\nRUN echo hi\n"),
+            (
+                "proto",
+                "syntax = \"proto3\";\nmessage M { int32 id = 1; }\n",
+            ),
+            ("just", "build:\n    cargo build\n"),
         ];
         for (lang, source) in cases {
             let cfg =
@@ -1326,6 +1451,8 @@ mod tests {
             ("sh", "bash"),
             ("zsh", "bash"),
             ("golang", "go"),
+            ("python3", "python"),
+            ("node", "javascript"),
             ("ex", "elixir"),
             ("exs", "elixir"),
             ("erl", "erlang"),
@@ -1336,6 +1463,8 @@ mod tests {
             ("hcl", "terraform"),
             ("docker", "dockerfile"),
             ("containerfile", "dockerfile"),
+            ("protobuf", "proto"),
+            ("justfile", "just"),
         ];
         for (alias, canonical) in pairs {
             let a = get_config(alias).unwrap_or_else(|| panic!("alias `{alias}` not registered"));

@@ -185,6 +185,8 @@
                     <string>dockerfile</string>
                     <string>containerfile</string>
                     <string>qv</string>
+                    <string>proto</string>
+                    <string>just</string>
                 </array>
             </dict>
         </dict>

@@ -99,6 +99,14 @@ tree-sitter-containerfile = "0.9"
 # Commit messages (`COMMIT_EDITMSG`). We ship our own highlights query rather than the crate's:
 # upstream captures use nvim's `markup.*` vocabulary, which `theme.rs` doesn't map.
 tree-sitter-gitcommit = "0.5"
+# Protobuf. The crate compiles the grammar but doesn't export its queries, so both are vendored
+# under `queries/proto/`.
+tree-sitter-proto = "0.6"
+# Justfiles. A fork rather than upstream `tree-sitter-just`, whose 0.2 release takes a normal
+# dependency on `tree-sitter ~0.25` — and tree-sitter's `links` key allows only one copy in the
+# graph, so it can't resolve alongside ours. This one is written against just's own lexer and
+# parser, and ships highlights and injections queries.
+codebook-tree-sitter-just = "0.1"
 # Quiver grammar, pinned to the upstream repo's latest release tag (the crate lives in its
 # `tree-sitter` subdirectory; Cargo resolves it by package name). Not published to crates.io.
 tree-sitter-quiver = { git = "https://github.com/joefreeman/quiver", tag = "v0.5.0" }

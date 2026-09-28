@@ -28,8 +28,8 @@ Categories=Development;TextEditor;
 # Types are the ones shared-mime-info actually reports for each extension, not the ones you would
 # guess. Absent by design: TypeScript, whose `.ts`/`.tsx` resolve to `text/vnd.trolltech.linguist`
 # (Qt Linguist) and `application/x-tiled-tsx` (Tiled) — claiming those would offer Aether for
-# unrelated formats. `.jsx`, `.cjs`, `.hrl`, `.zsh`, `.qv`, `.tf` and Dockerfiles have no type of
-# their own and are covered by `text/plain`.
+# unrelated formats. `.jsx`, `.cjs`, `.hrl`, `.zsh`, `.qv`, `.tf`, `.proto`, `.just`, Dockerfiles
+# and justfiles have no type of their own and are covered by `text/plain`.
 #
 # `inode/directory` because `ae DIR` opens that directory as a workspace — it makes Aether an
 # option for "Open With" on a folder. It cannot become the default handler unless someone
