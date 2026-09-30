@@ -108,8 +108,22 @@ impl WasmSession {
         alt: bool,
         shift: bool,
     ) -> Result<JsValue, JsValue> {
-        let effects = self.dispatch_key(key, code, ctrl, alt, shift);
-        to_js(&effects)
+        let outcome = self.dispatch_key(key, code, ctrl, alt, shift);
+        to_js(&outcome.effects)
+    }
+
+    /// [`Self::on_key`] for the editor's window-level handler: returns `{ effects, consumed }`, where
+    /// `consumed: false` means nothing claimed the key and the browser may have it (`Alt-1`
+    /// switching tabs). The overlay inputs own their keys outright and keep using `on_key`.
+    pub fn on_key_outcome(
+        &mut self,
+        key: &str,
+        code: &str,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+    ) -> Result<JsValue, JsValue> {
+        to_js(&self.dispatch_key(key, code, ctrl, alt, shift))
     }
 
     /// The render view: a JSON projection of the session for the shell to paint. Read after every
@@ -767,19 +781,26 @@ impl WasmSession {
         ctrl: bool,
         alt: bool,
         shift: bool,
-    ) -> Vec<Value> {
+    ) -> KeyResult {
         // Resolve the binding against the physical key (`code`) when Alt is held and the modified
         // key (`key`) otherwise: on macOS `key` is Option-composed (Option-`l` → `¬`) and would
         // never match an Alt-chord, while `code` stays `KeyL`. Text insertion still uses `key`.
         let Some(keycode) = keycode_for_binding(parse_code(code), parse_keycode(key), alt) else {
-            return Vec::new();
+            // A key the core has no name for (F-keys, media keys) can't be bound: the browser's.
+            return KeyResult {
+                effects: Vec::new(),
+                consumed: false,
+            };
         };
         let mods = Mods { ctrl, alt, shift };
         // The browser reports Shift-Tab as Tab + Shift; the core wants it as its own key.
         let keycode = aether_client::keymap::apply_backtab(keycode, mods);
         let text = key_text(key, &mods);
-        let fx = self.inner.on_key(keycode, mods, text);
-        effects_to_json(fx)
+        let outcome = self.inner.on_key_outcome(keycode, mods, text);
+        KeyResult {
+            effects: effects_to_json(outcome.effects),
+            consumed: outcome.consumed,
+        }
     }
 
     /// Host-testable core of [`WasmSession::on_event`]: wrap the push as a `Notification` and feed
@@ -1176,6 +1197,13 @@ fn action_value(a: &ShellAction) -> Value {
     }
 }
 
+/// A key's lowered outcome: the effects, and whether the core claimed the key.
+#[derive(serde::Serialize)]
+struct KeyResult {
+    effects: Vec<Value>,
+    consumed: bool,
+}
+
 fn to_js<T: serde::Serialize>(v: &T) -> Result<JsValue, JsValue> {
     // Two non-default options, both essential:
     // - `serialize_maps_as_objects`: the default serialises JSON objects as ES `Map`s, which
@@ -1259,6 +1287,23 @@ mod tests {
         assert_eq!(parse_code("Backspace"), Some(KeyCode::Backspace));
         assert_eq!(parse_code("F1"), None);
         assert_eq!(parse_code("MetaLeft"), None);
+    }
+
+    #[test]
+    fn claims_travel_the_boundary() {
+        let mut s = WasmSession::new();
+        assert!(
+            !s.dispatch_key("1", "Digit1", false, true, false).consumed,
+            "unbound Alt-1"
+        );
+        assert!(
+            !s.dispatch_key("F1", "F1", false, false, false).consumed,
+            "no name for F1"
+        );
+        assert!(
+            s.dispatch_key(",", "Comma", false, false, false).consumed,
+            "insert entry"
+        );
     }
 
     #[test]

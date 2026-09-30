@@ -2250,10 +2250,7 @@ export class Shell {
     const pk = this.snapshot?.picker;
     if (pk && !pk.chip_editor && pk.chip_selected !== null && this.session) {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
-        e.preventDefault();
-        this.runEffects(
-          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey) as CoreEffect[],
-        );
+        this.feedKey(e);
       }
       return;
     }
@@ -2263,10 +2260,7 @@ export class Shell {
     const sv = this.snapshot;
     if (sv?.mode === "search" && sv.search.chip_selected !== null && this.session) {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
-        e.preventDefault();
-        this.runEffects(
-          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey) as CoreEffect[],
-        );
+        this.feedKey(e);
       }
       return;
     }
@@ -2275,10 +2269,7 @@ export class Shell {
     const ps = this.snapshot?.workspace_settings;
     if (ps && ps.selected !== 0 && ps.selected !== ps.input_index && this.session) {
       if (e.key !== "Shift" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Meta") {
-        e.preventDefault();
-        this.runEffects(
-          this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey) as CoreEffect[],
-        );
+        this.feedKey(e);
       }
       return;
     }
@@ -2287,12 +2278,13 @@ export class Shell {
     // IME composition: let it run on the focused capture textarea (the composed text is flushed on
     // compositionend → insert_text). keyCode 229 is the IME-processing sentinel on the starting key.
     if (e.isComposing || e.keyCode === 229) return;
-    // The editor owns the keyboard: preventDefault every key unconditionally. This is the correct
-    // model for a modal editor — it suppresses the cancellable browser behaviors the editor should
+    // The editor owns the keyboard, but not the browser's: a key is preventDefaulted unless it is
+    // handed back (`handsBack`). That suppresses the cancellable browser behaviors the editor should
     // own (the Firefox Alt menu, Space-scroll, `/` quick-find, Ctrl-S/P/F, Backspace-back) while
     // hard-reserved combos (Ctrl-W/T/N, F5/F11/F12, Ctrl-L) ignore preventDefault and keep working.
-    // Tying this to whether the core returned effects was the bug: many handled keys (leader,
-    // opening a prompt, a mode switch) produce no effect, so those leaked to the browser.
+    // Whether the key was *claimed* comes from the core, not from whether it returned effects: many
+    // claimed keys (leader, opening a prompt, a mode switch) produce none, and keying off effects
+    // leaked those to the browser.
     // EXCEPT Ctrl/Cmd-V: leave its default so the native `paste` event fires into the capture
     // textarea (no clipboard-read prompt). The core still processes it (→ ReadClipboard); the
     // paste-event handler supplies the text.
@@ -2305,20 +2297,59 @@ export class Shell {
       if (sel && !sel.isCollapsed) return;
     }
     const isPaste = (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "v" || e.key === "V");
-    if (!isPaste) e.preventDefault();
     // A lone modifier keydown isn't fed to the core (it would disturb pending captures).
-    if (e.key === "Shift" || e.key === "Control" || e.key === "Alt" || e.key === "Meta") return;
-    if (!this.session) return;
+    if (e.key === "Shift" || e.key === "Control" || e.key === "Alt" || e.key === "Meta") {
+      e.preventDefault();
+      return;
+    }
+    this.feedKey(e, isPaste ? "paste" : isCopy ? "copy" : null);
+  }
+
+  /** Feed a real keydown to the core and settle its default: prevented when the core claimed the
+   *  key, or when it's one the browser mustn't have either (`handsBack`). Every surface that forwards
+   *  keys it hasn't vetted — editor, overlay inputs, chip rows — comes through here, so they all hand
+   *  back the same keys. (The path editors forward only their command keys and leave the rest native.)
+   *  `clipboard` marks the copy/paste chords the editor takes even as Cmd chords; a paste also keeps
+   *  its default, so the native `paste` event fires into the capture textarea. */
+  private feedKey(e: KeyboardEvent, clipboard: "copy" | "paste" | null = null): void {
+    // The core has no Meta modifier, so a Cmd/Super chord would reach it as the bare key (Cmd-1 a
+    // count, Cmd-s a motion). Those chords are the browser's and the OS's.
+    if (e.metaKey && !clipboard) {
+      if (!Shell.handsBack(e)) e.preventDefault();
+      return;
+    }
+    if (!this.session) {
+      if (clipboard !== "paste") e.preventDefault();
+      return;
+    }
     // Pass both the composed key (`e.key`) and the physical key (`e.code`): the core resolves
     // Alt-chords against `code` so macOS Option-composition (Option-l → `¬`) can't hide them.
-    const effects = this.session.on_key(
+    const outcome = this.session.on_key_outcome(
       e.key,
       e.code,
       e.ctrlKey,
       e.altKey,
       e.shiftKey,
-    ) as CoreEffect[];
-    this.runEffects(effects);
+    ) as { effects: CoreEffect[]; consumed: boolean };
+    if (clipboard !== "paste" && (outcome.consumed || !Shell.handsBack(e))) e.preventDefault();
+    this.runEffects(outcome.effects);
+  }
+
+  /** Whether a key nothing claimed goes back to the browser (`Alt-1` switching tabs, `Ctrl-+`
+   *  zooming). Only chords: a bare key is always the editor's, or an unbound `'` would start
+   *  Firefox's quick-find and Space would scroll the page. And never a chord that covers or leaves
+   *  the editor: letters (Alt-letter opens the Firefox menu bar, Ctrl-S/P/O/F open dialogs — and
+   *  letters are the keymap's namespace anyway), nor history navigation (Alt-Left/Right/Home,
+   *  Cmd-[/] and Cmd-Left/Right on macOS), which a mode that leaves those keys unbound would
+   *  otherwise hand straight to Back. `code`, not `key`, so macOS Option-composition and
+   *  non-Latin layouts don't disguise the key. */
+  private static handsBack(e: KeyboardEvent): boolean {
+    const chord = e.ctrlKey || e.altKey || e.metaKey;
+    const leavesEditor =
+      /^Key[A-Z]$/.test(e.code) ||
+      /^(Arrow(Left|Right|Up|Down)|Home|End)$/.test(e.code) ||
+      (e.metaKey && /^Bracket(Left|Right)$/.test(e.code));
+    return chord && !leavesEditor;
   }
 
   /** The current popover as plain text (for Ctrl-c). Markdown flattens via the shared serializer;
@@ -3653,12 +3684,7 @@ export class Shell {
     const clip =
       (e.ctrlKey || e.metaKey) && !e.altKey && ["c", "v", "x", "a"].includes(e.key.toLowerCase());
     if (clip || Shell.isEditingKey(e)) return;
-    e.preventDefault();
-    if (this.session) {
-      this.runEffects(
-        this.session.on_key(e.key, e.code, e.ctrlKey, e.altKey, e.shiftKey) as CoreEffect[],
-      );
-    }
+    this.feedKey(e);
   }
 
   private onSearchInputKey(e: KeyboardEvent): void {

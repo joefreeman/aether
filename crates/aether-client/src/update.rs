@@ -6401,14 +6401,19 @@ impl Session {
     }
 
     /// Keys while a picker is open: list navigation + query editing.
-    pub fn on_picker_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
+    pub fn on_picker_key(
+        &mut self,
+        code: KeyCode,
+        mods: Mods,
+        text: Option<String>,
+    ) -> Option<Effects> {
         // A key chip being captured takes every key, Esc included — that is the point of it.
         if self
             .picker
             .as_ref()
             .is_some_and(|p| p.key_capture.is_some())
         {
-            return self.on_key_capture_key(code, mods);
+            return Some(self.on_key_capture_key(code, mods));
         }
         // The chip editor line (glob/dir, revealed below the input) owns the keys while open.
         if self
@@ -6416,11 +6421,11 @@ impl Session {
             .as_ref()
             .is_some_and(|p| p.chip_editor.is_some())
         {
-            return self.on_chip_editor_key(code, mods, text);
+            return Some(self.on_chip_editor_key(code, mods, text));
         }
         let workspace_paths = self.workspace_paths.clone();
         let Some(p) = &mut self.picker else {
-            return Effects::none();
+            return Some(Effects::none());
         };
         let no_chord = !mods.ctrl && !mods.alt;
         // A selected chip captures the editing keys (Enter edits, Backspace/Delete removes,
@@ -6435,7 +6440,7 @@ impl Session {
                 match code {
                     KeyCode::Left if no_chord => {
                         p.chip_selected = Some(sel.saturating_sub(1));
-                        return Effects::none();
+                        return Some(Effects::none());
                     }
                     KeyCode::Right if no_chord => {
                         if sel + 1 >= row.len() {
@@ -6443,20 +6448,20 @@ impl Session {
                         } else {
                             p.chip_selected = Some(sel + 1);
                         }
-                        return Effects::none();
+                        return Some(Effects::none());
                     }
                     KeyCode::Esc => {
                         p.chip_selected = None;
-                        return Effects::none();
+                        return Some(Effects::none());
                     }
                     KeyCode::Backspace | KeyCode::Delete if no_chord => {
                         chips::remove_chip(&mut p.chips, row[sel].id);
                         let remaining = row.len() - 1;
                         p.chip_selected = (remaining > 0).then(|| sel.min(remaining - 1));
-                        return self.apply_picker_filter_change();
+                        return Some(self.apply_picker_filter_change());
                     }
                     KeyCode::Enter if no_chord => {
-                        return self.edit_selected_chip(row[sel].id);
+                        return Some(self.edit_selected_chip(row[sel].id));
                     }
                     KeyCode::Char(_) if no_chord => {
                         // Typing returns to the query — fall through so the char lands.
@@ -6468,7 +6473,7 @@ impl Session {
         }
         let mandatory = self.picker_is_mandatory();
         let Some(p) = &mut self.picker else {
-            return Effects::none();
+            return Some(Effects::none());
         };
         match code {
             // The mandatory chooser ([`Self::picker_is_mandatory`]): there is nothing behind the
@@ -6477,13 +6482,13 @@ impl Session {
             // maps `Effect::Exit` to a no-op and the chooser simply remains up. Deliberately not a
             // `PickerCmd::Dismiss` observation: nothing closes here.
             KeyCode::Esc if mandatory => {
-                return Effects::one(Effect::Exit);
+                return Some(Effects::one(Effect::Exit));
             }
             // Hint observation before the picker closes (the picker-dismiss hint displays in
             // this context — Esc while it's up is its follow).
             KeyCode::Esc => {
                 let observed = self.observe_picker_cmd(PickerCmd::Dismiss);
-                return observed.and(self.close_picker());
+                return Some(observed.and(self.close_picker()));
             }
             // Ctrl-Enter opens the highlighted item in a *new* window (GUI-only; a no-op in the TUI),
             // mirroring the web client's Ctrl/Cmd-Enter "open in a new tab". Rows that aren't a
@@ -6497,21 +6502,21 @@ impl Session {
                 if p.kind == PickerKind::GitBranches {
                     if let Some(PickerItem::GitBranch { name, checkout, .. }) = p.selected_item() {
                         if checkout.is_none() {
-                            return Effects::toast(
+                            return Some(Effects::toast(
                                 format!("{name} has no worktree yet"),
                                 ToastKind::Warning,
-                            );
+                            ));
                         }
                     }
                 }
                 if let Some(target) = self.picker_item_target() {
-                    return self.close_picker().and(Effects::one(Effect::ShellAction(
+                    return Some(self.close_picker().and(Effects::one(Effect::ShellAction(
                         ShellAction::NewWindow(target),
-                    )));
+                    ))));
                 }
-                return self.picker_accept();
+                return Some(self.picker_accept());
             }
-            KeyCode::Enter => return self.picker_accept(),
+            KeyCode::Enter => return Some(self.picker_accept()),
             // Ctrl-d: trash the highlighted entry (Files + Explorer) or delete the highlighted
             // workspace (Workspaces), behind a confirm. (Not plain `Delete` — that's a forward-delete
             // in the query input, owned by the shell; deleting is too destructive to ride a bare
@@ -6524,7 +6529,7 @@ impl Session {
                         PickerKind::Files | PickerKind::Explorer | PickerKind::Workspaces
                     ) =>
             {
-                return self.picker_stage_delete();
+                return Some(self.picker_stage_delete());
             }
             // Ctrl-r: rename or move the highlighted Files/Explorer entry, through a path prompt
             // pre-filled with where it is now.
@@ -6533,7 +6538,7 @@ impl Session {
                     && !mods.alt
                     && matches!(p.kind, PickerKind::Files | PickerKind::Explorer) =>
             {
-                return self.picker_stage_rename();
+                return Some(self.picker_stage_rename());
             }
             // Ctrl-d in the view picker closes the highlighted row in place (no open) — a live
             // buffer or a dormant (session-restored) one alike, the server resolves which. It shares
@@ -6556,7 +6561,7 @@ impl Session {
                     ..
                 }) = p.selected_item()
                 else {
-                    return Effects::none();
+                    return Some(Effects::none());
                 };
                 // One key, taking the **outermost** thing off: a row with a worktree loses the
                 // worktree, a row without one loses the branch. The exact inverse of `Ctrl-o`
@@ -6566,35 +6571,35 @@ impl Session {
                     if mods.alt {
                         // Force is the escalation from a `NotMerged` refusal the user has read, and
                         // that path runs through the confirm below. Nothing to escalate from yet.
-                        return Effects::none();
+                        return Some(Effects::none());
                     }
                     let name = name.clone();
                     self.prompt = Some(Prompt::Confirm {
                         kind: ConfirmKind::DeleteBranch { name: name.clone() },
                         action: ConfirmAction::DeleteBranch { name, force: false },
                     });
-                    return Effects::none();
+                    return Some(Effects::none());
                 };
                 // Two things this row can't be asked to do, checked in the order the user would
                 // hit them. Standing in it comes first: it is true of the main checkout *and* of a
                 // worktree, and "you are here" is the more useful sentence either way.
                 if checkout.is_current {
-                    return Effects::error_detail(
+                    return Some(Effects::error_detail(
                         if detached_at.is_some() {
                             format!("You're in {name}")
                         } else {
                             format!("You're on {name}")
                         },
                         "Switch away first",
-                    );
+                    ));
                 }
                 // The main checkout is the repository: there is no tree to remove, and git refuses
                 // to delete a branch it holds, so neither half of `Ctrl-d` applies.
                 if checkout.is_main {
-                    return Effects::error_detail(
+                    return Some(Effects::error_detail(
                         format!("{name} is in the main checkout"),
                         "There's no worktree to remove, and git won't delete a branch it holds",
-                    );
+                    ));
                 }
                 // No confirm dialog, unlike the branch half: here the *refusal* is the
                 // confirmation. A first press either removes a clean tree or comes back itemising
@@ -6606,7 +6611,7 @@ impl Session {
                 // indistinguishable from Ctrl-d.
                 let (repo_id, worktree) = (repo_id.clone(), checkout.worktree.clone());
                 let force = mods.alt;
-                return self.git_worktree_remove(repo_id, worktree, force);
+                return Some(self.git_worktree_remove(repo_id, worktree, force));
             }
             // `Ctrl-o` — create a worktree for the highlighted branch and **stay put**.
             //
@@ -6643,33 +6648,33 @@ impl Session {
                 // The `+ Create` row: the branch doesn't exist either, so make both.
                 if let Some(branch) = create_from_query {
                     let Some(repo_id) = self.branch_picker_repo_id() else {
-                        return observed;
+                        return Some(observed);
                     };
                     if branch.is_empty() {
-                        return observed.and(Effects::error("Type a branch name to create"));
+                        return Some(observed.and(Effects::error("Type a branch name to create")));
                     }
-                    return observed.and(self.git_worktree_add(repo_id, branch, true));
+                    return Some(observed.and(self.git_worktree_add(repo_id, branch, true)));
                 }
                 let Some((repo_id, name, checkout, detached)) = row else {
-                    return observed;
+                    return Some(observed);
                 };
                 if let Some(checkout) = checkout {
                     // Already has one. Naming *which* matters: the tree's admin name drifts from
                     // the branch, so "main already has a worktree" would be the wrong sentence for
                     // a row whose tree is called something else entirely.
-                    return observed.and(Effects::error(if checkout.is_main {
+                    return Some(observed.and(Effects::error(if checkout.is_main {
                         format!("{name} is in the main checkout")
                     } else {
                         format!("{name} is already in worktree {}", checkout.worktree)
-                    }));
+                    })));
                 }
                 // A detached row always carries a checkout, so this is unreachable through it —
                 // but a row with no branch has no branch to make a tree for, and saying so beats
                 // sending the server a commit id where it expects a ref.
                 if detached {
-                    return observed;
+                    return Some(observed);
                 }
-                return observed.and(self.git_worktree_add(repo_id, name, false));
+                return Some(observed.and(self.git_worktree_add(repo_id, name, false)));
             }
             // Stash chords, in the Ctrl family the other pickers' row actions use. `Ctrl-p` pops
             // (the gesture you stashed *for*) and `Ctrl-Alt-p` applies — the plain/Alt sibling
@@ -6679,7 +6684,7 @@ impl Session {
             {
                 let pop = !mods.alt;
                 let Some(PickerItem::GitStash { repo_id, oid, .. }) = p.selected_item() else {
-                    return Effects::none();
+                    return Some(Effects::none());
                 };
                 let params = GitStashApplyParams {
                     repo_id: Some(repo_id.clone()),
@@ -6688,12 +6693,14 @@ impl Session {
                     pop,
                 };
                 let hide = self.close_picker();
-                return hide.and(self.request_str::<GitStashApply>(params, |result| {
-                    Event::StashDone {
-                        staged: false,
-                        result,
-                    }
-                }));
+                return Some(
+                    hide.and(self.request_str::<GitStashApply>(params, |result| {
+                        Event::StashDone {
+                            staged: false,
+                            result,
+                        }
+                    })),
+                );
             }
             // `Ctrl-d` deletes the highlighted thing, as in every other picker — behind a confirm,
             // because a dropped stash is not something the editor can give back.
@@ -6705,14 +6712,14 @@ impl Session {
                     ..
                 }) = p.selected_item()
                 else {
-                    return Effects::none();
+                    return Some(Effects::none());
                 };
                 let (repo_id, oid, message) = (repo_id.clone(), oid.clone(), message.clone());
                 self.prompt = Some(Prompt::Confirm {
                     kind: ConfirmKind::DropStash { message },
                     action: ConfirmAction::DropStash { repo_id, oid },
                 });
-                return Effects::none();
+                return Some(Effects::none());
             }
             // The tasks pickers' two other ways into a row. `Ctrl-e` opens the task's shell with its
             // command typed but not run — *edit* it first, the `Ctrl-e` of Normal mode — and
@@ -6724,11 +6731,11 @@ impl Session {
                     && matches!(p.kind, PickerKind::Tasks | PickerKind::TasksWorkspace) =>
             {
                 let Some(item @ PickerItem::Task { .. }) = p.selected_item().cloned() else {
-                    return Effects::none();
+                    return Some(Effects::none());
                 };
                 if c == 'e' {
                     let observed = self.observe_picker_cmd(PickerCmd::EditTask);
-                    return observed.and(self.open_task(item, false));
+                    return Some(observed.and(self.open_task(item, false)));
                 }
                 let kind = p.kind;
                 let observed = self.observe_picker_cmd(PickerCmd::TaskDefinition);
@@ -6740,20 +6747,22 @@ impl Session {
                             result: r.map_err(|e| e.message),
                         }
                     });
-                return observed.and(select).and(self.close_picker());
+                return Some(observed.and(select).and(self.close_picker()));
             }
             // The activity picker: `Ctrl-d` stops the row's work, and the picker stays open — the
             // row leaves by itself once it has stopped, and whatever else is running is still
             // listed. The pickers' "remove this row" chord, as it closes a view in the view pickers.
             KeyCode::Char('d') if mods.ctrl && !mods.alt && p.kind == PickerKind::Activity => {
                 let Some(PickerItem::Activity { id, .. }) = p.selected_item() else {
-                    return Effects::none();
+                    return Some(Effects::none());
                 };
                 let id = id.clone();
                 let observed = self.observe_picker_cmd(PickerCmd::StopActivity);
-                return observed.and(self.request::<aether_protocol::activity::ActivityCancel>(
-                    aether_protocol::activity::ActivityCancelParams { id },
-                    Event::ActivityCancelled,
+                return Some(observed.and(
+                    self.request::<aether_protocol::activity::ActivityCancel>(
+                        aether_protocol::activity::ActivityCancelParams { id },
+                        Event::ActivityCancelled,
+                    ),
                 ));
             }
             // All three view-listing pickers: the row names a view, and `Ctrl-d` closes it.
@@ -6766,7 +6775,7 @@ impl Session {
                     ) =>
             {
                 let fx = self.observe_picker_cmd(PickerCmd::CloseView);
-                return fx.and(self.picker_close_view());
+                return Some(fx.and(self.picker_close_view()));
             }
             // Ctrl-j: capture the picker's filtered results into the jumplist and jump to the
             // highlighted row — `]`/`[` then step the captured set. Position-shaped kinds only
@@ -6774,7 +6783,7 @@ impl Session {
             // inputs don't claim it) and distinct from Enter in the TUI (crossterm raw mode maps
             // the 0x0A byte to Ctrl-j, not Enter).
             KeyCode::Char('j') if mods.ctrl && !mods.alt && p.kind.captures_to_jumplist() => {
-                return self.jumplist_capture();
+                return Some(self.jumplist_capture());
             }
             // Up/Down recall this picker's query history — grep only, the one kind whose query is a
             // question you re-ask rather than a live filter over a candidate set. They're free here
@@ -6792,7 +6801,7 @@ impl Session {
                     filters: p.wire_filters(),
                 };
                 let Some(entry) = self.history_step(kind, dir, current) else {
-                    return Effects::none(); // nothing to recall; leave the picker alone
+                    return Some(Effects::none()); // nothing to recall; leave the picker alone
                 };
                 // Not via `picker_set_query` — that's the shell's typing sync, which abandons the
                 // walk we're in the middle of. Install the query *and* the chip row the entry
@@ -6803,24 +6812,24 @@ impl Session {
                     p.query = entry.value;
                     p.adopt_filters(&entry.filters);
                 }
-                return self.picker_query_changed();
+                return Some(self.picker_query_changed());
             }
             // Alt-k/j move the highlight (Up/Down deliberately don't, matching the others).
             KeyCode::Char('k') if mods.alt && !mods.ctrl => {
                 let fx = self.observe_picker_cmd(PickerCmd::MoveSelection);
-                return fx.and(self.picker_move(-1));
+                return Some(fx.and(self.picker_move(-1)));
             }
             KeyCode::Char('j') if mods.alt && !mods.ctrl => {
                 let fx = self.observe_picker_cmd(PickerCmd::MoveSelection);
-                return fx.and(self.picker_move(1));
+                return Some(fx.and(self.picker_move(1)));
             }
             // `Ctrl-g` / `Ctrl-f` in the Explorer: switch to Grep / Files scoped to the
             // browsed directory ("grep here").
             KeyCode::Char('g') if mods.ctrl && !mods.alt && p.kind == PickerKind::Explorer => {
-                return self.switch_explorer_picker(PickerKind::Grep);
+                return Some(self.switch_explorer_picker(PickerKind::Grep));
             }
             KeyCode::Char('f') if mods.ctrl && !mods.alt && p.kind == PickerKind::Explorer => {
-                return self.switch_explorer_picker(PickerKind::Files);
+                return Some(self.switch_explorer_picker(PickerKind::Files));
             }
             // Alt-l is one rule in every picker: go one level deeper into the highlighted row.
             // A container descends (Explorer directory, collapsed group); a leaf has no inside,
@@ -6834,12 +6843,12 @@ impl Session {
             // Alt-l/h used to also mean "jump to the next/previous group" in the header-grouped
             // kinds that don't collapse (References, Keybindings) and "next top-level unit" in
             // DocumentSymbols. That third meaning is gone — those rows open now.
-            KeyCode::Char('l') if mods.alt && !mods.ctrl => return self.picker_descend(),
+            KeyCode::Char('l') if mods.alt && !mods.ctrl => return Some(self.picker_descend()),
             // Alt-h mirrors it: one level shallower — out of the listed directory, or out of a
             // group onto its header. There's no "un-open", so on a leaf it does nothing. Never
             // the query: the unwind ladder (query, then chips) is Alt-Backspace's alone.
             KeyCode::Char('h') if mods.alt && !mods.ctrl && p.kind == PickerKind::Explorer => {
-                return self.explorer_ascend().unwrap_or_else(Effects::none);
+                return Some(self.explorer_ascend().unwrap_or_else(Effects::none));
             }
             // Alt-h closes the group: from inside a run it collapses that run and puts the
             // highlight on its header; on an expanded header it collapses in place. A collapsed
@@ -6851,53 +6860,53 @@ impl Session {
                 // is exactly the repeat that covers that case. A collapsed group answers
                 // `expanded: false` here and the press does nothing.
                 let Some(span) = p.governing_span(p.selected) else {
-                    return Effects::none();
+                    return Some(Effects::none());
                 };
                 if span.expanded != Some(true) {
-                    return Effects::none();
+                    return Some(Effects::none());
                 }
                 let header = span.header.clone();
-                return self.picker_collapse_group(header);
+                return Some(self.picker_collapse_group(header));
             }
             // Alt-a toggles every group at once — expand-all, or collapse-all when nothing is
             // collapsed. `a` for "all", unshifted: the Alt-letter family is the one that survives
             // every terminal. A no-op in the flat pickers.
             KeyCode::Char('a') if mods.alt && !mods.ctrl && p.collapsible => {
-                return self.picker_toggle_all_groups();
+                return Some(self.picker_toggle_all_groups());
             }
             // Alt-Backspace unwind: clear the query first, then (explorer) step to the parent
             // (one segment per press) into roots mode (multi-root only), then pop chips.
             // Alt-h used to share this and no longer does — it duplicated Alt-Backspace on the
             // query and now only ever ascends (the arms above).
-            KeyCode::Backspace if mods.alt && !mods.ctrl => return self.picker_back(),
+            KeyCode::Backspace if mods.alt && !mods.ctrl => return Some(self.picker_back()),
             // Filter-chip chords. Booleans toggle in place; valued filters open the editor line.
             // Gated per kind inside the helpers.
             KeyCode::Char('c') if mods.alt && !mods.ctrl => {
-                return self.toggle_picker_filter(ChipId::Case);
+                return Some(self.toggle_picker_filter(ChipId::Case));
             }
             KeyCode::Char('w') if mods.alt && !mods.ctrl => {
-                return self.toggle_picker_filter(ChipId::Word);
+                return Some(self.toggle_picker_filter(ChipId::Word));
             }
             KeyCode::Char('e') if mods.alt && !mods.ctrl => {
-                return self.toggle_picker_filter(ChipId::Regex);
+                return Some(self.toggle_picker_filter(ChipId::Regex));
             }
             KeyCode::Char('i') if mods.alt && !mods.ctrl => {
-                return self.toggle_picker_filter(ChipId::Ignored);
+                return Some(self.toggle_picker_filter(ChipId::Ignored));
             }
             KeyCode::Char('.') if mods.alt && !mods.ctrl => {
-                return self.toggle_picker_filter(ChipId::Hidden);
+                return Some(self.toggle_picker_filter(ChipId::Hidden));
             }
             KeyCode::Char('m') if mods.alt && !mods.ctrl => {
-                return self.toggle_picker_filter(ChipId::Changed);
+                return Some(self.toggle_picker_filter(ChipId::Changed));
             }
             KeyCode::Char('u') if mods.alt && !mods.ctrl => {
-                return self.toggle_picker_filter(ChipId::Untracked);
+                return Some(self.toggle_picker_filter(ChipId::Untracked));
             }
             KeyCode::Char('g') if mods.alt && !mods.ctrl => {
-                return self.open_glob_prompt(None);
+                return Some(self.open_glob_prompt(None));
             }
             KeyCode::Char('b') if mods.alt && !mods.ctrl => {
-                return self.start_key_capture();
+                return Some(self.start_key_capture());
             }
             KeyCode::Char('p') if mods.alt && !mods.ctrl => {
                 // Only the kinds that actually have path scopes count as a demonstration —
@@ -6907,13 +6916,13 @@ impl Session {
                 } else {
                     Effects::none()
                 };
-                return fx.and(self.open_dir_prompt(None));
+                return Some(fx.and(self.open_dir_prompt(None)));
             }
             KeyCode::PageUp => {
-                return self.picker_move(-(VISIBLE_ROWS as i64 - 1));
+                return Some(self.picker_move(-(VISIBLE_ROWS as i64 - 1)));
             }
             KeyCode::PageDown => {
-                return self.picker_move(VISIBLE_ROWS as i64 - 1);
+                return Some(self.picker_move(VISIBLE_ROWS as i64 - 1));
             }
             // LspServers: Ctrl-r restarts the highlighted server in place.
             KeyCode::Char('r') if mods.ctrl && !mods.alt && p.kind == PickerKind::LspServers => {
@@ -6937,16 +6946,16 @@ impl Session {
                         },
                     );
                     fx.push(self.lsp_restarting_toast(&name, &language, &workspace_root));
-                    return fx;
+                    return Some(fx);
                 }
-                return Effects::none();
+                return Some(Effects::none());
             }
             // `Left` / `Backspace` step into the chip row (rightmost first) — the browser
             // tag-input gesture. In-query caret moves and deletes are owned by each shell's input
             // (which only forwards these from the query start), so reaching the core *is* the
             // boundary: there's nothing to the left but the chips.
             KeyCode::Left | KeyCode::Backspace if no_chord => {
-                return self.picker_select_last_chip();
+                return Some(self.picker_select_last_chip());
             }
             _ => {}
         }
@@ -6958,11 +6967,11 @@ impl Session {
                 let typed: String = typed.chars().filter(|c| !c.is_control()).collect();
                 if !typed.is_empty() {
                     p.query.push_str(&typed);
-                    return self.picker_query_changed();
+                    return Some(self.picker_query_changed());
                 }
             }
         }
-        Effects::none()
+        None
     }
 
     /// Keys while the chip editor line is open. The dir editor reads as one `dir: root: path`
@@ -8736,13 +8745,13 @@ impl Session {
         code: KeyCode,
         mods: Mods,
         text: Option<String>,
-    ) -> Effects {
+    ) -> Option<Effects> {
         // Ctrl-d is accepted alongside Delete to remove the selected root or project.
         let is_delete_chord =
             code == KeyCode::Delete || (code == KeyCode::Char('d') && mods.ctrl && !mods.alt);
 
         let Some(row) = self.workspace_settings.as_ref().map(|s| s.row()) else {
-            return Effects::none();
+            return Some(Effects::none());
         };
         let on_name = row == SettingsRow::Name;
         let no_chord = !mods.ctrl && !mods.alt;
@@ -8757,7 +8766,7 @@ impl Session {
                 Effects::none()
             };
             self.workspace_settings = None;
-            return rename;
+            return Some(rename);
         }
 
         // The add-project row is a full path editor. Give it the key first: it owns the chords that
@@ -8773,7 +8782,7 @@ impl Session {
                 .is_some_and(|s| s.on_add_project_language)
             {
                 if let Some(fx) = self.on_add_project_language_key(code, mods) {
-                    return fx;
+                    return Some(fx);
                 }
             }
             let workspace_paths = self.workspace_paths.clone();
@@ -8787,22 +8796,22 @@ impl Session {
                 )
             });
             match outcome {
-                Some(PathEditorKey::Commit) => return self.commit_add_project(),
+                Some(PathEditorKey::Commit) => return Some(self.commit_add_project()),
                 // Esc closes the whole dialog, as it does from any row — the editor is a field
                 // here, not a prompt of its own.
                 Some(PathEditorKey::Cancel) => {
                     self.workspace_settings = None;
-                    return Effects::none();
+                    return Some(Effects::none());
                 }
                 // Editor chords can rewrite the path (Alt-l accept, Alt-Backspace pop) or re-aim
                 // the root (Alt-j/k in the root segment) — re-sync the language suggestion either
                 // way; it dedupes on the (root, path) pair, so an unmoved pair costs nothing.
                 Some(PathEditorKey::Handled { refresh: true }) => {
                     let fx = self.refresh_add_project_listing();
-                    return fx.and(self.sync_add_project_inference());
+                    return Some(fx.and(self.sync_add_project_inference()));
                 }
                 Some(PathEditorKey::Handled { refresh: false }) => {
-                    return self.sync_add_project_inference()
+                    return Some(self.sync_add_project_inference())
                 }
                 // Tab off the editor's last segment enters the language field rather than leaving
                 // the row; only Tab off *that* moves on. Backward still steps to the row above.
@@ -8810,9 +8819,9 @@ impl Session {
                     if let Some(s) = self.workspace_settings.as_mut() {
                         s.on_add_project_language = true;
                     }
-                    return Effects::none();
+                    return Some(Effects::none());
                 }
-                Some(PathEditorKey::PrevField) => return self.settings_step_field(false),
+                Some(PathEditorKey::PrevField) => return Some(self.settings_step_field(false)),
                 Some(PathEditorKey::Ignored) | None => {}
             }
         }
@@ -8828,17 +8837,17 @@ impl Session {
                 .as_mut()
                 .map(|s| path_editor_key(&mut s.add, &workspace_paths, code, mods, text.clone()));
             match outcome {
-                Some(PathEditorKey::Commit) => return self.commit_add_root(),
+                Some(PathEditorKey::Commit) => return Some(self.commit_add_root()),
                 Some(PathEditorKey::Cancel) => {
                     self.workspace_settings = None;
-                    return Effects::none();
+                    return Some(Effects::none());
                 }
                 Some(PathEditorKey::Handled { refresh: true }) => {
-                    return self.refresh_add_root_listing()
+                    return Some(self.refresh_add_root_listing())
                 }
-                Some(PathEditorKey::Handled { refresh: false }) => return Effects::none(),
-                Some(PathEditorKey::NextField) => return self.settings_step_field(true),
-                Some(PathEditorKey::PrevField) => return self.settings_step_field(false),
+                Some(PathEditorKey::Handled { refresh: false }) => return Some(Effects::none()),
+                Some(PathEditorKey::NextField) => return Some(self.settings_step_field(true)),
+                Some(PathEditorKey::PrevField) => return Some(self.settings_step_field(false)),
                 Some(PathEditorKey::Ignored) | None => {}
             }
         }
@@ -8846,7 +8855,7 @@ impl Session {
         // Tab / Shift-Tab traverse the dialog's fields — the form convention, and the reason the
         // editor above no longer claims Tab for completion.
         if code == KeyCode::Tab || code == KeyCode::BackTab {
-            return self.settings_step_field(code == KeyCode::Tab);
+            return Some(self.settings_step_field(code == KeyCode::Tab));
         }
 
         // Up / Down traverse too, as a non-chord alternative to Tab. Deliberately *not* Alt-j/k:
@@ -8867,13 +8876,13 @@ impl Session {
                     s.selected.saturating_sub(1)
                 };
             }
-            return rename;
+            return Some(rename);
         }
 
         if is_delete_chord {
             match row {
-                SettingsRow::Root(i) => return self.request_remove_root(i),
-                SettingsRow::Project(i) => return self.request_remove_project(i),
+                SettingsRow::Root(i) => return Some(self.request_remove_root(i)),
+                SettingsRow::Project(i) => return Some(self.request_remove_project(i)),
                 _ => {}
             }
         }
@@ -8881,8 +8890,8 @@ impl Session {
         // Both input rows commit through their own editor above; only the name field reaches here.
         if code == KeyCode::Enter {
             match row {
-                SettingsRow::Name => return self.commit_rename_if_changed(),
-                _ => return Effects::none(),
+                SettingsRow::Name => return Some(self.commit_rename_if_changed()),
+                _ => return Some(Effects::none()),
             }
         }
 
@@ -8896,7 +8905,7 @@ impl Session {
                     s.name.set(shortened);
                 }
             }
-            return Effects::none();
+            return Some(Effects::none());
         }
 
         // Text editing for the focused field (name / add-root / add-project) is owned by each
@@ -8904,7 +8913,7 @@ impl Session {
         // `_set_add_project`. The core handles only the command keys above; any other key here is a
         // no-op.
         let _ = text;
-        Effects::none()
+        None
     }
 
     /// Keys while the add-project row's language segment has focus. `None` means "not mine" — the
@@ -9325,15 +9334,15 @@ impl Session {
         code: KeyCode,
         mods: Mods,
         _text: Option<String>,
-    ) -> Effects {
+    ) -> Option<Effects> {
         let row_count = self.app_setting_rows().len();
         let Some(selected) = self.app_settings.as_ref().map(|s| s.selected) else {
-            return Effects::none();
+            return Some(Effects::none());
         };
 
         if code == KeyCode::Esc {
             self.app_settings = None;
-            return Effects::none();
+            return Some(Effects::none());
         }
 
         // Tab / Shift-Tab and the arrows traverse, matching the workspace-settings dialog. Alt-j/k
@@ -9351,19 +9360,19 @@ impl Session {
                     (s.selected + row_count - 1) % row_count
                 };
             }
-            return Effects::none();
+            return Some(Effects::none());
         }
         if code == KeyCode::Up {
             if let Some(s) = self.app_settings.as_mut() {
                 s.selected = s.selected.saturating_sub(1);
             }
-            return Effects::none();
+            return Some(Effects::none());
         }
         if code == KeyCode::Down {
             if let Some(s) = self.app_settings.as_mut() {
                 s.selected = (s.selected + 1).min(row_count.saturating_sub(1));
             }
-            return Effects::none();
+            return Some(Effects::none());
         }
 
         // Left/Right step a multi-value row (either font size, the reading width) without
@@ -9371,7 +9380,7 @@ impl Session {
         let left = code == KeyCode::Left || (mods.alt && code == KeyCode::Char('h'));
         let right = code == KeyCode::Right || (mods.alt && code == KeyCode::Char('l'));
         if left || right {
-            return match self.app_setting_rows().get(selected).map(|r| r.id) {
+            return Some(match self.app_setting_rows().get(selected).map(|r| r.id) {
                 Some(AppSettingId::EditorFontSize) => {
                     self.set_editor_font_size(step_font_size(self.editor_font_size, right, false))
                 }
@@ -9382,13 +9391,13 @@ impl Session {
                     self.set_markdown_width(step_markdown_width(self.markdown_width, right, false))
                 }
                 _ => Effects::none(),
-            };
+            });
         }
 
         if code == KeyCode::Enter || code == KeyCode::Char(' ') {
-            return self.toggle_app_setting(selected);
+            return Some(self.toggle_app_setting(selected));
         }
-        Effects::none()
+        None
     }
 
     /// Toggle the setting at flat row `index` from a shell-side click on its checkbox (native/web).
@@ -9610,7 +9619,12 @@ impl Session {
     /// Left/Right walk the row, Backspace/Delete remove, Enter cycles, Esc/typing deselect. A
     /// forwarded Left/Backspace with no chip selected is the "step into the chips from the query
     /// start" gesture each shell sends when the caret sits at column 0.
-    pub fn on_search_key(&mut self, code: KeyCode, mods: Mods, _text: Option<String>) -> Effects {
+    pub fn on_search_key(
+        &mut self,
+        code: KeyCode,
+        mods: Mods,
+        _text: Option<String>,
+    ) -> Option<Effects> {
         let no_chord = !mods.ctrl && !mods.alt;
         if let Some(sel) = self.view.search.chip_selected {
             let chips = self.view.search.option_chips();
@@ -9621,21 +9635,21 @@ impl Session {
                 match code {
                     KeyCode::Left if no_chord => {
                         self.view.search.chip_selected = Some(sel.saturating_sub(1));
-                        return Effects::none();
+                        return Some(Effects::none());
                     }
                     KeyCode::Right if no_chord => {
                         self.view.search.chip_selected = (sel + 1 < chips.len()).then_some(sel + 1);
-                        return Effects::none();
+                        return Some(Effects::none());
                     }
                     KeyCode::Esc => {
                         self.view.search.chip_selected = None;
-                        return Effects::none();
+                        return Some(Effects::none());
                     }
                     KeyCode::Backspace | KeyCode::Delete if no_chord => {
-                        return self.remove_search_chip(sel);
+                        return Some(self.remove_search_chip(sel));
                     }
                     KeyCode::Enter if no_chord => {
-                        return self.cycle_search_chip(sel);
+                        return Some(self.cycle_search_chip(sel));
                     }
                     KeyCode::Char(_) if no_chord => {
                         // Typing returns to the query (the shell's input takes the char).
@@ -9649,7 +9663,7 @@ impl Session {
             && !self.view.search.option_chips().is_empty()
         {
             // Forwarded from the query start: step into the chip row, selecting the rightmost.
-            return self.search_select_last_chip();
+            return Some(self.search_select_last_chip());
         }
         match lookup(KeyContext::Search, code, mods) {
             Some(b) => {
@@ -9660,9 +9674,9 @@ impl Session {
                 let enabled = self.hints_enabled;
                 let evs = self.hints.observe_action(&b.action, ctx, enabled);
                 let observed = self.emit_hint_events(evs);
-                observed.and(self.search_action(b.action))
+                Some(observed.and(self.search_action(b.action)))
             }
-            None => Effects::none(),
+            None => None,
         }
     }
 
@@ -10086,15 +10100,36 @@ impl Session {
     /// what this boundary uniquely catches is the *synchronous* search-clear paths — `drop_search`
     /// (Esc in Normal), `abort_search` / `commit_search` (the prompt) — which never reach `on_event`.
     pub fn on_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
+        self.on_key_outcome(code, mods, text).effects
+    }
+
+    /// [`Self::on_key`], also saying whether anything claimed the key. A shell hosted inside
+    /// something with keys of its own (the browser: `Alt-1` switches tabs) hands an unclaimed key
+    /// back rather than swallowing it; a native shell has no host to hand it to.
+    pub fn on_key_outcome(
+        &mut self,
+        code: KeyCode,
+        mods: Mods,
+        text: Option<String>,
+    ) -> KeyOutcome {
         // Every key is hint-relevant activity (the idle gate), and dispatch may have moved the
         // hint context (opened an overlay, left Insert) — re-sync so the corner follows.
         self.hints.note_input();
-        let fx = self.dispatch_key(code, mods, text);
+        let resolved = self.dispatch_key(code, mods, text);
+        let consumed = resolved.is_some();
+        let fx = resolved.unwrap_or_else(Effects::none);
         let fx = fx.and(self.sync_hint_context());
-        fx.and(self.sync_decoration_follow())
+        KeyOutcome {
+            effects: fx.and(self.sync_decoration_follow()),
+            consumed,
+        }
     }
 
-    fn dispatch_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
+    /// `None` when nothing claimed the key: it isn't in the open overlay's vocabulary (a prompt
+    /// claims every key — any key dismisses it), or, with no overlay, no pending capture takes it,
+    /// it isn't a count digit or inserted text, and no table binds it. Everything else — including
+    /// a key that only cancels a chord — is claimed, even when it produces no effects.
+    fn dispatch_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Option<Effects> {
         // Input isn't gated here: client-only actions (Quit, scroll, help, mode toggles) stay
         // usable while the connection is down — most importantly, the user can still quit. Anything
         // that actually talks to the server is dropped at the point of issue (see `request`), so a
@@ -10103,11 +10138,12 @@ impl Session {
         // An open modal prompt owns the keyboard outright; a picker likewise.
         if self.prompt.is_some() {
             let fx = self.on_prompt_key(code, mods, text);
-            return fx;
+            return Some(fx);
         }
+        // The overlays below own the keyboard too, but each reports a key its vocabulary doesn't
+        // know as unclaimed — nothing reaches the editor behind them either way.
         if self.picker.is_some() {
-            let fx = self.on_picker_key(code, mods, text);
-            return fx;
+            return self.on_picker_key(code, mods, text);
         }
         // The workspace-settings overlay likewise owns the keyboard while open.
         if self.workspace_settings.is_some() {
@@ -10121,8 +10157,7 @@ impl Session {
         // Search mode owns the keyboard: control keys via its table, anything printable is
         // query text (case-preserved — no normalisation of the literal query).
         if self.view.mode == Mode::Search {
-            let fx = self.on_search_key(code, mods, text);
-            return fx;
+            return self.on_search_key(code, mods, text);
         }
 
         // An active sneak session owns the keyboard: keystrokes refine the query or pick a label.
@@ -10140,11 +10175,11 @@ impl Session {
             } => {
                 self.view.pending = Pending::None;
                 if code == KeyCode::Esc {
-                    return Effects::none();
+                    return Some(Effects::none());
                 }
                 let ch = text.as_deref().and_then(|t| t.chars().next());
                 let Some(ch) = ch.filter(|c| !c.is_control()) else {
-                    return Effects::none();
+                    return Some(Effects::none());
                 };
                 let motion = Motion::FindChar {
                     ch,
@@ -10158,22 +10193,24 @@ impl Session {
                     motion: motion.clone(),
                     extend,
                 });
-                return self.move_motion(motion, extend);
+                return Some(self.move_motion(motion, extend));
             }
             Pending::Surround(target) => {
                 self.view.pending = Pending::None;
                 let ch = text.as_deref().and_then(|t| t.chars().next());
                 let Some(delimiter) = ch.filter(|c| !c.is_control()) else {
-                    return Effects::none(); // Esc / non-char cancels
+                    return Some(Effects::none()); // Esc / non-char cancels
                 };
                 // `BeginSurround` only armed the capture; the change is this resolved surround.
-                return self.recorded(RepeatTarget::Surround { delimiter, target }, |s| {
-                    s.edit::<InputSurround>(InputSurroundParams {
-                        buffer_id: s.view.buffer.buffer_id,
-                        delimiter,
-                        target,
-                    })
-                });
+                return Some(
+                    self.recorded(RepeatTarget::Surround { delimiter, target }, |s| {
+                        s.edit::<InputSurround>(InputSurroundParams {
+                            buffer_id: s.view.buffer.buffer_id,
+                            delimiter,
+                            target,
+                        })
+                    }),
+                );
             }
             Pending::Transform => {
                 self.view.pending = Pending::None;
@@ -10183,7 +10220,7 @@ impl Session {
                     .and_then(|t| t.chars().next())
                     .and_then(CaseKind::from_char);
                 let Some(kind) = kind else {
-                    return Effects::none();
+                    return Some(Effects::none());
                 };
                 // Insert mode has no selection, so the server scans for the identifier under the
                 // caret; Normal mode recases exactly the selection (a point being the single char
@@ -10193,30 +10230,30 @@ impl Session {
                     kind,
                     scan_at_cursor,
                 };
-                return self.recorded(step, |s| {
+                return Some(self.recorded(step, |s| {
                     s.edit::<InputTransformCase>(InputTransformCaseParams {
                         buffer_id: s.view.buffer.buffer_id,
                         kind,
                         scan_at_cursor,
                     })
-                });
+                }));
             }
             Pending::Leader => {
                 self.view.pending = Pending::None;
                 if let Some(b) = lookup(KeyContext::Leader, code, mods) {
                     // `Space g` re-arms into the git sub-leader from inside `run_action`, which is
                     // why the clear above happens first.
-                    return self.run_action(b.action, 1, false, mods.shift);
+                    return Some(self.run_action(b.action, 1, false, mods.shift));
                 }
-                return Effects::none();
+                return Some(Effects::none());
             }
             Pending::LeaderGit => {
                 self.view.pending = Pending::None;
                 if let Some(b) = lookup(KeyContext::LeaderGit, code, mods) {
-                    return self.run_action(b.action, 1, false, mods.shift);
+                    return Some(self.run_action(b.action, 1, false, mods.shift));
                 }
                 // An unbound key (or Esc) cancels the chord, exactly like the leader.
-                return Effects::none();
+                return Some(Effects::none());
             }
             Pending::None => {}
         }
@@ -10228,7 +10265,7 @@ impl Session {
                 if c.is_ascii_digit() && (c != '0' || self.view.count.is_some()) {
                     let d = c.to_digit(10).unwrap();
                     self.view.count = Some(self.view.count.unwrap_or(0).saturating_mul(10) + d);
-                    return Effects::none();
+                    return Some(Effects::none());
                 }
             }
         }
@@ -10252,7 +10289,7 @@ impl Session {
             Mode::Normal => KeyContext::Normal,
             Mode::Insert => KeyContext::Insert,
             Mode::Read => KeyContext::Read,
-            Mode::Search => return Effects::none(), // handled above
+            Mode::Search => return Some(Effects::none()), // handled above
         };
         let global = if self.view.mode == Mode::Read {
             None
@@ -10260,7 +10297,7 @@ impl Session {
             lookup(KeyContext::Global, code, mods)
         };
         if let Some(b) = global.or_else(|| lookup(ctx, code, mods)) {
-            return self.run_action(b.action, count, counted, extend);
+            return Some(self.run_action(b.action, count, counted, extend));
         }
 
         // Insert mode: unmatched printable input is text.
@@ -10271,7 +10308,7 @@ impl Session {
                     .filter(|c| !c.is_control() || *c == '\t')
                     .collect();
                 if !typed.is_empty() {
-                    return self.recorded(RepeatTarget::Text(typed.clone()), |s| {
+                    return Some(self.recorded(RepeatTarget::Text(typed.clone()), |s| {
                         s.edit::<InputText>(InputTextParams {
                             buffer_id: s.view.buffer.buffer_id,
                             text: typed,
@@ -10279,11 +10316,12 @@ impl Session {
                             replace_selection: false,
                             at: None,
                         })
-                    });
+                    }));
                 }
             }
         }
-        Effects::none()
+        // Nothing claimed the key: the shell may hand it back to its host (a browser chord).
+        None
     }
 
     fn run_action(
@@ -12471,44 +12509,41 @@ impl Session {
 
     /// Handle a keystroke while a sneak (`s`/`S`) session is active: Esc cancels, Backspace unwinds
     /// the query, a key matching a live label jumps, and any other printable char refines the query.
-    fn on_sneak_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Effects {
+    fn on_sneak_key(&mut self, code: KeyCode, mods: Mods, text: Option<String>) -> Option<Effects> {
         if code == KeyCode::Esc {
-            return self.sneak_cancel();
+            return Some(self.sneak_cancel());
         }
         if code == KeyCode::Backspace {
             let Some(sneak) = self.view.sneak.as_mut() else {
-                return Effects::none();
+                return Some(Effects::none());
             };
             sneak.query.pop();
             let query = sneak.query.clone();
-            return self.sneak_update(query);
+            return Some(self.sneak_update(query));
         }
         // Only plain printable input is query/label data; ignore chords and non-char keys (they
         // leave the session armed rather than trapping it — Esc is the explicit exit).
         if mods.ctrl || mods.alt {
-            return Effects::none();
+            return None;
         }
-        let Some(ch) = text
+        let ch = text
             .as_deref()
             .and_then(|t| t.chars().next())
-            .filter(|c| !c.is_control())
-        else {
-            return Effects::none();
-        };
+            .filter(|c| !c.is_control())?;
         if self
             .view
             .sneak
             .as_ref()
             .is_some_and(|s| s.labels.contains(&ch))
         {
-            return self.sneak_select(ch);
+            return Some(self.sneak_select(ch));
         }
         let Some(sneak) = self.view.sneak.as_mut() else {
-            return Effects::none();
+            return Some(Effects::none());
         };
         sneak.query.push(ch);
         let query = sneak.query.clone();
-        self.sneak_update(query)
+        Some(self.sneak_update(query))
     }
 
     /// Push the current query to the server, which recomputes labels and refreshes the viewport.
@@ -13612,6 +13647,13 @@ mod tests {
             "the refusal is audible"
         );
     }
+}
+
+/// What a keystroke came to: see [`Session::on_key_outcome`].
+pub struct KeyOutcome {
+    pub effects: Effects,
+    /// Whether anything claimed the key. `false` means it was a no-op the host may act on instead.
+    pub consumed: bool,
 }
 
 /// What feeding a key to a [`PathEditor`] means for its owner.

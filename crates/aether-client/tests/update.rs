@@ -15886,3 +15886,97 @@ fn repeat_keys_with_nothing_recorded_are_silent() {
     assert!(no_request(&key(&mut s, 'r')));
     assert!(no_request(&ctrl(&mut s, 'r')));
 }
+
+/// Whether the core claimed a key — what the browser shell keys `preventDefault` off, so an
+/// unbound chord (`Alt-1`: switch tab) reaches the browser while every claimed key stays ours.
+mod key_claims {
+    use super::*;
+
+    fn claimed(s: &mut Session, code: KeyCode, mods: Mods, text: Option<&str>) -> bool {
+        s.on_key_outcome(code, mods, text.map(str::to_string))
+            .consumed
+    }
+
+    #[test]
+    fn an_unbound_chord_is_not_claimed() {
+        let mut s = session();
+        for c in '1'..='9' {
+            assert!(
+                !claimed(&mut s, KeyCode::Char(c), Mods::ALT, None),
+                "Alt-{c}"
+            );
+            assert!(
+                !claimed(&mut s, KeyCode::Char(c), Mods::CTRL, None),
+                "Ctrl-{c}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bound_chord_is_claimed() {
+        let mut s = session();
+        assert!(claimed(&mut s, KeyCode::Char('r'), Mods::CTRL, None));
+    }
+
+    #[test]
+    fn a_count_digit_is_claimed_though_it_does_nothing_yet() {
+        let mut s = session();
+        let outcome = s.on_key_outcome(KeyCode::Char('3'), Mods::NONE, Some("3".into()));
+        assert!(outcome.consumed);
+        assert!(no_request(&outcome.effects));
+    }
+
+    #[test]
+    fn a_key_that_cancels_the_leader_is_claimed() {
+        // An unbound key after the leader cancels the chord — that's the key's meaning, even
+        // though it resolves no binding. Handing it to the browser would do two things at once.
+        let mut s = session();
+        assert!(claimed(&mut s, KeyCode::Char(' '), Mods::NONE, Some(" ")));
+        assert!(claimed(&mut s, KeyCode::Char('1'), Mods::ALT, None));
+    }
+
+    #[test]
+    fn an_open_picker_hands_back_what_its_vocabulary_lacks() {
+        use aether_protocol::picker::PickerKind;
+        let mut s = session();
+        let _ = s.open_picker(PickerKind::Files, None, None, false, None);
+        assert!(!claimed(&mut s, KeyCode::Char('1'), Mods::ALT, None));
+        assert!(
+            claimed(&mut s, KeyCode::Char('j'), Mods::ALT, None),
+            "Alt-j moves"
+        );
+        assert!(claimed(&mut s, KeyCode::Enter, Mods::NONE, None));
+    }
+
+    #[test]
+    fn a_key_capture_claims_every_key() {
+        // The keybindings picker's chip capture exists to take a chord, whatever it is.
+        use aether_protocol::picker::PickerKind;
+        let mut s = session();
+        let _ = s.open_picker(PickerKind::Keybindings, None, None, false, None);
+        let _ = s.on_key(KeyCode::Char('b'), Mods::ALT, None);
+        assert!(claimed(&mut s, KeyCode::Char('1'), Mods::ALT, None));
+    }
+
+    #[test]
+    fn search_and_the_settings_dialog_hand_back_unbound_chords() {
+        let mut s = session();
+        key(&mut s, '/');
+        assert!(!claimed(&mut s, KeyCode::Char('1'), Mods::ALT, None));
+        assert!(claimed(&mut s, KeyCode::Esc, Mods::NONE, None));
+
+        s.open_app_settings();
+        assert!(!claimed(&mut s, KeyCode::Char('1'), Mods::ALT, None));
+        assert!(claimed(&mut s, KeyCode::Down, Mods::NONE, None));
+        assert!(claimed(&mut s, KeyCode::Esc, Mods::NONE, None));
+        assert!(s.app_settings.is_none());
+    }
+
+    #[test]
+    fn insert_text_is_claimed_but_an_unbound_chord_in_insert_is_not() {
+        let mut s = session();
+        key(&mut s, ',');
+        assert!(claimed(&mut s, KeyCode::Char('x'), Mods::NONE, Some("x")));
+        assert!(!claimed(&mut s, KeyCode::Char('1'), Mods::ALT, None));
+    }
+}
