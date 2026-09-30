@@ -245,7 +245,9 @@ mod tests {
     #[test]
     fn a_device_attributes_reply_ends_the_drain() {
         assert!(ends_with_device_attributes(b"\x1b[?62;22c"));
-        assert!(ends_with_device_attributes(b"\x1b[<35;198;50M\x1b[?65;1;9c"));
+        assert!(ends_with_device_attributes(
+            b"\x1b[<35;198;50M\x1b[?65;1;9c"
+        ));
         assert!(ends_with_device_attributes(b"\x1b[?c"));
     }
 
