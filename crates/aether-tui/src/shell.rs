@@ -750,6 +750,9 @@ impl Shell {
                         let scroll = self.subscribe_scroll;
                         let fx = self.session.adopt_subscribe(res);
                         self.run_effects(fx);
+                        // Before placing: a conversation's replies have no height until laid out,
+                        // and counting them as nothing put its input a screen above where it is.
+                        self.lay_out_markdown();
                         // A reading view not yet laid out cannot be placed by rows: `read_view`
                         // finishes the placement once it has measured.
                         if self.defer_read_placement() {
@@ -4117,6 +4120,71 @@ mod scroll_tests {
             sh.top_visual_row,
             VisualRow(0),
             "the view opens at its first row — the file heading above line 0, not below it"
+        );
+    }
+
+    /// A conversation opens at its input, with the input on screen — the landing a shell gets.
+    ///
+    /// An agent's replies are prose, which has no height until this shell lays it out. The
+    /// subscribe placed the view before measuring them, so it counted the replies as nothing:
+    /// the input sat at row 1 and the view went to the top. Once measured, the replies were a
+    /// screen tall and the input was below the bottom.
+    #[test]
+    fn a_conversation_opens_with_its_input_on_screen() {
+        let text: String = (0..40).map(|i| format!("Paragraph {i}.\n\n")).collect();
+        let window = Window {
+            other_elements_dirty: false,
+            max_line_width: 0,
+            git_status: None,
+            root: Element::column(vec![
+                Element::Prose {
+                    element: 0,
+                    blocks: aether_client::markdown::parse(&text),
+                    source: aether_protocol::ui::SourceLines::of(&text),
+                },
+                Element::Editor {
+                    collapsed: false,
+                    element: 1,
+                    buffer: 9,
+                    rows: 1,
+                    first_row: aether_protocol::coords::ElementRow::ZERO,
+                    laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+                    role: aether_protocol::ui::ElementRole::Input,
+                    first_buffer_line: 0,
+                    lines: vec![line(0)],
+                },
+            ]),
+        };
+        let wire = serde_json::to_value(&window).expect("serialises");
+        let mut sh = shell_with(window, 1, 0);
+        sh.session.view.window = None;
+        sh.subscribe_scroll = ScrollPosition {
+            element: 1,
+            line: 0,
+            sub_row: 0.0,
+        };
+        let mut res = serde_json::json!({
+            "viewport_id": 1,
+            "window": wire,
+            "buffer_status": {},
+            "focus": focus_result(1, 9, 0),
+        });
+        res["focus"]["buffer_status"] = serde_json::json!({});
+        sh.on_response(Continuation::Subscribed, "view/subscribe", Ok(res));
+        sh.sync();
+
+        let w = sh.session.view.window.as_ref().unwrap();
+        let input = aether_client::grid::element_start_row(w, 1, &sh.measured).expect("input row");
+        assert!(
+            input.get() >= 40,
+            "the replies were laid out: the input is below them"
+        );
+        let top = sh.top_visual_row.get();
+        assert!(
+            input.get() >= top && input.get() < top + sh.visible_rows(),
+            "the input is on screen: input at {}, screen {top}..{}",
+            input.get(),
+            top + sh.visible_rows()
         );
     }
 
