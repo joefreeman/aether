@@ -1105,6 +1105,9 @@ export type PickerKind =
   | "tasks_workspace"
   | "activity";
 
+/** Mirrors aether-protocol::picker::ReferenceRole (serde snake_case). */
+export type ReferenceRole = "definition" | "implementation" | "use";
+
 /** Mirrors aether-protocol::picker::SymbolKind (serde snake_case). `unknown` covers any value
  *  outside the LSP-defined 1..=26 range. */
 export type SymbolKind =
@@ -1315,9 +1318,9 @@ export type PickerItem =
       col: number;
       /** The referenced line's text; the fuzzy haystack + preview. */
       preview: string;
-      /** True for the row that is the symbol's definition (vs an ordinary use). Drives the
-       *  Definition / References section split; references arrive definition-first. */
-      is_definition?: boolean;
+      /** What this location is to the symbol. Drives the Definition / Implementations /
+       *  References section split; references arrive in that order. Absent = "use". */
+      role?: ReferenceRole;
       match_indices?: number[];
     }
   | {

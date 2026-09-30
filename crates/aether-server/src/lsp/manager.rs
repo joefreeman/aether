@@ -98,6 +98,9 @@ pub struct LspHandle {
     /// Whether the server advertises `workspace/symbol` (set from the handshake). Gates it out of
     /// the workspace-symbols fan-out.
     pub workspace_symbol: bool,
+    /// Whether the server advertises `textDocument/implementation` (set from the handshake).
+    /// Gates the references picker's Implementations request.
+    pub implementation: bool,
     /// The **documents** we've sent `didOpen` for and not yet `didClose`, each with the buffers
     /// currently holding it open.
     ///
@@ -173,6 +176,7 @@ impl LspManager {
                 position_encoding: PositionEncoding::Utf16,
                 document_formatting: false,
                 workspace_symbol: false,
+                implementation: false,
                 open_documents: HashMap::new(),
                 registered_buffers: HashSet::new(),
                 pinned_by: HashSet::new(),
@@ -623,6 +627,7 @@ async fn bring_up(
             h.position_encoding = caps.position_encoding;
             h.document_formatting = caps.document_formatting;
             h.workspace_symbol = caps.workspace_symbol;
+            h.implementation = caps.implementation;
             // Keep the launch command as the name when the server reports none (vscode json/css/
             // html) rather than overwriting it with a placeholder.
             if let Some(name) = &caps.name {
@@ -1346,6 +1351,7 @@ mod tests {
             position_encoding: PositionEncoding::Utf8,
             document_formatting: true,
             workspace_symbol: true,
+            implementation: false,
             open_documents: HashMap::new(),
             registered_buffers: HashSet::new(),
             pinned_by: HashSet::new(),
@@ -1376,6 +1382,7 @@ mod tests {
             position_encoding: PositionEncoding::Utf8,
             document_formatting: false,
             workspace_symbol: true,
+            implementation: false,
             open_documents: HashMap::new(),
             registered_buffers: HashSet::new(),
             pinned_by: HashSet::new(),

@@ -13,7 +13,7 @@ use aether_protocol::lsp::{LspProgress, LspStatus};
 use aether_protocol::picker::{
     AgentRowState, BranchCheckout, BufferDirtyState, CaseMode, GroupHeader, GroupRunRows,
     GroupSpan, KeybindingEntry, MatchOptions, PickerFilters, PickerItem, PickerKind,
-    PickerSelectResult, PickerUpdateParams,
+    PickerSelectResult, PickerUpdateParams, ReferenceRole,
 };
 use aether_protocol::viewport::{DiagnosticSeverity, DiffStage};
 use aether_protocol::{BufferId, LogicalPosition};
@@ -459,10 +459,19 @@ pub struct ReferenceCandidate {
     pub end_col: u32,
     /// The referenced line's text (trailing newline trimmed). Haystack + preview.
     pub preview: String,
-    /// True for the one candidate that is the symbol's definition (resolved via a parallel
-    /// `textDocument/definition`), false for ordinary uses. Drives the Definition/References
-    /// section split; candidates are sorted definition-first.
-    pub is_definition: bool,
+    /// What this location is to the symbol (see [`ReferenceRole`]). Drives the section split;
+    /// candidates are sorted in role order.
+    pub role: ReferenceRole,
+}
+
+/// The section header a References row sits under — shared by the picker's group spans and the
+/// jumplist's capture of them, which must agree.
+pub fn reference_section_label(role: ReferenceRole) -> &'static str {
+    match role {
+        ReferenceRole::Definition => "Definition",
+        ReferenceRole::Implementation => "Implementations",
+        ReferenceRole::Use => "References",
+    }
 }
 
 impl ReferenceCandidate {
@@ -1065,7 +1074,7 @@ impl PickerCandidates {
                     line: c.line,
                     col: c.col,
                     preview: c.preview.clone(),
-                    is_definition: c.is_definition,
+                    role: c.role,
                     match_indices,
                 }
             }
@@ -2545,7 +2554,7 @@ impl PickerState {
     }
 
     /// The group key of ranked row `ci`, for the header-grouped kinds — `(path_index,
-    /// relative_path)` for the file-grouped kinds, a synthetic `(is_definition, "")` section
+    /// relative_path)` for the file-grouped kinds, a synthetic `(role, "")` section
     /// key for References, and the binding group for Keybindings. Only equality matters. The
     /// borrowing, allocation-free sibling of [`Self::group_header_at`] (which builds the
     /// wire-shaped header the key summarizes) — `grouped_display_metrics` walks the *whole*
@@ -2567,7 +2576,7 @@ impl PickerState {
             PickerCandidates::Diagnostics(v) => {
                 Some((v[ci].path_index, v[ci].relative_path.as_str()))
             }
-            PickerCandidates::References(v) => Some((v[ci].is_definition as u32, "")),
+            PickerCandidates::References(v) => Some((v[ci].role as u32, "")),
             // Two sections keyed on the same fact the label's brackets show: is this a revision.
             PickerCandidates::GitBaseline(v) => Some((v[ci].row.is_revision() as u32, "")),
             // Must agree with `group_header_at`'s `Label`: same discriminant convention as the
@@ -2619,11 +2628,7 @@ impl PickerState {
                 label: v[ci].display_path.clone(),
             }),
             PickerCandidates::References(v) => Some(GroupHeader::Label {
-                label: if v[ci].is_definition {
-                    "Definition".into()
-                } else {
-                    "References".into()
-                },
+                label: reference_section_label(v[ci].role).into(),
             }),
             PickerCandidates::GitBaseline(v) => Some(GroupHeader::Label {
                 label: if v[ci].row.is_revision() {
@@ -3272,7 +3277,7 @@ mod tests {
                 end_line: 4,
                 end_col: 13, // "helper" spans cols 8..=13
                 preview: "    helper();".into(),
-                is_definition: false,
+                role: ReferenceRole::Use,
             },
             ReferenceCandidate {
                 abs_path: "/proj/src/main.rs".into(),
@@ -3282,7 +3287,7 @@ mod tests {
                 end_line: 0,
                 end_col: 8, // "helper" spans cols 3..=8
                 preview: "fn helper() {}".into(),
-                is_definition: true,
+                role: ReferenceRole::Definition,
             },
         ])
     }
@@ -3302,7 +3307,7 @@ mod tests {
                 line,
                 col,
                 preview,
-                is_definition,
+                role,
                 match_indices,
             } => {
                 assert_eq!(path, "/proj/src/lib.rs");
@@ -3310,17 +3315,17 @@ mod tests {
                 assert_eq!(line, 4);
                 assert_eq!(col, 8);
                 assert_eq!(preview, "    helper();");
-                assert!(!is_definition); // candidate 0 is a use
+                assert_eq!(role, ReferenceRole::Use); // candidate 0 is a use
                 assert_eq!(match_indices, vec![4, 5]);
             }
             other => panic!("expected Reference, got {other:?}"),
         }
-        // The definition flag rides through make_item too (candidate 1 is the definition).
+        // The role rides through make_item too (candidate 1 is the definition).
         assert!(
             matches!(
                 c.make_item(1, vec![]),
                 PickerItem::Reference {
-                    is_definition: true,
+                    role: ReferenceRole::Definition,
                     ..
                 }
             ),
@@ -3340,7 +3345,7 @@ mod tests {
             line: 99,
             col: 8,
             preview: "ignored".into(),
-            is_definition: false,
+            role: ReferenceRole::Use,
             match_indices: vec![],
         };
         assert_eq!(c.position_of(&elsewhere), None);
@@ -3375,7 +3380,7 @@ mod tests {
             end_line: 2,
             end_col: 5,
             preview: "x".into(),
-            is_definition: false,
+            role: ReferenceRole::Use,
         }]);
         match c.select_result(0) {
             Some(PickerSelectResult::FileAt {
@@ -3389,11 +3394,11 @@ mod tests {
     }
 
     #[test]
-    fn references_group_into_definition_and_use_sections() {
-        // A definition (is_definition) followed by two uses. `grouped_display_metrics` opens one
-        // section header per `is_definition` transition — Definition then References — exactly as
-        // the client's `display_rows` does, so the virtual-scroll row math lines up.
-        let cand = |rel: &str, line: u32, is_definition: bool| ReferenceCandidate {
+    fn references_group_into_role_sections() {
+        // A definition, an implementation, then two uses. `grouped_display_metrics` opens one
+        // section header per role transition — Definition, Implementations, References — exactly
+        // as the client's `display_rows` does, so the virtual-scroll row math lines up.
+        let cand = |rel: &str, line: u32, role: ReferenceRole| ReferenceCandidate {
             abs_path: format!("/proj/{rel}"),
             display_path: rel.into(),
             line,
@@ -3401,34 +3406,45 @@ mod tests {
             end_line: line,
             end_col: 0,
             preview: "x".into(),
-            is_definition,
+            role,
         };
         let cands = PickerCandidates::References(vec![
-            cand("lib.rs", 0, true),
-            cand("a.rs", 5, false),
-            cand("b.rs", 9, false),
+            cand("lib.rs", 0, ReferenceRole::Definition),
+            cand("imp.rs", 3, ReferenceRole::Implementation),
+            cand("a.rs", 5, ReferenceRole::Use),
+            cand("b.rs", 9, ReferenceRole::Use),
         ]);
         let mut s = PickerState::new(cands);
         let mut m = make_matcher();
         s.rerank(&mut m);
-        assert_eq!(s.ranked, vec![0, 1, 2], "definition-first, then the uses");
+        assert_eq!(s.ranked, vec![0, 1, 2, 3], "role order is kept");
+        let headers: Vec<String> = (0..4)
+            .map(|ci| match s.group_header_at(ci) {
+                Some(GroupHeader::Label { label }) => label,
+                other => panic!("expected a Label header, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            ["Definition", "Implementations", "References", "References"]
+        );
 
-        // Two sections over three rows → 3 + 2 = 5 display rows. A window opening at ranked row 0
+        // Three sections over four rows → 4 + 3 = 7 display rows. A window opening at ranked row 0
         // sits one row down (the Definition header above it).
         let (display_offset, total) = s
             .grouped_display_metrics(0)
             .expect("references are header-grouped");
-        assert_eq!(total, 5, "3 items + 2 section headers");
+        assert_eq!(total, 7, "4 items + 3 section headers");
         assert_eq!(
             display_offset, 1,
             "the Definition header precedes ranked row 0"
         );
-        // A window opening at the first use is below both headers.
-        let (display_offset, total) = s.grouped_display_metrics(1).unwrap();
-        assert_eq!(total, 5);
+        // A window opening at the first use is below all three headers.
+        let (display_offset, total) = s.grouped_display_metrics(2).unwrap();
+        assert_eq!(total, 7);
         assert_eq!(
-            display_offset, 3,
-            "Definition + References headers precede the first use"
+            display_offset, 5,
+            "Definition + Implementations + References headers precede the first use"
         );
     }
 
@@ -3444,7 +3460,7 @@ mod tests {
             end_line: 1,
             end_col: 0,
             preview: "x".into(),
-            is_definition: false,
+            role: ReferenceRole::Use,
         };
         let cands = PickerCandidates::References(vec![cand("a.rs"), cand("b.rs")]);
         let mut s = PickerState::new(cands);

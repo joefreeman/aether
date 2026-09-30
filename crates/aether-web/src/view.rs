@@ -268,8 +268,8 @@ fn picker(p: &Option<PickerState>, workspace_paths: &[String]) -> Value {
                 "collapsible": p.collapsible,
                 "total_matches": p.total_matches,
                 "total_candidates": p.total_candidates,
-                // The web throbber is CSS-animated off `ticking` (the braille `spinner_glyph` is for
-                // the terminal); no glyph needed here.
+                // The web throbber is CSS-animated off `ticking` (the braille frames are for the
+                // terminal); no glyph needed here.
                 "ticking": p.ticking,
                 // Settled empty-state line (core-owned wording), or null while searching / when rows
                 // exist. The shell renders it verbatim; the "Searching…/Finding…" loading text it

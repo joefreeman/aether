@@ -138,11 +138,12 @@ pub fn build_workspace_diagnostic_candidates(
 
 /// Build the references-picker candidates: ask the language server for every reference to the
 /// symbol at the cursor (`textDocument/references`, including the declaration), then attach a
-/// line-text preview and a display label to each. A parallel `textDocument/definition` resolves
-/// which of those locations is the symbol's definition, so the picker can split into a `Definition`
-/// section and a `References` section (candidates come back ordered definition-first). Returns empty
-/// when there's no ready server, the server resolves nothing, or the request fails. Async (off the
-/// lock): the two LSP round-trips plus reading each referenced file's line from disk.
+/// line-text preview and a display label to each. Two sibling requests, sent concurrently, sort
+/// them into sections: `textDocument/definition` picks out the symbol's definition row, and — from
+/// servers that advertise it — `textDocument/implementation` adds the implementations (a trait's
+/// impls, an interface's implementers). Candidates come back in [`ReferenceRole`] order. Returns
+/// empty when there's no ready server, the server resolves nothing, or the references request
+/// fails. Async (off the lock): the LSP round-trips plus reading each listed file's line from disk.
 async fn build_reference_candidates(
     state: &SharedState,
     client_id: ClientId,
@@ -163,17 +164,30 @@ async fn build_reference_candidates(
     let Some(req) = resolve.ready() else {
         return AsyncResolveAttempt::Done(Vec::new());
     };
-    let refs_params = serde_json::json!({
-        "textDocument": { "uri": req.uri.clone() },
+    let at_cursor = serde_json::json!({
+        "textDocument": { "uri": req.uri },
         "position": { "line": req.line, "character": req.character },
-        "context": { "includeDeclaration": true },
     });
-    let locations = match req
-        .client
-        .request("textDocument/references", refs_params)
-        .await
-    {
-        Ok(v) => parse_references(&v, req.encoding),
+    let mut refs_params = at_cursor.clone();
+    refs_params["context"] = serde_json::json!({ "includeDeclaration": true });
+    let (references, definition, implementations) = tokio::join!(
+        req.client.request("textDocument/references", refs_params),
+        req.client
+            .request("textDocument/definition", at_cursor.clone()),
+        async {
+            if req.implementation {
+                Some(
+                    req.client
+                        .request("textDocument/implementation", at_cursor.clone())
+                        .await,
+                )
+            } else {
+                None
+            }
+        },
+    );
+    let uses = match references {
+        Ok(v) => parse_locations(&v, req.encoding),
         // A timeout from a server mid-`$/progress` (indexing) usually means the answer is queued
         // behind the work, not lost — retry so the picker fills when it lands. Any other error
         // (or a timeout from an idle server) settles empty as before.
@@ -187,72 +201,78 @@ async fn build_reference_candidates(
             return AsyncResolveAttempt::Done(Vec::new());
         }
     };
-    // Resolve the definition in parallel so its reference row can be split into the Definition
-    // section. Non-fatal: on failure (or a server without goto-definition) every row stays a use
-    // and the picker shows a single References section.
-    let def_params = serde_json::json!({
-        "textDocument": { "uri": req.uri },
-        "position": { "line": req.line, "character": req.character },
-    });
-    let definition = match req
-        .client
-        .request("textDocument/definition", def_params)
-        .await
-    {
+    // The definition and implementations are non-fatal: on failure (or a server without the
+    // request) their sections are just absent and every row stays a use.
+    let definition = match definition {
         Ok(v) => parse_definition(&v, req.encoding),
         Err(e) => {
             tracing::debug!(error = %e, "lsp definition request (for references split) failed");
             None
         }
     };
+    let implementations = match implementations {
+        Some(Ok(v)) => parse_locations(&v, req.encoding),
+        Some(Err(e)) => {
+            tracing::debug!(error = %e, "lsp implementation request (for references split) failed");
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
 
-    // Cache each referenced file's lines so a file with many references is read only once. `None`
-    // marks a file we couldn't read — its previews fall back to empty.
+    // Cache each listed file's lines so a file with many locations is read only once. `None` marks
+    // a file we couldn't read — its previews fall back to empty.
     let mut file_lines: HashMap<String, Option<Vec<String>>> = HashMap::new();
-    let mut out: Vec<picker_state::ReferenceCandidate> = locations
-        .into_iter()
-        // Workspace-only: a reference that doesn't live under any workspace root (a dependency, the
-        // stdlib, generated code outside the tree) is dropped — `workspace_relative_parts` is the
-        // gate, and its relative path becomes the display label.
-        .filter_map(|loc| {
-            let (_, display_path) = crate::workspace_index::workspace_relative_parts(
-                std::path::Path::new(&loc.path),
-                &roots,
-            )?;
-            let lines = file_lines.entry(loc.path.clone()).or_insert_with(|| {
-                std::fs::read_to_string(&loc.path)
-                    .ok()
-                    .map(|c| c.lines().map(str::to_string).collect())
-            });
-            let preview = lines
-                .as_ref()
-                .and_then(|ls| ls.get(loc.position.line as usize))
-                .map(|l| l.trim_end().to_string())
-                .unwrap_or_default();
-            Some(picker_state::ReferenceCandidate {
-                abs_path: loc.path,
-                display_path,
-                line: loc.position.line,
-                col: loc.position.col,
-                end_line: loc.end.line,
-                end_col: loc.end.col,
-                preview,
-                is_definition: false,
+    let mut candidates = |locations: Vec<LspLocation>, role: ReferenceRole| {
+        let mut out: Vec<picker_state::ReferenceCandidate> = locations
+            .into_iter()
+            // Workspace-only: a location that doesn't live under any workspace root (a dependency,
+            // the stdlib, generated code outside the tree) is dropped — `workspace_relative_parts`
+            // is the gate, and its relative path becomes the display label.
+            .filter_map(|loc| {
+                let (_, display_path) = crate::workspace_index::workspace_relative_parts(
+                    std::path::Path::new(&loc.path),
+                    &roots,
+                )?;
+                let lines = file_lines.entry(loc.path.clone()).or_insert_with(|| {
+                    std::fs::read_to_string(&loc.path)
+                        .ok()
+                        .map(|c| c.lines().map(str::to_string).collect())
+                });
+                let preview = lines
+                    .as_ref()
+                    .and_then(|ls| ls.get(loc.position.line as usize))
+                    .map(|l| l.trim_end().to_string())
+                    .unwrap_or_default();
+                Some(picker_state::ReferenceCandidate {
+                    abs_path: loc.path,
+                    display_path,
+                    line: loc.position.line,
+                    col: loc.position.col,
+                    end_line: loc.end.line,
+                    end_col: loc.end.col,
+                    preview,
+                    role,
+                })
             })
-        })
-        .collect();
-    // Stable, file-grouped order: by display path, then position. Dedup identical locations (some
-    // servers return the declaration twice, or overlapping ranges collapse to the same start).
-    out.sort_by(|a, b| {
-        a.display_path
-            .cmp(&b.display_path)
-            .then_with(|| (a.line, a.col).cmp(&(b.line, b.col)))
-    });
-    out.dedup_by(|a, b| a.abs_path == b.abs_path && a.line == b.line && a.col == b.col);
+            .collect();
+        // Stable, file-grouped order: by display path, then position. Dedup identical locations
+        // (some servers return the declaration twice, or overlapping ranges collapse to the same
+        // start).
+        out.sort_by(|a, b| {
+            a.display_path
+                .cmp(&b.display_path)
+                .then_with(|| (a.line, a.col).cmp(&(b.line, b.col)))
+        });
+        out.dedup_by(|a, b| a.abs_path == b.abs_path && a.line == b.line && a.col == b.col);
+        out
+    };
+    let mut out = candidates(uses, ReferenceRole::Use);
+    let mut implementations = candidates(implementations, ReferenceRole::Implementation);
+
     // Flag the reference that is the definition. Exact `(path, line, col)` first; else the nearest
     // column on the same `(path, line)` — goto-definition may report the name's selection-range
     // start a few columns off from the reference entry. At most one row is flagged.
-    if let Some(def) = definition {
+    if let Some(def) = &definition {
         let exact = out.iter().position(|c| {
             c.abs_path == def.path && c.line == def.position.line && c.col == def.position.col
         });
@@ -264,12 +284,27 @@ async fn build_reference_candidates(
                 .map(|(i, _)| i)
         });
         if let Some(i) = chosen {
-            out[i].is_definition = true;
+            out[i].role = ReferenceRole::Definition;
         }
     }
-    // Definition first, then the file-grouped order within each section. Stable `sort_by_key`, so
-    // the `(display_path, line, col)` ordering set above survives inside each section.
-    out.sort_by_key(|c| !c.is_definition);
+    // Implementations and uses overlap at line grain: the trait name in `impl Trait for X` is a
+    // reference on the line the implementation points into, and asked on a concrete item a server
+    // may answer with the item's own definition. One row per line, the more specific role winning:
+    // an implementation on the definition's line is dropped, a use on an implementation's line is
+    // folded into it.
+    if let Some(def) = &definition {
+        implementations.retain(|i| !(i.abs_path == def.path && i.line == def.position.line));
+    }
+    out.retain(|c| {
+        c.role != ReferenceRole::Use
+            || !implementations
+                .iter()
+                .any(|i| i.abs_path == c.abs_path && i.line == c.line)
+    });
+    out.extend(implementations);
+    // Section order, then the file-grouped order within each section. Stable, so the
+    // `(display_path, line, col)` ordering set above survives inside each section.
+    out.sort_by_key(|c| c.role);
     AsyncResolveAttempt::Done(out)
 }
 
@@ -957,6 +992,8 @@ struct LspCursorRequest {
     line: u32,
     character: u32,
     encoding: crate::lsp::position::PositionEncoding,
+    /// Whether the server answers `textDocument/implementation` (see [`crate::lsp::manager::LspHandle::implementation`]).
+    implementation: bool,
 }
 
 /// Resolve [`LspCursorRequest`] for `client_id`'s cursor in `buffer_id`, or `None` if the buffer
@@ -1037,6 +1074,7 @@ fn lsp_cursor_request(s: &ServerState, client_id: ClientId, buffer_id: BufferId)
         line: pos.line,
         character,
         encoding,
+        implementation: handle.implementation,
     })
 }
 
@@ -1737,7 +1775,7 @@ fn parse_definition(
 }
 
 /// Parse a single LSP `Location` / `LocationLink` object into a location in editor coordinates.
-/// Shared by `parse_definition` (first entry only) and `parse_references` (every entry — whose
+/// Shared by `parse_definition` (first entry only) and `parse_locations` (every entry — whose
 /// `cache` is what keeps a many-references-in-one-file response from re-reading that file per
 /// position).
 fn parse_location_entry(
@@ -1796,10 +1834,11 @@ fn lsp_range_end_inclusive(
     .unwrap_or(start)
 }
 
-/// Parse an LSP `textDocument/references` response (`Location[]`, `LocationLink[]`, or null) into
-/// every reference location, converting positions into the buffer's byte columns. Entries that
-/// fail to parse are skipped.
-fn parse_references(
+/// Parse an LSP multi-location response — `textDocument/references` (`Location[]` or null) or
+/// `textDocument/implementation` (which may also answer a single `Location`, or `LocationLink[]`) —
+/// into every location, converting positions into the buffer's byte columns. Entries that fail to
+/// parse are skipped.
+fn parse_locations(
     v: &serde_json::Value,
     encoding: crate::lsp::position::PositionEncoding,
 ) -> Vec<LspLocation> {
@@ -1808,6 +1847,9 @@ fn parse_references(
         serde_json::Value::Array(a) => a
             .iter()
             .filter_map(|e| parse_location_entry(e, encoding, &mut cache))
+            .collect(),
+        serde_json::Value::Object(_) => parse_location_entry(v, encoding, &mut cache)
+            .into_iter()
             .collect(),
         _ => Vec::new(),
     }
@@ -2549,7 +2591,7 @@ mod lsp_parse_tests {
             {"uri": "file:///p/a.rs", "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 9}}},
             {"uri": "file:///p/b.rs", "range": {"start": {"line": 4, "character": 8}, "end": {"line": 4, "character": 14}}},
         ]);
-        let refs = parse_references(&v, PositionEncoding::Utf8);
+        let refs = parse_locations(&v, PositionEncoding::Utf8);
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].path, "/p/a.rs");
         assert_eq!(refs[0].position, LogicalPosition { line: 0, col: 3 });
@@ -2562,19 +2604,37 @@ mod lsp_parse_tests {
     }
 
     #[test]
-    fn references_null_and_non_array_is_empty() {
-        // `textDocument/references` returns `Location[] | null`; both null and a stray object
-        // yield no references rather than erroring.
-        assert!(parse_references(&json!(null), PositionEncoding::Utf8).is_empty());
+    fn locations_null_and_malformed_are_empty() {
+        // Null and a malformed object yield no locations rather than erroring.
+        assert!(parse_locations(&json!(null), PositionEncoding::Utf8).is_empty());
         assert!(
-            parse_references(&json!({"uri": "file:///p/a.rs"}), PositionEncoding::Utf8).is_empty()
+            parse_locations(&json!({"uri": "file:///p/a.rs"}), PositionEncoding::Utf8).is_empty()
         );
         // Unparseable entries are skipped, not fatal.
         let v = json!([
             {"uri": "file:///p/a.rs", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}},
             {"garbage": true},
         ]);
-        assert_eq!(parse_references(&v, PositionEncoding::Utf8).len(), 1);
+        assert_eq!(parse_locations(&v, PositionEncoding::Utf8).len(), 1);
+    }
+
+    #[test]
+    fn locations_accept_a_single_location_and_location_links() {
+        // `textDocument/implementation` may answer one bare `Location` rather than an array…
+        let one = json!({"uri": "file:///p/a.rs", "range": {"start": {"line": 2, "character": 5}, "end": {"line": 2, "character": 6}}});
+        let locs = parse_locations(&one, PositionEncoding::Utf8);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].position, LogicalPosition { line: 2, col: 5 });
+        // …or `LocationLink[]`, whose precise selection range wins over the whole target.
+        let links = json!([{
+            "targetUri": "file:///p/b.rs",
+            "targetRange": {"start": {"line": 7, "character": 0}, "end": {"line": 9, "character": 1}},
+            "targetSelectionRange": {"start": {"line": 7, "character": 13}, "end": {"line": 7, "character": 19}},
+        }]);
+        let locs = parse_locations(&links, PositionEncoding::Utf8);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path, "/p/b.rs");
+        assert_eq!(locs[0].position, LogicalPosition { line: 7, col: 13 });
     }
 
     #[test]
@@ -2772,7 +2832,7 @@ mod seed_reference_center_tests {
             end_line: line,
             end_col,
             preview: String::new(),
-            is_definition: false,
+            role: ReferenceRole::Use,
         }
     }
 

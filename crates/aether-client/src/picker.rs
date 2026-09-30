@@ -3,7 +3,6 @@
 //! (`src/picker.rs`).
 //!
 use crate::chips::{self, Chip, ChipEditor, ChipEditorKind, ChipId, ChipValue, DirListingState};
-use crate::theme::SPINNER_FRAMES;
 use aether_protocol::picker::{
     GroupHeader, GroupRunRows, GroupSpan, PickerFilters, PickerItem, PickerKind, PickerUpdateParams,
 };
@@ -192,10 +191,6 @@ pub struct PickerState {
     /// in-progress value into the filters) skip a redundant re-query when a keystroke leaves the
     /// effective filters unchanged, so focus moves and no-op edits don't blank + refetch.
     pub sent_filters: PickerFilters,
-    /// Spinner animation frame, advanced once per applied push while `ticking` — so the throttled
-    /// streaming-grep ticks (~16/s) drive the throbber without any client-side timer. See
-    /// [`PickerState::spinner_glyph`].
-    pub spinner_frame: u8,
     /// Single-flight guard for window refetches: true while a `picker/view` fired by
     /// [`crate::Session::picker_refetch`] is awaiting its reply. A *selection* move that leaves the
     /// window while this is set is coalesced — `selected` keeps advancing locally and the reply's
@@ -258,7 +253,6 @@ impl PickerState {
             chip_editor: None,
             key_capture: None,
             sent_filters: PickerFilters::default(),
-            spinner_frame: 0,
             refetch_in_flight: false,
             refetch_chases_selection: false,
             loaded: false,
@@ -286,14 +280,6 @@ impl PickerState {
                 .filter(|i| matches!(i, PickerItem::Workspace { .. }))
                 .count() as u32
         })
-    }
-
-    /// The throbber glyph to show while a search is in progress (`ticking`), or `None` when settled.
-    /// The frame advances per applied push (see [`apply_update`]), so it animates while results
-    /// stream and stops the moment the search completes.
-    pub fn spinner_glyph(&self) -> Option<&'static str> {
-        self.ticking
-            .then(|| SPINNER_FRAMES[self.spinner_frame as usize % SPINNER_FRAMES.len()])
     }
 
     /// The rendered chip row, derived from the stored list. A key capture in progress shows as
@@ -697,10 +683,6 @@ impl PickerState {
         }
         self.ticking = u.ticking;
         self.explorer_peek_missing = u.explorer_peek_missing;
-        // Advance the throbber each applied push while a search is still running.
-        if u.ticking {
-            self.spinner_frame = self.spinner_frame.wrapping_add(1);
-        }
         if let Some(center) = self.pending_center.take() {
             let key = item_key(&center);
             if let Some(pos) = self.items.iter().position(|i| item_key(i) == key) {
@@ -1277,6 +1259,7 @@ mod tests {
         assert_eq!(frame_run(10.0 * row_h, 150.0, start, end), Some(start));
     }
     use aether_protocol::git::GitStatus;
+    use aether_protocol::picker::ReferenceRole;
 
     /// The shells / agents row split: the offsets are into the *composed* haystack, so a hit in
     /// the second or third field has to come back rebased onto that field's own chars.
@@ -1320,7 +1303,7 @@ mod tests {
             line,
             col: 0,
             preview: "x".into(),
-            is_definition: false,
+            role: ReferenceRole::Use,
             match_indices: vec![],
         };
         let label_span = |start: u32, label: &str| GroupSpan {
@@ -1848,13 +1831,13 @@ mod tests {
 
     #[test]
     fn references_display_rows_split_into_definition_and_references_sections() {
-        let reference = |path: &str, line: u32, is_definition: bool| PickerItem::Reference {
+        let reference = |path: &str, line: u32, role: ReferenceRole| PickerItem::Reference {
             path: path.into(),
             display_path: path.into(),
             line,
             col: 0,
             preview: "x".into(),
-            is_definition,
+            role,
             match_indices: vec![],
         };
         let mut s = PickerState::new(PickerKind::References);
@@ -1866,9 +1849,9 @@ mod tests {
             generation: 0,
             offset: 0,
             items: Some(vec![
-                reference("lib.rs", 0, true),
-                reference("a.rs", 5, false),
-                reference("b.rs", 9, false),
+                reference("lib.rs", 0, ReferenceRole::Definition),
+                reference("a.rs", 5, ReferenceRole::Use),
+                reference("b.rs", 9, ReferenceRole::Use),
             ]),
             total_matches: 3,
             total_candidates: 3,

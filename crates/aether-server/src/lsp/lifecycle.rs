@@ -31,6 +31,9 @@ pub struct ServerCaps {
     /// servers without it rather than sending a request they'll error on — several of the small
     /// servers (yaml, css, dockerfile) don't implement it.
     pub workspace_symbol: bool,
+    /// Whether the server advertises `implementationProvider`. The references picker only asks
+    /// for an Implementations section from servers that do — most of the small ones don't.
+    pub implementation: bool,
 }
 
 /// Perform the `initialize`/`initialized` handshake against `workspace_root`. `init_options`, when
@@ -63,6 +66,8 @@ pub async fn initialize(
                 // We parse `LocationLink` (its precise `targetSelectionRange`), so let servers send
                 // it for goto-definition instead of the coarser `Location`.
                 "definition": { "linkSupport": true },
+                // Same `LocationLink` parse for the references picker's Implementations section.
+                "implementation": { "linkSupport": true },
                 // We flatten the hierarchical `DocumentSymbol[]` ourselves (tracking nesting depth
                 // for the symbol picker's top-level collapse). Without this, servers (e.g.
                 // rust-analyzer) fall back to the flat `SymbolInformation[]` form — everything depth
@@ -104,12 +109,19 @@ pub async fn initialize(
         .and_then(|c| c.get("workspaceSymbolProvider"))
         .map(|v| v != &Value::Bool(false))
         .unwrap_or(false);
+    // Same three-state shape: `true` / `false` / an `ImplementationOptions` object / absent.
+    let implementation = result
+        .get("capabilities")
+        .and_then(|c| c.get("implementationProvider"))
+        .map(|v| v != &Value::Bool(false))
+        .unwrap_or(false);
     client.notify("initialized", json!({}))?;
     Ok(ServerCaps {
         name,
         position_encoding,
         workspace_symbol,
         document_formatting,
+        implementation,
     })
 }
 
@@ -274,6 +286,29 @@ mod tests {
                 .await
                 .unwrap()
                 .document_formatting
+        );
+        let _ = recv(&mut ev2).await;
+    }
+
+    #[tokio::test]
+    async fn handshake_reads_implementation_capability() {
+        // An options object counts as advertised; an explicit `false` doesn't.
+        let (client, mut ev) =
+            connect_to_server(json!({ "implementationProvider": { "workDoneProgress": false } }));
+        assert!(
+            initialize(&client, Path::new("/p"), None)
+                .await
+                .unwrap()
+                .implementation
+        );
+        let _ = recv(&mut ev).await;
+
+        let (client2, mut ev2) = connect_to_server(json!({ "implementationProvider": false }));
+        assert!(
+            !initialize(&client2, Path::new("/p"), None)
+                .await
+                .unwrap()
+                .implementation
         );
         let _ = recv(&mut ev2).await;
     }

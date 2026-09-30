@@ -835,10 +835,7 @@ impl App {
 
     /// Whether this window has something moving that needs frame ticks.
     fn is_animating(&self) -> bool {
-        (self.scroll_anim.is_some()
-            || self.read_scroll_anim.is_some()
-            || self.picker_ticking()
-            || self.session.lsp_spinning())
+        (self.scroll_anim.is_some() || self.read_scroll_anim.is_some() || self.session.spinning())
             && self.session.conn == ConnState::Connected
     }
 
@@ -846,11 +843,6 @@ impl App {
     /// is just the Workspaces picker over a placeholder session.
     fn wants_hint_ticks(&self) -> bool {
         self.session.hints_enabled && self.session.conn == ConnState::Connected
-    }
-
-    /// Whether a picker search is still streaming (drives the throbber animation).
-    fn picker_ticking(&self) -> bool {
-        self.session.picker.as_ref().is_some_and(|p| p.ticking)
     }
 
     // ---- update ---------------------------------------------------------------------------
@@ -1465,7 +1457,7 @@ impl App {
                 // Advance the throbber — the picker's, and a busy language server's — by elapsed
                 // time (clamped so a gap between animation bursts doesn't jump it); ~1
                 // rotation/sec. Processing the tick re-renders the view.
-                if self.picker_ticking() || self.session.lsp_spinning() {
+                if self.session.spinning() {
                     let dt = self
                         .last_anim_tick
                         .map_or(0.0, |t| (now - t).as_secs_f32().min(0.1));

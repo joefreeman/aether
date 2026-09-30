@@ -2,6 +2,8 @@
 
 mod common;
 
+use aether_protocol::picker::ReferenceRole;
+use aether_protocol::BufferId;
 use common::*;
 
 // ---- real-LSP verification ---------------------------------------------------------------------
@@ -2278,7 +2280,7 @@ async fn references_picker_lists_all_uses() {
                 display_path,
                 line,
                 preview,
-                is_definition,
+                role,
                 ..
             } = i
             else {
@@ -2287,7 +2289,7 @@ async fn references_picker_lists_all_uses() {
             assert!(path.ends_with("main.rs"), "unexpected path: {path}");
             assert_eq!(display_path, "main.rs", "workspace-relative display path");
             assert!(!preview.is_empty(), "reference rows carry a line preview");
-            (*line, *is_definition)
+            (*line, *role == ReferenceRole::Definition)
         })
         .collect();
     let lines: Vec<u32> = refs.iter().map(|(l, _)| *l).collect();
@@ -2315,16 +2317,180 @@ async fn references_picker_lists_all_uses() {
         .center_on
         .as_deref()
         .expect("references seed a center_on like grep/outline");
-    let PickerItem::Reference {
-        line,
-        is_definition,
-        ..
-    } = center
-    else {
+    let PickerItem::Reference { line, role, .. } = center else {
         panic!("center_on should be a Reference, got {center:?}");
     };
     assert_eq!(*line, 0, "seeded on the cursor's occurrence (line 0)");
-    assert!(*is_definition, "that occurrence is the definition");
+    assert_eq!(
+        *role,
+        ReferenceRole::Definition,
+        "that occurrence is the definition"
+    );
+    // This server doesn't advertise `implementationProvider`, so there's no Implementations section.
+    assert_eq!(
+        section_labels(&final_update),
+        ["Definition", "References"],
+        "no implementation support, no Implementations section"
+    );
+}
+
+/// The section headers a References push opens, in order.
+fn section_labels(update: &PickerUpdateParams) -> Vec<String> {
+    update
+        .groups
+        .iter()
+        .map(|g| match &g.header {
+            GroupHeader::Label { label } => label.clone(),
+            other => panic!("references group under labels, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Open the References picker on `buffer_id` once and wait for its resolve to settle.
+async fn resolve_references(ws: &mut Ws, buffer_id: BufferId) -> PickerUpdateParams {
+    use std::time::Duration;
+    let _ = send_request::<PickerView>(
+        ws,
+        &PickerViewParams {
+            view_id: None,
+            limit: 30,
+            buffer_id: Some(buffer_id),
+            ..view_params(PickerKind::References)
+        },
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let p: PickerUpdateParams = expect_notification::<PickerUpdate>(ws).await;
+            if p.kind == PickerKind::References && !p.ticking {
+                break p;
+            }
+        }
+    })
+    .await
+    .expect("the resolve never settled")
+}
+
+/// `(line, col, role)` of each row of a References push, in order.
+fn reference_rows(update: &PickerUpdateParams) -> Vec<(u32, u32, ReferenceRole)> {
+    update
+        .items()
+        .iter()
+        .map(|i| match i {
+            PickerItem::Reference {
+                line, col, role, ..
+            } => (*line, *col, *role),
+            other => panic!("expected Reference item, got {other:?}"),
+        })
+        .collect()
+}
+
+/// On a trait, a server that answers `textDocument/implementation` adds an Implementations section
+/// between the definition and the uses. The trait's name in each `impl Shape for …` header is also
+/// a reference on the line the implementation points into; it folds into the implementation row
+/// instead of listing each impl twice.
+#[tokio::test]
+async fn references_picker_sections_a_traits_implementations() {
+    use aether_server::{DummyLspConfig, DummyRange};
+    let dir = lay_out(&[(
+        "main.rs",
+        "trait Shape {\n    fn area(&self) -> f64;\n}\nstruct Sq;\nimpl Shape for Sq {\n    fn area(&self) -> f64 { 1.0 }\n}\nstruct Ci;\nimpl Shape for Ci {\n    fn area(&self) -> f64 { 2.0 }\n}\nfn draw(s: &dyn Shape) {}\n",
+    )]);
+    let dummy = DummyLspConfig {
+        // `Shape`: declared on line 0, named in both impl headers (cols 5..10), used on line 11.
+        references: vec![
+            DummyRange::on(0, 6, 11),
+            DummyRange::on(4, 5, 10),
+            DummyRange::on(8, 5, 10),
+            DummyRange::on(11, 16, 21),
+        ],
+        definition: Some(DummyRange::on(0, 6, 11)),
+        // Each impl, focused on its self type (`Sq` / `Ci`), as rust-analyzer answers.
+        implementations: vec![DummyRange::on(4, 15, 17), DummyRange::on(8, 15, 17)],
+        ..Default::default()
+    };
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "refs-impls",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
+    let buffer_id = view_of_main(&mut ws).await;
+    set_cursor(&mut ws, buffer_id, 0, 6).await; // on `Shape`'s declaration
+
+    let done = resolve_references(&mut ws, buffer_id).await;
+    drop(server);
+    assert_eq!(
+        reference_rows(&done),
+        [
+            (0, 6, ReferenceRole::Definition),
+            (4, 15, ReferenceRole::Implementation),
+            (8, 15, ReferenceRole::Implementation),
+            (11, 16, ReferenceRole::Use),
+        ],
+        "one row per line: the impl-header references fold into their implementations"
+    );
+    assert_eq!(
+        section_labels(&done),
+        ["Definition", "Implementations", "References"]
+    );
+}
+
+/// Asked on a concrete item, a server may answer `textDocument/implementation` with the item's own
+/// definition. That is no implementation: it stays the Definition row and no Implementations
+/// section opens.
+#[tokio::test]
+async fn references_picker_drops_an_implementation_that_is_the_definition() {
+    use aether_server::{DummyLspConfig, DummyRange};
+    let dir = lay_out(&[(
+        "main.rs",
+        "fn helper() -> i32 {\n    42\n}\nfn main() {\n    let _ = helper();\n}\n",
+    )]);
+    let dummy = DummyLspConfig {
+        references: vec![DummyRange::on(0, 3, 9), DummyRange::on(4, 12, 18)],
+        definition: Some(DummyRange::on(0, 3, 9)),
+        implementations: vec![DummyRange::on(0, 3, 9)],
+        ..Default::default()
+    };
+    let (server, mut ws) = open_and_subscribe_with_lsp(
+        "refs-self-impl",
+        dir.path(),
+        "main.rs",
+        vec![("rust".into(), dummy)],
+    )
+    .await;
+    let buffer_id = view_of_main(&mut ws).await;
+    set_cursor(&mut ws, buffer_id, 0, 3).await;
+
+    let done = resolve_references(&mut ws, buffer_id).await;
+    drop(server);
+    assert_eq!(
+        reference_rows(&done),
+        [
+            (0, 3, ReferenceRole::Definition),
+            (4, 12, ReferenceRole::Use)
+        ]
+    );
+    assert_eq!(section_labels(&done), ["Definition", "References"]);
+}
+
+/// Open `main.rs` (workspace root 0) and return its buffer.
+async fn view_of_main(ws: &mut Ws) -> BufferId {
+    let open: ViewOpenResult = send_request::<ViewOpen>(
+        ws,
+        &ViewOpenParams {
+            transient: None,
+            path_index: Some(0),
+            relative_path: Some("main.rs".into()),
+            language: None,
+            create_if_missing: false,
+            jump_to: None,
+            ..Default::default()
+        },
+    )
+    .await;
+    open.buffer_id
 }
 
 /// A picker opened while the buffer's server is still doing its handshake waits it out and fills

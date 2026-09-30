@@ -6,7 +6,7 @@ use crate::app::{
 };
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_client::session::{AppSettingControl, ConnState};
-use aether_client::theme::{LspDot, Rgb, Theme};
+use aether_client::theme::{LspDot, Rgb, Theme, SPINNER_FRAMES};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::{CommitRef, CommitRefKind, GitStatus};
 use aether_protocol::lsp::{LspProgress, LspStatus, SymbolCrumb};
@@ -2292,7 +2292,7 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
 
     let counts = if state.picker.total_matches == 0 {
         // Initial phase (still searching, no hits yet): the throbber stands alone.
-        state.picker.spinner.unwrap_or("").to_string()
+        picker_spinner(state).unwrap_or("").to_string()
     } else {
         // A list narrowed *below* its candidate set shows `matched/total`; an unfiltered list — and
         // grep, where every candidate is a hit — collapses to a single total. Guarded on `>` rather
@@ -2307,7 +2307,7 @@ fn draw_picker_input_row(f: &mut Frame, state: &AppState, area: Rect) {
         } else {
             format!("{}", state.picker.total_matches)
         };
-        match state.picker.spinner {
+        match picker_spinner(state) {
             Some(s) => format!("{s} {num}"),
             None => num,
         }
@@ -8058,6 +8058,14 @@ fn lsp_indicator_span(state: &AppState) -> Option<Span<'static>> {
     ))
 }
 
+/// The picker's throbber at the current frame while a search is in progress, `None` once settled.
+fn picker_spinner(state: &AppState) -> Option<&'static str> {
+    state
+        .picker
+        .ticking
+        .then(|| SPINNER_FRAMES[SPIN_FRAME.with(|f| f.get()) % SPINNER_FRAMES.len()])
+}
+
 /// A language server's health glyph, at the current throbber frame when it's busy.
 fn lsp_glyph(dot: LspDot) -> &'static str {
     dot.glyph(SPIN_FRAME.with(|f| f.get()))
@@ -9591,6 +9599,38 @@ mod tests {
         assert!(spans_text(&single).starts_with("○ rust-analyzer"));
         assert!(spans_text(&single).ends_with("  rust"));
         assert_eq!(single[0].style.fg, Some(c(th().fg_faint))); // stopped → dim dot
+    }
+
+    /// A searching picker's throbber is the frame the shell stamped, not one advanced per push: an
+    /// async picker (references) sits on its placeholder with no pushes until the server answers,
+    /// and the spin timer's repaint must still move it.
+    #[test]
+    fn searching_picker_throbber_follows_the_stamped_frame() {
+        let searching = |frame| {
+            set_spin_frame(frame);
+            render_picker_rows(crate::picker::PickerState {
+                open: true,
+                kind: Some(PickerKind::References),
+                ticking: true,
+                ..Default::default()
+            })
+        };
+        let (first, next) = (searching(0), searching(1));
+        set_spin_frame(0);
+        let shows = |rows: &[String], glyph: &str| rows.iter().any(|r| r.contains(glyph));
+        assert!(shows(&first, SPINNER_FRAMES[0]), "{}", first.join("\n"));
+        assert!(shows(&next, SPINNER_FRAMES[1]), "{}", next.join("\n"));
+        assert!(!shows(&next, SPINNER_FRAMES[0]));
+
+        let settled = render_picker_rows(crate::picker::PickerState {
+            open: true,
+            kind: Some(PickerKind::References),
+            ..Default::default()
+        });
+        assert!(
+            SPINNER_FRAMES.iter().all(|g| !shows(&settled, g)),
+            "a settled picker shows no throbber"
+        );
     }
 
     /// A busy server's glyph is the throbber frame the shell stamped, not a fixed one — that's

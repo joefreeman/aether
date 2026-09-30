@@ -88,6 +88,9 @@ pub struct DummyLspConfig {
     pub definition: Option<DummyRange>,
     /// `textDocument/references` targets (in the requested document).
     pub references: Vec<DummyRange>,
+    /// `textDocument/implementation` targets (in the requested document); also flips
+    /// `implementationProvider` in the handshake, so empty = a server without the request.
+    pub implementations: Vec<DummyRange>,
     /// `textDocument/formatting` edits; also flips `documentFormattingProvider` in the handshake so
     /// Aether's `lsp/format` doesn't short-circuit with "no formatter".
     pub formatting: Vec<DummyTextEdit>,
@@ -177,6 +180,7 @@ where
                             "hoverProvider": config.hover.is_some(),
                             "definitionProvider": config.definition.is_some(),
                             "referencesProvider": !config.references.is_empty(),
+                            "implementationProvider": !config.implementations.is_empty(),
                             "documentFormattingProvider": !config.formatting.is_empty(),
                             "workspaceSymbolProvider": !config.workspace_symbols.is_empty(),
                             "documentSymbolProvider": !config.document_symbols.is_empty(),
@@ -232,6 +236,15 @@ where
                 let uri = str_at(&msg, &["params", "textDocument", "uri"]);
                 let locs: Vec<Value> = config
                     .references
+                    .iter()
+                    .map(|r| json!({ "uri": uri, "range": r.to_json() }))
+                    .collect();
+                respond(&mut writer, id, Value::Array(locs)).await;
+            }
+            "textDocument/implementation" => {
+                let uri = str_at(&msg, &["params", "textDocument", "uri"]);
+                let locs: Vec<Value> = config
+                    .implementations
                     .iter()
                     .map(|r| json!({ "uri": uri, "range": r.to_json() }))
                     .collect();

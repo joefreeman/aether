@@ -4083,7 +4083,7 @@ fn picker_item_diagnostic_is_tagged() {
 
 #[test]
 fn picker_item_reference_is_tagged() {
-    use aether_protocol::picker::{PickerItem, PickerKind};
+    use aether_protocol::picker::{PickerItem, PickerKind, ReferenceRole};
     assert_eq!(
         to_value(PickerKind::References).unwrap(),
         json!("references")
@@ -4094,7 +4094,7 @@ fn picker_item_reference_is_tagged() {
         line: 41,
         col: 7,
         preview: "    helper();".into(),
-        is_definition: true,
+        role: ReferenceRole::Implementation,
         match_indices: vec![4, 5],
     };
     let v = to_value(&item).unwrap();
@@ -4104,18 +4104,18 @@ fn picker_item_reference_is_tagged() {
     assert_eq!(v["line"], 41);
     assert_eq!(v["col"], 7);
     assert_eq!(v["preview"], "    helper();");
-    assert_eq!(v["is_definition"], true);
+    assert_eq!(v["role"], "implementation");
     assert_eq!(v["match_indices"], json!([4, 5]));
     let back: PickerItem = from_value(v).unwrap();
     assert_eq!(back, item);
 
-    // is_definition and match_indices default (false / empty) when omitted, as the other variants do.
+    // role and match_indices default (use / empty) when omitted, as the other variants do.
     let bare: PickerItem = from_value(json!({
         "kind": "reference", "path": "/a", "display_path": "a", "line": 0, "col": 0, "preview": ""
     }))
     .unwrap();
     assert!(
-        matches!(bare, PickerItem::Reference { ref match_indices, is_definition: false, .. } if match_indices.is_empty())
+        matches!(bare, PickerItem::Reference { ref match_indices, role: ReferenceRole::Use, .. } if match_indices.is_empty())
     );
 }
 

@@ -1814,20 +1814,23 @@ pub fn read_only_toast() -> Effects {
 pub const TAB_WIDTH: u32 = 4;
 
 impl Session {
-    /// Whether a busy language server's throbber is on screen — the status bar's server, a row of
-    /// the language-servers picker, or the detail dialog — so the shell keeps repainting for it.
-    /// Only while connected: a throbber frozen by a lost connection would otherwise pin the
-    /// repaint loop for the whole reconnect.
-    pub fn lsp_spinning(&self) -> bool {
+    /// Whether a throbber is on screen — a picker still searching, or a busy language server (the
+    /// status bar's, a row of the language-servers picker, or the detail dialog) — so the shell
+    /// keeps repainting for it. The shells animate off the clock, not off pushes: an async picker
+    /// (references, outline) goes quiet between its placeholder and its answer. Only while
+    /// connected: a throbber frozen by a lost connection would otherwise pin the repaint loop for
+    /// the whole reconnect.
+    pub fn spinning(&self) -> bool {
         let spins = |s: &LspServerStatus| LspDot::for_server(s).spins();
         self.conn == ConnState::Connected
             && (self.view.lsp.as_ref().is_some_and(spins)
                 || matches!(&self.prompt, Some(Prompt::LspInfo(info)) if spins(info))
                 || self.picker.as_ref().is_some_and(|p| {
-                    p.items.iter().any(|i| {
-                        matches!(i, PickerItem::LspServer { status, progress, .. }
-                            if LspDot::of(status, progress).spins())
-                    })
+                    p.ticking
+                        || p.items.iter().any(|i| {
+                            matches!(i, PickerItem::LspServer { status, progress, .. }
+                                if LspDot::of(status, progress).spins())
+                        })
                 }))
     }
 
@@ -2286,10 +2289,10 @@ mod tests {
     }
 
     /// The repaint gate follows a busy server to each place its icon lands — the status bar, a
-    /// language-servers picker row, the detail dialog — and nowhere else: a ready server doesn't
-    /// spin, and nothing spins while disconnected.
+    /// language-servers picker row, the detail dialog — and a picker still searching, and nowhere
+    /// else: a ready server doesn't spin, and nothing spins while disconnected.
     #[test]
-    fn lsp_spinning_tracks_every_place_a_busy_server_shows() {
+    fn spinning_tracks_every_place_a_throbber_shows() {
         use aether_protocol::lsp::{LspServerStatus, LspStatus};
         use aether_protocol::picker::PickerKind;
         let server = |status: LspStatus| LspServerStatus {
@@ -2301,19 +2304,19 @@ mod tests {
         };
 
         let mut s = Session::placeholder();
-        assert!(!s.lsp_spinning(), "no server anywhere");
+        assert!(!s.spinning(), "no server anywhere");
 
         s.view.lsp = Some(server(LspStatus::Ready));
-        assert!(!s.lsp_spinning(), "a ready server holds still");
+        assert!(!s.spinning(), "a ready server holds still");
         s.view.lsp = Some(server(LspStatus::Starting));
-        assert!(s.lsp_spinning(), "the status bar's server is busy");
+        assert!(s.spinning(), "the status bar's server is busy");
         s.conn = ConnState::Connecting;
-        assert!(!s.lsp_spinning(), "no repaints while disconnected");
+        assert!(!s.spinning(), "no repaints while disconnected");
         s.conn = ConnState::Connected;
         s.view.lsp = None;
 
         s.prompt = Some(Prompt::LspInfo(Box::new(server(LspStatus::Initializing))));
-        assert!(s.lsp_spinning(), "the detail dialog's server is busy");
+        assert!(s.spinning(), "the detail dialog's server is busy");
         s.prompt = None;
 
         let mut picker = PickerState::new(PickerKind::LspServers);
@@ -2327,7 +2330,15 @@ mod tests {
             match_indices: Vec::new(),
         });
         s.picker = Some(picker);
-        assert!(s.lsp_spinning(), "a picker row's server is busy");
+        assert!(s.spinning(), "a picker row's server is busy");
+
+        // A picker between its placeholder push and its answer: no pushes arrive to animate it.
+        let mut picker = PickerState::new(PickerKind::References);
+        picker.ticking = true;
+        s.picker = Some(picker);
+        assert!(s.spinning(), "a picker still searching");
+        s.picker.as_mut().unwrap().ticking = false;
+        assert!(!s.spinning(), "a settled picker holds still");
     }
 
     /// Typing a command bumps the input's revision past the saved point the client learned when

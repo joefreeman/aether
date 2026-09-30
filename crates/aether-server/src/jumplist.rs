@@ -472,11 +472,7 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
                 position: Some(end),
                 anchor: (end != start).then_some(start),
                 group: Some(GroupHeader::Label {
-                    label: if c.is_definition {
-                        "Definition".into()
-                    } else {
-                        "References".into()
-                    },
+                    label: crate::picker::reference_section_label(c.role).into(),
                 }),
                 display: c.preview.clone(),
             }

@@ -373,8 +373,9 @@ pub async fn run(
     terminal.draw(|f| ui::draw(f, &shell.state))?;
     crate::app::refresh_terminal_title(&mut shell.state);
 
-    // A busy language server's throbber: one repaint per frame, armed only while one is on screen
-    // (the core's gate, which is also off while disconnected), so an idle terminal stays idle.
+    // A throbber (a picker still searching, a busy language server): one repaint per frame, armed
+    // only while one is on screen (the core's gate, which is also off while disconnected), so an
+    // idle terminal stays idle.
     let mut spin_tick = tokio::time::interval(std::time::Duration::from_millis(SPINNER_FRAME_MS));
     spin_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -403,7 +404,7 @@ pub async fn run(
                 shell.run_effects(fx);
             }
             // Nothing to do but fall through to the repaint below, which reads the new frame.
-            _ = spin_tick.tick(), if shell.session.lsp_spinning() => {}
+            _ = spin_tick.tick(), if shell.session.spinning() => {}
             // Only poll the inbound stream while connected. Once the socket dies the channel
             // is closed, so `recv` returns `None` *immediately* — without this guard the `select!`
             // would spin on that arm (re-dispatching `ConnectionLost` + redrawing) and peg a core
@@ -2893,7 +2894,6 @@ impl Shell {
         p.total_matches = core.total_matches;
         p.total_candidates = core.total_candidates;
         p.ticking = core.ticking;
-        p.spinner = core.spinner_glyph();
         p.total_display_rows = Some(core.total_display_rows);
         p.empty_note = core.empty_note().map(str::to_string);
         p.selected = (core.selected.saturating_sub(core.offset)) as usize;

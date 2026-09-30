@@ -88,7 +88,7 @@ use aether_protocol::picker::{
     AgentRowState, BufferDirtyState, GroupHeader, MatchOptions, PickerGroupAction,
     PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerReset, PickerSelectParams,
     PickerSelectResult, PickerSetGroupParams, PickerSetGroupResult, PickerUpdate,
-    PickerUpdateParams, PickerViewParams, PickerViewResult,
+    PickerUpdateParams, PickerViewParams, PickerViewResult, ReferenceRole,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavResult, SearchSetParams, SearchSetResult,

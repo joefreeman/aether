@@ -443,6 +443,24 @@ impl BufferDirtyState {
     }
 }
 
+/// What a [`PickerItem::Reference`] location is to the symbol find-references was invoked on.
+/// Declared in section order: the picker lists every definition row, then every implementation,
+/// then the uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceRole {
+    /// The location `textDocument/definition` resolves to. At most one row; none when the server
+    /// can't resolve a definition, or it falls outside the returned references.
+    Definition,
+    /// A location `textDocument/implementation` returns — an impl of a trait, an implementer of an
+    /// interface, an override of an abstract member. Only from servers that advertise
+    /// `implementationProvider`; a use on the same line folds into it.
+    Implementation,
+    /// An ordinary reference.
+    #[default]
+    Use,
+}
+
 /// The kind of a document symbol, mirroring the LSP `SymbolKind` enumeration. Carried by
 /// [`PickerItem::Symbol`] so the clients can show a short type tag (and, later, a coloured icon)
 /// next to each symbol. `Unknown` covers any value outside the LSP-defined 1..=26 range.
@@ -886,14 +904,11 @@ pub enum PickerItem {
         col: u32,
         /// The text of the referenced line, trailing newline trimmed. Fuzzy haystack + preview.
         preview: String,
-        /// True for the row that is the symbol's definition (the location `textDocument/definition`
-        /// resolves to), false for an ordinary use. Drives the `Definition` / `References` section
-        /// split: candidates are ordered definition-first, and clients open a section header above
-        /// each run. At most one row is the definition; `false` for every row when the server can't
-        /// resolve a definition (no `textDocument/definition` support, or it falls outside the
-        /// returned references), in which case the list is a single `References` section.
+        /// What this location is to the symbol. Drives the `Definition` / `Implementations` /
+        /// `References` section split: candidates are ordered in that section order, and clients
+        /// open a section header above each run. Defaults to [`ReferenceRole::Use`].
         #[serde(default)]
-        is_definition: bool,
+        role: ReferenceRole,
         /// Char offsets into `preview` covered by fuzzy matches.
         #[serde(default)]
         match_indices: Vec<u32>,
