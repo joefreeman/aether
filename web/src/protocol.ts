@@ -1185,6 +1185,7 @@ export type PickerItem =
       cwd?: string;
       cwd_root?: number;
       state?: AgentRowState;
+      empty?: boolean;
       dormant?: boolean;
       match_indices?: number[];
     }

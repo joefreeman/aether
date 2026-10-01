@@ -7617,6 +7617,10 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::CloseBusyAgent { title } => {
             format!("{title} is still working — close it and stop the turn")
         }
+        // The one irreversible step for a conversation: closing its view keeps it.
+        ConfirmKind::DeleteConversation { title } => {
+            format!("Delete {title} — its conversation can't be recovered")
+        }
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
         ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),

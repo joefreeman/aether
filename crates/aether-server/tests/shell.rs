@@ -1661,16 +1661,22 @@ async fn a_shell_survives_a_server_restart() {
             PickerItem::Shell {
                 title,
                 cwd,
+                cwd_root,
                 last_command,
                 exit,
                 ..
-            } if title == "Shell 1" => Some((cwd.clone(), last_command.clone(), *exit)),
+            } if title == "Shell 1" => Some((cwd.clone(), *cwd_root, last_command.clone(), *exit)),
             _ => None,
         })
         .expect("the dormant row");
-    assert!(row.0.ends_with("/sub"), "its directory: {row:?}");
-    assert_eq!(row.1.as_deref(), Some("sleep 100"));
-    assert_eq!(row.2, None);
+    // Root-relative, as a live row's is: the root's label is the client's to add.
+    assert_eq!(
+        (row.0.as_str(), row.1),
+        ("sub", Some(0)),
+        "its directory: {row:?}"
+    );
+    assert_eq!(row.2.as_deref(), Some("sleep 100"));
+    assert_eq!(row.3, None);
     let buffers = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Buffers)).await;
     let buffer_rows = buffers.update.and_then(|u| u.items).expect("a window");
     assert!(

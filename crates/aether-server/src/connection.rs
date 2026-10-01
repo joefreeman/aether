@@ -12,7 +12,7 @@ use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
 use crate::state::{ClientSession, SharedState};
 use aether_protocol::activity::ActivityCancel;
-use aether_protocol::agent::{AgentCancel, AgentPrompt, AgentRespond, AgentStart};
+use aether_protocol::agent::{AgentCancel, AgentDelete, AgentPrompt, AgentRespond, AgentStart};
 use aether_protocol::app::AppInfoGet;
 use aether_protocol::buffer::{BufferContent, BufferCopy, BufferCut, BufferReload, BufferSave};
 use aether_protocol::cursor::{
@@ -638,6 +638,7 @@ async fn dispatch(
         AgentStart::NAME => run!(AgentStart, handlers::agent_start),
         AgentPrompt::NAME => run!(AgentPrompt, handlers::agent_prompt),
         AgentCancel::NAME => run!(AgentCancel, handlers::agent_cancel),
+        AgentDelete::NAME => run!(AgentDelete, handlers::agent_delete),
         AgentRespond::NAME => run!(AgentRespond, handlers::agent_respond),
         LspRestartServer::NAME => run!(LspRestartServer, handlers::lsp_restart_server),
         LspHover::NAME => run!(LspHover, handlers::lsp_hover),

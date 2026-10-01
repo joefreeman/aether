@@ -3098,3 +3098,263 @@ async fn git_commands_in_an_agent_view_outside_a_repo_say_so() {
     .expect_err("no repo to show");
     assert_eq!(err["message"], "Not in a git repository", "{err}");
 }
+
+// ---- closing keeps, deleting discards -----------------------------------------------------------
+
+/// A workspace `p` over a temp root **with persistence on** — sessions and backups — and a dummy
+/// agent per script, one script per conversation the test starts.
+async fn setup_persistent(
+    scripts: Vec<Script>,
+) -> (aether_server::ServerHandle, Ws, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+    let mut server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![("p".to_string(), vec![root.clone()])],
+        Some(root.join("sessions.json")),
+        Some(root.join("backups")),
+    )
+    .await
+    .unwrap();
+    server.keep_alive(());
+    let slots = Mutex::new(
+        scripts
+            .into_iter()
+            .map(|script| dummy::start(script).transport)
+            .collect::<std::collections::VecDeque<_>>(),
+    );
+    {
+        let mut s = server.state.lock().await;
+        s.agent_launcher = aether_server::state::AgentLauncher::Dummy(Arc::new(move || {
+            slots
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("one script per conversation the test starts")
+        }));
+    }
+    let mut ws = Ws::connect(&server).await;
+    activate_p(&mut ws).await;
+    (server, ws, dir)
+}
+
+fn one_reply() -> Script {
+    Script {
+        steps: vec![Step::Say {
+            message_id: Some("m1"),
+            text: "It drops them in the parser.\n",
+        }],
+        ..Script::default()
+    }
+}
+
+fn agent_snapshot(dir: &tempfile::TempDir, number: u32) -> std::path::PathBuf {
+    dir.path()
+        .canonicalize()
+        .unwrap()
+        .join("backups")
+        .join("agent")
+        .join("p")
+        .join(number.to_string())
+}
+
+async fn agent_rows(ws: &mut Ws) -> Vec<PickerItem> {
+    send_request::<PickerView>(ws, &view_params(PickerKind::Agents))
+        .await
+        .update
+        .and_then(|u| u.items)
+        .expect("a window")
+}
+
+async fn close(ws: &mut Ws, view_id: aether_protocol::ViewId) {
+    let _: aether_protocol::view::ViewCloseResult = send_request::<ViewClose>(
+        ws,
+        &ViewCloseParams {
+            view_id,
+            open_next: true,
+        },
+    )
+    .await;
+}
+
+async fn delete(ws: &mut Ws, view_id: aether_protocol::ViewId) {
+    let _: aether_protocol::view::ViewCloseResult =
+        send_request::<aether_protocol::agent::AgentDelete>(
+            ws,
+            &ViewCloseParams {
+                view_id,
+                open_next: true,
+            },
+        )
+        .await;
+}
+
+/// **Closing a conversation's view keeps the conversation.** Its agent stops — no live document is
+/// left holding it — and it stays in the agents picker as a dormant row over its snapshot, which
+/// opening reads back.
+#[tokio::test]
+async fn closing_a_conversation_keeps_it_dormant() {
+    let (server, mut ws, dir) = setup_persistent(vec![one_reply()]).await;
+    let open = start_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "why are semicolons dropped?").await;
+    close(&mut ws, open.opened.view_id).await;
+
+    {
+        let s = server.state.lock().await;
+        assert!(
+            s.documents.values().all(|d| d.conversation().is_none()),
+            "the conversation is no longer live — its agent went with it"
+        );
+    }
+    assert!(agent_snapshot(&dir, 1).exists(), "its record is on disk");
+    let rows = agent_rows(&mut ws).await;
+    let [PickerItem::Agent {
+        view_id,
+        title,
+        dormant,
+        empty,
+        ..
+    }] = rows.as_slice()
+    else {
+        panic!("one agent row: {rows:?}");
+    };
+    assert_eq!(title, "Agent 1");
+    assert!(*dormant && !*empty);
+
+    // Opening the row reads the record back — without launching anything.
+    let reopened: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(*view_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    let s = server.state.lock().await;
+    let c = s
+        .try_presenting_buffer(reopened.view_id)
+        .and_then(|b| s.try_doc_of(b))
+        .and_then(|d| d.conversation())
+        .expect("the conversation, back");
+    assert!(c.handle.is_none(), "reading the record started an agent");
+    let labels: Vec<String> = c
+        .blocks
+        .iter()
+        .map(aether_server::agent::block_label)
+        .collect();
+    assert_eq!(labels, vec!["You", "Agent"]);
+}
+
+/// A conversation with nothing in it is not worth a row: closing it discards it, snapshot and all.
+#[tokio::test]
+async fn closing_an_empty_conversation_discards_it() {
+    let (_server, mut ws, dir) = setup_persistent(vec![Script::default()]).await;
+    let open = start_agent(&mut ws).await;
+    let rows = agent_rows(&mut ws).await;
+    assert!(
+        matches!(rows.as_slice(), [PickerItem::Agent { empty: true, .. }]),
+        "a fresh conversation says it is empty, so deleting it asks nothing: {rows:?}"
+    );
+    close(&mut ws, open.opened.view_id).await;
+    assert!(agent_rows(&mut ws).await.is_empty());
+    assert!(!agent_snapshot(&dir, 1).exists());
+}
+
+/// **Deleting a conversation is for good**, live or dormant: the row goes, the snapshot goes, and a
+/// restart does not find it again. The restart is the point — a snapshot left on disk with no
+/// session entry is exactly what a lost session write looks like, and comes back as one.
+#[tokio::test]
+async fn deleting_a_conversation_removes_it_for_good() {
+    let (server, mut ws, dir) = setup_persistent(vec![one_reply(), one_reply()]).await;
+    let root = dir.path().canonicalize().unwrap();
+
+    // Agent 1 deleted while live.
+    let first = start_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &first, "one").await;
+    delete(&mut ws, first.opened.view_id).await;
+    assert!(!agent_snapshot(&dir, 1).exists());
+
+    // Agent 1 again (its number is free), closed — kept — and then deleted from its dormant row.
+    let second = start_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &second, "two").await;
+    close(&mut ws, second.opened.view_id).await;
+    let rows = agent_rows(&mut ws).await;
+    let [PickerItem::Agent {
+        view_id,
+        dormant: true,
+        ..
+    }] = rows.as_slice()
+    else {
+        panic!("one dormant row: {rows:?}");
+    };
+    delete(&mut ws, *view_id).await;
+    assert!(agent_rows(&mut ws).await.is_empty());
+    assert!(!agent_snapshot(&dir, 1).exists());
+
+    drop(ws);
+    drop(server);
+    let store = root.join("workspaces");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("p.toml"),
+        format!("[[roots]]\npath = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![],
+        Some(root.join("sessions.json")),
+        Some(root.join("backups")),
+    )
+    .await
+    .unwrap();
+    server.state.lock().await.workspaces_dir = Some(store);
+    let mut ws = Ws::connect(&server).await;
+    activate_p(&mut ws).await;
+    assert!(
+        agent_rows(&mut ws).await.is_empty(),
+        "a deleted conversation came back after a restart"
+    );
+}
+
+/// A closed conversation keeps its number: its snapshot is keyed by it, so a new conversation
+/// taking the number would overwrite the record of the one you closed.
+#[tokio::test]
+async fn a_new_conversation_does_not_take_a_closed_ones_number() {
+    let (server, mut ws, _dir) = setup_persistent(vec![one_reply(), Script::default()]).await;
+    let first = start_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &first, "one").await;
+    close(&mut ws, first.opened.view_id).await;
+    let second = start_agent(&mut ws).await;
+    assert_eq!(second.opened.title.as_deref(), Some("Agent 2"));
+}
+
+/// `agent/delete` is refused for a view that is not a conversation — and nothing closes.
+#[tokio::test]
+async fn deleting_refuses_a_view_that_is_not_a_conversation() {
+    let (_server, mut ws, _dir) = setup_persistent(vec![]).await;
+    let file: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("a.txt", Some(false))).await;
+    let err = send_request_result::<aether_protocol::agent::AgentDelete>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: file.view_id,
+            open_next: false,
+        },
+    )
+    .await
+    .expect_err("a file is not a conversation");
+    assert!(
+        err["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not a conversation")),
+        "{err}"
+    );
+    let content = send_request::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: file.buffer_id,
+        },
+    )
+    .await;
+    assert_eq!(content.text, "hello\n", "the file is still open");
+}

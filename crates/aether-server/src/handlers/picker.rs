@@ -258,11 +258,10 @@ fn build_agent_candidates(
     let roots = workspace_roots(s, client_id);
     let mut out = Vec::with_capacity(views.len() + dormant.len());
     for view_id in views {
-        let Some(c) = s
-            .try_view(view_id)
-            .and_then(|v| s.try_doc_of(v.presenting))
-            .and_then(|d| d.conversation())
-        else {
+        let Some(presenting) = s.try_view(view_id).map(|v| v.presenting) else {
+            continue;
+        };
+        let Some(c) = s.try_doc_of(presenting).and_then(|d| d.conversation()) else {
             continue;
         };
         // Blocked beats running: a turn waiting on an answer is not making progress, and saying
@@ -286,6 +285,7 @@ fn build_agent_candidates(
             cwd_root,
             state,
             dormant: false,
+            empty: s.conversation_is_empty(presenting),
         });
     }
     for d in dormant {
@@ -309,6 +309,7 @@ fn build_agent_candidates(
             cwd_root,
             state: AgentRowState::Disconnected,
             dormant: true,
+            empty: false,
         });
     }
     out

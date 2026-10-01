@@ -8496,21 +8496,27 @@ impl Session {
                     busy_agent: false,
                 },
             ),
+            // `Ctrl-d` on a conversation **deletes** it — closing its view keeps it, so the row's
+            // key is the one way to throw the record away, and it asks first whenever there is
+            // anything to lose.
             PickerItem::Agent {
                 view_id,
                 title,
-                state,
+                empty,
                 ..
-            } => (
-                None,
-                *view_id,
-                Closing {
-                    label: title.clone(),
-                    unsaved: false,
-                    running_shell: false,
-                    busy_agent: agent_state_is_busy(state),
-                },
-            ),
+            } => {
+                let view_id = *view_id;
+                if *empty {
+                    return self.delete_picker_conversation(view_id);
+                }
+                self.prompt = Some(Prompt::Confirm {
+                    kind: ConfirmKind::DeleteConversation {
+                        title: title.clone(),
+                    },
+                    action: ConfirmAction::DeletePickerConversation { view_id },
+                });
+                return Effects::none();
+            }
             _ => return Effects::none(),
         };
         if let Some(kind) = close_confirm_for(&closing) {
@@ -8530,6 +8536,42 @@ impl Session {
     /// switch doesn't tear it down — see [`Self::adopt_switch`]). Closing the
     /// [tether](Session::tether) — active or backgrounded — exits the client instead, like every
     /// other close path.
+    /// Fire `agent/delete` for a conversation chosen in the agents picker — the same request and
+    /// landing as [`Self::close_picker_view`], with the record discarded rather than kept.
+    fn delete_picker_conversation(&mut self, view_id: ViewId) -> Effects {
+        self.close_picker_row::<aether_protocol::agent::AgentDelete>(view_id)
+    }
+
+    /// Close (or delete) the picker row `view_id` through `M`: a view the editor is showing lands
+    /// where the server says, as `Space x` would; a background one just goes, the picker re-listing
+    /// from the server's refresh push.
+    fn close_picker_row<M>(&mut self, view_id: ViewId) -> Effects
+    where
+        M: RpcMethod<Params = ViewCloseParams, Result = aether_protocol::view::ViewCloseResult>
+            + 'static,
+    {
+        let closing_active = view_id == self.view.view_id;
+        self.request_str::<M>(
+            ViewCloseParams {
+                view_id,
+                open_next: closing_active,
+            },
+            move |r| {
+                if closing_active {
+                    Event::Switched(r.and_then(|closed| {
+                        closed
+                            .opened
+                            .ok_or_else(|| "the close returned no successor".into())
+                    }))
+                } else {
+                    // Background view: nothing to adopt — the picker refresh rides a separate push.
+                    let _ = r;
+                    Event::Noop
+                }
+            },
+        )
+    }
+
     fn close_picker_view(&mut self, buffer_id: Option<BufferId>, view_id: ViewId) -> Effects {
         // The row names its view — the one closing addresses — and, for a buffer row, its buffer,
         // which is what the tether is. A shell or a conversation carries none and can never be it.
@@ -8542,26 +8584,7 @@ impl Session {
                 |r| Event::TetherClosed(r.map(|_| ())),
             );
         }
-        let closing_active = view_id == self.view.view_id;
-        self.request_str::<ViewClose>(
-            ViewCloseParams {
-                view_id,
-                open_next: closing_active,
-            },
-            move |r| {
-                if closing_active {
-                    Event::Switched(r.and_then(|closed| {
-                        closed
-                            .opened
-                            .ok_or_else(|| "view/close returned no successor".into())
-                    }))
-                } else {
-                    // Background buffer: nothing to adopt — the picker refresh rides a separate push.
-                    let _ = r;
-                    Event::Noop
-                }
-            },
-        )
+        self.close_picker_row::<ViewClose>(view_id)
     }
 
     /// Create whatever the Explorer query names in the listed directory — a directory when it ends
@@ -9811,6 +9834,9 @@ impl Session {
             ConfirmAction::CloseDiscard => self.close_view(),
             ConfirmAction::ClosePickerView { buffer_id, view_id } => {
                 self.close_picker_view(buffer_id, view_id)
+            }
+            ConfirmAction::DeletePickerConversation { view_id } => {
+                self.delete_picker_conversation(view_id)
             }
             ConfirmAction::DeletePath { path, noun } => self
                 .request_str::<PathDelete>(PathDeleteParams { path }, move |result| {

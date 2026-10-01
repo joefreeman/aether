@@ -18,10 +18,36 @@ use super::*;
 /// landing), and only a trail with nothing to say falls through to the MRU successor. Nothing is
 /// pushed the other way — the closed view is gone, not left. Every other client the close *moves*
 /// gets the same rule applied to its own trail, as far as the `view/closed` push can name it.
+///
+/// **Closing a conversation's view keeps the conversation** ([`ConversationClose::Keep`]): its agent
+/// stops, and it stays in the agents picker as a dormant row over its snapshot — the state a
+/// restart leaves it in. Deleting one is `agent/delete`, the other half of [`close_view`].
 pub async fn view_close(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: ViewCloseParams,
+) -> Result<aether_protocol::view::ViewCloseResult, RpcError> {
+    close_view(state, ctx, params, ConversationClose::Keep).await
+}
+
+/// What closing a conversation's view does to the conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationClose {
+    /// Keep it as a dormant row — `view/close`. Only when there is something to keep and its
+    /// snapshot is on disk to come back from: an empty conversation, or one in a workspace with
+    /// nowhere to write it (an ephemeral one, backups off), is discarded instead.
+    Keep,
+    /// Discard it, snapshot and all — `agent/delete`.
+    Discard,
+}
+
+/// [`view_close`], with what happens to a conversation said outright. Everything that is not a
+/// conversation closes the same either way.
+pub async fn close_view(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: ViewCloseParams,
+    conversation: ConversationClose,
 ) -> Result<aether_protocol::view::ViewCloseResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -196,6 +222,23 @@ pub async fn view_close(
                 Some(crate::state::VirtualTarget::Shell { number, .. }) => Some(*number),
                 _ => None,
             });
+    // A conversation: its number (what its snapshot is keyed by) and where its agent ran (what its
+    // dormant row will say), read while the document is still here.
+    let agent = s.try_doc_of(buffer_id).and_then(|d| {
+        let c = d.conversation()?;
+        match d.virtual_source.as_ref().map(|v| &v.target) {
+            Some(crate::state::VirtualTarget::Agent { number, .. }) => {
+                Some((*number, c.cwd.clone()))
+            }
+            _ => None,
+        }
+    });
+    // Kept only when there is something to keep and the record it would come back from is on
+    // disk — written here, now, so a row is never listed over a snapshot that is not there.
+    let keep_agent = agent.is_some()
+        && conversation == ConversationClose::Keep
+        && !s.conversation_is_empty(buffer_id)
+        && s.snapshot_agent(buffer_id);
     // Canonical teardown (drops the buffer + all its per-client slices, sends LSP `didClose`,
     // clears diagnostics, and tears down the language server if this was its last buffer).
     let stopped_server = s.close_buffer(buffer_id);
@@ -207,6 +250,33 @@ pub async fn view_close(
         s.backups_path.as_deref(),
     ) {
         crate::backup::delete(&crate::backup::shell_backup_path(root, ws, number));
+    }
+    // A conversation goes dormant or goes. Teardown stopped its agent and wrote it down either way
+    // (as a workspace switch's would); kept, it is listed again as a row over that snapshot, first
+    // among the dormant ones since it was the last seen; discarded, the snapshot goes too — or the
+    // restore would find a snapshot no session mentions and bring it back as a lost one.
+    if let (Some(ws), Some((number, cwd))) = (owning_workspace.as_deref(), agent) {
+        if keep_agent {
+            let id = s.allocate_buffer_id();
+            let view = s.allocate_view_id();
+            if let Some(entry) = s.workspaces.get_mut(ws) {
+                entry.dormant_views.insert(
+                    0,
+                    crate::state::DormantView {
+                        id,
+                        view,
+                        read: false,
+                        transient: false,
+                        source: crate::state::DormantSource::Agent { number },
+                        summary: Some(crate::state::DormantSummary::Agent(
+                            crate::agent::SnapshotSummary { cwd },
+                        )),
+                    },
+                );
+            }
+        } else if let Some(root) = s.backups_path.as_deref() {
+            crate::backup::delete(&crate::backup::agent_backup_path(root, ws, number));
+        }
     }
     // The previews it was keeping alive — a review's element buffers — go with it.
     let collected = collect_after_close(&mut s, &left_behind);

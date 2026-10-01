@@ -1010,6 +1010,20 @@ impl ServerState {
             .map(|(_, c)| c)
     }
 
+    /// Whether the conversation `id` presents holds nothing at all: no block, and nothing typed.
+    /// Such a conversation is discarded rather than kept when its view closes, and deleted without
+    /// asking. `false` for a buffer that is not a conversation.
+    pub fn conversation_is_empty(&self, id: BufferId) -> bool {
+        self.try_doc_of(id)
+            .and_then(|d| d.conversation())
+            .is_some_and(|c| {
+                c.blocks.is_empty()
+                    && self
+                        .try_doc_of(c.input)
+                        .is_none_or(|d| d.text.len_chars() == 0)
+            })
+    }
+
     /// Mint the id of a new view.
     ///
     /// Buffers and views draw on one id space ([`Self::next_id`]), so no view id is ever a
@@ -2467,30 +2481,33 @@ impl ServerState {
     /// A session id is recorded only once the agent has **confirmed** it (`Conversation::session`,
     /// set from `AgentEvent::Ready`), never one we were merely trying to resume: a snapshot naming
     /// a session that failed to load would claim a context nobody holds.
-    pub fn snapshot_agent(&self, id: BufferId) {
+    ///
+    /// True when the snapshot is on disk — what closing a conversation's view needs to know before
+    /// it keeps the conversation as a dormant row that will read it back.
+    pub fn snapshot_agent(&self, id: BufferId) -> bool {
         let Some(root) = self.backups_path.as_deref() else {
-            return;
+            return false;
         };
         let Some(workspace) = self.buffer_workspaces.get(&id) else {
-            return;
+            return false;
         };
         if self
             .workspaces
             .get(workspace)
             .is_none_or(|w| w.name.is_none())
         {
-            return;
+            return false;
         }
         let Some(doc) = self.try_doc_of(id) else {
-            return;
+            return false;
         };
         let Some(c) = doc.conversation() else {
-            return;
+            return false;
         };
         let Some(VirtualTarget::Agent { number, .. }) =
             doc.virtual_source.as_ref().map(|v| &v.target)
         else {
-            return;
+            return false;
         };
         let input: String = self
             .try_doc_of(c.input)
@@ -2503,12 +2520,17 @@ impl ServerState {
                     .unwrap_or_default()
             })
             .trimmed(crate::agent::SNAPSHOT_BUDGET);
-        if let Ok(json) = serde_json::to_string(&snap) {
-            if let Err(e) = crate::backup::write(
-                &crate::backup::agent_backup_path(root, workspace, *number),
-                &json,
-            ) {
+        let Ok(json) = serde_json::to_string(&snap) else {
+            return false;
+        };
+        match crate::backup::write(
+            &crate::backup::agent_backup_path(root, workspace, *number),
+            &json,
+        ) {
+            Ok(_) => true,
+            Err(e) => {
                 tracing::warn!(error = %e, "failed to write agent snapshot");
+                false
             }
         }
     }
@@ -2525,7 +2547,7 @@ impl ServerState {
         self.snapshot_shell(id);
         // Same reason, same moment: a conversation torn down by a switch or a disconnect keeps
         // what it held.
-        self.snapshot_agent(id);
+        let _ = self.snapshot_agent(id);
         let input = match self
             .try_doc_of_mut(id)
             .and_then(|d| d.generated.as_mut())

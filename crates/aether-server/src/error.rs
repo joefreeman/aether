@@ -150,6 +150,15 @@ impl RpcError {
         )
     }
 
+    /// `agent/delete` addressed at a view that is not a conversation, live or dormant. Refused
+    /// rather than closed: deleting is not a close, and a stale id must not take a file with it.
+    pub fn not_a_conversation(view_id: aether_protocol::ViewId) -> Self {
+        Self::new(
+            ErrorCode::BUFFER_NOT_FOUND,
+            format!("view {} is not a conversation", view_id.get()),
+        )
+    }
+
     /// A submit into a shell that is already running something. The message is what the client
     /// toasts, so it names both the shell and the command in the way.
     pub fn shell_busy(title: &str, command: &str) -> Self {

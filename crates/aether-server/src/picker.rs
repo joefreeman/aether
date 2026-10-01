@@ -81,6 +81,7 @@ pub struct AgentCandidate {
     pub cwd_root: Option<u32>,
     pub state: AgentRowState,
     pub dormant: bool,
+    pub empty: bool,
     /// `"{title}  {cwd}"`, an empty `cwd` elided — see [`PickerItem::Agent`].
     pub haystack: String,
 }
@@ -1010,6 +1011,7 @@ impl PickerCandidates {
                     cwd_root: c.cwd_root,
                     state: c.state.clone(),
                     dormant: c.dormant,
+                    empty: c.empty,
                     match_indices,
                 }
             }

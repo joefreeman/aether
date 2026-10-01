@@ -443,6 +443,9 @@ fn confirm_kind(k: &ConfirmKind) -> Value {
         ConfirmKind::CloseBusyAgent { title } => {
             json!({ "kind": "close_busy_agent", "title": title })
         }
+        ConfirmKind::DeleteConversation { title } => {
+            json!({ "kind": "delete_conversation", "title": title })
+        }
         ConfirmKind::Delete { noun, name } => {
             json!({ "kind": "delete", "noun": noun, "name": name })
         }

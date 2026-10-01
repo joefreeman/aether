@@ -115,6 +115,23 @@ pub struct AgentCancelResult {
     pub cancelled: bool,
 }
 
+// ---- agent/delete ------------------------------------------------------------------------------
+
+/// Delete a conversation — `Ctrl-d` on its row in the agents picker. Stops its agent, discards the
+/// snapshot it would come back from, and removes the row; live or dormant alike.
+///
+/// Its own method rather than [`crate::view::ViewClose`], because the two do different things to
+/// a conversation: closing its view **keeps** it — the row goes dormant, and opening it again reads
+/// the record back — while this destroys the record. A close must not have to guess which was
+/// meant. The shapes are a close's because the landing is: deleting the conversation on screen
+/// moves the client exactly as closing it would. Errors for a view that is not a conversation.
+pub struct AgentDelete;
+impl RpcMethod for AgentDelete {
+    const NAME: &'static str = "agent/delete";
+    type Params = crate::view::ViewCloseParams;
+    type Result = crate::view::ViewCloseResult;
+}
+
 // ---- agent/respond -----------------------------------------------------------------------------
 
 /// Answer a tool call's pending permission request — `Enter` on the block in Normal

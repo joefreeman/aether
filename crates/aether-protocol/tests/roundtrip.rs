@@ -5117,6 +5117,7 @@ fn picker_item_agent_is_tagged() {
         cwd_root: Some(0),
         state: AgentRowState::AwaitingPermission,
         dormant: false,
+        empty: false,
         match_indices: vec![0],
     };
     assert_eq!(
@@ -5139,6 +5140,7 @@ fn picker_item_agent_is_tagged() {
         cwd_root: None,
         state: AgentRowState::Thinking,
         dormant: false,
+        empty: false,
         match_indices: vec![],
     };
     assert_eq!(
@@ -5154,11 +5156,26 @@ fn picker_item_agent_is_tagged() {
         cwd_root: None,
         state: AgentRowState::Disconnected,
         dormant: true,
+        empty: false,
         match_indices: vec![],
     };
     let dv = to_value(&dormant).unwrap();
     assert_eq!(dv["state"], json!({ "state": "disconnected" }));
     assert_eq!(dv["dormant"], json!(true));
+    assert!(dv.get("empty").is_none(), "quiet unless true");
+
+    // A conversation with nothing in it says so — deleting it asks nothing.
+    let fresh = PickerItem::Agent {
+        view_id: aether_protocol::ViewId(24),
+        title: "Agent 5".into(),
+        cwd: String::new(),
+        cwd_root: Some(0),
+        state: AgentRowState::Disconnected,
+        dormant: false,
+        empty: true,
+        match_indices: vec![],
+    };
+    assert_eq!(to_value(&fresh).unwrap()["empty"], json!(true));
 
     // Idle is the default, so an absent state reads back as idle; an absent `cwd` as empty.
     let back: PickerItem = from_value(json!({
@@ -5170,6 +5187,18 @@ fn picker_item_agent_is_tagged() {
     };
     assert_eq!(*state, AgentRowState::Idle);
     assert_eq!(cwd, "");
+}
+
+/// `agent/delete` is a close in shape — the same params and the same landing — under its own name,
+/// since it does what a close does not: discard the conversation rather than keep it.
+#[test]
+fn agent_delete_is_a_close_in_shape() {
+    use aether_protocol::agent::AgentDelete;
+    use aether_protocol::envelope::RpcMethod;
+    assert_eq!(AgentDelete::NAME, "agent/delete");
+    let params: <AgentDelete as RpcMethod>::Params = from_value(json!({ "view_id": 9 })).unwrap();
+    assert_eq!(params.view_id, aether_protocol::ViewId(9));
+    assert!(!params.open_next);
 }
 
 /// An agent view's description names the directory its agent runs in, beside its title — and a

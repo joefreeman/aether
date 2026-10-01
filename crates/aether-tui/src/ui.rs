@@ -10186,6 +10186,7 @@ mod tests {
             cwd_root: Some(1),
             state: AgentRowState::AwaitingPermission,
             dormant: false,
+            empty: false,
             match_indices: vec![],
         };
         let spans = picker_item_spans(&asking, &labels, None, false, 70);
@@ -10216,6 +10217,7 @@ mod tests {
             cwd_root: None,
             state: AgentRowState::Disconnected,
             dormant: true,
+            empty: false,
             match_indices: vec![],
         };
         let spans = picker_item_spans(&dormant, &labels, None, false, 70);

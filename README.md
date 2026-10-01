@@ -234,6 +234,10 @@ caret is there:
 caret out to the transcript and back, where `Enter` opens the file the line under the cursor names
 and edits are refused.
 
+Closing a shell (`Space x`, or `Ctrl-d` on its row) ends it. Closing an agent conversation stops
+the agent but keeps the conversation in `Space a`, where opening it reads it back and the next
+prompt picks up where it left off; `Ctrl-d` on its row deletes it, asking first if anything was said.
+
 A task is a shortcut for starting a shell. `Space t` lists the justfile recipes, Makefile targets,
 `package.json` scripts and mise tasks defined in the current file's directory and each directory
 above it, nearest first — it needs a file open, as the Git commands need one to find their

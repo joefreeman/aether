@@ -733,10 +733,16 @@ pub enum PickerItem {
         /// What it is doing, as a badge.
         #[serde(default)]
         state: AgentRowState,
-        /// A session-restored conversation nothing has opened yet: a record on disk with no
-        /// subprocess behind it. Its state is always [`AgentRowState::Disconnected`].
+        /// A conversation nothing is showing: a record on disk with no subprocess behind it —
+        /// session-restored, or closed (closing a conversation's view keeps it). Its state is
+        /// always [`AgentRowState::Disconnected`].
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         dormant: bool,
+        /// Nothing has been said and nothing typed: deleting it loses nothing, so the client
+        /// deletes without asking. Never true of a dormant row — an empty conversation is
+        /// discarded when closed rather than kept.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        empty: bool,
         /// Char offsets into the composed haystack described above.
         #[serde(default)]
         match_indices: Vec<u32>,

@@ -305,7 +305,7 @@ async fn present(
 }
 
 fn next_agent_number(s: &ServerState, workspace: &str) -> u32 {
-    let used: std::collections::HashSet<u32> = s
+    let mut used: std::collections::HashSet<u32> = s
         .buffer_workspaces
         .iter()
         .filter(|(_, w)| w.as_str() == workspace)
@@ -315,6 +315,15 @@ fn next_agent_number(s: &ServerState, workspace: &str) -> u32 {
             _ => None,
         })
         .collect();
+    // A dormant conversation holds its number too — the shell rule. Its snapshot is keyed by it, so
+    // a fresh conversation taking the number would overwrite the record of the closed one.
+    if let Some(w) = s.workspaces.get(workspace) {
+        for d in &w.dormant_views {
+            if let crate::state::DormantSource::Agent { number } = d.source {
+                used.insert(number);
+            }
+        }
+    }
     (1..).find(|n| !used.contains(n)).unwrap_or(1)
 }
 
@@ -443,6 +452,41 @@ async fn record_history(state: &SharedState, client_id: ClientId, text: &str) {
             s.history_dirty = true;
         }
     }
+}
+
+// ---- agent/delete ------------------------------------------------------------------------------
+
+/// Delete a conversation, live or dormant: [`close_view`] with the conversation discarded rather
+/// than kept. Anything that is not a conversation is refused before anything closes.
+pub async fn agent_delete(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::view::ViewCloseParams,
+) -> Result<aether_protocol::view::ViewCloseResult, RpcError> {
+    {
+        let s = state.lock().await;
+        let is_conversation = match s.try_presenting_buffer(params.view_id) {
+            Some(buffer) => s
+                .try_doc_of(buffer)
+                .is_some_and(|d| d.conversation().is_some()),
+            None => s.active_workspace(ctx.client_id).is_some_and(|w| {
+                w.dormant_views.iter().any(|d| {
+                    d.view == params.view_id
+                        && matches!(d.source, crate::state::DormantSource::Agent { .. })
+                })
+            }),
+        };
+        if !is_conversation {
+            return Err(RpcError::not_a_conversation(params.view_id));
+        }
+    }
+    crate::handlers::buffer::close_view(
+        state,
+        ctx,
+        params,
+        crate::handlers::buffer::ConversationClose::Discard,
+    )
+    .await
 }
 
 // ---- agent/cancel ------------------------------------------------------------------------------

@@ -15489,9 +15489,10 @@ fn closing_a_busy_agent_confirms() {
     assert!(find_request(&fx, "view/close").is_some());
 }
 
-/// `Ctrl-d` in the shells and agents pickers goes through the same gate, reading the row's own
-/// badge instead of the focused view's state — the picker can close something you are not looking
-/// at, so the current view says nothing about it.
+/// `Ctrl-d` in the shells picker goes through the same gate, reading the row's own badge instead
+/// of the focused view's state — the picker can close something you are not looking at, so the
+/// current view says nothing about it. In the agents picker it deletes, asking whenever the row
+/// says there is something to lose.
 #[test]
 fn picker_ctrl_d_confirms_a_running_row_and_closes_an_idle_one() {
     use aether_client::session::{ConfirmKind, Prompt};
@@ -15547,43 +15548,61 @@ fn picker_ctrl_d_confirms_a_running_row_and_closes_an_idle_one() {
         json!(32)
     );
 
-    // An agent blocked on a permission request is *not* idle: the turn is stopped, not over.
-    let agent_row = |view_id: u64, title: &str, state: AgentRowState| PickerItem::Agent {
-        view_id: ViewId(view_id),
-        title: title.into(),
-        cwd: String::new(),
-        cwd_root: Some(0),
-        state,
-        dormant: false,
-        match_indices: vec![],
-    };
+    // A conversation **deletes** rather than closes — closing its view is what keeps it — and asks
+    // first whenever there is something to lose, busy or not: one question, the delete's.
+    let agent_row =
+        |view_id: u64, title: &str, state: AgentRowState, empty: bool| PickerItem::Agent {
+            view_id: ViewId(view_id),
+            title: title.into(),
+            cwd: String::new(),
+            cwd_root: Some(0),
+            state,
+            dormant: false,
+            empty,
+            match_indices: vec![],
+        };
     let mut s = session();
     let _ = s.open_picker(PickerKind::Agents, None, None, false, None);
     {
         let p = s.picker.as_mut().unwrap();
         p.items = vec![
-            agent_row(41, "Agent 1", AgentRowState::AwaitingPermission),
-            agent_row(42, "Agent 2", AgentRowState::Idle),
+            agent_row(41, "Agent 1", AgentRowState::AwaitingPermission, false),
+            agent_row(42, "Agent 2", AgentRowState::Idle, false),
+            agent_row(43, "Agent 3", AgentRowState::Idle, true),
         ];
         p.offset = 0;
-        p.total_matches = 2;
+        p.total_matches = 3;
         p.selected = 0;
     }
-    let _ = ctrl(&mut s, 'd');
-    match &s.prompt {
-        Some(Prompt::Confirm {
-            kind: ConfirmKind::CloseBusyAgent { title },
-            ..
-        }) => assert_eq!(title, "Agent 1"),
-        other => panic!("expected a busy-agent confirm, got {other:?}"),
+    for (row, title) in [(0, "Agent 1"), (1, "Agent 2")] {
+        s.picker.as_mut().unwrap().selected = row;
+        let fx = ctrl(&mut s, 'd');
+        assert!(all_requests(&fx).is_empty(), "{title} asks first");
+        match &s.prompt {
+            Some(Prompt::Confirm {
+                kind: ConfirmKind::DeleteConversation { title: asked },
+                ..
+            }) => assert_eq!(asked, title),
+            other => panic!("expected a delete confirm for {title}, got {other:?}"),
+        }
+        let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
+        assert!(
+            find_request(&fx, "view/close").is_none(),
+            "a delete, not a close"
+        );
+        assert_eq!(
+            find_request(&fx, "agent/delete").expect("the confirm deletes it")["view_id"],
+            json!(41 + row as u64)
+        );
     }
-    s.prompt = None;
-    s.picker.as_mut().unwrap().selected = 1;
+
+    // Nothing said and nothing typed: nothing to lose, so no question.
+    s.picker.as_mut().unwrap().selected = 2;
     let fx = ctrl(&mut s, 'd');
-    assert!(s.prompt.is_none(), "an idle conversation closes at once");
+    assert!(s.prompt.is_none(), "an empty conversation deletes at once");
     assert_eq!(
-        find_request(&fx, "view/close").expect("closes")["view_id"],
-        json!(42)
+        find_request(&fx, "agent/delete").expect("deletes")["view_id"],
+        json!(43)
     );
 }
 
