@@ -146,7 +146,8 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow
 }
 
 /// How long [`drain_terminal_input`] waits for the terminal to answer its fence. Every terminal
-/// answers a device-attributes query at once; this only bounds exit on one that never does.
+/// answers a device-attributes query at once; this only bounds exit on one that never does, or on
+/// a reply something else read first.
 const DRAIN_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Discard every byte the terminal sent us that we never read. Call it with raw mode still on, and
@@ -160,13 +161,18 @@ const DRAIN_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_milli
 /// answers in order, so once the reply is in, everything it sent before the disable is too. Safe:
 /// a raw-mode full-screen app accumulates no shell-bound type-ahead, so there's nothing
 /// legitimate to preserve.
+///
+/// The tty is read non-blocking and the deadline checked between reads, never left to `poll`:
+/// macOS's `poll` doesn't support devices, answering `POLLNVAL` at once, so a blocking read
+/// behind it waited forever for a reply that wasn't coming and the client hung on exit.
 fn drain_terminal_input() {
     use std::io::{Read, Write};
-    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
 
     let tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NONBLOCK)
         .open("/dev/tty");
     if let Ok(mut tty) = tty {
         if tty.write_all(b"\x1b[c").and_then(|()| tty.flush()).is_ok() {
@@ -174,23 +180,22 @@ fn drain_terminal_input() {
             let mut seen = Vec::new();
             let mut buf = [0u8; 512];
             loop {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                let mut fd = libc::pollfd {
-                    fd: tty.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: one valid, initialised pollfd, and its count.
-                let ready = unsafe { libc::poll(&mut fd, 1, left.as_millis() as libc::c_int) };
-                if ready <= 0 {
-                    break;
-                }
                 match tty.read(&mut buf) {
-                    Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
-                    _ => break,
-                }
-                if ends_with_device_attributes(&seen) {
-                    break;
+                    Ok(0) => break,
+                    Ok(n) => {
+                        seen.extend_from_slice(&buf[..n]);
+                        if ends_with_device_attributes(&seen) {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(_) => break,
                 }
             }
         }

@@ -302,8 +302,8 @@ pub async fn run(
     version: String,
     server_url: String,
 ) -> Result<()> {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<std::io::Result<Event>>();
-    tokio::spawn(async move {
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<std::io::Result<Event>>();
+    let reader = tokio::spawn(async move {
         let mut events = EventStream::new();
         while let Some(ev) = events.next().await {
             if event_tx.send(ev).is_err() {
@@ -311,7 +311,30 @@ pub async fn run(
             }
         }
     });
+    let result = run_events(
+        terminal, event_rx, workspace, file, jump, tether, version, server_url,
+    )
+    .await;
+    // Stop reading the terminal before the caller restores it. Left running, the reader would sit
+    // on the tty until the next event and swallow the reply `restore_terminal` waits for. Awaiting
+    // the cancelled task is what makes it drop the `EventStream`, which wakes crossterm's polling
+    // thread to exit.
+    reader.abort();
+    let _ = reader.await;
+    result
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn run_events(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    mut event_rx: mpsc::UnboundedReceiver<std::io::Result<Event>>,
+    workspace: Option<String>,
+    file: Option<String>,
+    jump: Option<(u32, u32)>,
+    tether: bool,
+    version: String,
+    server_url: String,
+) -> Result<()> {
     let term = crossterm::terminal::size()?;
     // Launch connectionless: a placeholder session flagged `Connecting` and dummy transport that's
     // never exercised (the core drops RPCs while not `Connected`). The editor chrome renders from
