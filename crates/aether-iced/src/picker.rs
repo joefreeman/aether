@@ -1171,24 +1171,23 @@ fn glyph_cell<'a>(
 /// The three parts are the row's composed haystack in order (see
 /// `aether_client::picker::row_match_segments`), so the fuzzy highlight lands in whichever of them
 /// the query hit. An empty part is skipped — it contributes no separator to the haystack either.
-fn composed_row<'a>(
-    parts: [&'a str; 3],
-    match_indices: &'a [u32],
+fn composed_row<'a, S: AsRef<str>>(
+    parts: [S; 3],
+    seg: aether_client::picker::RowSegments,
     badge: Option<(String, aether_client::labels::RowBadgeTone)>,
     hovered: bool,
     ui: theme::Ui,
     p: &'static theme::Palette,
 ) -> Element<'a, PickerMsg> {
-    let seg = aether_client::picker::row_match_segments(parts, match_indices);
     let colours = [p.fg, p.fg_dim, p.fg_dim];
     let indices = [seg.first, seg.second, seg.third];
     let mut r = row![].spacing(8).align_y(iced::Alignment::Center);
     for ((part, colour), idx) in parts.iter().zip(colours).zip(indices) {
-        if part.is_empty() {
+        if part.as_ref().is_empty() {
             continue;
         }
         r = r.push(highlighted_owned(
-            (*part).to_string(),
+            part.as_ref().to_string(),
             idx,
             colour,
             SANS,
@@ -1465,27 +1464,40 @@ fn render_item<'a>(
         PickerItem::Shell {
             title,
             cwd,
+            cwd_root,
             last_command,
             running,
             exit,
             elapsed_ms,
             match_indices,
             ..
-        } => composed_row(
-            [title, cwd, last_command.as_deref().unwrap_or("")],
-            match_indices,
-            aether_client::labels::shell_row_badge(*running, *exit, *elapsed_ms),
-            hovered,
-            ui,
-            p,
-        ),
+        } => {
+            let (parts, seg) = aether_client::picker::dir_row_parts(
+                &aether_client::labels::root_labels(roots),
+                [title, cwd, last_command.as_deref().unwrap_or("")],
+                *cwd_root,
+                match_indices,
+            );
+            composed_row(
+                parts,
+                seg,
+                aether_client::labels::shell_row_badge(*running, *exit, *elapsed_ms),
+                hovered,
+                ui,
+                p,
+            )
+        }
         // `Shell 2   cargo test` — what the work belongs to, then what it is doing.
         PickerItem::Activity {
             owner,
             label,
             match_indices,
             ..
-        } => composed_row([owner, label, ""], match_indices, None, hovered, ui, p),
+        } => {
+            let parts = [owner.as_str(), label.as_str(), ""];
+            let seg = aether_client::picker::row_match_segments(parts, match_indices);
+            composed_row(parts, seg, None, hovered, ui, p)
+        }
         // `test   web/justfile   Run the tests` — the shell row's shape, with no badge.
         PickerItem::Task {
             name,
@@ -1493,30 +1505,35 @@ fn render_item<'a>(
             description,
             match_indices,
             ..
-        } => composed_row(
-            [name, display_path, description],
-            match_indices,
-            None,
-            hovered,
-            ui,
-            p,
-        ),
+        } => {
+            let parts = [name.as_str(), display_path.as_str(), description.as_str()];
+            let seg = aether_client::picker::row_match_segments(parts, match_indices);
+            composed_row(parts, seg, None, hovered, ui, p)
+        }
         PickerItem::Agent {
             title,
-            agent,
+            cwd,
+            cwd_root,
             state,
-            last_prompt,
             dormant,
             match_indices,
             ..
-        } => composed_row(
-            [title, agent, last_prompt.as_deref().unwrap_or("")],
-            match_indices,
-            aether_client::labels::agent_row_badge(state, *dormant),
-            hovered,
-            ui,
-            p,
-        ),
+        } => {
+            let (parts, seg) = aether_client::picker::dir_row_parts(
+                &aether_client::labels::root_labels(roots),
+                [title, cwd, ""],
+                *cwd_root,
+                match_indices,
+            );
+            composed_row(
+                parts,
+                seg,
+                aether_client::labels::agent_row_badge(state, *dormant),
+                hovered,
+                ui,
+                p,
+            )
+        }
         PickerItem::GrepHit {
             line,
             preview,

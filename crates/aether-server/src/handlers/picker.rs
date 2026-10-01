@@ -167,6 +167,14 @@ fn build_buffer_candidates(
     out
 }
 
+/// The roots of `client_id`'s active workspace — what a shell or agent row's directory is
+/// addressed against.
+fn workspace_roots(s: &ServerState, client_id: ClientId) -> Vec<std::path::PathBuf> {
+    s.active_workspace(client_id)
+        .map(|w| w.paths.clone())
+        .unwrap_or_default()
+}
+
 /// Build the shells-picker candidate list: one row per shell view, live or dormant.
 ///
 /// Row data comes off the [`crate::shell::Transcript`] — its title, where the next command would
@@ -176,6 +184,7 @@ fn build_shell_candidates(
     client_id: ClientId,
 ) -> Vec<picker_state::ShellCandidate> {
     let (views, dormant) = picker_rows(s, client_id, RowKind::Shell);
+    let roots = workspace_roots(s, client_id);
     let mut out = Vec::with_capacity(views.len() + dormant.len());
     for view_id in views {
         let Some(t) = s
@@ -188,16 +197,16 @@ fn build_shell_candidates(
         // The last *finished* run: while one is in flight, the badge says so and these two still
         // describe the run before it, which is what you were looking for when you opened the list.
         let finished = t.runs.iter().rev().find(|r| !r.is_running());
-        // Shortened `$HOME` → `~`, the shell view's own [`crate::shell::display_path`]: the row and
-        // the run box must not disagree about how a directory is written, and the haystack has to
-        // hold the string the row shows or the fuzzy highlight would land off the text.
-        let cwd = crate::shell::display_path(&t.cwd);
+        // Root-relative, the root's label left to the client — the Files and Buffers rows' shape.
+        // The haystack holds the part the server sends, so the label is not matched, as there.
+        let (cwd_root, cwd) = crate::shell::dir_location(&t.cwd, &roots);
         let last_command = t.runs.last().map(|r| r.command.clone());
         out.push(picker_state::ShellCandidate {
             view_id,
             haystack: shell_haystack(&t.title, &cwd, last_command.as_deref()),
             title: t.title.clone(),
             cwd,
+            cwd_root,
             last_command,
             running: t.active().is_some(),
             exit: finished.and_then(|r| match r.status {
@@ -216,17 +225,17 @@ fn build_shell_candidates(
         // unopened shell reads like the one it was: where it is, what it last ran, how that went.
         // Nothing is running in it, whatever the snapshot caught mid-run.
         let title = format!("Shell {number}");
-        let summary = d.shell.clone().unwrap_or_default();
-        let cwd = if summary.cwd.as_os_str().is_empty() {
-            String::new()
-        } else {
-            crate::shell::display_path(&summary.cwd)
+        let summary = match &d.summary {
+            Some(crate::state::DormantSummary::Shell(summary)) => summary.clone(),
+            _ => Default::default(),
         };
+        let (cwd_root, cwd) = crate::shell::dir_location(&summary.cwd, &roots);
         out.push(picker_state::ShellCandidate {
             view_id: d.view,
             haystack: shell_haystack(&title, &cwd, summary.last_command.as_deref()),
             title,
             cwd,
+            cwd_root,
             last_command: summary.last_command,
             running: false,
             exit: summary.exit,
@@ -239,13 +248,14 @@ fn build_shell_candidates(
 
 /// Build the agents-picker candidate list: one row per conversation, live or dormant.
 ///
-/// Row data comes off the [`crate::agent::Conversation`] — which agent is behind it, whether a turn
-/// is in flight, whether it is blocked on a permission request, and the last thing the user said.
+/// Row data comes off the [`crate::agent::Conversation`] — where its agent runs, and whether a turn
+/// is in flight or blocked on a permission request.
 fn build_agent_candidates(
     s: &ServerState,
     client_id: ClientId,
 ) -> Vec<picker_state::AgentCandidate> {
     let (views, dormant) = picker_rows(s, client_id, RowKind::Agent);
+    let roots = workspace_roots(s, client_id);
     let mut out = Vec::with_capacity(views.len() + dormant.len());
     for view_id in views {
         let Some(c) = s
@@ -259,31 +269,22 @@ fn build_agent_candidates(
         // "thinking" about one would hide the only row that needs the user.
         let state = if c.pending_permission().is_some() {
             AgentRowState::AwaitingPermission
-        } else if let Some(turn) = &c.turn {
-            AgentRowState::Thinking {
-                activity: turn.activity.clone(),
-            }
+        } else if c.turn.is_some() {
+            AgentRowState::Thinking
         } else if c.handle.is_none() {
             AgentRowState::Disconnected
         } else {
             AgentRowState::Idle
         };
-        let last_prompt = c
-            .blocks
-            .iter()
-            .rev()
-            .find(|b| matches!(b.kind, crate::agent::BlockKind::UserMessage))
-            .and_then(|b| s.try_doc_of(b.buffer))
-            .map(|d| d.text.to_string())
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
+        // Addressed as the status bar's is (`describe_buffer`), so the row and the bar agree.
+        let (cwd_root, cwd) = crate::shell::dir_location(&c.cwd, &roots);
         out.push(picker_state::AgentCandidate {
             view_id,
-            haystack: agent_haystack(&c.title, c.agent.name, last_prompt.as_deref()),
+            haystack: agent_haystack(&c.title, &cwd),
             title: c.title.clone(),
-            agent: c.agent.name.to_string(),
+            cwd,
+            cwd_root,
             state,
-            last_prompt,
             dormant: false,
         });
     }
@@ -291,16 +292,22 @@ fn build_agent_candidates(
         let crate::state::DormantSource::Agent { number } = &d.source else {
             continue;
         };
-        // As with a dormant shell: the snapshot holds the agent's name and its blocks, and reading
-        // one per row is a disk hit the list does not need. There is certainly no subprocess.
+        // What the snapshot said, read when the row was restored — as for a dormant shell. There
+        // is certainly no subprocess.
         let title = format!("Agent {number}");
+        let (cwd_root, cwd) = match &d.summary {
+            Some(crate::state::DormantSummary::Agent(summary)) => {
+                crate::shell::dir_location(&summary.cwd, &roots)
+            }
+            _ => (None, String::new()),
+        };
         out.push(picker_state::AgentCandidate {
             view_id: d.view,
-            haystack: agent_haystack(&title, "", None),
+            haystack: agent_haystack(&title, &cwd),
             title,
-            agent: String::new(),
+            cwd,
+            cwd_root,
             state: AgentRowState::Disconnected,
-            last_prompt: None,
             dormant: true,
         });
     }
@@ -324,10 +331,10 @@ fn buffer_haystack(display: &str, commit: Option<&str>) -> String {
     join_haystack([display, commit.unwrap_or(""), ""])
 }
 
-/// The agents picker's fuzzy haystack: `"{title}  {agent}  {last_prompt}"`, empty parts elided.
-/// A wire contract for the reason [`shell_haystack`] is.
-fn agent_haystack(title: &str, agent: &str, last_prompt: Option<&str>) -> String {
-    join_haystack([title, agent, last_prompt.unwrap_or("")])
+/// The agents picker's fuzzy haystack: `"{title}  {cwd}"`, an empty `cwd` elided. A wire contract
+/// for the reason [`shell_haystack`] is.
+fn agent_haystack(title: &str, cwd: &str) -> String {
+    join_haystack([title, cwd, ""])
 }
 
 /// The tasks picker's fuzzy haystack: `"{name}  {display_path}  {description}"`, empty parts elided.

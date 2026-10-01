@@ -21,6 +21,9 @@ import {
 import type { PickerItem } from "./protocol";
 
 const describe_ = (item: PickerItem) => describePickerItem(item, ["/w"], [""], 80);
+/** A two-root workspace, whose roots wear their labels. */
+const describeMulti = (item: PickerItem) =>
+  describePickerItem(item, ["/src/aether", "/src/docs"], ["aether", "docs"], 80);
 
 const shell = (over: Partial<Extract<PickerItem, { kind: "shell" }>> = {}) =>
   ({
@@ -36,7 +39,8 @@ const agent = (over: Partial<Extract<PickerItem, { kind: "agent" }>> = {}) =>
     kind: "agent",
     view_id: 20,
     title: "Agent 1",
-    agent: "Claude Code",
+    cwd: "",
+    cwd_root: 0,
     ...over,
   }) as PickerItem;
 
@@ -45,6 +49,17 @@ describe("shell rows", () => {
     const d = describe_(shell({ last_command: "cargo test" }));
     expect(d.primary).toBe("Shell 2");
     expect(d.suffix).toBe("~/proj  cargo test");
+  });
+
+  it("writes a directory under a root after the root's label, the highlight past it", () => {
+    // Haystack "Shell 2  crates/web  cargo test": `c` of crates at 9.
+    const d = describeMulti(
+      shell({ cwd: "crates/web", cwd_root: 0, last_command: "cargo test", match_indices: [9] }),
+    );
+    expect(d.suffix).toBe("aether: crates/web  cargo test");
+    expect(d.suffixMatches).toEqual([8]);
+    // At the root of a single-root workspace there is nothing to say.
+    expect(describe_(shell({ cwd: "", cwd_root: 0, last_command: "ls" })).suffix).toBe("ls");
   });
 
   it("floats a running badge to the right", () => {
@@ -147,10 +162,22 @@ describe("buffer rows", () => {
 });
 
 describe("agent rows", () => {
-  it("leads with the name and trails the agent and last prompt", () => {
-    const d = describe_(agent({ last_prompt: "fix the wrap bug" }));
+  it("names its root after the name, and nothing in a single-root workspace", () => {
+    expect(describeMulti(agent({ cwd_root: 1 })).suffix).toBe("docs");
+    const same = describePickerItem(
+      agent(),
+      ["/work/aether", "/personal/aether"],
+      ["aether (work)", "aether (personal)"],
+      80,
+    );
+    expect(same.suffix).toBe("aether (work)");
+    const d = describe_(agent());
     expect(d.primary).toBe("Agent 1");
-    expect(d.suffix).toBe("Claude Code  fix the wrap bug");
+    expect(d.suffix).toBeUndefined();
+  });
+
+  it("writes a directory outside every root as the server sent it", () => {
+    expect(describe_(agent({ cwd: "~/elsewhere", cwd_root: undefined })).suffix).toBe("~/elsewhere");
   });
 
   it("badges what it is doing, and stays quiet when idle", () => {
@@ -159,9 +186,6 @@ describe("agent rows", () => {
     expect(describe_(agent({ state: { state: "thinking" } })).metaParts).toEqual([
       { text: "● thinking", cls: "picker-badge-running" },
     ]);
-    expect(
-      describe_(agent({ state: { state: "thinking", activity: "Reading src/lib.rs" } })).metaParts,
-    ).toEqual([{ text: "● Reading src/lib.rs", cls: "picker-badge-running" }]);
     expect(describe_(agent({ state: { state: "awaiting_permission" } })).metaParts).toEqual([
       { text: "● awaiting permission", cls: "picker-badge-bad" },
     ]);
@@ -170,8 +194,8 @@ describe("agent rows", () => {
     ]);
   });
 
-  it("a dormant conversation shows no badge and no agent name it hasn't read", () => {
-    const d = describe_(agent({ agent: "", dormant: true, state: { state: "disconnected" } }));
+  it("a dormant conversation shows no badge", () => {
+    const d = describe_(agent({ dormant: true, state: { state: "disconnected" } }));
     expect(d.primary).toBe("Agent 1");
     expect(d.suffix).toBeUndefined();
     expect(agentRowBadge({ state: { state: "disconnected" }, dormant: true })).toBeUndefined();

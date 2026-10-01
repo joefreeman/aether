@@ -12941,7 +12941,7 @@ pub fn close_confirm_for(c: &Closing) -> Option<ConfirmKind> {
 /// counts: the turn is blocked, not over, and closing the view abandons it.
 pub fn agent_state_is_busy(state: &aether_protocol::picker::AgentRowState) -> bool {
     use aether_protocol::picker::AgentRowState as S;
-    matches!(state, S::Thinking { .. } | S::AwaitingPermission)
+    matches!(state, S::Thinking | S::AwaitingPermission)
 }
 
 #[cfg(test)]

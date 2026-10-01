@@ -1024,22 +1024,12 @@ async fn a_permission_request_repushes_the_agents_picker() {
         if update.kind != PickerKind::Agents {
             continue;
         }
-        let Some(PickerItem::Agent {
-            state, last_prompt, ..
-        }) = update.items().first().cloned()
-        else {
+        let Some(PickerItem::Agent { state, .. }) = update.items().first().cloned() else {
             continue;
         };
         match state {
-            AgentRowState::Thinking { .. } => saw_thinking = true,
-            AgentRowState::AwaitingPermission => {
-                assert_eq!(
-                    last_prompt.as_deref(),
-                    Some("go"),
-                    "the row carries the last thing said to it"
-                );
-                break;
-            }
+            AgentRowState::Thinking => saw_thinking = true,
+            AgentRowState::AwaitingPermission => break,
             other => panic!("unexpected row state {other:?}"),
         }
     }
@@ -1623,6 +1613,26 @@ async fn a_conversation_survives_a_server_restart() {
     server.state.lock().await.workspaces_dir = Some(store);
     let mut ws = Ws::connect(&server).await;
     activate_p(&mut ws).await;
+
+    // The dormant row already says where its agent ran, read from the snapshot — nothing has
+    // materialised the conversation yet.
+    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Agents)).await;
+    let rows = view.update.and_then(|u| u.items).expect("a window");
+    let Some(PickerItem::Agent {
+        cwd,
+        cwd_root,
+        dormant,
+        ..
+    }) = rows.first()
+    else {
+        panic!("an agent row: {rows:?}");
+    };
+    assert!(*dormant);
+    assert_eq!(
+        (cwd.as_str(), *cwd_root),
+        ("", Some(0)),
+        "it ran at the root"
+    );
 
     let dormant_view = {
         let s = server.state.lock().await;
@@ -2963,4 +2973,128 @@ async fn the_focus_ring_and_the_cursor_rule_agree() {
         from_ring, from_server,
         "`Tab` and `j` disagree about which elements take a cursor"
     );
+}
+
+// ---- where the agent runs ----------------------------------------------------------------------
+
+/// An agent view's description names the directory its agent runs in, beside `Agent N` — what the
+/// status bar paints muted after the name — and the agents picker row says the same. Both address
+/// it as root + path: an agent runs at a root, so the path is empty and the client shows the root's
+/// label (none at all in a single-root workspace like this one).
+#[tokio::test]
+async fn an_agent_views_name_carries_its_directory() {
+    let (_server, mut ws, _dir, _t) = setup(Script::default()).await;
+    let open = start_agent(&mut ws).await;
+    assert_eq!(open.opened.title.as_deref(), Some("Agent 1"));
+    assert_eq!(open.opened.cwd.as_deref(), Some(""));
+    assert_eq!(open.opened.cwd_root, Some(0));
+
+    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Agents)).await;
+    let rows = view.update.and_then(|u| u.items).expect("a window");
+    let PickerItem::Agent { cwd, cwd_root, .. } = &rows[0] else {
+        panic!("an agent row");
+    };
+    assert_eq!((cwd.as_str(), *cwd_root), ("", Some(0)));
+
+    // Reopening it by its view — the picker's path — says the same.
+    let again: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            view_id: Some(open.opened.view_id),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(again.cwd.as_deref(), Some(""));
+    assert_eq!(again.cwd_root, Some(0));
+}
+
+/// A conversation whose directory is outside every root — restored after its root was removed —
+/// carries the whole path, `~`-shortened, and no root.
+#[tokio::test]
+async fn an_agent_outside_every_root_carries_its_whole_path() {
+    let (server, mut ws, _dir, _t) = setup(Script::default()).await;
+    let open = start_agent(&mut ws).await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere = elsewhere.path().canonicalize().unwrap();
+    {
+        let mut s = server.state.lock().await;
+        let view_buffer = s.try_presenting_buffer(open.opened.view_id).unwrap();
+        s.try_doc_of_mut(view_buffer)
+            .and_then(|d| d.generated.as_mut()?.conversation_mut())
+            .unwrap()
+            .cwd = elsewhere.clone();
+    }
+    let view = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Agents)).await;
+    let rows = view.update.and_then(|u| u.items).expect("a window");
+    let PickerItem::Agent { cwd, cwd_root, .. } = &rows[0] else {
+        panic!("an agent row");
+    };
+    assert_eq!(*cwd_root, None);
+    let file_name = elsewhere
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(cwd.ends_with(&file_name), "{cwd:?}");
+}
+
+/// **Git commands in an agent view act on the repository its agent runs in.** None of the view's
+/// documents has a path, so before this every git verb refused with "open a file"; the directory
+/// is on screen beside the view's name, so it is the answer in view.
+#[tokio::test]
+async fn git_commands_in_an_agent_view_act_on_its_directorys_repo() {
+    let (server, mut ws, dir, _t) = setup(Script::default()).await;
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.txt", "hello\n");
+    std::fs::write(root.join("a.txt"), "hello\nchanged\n").unwrap();
+
+    let open = start_agent(&mut ws).await;
+    let input = input_buffer_of(&server, &open).await;
+
+    // From the input — where the cursor lands — and from the view's own document alike.
+    for buffer_id in [input, open.opened.buffer_id] {
+        let shown = show_buffer(
+            &mut ws,
+            &GitShowParams {
+                repo_id: None,
+                buffer_id: Some(buffer_id),
+                target: ShowTarget::WorkingChanges,
+                focus_path: None,
+                record_nav_from: None,
+            },
+        )
+        .await;
+        assert!(
+            shown
+                .title
+                .as_deref()
+                .is_some_and(|t| t.contains("Working changes")),
+            "the working changes of the agent's repo: {:?}",
+            shown.title
+        );
+    }
+}
+
+/// An agent running outside any repository refuses git commands the way a file outside one does
+/// — not with "open a file", which would point at a remedy that is not the problem.
+#[tokio::test]
+async fn git_commands_in_an_agent_view_outside_a_repo_say_so() {
+    let (server, mut ws, _dir, _t) = setup(Script::default()).await;
+    let open = start_agent(&mut ws).await;
+    let input = input_buffer_of(&server, &open).await;
+    let err = send_request_result::<aether_protocol::git::GitShow>(
+        &mut ws,
+        &GitShowParams {
+            repo_id: None,
+            buffer_id: Some(input),
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await
+    .expect_err("no repo to show");
+    assert_eq!(err["message"], "Not in a git repository", "{err}");
 }

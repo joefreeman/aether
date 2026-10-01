@@ -4997,11 +4997,12 @@ impl App {
                 },
             );
         left = left.push(name);
-        // The revision a file shown at a commit is *as of*, muted after the name — the same pairing
-        // the buffers picker paints, and upright even on a slanted transient label.
-        if let Some(commit) = self.session.view.view_label.commit_suffix() {
-            used += commit.chars().count();
-            left = left.push(t(commit, p.fg_muted));
+        // What is noted beside the name, muted after it — the revision a file shown at a commit is
+        // *as of*, or the directory an agent runs in. The same pairing the pickers paint, and
+        // upright even on a slanted transient label.
+        if let Some(note) = self.session.view.view_label.suffix() {
+            used += note.chars().count();
+            left = left.push(t(note, p.fg_muted));
         }
         // The tether mark: a dim ` *` after the file label — closing this buffer exits the window.
         // Upright even on a slanted transient label, like the terminal client.

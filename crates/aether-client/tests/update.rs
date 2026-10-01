@@ -427,6 +427,8 @@ fn a_gone_jumplist_entry_toasts_instead_of_opening_the_file() {
                     lsp_server: None,
                     title: Some("Working changes".into()),
                     commit: None,
+                    cwd: None,
+                    cwd_root: None,
                     read_only: true,
                     is_patch: true,
                 },
@@ -3614,14 +3616,14 @@ fn a_file_at_a_revision_labels_by_path_with_the_commit_beside_it() {
         &roots,
     );
     assert_eq!(info.label.name, "src/main.rs");
-    assert_eq!(info.label.commit.as_deref(), Some("abc1234"));
+    assert_eq!(info.label.commit(), Some("abc1234"));
     assert_eq!(
         info.label.joined(),
         "src/main.rs (abc1234)",
         "one string where there is no second shade to paint in — brackets included, since there \
          is no colour there to say the revision annotates the name"
     );
-    assert_eq!(info.label.commit_suffix().as_deref(), Some(" (abc1234)"));
+    assert_eq!(info.label.suffix().as_deref(), Some(" (abc1234)"));
 
     let mut s = session();
     s.view.buffer = info;
@@ -3631,8 +3633,51 @@ fn a_file_at_a_revision_labels_by_path_with_the_commit_beside_it() {
     // A save-as relabels: the new name arrives on its own, and the revision goes with the old one.
     s.view
         .relabel_focused(aether_client::labels::Label::from("src/renamed.rs"));
-    assert_eq!(s.view.buffer.label.commit, None);
+    assert_eq!(s.view.buffer.label.commit(), None);
     assert_eq!(s.view.view_label.joined(), "src/renamed.rs");
+}
+
+/// An **agent view** is labelled `Agent N` with the directory its agent runs in beside it, written
+/// as a file's location is: the root's label in a multi-root workspace, and nothing at all at the
+/// root of a single-root one — where the label is empty.
+#[test]
+fn an_agent_view_labels_by_name_with_its_root_beside_it() {
+    use aether_client::session::buffer_info;
+    use aether_protocol::view::BufferDescription;
+
+    let agent = |cwd: &str, cwd_root: Option<u32>| {
+        serde_json::from_value::<BufferDescription>(json!({
+            "buffer_id": 7,
+            "line_count": 1,
+            "byte_count": 0,
+            "revision": 0,
+            "saved_revision": 0,
+            "path": null,
+            "title": "Agent 1",
+            "cwd": cwd,
+            "cwd_root": cwd_root,
+            "read_only": true,
+        }))
+        .unwrap()
+    };
+    let multi = vec!["/src/aether".to_string(), "/src/docs".to_string()];
+    let info = buffer_info(agent("", Some(1)), &multi);
+    assert_eq!(info.label.name, "Agent 1");
+    assert_eq!(info.label.cwd(), Some("docs"));
+    assert_eq!(info.label.suffix().as_deref(), Some(" docs"));
+    assert_eq!(info.label.joined(), "Agent 1 · docs");
+
+    let info = buffer_info(agent("crates/web", Some(0)), &multi);
+    assert_eq!(info.label.cwd(), Some("aether: crates/web"));
+
+    let single = vec!["/src/aether".to_string()];
+    let info = buffer_info(agent("", Some(0)), &single);
+    assert_eq!(info.label.note, None, "nothing beside the name");
+    assert_eq!(info.label.joined(), "Agent 1");
+
+    // Outside every root: the path as the server wrote it.
+    let info = buffer_info(agent("~/elsewhere", None), &single);
+    assert_eq!(info.label.cwd(), Some("~/elsewhere"));
 }
 
 /// A virtual buffer (a revision materialised by `git/show`) labels itself with the server's title
@@ -3663,7 +3708,8 @@ fn a_read_only_buffer_labels_by_title_and_declines_edits_locally() {
     );
     assert_eq!(info.label.name, "abc1234 — Add commit grammar");
     assert_eq!(
-        info.label.commit, None,
+        info.label.commit(),
+        None,
         "a commit's patch is named by the commit"
     );
     assert!(info.read_only);
@@ -4759,6 +4805,8 @@ fn jumplist_step_adopts_the_opened_entry() {
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -6639,6 +6687,8 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -8928,6 +8978,8 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
                 lsp_server: None,
                 title: None,
                 commit: None,
+                cwd: None,
+                cwd_root: None,
                 read_only: false,
                 is_patch: false,
             },
@@ -10035,6 +10087,8 @@ fn space_x_lands_on_the_successor_the_close_hands_back() {
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -10489,6 +10543,8 @@ fn open_path_prompt_submits_via_open_path_rpc() {
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -10831,6 +10887,8 @@ fn hint_session() -> Session {
                 lsp_server: None,
                 title: None,
                 commit: None,
+                cwd: None,
+                cwd_root: None,
                 read_only: false,
                 is_patch: false,
             },
@@ -13094,6 +13152,8 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -14120,6 +14180,8 @@ fn focus_on(
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -15439,6 +15501,7 @@ fn picker_ctrl_d_confirms_a_running_row_and_closes_an_idle_one() {
         view_id: ViewId(view_id),
         title: title.into(),
         cwd: "~/proj".into(),
+        cwd_root: None,
         last_command: Some("cargo test".into()),
         running,
         exit: None,
@@ -15488,9 +15551,9 @@ fn picker_ctrl_d_confirms_a_running_row_and_closes_an_idle_one() {
     let agent_row = |view_id: u64, title: &str, state: AgentRowState| PickerItem::Agent {
         view_id: ViewId(view_id),
         title: title.into(),
-        agent: "Claude Code".into(),
+        cwd: String::new(),
+        cwd_root: Some(0),
         state,
-        last_prompt: None,
         dormant: false,
         match_indices: vec![],
     };
@@ -15856,6 +15919,8 @@ fn a_buffer_switch_drops_a_half_recorded_session() {
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },

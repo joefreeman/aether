@@ -1364,6 +1364,8 @@ async fn open_restored_scratch(
             lsp_server: None, // scratch buffers are never language-server-backed
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -1416,6 +1418,7 @@ pub fn describe_buffer(
         .get(&buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let doc = s.doc_of(buffer_id);
+    let conversation_dir = s.conversation_dir(buffer_id);
     Ok(aether_protocol::view::BufferDescription {
         buffer_id,
         language: doc.language.clone(),
@@ -1429,6 +1432,8 @@ pub fn describe_buffer(
         lsp_server: buffer_lsp_server_ref(s, buffer_id),
         title: doc.virtual_source.as_ref().map(|v| v.title.clone()),
         commit: doc.virtual_source.as_ref().and_then(|v| v.commit.clone()),
+        cwd: conversation_dir.as_ref().map(|(_, cwd)| cwd.clone()),
+        cwd_root: conversation_dir.and_then(|(root, _)| root),
         read_only: doc.read_only(),
         is_patch: doc.patch().is_some(),
     })
@@ -2206,6 +2211,8 @@ async fn open_generated_buffer(
             lsp_server: None, // no file on disk for a server to have an opinion about
             title: Some(content.title),
             commit: content.commit,
+            cwd: None,
+            cwd_root: None,
             read_only: true,
             // A commit's diff, not a file at a revision — both are read-only, only the first has a
             // patch index for `Enter` to follow through.
@@ -2453,6 +2460,7 @@ async fn view_open_inner(
         // view picker, which opens by id because there's no path to dispatch on.
         let virtual_title = doc.virtual_source.as_ref().map(|v| v.title.clone());
         let virtual_commit = doc.virtual_source.as_ref().and_then(|v| v.commit.clone());
+        let conversation_dir = s.conversation_dir(buffer_id);
         let read_only = doc.read_only();
         let is_patch = doc.patch().is_some();
         let clamped_jump = params.jump_to.map(|jt| motion::clamp_position(doc, jt));
@@ -2482,6 +2490,8 @@ async fn view_open_inner(
                 lsp_server: buffer_lsp_server_ref(&s, buffer_id),
                 title: virtual_title,
                 commit: virtual_commit,
+                cwd: conversation_dir.as_ref().map(|(_, cwd)| cwd.clone()),
+                cwd_root: conversation_dir.and_then(|(root, _)| root),
                 read_only,
                 is_patch,
             },
@@ -2552,6 +2562,8 @@ async fn view_open_inner(
                         lsp_server: None, // scratch buffers are never language-server-backed
                         title: None,
                         commit: None,
+                        cwd: None,
+                        cwd_root: None,
                         read_only: false,
                         is_patch: false,
                     },
@@ -2675,6 +2687,8 @@ async fn view_open_inner(
                     lsp_server: buffer_lsp_server_ref(&s, existing),
                     title: None,
                     commit: None,
+                    cwd: None,
+                    cwd_root: None,
                     read_only: false,
                     is_patch: false,
                 },
@@ -2866,6 +2880,8 @@ async fn view_open_inner(
             lsp_server: buffer_lsp_server_ref(&s, id),
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -3263,7 +3279,7 @@ mod next_buffer_tests {
                 read: false,
                 transient: false,
                 source: crate::state::DormantSource::File(std::path::PathBuf::from("/p/a.rs")),
-                shell: None,
+                summary: None,
             },
             crate::state::DormantView {
                 id: d2,
@@ -3271,7 +3287,7 @@ mod next_buffer_tests {
                 read: false,
                 transient: false,
                 source: crate::state::DormantSource::File(std::path::PathBuf::from("/p/b.rs")),
-                shell: None,
+                summary: None,
             },
         ];
         assert_eq!(next_view_for_client(&st, client_id), Some(ViewId(d1)));

@@ -44,7 +44,8 @@ pub struct Conversation {
     /// never session-recorded, never dirty. Dropped with the view.
     pub input: BufferId,
     /// Where the agent was started — the root of the project holding the buffer that was focused
-    /// when the view opened, else the workspace's first root. Shown on the input's box.
+    /// when the view opened, else the workspace's first root. Shown muted after the view's name
+    /// (status bar, agents picker), and the repository the view's git commands act on.
     pub cwd: PathBuf,
     /// Which row of [`KNOWN_AGENTS`] is behind this conversation.
     pub agent: &'static AgentSpec,
@@ -620,6 +621,30 @@ pub struct AgentSnapshot {
     #[serde(default)]
     pub input: String,
     pub blocks: Vec<BlockSnapshot>,
+}
+
+/// What the agents picker says about a conversation nobody has opened since the restart: where its
+/// agent ran — the live row's field, read out of the snapshot.
+///
+/// Read once, when the workspace restores its dormant rows, and kept on the row, for the reason
+/// [`crate::shell::SnapshotSummary`] is: a conversation's snapshot holds every block's text, and
+/// reading one per row on every picker refresh would be a disk read under the state lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotSummary {
+    pub cwd: PathBuf,
+}
+
+impl SnapshotSummary {
+    /// Summarise the snapshot at `path`, or `None` when it is missing or unreadable. The blocks are
+    /// skipped rather than kept: nothing here needs them.
+    pub fn read(path: &std::path::Path) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        struct Head {
+            cwd: PathBuf,
+        }
+        let head: Head = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+        Some(SnapshotSummary { cwd: head.cwd })
+    }
 }
 
 /// One block written down: what it was, what its box said, and its text.

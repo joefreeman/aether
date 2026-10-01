@@ -124,24 +124,64 @@ pub fn root_relative_display(roots: &[String], path_index: u32, relative_path: &
     }
 }
 
-/// What a buffer or a view is **called**: its name, and the revision its content is a snapshot of.
+/// A **directory** as a shell or agent row and an agent view's status bar show it: the
+/// [`root_relative_display`] form — `aether: crates/web`, the label alone at the root itself
+/// (`aether-docs`), and nothing at all at the root of a single-root workspace, whose label is empty
+/// — or, for `root: None` (outside every root), `path` as the server wrote it.
+///
+/// `labels` is [`root_labels`] over the workspace's roots. `matches` index `path`, which is what the
+/// row's haystack holds; they come back rebased onto the result, past the label, which is chrome
+/// and never matched — as in the Files and Buffers rows.
+pub fn dir_display(
+    labels: &[String],
+    root: Option<u32>,
+    path: &str,
+    matches: &[u32],
+) -> (String, Vec<u32>) {
+    let label = root
+        .and_then(|i| labels.get(i as usize))
+        .filter(|l| !l.is_empty());
+    match label {
+        Some(label) if path.is_empty() => (label.clone(), Vec::new()),
+        Some(label) => {
+            let lead = label.chars().count() as u32 + 2;
+            (
+                format!("{label}: {path}"),
+                matches.iter().map(|i| i + lead).collect(),
+            )
+        }
+        None => (path.to_string(), matches.to_vec()),
+    }
+}
+
+/// What a buffer or a view is **called**: its name, and the muted note beside it — the revision its
+/// content is a snapshot of, or the directory its agent runs in.
 ///
 /// Two fields rather than one string, because the two are painted differently everywhere a buffer
-/// is named — the name in the body colour, the commit muted and bracketed after it
-/// (`src/main.rs (abc1234)`), in the status bar as in the buffers picker. A single
-/// `abc1234:src/main.rs` made the revision the *first* thing read on a row whose subject is the
-/// file, and left no shell able to shade it.
+/// is named — the name in the body colour, the note muted after it (`src/main.rs (abc1234)`,
+/// `Agent 1 ~/src/aether`), in the status bar as in the pickers. A single `abc1234:src/main.rs`
+/// made the revision the *first* thing read on a row whose subject is the file, and left no shell
+/// able to shade it.
 ///
-/// Paired in one type rather than carried as two fields side by side so they cannot drift: a
-/// save-as replaces the label wholesale ([`Label::from`]), which drops a stale hash by
-/// construction, and no shell can paint a commit next to a name it no longer belongs to.
-///
-/// `commit` is `Some` only for a **file at a revision** (`git/show <rev>:<path>`). A commit's own
-/// patch is named by the commit already; every other buffer has no revision to speak of.
+/// Paired in one type rather than carried as fields side by side so they cannot drift: a save-as
+/// replaces the label wholesale ([`Label::from`]), which drops a stale hash by construction, and no
+/// shell can paint a note next to a name it no longer belongs to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Label {
     pub name: String,
-    pub commit: Option<String>,
+    pub note: Option<LabelNote>,
+}
+
+/// The muted half of a [`Label`]. One or the other, never both: no buffer is both a file at a
+/// revision and an agent view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LabelNote {
+    /// The revision a **file at a revision** (`git/show <rev>:<path>`) is shown as of. A commit's
+    /// own patch is named by the commit already; every other buffer has no revision to speak of.
+    Commit(String),
+    /// The directory an **agent view**'s agent runs in, as [`dir_display`] writes it. Never
+    /// empty: an agent at the root of a single-root workspace has no note at all.
+    Cwd(String),
 }
 
 impl Label {
@@ -149,25 +189,54 @@ impl Label {
     pub fn at(name: impl Into<String>, commit: Option<String>) -> Self {
         Self {
             name: name.into(),
-            commit,
+            note: commit.map(LabelNote::Commit),
+        }
+    }
+
+    /// An agent view's name, and the directory its agent runs in — none when that is empty.
+    pub fn in_dir(name: impl Into<String>, cwd: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            note: cwd.filter(|c| !c.is_empty()).map(LabelNote::Cwd),
+        }
+    }
+
+    /// The revision this label is as of, for a file at a revision.
+    pub fn commit(&self) -> Option<&str> {
+        match &self.note {
+            Some(LabelNote::Commit(commit)) => Some(commit),
+            _ => None,
+        }
+    }
+
+    /// The directory this label's agent runs in, for an agent view.
+    pub fn cwd(&self) -> Option<&str> {
+        match &self.note {
+            Some(LabelNote::Cwd(cwd)) => Some(cwd),
+            _ => None,
         }
     }
 
     /// The muted piece a shell paints after the name, separator included, or `None` when there is
-    /// no revision to show. The one place the gap between the two is decided.
-    pub fn commit_suffix(&self) -> Option<String> {
-        self.commit
-            .as_ref()
-            .map(|c| format!(" {}", commit_annotation(c, &[]).0))
+    /// nothing to note. The one place the gap between the two is decided.
+    pub fn suffix(&self) -> Option<String> {
+        self.note.as_ref().map(|note| match note {
+            LabelNote::Commit(commit) => format!(" {}", commit_annotation(commit, &[]).0),
+            LabelNote::Cwd(cwd) => format!(" {cwd}"),
+        })
     }
 
     /// The whole label as *one string*, for the surfaces that have no second shade to paint in —
-    /// the window title, a confirm prompt, a toast, a log line. The brackets come too: they are
-    /// what says the revision annotates the name rather than being part of it, and that reading is
-    /// needed most where there is no colour to say it.
+    /// the window title, a confirm prompt, a toast, a log line. The revision's brackets come too:
+    /// they are what says the revision annotates the name rather than being part of it, and that
+    /// reading is needed most where there is no colour to say it. A directory is set off by a `·`
+    /// for the same reason, since brackets already mean a revision.
     pub fn joined(&self) -> String {
-        match &self.commit {
-            Some(commit) => format!("{} {}", self.name, commit_annotation(commit, &[]).0),
+        match &self.note {
+            Some(LabelNote::Commit(commit)) => {
+                format!("{} {}", self.name, commit_annotation(commit, &[]).0)
+            }
+            Some(LabelNote::Cwd(cwd)) => format!("{} · {cwd}", self.name),
             None => self.name.clone(),
         }
     }
@@ -195,7 +264,7 @@ pub const COMMIT_CLOSE: &str = ")";
 
 impl From<String> for Label {
     fn from(name: String) -> Self {
-        Self { name, commit: None }
+        Self { name, note: None }
     }
 }
 
@@ -701,11 +770,9 @@ pub fn agent_row_badge(
     }
     match state {
         S::Idle => None,
-        // The agent's own words for what it is doing, when it has said any.
-        S::Thinking { activity } => Some((
-            format!("● {}", activity.as_deref().unwrap_or("thinking")),
-            RowBadgeTone::Running,
-        )),
+        // Not what it is working through: a tool call's title is often a whole command line,
+        // and the activity picker is where that is listed.
+        S::Thinking => Some(("● thinking".into(), RowBadgeTone::Running)),
         S::AwaitingPermission => Some(("● awaiting permission".into(), RowBadgeTone::Bad)),
         S::Disconnected => Some(("not connected".into(), RowBadgeTone::Muted)),
     }
@@ -864,17 +931,8 @@ mod tests {
         use aether_protocol::picker::AgentRowState as S;
         assert_eq!(agent_row_badge(&S::Idle, false), None);
         assert_eq!(
-            agent_row_badge(&S::Thinking { activity: None }, false),
+            agent_row_badge(&S::Thinking, false),
             Some(("● thinking".into(), RowBadgeTone::Running))
-        );
-        assert_eq!(
-            agent_row_badge(
-                &S::Thinking {
-                    activity: Some("Reading src/lib.rs".into())
-                },
-                false
-            ),
-            Some(("● Reading src/lib.rs".into(), RowBadgeTone::Running))
         );
         assert_eq!(
             agent_row_badge(&S::AwaitingPermission, false),
@@ -886,6 +944,39 @@ mod tests {
         );
         // A dormant row is dimmed rather than badged: there is no process to describe.
         assert_eq!(agent_row_badge(&S::Disconnected, true), None);
+    }
+
+    /// A directory is written the way a file's location is: the root's label, then the path under
+    /// it — the label alone at a root, and nothing at the root of a single-root workspace.
+    #[test]
+    fn a_directory_reads_like_a_files_location() {
+        let multi = root_labels(&["/src/aether".into(), "/src/aether-docs".into()]);
+        assert_eq!(
+            dir_display(&multi, Some(0), "crates/web", &[0]),
+            ("aether: crates/web".into(), vec![8])
+        );
+        assert_eq!(
+            dir_display(&multi, Some(1), "", &[]),
+            ("aether-docs".into(), vec![])
+        );
+        let same_name = root_labels(&["/work/aether".into(), "/personal/aether".into()]);
+        assert_eq!(dir_display(&same_name, Some(0), "", &[]).0, "aether (work)");
+
+        let single = root_labels(&["/src/aether".into()]);
+        assert_eq!(
+            dir_display(&single, Some(0), "", &[]),
+            (String::new(), vec![])
+        );
+        assert_eq!(
+            dir_display(&single, Some(0), "crates/web", &[1]),
+            ("crates/web".into(), vec![1])
+        );
+
+        // Outside every root: the server's spelling, untouched.
+        assert_eq!(
+            dir_display(&single, None, "~/elsewhere", &[2]),
+            ("~/elsewhere".into(), vec![2])
+        );
     }
 
     #[test]

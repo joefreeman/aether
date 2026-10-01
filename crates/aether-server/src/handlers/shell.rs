@@ -183,7 +183,9 @@ fn shell_for(
         })
         .or_else(|| {
             dormant.into_iter().find_map(|d| {
-                let summary = d.shell.as_ref()?;
+                let Some(crate::state::DormantSummary::Shell(summary)) = &d.summary else {
+                    return None;
+                };
                 (summary.cwd == dir && summary.last_command.as_deref() == Some(line))
                     .then_some(Found::Dormant(d.view))
             })

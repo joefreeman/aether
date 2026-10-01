@@ -562,6 +562,19 @@ pub(crate) async fn environment(cwd: &Path) -> std::collections::HashMap<String,
     env
 }
 
+/// Where `dir` is, as a picker row and the status bar address a directory: the root it is under and
+/// the path below it (empty at the root itself), or — outside every root — the whole path,
+/// [`display_path`]-shortened. The client puts the root's label in front.
+pub(crate) fn dir_location(dir: &Path, roots: &[PathBuf]) -> (Option<u32>, String) {
+    if dir.as_os_str().is_empty() {
+        return (None, String::new());
+    }
+    match crate::workspace_index::workspace_relative_parts(dir, roots) {
+        Some((root, rel)) => (Some(root), rel),
+        None => (None, display_path(dir)),
+    }
+}
+
 /// `$HOME` shortened to `~`, as every shell prompt does — a header naming an absolute path three
 /// levels deep spends the whole row on saying where you already are.
 pub(crate) fn display_path(path: &Path) -> String {

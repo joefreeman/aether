@@ -2972,6 +2972,7 @@ fn picker_item_spans(
     if let PickerItem::Shell {
         title,
         cwd,
+        cwd_root,
         last_command,
         running,
         exit,
@@ -2980,9 +2981,15 @@ fn picker_item_spans(
         ..
     } = item
     {
-        return composed_row_spans(
+        let (parts, seg) = aether_client::picker::dir_row_parts(
+            root_labels,
             [title, cwd, last_command.as_deref().unwrap_or("")],
+            *cwd_root,
             match_indices,
+        );
+        return composed_row_spans(
+            parts,
+            seg,
             aether_client::labels::shell_row_badge(*running, *exit, *elapsed_ms),
             highlighted,
             max_width,
@@ -2996,9 +3003,10 @@ fn picker_item_spans(
         ..
     } = item
     {
+        let parts = [owner.as_str(), label.as_str(), ""];
         return composed_row_spans(
-            [owner, label, ""],
-            match_indices,
+            parts,
+            aether_client::picker::row_match_segments(parts, match_indices),
             None,
             highlighted,
             max_width,
@@ -3014,9 +3022,10 @@ fn picker_item_spans(
         ..
     } = item
     {
+        let parts = [name.as_str(), display_path.as_str(), description.as_str()];
         return composed_row_spans(
-            [name, display_path, description],
-            match_indices,
+            parts,
+            aether_client::picker::row_match_segments(parts, match_indices),
             None,
             highlighted,
             max_width,
@@ -3024,17 +3033,23 @@ fn picker_item_spans(
     }
     if let PickerItem::Agent {
         title,
-        agent,
+        cwd,
+        cwd_root,
         state,
-        last_prompt,
         dormant,
         match_indices,
         ..
     } = item
     {
-        return composed_row_spans(
-            [title, agent, last_prompt.as_deref().unwrap_or("")],
+        let (parts, seg) = aether_client::picker::dir_row_parts(
+            root_labels,
+            [title, cwd, ""],
+            *cwd_root,
             match_indices,
+        );
+        return composed_row_spans(
+            parts,
+            seg,
             aether_client::labels::agent_row_badge(state, *dormant),
             highlighted,
             max_width,
@@ -3660,13 +3675,14 @@ fn buffer_item_spans(
 ///
 /// The badge floats flush right like the buffers picker's dirty dot, and is dropped entirely when
 /// the row would have no space left for it — a name is worth more than a status.
-fn composed_row_spans(
-    parts: [&str; 3],
-    match_indices: &[u32],
+fn composed_row_spans<S: AsRef<str>>(
+    parts: [S; 3],
+    seg: aether_client::picker::RowSegments,
     badge: Option<(String, aether_client::labels::RowBadgeTone)>,
     highlighted: bool,
     max_width: usize,
 ) -> Vec<Span<'static>> {
+    let parts = parts.each_ref().map(|p| p.as_ref());
     let bg = picker_row_bg(highlighted);
     let base = Style::default().fg(c(th().fg)).bg(bg);
     let match_style = base
@@ -3674,7 +3690,9 @@ fn composed_row_spans(
         .add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(picker_dim_fg(highlighted)).bg(bg);
 
-    let seg = aether_client::picker::row_match_segments(parts, match_indices);
+    // The row's name is what it is; the badge only says how it is doing. A badge that would leave
+    // the name no room goes rather than the name.
+    let badge = badge.filter(|(t, _)| parts[0].width() + t.width() + 2 <= max_width);
     let badge_w = badge
         .as_ref()
         .map(|(t, _)| t.width() + 2)
@@ -7746,9 +7764,9 @@ fn build_editor_status_spans(
         transient,
         tethered,
     } = label;
-    // The name, and the revision it is shown at — muted, after it, like the buffers-picker row.
-    // Empty for every buffer that is not a file at a revision, which is all of them but one kind.
-    let commit = file_label.commit_suffix().unwrap_or_default();
+    // The name, and what is noted beside it — muted, after it, like the picker rows: the revision
+    // a file is shown at, or the directory an agent runs in. Empty for every other buffer.
+    let note = file_label.suffix().unwrap_or_default();
     let file_label = file_label.name.as_str();
     let base_style = Style::default().bg(status_bg()).fg(c(th().fg));
     // A transient (preview) buffer slants the file label (root + path — not the workspace name)
@@ -7781,7 +7799,7 @@ fn build_editor_status_spans(
         }
     }
     let pre_budget = left_max.saturating_sub(used);
-    if workspace_prefix.width() + file_label.width() + commit.width() + tether_mark.width()
+    if workspace_prefix.width() + file_label.width() + note.width() + tether_mark.width()
         >= pre_budget
     {
         // Even the workspace/file segment overflows. The file label is the informative part, so
@@ -7800,12 +7818,9 @@ fn build_editor_status_spans(
     } else {
         spans.push(Span::styled(workspace_prefix.to_string(), base_style));
         spans.push(Span::styled(file_label.to_string(), label_style));
-        if !commit.is_empty() {
-            // Upright even on a slanted transient label: which revision this is, is chrome.
-            spans.push(Span::styled(
-                commit.clone(),
-                base_style.fg(c(th().fg_muted)),
-            ));
+        if !note.is_empty() {
+            // Upright even on a slanted transient label: the note is chrome, not part of the name.
+            spans.push(Span::styled(note.clone(), base_style.fg(c(th().fg_muted))));
         }
         if !tether_mark.is_empty() {
             spans.push(Span::styled(
@@ -7813,8 +7828,7 @@ fn build_editor_status_spans(
                 base_style.fg(c(th().fg_muted)),
             ));
         }
-        used +=
-            workspace_prefix.width() + file_label.width() + commit.width() + tether_mark.width();
+        used += workspace_prefix.width() + file_label.width() + note.width() + tether_mark.width();
         // Each following section is introduced by a dim ` · `, which is exactly as wide as the
         // 3-space gap it replaced — the divider is free.
         let separator = || {
@@ -10002,6 +10016,7 @@ mod tests {
                 view_id: aether_protocol::ViewId(12),
                 title: "Shell 2".into(),
                 cwd: "~/proj".into(),
+                cwd_root: None,
                 last_command: Some("cargo test".into()),
                 running: false,
                 exit: None,
@@ -10062,6 +10077,7 @@ mod tests {
             view_id: aether_protocol::ViewId(12),
             title: "Shell 2".into(),
             cwd: "~/proj".into(),
+            cwd_root: None,
             last_command: Some("cargo test".into()),
             running: false,
             exit: None,
@@ -10079,6 +10095,54 @@ mod tests {
             hl, "S~c",
             "index 7 is a separator space and highlights nothing"
         );
+    }
+
+    /// A shell inside a root of a multi-root workspace writes its directory as a file's location
+    /// is written — `aether: crates/web` — and the highlight lands on the path, past the label,
+    /// which is never matched.
+    #[test]
+    fn shell_row_writes_its_directory_after_its_root() {
+        // Haystack "Shell 2  crates/web  cargo test": `c` of crates at 9.
+        let item = PickerItem::Shell {
+            view_id: aether_protocol::ViewId(12),
+            title: "Shell 2".into(),
+            cwd: "crates/web".into(),
+            cwd_root: Some(0),
+            last_command: Some("cargo test".into()),
+            running: false,
+            exit: None,
+            elapsed_ms: None,
+            dormant: false,
+            match_indices: vec![9],
+        };
+        let labels = vec!["aether".to_string(), "docs".to_string()];
+        let spans = picker_item_spans(&item, &labels, None, false, 60);
+        assert_eq!(
+            spans_text(&spans).trim_end(),
+            "Shell 2  aether: crates/web  cargo test"
+        );
+        let hl: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(c(th().match_highlight)))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(hl, vec!["c"]);
+        let at = spans.iter().position(|s| s.content == "c").unwrap();
+        assert!(spans[at - 1].content.ends_with("aether: "), "{spans:?}");
+
+        // At the root of a single-root workspace there is nothing to say.
+        let mut at_root = item.clone();
+        if let PickerItem::Shell { cwd, .. } = &mut at_root {
+            cwd.clear();
+        }
+        let text = spans_text(&picker_item_spans(
+            &at_root,
+            &[String::new()],
+            None,
+            false,
+            60,
+        ));
+        assert_eq!(text.trim_end(), "Shell 2  cargo test");
     }
 
     /// A tasks-picker row wears the shell row's shape: the name, then the defining file and the
@@ -10109,49 +10173,73 @@ mod tests {
         assert_eq!(hl, "tw");
     }
 
-    /// An agents-picker row wears the shell row's shape with a conversation's fields, and a
-    /// dormant one drops its badge.
+    /// An agents-picker row is the conversation's name and, muted beside it, where its agent runs —
+    /// its root's label, since an agent runs at a root; a dormant one drops its badge.
     #[test]
-    fn agent_row_lays_out_name_agent_prompt_and_badge() {
+    fn agent_row_lays_out_name_root_and_badge() {
         use aether_protocol::picker::AgentRowState;
+        let labels = vec!["aether".to_string(), "docs".to_string()];
         let asking = PickerItem::Agent {
             view_id: aether_protocol::ViewId(20),
             title: "Agent 1".into(),
-            agent: "Claude Code".into(),
+            cwd: String::new(),
+            cwd_root: Some(1),
             state: AgentRowState::AwaitingPermission,
-            last_prompt: Some("fix the wrap bug".into()),
             dormant: false,
             match_indices: vec![],
         };
-        let text = spans_text(&picker_item_spans(&asking, &[], None, false, 70));
-        assert!(
-            text.starts_with("Agent 1  Claude Code  fix the wrap bug"),
-            "{text:?}"
-        );
+        let spans = picker_item_spans(&asking, &labels, None, false, 70);
+        let text = spans_text(&spans);
+        assert!(text.starts_with("Agent 1  docs "), "{text:?}");
         assert!(text.ends_with("● awaiting permission"), "{text:?}");
+        let dir = spans.iter().find(|s| s.content == "docs").unwrap();
+        assert_eq!(dir.style.fg, Some(picker_dim_fg(false)));
 
         // Idle says nothing — "ready" is the resting state.
         let mut idle = asking.clone();
         if let PickerItem::Agent { state, .. } = &mut idle {
             *state = AgentRowState::Idle;
         }
-        let text = spans_text(&picker_item_spans(&idle, &[], None, false, 70));
-        assert_eq!(text.trim_end(), "Agent 1  Claude Code  fix the wrap bug");
+        let text = spans_text(&picker_item_spans(&idle, &labels, None, false, 70));
+        assert_eq!(text.trim_end(), "Agent 1  docs");
 
-        // A dormant row: no badge, and no agent name it has not read — but not greyed: being
-        // unloaded changes nothing about what you can do with it.
+        // A single-root workspace's root has an empty label: the name alone.
+        let text = spans_text(&picker_item_spans(&idle, &[String::new()], None, false, 70));
+        assert_eq!(text.trim_end(), "Agent 1");
+
+        // A dormant row: no badge — but not greyed: being unloaded changes nothing about what you
+        // can do with it. Outside every root, the path as the server wrote it.
         let dormant = PickerItem::Agent {
             view_id: aether_protocol::ViewId(21),
             title: "Agent 2".into(),
-            agent: String::new(),
+            cwd: "~/elsewhere".into(),
+            cwd_root: None,
             state: AgentRowState::Disconnected,
-            last_prompt: None,
             dormant: true,
             match_indices: vec![],
         };
-        let spans = picker_item_spans(&dormant, &[], None, false, 70);
-        assert_eq!(spans_text(&spans).trim_end(), "Agent 2");
+        let spans = picker_item_spans(&dormant, &labels, None, false, 70);
+        assert_eq!(spans_text(&spans).trim_end(), "Agent 2  ~/elsewhere");
         assert_eq!(spans[0].style.fg, Some(c(th().fg)));
+    }
+
+    /// A row too narrow for its name and its badge keeps the name. The badge used to be laid out
+    /// first, and a long one — a whole tool-call command line — left the name no room at all.
+    #[test]
+    fn a_composed_row_drops_its_badge_before_its_name() {
+        let badge = Some((
+            "● awaiting permission".to_string(),
+            aether_client::labels::RowBadgeTone::Bad,
+        ));
+        let text = spans_text(&composed_row_spans(
+            ["Agent 1", "~/src/aether", ""],
+            Default::default(),
+            badge,
+            false,
+            24,
+        ));
+        assert!(text.starts_with("Agent 1"), "{text:?}");
+        assert!(!text.contains('●'), "{text:?}");
     }
 
     #[test]
@@ -10561,6 +10649,40 @@ mod tests {
             !commit.style.add_modifier.contains(Modifier::ITALIC),
             "upright beside a slanted transient label"
         );
+    }
+
+    /// An agent view's status row is its name and, muted after it, the directory its agent runs
+    /// in — the pairing its agents-picker row paints.
+    #[test]
+    fn editor_status_spans_show_an_agents_directory_dim_after_its_name() {
+        let status = crate::app::StatusMessage::default();
+        let spans = build_editor_status_spans(
+            StatusLabel {
+                workspace_prefix: "[proj] ",
+                file_label: &aether_client::labels::Label::in_dir(
+                    "Agent 1",
+                    Some("aether-docs".into()),
+                ),
+                transient: false,
+                tethered: false,
+            },
+            None,
+            Vec::new(),
+            &status,
+            &[],
+            vec![Span::raw("12:5")],
+            50,
+        );
+        let text = spans_text(&spans);
+        assert!(
+            text.starts_with("[proj] Agent 1 aether-docs"),
+            "the name, then the directory: {text:?}"
+        );
+        let cwd = spans
+            .iter()
+            .find(|s| s.content.contains("aether-docs"))
+            .expect("a directory span");
+        assert_eq!(cwd.style.fg, Some(c(th().fg_muted)));
     }
 
     /// A transient buffer italicises the workspace/file segment (no explicit marker text); a

@@ -574,12 +574,10 @@ pub enum AgentRowState {
     /// Connected with nothing in flight — ready for a prompt.
     #[default]
     Idle,
-    /// A turn is running. `activity` is the title of the tool call it is working through, when it
-    /// has said; `None` while it is thinking with no tool named.
-    Thinking {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        activity: Option<String>,
-    },
+    /// A turn is running. What it is working through is the activity picker's to say, not the
+    /// row's: a tool call's title is often a whole command line, and as a badge it crowded out the
+    /// row's own name.
+    Thinking,
     /// Blocked on us: the agent has asked permission and the turn cannot proceed until it is
     /// answered.
     AwaitingPermission,
@@ -667,13 +665,18 @@ pub enum PickerItem {
         view_id: crate::ViewId,
         /// `Shell N` — the shell's own name, and the head of the haystack.
         title: String,
-        /// Where the next command would run, already shortened to `~/...` when it is under the
-        /// user's home — the same string the run boxes inside the shell wear. Shortened
-        /// server-side rather than per shell: the server is the one that knows the home directory
-        /// (the browser client does not), and the haystack must hold the same string the row shows
-        /// or the fuzzy highlight would land off the text. A dormant row carries its snapshot's, as
-        /// it does the last command and outcome; empty only when the snapshot could not be read.
+        /// Where the next command would run: relative to the root at [`Self::Shell::cwd_root`]
+        /// (empty at the root itself), or — outside every root — the whole path, shortened to
+        /// `~/...` under the user's home. Shortened server-side because the server is the one that
+        /// knows the home directory (the browser client does not). This is the haystack's part;
+        /// the root's label is the client's to put in front (`aether_client::labels::dir_display`)
+        /// and, as in the Files and Buffers pickers, is not part of the fuzzy match. A dormant row
+        /// carries its snapshot's, as it does the last command and outcome; empty, with no root,
+        /// only when the snapshot could not be read.
         cwd: String,
+        /// The workspace root `cwd` is relative to, by index; `None` outside every root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd_root: Option<u32>,
         /// The last command this shell ran, or `None` for one that has run nothing yet.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_command: Option<String>,
@@ -712,21 +715,24 @@ pub enum PickerItem {
     },
     /// One agent conversation, live or dormant. Identity is `view_id`.
     ///
-    /// The fuzzy haystack is `"{title}  {agent}  {last_prompt}"` (the empty parts elided) — a
+    /// The fuzzy haystack is `"{title}  {cwd}"` (an empty `cwd` elided, as it is at a root) — a
     /// **wire contract**, exactly as [`Self::Shell`]'s is.
     Agent {
         /// The row's view: what selecting the row presents and what closing it closes.
         view_id: crate::ViewId,
         /// `Agent N` — the conversation's own name, and the head of the haystack.
         title: String,
-        /// The agent behind it, by its display name (`Claude Code`), not its id.
-        agent: String,
+        /// Where the agent runs, addressed as [`Self::Shell`]'s `cwd` is — so at a root of a
+        /// single-root workspace, which is where nearly every agent runs, the row shows nothing
+        /// beside its name.
+        #[serde(default)]
+        cwd: String,
+        /// The workspace root `cwd` is relative to, by index; `None` outside every root.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd_root: Option<u32>,
         /// What it is doing, as a badge.
         #[serde(default)]
         state: AgentRowState,
-        /// The last thing the user said to it, or `None` for a conversation with nothing in it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        last_prompt: Option<String>,
         /// A session-restored conversation nothing has opened yet: a record on disk with no
         /// subprocess behind it. Its state is always [`AgentRowState::Disconnected`].
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]

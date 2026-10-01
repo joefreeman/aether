@@ -1048,8 +1048,7 @@ pub enum ItemKey<'a> {
 /// A shell or agent row's `match_indices` split per rendered field.
 ///
 /// The wire indices are char offsets into the row's composed haystack
-/// (`"{title}  {cwd}  {last_command}"` for a shell, `"{title}  {agent}  {last_prompt}"` for a
-/// conversation — see [`aether_protocol::picker::PickerItem::Shell`], where the composition is a
+/// (`"{title}  {cwd}  {last_command}"` for a shell, `"{title}  {cwd}"` for a conversation — see [`aether_protocol::picker::PickerItem::Shell`], where the composition is a
 /// wire contract). Each field here is the subset falling inside that part, rebased to the part's
 /// own chars; indices landing on the two-space separators are dropped, since the shells render no
 /// separator to highlight.
@@ -1096,6 +1095,28 @@ pub fn row_match_segments(parts: [&str; 3], match_indices: &[u32]) -> RowSegment
         }
     }
     out
+}
+
+/// A shell or agent row's three fields as painted, with their matches: the haystack's parts, the
+/// second — the directory, sent root-relative — written by [`crate::labels::dir_display`] against
+/// `labels` (the workspace's [`crate::labels::root_labels`]). The root's label is chrome, so the
+/// matches that landed in the directory come back shifted past it.
+pub fn dir_row_parts(
+    labels: &[String],
+    parts: [&str; 3],
+    cwd_root: Option<u32>,
+    match_indices: &[u32],
+) -> ([String; 3], RowSegments) {
+    let seg = row_match_segments(parts, match_indices);
+    let (dir, second) = crate::labels::dir_display(labels, cwd_root, parts[1], &seg.second);
+    (
+        [parts[0].to_string(), dir, parts[2].to_string()],
+        RowSegments {
+            first: seg.first,
+            second,
+            third: seg.third,
+        },
+    )
 }
 
 /// Split an Explorer path-query into `(path_part, filter_part)` at the last `/`, mirroring the
@@ -1260,6 +1281,27 @@ mod tests {
     }
     use aether_protocol::git::GitStatus;
     use aether_protocol::picker::ReferenceRole;
+
+    /// A directory sent root-relative is painted after its root's label, and the matches in it
+    /// follow it there; at a root the label stands alone, unmatched.
+    #[test]
+    fn dir_row_parts_write_the_directory_after_its_root() {
+        let labels = crate::labels::root_labels(&["/src/aether".into(), "/src/docs".into()]);
+        // "Shell 1  crates/web  cargo test": `c` of crates at 9.
+        let (parts, seg) = dir_row_parts(
+            &labels,
+            ["Shell 1", "crates/web", "cargo test"],
+            Some(0),
+            &[0, 9],
+        );
+        assert_eq!(parts[1], "aether: crates/web");
+        assert_eq!(seg.first, vec![0]);
+        assert_eq!(seg.second, vec![8]);
+
+        let (parts, seg) = dir_row_parts(&labels, ["Agent 1", "", ""], Some(1), &[0]);
+        assert_eq!(parts, ["Agent 1".to_string(), "docs".into(), String::new()]);
+        assert_eq!(seg.second, Vec::<u32>::new());
+    }
 
     /// The shells / agents row split: the offsets are into the *composed* haystack, so a hit in
     /// the second or third field has to come back rebased onto that field's own chars.

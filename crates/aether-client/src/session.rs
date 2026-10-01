@@ -2092,6 +2092,8 @@ impl Session {
                     lsp_server: Default::default(),
                     title: Default::default(),
                     commit: Default::default(),
+                    cwd: None,
+                    cwd_root: None,
                     read_only: Default::default(),
                     is_patch: Default::default(),
                 },
@@ -2143,12 +2145,20 @@ pub fn label_for_path(path: &str, roots: &[String]) -> String {
 /// A description's buffer facts as the client holds them. The scroll is the view's, not the
 /// buffer's: a description carries none, and the view state sets it from the open.
 pub fn buffer_info(open: BufferDescription, roots: &[String]) -> BufferInfo {
-    // A virtual buffer (a revision materialised by `git/show`) is pathless but named: the server
-    // supplies the title, since only it knows what revision this is — and, for a file shown at a
-    // revision, the commit that goes beside the name.
+    // A virtual buffer (a revision materialised by `git/show`, an agent view) is pathless but
+    // named: the server supplies the title, since only it knows what revision this is — and what
+    // goes beside the name: for a file shown at a revision the commit, for an agent view the
+    // directory it runs in.
     let label = match (&open.path, &open.title, open.scratch_number) {
         (Some(path), _, _) => label_for_path(path, roots).into(),
-        (None, Some(title), _) => crate::labels::Label::at(title.clone(), open.commit.clone()),
+        (None, Some(title), _) => match &open.cwd {
+            Some(cwd) => {
+                let labels = crate::labels::root_labels(roots);
+                let (dir, _) = crate::labels::dir_display(&labels, open.cwd_root, cwd, &[]);
+                crate::labels::Label::in_dir(title.clone(), Some(dir))
+            }
+            None => crate::labels::Label::at(title.clone(), open.commit.clone()),
+        },
         (None, None, Some(n)) => format!("(scratch {n})").into(),
         (None, None, None) => crate::labels::Label::from("(scratch)"),
     };

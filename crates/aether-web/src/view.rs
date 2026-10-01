@@ -44,7 +44,8 @@ pub fn build_view(s: &Session) -> Value {
         // which focus does not move. See `ViewState::view_label`. The name and the revision it is
         // shown at travel apart because the shell paints them in two shades.
         "view_label": s.view.view_label.name,
-        "view_commit": s.view.view_label.commit,
+        "view_commit": s.view.view_label.commit(),
+        "view_cwd": s.view.view_label.cwd(),
         // Whether the *view* is a preview that closes itself once hidden — a fact about the view,
         // not about whichever file the cursor is in. See `ViewState::view_transient`.
         "view_transient": s.view.view_transient,

@@ -5080,8 +5080,8 @@ async fn each_view_listing_picker_lists_only_its_own_kind() {
     drop(server);
 }
 
-/// A shell's row says where it is, what it last ran, and which agent is behind a conversation —
-/// the fields the fuzzy haystack is composed from.
+/// A shell's row says where it is and what it last ran, and a conversation's where its agent runs
+/// — the fields the fuzzy haystack is composed from.
 #[tokio::test]
 async fn shell_and_agent_rows_carry_their_own_fields() {
     let (server, mut ws, _file_view) = setup_three_kinds().await;
@@ -5089,6 +5089,7 @@ async fn shell_and_agent_rows_carry_their_own_fields() {
     let shells = rows_of(&mut ws, PickerKind::Shells).await;
     let PickerItem::Shell {
         cwd,
+        cwd_root,
         last_command,
         running,
         dormant,
@@ -5097,23 +5098,34 @@ async fn shell_and_agent_rows_carry_their_own_fields() {
     else {
         panic!("a shell row");
     };
-    assert!(!cwd.is_empty(), "the row says where the next command runs");
+    // At the workspace's root: the root by index, and nothing below it.
+    assert_eq!(
+        (cwd.as_str(), *cwd_root),
+        ("", Some(0)),
+        "the row says where the next command runs"
+    );
     assert_eq!(*last_command, None, "nothing has been run in it yet");
     assert!(!running);
     assert!(!dormant);
 
+    let shell_dir = (cwd.clone(), *cwd_root);
     let agents = rows_of(&mut ws, PickerKind::Agents).await;
     let PickerItem::Agent {
-        agent,
-        last_prompt,
+        cwd,
+        cwd_root,
         dormant,
         ..
     } = &agents[0]
     else {
         panic!("an agent row");
     };
-    assert!(!agent.is_empty(), "the row names the agent behind it");
-    assert_eq!(*last_prompt, None, "nothing has been said to it yet");
+    // Both started with no file of a root focused, so both run at the workspace's first root —
+    // and both rows address it the same way.
+    assert_eq!(
+        (cwd.clone(), *cwd_root),
+        shell_dir,
+        "the row says where its agent runs"
+    );
     assert!(!dormant);
 
     drop(server);
@@ -5471,7 +5483,7 @@ async fn a_dormant_commit_key_is_never_a_buffers_row() {
                 read: false,
                 transient: false,
                 source: DormantSource::Virtual { key },
-                shell: None,
+                summary: None,
             });
         }
     }

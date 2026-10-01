@@ -398,14 +398,9 @@ pub async fn activate_context(
                 let dormant: Vec<crate::state::DormantView> = sources
                     .into_iter()
                     .map(|(source, shown)| {
-                        let shell = match (&source, s.backups_path.as_deref()) {
-                            (crate::state::DormantSource::Shell { number }, Some(root)) => {
-                                crate::shell::SnapshotSummary::read(
-                                    &crate::backup::shell_backup_path(root, &context, *number),
-                                )
-                            }
-                            _ => None,
-                        };
+                        let summary = s.backups_path.as_deref().and_then(|root| {
+                            crate::state::DormantSummary::read(root, &context, &source)
+                        });
                         let id = s.allocate_buffer_id();
                         crate::state::DormantView {
                             id,
@@ -413,7 +408,7 @@ pub async fn activate_context(
                             read: shown.read,
                             transient: shown.transient,
                             source,
-                            shell,
+                            summary,
                         }
                     })
                     .collect();

@@ -44,3 +44,21 @@ function labelAtDepth(path: string, depth: number): string {
   parents.reverse();
   return `${base} (${parents.join("/")})`;
 }
+
+/** A directory as a shell or agent row writes it. Mirrors the core's `labels::dir_display`:
+ *  `aether: crates/web` under a labelled root, the label alone at the root itself, nothing at all
+ *  at the root of a single-root workspace (its label is empty), and `path` as the server wrote it
+ *  outside every root (`root` undefined). `matches` index `path`; they come back shifted past the
+ *  label, which is chrome and never matched. */
+export function dirDisplay(
+  labels: string[],
+  root: number | undefined,
+  path: string,
+  matches: number[],
+): { text: string; matches: number[] } {
+  const label = root == null ? undefined : labels[root];
+  if (!label) return { text: path, matches };
+  if (!path) return { text: label, matches: [] };
+  const lead = [...label].length + 2;
+  return { text: `${label}: ${path}`, matches: matches.map((i) => i + lead) };
+}

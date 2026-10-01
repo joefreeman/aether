@@ -55,16 +55,35 @@ pub fn reachable_repos(s: &ServerState, client_id: ClientId) -> Result<Vec<GitRe
     // reached only through a file, then closing that file, must not strand the commit view in a
     // workspace that no longer admits its repo exists — every git read taken from that buffer
     // resolves through here.
+    //
+    // An agent conversation counts for the same reason: its directory is the repo its view's git
+    // commands act on ([`resolve_readable_repo`]), and a restored conversation keeps the directory
+    // it had even once that is no longer a root.
     let mut nested: Vec<GitRepoInfo> = Vec::new();
     for buffer_id in s.buffers_in_workspace(&workspace.id) {
-        let Some(workdir) = buffer_repo_id(s, buffer_id).map(std::path::PathBuf::from) else {
+        let identity = match buffer_repo_id(s, buffer_id) {
+            Some(workdir) => {
+                if repos
+                    .iter()
+                    .chain(nested.iter())
+                    .any(|r| r.repo_id == workdir)
+                {
+                    continue;
+                }
+                crate::git::discover_repo(Path::new(&workdir))
+            }
+            None => match s.try_doc_of(buffer_id).and_then(|d| d.conversation()) {
+                // A conversation started at a root — nearly all of them — walks up to a repo the
+                // roots pass already found; skip the second walk.
+                Some(c) if !workspace.paths.contains(&c.cwd) => crate::git::discover_repo(&c.cwd),
+                _ => continue,
+            },
+        };
+        let Some(identity) = identity else {
             continue;
         };
-        let id = path_string(&workdir);
-        if repos.iter().chain(nested.iter()).any(|r| r.repo_id == id) {
-            continue;
-        }
-        if let Some(identity) = crate::git::discover_repo(&workdir) {
+        let id = path_string(&identity.workdir);
+        if !repos.iter().chain(nested.iter()).any(|r| r.repo_id == id) {
             nested.push(repo_info(&identity));
         }
     }
@@ -183,7 +202,8 @@ fn buffer_repo_id(s: &ServerState, buffer_id: BufferId) -> Option<RepoId> {
 
 /// Repo resolution for a **read**: the repo the buffer names, and nothing else.
 ///
-/// The buffer is the whole rule. An earlier version fell back to the workspace's only repo when the
+/// The buffer is the whole rule — for a buffer in an agent view, through the directory the
+/// conversation runs in. An earlier version fell back to the workspace's only repo when the
 /// buffer couldn't answer — which meant `Space g l` on a scratch buffer quietly picked a repo, and
 /// meant multi-repo workspaces had a separate "ambiguous, say which one" failure the client had no
 /// way to answer. Both are gone: a repo comes from the file you are looking at, or the command
@@ -201,6 +221,17 @@ pub fn resolve_readable_repo(
     let Some(buffer_id) = buffer_id else {
         return Err(RpcError::repo_needs_file());
     };
+    // An agent view names its repo by where its agent runs: none of its documents has a path, and
+    // the directory is on screen beside the view's name, so the answer is still the one in view.
+    if let Some(c) = s.conversation_holding(buffer_id) {
+        let workdir = crate::git::discover_repo(&c.cwd)
+            .map(|identity| path_string(&identity.workdir))
+            .ok_or_else(RpcError::not_in_repo)?;
+        return reachable_repos(s, client_id)?
+            .into_iter()
+            .find(|r| r.repo_id == workdir)
+            .ok_or_else(RpcError::not_in_repo);
+    }
     let Some(workdir) = buffer_repo_id(s, buffer_id) else {
         // A buffer with a path that resolved no repo is *outside* one; a buffer without a path
         // hasn't got as far as having somewhere to look. Different remedies, so different wording.
@@ -1013,7 +1044,7 @@ pub async fn rebind_loaded_workspace(
                 read: false,
                 transient: false,
                 source: crate::state::DormantSource::File(path),
-                shell: None,
+                summary: None,
             }
         })
         .collect();

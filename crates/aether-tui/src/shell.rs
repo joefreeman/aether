@@ -4128,6 +4128,8 @@ mod scroll_tests {
                     lsp_server: None,
                     title: None,
                     commit: None,
+                    cwd: None,
+                    cwd_root: None,
                     read_only: false,
                     is_patch: false,
                 },

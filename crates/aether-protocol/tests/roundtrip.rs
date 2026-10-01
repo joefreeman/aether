@@ -1985,6 +1985,8 @@ fn buffer_open_result_shape() {
             }),
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -2029,6 +2031,8 @@ fn a_file_at_a_revision_carries_its_commit_beside_its_title() {
             lsp_server: None,
             title: Some("src/main.rs".into()),
             commit: Some("abc1234".into()),
+            cwd: None,
+            cwd_root: None,
             read_only: true,
             is_patch: false,
         },
@@ -2070,6 +2074,8 @@ fn buffer_open_result_reports_its_view() {
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -2159,6 +2165,8 @@ fn buffer_open_result_reports_reading() {
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -2210,6 +2218,8 @@ fn buffer_open_result_restored_scroll() {
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -3312,6 +3322,8 @@ fn follow_patch_line_shape() {
             lsp_server: None,
             title: Some("src/a.rs".into()),
             commit: Some("abc1234".into()),
+            cwd: None,
+            cwd_root: None,
             read_only: true,
             is_patch,
         },
@@ -4970,7 +4982,8 @@ fn picker_item_shell_is_tagged() {
     let running = PickerItem::Shell {
         view_id: aether_protocol::ViewId(12),
         title: "Shell 2".into(),
-        cwd: "~/proj".into(),
+        cwd: "crates/web".into(),
+        cwd_root: Some(1),
         last_command: Some("cargo test".into()),
         running: true,
         exit: Some(0),
@@ -4984,7 +4997,8 @@ fn picker_item_shell_is_tagged() {
             "kind": "shell",
             "view_id": 12,
             "title": "Shell 2",
-            "cwd": "~/proj",
+            "cwd": "crates/web",
+            "cwd_root": 1,
             "last_command": "cargo test",
             "running": true,
             "exit": 0,
@@ -4997,6 +5011,7 @@ fn picker_item_shell_is_tagged() {
         view_id: aether_protocol::ViewId(13),
         title: "Shell 3".into(),
         cwd: "~".into(),
+        cwd_root: None,
         last_command: None,
         running: false,
         exit: None,
@@ -5005,7 +5020,15 @@ fn picker_item_shell_is_tagged() {
         match_indices: vec![],
     };
     let v = to_value(&fresh).unwrap();
-    for quiet in ["last_command", "running", "exit", "elapsed_ms", "dormant"] {
+    // `cwd_root` among them: a directory outside every root is the whole path.
+    for quiet in [
+        "cwd_root",
+        "last_command",
+        "running",
+        "exit",
+        "elapsed_ms",
+        "dormant",
+    ] {
         assert!(v.get(quiet).is_none(), "a fresh shell omits {quiet}: {v}");
     }
     // …and the quiet fields default back on the way in.
@@ -5081,17 +5104,18 @@ fn picker_tasks_kinds_and_row_shape() {
     }
 }
 
-/// An agent row carries its name, which agent is behind it, what it is doing, and the last thing
-/// said to it. The state is a tagged enum so `thinking` can name the tool call it is working on.
+/// An agent row carries its name, where its agent runs (root-relative, as a shell row's is), and
+/// what it is doing. The state is a tagged
+/// enum whose `thinking` names nothing more — the tool call it is on is the activity picker's.
 #[test]
 fn picker_item_agent_is_tagged() {
     use aether_protocol::picker::{AgentRowState, PickerItem};
     let asking = PickerItem::Agent {
         view_id: aether_protocol::ViewId(20),
         title: "Agent 1".into(),
-        agent: "Claude Code".into(),
+        cwd: String::new(),
+        cwd_root: Some(0),
         state: AgentRowState::AwaitingPermission,
-        last_prompt: Some("fix the wrap bug".into()),
         dormant: false,
         match_indices: vec![0],
     };
@@ -5101,9 +5125,9 @@ fn picker_item_agent_is_tagged() {
             "kind": "agent",
             "view_id": 20,
             "title": "Agent 1",
-            "agent": "Claude Code",
+            "cwd": "",
+            "cwd_root": 0,
             "state": { "state": "awaiting_permission" },
-            "last_prompt": "fix the wrap bug",
             "match_indices": [0],
         })
     );
@@ -5111,28 +5135,24 @@ fn picker_item_agent_is_tagged() {
     let thinking = PickerItem::Agent {
         view_id: aether_protocol::ViewId(21),
         title: "Agent 2".into(),
-        agent: "Codex".into(),
-        state: AgentRowState::Thinking {
-            activity: Some("Reading src/lib.rs".into()),
-        },
-        last_prompt: None,
+        cwd: "~/elsewhere".into(),
+        cwd_root: None,
+        state: AgentRowState::Thinking,
         dormant: false,
         match_indices: vec![],
     };
-    let v = to_value(&thinking).unwrap();
     assert_eq!(
-        v["state"],
-        json!({ "state": "thinking", "activity": "Reading src/lib.rs" })
+        to_value(&thinking).unwrap()["state"],
+        json!({ "state": "thinking" })
     );
-    assert!(v.get("last_prompt").is_none());
 
     // A dormant row: restored from disk with no subprocess behind it.
     let dormant = PickerItem::Agent {
         view_id: aether_protocol::ViewId(22),
         title: "Agent 3".into(),
-        agent: String::new(),
+        cwd: String::new(),
+        cwd_root: None,
         state: AgentRowState::Disconnected,
-        last_prompt: None,
         dormant: true,
         match_indices: vec![],
     };
@@ -5140,15 +5160,52 @@ fn picker_item_agent_is_tagged() {
     assert_eq!(dv["state"], json!({ "state": "disconnected" }));
     assert_eq!(dv["dormant"], json!(true));
 
-    // Idle is the default, so an absent state reads back as idle.
+    // Idle is the default, so an absent state reads back as idle; an absent `cwd` as empty.
     let back: PickerItem = from_value(json!({
-        "kind": "agent", "view_id": 23, "title": "Agent 4", "agent": "Codex"
+        "kind": "agent", "view_id": 23, "title": "Agent 4"
     }))
     .unwrap();
-    let PickerItem::Agent { state, .. } = &back else {
+    let PickerItem::Agent { state, cwd, .. } = &back else {
         panic!("expected an agent row");
     };
     assert_eq!(*state, AgentRowState::Idle);
+    assert_eq!(cwd, "");
+}
+
+/// An agent view's description names the directory its agent runs in, beside its title — and a
+/// description without one omits the key, so every other buffer's wire shape is unchanged.
+#[test]
+fn buffer_description_carries_an_agent_views_cwd() {
+    use aether_protocol::view::BufferDescription;
+    let agent = BufferDescription {
+        buffer_id: 7,
+        language: None,
+        line_count: 1,
+        byte_count: 0,
+        revision: 0,
+        saved_revision: 0,
+        path: None,
+        scratch_number: None,
+        cursor: Default::default(),
+        lsp_server: None,
+        title: Some("Agent 1".into()),
+        commit: None,
+        cwd: Some("crates/web".into()),
+        cwd_root: Some(0),
+        read_only: true,
+        is_patch: false,
+    };
+    let v = to_value(&agent).unwrap();
+    assert_eq!(v["title"], json!("Agent 1"));
+    assert_eq!(v["cwd"], json!("crates/web"));
+    assert_eq!(v["cwd_root"], json!(0));
+    let file = BufferDescription {
+        cwd: None,
+        cwd_root: None,
+        ..agent
+    };
+    let v = to_value(&file).unwrap();
+    assert!(v.get("cwd").is_none() && v.get("cwd_root").is_none());
 }
 
 /// `activity/*`: the workspace's work in progress as one list, and one cancel for any of it. An id
@@ -7354,6 +7411,8 @@ fn every_subscribe_carries_the_focus_it_resolved() {
             lsp_server: None,
             title: None,
             commit: None,
+            cwd: None,
+            cwd_root: None,
             read_only: false,
             is_patch: false,
         },
@@ -7680,6 +7739,8 @@ fn shell_start_shape() {
                 lsp_server: None,
                 title: Some("Shell 1".into()),
                 commit: None,
+                cwd: None,
+                cwd_root: None,
                 read_only: true,
                 is_patch: false,
             },

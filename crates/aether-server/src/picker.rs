@@ -61,6 +61,7 @@ pub struct ShellCandidate {
     pub view_id: aether_protocol::ViewId,
     pub title: String,
     pub cwd: String,
+    pub cwd_root: Option<u32>,
     pub last_command: Option<String>,
     pub running: bool,
     pub exit: Option<i32>,
@@ -76,11 +77,11 @@ pub struct ShellCandidate {
 pub struct AgentCandidate {
     pub view_id: aether_protocol::ViewId,
     pub title: String,
-    pub agent: String,
+    pub cwd: String,
+    pub cwd_root: Option<u32>,
     pub state: AgentRowState,
-    pub last_prompt: Option<String>,
     pub dormant: bool,
-    /// `"{title}  {agent}  {last_prompt}"`, empty parts elided — see [`PickerItem::Agent`].
+    /// `"{title}  {cwd}"`, an empty `cwd` elided — see [`PickerItem::Agent`].
     pub haystack: String,
 }
 
@@ -991,6 +992,7 @@ impl PickerCandidates {
                     view_id: c.view_id,
                     title: c.title.clone(),
                     cwd: c.cwd.clone(),
+                    cwd_root: c.cwd_root,
                     last_command: c.last_command.clone(),
                     running: c.running,
                     exit: c.exit,
@@ -1004,9 +1006,9 @@ impl PickerCandidates {
                 PickerItem::Agent {
                     view_id: c.view_id,
                     title: c.title.clone(),
-                    agent: c.agent.clone(),
+                    cwd: c.cwd.clone(),
+                    cwd_root: c.cwd_root,
                     state: c.state.clone(),
-                    last_prompt: c.last_prompt.clone(),
                     dormant: c.dormant,
                     match_indices,
                 }

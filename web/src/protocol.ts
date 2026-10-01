@@ -1126,7 +1126,7 @@ export type ActivityId =
  *  the agents-picker row, never a sort key. */
 export type AgentRowState =
   | { state: "idle" }
-  | { state: "thinking"; activity?: string }
+  | { state: "thinking" }
   | { state: "awaiting_permission" }
   | { state: "disconnected" };
 
@@ -1137,14 +1137,16 @@ export type PickerItem =
   | { kind: "buffer"; buffer_id: BufferId; view_id: number; display: string; commit?: string; status?: BufferDirtyState; path_index?: number; relative_path?: string; match_indices?: number[]; transient?: boolean }
   /** A shell view. `match_indices` are code-point offsets into the composed haystack
    *  `"{title}  {cwd}  {last_command}"` (empty parts elided, two spaces between the rest) — the
-   *  server's `shell_haystack`, mirrored by `rowMatchSegments`. `cwd` arrives already shortened
-   *  to `~/…`; `exit`/`elapsed_ms` describe the last *finished* run, so they survive a new one
-   *  starting. */
+   *  server's `shell_haystack`, mirrored by `rowMatchSegments`. `cwd` is relative to the root at
+   *  `cwd_root` (empty at the root itself), or — with no `cwd_root` — the whole path, shortened to
+   *  `~/…`; the row writes it with `dirDisplay`. `exit`/`elapsed_ms` describe the last *finished*
+   *  run, so they survive a new one starting. */
   | {
       kind: "shell";
       view_id: number;
       title: string;
       cwd: string;
+      cwd_root?: number;
       last_command?: string;
       running?: boolean;
       exit?: number;
@@ -1174,15 +1176,15 @@ export type PickerItem =
       description?: string;
       match_indices?: number[];
     }
-  /** An agent conversation. Haystack is `"{title}  {agent}  {last_prompt}"`, composed like the
-   *  shell row's. */
+  /** An agent conversation. Haystack is `"{title}  {cwd}"`, composed like the shell row's, and
+   *  `cwd`/`cwd_root` address its directory as the shell row's do. */
   | {
       kind: "agent";
       view_id: number;
       title: string;
-      agent: string;
+      cwd?: string;
+      cwd_root?: number;
       state?: AgentRowState;
-      last_prompt?: string;
       dormant?: boolean;
       match_indices?: number[];
     }

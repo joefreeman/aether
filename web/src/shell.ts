@@ -40,7 +40,7 @@ import {
 import { decodeRow } from "./text";
 import { statusIcon, severityIcon, lspDotClass, type IconKind } from "./icons";
 import { truncatePath, charBudget } from "./paths";
-import { rootLabels } from "./labels";
+import { dirDisplay, rootLabels } from "./labels";
 import { renderHoverDoc, mdToPlain, type MdBlock } from "./markdown";
 import type {
   AgentRowState,
@@ -492,6 +492,9 @@ interface CoreView {
    *  has one. Painted muted and bracketed after the label; the tab title spells the two out as one
    *  string, brackets included. */
   view_commit: string | null;
+  /** The directory an agent view's agent runs in, `~`-shortened — only an agent view has one.
+   *  Painted muted after the label, like `view_commit`; the tab title sets it off with a `·`. */
+  view_cwd: string | null;
   /** Whether the *view* is a preview that closes itself once hidden — a fact about the view, not
    *  about whichever file the cursor is in (focus rebinds `buffer`, and a working-changes view is a
    *  transient view over permanent files). */
@@ -859,6 +862,20 @@ export function composedTail(parts: [string, string, string]): string | undefine
   return tail.length ? tail.join("  ") : undefined;
 }
 
+/** A shell or agent row's three fields as painted. Mirrors the core's `picker::dir_row_parts`: the
+ *  haystack's parts, with the second — the directory, sent root-relative — written by `dirDisplay`
+ *  and its matches shifted past the root's label. */
+export function dirRowParts(
+  labels: string[],
+  raw: [string, string, string],
+  cwdRoot: number | undefined,
+  matchIndices: number[] | undefined,
+): { parts: [string, string, string]; seg: { first: number[]; second: number[]; third: number[] } } {
+  const seg = rowMatchSegments(raw, matchIndices);
+  const dir = dirDisplay(labels, cwdRoot, raw[1], seg.second);
+  return { parts: [raw[0], dir.text, raw[2]], seg: { ...seg, second: dir.matches } };
+}
+
 /** The tail's match offsets: the second part's as they are, the third's shifted past it. */
 export function composedTailMatches(
   parts: [string, string, string],
@@ -905,10 +922,7 @@ export function agentRowBadge(item: {
     case "idle":
       return undefined;
     case "thinking":
-      return {
-        text: `● ${(item.state as { activity?: string }).activity ?? "thinking"}`,
-        cls: "picker-badge-running",
-      };
+      return { text: "● thinking", cls: "picker-badge-running" };
     case "awaiting_permission":
       return { text: "● awaiting permission", cls: "picker-badge-bad" };
     default:
@@ -964,8 +978,12 @@ export function describePickerItem(
       // `Shell 2   ~/proj   cargo test        ● running`. The name leads, its two dim fields
       // follow, and the badge floats right — the same shape the terminal and GUI paint. The three
       // parts are the composed haystack in order, so the fuzzy highlight is split across them.
-      const parts: [string, string, string] = [item.title, item.cwd, item.last_command ?? ""];
-      const seg = rowMatchSegments(parts, item.match_indices);
+      const { parts, seg } = dirRowParts(
+        labels,
+        [item.title, item.cwd, item.last_command ?? ""],
+        item.cwd_root,
+        item.match_indices,
+      );
       const badge = shellRowBadge(item);
       return {
         primary: item.title,
@@ -976,10 +994,14 @@ export function describePickerItem(
       };
     }
     case "agent": {
-      // `Agent 1   Claude Code   fix the wrap bug…      ● awaiting permission` — the shell row's
-      // shape with the conversation's fields.
-      const parts: [string, string, string] = [item.title, item.agent, item.last_prompt ?? ""];
-      const seg = rowMatchSegments(parts, item.match_indices);
+      // `Agent 1   ~/src/aether      ● awaiting permission` — the name, then where its agent runs,
+      // dim: the shell row's shape with the conversation's fields.
+      const { parts, seg } = dirRowParts(
+        labels,
+        [item.title, item.cwd ?? "", ""],
+        item.cwd_root,
+        item.match_indices,
+      );
       const badge = agentRowBadge(item);
       return {
         primary: item.title,
@@ -5478,12 +5500,18 @@ export class Shell {
     fileGroup.append(name);
     // The revision a file shown at a commit is *as of*, muted after the name — the same pairing the
     // buffers picker paints, and upright even beside a slanted transient label.
-    if (v.view_commit) {
-      const commit = document.createElement("span");
-      commit.className = "status-commit";
-      commit.textContent = ` ${commitAnnotation(v.view_commit).text}`;
-      used += [...commit.textContent].length;
-      fileGroup.append(commit);
+    // An agent view's directory rides in the same place and the same shade.
+    const note = v.view_commit
+      ? ` ${commitAnnotation(v.view_commit).text}`
+      : v.view_cwd
+        ? ` ${v.view_cwd}`
+        : "";
+    if (note) {
+      const noteEl = document.createElement("span");
+      noteEl.className = "status-commit";
+      noteEl.textContent = note;
+      used += [...note].length;
+      fileGroup.append(noteEl);
     }
     left.append(fileGroup);
     // Git group: `⎇ branch  +u(s) ~u(s) -u(s)` (unstaged then staged-in-parens; zero omitted).
@@ -5670,15 +5698,17 @@ export class Shell {
     // would make the browser display the raw URL. The label is segment-elided to the same fixed cap
     // as the native titles (aether-client's TITLE_LABEL_MAX) so an external file's absolute path
     // doesn't overflow the tab title.
-    // One string: a tab title has no second shade, so the commit is spelled out beside the name
-    // (aether-client's `Label::joined`).
+    // One string: a tab title has no second shade, so the commit or directory is spelled out
+    // beside the name (aether-client's `Label::joined`).
     const titleName = v.view_label
       ? truncatePath(v.view_label, undefined, TITLE_LABEL_MAX).display
       : "";
     const titleLabel =
       titleName && v.view_commit
         ? `${titleName} ${commitAnnotation(v.view_commit).text}`
-        : titleName;
+        : titleName && v.view_cwd
+          ? `${titleName} · ${v.view_cwd}`
+          : titleName;
     document.title = showsWorkspaceChrome(v.workspace)
       ? titleLabel
         ? `[${v.workspace}] ${titleLabel}`

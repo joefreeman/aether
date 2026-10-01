@@ -655,9 +655,36 @@ pub struct DormantView {
     /// What to materialize: a file (by path) or a scratch (by per-workspace number, whose unsaved
     /// content is restored from its backup).
     pub source: DormantSource,
-    /// For a shell, what its snapshot says — the picker row's directory, last command and outcome.
-    /// `None` for every other source, and for a snapshot that could not be read.
-    pub shell: Option<crate::shell::SnapshotSummary>,
+    /// For a shell or an agent, what its snapshot says about the picker row — read once, at
+    /// restore. `None` for every other source, and for a snapshot that could not be read.
+    pub summary: Option<DormantSummary>,
+}
+
+/// What a dormant shell's or conversation's snapshot says about its picker row. One field on
+/// [`DormantView`] rather than one per kind, so a row can only carry the summary its source has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DormantSummary {
+    /// Its directory, last command and how that went.
+    Shell(crate::shell::SnapshotSummary),
+    /// Where the agent ran.
+    Agent(crate::agent::SnapshotSummary),
+}
+
+impl DormantSummary {
+    /// Read the summary for `source` out of the backups under `root`, for the kinds that have one.
+    pub fn read(root: &std::path::Path, workspace: &str, source: &DormantSource) -> Option<Self> {
+        match source {
+            DormantSource::Shell { number } => crate::shell::SnapshotSummary::read(
+                &crate::backup::shell_backup_path(root, workspace, *number),
+            )
+            .map(Self::Shell),
+            DormantSource::Agent { number } => crate::agent::SnapshotSummary::read(
+                &crate::backup::agent_backup_path(root, workspace, *number),
+            )
+            .map(Self::Agent),
+            _ => None,
+        }
+    }
 }
 
 /// One registered git operation — see [`ServerState::git_operations`].
@@ -959,6 +986,28 @@ impl ServerState {
         self.views_presenting(buffer_id)
             .into_iter()
             .max_by_key(|id| self.views[id].last_used)
+    }
+
+    /// The agent conversation `buffer_id` is part of: the view's own document, its input, or one of
+    /// its blocks. `None` for every buffer outside an agent view.
+    ///
+    /// A walk over the views rather than a back-reference on the buffer, because a conversation's
+    /// blocks come and go with the agent and an index would be one more thing to keep in step.
+    /// Callers ask it once per request, not once per buffer.
+    pub fn conversation_holding(&self, buffer_id: BufferId) -> Option<&crate::agent::Conversation> {
+        self.views
+            .values()
+            .filter_map(|v| {
+                self.try_doc_of(v.presenting)?
+                    .conversation()
+                    .map(|c| (v, c))
+            })
+            .find(|(v, c)| {
+                v.presenting == buffer_id
+                    || c.input == buffer_id
+                    || c.blocks.iter().any(|b| b.buffer == buffer_id)
+            })
+            .map(|(_, c)| c)
     }
 
     /// Mint the id of a new view.
@@ -1758,6 +1807,19 @@ impl ServerState {
         if let Some(entry) = self.workspaces.get_mut(workspace_id) {
             entry.join_nav(client_id);
         }
+    }
+
+    /// Where the agent behind `buffer_id`'s conversation runs, addressed against the roots of the
+    /// workspace the buffer belongs to ([`crate::shell::dir_location`]). `None` for a buffer that is
+    /// not an agent view.
+    pub fn conversation_dir(&self, buffer_id: BufferId) -> Option<(Option<u32>, String)> {
+        let c = self.try_doc_of(buffer_id)?.conversation()?;
+        let roots = self
+            .workspace_for_buffer(buffer_id)
+            .and_then(|w| self.workspaces.get(w))
+            .map(|w| w.paths.as_slice())
+            .unwrap_or_default();
+        Some(crate::shell::dir_location(&c.cwd, roots))
     }
 
     /// Id of the workspace a buffer belongs to. `None` if the buffer is unknown or somehow
@@ -6919,7 +6981,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::File(PathBuf::from("/p/c.rs")),
-                shell: None,
+                summary: None,
             },
             DormantView {
                 id: d_dup,
@@ -6927,7 +6989,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
-                shell: None,
+                summary: None,
             },
         ];
 
@@ -6968,7 +7030,7 @@ mod workspace_state_tests {
                 read: false,
                 transient,
                 source: DormantSource::File(PathBuf::from(path)),
-                shell: None,
+                summary: None,
             }
         };
         let front = row(&mut s, "/p/front.rs", true);
@@ -7071,7 +7133,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
-                shell: None,
+                summary: None,
             },
             DormantView {
                 id: d2,
@@ -7079,7 +7141,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::File(PathBuf::from("/p/b.rs")),
-                shell: None,
+                summary: None,
             },
         ];
 
@@ -7122,7 +7184,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::Scratch { number: 1 },
-                shell: None,
+                summary: None,
             },
             DormantView {
                 id: file,
@@ -7130,7 +7192,7 @@ mod workspace_state_tests {
                 read: false,
                 transient: false,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
-                shell: None,
+                summary: None,
             },
         ];
 
@@ -7275,7 +7337,7 @@ mod workspace_state_tests {
             read: false,
             transient: false,
             source: DormantSource::File(PathBuf::from(path)),
-            shell: None,
+            summary: None,
         };
         ws.dormant_views = vec![dormant("/r0/sub/a.rs", 1), dormant("/r0/other.rs", 2)];
         let file = |i: u32, rel: &str| JumplistEntry {

@@ -154,6 +154,18 @@ pub struct BufferDescription {
     /// shown at one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// The directory an **agent conversation** runs in — set only for an agent view, whose
+    /// [`Self::title`] is then `Agent N`. Addressed as an agents-picker row's is: relative to the
+    /// root at [`Self::cwd_root`] (empty at the root itself), else the whole path, `~`-shortened.
+    ///
+    /// Its own field for the reason [`Self::commit`] is: every shell paints it muted, after the
+    /// name, in the status bar as in the agents picker. Fixed for the conversation's life, so a
+    /// description is a fine place for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The workspace root [`Self::cwd`] is relative to, by index; `None` outside every root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_root: Option<u32>,
     /// The buffer refuses edits, saves and reloads. Set for virtual buffers: their content is a
     /// snapshot of something immutable, so there is nothing an edit could mean. Enforced
     /// server-side (`apply_edit` and the save/reload handlers); clients surface it and decline
