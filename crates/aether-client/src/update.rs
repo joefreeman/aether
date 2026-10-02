@@ -10526,10 +10526,14 @@ impl Session {
     /// from a file — which is the condition `Enter` follows a line under rather than asking a
     /// language server.
     ///
-    /// Two facts, and neither is a kind check on the view: `is_patch` is the flag an open already
-    /// carries, and an input element is a thing the window itself says it has.
+    /// Three facts, and none is a kind check on the view: the cursor is in an element windowing
+    /// some other document than the view's own (a review's hunk, a conversation's block),
+    /// `is_patch` is the flag an open carries for the patch's own text, and an input element is a
+    /// thing the window itself says it has.
     fn composed_view(&self) -> bool {
-        self.view.buffer.is_patch || self.shell_input().is_some()
+        self.view.buffer.buffer_id != self.view.view_buffer
+            || self.view.buffer.is_patch
+            || self.shell_input().is_some()
     }
 
     /// Whether the caret is in that input right now — the condition `Enter` submits under.
@@ -11520,22 +11524,8 @@ impl Session {
             // `Enter` means "follow what's under the cursor", and which resolver answers depends on
             // what the cursor is *in*, not on what kind of view is open.
             //
-            // **Composed view, cursor in a bound element** — the element windows a real file and the
-            // cursor is already inside that file's document, so the most-wanted destination is the
-            // file itself: promote it to its own view. That is an ordinary `view/open`, naming this
-            // view and the element — the file is named through the view because a file at a
-            // revision has no path of its own. The test is structural rather than a kind flag:
-            // "the buffer I am editing is not the one I opened" is exactly what composed means.
-            //
-            // This spends `Enter` on the file rather than on go-to-definition, knowingly. Inside a
-            // patch, go-to-definition genuinely works (the element is a real buffer with a real
-            // language server), which is what makes the trade affordable — `Enter` twice gets you
-            // there, and `Ctrl-Enter` is not available as a shortcut because it already means
-            // "activate in a new window" in the reading view.
             // `Enter` in a shell's input means the same thing in Normal mode as in Insert: run it.
-            // Declared before the composed-view arm below, which would otherwise fire first — the
-            // input windows a different buffer than the view's own, so it looks like a hunk over a
-            // file and `Enter` would promote it to a view of its own.
+            // Declared before the composed-view arm below, which would otherwise fire first.
             A::Activate if self.focused_action().is_some() => {
                 let Some((element, action)) = self.focused_action() else {
                     return Effects::none();
@@ -11560,39 +11550,19 @@ impl Session {
             A::Activate if self.shell_input_focused() => {
                 self.dispatch_action(A::SubmitInput, count, counted, extend)
             }
-            // **And windowing a real file**, which "not the view's own buffer" only approximated.
-            // A conversation's blocks are separate documents too, and they are *fields of the
-            // view* — internal, never listed, gone with the conversation — so asking to open one
-            // as its own view is asking for something the server refuses. Falling through instead
-            // reaches `view/follow_line`, which for a tool call goes to the file it touched: the
-            // thing `Enter` on a block was always meant to mean.
+            // **Composed view** — `view/follow_line`, whatever the cursor is in. A hunk windowing a
+            // file opens that file as its own view (the working copy, or the file at the commit),
+            // a conversation's block follows the tool call it shows, and generated text — a
+            // patch's metadata block or a deletion, a shell's output — follows what it names. Which
+            // of those the cursor is in is the server's to say: the client guessed "a file" from
+            // the buffer having a path once, and a file at a revision has none, so `Enter` in a
+            // commit asked the language server instead.
             //
-            // Reachable since line motions cross elements: the cursor can be inside a block now,
-            // where only `Tab` could put it before.
-            A::Activate
-                if self.view.buffer.buffer_id != self.view.view_buffer
-                    && self.view.buffer.path.is_some() =>
-            {
-                // No keep flag: promoting an element to its own view is a glance at the file, so
-                // it lands as a preview and is kept only once you do something to it (a file
-                // already kept is never demoted by an open). `record_nav_from` is the view, so
-                // `Backspace` returns to the review rather than to the file you were already in.
-                let from = self.view.view_buffer;
-                self.request_str::<ViewOpen>(
-                    ViewOpenParams {
-                        view_id: Some(self.view.view_id),
-                        element: Some(self.view.focused_element),
-                        record_nav_from: Some(from),
-                        ..Default::default()
-                    },
-                    Event::Switched,
-                )
-            }
-            // **Generated text** — a patch's metadata block or a deletion, a shell's output:
-            // there is no element to promote because there is no file to window, so the only thing
-            // that can say where the line leads is the document's own account of itself, which is
-            // server-side. `view/follow_line` is total over the kinds of it, so this dispatch does
-            // not branch on which.
+            // This spends `Enter` on the file rather than on go-to-definition, knowingly. Inside a
+            // patch, go-to-definition genuinely works (the element is a real buffer with a real
+            // language server), which is what makes the trade affordable — `Enter` twice gets you
+            // there, and `Ctrl-Enter` is not available as a shortcut because it already means
+            // "activate in a new window" in the reading view.
             //
             // The condition, not the destination, is the client's: `view/follow_line` would answer
             // "nowhere" for an ordinary buffer, but asking it first would make every

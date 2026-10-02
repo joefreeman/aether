@@ -269,7 +269,6 @@ export type ViewNode =
 export type ViewActionSpec =
   | { do: "permission"; allow: boolean }
   | { do: "expand"; expand?: boolean }
-  | { do: "stage"; stage: boolean }
   | { do: "cancel"; run: number };
 
 /** Mirrors `ui::ActionKind::role` — the highlight role a button's label paints in. Derived, not

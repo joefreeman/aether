@@ -6369,7 +6369,7 @@ fn children_spans(
                 let fg = match action.kind() {
                     ActionKind::Accept => c(th().git_added),
                     ActionKind::Reject => c(th().git_deleted),
-                    ActionKind::Toggle | ActionKind::Neutral => c(th().fg_muted),
+                    ActionKind::Toggle => c(th().fg_muted),
                 };
                 let style = if !enabled {
                     Style::default().fg(c(th().fg_faint)).bg(bg)

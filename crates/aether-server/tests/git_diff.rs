@@ -8673,16 +8673,14 @@ async fn focus_steps_between_a_patchs_elements_and_stops_at_the_ends() {
     drop(server);
 }
 
-/// `Enter` on a commit patch leads to the working tree's copy of the file, at the same line.
+/// `Enter` on a commit's hunk opens the file **at that commit** as its own view, at the line the
+/// cursor is on — read-only, and the same route the working changes take to the working copy.
 ///
-/// Untested until now, which is how it survived the driver landing: a patch's elements window the
-/// real blobs, so following no longer resolves through the patch index at all — the element's own
-/// buffer says which file and which revision it is, and the cursor is already on one of its lines.
+/// It once led to the working tree's copy instead, and the client never asked anyway: it decided
+/// "this element is a file" from the buffer having a path, which a file at a revision does not, so
+/// `Enter` there went to the language server.
 #[tokio::test]
-async fn enter_on_a_patch_leads_to_the_working_file() {
-    use aether_protocol::git::{
-        GitFollowPatchLine, GitFollowPatchLineParams, GitFollowPatchLineResult,
-    };
+async fn enter_on_a_commits_hunk_opens_the_file_at_the_commit() {
     use aether_protocol::viewport::{
         FocusStep, ViewportFocusElementResult, ViewportNavigateChange, ViewportNavigateChangeParams,
     };
@@ -8750,19 +8748,138 @@ async fn enter_on_a_patch_leads_to_the_working_file() {
         "the change is in an element windowing the real file"
     );
 
-    let followed: GitFollowPatchLineResult = send_request::<GitFollowPatchLine>(
+    let blob = at.buffer.buffer_id;
+    let line = at.buffer.cursor.position.line;
+
+    let followed: ViewFollowLineResult = send_request::<ViewFollowLine>(
         &mut ws,
-        &GitFollowPatchLineParams {
-            buffer_id: at.buffer.buffer_id,
+        &ViewFollowLineParams {
+            view_id: opened.view_id,
+        },
+    )
+    .await;
+    let landed = followed.opened.expect("Enter leads somewhere");
+    assert_eq!(landed.buffer_id, blob, "the file the hunk windows");
+    assert_ne!(
+        landed.view_id, opened.view_id,
+        "as its own view, not the review"
+    );
+    assert!(!landed.is_patch, "a file, not another patch");
+    assert!(landed.read_only, "a file at a commit is read-only");
+    assert_eq!(landed.path, None, "and it is not the working copy");
+    assert_eq!(
+        landed.commit.as_deref().map(|c| head.starts_with(c)),
+        Some(true),
+        "it is the file as of the commit: {:?}",
+        landed.commit
+    );
+    assert_eq!(
+        landed.cursor.position.line, line,
+        "on the line the cursor was on"
+    );
+    let content: BufferContentResult =
+        send_request::<BufferContent>(&mut ws, &BufferContentParams { buffer_id: blob }).await;
+    assert_eq!(content.text, "fn one() {}\nfn TWO() {}\n");
+
+    // `Backspace` returns to the review, which had closed behind us.
+    let back: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        &NavStepParams {
+            buffer_id: landed.buffer_id,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
+    let returned = back.target.expect("a step back to the review");
+    assert!(returned.is_patch, "back to the diff we came from");
+
+    drop(server);
+}
+
+/// `Enter` on a working-changes hunk opens the working copy as its own view, at the line the
+/// cursor is on — through `view/follow_line`, the one method `Enter` sends in any composed view.
+#[tokio::test]
+async fn enter_on_a_working_changes_hunk_opens_the_working_file() {
+    use aether_protocol::viewport::{
+        FocusStep, ViewportFocusElementResult, ViewportNavigateChange, ViewportNavigateChangeParams,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn one() {}\nfn two() {}\n");
+    std::fs::write(root.join("a.rs"), "fn one() {}\nfn TWO() {}\n").unwrap();
+
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let review: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: review.view_id,
+            cols: 120,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    let at: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
+        &mut ws,
+        &ViewportNavigateChangeParams {
+            grain: Default::default(),
+            viewport_id: sub.viewport_id,
+            direction: FocusStep::Next,
+            count: None,
+            extend: false,
+        },
+    )
+    .await;
+    assert_ne!(
+        at.buffer.buffer_id, review.buffer_id,
+        "the change is in an element windowing the working file"
+    );
+
+    let followed: ViewFollowLineResult = send_request::<ViewFollowLine>(
+        &mut ws,
+        &ViewFollowLineParams {
+            view_id: review.view_id,
         },
     )
     .await;
     let landed = followed.opened.expect("Enter leads somewhere");
     assert_eq!(
+        landed.buffer_id, at.buffer.buffer_id,
+        "the file the hunk windows"
+    );
+    assert_ne!(
+        landed.view_id, review.view_id,
+        "as its own view, not the review"
+    );
+    assert!(!landed.read_only, "the working copy is editable");
+    assert_eq!(
         landed.path.as_deref(),
         Some(root.join("a.rs").to_string_lossy().as_ref()),
-        "…to the working tree's copy, not to another blob"
     );
+    assert_eq!(landed.cursor.position.line, at.buffer.cursor.position.line);
 
     drop(server);
 }
@@ -13110,99 +13227,85 @@ async fn a_subscribe_loads_no_more_than_the_screen_it_was_given() {
     drop(server);
 }
 
-/// A review's file blocks declare a **stage button**, and `Tab` is what reaches it.
+/// `Tab` through a patch stops only in text — in a working-changes review and in a commit alike.
 ///
-/// The keymap's `Space g Alt-s` still stages a whole file; what this adds is that the view *says*
-/// it can be staged, so the gesture is reachable by the same key a conversation's buttons are and
-/// by a pointer. It is also what keeps `Tab` meaningful in a review at all: the ring is the things
-/// a view offers to act on, and before this a patch offered none.
+/// A patch offers no buttons: staging is the keymap's, which can say "this hunk" or "these lines"
+/// where a button on a file's heading could only say "this file". A button that was here made `Tab`
+/// stop between hunks with no caret drawn — in the terminal, on nothing visible at all — and
+/// offered to stage a commit's history.
 #[tokio::test]
-async fn a_reviews_file_block_offers_a_stage_button() {
+async fn tab_through_a_patch_stops_only_in_text() {
+    async fn ring_of(ws: &mut Ws, root: &std::path::Path, target: ShowTarget) -> Vec<String> {
+        let opened: ViewOpenResult = show_buffer(
+            ws,
+            &GitShowParams {
+                repo_id: Some(root.to_string_lossy().into_owned()),
+                buffer_id: None,
+                target,
+                focus_path: None,
+                record_nav_from: None,
+            },
+        )
+        .await;
+        let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+            ws,
+            &ViewportSubscribeParams {
+                view_id: opened.view_id,
+                cols: 100,
+                rows: 200,
+                overscan_rows: 0,
+                scroll: ScrollPosition {
+                    element: 0,
+                    line: 0,
+                    sub_row: 0.0,
+                },
+                focus: None,
+                wrap: WrapMode::None,
+                continuation_marker_width: 0,
+                tab_width: 4,
+                diff_view: false,
+            },
+        )
+        .await;
+        aether_client::grid::focus_ring(&sub.window.root)
+            .iter()
+            .map(|s| match s {
+                aether_client::grid::Stop::Element { .. } => "text".to_string(),
+                aether_client::grid::Stop::Action { action, .. } => format!("{action:?}"),
+            })
+            .collect()
+    }
+
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
-    let base: String = (1..=20).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    // Two hunks per file, far enough apart not to merge, in two files: the stray stop sat between
+    // a file's hunks, and a file's own sat on its heading.
+    let base: String = (1..=40).map(|i| format!("fn f{i}() {{}}\n")).collect();
     commit_file(&repo, "a.rs", &base);
-    std::fs::write(
-        root.join("a.rs"),
-        base.replace("fn f3() {}\n", "fn ONE() {}\n"),
-    )
-    .unwrap();
+    commit_file(&repo, "b.rs", &base);
+    let edited = base
+        .replace("fn f3() {}\n", "fn ONE() {}\n")
+        .replace("fn f30() {}\n", "fn TWO() {}\n");
+    std::fs::write(root.join("a.rs"), &edited).unwrap();
+    std::fs::write(root.join("b.rs"), &edited).unwrap();
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: ViewOpenResult = show_buffer(
-        &mut ws,
-        &GitShowParams {
-            repo_id: Some(root.to_string_lossy().into_owned()),
-            buffer_id: None,
-            target: ShowTarget::WorkingChanges,
-            focus_path: None,
-            record_nav_from: None,
-        },
-    )
-    .await;
-
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
-        &mut ws,
-        &ViewportSubscribeParams {
-            view_id: opened.view_id,
-            cols: 100,
-            rows: 60,
-            overscan_rows: 0,
-            scroll: ScrollPosition {
-                element: 0,
-                line: 0,
-                sub_row: 0.0,
-            },
-            focus: None,
-            wrap: WrapMode::None,
-            continuation_marker_width: 0,
-            tab_width: 4,
-            diff_view: false,
-        },
-    )
-    .await;
-
-    let ring = aether_client::grid::focus_ring(&sub.window.root);
-    let (element, action) = ring
-        .iter()
-        .find_map(|s| match s {
-            aether_client::grid::Stop::Action {
-                element,
-                action: action @ aether_protocol::ui::ViewAction::Stage { .. },
-                ..
-            } => Some((*element, *action)),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("no stage button on the ring: {ring:?}"));
-    assert!(
-        matches!(
-            action,
-            aether_protocol::ui::ViewAction::Stage { stage: true }
-        ),
-        "an unstaged file's button should offer to stage it, not to unstage it"
-    );
-
-    // Pressing it stages the file — the same thing `Space g Alt-s` does, through the one method
-    // every button goes through.
-    let _: ViewportWindowResult = send_request::<ViewportInvokeAction>(
-        &mut ws,
-        &ViewportInvokeActionParams {
-            viewport_id: sub.viewport_id,
-            element,
-            action,
-        },
-    )
-    .await;
-    let _ = server;
-    let staged = std::process::Command::new("git")
-        .args(["diff", "--cached", "--name-only"])
-        .current_dir(&root)
-        .output()
-        .expect("git diff --cached");
     assert_eq!(
-        String::from_utf8_lossy(&staged.stdout).trim(),
-        "a.rs",
-        "the button did not stage the file"
+        ring_of(&mut ws, &root, ShowTarget::WorkingChanges).await,
+        vec!["text"; 4],
+        "working changes: one stop per hunk and nothing between them"
     );
+
+    // `HEAD` is then b.rs's two hunks: a commit's blocks are boxed like a review's, and all of its
+    // lines read as unstaged, which is what a stage button keyed on.
+    commit_file(&repo, "a.rs", &edited);
+    commit_file(&repo, "b.rs", &edited);
+    let ring = ring_of(&mut ws, &root, ShowTarget::Commit { rev: "HEAD".into() }).await;
+    assert_eq!(
+        ring,
+        vec!["text"; 3],
+        "a commit: its message, then one stop per hunk — nothing to press"
+    );
+    drop(server);
 }

@@ -1994,111 +1994,78 @@ pub async fn git_follow_patch_line(
 
     // Resolve everything the jump needs under one short lock, then let go: materialising the file
     // is `git_show`'s job and it takes the lock itself.
-    // A patch element windows the file *itself*, at a revision, so following from one needs no
-    // patch index: the buffer already says which file and which revision it is, and the cursor is
-    // already on one of its real lines. `Enter` leads from the blob to the working tree's copy of
-    // it, at the same place. The index path below is for a patch whose elements are still slices of
-    // a generated document.
-    let from_element = {
+    //
+    // Only the patch's **generated** text is followed here. A hunk that windows a file is the file
+    // already, and `view/follow_line` opens it as its own view before asking this.
+    let (repo_id, follow, lineno) = {
         let s = state.lock().await;
-        match s
-            .try_doc_of(params.buffer_id)
-            .and_then(|d| d.virtual_source.as_ref())
-            .and_then(|v| Some((v.target.repo_id()?.to_string(), v.target.what()?)))
-        {
-            Some((repo_id, aether_protocol::git::ShowTarget::File { path, .. })) => {
-                let cursor_line = s
-                    .cursors
-                    .get(&(client_id, params.buffer_id))
-                    .map(|c| c.position.line)
-                    .unwrap_or_default();
-                let abs_path = std::path::Path::new(&repo_id).join(path);
-                // `lineno` is 1-based, as libgit2 reports it; the cursor is 0-based.
-                Some((
-                    repo_id,
-                    FollowTarget::WorkingFile { abs_path },
-                    Some(cursor_line + 1),
-                ))
+        let Some(doc) = s.try_doc_of(params.buffer_id) else {
+            return Ok(none());
+        };
+        let Some(source) = doc.virtual_source.as_ref() else {
+            return Ok(none());
+        };
+
+        let Some(generated) = doc.patch() else {
+            return Ok(none());
+        };
+        let repo_id = source.target.repo_id().unwrap_or_default();
+        let cursor_line = s
+            .cursors
+            .get(&(client_id, params.buffer_id))
+            .map(|c| c.position.line)
+            .unwrap_or_default();
+        // The metadata block and the message belong to no file — nothing to follow.
+        let Some(Some(info)) = generated.index.lines.get(cursor_line as usize).copied() else {
+            return Ok(none());
+        };
+        let Some(file) = generated.index.files.get(info.file as usize) else {
+            return Ok(none());
+        };
+
+        // A deleted file exists only on the old side and an added file only on the new one, so
+        // those decide before the line's own side does — otherwise `Enter` on a context line of a
+        // deleted file would ask for a blob that isn't there.
+        let take_old = match file.status {
+            PatchFileStatus::Deleted => true,
+            PatchFileStatus::Added => false,
+            _ => info.side == Some(aether_protocol::viewport::PatchLine::Removed),
+        };
+        let (path, lineno) = if take_old {
+            (file.old_path.clone(), info.old_lineno)
+        } else {
+            (file.new_path.clone(), info.new_lineno)
+        };
+        let Some(path) = path else {
+            return Ok(none());
+        };
+        let follow = match source.target.rev() {
+            // A commit's diff: both sides are blobs in history. The old side is the first parent's.
+            // A root commit has none, but also has no removals to follow, so that can't be reached.
+            Some(rev) if take_old => {
+                let Some(parent) = crate::git::first_parent(std::path::Path::new(repo_id), rev)
+                else {
+                    return Ok(none());
+                };
+                FollowTarget::Revision { rev: parent, path }
             }
-            _ => None,
-        }
-    };
-
-    let resolved = match from_element {
-        Some(found) => Some(found),
-        None => {
-            let s = state.lock().await;
-            let Some(doc) = s.try_doc_of(params.buffer_id) else {
-                return Ok(none());
-            };
-            let Some(source) = doc.virtual_source.as_ref() else {
-                return Ok(none());
-            };
-
-            let Some(generated) = doc.patch() else {
-                return Ok(none());
-            };
-            let repo_id = source.target.repo_id().unwrap_or_default();
-            let cursor_line = s
-                .cursors
-                .get(&(client_id, params.buffer_id))
-                .map(|c| c.position.line)
-                .unwrap_or_default();
-            // The metadata block and the message belong to no file — nothing to follow.
-            let Some(Some(info)) = generated.index.lines.get(cursor_line as usize).copied() else {
-                return Ok(none());
-            };
-            let Some(file) = generated.index.files.get(info.file as usize) else {
-                return Ok(none());
-            };
-
-            // A deleted file exists only on the old side and an added file only on the new one, so
-            // those decide before the line's own side does — otherwise `Enter` on a context line of a
-            // deleted file would ask for a blob that isn't there.
-            let take_old = match file.status {
-                PatchFileStatus::Deleted => true,
-                PatchFileStatus::Added => false,
-                _ => info.side == Some(aether_protocol::viewport::PatchLine::Removed),
-            };
-            let (path, lineno) = if take_old {
-                (file.old_path.clone(), info.old_lineno)
-            } else {
-                (file.new_path.clone(), info.new_lineno)
-            };
-            let Some(path) = path else {
-                return Ok(none());
-            };
-            let follow = match source.target.rev() {
-                // A commit's diff: both sides are blobs in history. The old side is the first parent's.
-                // A root commit has none, but also has no removals to follow, so that can't be reached.
-                Some(rev) if take_old => {
-                    let Some(parent) = crate::git::first_parent(std::path::Path::new(repo_id), rev)
-                    else {
-                        return Ok(none());
-                    };
-                    FollowTarget::Revision { rev: parent, path }
-                }
-                Some(rev) => FollowTarget::Revision {
-                    rev: rev.to_string(),
-                    path,
-                },
-                // The working-changes view. Its new side is the working tree itself, so `Enter` leads
-                // to the **real file** — the one place a patch leads somewhere editable, and what makes
-                // the view a place to work from rather than only to read. Its old side is HEAD, which
-                // is what `git diff HEAD` compared against.
-                None if take_old => FollowTarget::Revision {
-                    rev: "HEAD".to_string(),
-                    path,
-                },
-                None => FollowTarget::WorkingFile {
-                    abs_path: std::path::Path::new(repo_id).join(path),
-                },
-            };
-            Some((repo_id.to_string(), follow, lineno))
-        }
-    };
-    let Some((repo_id, follow, lineno)) = resolved else {
-        return Ok(none());
+            Some(rev) => FollowTarget::Revision {
+                rev: rev.to_string(),
+                path,
+            },
+            // The working-changes view. Its new side is the working tree itself, so `Enter` leads
+            // to the **real file** — the one place a patch leads somewhere editable, and what makes
+            // the view a place to work from rather than only to read. Its old side is HEAD, which
+            // is what `git diff HEAD` compared against.
+            None if take_old => FollowTarget::Revision {
+                rev: "HEAD".to_string(),
+                path,
+            },
+            None => FollowTarget::WorkingFile {
+                abs_path: std::path::Path::new(repo_id).join(path),
+            },
+        };
+        (repo_id.to_string(), follow, lineno)
     };
 
     // Record the jump origin before leaving, as an ordinary open would through

@@ -14438,21 +14438,19 @@ fn closing_a_composed_view_asks_about_unsaved_edits_in_any_element() {
     }
 }
 
-/// `Enter` in a composed view opens the file the focused element windows.
+/// `Enter` in a composed view asks the server to follow the line, with the cursor in an element.
 ///
-/// One verb, several resolvers, chosen by what the cursor is *in*. In a working-changes view the
-/// cursor is already inside the real file's document, so the most-wanted destination is that file —
-/// and promoting it needs no new operation, because the buffer is already open: opening it *as the
-/// view* is an ordinary `view/open`.
-///
-/// The test is structural rather than a kind flag: "the buffer I am editing is not the one I
-/// opened" is what composed means, and it is the same predicate the breadcrumb uses.
+/// One verb, several resolvers, chosen by what the cursor is *in* — and which one is the server's
+/// to say, since only it knows whether the element windows a file (open it as its own view) or is
+/// a field of the view (a conversation's block). The client's test is structural: "the buffer I am
+/// editing is not the one I opened" is what composed means, and it is the same predicate the
+/// breadcrumb uses.
 ///
 /// **This knowingly spends `Enter` on the file rather than on go-to-definition.** Inside a patch,
 /// go-to-definition genuinely works — the element is a real buffer with a real language server —
 /// which is what makes the trade affordable: `Enter` twice gets you there.
 #[test]
-fn enter_in_a_composed_view_opens_the_focused_elements_file() {
+fn enter_in_a_composed_view_follows_the_focused_element() {
     let mut s = session();
     s.adopt_subscribe(subscribe_over(9, focus_on(0, 9, 17)));
     let view_buffer = s.view.view_buffer;
@@ -14466,17 +14464,15 @@ fn enter_in_a_composed_view_opens_the_focused_elements_file() {
         find_request(&fx, "lsp/goto_definition").is_none(),
         "the file wins over go-to-definition here"
     );
-    let open = find_request(&fx, "view/open").expect("Enter promotes the element to a view");
-    assert_eq!(
-        (&open["view_id"], &open["element"]),
-        (&json!(s.view.view_id.get()), &json!(s.view.focused_element)),
-        "it names the element through the view it is in — the file the element windows"
+    assert!(
+        find_request(&fx, "view/open").is_none(),
+        "the client does not decide the element is a file"
     );
-    assert!(open.get("buffer_id").is_none(), "no buffer on the wire");
+    let follow = find_request(&fx, "view/follow_line").expect("Enter follows the line");
     assert_eq!(
-        open["record_nav_from"],
-        json!(view_buffer),
-        "nav history records the *view*, so Backspace returns to the review"
+        *follow,
+        json!({ "view_id": s.view.view_id.get() }),
+        "it names the view and nothing else — the focused element is the server's"
     );
 }
 
@@ -14846,67 +14842,75 @@ fn enter_follows_the_line_in_any_composed_view() {
 /// though the cursor is already in that file. The adopter once judged "same buffer" as "a move
 /// within this view" and left the review on screen with the cursor nudged; a different view of
 /// the buffer you are in is a different window.
+///
+/// The client does not decide that the hunk is a file: it asks `view/follow_line`, the same as
+/// for any composed view, and the server opens the element. It once decided from the buffer
+/// having a path, and a file at a **revision** has none — so `Enter` in a commit's hunk went to
+/// the language server, while the same key in the working changes opened the file.
 #[test]
 fn enter_in_a_review_switches_to_the_file_under_the_cursor() {
-    let mut s = session();
-    // A review: its identity is the patch (view 9 over buffer 9); the cursor is in file 42, which
-    // element 2 windows.
-    s.view.view_id = ViewId(9);
-    s.view.view_buffer = 9;
-    s.view.buffer.buffer_id = 42;
-    // A review's element windows a **file**, and that is what makes it promotable: a composed
-    // view's elements can also be documents internal to it — a conversation's blocks — which are
-    // not openable as views of their own and must fall through to `view/follow_line` instead.
-    s.view.buffer.path = Some("/p/src/other.rs".into());
-    s.view.focused_element = 2;
+    // A commit's hunk (a file at a revision: no path) and a working-changes hunk (the working
+    // copy) take the one route.
+    for path in [None, Some("/p/src/other.rs")] {
+        let mut s = session();
+        // A review: its identity is the patch (view 9 over buffer 9); the cursor is in file 42,
+        // which element 2 windows. The focused element's buffer is not the patch's own text, so
+        // it carries no `is_patch` — being somewhere other than the view's own buffer is what
+        // makes this composed.
+        s.view.view_id = ViewId(9);
+        s.view.view_buffer = 9;
+        s.view.buffer.buffer_id = 42;
+        s.view.buffer.path = path.map(Into::into);
+        s.view.focused_element = 2;
 
-    let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
-    // The open, picked out by name: a buffer with a real path behind it also asks the server to
-    // follow blame, which is nothing to do with what `Enter` did.
-    let (token, params) =
-        fx.0.iter()
-            .find_map(|e| match e {
+        let fx = s.on_key(KeyCode::Enter, Mods::NONE, None);
+        // Picked out by name: a buffer with a real path behind it also asks the server to follow
+        // blame, which is nothing to do with what `Enter` did.
+        let requests: Vec<_> = fx
+            .0
+            .iter()
+            .filter_map(|e| match e {
                 Effect::Request {
                     token,
                     method,
                     params,
                     ..
-                } if *method == "view/open" => Some((*token, params.clone())),
+                } if *method != "git/set_blame_follow" => Some((*token, *method, params.clone())),
                 _ => None,
             })
-            .expect("`Enter` in a review opens the file its element windows");
-    assert_eq!(params["view_id"], json!(9), "named through the review");
-    assert_eq!(params["element"], json!(2), "the element the cursor is in");
-    assert_eq!(
-        params["record_nav_from"],
-        json!(9),
-        "Backspace returns to the review"
-    );
+            .collect();
+        let [(token, method, params)] = requests.as_slice() else {
+            panic!("`Enter` in a review makes one request, path {path:?}: {requests:?}");
+        };
+        assert_eq!(*method, "view/follow_line", "path {path:?}");
+        assert_eq!(params["view_id"], json!(9), "asked of the review");
+        let token = *token;
 
-    let fx = s.on_rpc_result(
-        token,
-        Ok(json!({
-            "view_id": 42,
-            "buffer_id": 42,
-            "language": "rust",
-            "line_count": 10,
-            "byte_count": 100,
-            "revision": 1,
-            "saved_revision": 1,
-            "path": "/p/a.rs",
-            "cursor": { "position": {"line": 3, "col": 0}, "anchor": {"line": 3, "col": 0} },
-        })),
-    );
-    assert_eq!(
-        s.view.view_id,
-        ViewId(42),
-        "the file's own view is what is on screen now"
-    );
-    assert_eq!(s.view.view_buffer, 42, "and it is its own buffer's view");
-    assert!(
-        fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
-        "a switch re-subscribes the viewport"
-    );
+        let fx = s.on_rpc_result(
+            token,
+            Ok(json!({ "opened": {
+                "view_id": 42,
+                "buffer_id": 42,
+                "language": "rust",
+                "line_count": 10,
+                "byte_count": 100,
+                "revision": 1,
+                "saved_revision": 1,
+                "path": "/p/a.rs",
+                "cursor": { "position": {"line": 3, "col": 0}, "anchor": {"line": 3, "col": 0} },
+            }})),
+        );
+        assert_eq!(
+            s.view.view_id,
+            ViewId(42),
+            "the file's own view is what is on screen now"
+        );
+        assert_eq!(s.view.view_buffer, 42, "and it is its own buffer's view");
+        assert!(
+            fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
+            "a switch re-subscribes the viewport"
+        );
+    }
 }
 
 /// A history step onto a patch — regenerated, so a new view over a new buffer — is a switch, and

@@ -1368,9 +1368,11 @@ async fn push_run_changed(state: &SharedState, view_id: ViewId, run: Option<RunS
 
 /// `Enter` in a composed view: follow the line under the cursor to whatever it names.
 ///
-/// **Total** over the kinds of generated content, which is the point: the client asks one question
-/// of every view it did not open from a file, and the answer is decided here by what the document
-/// actually is rather than by a flag the client carries. A view with no generated content answers
+/// **Total** over what the cursor can be in, which is the point: the client asks one question of
+/// every view it did not open from a file, and the answer is decided here by what the document
+/// actually is rather than by a flag the client carries. An element windowing a file opens that
+/// file as its own view — the working copy from the working changes, the file at the commit from a
+/// commit — and generated content is followed by its kind. A view with no generated content answers
 /// `None` rather than erroring, so a stale route costs nothing.
 pub async fn view_follow_line(
     state: &SharedState,
@@ -1382,29 +1384,40 @@ pub async fn view_follow_line(
     let client_id = ctx.client_id;
     // Resolved under one short lock; the open below takes the lock itself.
     enum Follow {
+        Element(aether_protocol::viewport::FieldId),
         Patch(BufferId),
         File(std::path::PathBuf, LogicalPosition),
         Nothing,
     }
-    let follow = {
+    let (view_buffer, follow) = {
         let s = state.lock().await;
         let Some(view_buffer) = s.try_presenting_buffer(params.view_id) else {
             return Ok(ViewFollowLineResult { opened: None });
         };
         // The buffer the cursor is actually in — the focused element's, which for a bound element
         // is a real file and for a generated one is the view's own document.
-        let focused = s
+        let viewport = s
             .viewports
             .values()
-            .find(|v| v.client_id == client_id && v.view_id == params.view_id)
-            .map(|v| s.focused_buffer(v))
-            .unwrap_or(view_buffer);
+            .find(|v| v.client_id == client_id && v.view_id == params.view_id);
+        let focused = viewport.map_or(view_buffer, |v| s.focused_buffer(v));
         let line = s
             .cursors
             .get(&(client_id, focused))
             .map_or(0, |c| c.position.line);
-        match s.try_doc_of(view_buffer).and_then(|d| d.generated.as_ref()) {
-            // The patch's own index says where a line came from; that logic stays where it is.
+        let follow = match s.try_doc_of(view_buffer).and_then(|d| d.generated.as_ref()) {
+            // **An element windowing a document of the user's own** — a review's hunk, over the
+            // working file or over the file at a commit — leads to that document, as its own view.
+            // Decided here rather than by the client, which could only guess from what the buffer
+            // carries — and guessed "has a path", which a file at a revision does not, so `Enter`
+            // in a commit went to the language server. An internal document is a field of the view
+            // (a conversation's block, an input) and falls through to what the view's kind says
+            // its lines mean.
+            _ if focused != view_buffer && s.try_doc_of(focused).is_some_and(|d| !d.internal) => {
+                viewport.map_or(Follow::Nothing, |v| Follow::Element(v.focused))
+            }
+            // The patch's own index says where a line of its generated text came from — the
+            // metadata block, a removed line, a file only the old side has.
             Some(Generated::Patch(_)) => Follow::Patch(view_buffer),
             Some(Generated::Shell(t)) => {
                 let doc = s.doc_of(focused);
@@ -1474,11 +1487,32 @@ pub async fn view_follow_line(
                 }
             }
             None => Follow::Nothing,
-        }
+        };
+        (view_buffer, follow)
     };
 
     match follow {
         Follow::Nothing => Ok(ViewFollowLineResult { opened: None }),
+        // No keep flag: promoting an element to its own view is a glance at the file, so it lands
+        // as a preview and is kept only once you do something to it (a file already kept is never
+        // demoted by an open). `record_nav_from` is the view, so `Backspace` returns to the review
+        // rather than to the file the cursor was already in.
+        Follow::Element(element) => {
+            let opened = view_open(
+                state,
+                ctx,
+                ViewOpenParams {
+                    view_id: Some(params.view_id),
+                    element: Some(element),
+                    record_nav_from: Some(view_buffer),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            Ok(ViewFollowLineResult {
+                opened: Some(opened),
+            })
+        }
         Follow::Patch(buffer_id) => {
             let followed = git_follow_patch_line(
                 state,
@@ -1495,17 +1529,13 @@ pub async fn view_follow_line(
         // to it — the same rule `Enter` on a patch's bound element follows. A file already kept is
         // never demoted by this. `record_nav_from` is the view, so `Alt-Left` comes back here.
         Follow::File(path, jump_to) => {
-            let view_buffer = {
-                let s = state.lock().await;
-                s.try_presenting_buffer(params.view_id)
-            };
             let opened = view_open(
                 state,
                 ctx,
                 ViewOpenParams {
                     absolute_path: Some(path.to_string_lossy().into_owned()),
                     jump_to: Some(jump_to),
-                    record_nav_from: view_buffer,
+                    record_nav_from: Some(view_buffer),
                     ..Default::default()
                 },
             )

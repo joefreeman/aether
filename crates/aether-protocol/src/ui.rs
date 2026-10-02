@@ -632,8 +632,6 @@ pub enum ViewAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expand: Option<bool>,
     },
-    /// Stage or unstage the change this element windows.
-    Stage { stage: bool },
     /// Stop a shell's run, or take it out of the queue before it starts. Named by the run's id
     /// rather than by the element: a queued run's element moves up when one ahead of it is taken
     /// out, and an id is still the run it was when the button was drawn.
@@ -661,7 +659,6 @@ impl ViewAction {
                 ActionKind::Reject
             }
             ViewAction::Expand { .. } => ActionKind::Toggle,
-            ViewAction::Stage { .. } => ActionKind::Neutral,
         }
     }
 }
@@ -676,7 +673,7 @@ impl ActionKind {
         match self {
             ActionKind::Accept => "diff.added",
             ActionKind::Reject => "diff.removed",
-            ActionKind::Toggle | ActionKind::Neutral => "diff.meta",
+            ActionKind::Toggle => "diff.meta",
         }
     }
 }
@@ -692,8 +689,6 @@ pub enum ActionKind {
     Reject,
     /// Flips a way of looking at something. Reversible by pressing it again.
     Toggle,
-    /// Everything else.
-    Neutral,
 }
 
 /// Cells per side, in the order a stylesheet names them.

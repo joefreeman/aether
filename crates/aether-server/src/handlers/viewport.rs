@@ -1341,34 +1341,6 @@ pub async fn viewport_invoke_action(
             .await?;
             s = state.lock().await;
         }
-        // Whole file, which is what the button on a file's heading means — `Space g s` is still
-        // how you stage one hunk or a selection. Delegated to the ordinary apply rather than
-        // reimplemented: that path resolves the repo, seats the cursor and rebuilds the patch, and
-        // there is exactly one place that knows how.
-        ViewAction::Stage { stage } => {
-            if stage_button(&binding).is_none() {
-                return Err(RpcError::invalid_params(format!(
-                    "element {} offers no stage action",
-                    params.element
-                )));
-            }
-            drop(s);
-            crate::handlers::git_apply_hunk(
-                state,
-                ctx,
-                aether_protocol::git::GitApplyHunkParams {
-                    buffer_id: binding.buffer_id,
-                    action: if stage {
-                        aether_protocol::git::HunkAction::Stage
-                    } else {
-                        aether_protocol::git::HunkAction::Unstage
-                    },
-                    scope: aether_protocol::git::ApplyScope::File,
-                },
-            )
-            .await?;
-            s = state.lock().await;
-        }
         // A shell run's own stop button: through the shell handler, which is where a run is
         // stopped the way the activity picker stops it, and where a queued line is taken out.
         ViewAction::Cancel { run } => {
@@ -2611,39 +2583,10 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
             // Chrome *inside* the box — a tool call's permission question — folds with it. A block
             // that is asking something never folds in the first place, so nothing a fold hides is
             // ever waiting on an answer.
-            //
-            // A reviewable element's chrome grows a stage button: its file heading is where you
-            // would reach for one, and `Tab` reaching it is what makes a review navigable by the
-            // same key a conversation is. The `Space g s`/`u` chords stay — a button says "this
-            // file", and those still say "this hunk" or "these lines", which is a distinction a
-            // single button cannot carry.
             chrome_above: if collapsed {
                 Default::default()
             } else {
-                match stage_button(binding) {
-                    Some(button) => {
-                        let mut chrome = binding.chrome_above.as_ref().clone();
-                        // Onto the heading row, after what it already says.
-                        match chrome.iter_mut().find_map(|c| match c {
-                            Element::Row { children, .. } => Some(children),
-                            Element::Column { children, .. } => {
-                                children.iter_mut().find_map(|c| match c {
-                                    Element::Row { children, .. } => Some(children),
-                                    _ => None,
-                                })
-                            }
-                            _ => None,
-                        }) {
-                            Some(children) => {
-                                children.push(Element::Space { cols: 2 });
-                                children.push(button);
-                                std::sync::Arc::new(chrome)
-                            }
-                            None => binding.chrome_above.clone(),
-                        }
-                    }
-                    None => binding.chrome_above.clone(),
-                }
+                binding.chrome_above.clone()
             },
             chrome_before: binding.chrome_before.clone(),
             first_buffer_line,
@@ -2708,39 +2651,6 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         other_elements_dirty: other_elements_dirty(s, elements, focused),
         root: compose_tree(rendered, trailing_chrome),
     }
-}
-
-/// The stage button a reviewable element offers, if it offers one.
-///
-/// Only an element that **opens a box and carries a diff's account of its own lines** — a file
-/// block in a review. Its state comes from those lines: everything already staged offers "Unstage",
-/// anything left offers "Stage", which is the same thing the `Space g Alt-s` chord decides from the
-/// same source. An element with no changes offers nothing, because there is nothing to stage.
-///
-/// Derived here rather than baked into the generated patch: staging is a fact about the working
-/// tree, and a commit's diff carries markers that are history rather than a layer you can move.
-/// Those come back `DiffStage::Unstaged` uniformly, so this is gated on the element having a box
-/// to open — which a commit's blocks also have — and then on there being a *split* to act on.
-fn stage_button(binding: &crate::state::ElementBinding) -> Option<Element> {
-    use aether_protocol::viewport::DiffStage;
-
-    let decorations = binding.decorations.as_deref()?;
-    binding.box_group?;
-    if decorations.markers.is_empty() {
-        return None;
-    }
-    let staged = decorations
-        .markers
-        .values()
-        .all(|(_, stage)| matches!(stage, DiffStage::Staged));
-    Some(Element::Action {
-        action: aether_protocol::ui::ViewAction::Stage { stage: !staged },
-        label: vec![Element::text(
-            if staged { "Unstage" } else { "Stage" },
-            Vec::new(),
-        )],
-        enabled: true,
-    })
 }
 
 /// The markdown an element renders as: the lines it windows, parsed — and where those lines begin.

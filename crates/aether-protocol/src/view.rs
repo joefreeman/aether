@@ -230,11 +230,12 @@ impl std::ops::DerefMut for ViewOpenResult {
 
 /// Follow the line under the cursor to whatever it points at — `Enter` in a **composed** view.
 ///
-/// One method, **total** over the kinds of generated content a view can be built from, so a client
-/// never has to know which it is looking at: a patch line leads to the file it came from at the
-/// revision that side of the diff belongs to (the logic [`crate::git::GitFollowPatchLine`] owns,
-/// which stays a method of its own), a shell's transcript line leads to a `path:line:col` printed
-/// in it, and anything else answers `None`.
+/// One method, **total** over what the cursor can be in, so a client never has to know which it is
+/// looking at: an element windowing a file opens that file as its own view (a review's hunk — the
+/// working copy, or the file at the commit), a line of a patch's generated text leads to the file
+/// it came from at the revision that side of the diff belongs to (the logic
+/// [`crate::git::GitFollowPatchLine`] owns, which stays a method of its own), a shell's transcript
+/// line leads to a `path:line:col` printed in it, and anything else answers `None`.
 ///
 /// No position rides here. The cursor is the server's — per `(client, buffer)`, in the focused
 /// element's buffer — and it is the same convention every other position-bearing method follows:
