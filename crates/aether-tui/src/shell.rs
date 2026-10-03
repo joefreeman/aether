@@ -1408,7 +1408,17 @@ impl Shell {
             }
             return;
         }
+        // Horizontal wheel (or shift+wheel) pans the no-wrap window, as it pans a code block in
+        // the reading view; like the vertical wheel it leaves the cursor where it is.
         match m.kind {
+            MouseEventKind::ScrollLeft => self.pan_cols(-6),
+            MouseEventKind::ScrollRight => self.pan_cols(6),
+            MouseEventKind::ScrollUp if m.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.pan_cols(-6)
+            }
+            MouseEventKind::ScrollDown if m.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.pan_cols(6)
+            }
             MouseEventKind::ScrollUp => self.scroll_by(-3),
             MouseEventKind::ScrollDown => self.scroll_by(3),
             MouseEventKind::Down(MouseButton::Left) => self.on_left_press(m),
@@ -1581,21 +1591,18 @@ impl Shell {
                     ScrollDir::Up => self.scroll_by(-delta),
                     ScrollDir::Down => self.scroll_by(delta),
                     ScrollDir::Left | ScrollDir::Right => {
-                        // Horizontal scroll only bites when soft wrap is off (wrapped text never
-                        // overflows right). A `Half` unit pans half a screen; a line pans one col.
-                        if self.session.wrap == WrapMode::None {
-                            let cols = self.text_cols() as i64;
-                            let mag = match unit {
-                                ScrollUnit::Half => (cols / 2).max(1),
-                                _ => 1,
-                            };
-                            let signed = if matches!(dir, ScrollDir::Left) {
-                                -mag
-                            } else {
-                                mag
-                            };
-                            self.scroll_col = (self.scroll_col as i64 + signed).max(0) as u32;
-                        }
+                        // A `Half` unit pans half a screen; a line pans one col.
+                        let cols = self.text_cols() as i64;
+                        let mag = match unit {
+                            ScrollUnit::Half => (cols / 2).max(1),
+                            _ => 1,
+                        };
+                        let signed = if matches!(dir, ScrollDir::Left) {
+                            -mag
+                        } else {
+                            mag
+                        };
+                        self.pan_cols(signed);
                     }
                 }
             }
@@ -1941,9 +1948,45 @@ impl Shell {
         true
     }
 
-    /// Keep the cursor's column inside the horizontal window — no-wrap only, since soft wrap
-    /// never overflows to the right. Pure client-side, mirroring the renderer's `scroll_col`
-    /// drop. Shared by every cursor-reveal path.
+    /// Pan the no-wrap horizontal window by `delta` columns. Only bites when soft wrap is off
+    /// (wrapped text never overflows right), and stops once the widest line's end reaches the
+    /// right edge — a trackpad flick shouldn't pan into empty space. Never pulls the window back
+    /// left on a rightward pan, so a cursor revealed past that bound stays put.
+    fn pan_cols(&mut self, delta: i64) {
+        if self.session.wrap != WrapMode::None {
+            return;
+        }
+        // The server's `max_line_width` covers the whole document; the loaded lines, measured
+        // the way this painter expands tabs, cover any line where the two disagree.
+        let widest = self
+            .session
+            .view
+            .window
+            .as_ref()
+            .map(|w| {
+                aether_client::grid::window_lines(w)
+                    .into_iter()
+                    .map(|(_, line)| {
+                        let text = line_text(line);
+                        crate::ui::display_span(&text, text.len() as u32).0
+                    })
+                    .fold(w.max_line_width, u32::max)
+            })
+            .unwrap_or(0);
+        let max_off = i64::from(widest.saturating_sub(self.text_cols()));
+        let cur = i64::from(self.scroll_col);
+        let next = if delta > 0 {
+            (cur + delta).min(max_off.max(cur))
+        } else {
+            (cur + delta).max(0)
+        };
+        self.scroll_col = next as u32;
+    }
+
+    /// Keep the cursor's cell inside the horizontal window — no-wrap only, since soft wrap
+    /// never overflows to the right. Pure client-side, in the display columns the renderer's
+    /// `scroll_col` counts: the cursor is a byte on the wire, so it is measured against its line
+    /// (a wide char's whole cell comes into view). Shared by every cursor-reveal path.
     fn reveal_cursor_col(&mut self) {
         if self.session.wrap != WrapMode::None {
             self.scroll_col = 0;
@@ -1953,11 +1996,27 @@ impl Shell {
         if cols == 0 {
             return;
         }
-        let col = self.session.view.buffer.cursor.position.col;
+        let cursor = self.session.view.buffer.cursor.position;
+        let at =
+            aether_client::grid::ElementLine::new(self.session.view.focused_element, cursor.line);
+        // A line not loaded yet has no geometry; its byte column is the best guess there is.
+        let (col, width) = self
+            .session
+            .view
+            .window
+            .as_ref()
+            .and_then(|w| {
+                aether_client::grid::window_lines(w)
+                    .into_iter()
+                    .find(|(el, _)| *el == at)
+                    .map(|(_, line)| crate::ui::display_span(&line_text(line), cursor.col))
+            })
+            .unwrap_or((cursor.col, 1));
+        let end = col + width;
         if col < self.scroll_col {
             self.scroll_col = col;
-        } else if col >= self.scroll_col.saturating_add(cols) {
-            self.scroll_col = col.saturating_sub(cols.saturating_sub(1));
+        } else if end > self.scroll_col.saturating_add(cols) {
+            self.scroll_col = end.saturating_sub(cols);
         }
     }
 
@@ -3650,6 +3709,15 @@ pub fn connecting_state(cols: u16, rows: u16) -> AppState {
     make_state(String::new(), Vec::new(), cols, rows, ConnState::Connecting)
 }
 
+/// A line's text, its rows' segments joined — under no wrap, the one row.
+fn line_text(line: &aether_protocol::viewport::LogicalLineRender) -> String {
+    line.visual_rows
+        .iter()
+        .flat_map(|r| r.segments.iter())
+        .map(|s| s.text.as_str())
+        .collect()
+}
+
 #[cfg(test)]
 mod scroll_tests {
     use super::*;
@@ -3846,6 +3914,80 @@ mod scroll_tests {
                 |s| matches!(s, aether_client::grid::Stop::Element { element: e } if *e == element),
             )
             .unwrap_or_else(|| panic!("element {element} is not a stop"))
+    }
+
+    fn wheel(kind: MouseEventKind, modifiers: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 10,
+            row: 5,
+            modifiers,
+        }
+    }
+
+    /// The horizontal wheel (and shift+wheel) pans the no-wrap buffer view, stopping where the
+    /// widest line's end meets the right edge, and leaves the cursor where it is.
+    #[test]
+    fn horizontal_wheel_pans_the_no_wrap_buffer_view() {
+        let mut window = window_of(&[(7, 0, 10)], &[0]);
+        let cols = crate::ui::text_cols(80) as u32;
+        window.max_line_width = cols + 10;
+        let mut sh = shell_with(window, 0, 0);
+        sh.session.wrap = WrapMode::None;
+
+        sh.on_mouse(wheel(MouseEventKind::ScrollRight, KeyModifiers::NONE));
+        assert_eq!(sh.scroll_col, 6);
+        sh.on_mouse(wheel(MouseEventKind::ScrollDown, KeyModifiers::SHIFT));
+        assert_eq!(sh.scroll_col, 10, "clamped at the widest line's end");
+        assert_eq!(
+            sh.top_visual_row,
+            VisualRow::ZERO,
+            "shift+wheel doesn't scroll vertically"
+        );
+        sh.on_mouse(wheel(MouseEventKind::ScrollLeft, KeyModifiers::NONE));
+        assert_eq!(sh.scroll_col, 4);
+        sh.on_mouse(wheel(MouseEventKind::ScrollUp, KeyModifiers::SHIFT));
+        assert_eq!(sh.scroll_col, 0, "clamped at the left edge");
+        assert_eq!(
+            sh.session.view.buffer.cursor.position,
+            aether_protocol::LogicalPosition { line: 0, col: 0 },
+            "panning leaves the cursor alone"
+        );
+    }
+
+    /// The cursor reveal measures the cursor in display columns: a line of tabs puts byte 30 at
+    /// column 120, past an 80-column window, where a byte count thought it already visible.
+    #[test]
+    fn the_cursor_reveal_counts_display_columns() {
+        let mut window = window_of(&[(7, 0, 1)], &[0]);
+        if let Element::Column { children, .. } = &mut window.root {
+            if let Element::Column { children, .. } = &mut children[0] {
+                if let Element::Editor { lines, .. } = &mut children[1] {
+                    lines[0].visual_rows[0].segments[0].text = format!("{}x", "\t".repeat(30));
+                }
+            }
+        }
+        let mut sh = shell_with(window, 0, 0);
+        sh.session.wrap = WrapMode::None;
+        sh.session.view.buffer.cursor.position.col = 30;
+        sh.reveal_cursor_col();
+        let cols = sh.text_cols();
+        assert_eq!(
+            sh.scroll_col,
+            121 - cols,
+            "`x` (column 120) is the last cell shown"
+        );
+    }
+
+    /// Under soft wrap nothing overflows right, so the horizontal wheel is inert.
+    #[test]
+    fn horizontal_wheel_is_inert_under_soft_wrap() {
+        let mut window = window_of(&[(7, 0, 10)], &[0]);
+        window.max_line_width = 500;
+        let mut sh = shell_with(window, 0, 0);
+        sh.session.wrap = WrapMode::Soft;
+        sh.on_mouse(wheel(MouseEventKind::ScrollRight, KeyModifiers::NONE));
+        assert_eq!(sh.scroll_col, 0);
     }
 
     /// `Tab` to an element **below the fold** rests it near the top, like any other jump.

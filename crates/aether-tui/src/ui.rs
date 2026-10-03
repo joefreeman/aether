@@ -69,6 +69,21 @@ fn char_display_width(c: char, current_col: u32) -> u32 {
     }
 }
 
+/// The display column the char at byte `byte` of `text` starts at, and its width (at least 1, so
+/// the end of the line and zero-width chars still claim a cell) — the unscrolled, unwrapped
+/// geometry the no-wrap horizontal scroll is measured in.
+pub fn display_span(text: &str, byte: u32) -> (u32, u32) {
+    let mut col = 0;
+    for (i, c) in text.char_indices() {
+        let w = char_display_width(c, col);
+        if i as u32 >= byte {
+            return (col, w.max(1));
+        }
+        col += w;
+    }
+    (col, 1)
+}
+
 // ---- Theme -------------------------------------------------------------------------------------
 // Colours come from the core's role tables (`aether_client::theme`) — the single source of truth
 // shared by every shell. `Theme::DARK` maps each role to exactly the Nord constant this file used
@@ -5961,8 +5976,10 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             state.ed().cursor.match_bracket,
         );
 
-        // Apply horizontal scroll to the row's text + highlights + selection. Skips zero
-        // bytes when scroll_col == 0 (the common case), so this is a no-op under soft wrap.
+        // Apply horizontal scroll to the row's text and every overlay on it. The scroll is display
+        // columns, so each row is cut at its own char boundary ([`HClip`]); a no-op at
+        // scroll_col == 0, so always under soft wrap.
+        let clip = HClip::new(&segment.text, scroll_col);
         let (clipped_text, clipped_highlights, clipped_sel, clipped_matches, clipped_diags) =
             clip_horizontal(
                 &segment.text,
@@ -5970,36 +5987,31 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 sel_on_row,
                 &matches_on_row,
                 &diags_on_row,
-                scroll_col,
+                clip,
             );
         let clipped_brackets: Vec<u32> = brackets_on_row
             .iter()
-            .filter(|b| **b >= scroll_col)
-            .map(|b| b - scroll_col)
+            .filter_map(|&b| clip.point(b))
             .collect();
-        // Intra-line diff emphasis, horizontally scroll-adjusted like the brackets (no-op
-        // under soft wrap where scroll_col is 0).
+        // Intra-line diff emphasis, horizontally scroll-adjusted like the brackets.
         let clipped_emphasis: Vec<(u32, u32)> = emphasis_on_row
             .iter()
-            .filter(|&&(_, e)| e > scroll_col)
-            .map(|&(s, e)| (s.saturating_sub(scroll_col), e - scroll_col))
+            .filter_map(|&r| clip.range(r))
             .collect();
-        // Sneak targets, row-relative then horizontally scroll-adjusted (no-op when scroll_col
-        // is 0). The label is dropped if its cell scrolled out of view.
+        // Sneak targets, row-relative then horizontally scroll-adjusted. The label is dropped if
+        // its cell scrolled out of view, even partly.
         let clipped_sneak: Vec<(u32, u32, u32, Option<char>)> =
             sneak_targets_on_visual_row(vrow.byte_offset, row_text_len, &render.sneak_targets)
                 .into_iter()
                 .filter_map(|(s, e, pe, label)| {
-                    if e <= scroll_col {
-                        return None;
-                    }
-                    let label = if s >= scroll_col { label } else { None };
-                    Some((
-                        s.saturating_sub(scroll_col),
-                        e - scroll_col,
-                        pe.saturating_sub(scroll_col),
-                        label,
-                    ))
+                    let (s2, e2) = clip.range((s, e))?;
+                    let pe2 = if pe <= s {
+                        s2
+                    } else {
+                        clip.range((s, pe)).map_or(s2, |(_, pe2)| pe2)
+                    };
+                    let label = if clip.whole(s) { label } else { None };
+                    Some((s2, e2, pe2, label))
                 })
                 .collect();
 
@@ -6046,6 +6058,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             &clipped_sneak,
             body_width,
             is_last_vrow_of_line,
+            scroll_col,
         ));
         // The EOL cell after the last char: the newline glyph when selected, and/or a
         // diagnostic underline when one is clamped to the line end (it has no real char to
@@ -6053,7 +6066,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         let eol_diag = is_last_vrow_of_line
             .then(|| eol_diag_at(vrow.byte_offset + row_text_len))
             .flatten();
-        if highlight_trailing_newline || eol_diag.is_some() {
+        if (highlight_trailing_newline || eol_diag.is_some()) && clip.eol_visible(&segment.text) {
             let mut style = if highlight_trailing_newline {
                 Style::default().bg(c(th().bg_visual)).fg(c(th().fg_faint))
             } else {
@@ -6339,6 +6352,7 @@ fn children_spans(
                     &[],
                     width,
                     false,
+                    0,
                 );
                 // The band has to reach behind the text too, not just the padding around it.
                 for span in text_spans.iter_mut() {
@@ -6716,8 +6730,100 @@ fn append_eol_blame(spans: &mut Vec<Span<'static>>, blame: Option<&str>) {
     }
 }
 
-/// Drop the first `scroll_col` bytes of the row's text, then shift highlight + selection + match
-/// ranges to match the new origin. Anything fully scrolled off the left is filtered out.
+/// Where a horizontal scroll of `scroll_col` display columns cuts one row's text.
+///
+/// The scroll is one column for every row, but each row reaches it at its own byte — and where a
+/// tab or wide char straddles it, partway through a char. The cut is the first char starting at
+/// or past the scroll; the straddler's visible tail is painted as `pad` spaces, so every row's
+/// text stays on the columns it occupies unscrolled.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HClip {
+    /// Bytes dropped from the front of the row.
+    skip: u32,
+    /// Blank cells standing in for the straddling char's visible tail.
+    pad: u32,
+    /// The first byte still (partly) on screen: the straddler's start when there is one, else
+    /// `skip` — or past the end when the whole row, end-of-line included, scrolled off.
+    lo: u32,
+}
+
+impl HClip {
+    fn new(text: &str, scroll_col: u32) -> Self {
+        let mut col = 0;
+        let mut prev = 0;
+        for (i, c) in text.char_indices() {
+            let i = i as u32;
+            if col >= scroll_col {
+                return Self::at(i, prev, col, scroll_col);
+            }
+            prev = i;
+            col += char_display_width(c, col);
+        }
+        let len = text.len() as u32;
+        if col >= scroll_col {
+            Self::at(len, prev, col, scroll_col)
+        } else {
+            Self {
+                skip: len,
+                pad: 0,
+                lo: len + 1,
+            }
+        }
+    }
+
+    /// The cut at byte `i`, which starts at display column `col`; `prev` starts the char before.
+    fn at(i: u32, prev: u32, col: u32, scroll_col: u32) -> Self {
+        Self {
+            skip: i,
+            pad: col - scroll_col,
+            lo: if col > scroll_col { prev } else { i },
+        }
+    }
+
+    /// Where a byte position lands in the clipped row: `None` once scrolled off, the remnant's
+    /// first cell for the straddler.
+    fn point(self, x: u32) -> Option<u32> {
+        if x < self.lo {
+            None
+        } else if x < self.skip {
+            Some(0)
+        } else {
+            Some(x - self.skip + self.pad)
+        }
+    }
+
+    /// A byte range, clipped: `None` once wholly scrolled off; one reaching into the straddler
+    /// covers its remnant.
+    fn range(self, (s, e): (u32, u32)) -> Option<(u32, u32)> {
+        if e <= self.lo {
+            return None;
+        }
+        let s = if s < self.skip {
+            0
+        } else {
+            s - self.skip + self.pad
+        };
+        let e = if e <= self.skip {
+            self.pad
+        } else {
+            e - self.skip + self.pad
+        };
+        Some((s, e))
+    }
+
+    /// Whether the char at byte `x` is wholly on screen.
+    fn whole(self, x: u32) -> bool {
+        x >= self.skip
+    }
+
+    /// Whether the end-of-line cell is on screen.
+    fn eol_visible(self, text: &str) -> bool {
+        self.lo <= text.len() as u32
+    }
+}
+
+/// Cut the row's text where `clip` says, then shift highlight + selection + match ranges to the
+/// new origin. Anything fully scrolled off the left is filtered out.
 #[allow(clippy::type_complexity)]
 fn clip_horizontal(
     text: &str,
@@ -6725,7 +6831,7 @@ fn clip_horizontal(
     sel: Option<(u32, u32)>,
     matches: &[(u32, u32)],
     diags: &[(u32, u32, DiagnosticSeverity)],
-    scroll_col: u32,
+    clip: HClip,
 ) -> (
     String,
     Vec<Highlight>,
@@ -6733,7 +6839,7 @@ fn clip_horizontal(
     Vec<(u32, u32)>,
     Vec<(u32, u32, DiagnosticSeverity)>,
 ) {
-    if scroll_col == 0 {
+    if clip.skip == 0 {
         return (
             text.to_string(),
             highlights.to_vec(),
@@ -6742,40 +6848,24 @@ fn clip_horizontal(
             diags.to_vec(),
         );
     }
-    let skip = scroll_col as usize;
-    let clipped_text = if skip >= text.len() {
-        String::new()
-    } else {
-        text[skip..].to_string()
-    };
+    let mut clipped_text = " ".repeat(clip.pad as usize);
+    clipped_text.push_str(&text[clip.skip as usize..]);
     let new_highlights = highlights
         .iter()
         .filter_map(|h| {
-            let end = (h.end as usize).saturating_sub(skip);
-            if end == 0 {
-                return None;
-            }
-            let start = (h.start as usize).saturating_sub(skip);
+            let (start, end) = clip.range((h.start, h.end))?;
             Some(Highlight {
-                start: start as u32,
-                end: end as u32,
+                start,
+                end,
                 kind: h.kind.clone(),
             })
         })
         .collect();
-    let shift_range = |(s, e): (u32, u32)| -> Option<(u32, u32)> {
-        let e2 = (e as usize).saturating_sub(skip);
-        if e2 == 0 {
-            return None;
-        }
-        let s2 = (s as usize).saturating_sub(skip);
-        Some((s2 as u32, e2 as u32))
-    };
-    let new_sel = sel.and_then(shift_range);
-    let new_matches = matches.iter().copied().filter_map(shift_range).collect();
+    let new_sel = sel.and_then(|r| clip.range(r));
+    let new_matches = matches.iter().filter_map(|&r| clip.range(r)).collect();
     let new_diags = diags
         .iter()
-        .filter_map(|(s, e, sev)| shift_range((*s, *e)).map(|(s, e)| (s, e, *sev)))
+        .filter_map(|&(s, e, sev)| clip.range((s, e)).map(|(s, e)| (s, e, sev)))
         .collect();
     (
         clipped_text,
@@ -7030,6 +7120,7 @@ fn build_spans(
     sneak: &[(u32, u32, u32, Option<char>)],
     max_chars: u16,
     line_end: bool,
+    origin_col: u32,
 ) -> Vec<Span<'static>> {
     let truncated: String = text.chars().take(max_chars as usize).collect();
     let trunc_len = truncated.len();
@@ -7200,7 +7291,9 @@ fn build_spans(
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut current_text = String::new();
     let mut current_style: Option<Style> = None;
-    let mut display_col: u32 = 0;
+    // The text's first char sits at `origin_col` of its line (a horizontally scrolled row), so
+    // tabs still expand to the line's own stops.
+    let mut display_col: u32 = origin_col;
     for (byte_idx, c) in truncated.char_indices() {
         // A sneak label is painted *over* the word's first cell: a bold, high-contrast glyph (dark
         // on Aurora yellow) that replaces the underlying character. The char it covers is the one
@@ -11131,6 +11224,7 @@ mod tests {
             &[],
             80,
             false,
+            0,
         ));
         assert_eq!(cells[0].2, Some(emph_bg), "plain emphasis cell");
         assert_eq!(
@@ -11214,6 +11308,7 @@ mod tests {
                 &[],
                 max,
                 line_end,
+                0,
             )
         };
         // Inner whitespace stays plain; the trailing run is marked, tabs and spaces alike.
@@ -11242,6 +11337,7 @@ mod tests {
             &sneak,
             80,
             false,
+            0,
         ));
         // Col 0: the label glyph, dark-on-yellow.
         assert_eq!(cells[0].0, 'j', "label glyph painted over the first cell");
@@ -11274,6 +11370,7 @@ mod tests {
             &[],
             80,
             false,
+            0,
         ));
         for (col, (underlined, color)) in cells.into_iter().enumerate() {
             if col == 2 || col == 3 {
@@ -11304,6 +11401,7 @@ mod tests {
             &[],
             80,
             false,
+            0,
         ));
         assert_eq!(cells[1].1, Some(c(th().error)), "overlap shows error red");
         assert_eq!(
@@ -11873,6 +11971,66 @@ mod painter_tests {
         );
         assert!(body.contains("fn f23() {}"), "…and its last:\n{body}");
         assert!(body.contains("a.rs"), "…under its file heading:\n{body}");
+    }
+
+    /// The editor rows `texts`, scrolled `scroll_col` columns right with soft wrap off.
+    fn scrolled(texts: &[&str], scroll_col: u32) -> Vec<String> {
+        let root = Element::Editor {
+            collapsed: false,
+            element: 0,
+            buffer: 7,
+            rows: texts.len() as u32,
+            first_row: ElementRow::ZERO,
+            laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+            role: aether_protocol::ui::ElementRole::Field,
+            first_buffer_line: 0,
+            lines: texts
+                .iter()
+                .enumerate()
+                .map(|(n, t)| line(n as u32, t))
+                .collect(),
+        };
+        let mut ed = editor_over(root, 0);
+        ed.wrap = WrapMode::None;
+        ed.scroll_col = scroll_col;
+        painted(&crate::app::test_state(ed))
+    }
+
+    /// The column `needle` is painted at on `row` (rows without wide chars: char index = cell).
+    fn col_in(row: &str, needle: char) -> usize {
+        row.chars()
+            .position(|c| c == needle)
+            .unwrap_or_else(|| panic!("{needle:?} not on {row:?}"))
+    }
+
+    /// The horizontal scroll counts display columns, so every row keeps the columns it has
+    /// unscrolled: a multibyte char is one column however many bytes, and a wide char cut by the
+    /// left edge leaves its visible half as a blank cell rather than pulling the row left.
+    ///
+    /// Regression: the painter dropped `scroll_col` *bytes* — which panicked mid-char, and
+    /// slid every row with a multibyte char left of the window out of line with its neighbours
+    /// (and with the cursor and clicks, which were already counting columns).
+    #[test]
+    fn a_horizontal_scroll_keeps_every_row_on_its_columns() {
+        // `→` is 3 bytes and 1 column; `中` 3 bytes and 2 columns, straddling column 2.
+        let rows = scrolled(&["a→bcd", "a中bc", "wxyz"], 2);
+        let (arrow, wide, plain) = (&rows[0], &rows[1], &rows[2]);
+        assert!(!arrow.contains('→') && !wide.contains('中'), "{rows:#?}");
+        assert_eq!(
+            col_in(arrow, 'b'),
+            col_in(plain, 'y'),
+            "column 2 → screen 0"
+        );
+        assert_eq!(col_in(wide, 'b'), col_in(plain, 'z'), "column 3 → screen 1");
+    }
+
+    /// A tab after the cut still expands to its line's own tab stop, not one counted from the
+    /// left edge of the window.
+    #[test]
+    fn a_horizontally_scrolled_tab_keeps_its_stop() {
+        // The tab spans columns 2..4, so `c` is at column 4 — under `e`.
+        let rows = scrolled(&["ab\tc", "abcdefg"], 1);
+        assert_eq!(col_in(&rows[0], 'c'), col_in(&rows[1], 'e'), "{rows:#?}");
     }
 
     /// Two files whose hunks start at the *same* line number — which is simply what a patch of two

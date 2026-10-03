@@ -567,7 +567,7 @@ pub struct EditorState {
     /// Diff baseline the gutter compares against: `Head` (all uncommitted) or `Index` (unstaged
     /// only). Server-authoritative (per-viewport); mirrored here so the keybinding can flip it and
     /// so it can be re-applied (sticky) on the next buffer's subscribe.
-    /// Horizontal scroll, in bytes. Only meaningful when `wrap == WrapMode::None`; reset to 0
+    /// Horizontal scroll, in display columns. Only meaningful when `wrap == WrapMode::None`; reset to 0
     /// when soft wrap is on (wrapped content never overflows). Client-only.
     pub scroll_col: u32,
     /// Accumulated vertical-scroll delta from arrow-key / PageUp-PageDown bursts. Deferred
