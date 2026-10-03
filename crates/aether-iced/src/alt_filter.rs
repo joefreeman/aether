@@ -8,6 +8,10 @@
 //! uncaptured — it bubbles to the application's key subscription, which routes the chord to the
 //! core's keymap. Every other event is delegated unchanged, so focus/caret/click/selection/typing
 //! all behave exactly like a plain `text_input`. Mirrors iced's own `opaque` decorator pattern.
+//!
+//! On macOS it hides the Emacs-style `Ctrl` chords the same way: there, `text_input` rewrites
+//! `Ctrl-b/f/a/e/h/d` into arrows, Home/End, Backspace and Delete and captures them (even when the
+//! edit is a no-op), so the app's `Ctrl-d` close/delete in every picker never reached the core.
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{tree, Operation, Tree};
@@ -69,6 +73,17 @@ where
         intercept: Some(Box::new(intercept)),
         value,
     })
+}
+
+/// The chords iced's `text_input` turns into editing keys on macOS (`convert_macos_shortcut` in
+/// `iced_widget`): exactly `Ctrl` — no other modifier — on one of these six letters. They belong to
+/// the core, so the filter keeps them out of the input.
+fn is_emacs_chord(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> bool {
+    modifiers == iced::keyboard::Modifiers::CTRL
+        && matches!(
+            key.as_ref(),
+            iced::keyboard::Key::Character("b" | "f" | "a" | "e" | "h" | "d")
+        )
 }
 
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -151,7 +166,7 @@ where
         // inner widget, and don't capture — leaving the event `Ignored` so it bubbles to the key
         // subscription. Everything else passes through untouched.
         if let Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
-            if modifiers.alt() {
+            if modifiers.alt() || (cfg!(target_os = "macos") && is_emacs_chord(key, *modifiers)) {
                 return;
             }
             // At a field boundary, an unmodified key may be a chip gesture rather than an edit —
@@ -206,5 +221,32 @@ where
         self.content
             .as_widget_mut()
             .overlay(tree, layout, renderer, viewport, translation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_emacs_chord;
+    use iced::keyboard::{Key, Modifiers};
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    #[test]
+    fn emacs_chords_are_exactly_ctrl_on_the_six_letters() {
+        for c in ["b", "f", "a", "e", "h", "d"] {
+            assert!(is_emacs_chord(&ch(c), Modifiers::CTRL), "Ctrl-{c}");
+        }
+        // Other letters, and the six with any extra modifier, stay with the input — iced only
+        // rewrites a bare `Ctrl`.
+        assert!(!is_emacs_chord(&ch("r"), Modifiers::CTRL));
+        assert!(!is_emacs_chord(
+            &ch("d"),
+            Modifiers::CTRL | Modifiers::SHIFT
+        ));
+        assert!(!is_emacs_chord(&ch("d"), Modifiers::CTRL | Modifiers::ALT));
+        assert!(!is_emacs_chord(&ch("d"), Modifiers::empty()));
+        assert!(!is_emacs_chord(&ch("d"), Modifiers::LOGO));
     }
 }

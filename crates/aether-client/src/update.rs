@@ -6549,7 +6549,8 @@ impl Session {
             // shell's focused query input claims Ctrl-x as its native Cut and swallows it before the
             // core ever sees it — the iced forward gate in `app.rs` only forwards keys the input left
             // uncaptured, and the web `routeOverlayKey` clip filter drops Ctrl-c/v/x/a outright. Only
-            // the TUI (which forwards every Ctrl chord) would see it. Ctrl-d dodges all three.
+            // the TUI (which forwards every Ctrl chord) would see it. Ctrl-d dodges all three
+            // (on macOS only because the iced overlay inputs filter out its Emacs forward-delete).
             // GitBranches: Ctrl-d deletes the highlighted branch behind a confirm — the same
             // gesture Explorer/Files/Workspaces and Views use for "remove the highlighted thing".
             KeyCode::Char('d') if mods.ctrl && p.kind == PickerKind::GitBranches => {
