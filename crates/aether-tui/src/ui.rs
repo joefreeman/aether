@@ -5305,6 +5305,10 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
         if let Some(split) = table_at {
             let (prefix, table_part) = row.spans.split_at(split);
             let mut used = 2usize;
+            // The prefix takes the band of what *encloses* the table (a quote), read off the
+            // prefix alone: the whole row also carries the table's own stripe, and taking that
+            // painted a list item's indent as a block of stripe left of the frame.
+            let prefix_band = read_row_band(prefix);
             for rs in prefix {
                 used += rs.text.width();
                 // What stands in front of a panel — the quote bar, when the fence or table is
@@ -5312,7 +5316,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 // block showing past the one nested in it. Without this the bar cell fell back to
                 // the page and the quote's fill looked as though it stopped at the fence.
                 let mut style = read_span_style(rs.style);
-                if let Some(bg) = read_row_band(&row.spans) {
+                if let Some(bg) = prefix_band {
                     if style.bg.is_none() {
                         style = style.bg(bg);
                     }
@@ -13836,6 +13840,30 @@ mod read_surface_tests {
             striped.1.contains(&c(th().md_panel_bg)),
             "the zebra stripe is missing: {striped:?}"
         );
+    }
+
+    /// A table nested in a list item keeps its bands **inside its frame**: the item's indent in
+    /// front of the table is page, not stripe. The prefix used to take the whole row's band — the
+    /// table's own — so every banded row grew a block of stripe left of the box.
+    #[test]
+    fn a_table_in_a_list_item_bands_only_inside_its_frame() {
+        let rows = painted(
+            "8. Item:\n\n   | Name | Role |\n   | --- | --- |\n   | Ada | Eng |\n   | Bo | Des |\n",
+            44,
+            14,
+        );
+        for needle in ["Name", "Bo"] {
+            let (text, bgs) = rows
+                .iter()
+                .find(|(t, _)| t.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} row painted"));
+            let frame = text.find('│').expect("the row has a frame bar");
+            let frame_col = text[..frame].chars().count();
+            assert!(
+                bgs[..frame_col].iter().all(|bg| *bg == c(th().bg_app)),
+                "the band spills left of the frame: {text:?} {bgs:?}"
+            );
+        }
     }
 
     /// Raw HTML and front matter are shown as literal source and take **no** panel: the tone and
