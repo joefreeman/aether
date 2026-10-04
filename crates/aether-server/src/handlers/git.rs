@@ -2488,27 +2488,17 @@ fn reconcile_repo(
     let mut pushes: PendingPushes = Vec::new();
 
     for id in affected {
-        let Some((path, dirty, recorded_mtime, was_deleted)) = s.try_doc_of(id).map(|d| {
-            (
-                d.canonical_path.clone(),
-                d.dirty,
-                d.last_modified_unix_ms,
-                d.externally_deleted,
-            )
-        }) else {
+        let Some((path, dirty, was_deleted)) = s
+            .try_doc_of(id)
+            .map(|d| (d.canonical_path.clone(), d.dirty, d.externally_deleted))
+        else {
             continue;
         };
         let Some(path) = path else {
             continue; // scratch: no file to reconcile against
         };
 
-        let disk_mtime = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64);
-
-        if disk_mtime.is_none() {
+        if std::fs::metadata(&path).is_err() {
             // Gone from the working tree — checked out a ref without this file. The buffer stays
             // open with its content intact; closing it would destroy work the user can still save.
             if !was_deleted {
@@ -2518,7 +2508,7 @@ fn reconcile_repo(
                 pushes.extend(collect_buffer_state_pushes(s, id));
             }
             result.missing.push(id);
-        } else if disk_mtime == recorded_mtime && !was_deleted {
+        } else if !was_deleted && s.try_doc_of(id).is_some_and(|d| d.disk_unchanged()) {
             // Byte-identical to what we already hold (this file wasn't part of the move, or the
             // move restored it). Nothing to reload — but the baseline below still refreshes.
         } else if dirty {

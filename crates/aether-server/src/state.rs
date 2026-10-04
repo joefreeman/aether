@@ -4003,6 +4003,16 @@ pub enum LineEnding {
     Crlf,
 }
 
+/// A file's text as a document holds it — CRLF normalized to LF — and the ending it had on disk.
+fn read_normalized(path: &std::path::Path) -> std::io::Result<(String, LineEnding)> {
+    let content = std::fs::read_to_string(path)?;
+    if content.contains("\r\n") {
+        Ok((content.replace("\r\n", "\n"), LineEnding::Crlf))
+    } else {
+        Ok((content, LineEnding::Lf))
+    }
+}
+
 impl Document {
     /// Load a document from disk. Detects line endings, normalizes to LF in-memory.
     ///
@@ -4014,17 +4024,7 @@ impl Document {
         canonical: PathBuf,
         force_defer: bool,
     ) -> std::io::Result<Self> {
-        let content = std::fs::read_to_string(&canonical)?;
-        let line_ending = if content.contains("\r\n") {
-            LineEnding::Crlf
-        } else {
-            LineEnding::Lf
-        };
-        let normalized = if line_ending == LineEnding::Crlf {
-            content.replace("\r\n", "\n")
-        } else {
-            content
-        };
+        let (normalized, line_ending) = read_normalized(&canonical)?;
         let text = ropey::Rope::from_str(&normalized);
         let metadata = std::fs::metadata(&canonical).ok();
         let last_modified_unix_ms = metadata.and_then(|m| {
@@ -4615,17 +4615,7 @@ impl Document {
         let path = self.canonical_path.clone().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "buffer has no path")
         })?;
-        let content = std::fs::read_to_string(&path)?;
-        let line_ending = if content.contains("\r\n") {
-            LineEnding::Crlf
-        } else {
-            LineEnding::Lf
-        };
-        let normalized = if line_ending == LineEnding::Crlf {
-            content.replace("\r\n", "\n")
-        } else {
-            content
-        };
+        let (normalized, line_ending) = read_normalized(&path)?;
         let mtime_ms = std::fs::metadata(&path)
             .ok()
             .and_then(|m| m.modified().ok())
@@ -4650,6 +4640,31 @@ impl Document {
         // is replaced. Matches what undo/redo do.
         self.reparse_full();
         Ok(mtime_ms)
+    }
+
+    /// Whether the file at `canonical_path` still holds what this document last read from or wrote
+    /// to it, line endings included: the text itself while clean, [`Self::disk_blob`] while dirty.
+    /// Unreadable or pathless is "no".
+    ///
+    /// This, not the file's mtime, is what tells the watcher a change event changed nothing — our
+    /// own save, a touch, a rewrite with the same bytes. A write that truncates and then fills the
+    /// file can be read halfway, and both halves routinely share a millisecond, so an mtime match
+    /// would keep the half-read (often empty) text for good.
+    pub fn disk_unchanged(&self) -> bool {
+        let Some(path) = self.canonical_path.as_deref() else {
+            return false;
+        };
+        let Ok((normalized, line_ending)) = read_normalized(path) else {
+            return false;
+        };
+        if line_ending != self.line_ending {
+            return false;
+        }
+        match (&self.disk_blob, self.dirty) {
+            (_, false) => self.text == normalized.as_str(),
+            (Some(blob), true) => blob.as_slice() == normalized.as_bytes(),
+            (None, true) => false,
+        }
     }
 
     /// Overlay restored unsaved content (from a backup) onto a freshly-constructed buffer. The

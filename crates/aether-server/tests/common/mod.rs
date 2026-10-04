@@ -320,22 +320,6 @@ pub async fn settled(server: &aether_server::ServerHandle) {
         .expect("server never went quiet: deferred work is outstanding");
 }
 
-/// Stamp `path`'s modification time a few seconds into the past.
-///
-/// The mirror of [`stamp_modified_ahead`], for the watcher fixtures: a buffer records the file's
-/// mtime when it loads, and the self-save filter treats a later write with an *equal* mtime as its
-/// own. Backdating the file before it is loaded makes every subsequent write strictly newer, which
-/// sleeping before the load only achieved probabilistically — and paid for on every run.
-pub fn stamp_modified_behind(path: &std::path::Path) {
-    let file = std::fs::File::options()
-        .write(true)
-        .open(path)
-        .expect("open to stamp mtime");
-    let behind = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
-    file.set_times(std::fs::FileTimes::new().set_modified(behind))
-        .expect("set mtime");
-}
-
 /// Poll `check` until it answers `Some`, then return it. Panics after ~10s naming `what`.
 ///
 /// The alternative — sleep a fixed guess, then assert — is how a suite acquires flakes: the guess

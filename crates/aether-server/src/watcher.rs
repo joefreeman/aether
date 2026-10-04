@@ -11,8 +11,9 @@
 //! - An open working-changes view is rebuilt when anything under its repo changes — a save, a
 //!   stage, a commit — since a diff of the whole tree is what it *is*.
 //!
-//! Self-writes (the server's own `buffer/save`) are filtered out by comparing on-disk mtime
-//! against the buffer's recorded `last_modified_unix_ms`.
+//! An event counts only if the file no longer holds what the buffer last read from or wrote to it
+//! (`Document::disk_unchanged`), so self-writes (the server's own `buffer/save`) and touches change
+//! nothing. Content, not mtime: two writes in one millisecond share an mtime.
 //!
 //! Roots are watched lazily: `workspace/activate` calls [`watch_workspace_paths`] for each new
 //! workspace's roots, so cold workspaces don't waste an inotify slot.
@@ -476,7 +477,7 @@ async fn handle_event(state: &SharedState, event: Event) {
                 if !seen_docs.insert(doc_id) {
                     continue;
                 }
-                handle_buffer_event(&mut s, buf_id, path, category, &mut pushes);
+                handle_buffer_event(&mut s, buf_id, category, &mut pushes);
             }
         }
 
@@ -743,7 +744,6 @@ fn linked_worktree_workdirs(main_git_dir: &Path) -> Vec<PathBuf> {
 fn handle_buffer_event(
     s: &mut ServerState,
     buf_id: BufferId,
-    path: &Path,
     category: Category,
     pushes: &mut PendingPushes,
 ) {
@@ -761,24 +761,17 @@ fn handle_buffer_event(
             pushes.extend(crate::handlers::refresh_view_pickers(s));
         }
         Category::Create | Category::Modify => {
-            // Self-save filter: if disk mtime matches our recorded one, this is our own write.
-            let disk_mtime = std::fs::metadata(path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64);
-
-            let (recorded_mtime, was_clean, was_deleted) = match s.try_doc_of(buf_id) {
-                Some(b) => (b.last_modified_unix_ms, !b.dirty, b.externally_deleted),
-                None => return,
+            let Some(doc) = s.try_doc_of(buf_id) else {
+                return;
             };
-
-            if !was_deleted && disk_mtime.is_some() && disk_mtime == recorded_mtime {
-                // Our own save (or a touch that didn't actually change anything).
+            // Settled by content, never by mtime: a reload that read a truncate-then-write halfway
+            // recorded the finished write's mtime (or one in the same millisecond), so an mtime
+            // match would take the second half for our own save. Our save, a touch, and a rewrite
+            // with the same bytes all leave the file holding what we last read or wrote.
+            if !doc.externally_deleted && doc.disk_unchanged() {
                 return;
             }
-
-            if was_clean {
+            if !doc.dirty {
                 match reload_buffer_locked(s, buf_id) {
                     Ok((_, reload_pushes)) => pushes.extend(reload_pushes),
                     Err(e) => {

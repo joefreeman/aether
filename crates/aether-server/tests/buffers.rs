@@ -1262,10 +1262,6 @@ async fn setup_watched_buffer(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("watched.txt");
     std::fs::write(&path, initial).unwrap();
-    // Backdate the file so every subsequent external write is strictly newer than the mtime the
-    // buffer records on load — otherwise a fast back-to-back write can land on an identical mtime,
-    // which the watcher's self-save filter would mistake for our own write.
-    stamp_modified_behind(&path);
     let dir_path = dir.path().to_path_buf();
 
     let mut server = spawn_for_test("test-proj", vec![dir_path]).await.unwrap();
@@ -1331,6 +1327,57 @@ async fn watcher_reloads_clean_buffer_on_external_write() {
         "clean buffer should silently reload, not flag"
     );
     assert!(!state_push.externally_deleted);
+
+    drop(server);
+}
+
+/// A writer that truncates and then writes (`fs::write`, most tools) fires two modify events. If
+/// the reload for the first one reads the file in between, the buffer goes empty — harmless only
+/// if the second event reloads it again. Both writes commonly land in the same millisecond, so the
+/// file's mtime cannot tell the second event from our own save: a clean buffer has to be checked
+/// against what the file *holds*, or it stays empty until a manual reload.
+#[tokio::test]
+async fn watcher_recovers_a_reload_that_read_a_write_halfway() {
+    let (server, mut ws, buffer_id, path) = setup_watched_buffer("original\n").await;
+
+    async fn content(ws: &mut Ws, buffer_id: u64) -> String {
+        send_request::<BufferContent>(ws, &BufferContentParams { buffer_id })
+            .await
+            .text
+    }
+    // The truncation alone: the watcher reloads the buffer to what the file holds right now.
+    std::fs::File::create(&path).unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !content(&mut ws, buffer_id).await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the truncation never reached the buffer"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let truncated_at = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    // The write half, stamped with the truncation's own mtime — the same-millisecond case.
+    std::fs::write(&path, "rewritten\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(truncated_at))
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let text = content(&mut ws, buffer_id).await;
+        if text == "rewritten\n" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the buffer is stuck on {text:?} after the file was rewritten"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 
     drop(server);
 }
@@ -1470,6 +1517,83 @@ async fn subscribe_with_scroll_past_eof_returns_non_empty_window() {
     drop(server);
 }
 
+/// Dirty the setup's buffer with one typed character, draining the edit's own push.
+async fn dirty_watched_buffer(ws: &mut Ws, buffer_id: u64) {
+    let _edit: EditResult = send_request::<InputText>(
+        ws,
+        &InputTextParams {
+            buffer_id,
+            text: "x".into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
+    let _ = expect_notification::<ViewportLinesChanged>(ws).await;
+}
+
+/// A dirty buffer is told about a rewrite even when it keeps the mtime the buffer loaded with —
+/// the same-millisecond case an mtime self-save filter takes for our own save.
+#[tokio::test]
+async fn watcher_flags_a_dirty_buffer_on_a_rewrite_with_its_loaded_mtime() {
+    let (server, mut ws, buffer_id, path) = setup_watched_buffer("hello\n").await;
+    let loaded_at = std::fs::metadata(&path).unwrap().modified().unwrap();
+    dirty_watched_buffer(&mut ws, buffer_id).await;
+
+    std::fs::write(&path, "external content\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(loaded_at))
+        .unwrap();
+
+    let state_push =
+        expect_notification_within::<BufferState>(&mut ws, std::time::Duration::from_secs(5)).await;
+    assert_eq!(state_push.buffer_id, buffer_id);
+    assert!(state_push.externally_modified);
+
+    drop(server);
+}
+
+/// A dirty buffer is *not* told about a write that leaves the file holding what the buffer last
+/// read from it — our own save landing after the next edit, a touch, a formatter that changed
+/// nothing — however new its mtime.
+#[tokio::test]
+async fn watcher_ignores_a_write_that_leaves_a_dirty_buffers_file_as_it_was() {
+    let (server, mut ws, buffer_id, path) = setup_watched_buffer("hello\n").await;
+    // The barrier: a clean neighbour in the same directory. The watcher handles one event at a
+    // time, in order, so once the neighbour has reloaded, the rewrite below has been handled too.
+    let neighbour_path = path.with_file_name("neighbour.txt");
+    std::fs::write(&neighbour_path, "before\n").unwrap();
+    let neighbour = open_test_buffer(&mut ws, "neighbour.txt").await;
+    dirty_watched_buffer(&mut ws, buffer_id).await;
+
+    std::fs::write(&path, "hello\n").unwrap();
+    stamp_modified_ahead(&path);
+    std::fs::write(&neighbour_path, "after\n").unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while buffer_text(&mut ws, neighbour).await != "after\n" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the neighbour never reloaded"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let s = server.state.lock().await;
+    let doc = s.try_doc_of(buffer_id).unwrap();
+    assert!(doc.dirty, "the buffer kept its edit");
+    assert!(
+        !doc.externally_modified,
+        "a rewrite with the bytes the buffer loaded flagged it as changed on disk"
+    );
+    drop(s);
+
+    drop(server);
+}
+
 #[tokio::test]
 async fn watcher_flags_dirty_buffer_on_external_write() {
     let (server, mut ws, buffer_id, path) = setup_watched_buffer("hello\n").await;
@@ -1593,8 +1717,6 @@ async fn watcher_covers_open_buffer_inside_gitignored_dir() {
     std::fs::create_dir_all(root.join("generated")).unwrap();
     let path = root.join("generated/out.txt");
     std::fs::write(&path, "v1\n").unwrap();
-    // Strictly-greater mtime for the external write (see `setup_watched_buffer`).
-    stamp_modified_behind(&path);
     let root_path = root.to_path_buf();
 
     let server = spawn_for_test("test-proj", vec![root_path]).await.unwrap();
@@ -1716,9 +1838,6 @@ async fn setup_overlapping_workspaces_watched_buffer(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("watched.txt");
     std::fs::write(&path, initial).unwrap();
-    // As in `setup_watched_buffer`: keep later writes' mtimes strictly above the loaded one so
-    // the self-save filter can't mistake them for our own.
-    stamp_modified_behind(&path);
     let dir_path = dir.path().to_path_buf();
 
     let mut server = spawn_for_test_multi(vec![
