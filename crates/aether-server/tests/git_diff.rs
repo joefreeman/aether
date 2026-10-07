@@ -13646,3 +13646,68 @@ async fn version_steps_go_to_either_end() {
 
     drop(server);
 }
+
+/// A file at a revision is named where its working-tree twin lives — relative to the workspace
+/// root holding it, with that root — in its description and in its buffers row alike, so a
+/// multi-root workspace labels the version as it labels the file. Here the root sits *inside*
+/// the repo, where the repo-relative path (`crates/api/src/x.rs`) is not the path the file itself
+/// is shown by (`src/x.rs` under the `api` root). The row's opener fields stay empty: a version
+/// opens as itself, never as its working file.
+#[tokio::test]
+async fn a_version_is_named_by_its_working_files_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&base.join("repo"));
+    commit_file(&repo, "crates/api/src/x.rs", "fn x() {}\n");
+    let other = base.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let api = base.join("repo/crates/api");
+    let (server, mut ws) = setup_repos_workspace(vec![other, api]).await;
+    // The working file, through its own root — which is also what makes the repo reachable.
+    let _: ViewOpenResult = send_request::<ViewOpen>(
+        &mut ws,
+        &ViewOpenParams {
+            path_index: Some(1),
+            relative_path: Some("src/x.rs".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let opened = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root_id(&base.join("repo"))),
+            buffer_id: None,
+            target: ShowTarget::File {
+                rev: "HEAD".into(),
+                path: "crates/api/src/x.rs".into(),
+            },
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    assert_eq!(opened.title.as_deref(), Some("src/x.rs"));
+    assert_eq!(opened.title_root, Some(1), "the `api` root, second of two");
+    assert!(opened.commit.is_some());
+
+    let buffers = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Buffers)).await;
+    let rows = buffers.update.and_then(|u| u.items).expect("a window");
+    let row = rows
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::Buffer {
+                display,
+                commit: Some(_),
+                root,
+                path_index,
+                relative_path,
+                ..
+            } => Some((display.clone(), *root, *path_index, relative_path.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a row for the version: {rows:?}"));
+    assert_eq!(row, ("src/x.rs".into(), Some(1), None, None));
+
+    drop(server);
+}

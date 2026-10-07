@@ -2238,6 +2238,7 @@ impl Session {
                     cursor: Default::default(),
                     lsp_server: Default::default(),
                     title: Default::default(),
+                    title_root: None,
                     commit: Default::default(),
                     cwd: None,
                     cwd_root: None,
@@ -2304,7 +2305,15 @@ pub fn buffer_info(open: BufferDescription, roots: &[String]) -> BufferInfo {
                 let (dir, _) = crate::labels::dir_display(&labels, open.cwd_root, cwd, &[]);
                 crate::labels::Label::in_dir(title.clone(), Some(dir))
             }
-            None => crate::labels::Label::at(title.clone(), open.commit.clone()),
+            // A file at a revision under a root reads as the file does — `api: src/x.rs` —
+            // with the revision beside it.
+            None => crate::labels::Label::at(
+                match open.title_root {
+                    Some(root) => crate::labels::root_relative_display(roots, root, title),
+                    None => title.clone(),
+                },
+                open.commit.clone(),
+            ),
         },
         (None, None, Some(n)) => format!("(scratch {n})").into(),
         (None, None, None) => crate::labels::Label::from("(scratch)"),

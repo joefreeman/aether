@@ -618,16 +618,23 @@ pub enum PickerItem {
         /// The row's **view**: what selecting the row presents and what closing it closes.
         #[serde(default)]
         view_id: crate::ViewId,
-        /// What the row renders: workspace-relative path for file-backed buffers, `(scratch N)`
-        /// for scratch buffers, the bare repo-relative path for a file at a revision (whose
-        /// revision is `commit`).
+        /// What the row renders: the path relative to [`Self::Buffer::root`] for a file-backed
+        /// buffer and for a file at a revision (whose revision is `commit`), `(scratch N)` for a
+        /// scratch buffer.
         display: String,
         /// The revision the row's buffer is *as of*, abbreviated (`abc1234`) — set only for a
         /// **file at a revision**, whose `display` is then the bare path. Rendered muted after
-        /// the name, in the slot a multi-root workspace's root label takes: the two never
-        /// co-occur, since a materialised revision has no path and so no root.
+        /// the name, ahead of the row's root label.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         commit: Option<String>,
+        /// The workspace root `display` is relative to, by index — for **labelling** only: a
+        /// multi-root workspace names it after the path, muted. Set for a file-backed buffer and
+        /// for a file at a revision (its working-tree twin's root); `None` otherwise.
+        ///
+        /// Apart from `path_index` on purpose: that one says where the row *opens*, and a file at
+        /// a revision opens as itself, never as the working file its root came from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        root: Option<u32>,
         /// Save/disk state, rendered as a colour-coded dot. Omitted on the wire (and defaulting
         /// to `Clean`) for a clean buffer — the common case.
         #[serde(default, skip_serializing_if = "BufferDirtyState::is_clean")]

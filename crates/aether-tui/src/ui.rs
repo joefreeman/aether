@@ -2957,22 +2957,22 @@ fn picker_item_spans(
         );
     }
     // Buffer rows carry a dim suffix after the name — the revision a file-at-a-commit row is shown
-    // at, or the disambiguated root label in a multi-root workspace — matching the status bar and
+    // at, then the disambiguated root label in a multi-root workspace — matching the status bar and
     // the other clients. `display` is the bare relative path; the match indices index the composed
     // `"{display}  {commit}"` haystack, so a hit highlights whichever part it landed in.
     if let PickerItem::Buffer {
         buffer_id,
         display,
         commit,
+        root,
         status,
-        path_index,
         match_indices,
         transient,
         ..
     } = item
     {
         return buffer_item_spans(
-            *path_index,
+            *root,
             display,
             commit.as_deref(),
             match_indices,
@@ -3573,7 +3573,7 @@ fn file_item_spans(
 /// gets the status bar's dim ` *` after the path (closing that row exits the client).
 #[allow(clippy::too_many_arguments)]
 fn buffer_item_spans(
-    path_index: Option<u32>,
+    root: Option<u32>,
     display: &str,
     commit: Option<&str>,
     match_indices: &[u32],
@@ -3602,18 +3602,18 @@ fn buffer_item_spans(
         match_indices,
     );
 
-    // Suffix: the revision this buffer is shown at, bracketed, or — for a file inside a multi-root
-    // workspace — the dim root label, like the Files picker. Never both: a materialised revision
-    // has no path, so it has no root either, and `path_index` is `None` for it. Nothing to say (a
-    // scratch, a single-root workspace) → no suffix.
+    // Suffix: the revision this buffer is shown at, bracketed, then — in a multi-root workspace —
+    // the dim root label, like the Files picker. A file at a revision has both: its root is its
+    // working-tree twin's, so its row lines up with the file's own (`src/x.rs (abc1234)  api` under
+    // `src/x.rs  api`). Nothing to say (a scratch, a single-root workspace) → no suffix.
     //
     // **One space before the commit, two before a root label.** The two-space gap is the *haystack's*
     // join, not a rendering rule — the offsets are rebased onto the rendered text, so the gap here
     // is free to be whatever reads best, and the brackets already fence the hash off from the path.
     // A root label has no brackets and needs the wider gap to read as separate; the status bar
     // spells the commit the same single-space way (`Label::commit_suffix`).
-    let (suffix, suffix_indices) = match (commit, path_index) {
-        (Some(commit), _) => {
+    let (mut suffix, suffix_indices) = match commit {
+        Some(commit) => {
             let (text, indices) = aether_client::labels::commit_annotation(commit, &seg.second);
             const GAP: &str = " ";
             (
@@ -3624,16 +3624,14 @@ fn buffer_item_spans(
                     .collect(),
             )
         }
-        (None, Some(i)) => {
-            let label = root_label_or_blank(root_labels, i);
-            if label.is_empty() {
-                (String::new(), Vec::new())
-            } else {
-                (format!("  {label}"), Vec::new())
-            }
-        }
-        (None, None) => (String::new(), Vec::new()),
+        None => (String::new(), Vec::new()),
     };
+    if let Some(i) = root {
+        let label = root_label_or_blank(root_labels, i);
+        if !label.is_empty() {
+            suffix.push_str(&format!("  {label}"));
+        }
+    }
 
     // The tether mark: a dim ` *` after the path, before the root label — matching the status bar.
     // Upright even on a slanted transient row.
@@ -10612,6 +10610,7 @@ mod tests {
             view_id: aether_protocol::ViewId(4),
             display: "src/a.rs".into(),
             commit: Some("abc1234".into()),
+            root: None,
             status: BufferDirtyState::Clean,
             path_index: None,
             relative_path: None,
@@ -10641,6 +10640,30 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(hl, "abc", "the hit lands in the hash, not the path");
+    }
+
+    /// In a multi-root workspace a version's row carries its working file's root too — commit
+    /// first, then the root label — so it lines up under the file's own `src/a.rs  api`.
+    #[test]
+    fn buffer_row_for_a_version_names_its_commit_then_its_root() {
+        let item = PickerItem::Buffer {
+            buffer_id: 4,
+            view_id: aether_protocol::ViewId(4),
+            display: "src/a.rs".into(),
+            commit: Some("abc1234".into()),
+            root: Some(1),
+            status: BufferDirtyState::Clean,
+            path_index: None,
+            relative_path: None,
+            match_indices: vec![],
+            transient: false,
+        };
+        let labels = vec!["web".to_string(), "api".to_string()];
+        let text = spans_text(&picker_item_spans(&item, &labels, None, false, 60));
+        assert!(
+            text.starts_with("src/a.rs (abc1234)  api"),
+            "the path, its commit, then its root: {text:?}"
+        );
     }
 
     /// A whole-target entry — a file or buffer captured from the Files/view picker — has no line
@@ -10673,6 +10696,7 @@ mod tests {
             view_id: aether_protocol::ViewId(id),
             display: "notes.md".into(),
             commit: None,
+            root: None,
             status: aether_protocol::picker::BufferDirtyState::Clean,
             path_index: None,
             relative_path: None,

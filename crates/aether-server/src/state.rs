@@ -1850,12 +1850,40 @@ impl ServerState {
     /// not an agent view.
     pub fn conversation_dir(&self, buffer_id: BufferId) -> Option<(Option<u32>, String)> {
         let c = self.try_doc_of(buffer_id)?.conversation()?;
-        let roots = self
-            .workspace_for_buffer(buffer_id)
+        Some(crate::shell::dir_location(
+            &c.cwd,
+            self.roots_for_buffer(buffer_id),
+        ))
+    }
+
+    /// The roots of the workspace a buffer belongs to — empty when it has none.
+    fn roots_for_buffer(&self, buffer_id: BufferId) -> &[PathBuf] {
+        self.workspace_for_buffer(buffer_id)
             .and_then(|w| self.workspaces.get(w))
             .map(|w| w.paths.as_slice())
-            .unwrap_or_default();
-        Some(crate::shell::dir_location(&c.cwd, roots))
+            .unwrap_or_default()
+    }
+
+    /// How a **virtual** buffer is named: its title, the root that title is relative to, and the
+    /// revision beside it. `None` for a buffer with a path or none of its own name (a scratch).
+    ///
+    /// A file at a revision is named where its working-tree twin lives, as that twin is: relative
+    /// to the workspace root holding it, so the version reads as `api: src/x.rs (abc1234)` beside
+    /// the file's own `api: src/x.rs`. The generated title is repo-relative, which is a different
+    /// path whenever a root sits inside its repo. Outside every root it keeps that title.
+    pub fn virtual_name(&self, buffer_id: BufferId) -> Option<VirtualName> {
+        let source = self.try_doc_of(buffer_id)?.virtual_source.as_ref()?;
+        let (root, title) = match (source.target.repo_id(), source.target.path()) {
+            (Some(repo_id), Some(path)) => {
+                revision_location(repo_id, path, self.roots_for_buffer(buffer_id))
+            }
+            _ => (None, source.title.clone()),
+        };
+        Some(VirtualName {
+            title,
+            root,
+            commit: source.commit.clone(),
+        })
     }
 
     /// Id of the workspace a buffer belongs to. `None` if the buffer is unknown or somehow
@@ -3671,6 +3699,28 @@ impl VirtualTarget {
                 },
             },
         ))
+    }
+}
+
+/// What a virtual buffer is called — see [`ServerState::virtual_name`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualName {
+    /// The name: for a file at a revision, its path relative to [`Self::root`].
+    pub title: String,
+    /// The workspace root the title is relative to, by index; `None` for anything not under one.
+    pub root: Option<u32>,
+    /// The revision a file at a revision is shown at, abbreviated.
+    pub commit: Option<String>,
+}
+
+/// Where a file at a revision lives in a workspace: the root its working-tree twin (`repo_id`
+/// joined with the repo-relative `path`) sits under, and the path relative to that root — or no
+/// root and the repo-relative path, outside every root.
+pub fn revision_location(repo_id: &str, path: &str, roots: &[PathBuf]) -> (Option<u32>, String) {
+    let twin = Path::new(repo_id).join(path);
+    match crate::workspace_index::workspace_relative_parts(&twin, roots) {
+        Some((root, rel)) if !rel.is_empty() => (Some(root), rel),
+        _ => (None, path.to_string()),
     }
 }
 

@@ -146,10 +146,17 @@ pub struct BufferDescription {
     /// of some commit). Rendered verbatim by the client, which otherwise labels a pathless buffer
     /// `(scratch N)`.
     ///
-    /// The name alone: for a file at a revision it is the file's repo-relative path, and the
-    /// revision rides in [`Self::commit`] beside it.
+    /// The name alone: for a file at a revision it is the file's path — relative to the workspace
+    /// root at [`Self::title_root`] that holds its working-tree twin, as the file's own buffer is
+    /// named, else relative to its repository — and the revision rides in [`Self::commit`] beside
+    /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The workspace root [`Self::title`] is relative to, by index — set for a file at a revision
+    /// under one, so a multi-root workspace labels it with its root as it does the file itself.
+    /// `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_root: Option<u32>,
     /// The revision this buffer's content is *as of*, abbreviated (`abc1234`) — set only for a
     /// **file at a revision**, whose [`Self::title`] is then the bare path.
     ///

@@ -2082,6 +2082,7 @@ fn buffer_open_result_shape() {
                 workspace_root: "/proj".into(),
             }),
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -2128,6 +2129,7 @@ fn a_file_at_a_revision_carries_its_commit_beside_its_title() {
             cursor: Default::default(),
             lsp_server: None,
             title: Some("src/main.rs".into()),
+            title_root: Some(1),
             commit: Some("abc1234".into()),
             cwd: None,
             cwd_root: None,
@@ -2137,9 +2139,11 @@ fn a_file_at_a_revision_carries_its_commit_beside_its_title() {
     };
     let v = to_value(&open).unwrap();
     assert_eq!(v["title"], "src/main.rs");
+    assert_eq!(v["title_root"], 1, "the root the title is relative to");
     assert_eq!(v["commit"], "abc1234");
     let back: ViewOpenResult = from_value(v).unwrap();
     assert_eq!(back.title.as_deref(), Some("src/main.rs"));
+    assert_eq!(back.title_root, Some(1));
     assert_eq!(back.commit.as_deref(), Some("abc1234"));
     // A server that predates the field: the title still names the buffer, with no revision beside it.
     let legacy: ViewOpenResult = from_value(json!({
@@ -2148,6 +2152,10 @@ fn a_file_at_a_revision_carries_its_commit_beside_its_title() {
     }))
     .unwrap();
     assert_eq!(legacy.commit, None);
+    assert_eq!(
+        legacy.title_root, None,
+        "no root: absent, and off the wire when unset"
+    );
 }
 
 /// An open answers with the view it presented — always, since a client subscribes to it — and
@@ -2171,6 +2179,7 @@ fn buffer_open_result_reports_its_view() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -2267,6 +2276,7 @@ fn buffer_open_result_reports_reading() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -2320,6 +2330,7 @@ fn buffer_open_result_restored_scroll() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -3424,6 +3435,7 @@ fn follow_patch_line_shape() {
             cursor: Default::default(),
             lsp_server: None,
             title: Some("src/a.rs".into()),
+            title_root: None,
             commit: Some("abc1234".into()),
             cwd: None,
             cwd_root: None,
@@ -5002,6 +5014,7 @@ fn picker_item_buffer_is_tagged() {
         view_id: aether_protocol::ViewId(7),
         display: "src/main.rs".into(),
         commit: None,
+        root: None,
         status: BufferDirtyState::ExternallyModified,
         path_index: Some(0),
         relative_path: Some("src/main.rs".into()),
@@ -5031,6 +5044,7 @@ fn picker_item_buffer_is_tagged() {
         view_id: aether_protocol::ViewId(9),
         display: "(scratch 1)".into(),
         commit: None,
+        root: None,
         status: BufferDirtyState::Clean,
         path_index: None,
         relative_path: None,
@@ -5067,6 +5081,7 @@ fn picker_item_buffer_is_tagged() {
         view_id: aether_protocol::ViewId(11),
         display: "src/a.rs".into(),
         commit: Some("abc1234".into()),
+        root: Some(1),
         status: BufferDirtyState::Clean,
         path_index: None,
         relative_path: None,
@@ -5076,6 +5091,9 @@ fn picker_item_buffer_is_tagged() {
     let rv = to_value(&at_rev).unwrap();
     assert_eq!(rv["display"], "src/a.rs");
     assert_eq!(rv["commit"], "abc1234");
+    // Labelled by its working file's root, but opening nowhere but itself: no opener fields.
+    assert_eq!(rv["root"], 1);
+    assert!(rv.get("path_index").is_none() && rv.get("relative_path").is_none());
     assert_eq!(from_value::<PickerItem>(rv).unwrap(), at_rev);
     assert!(
         to_value(&scratch).unwrap().get("commit").is_none(),
@@ -5392,6 +5410,7 @@ fn buffer_description_carries_an_agent_views_cwd() {
         cursor: Default::default(),
         lsp_server: None,
         title: Some("Agent 1".into()),
+        title_root: None,
         commit: None,
         cwd: Some("crates/web".into()),
         cwd_root: Some(0),
@@ -7628,6 +7647,7 @@ fn every_subscribe_carries_the_focus_it_resolved() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -7956,6 +7976,7 @@ fn shell_start_shape() {
                 cursor: CursorState::default(),
                 lsp_server: None,
                 title: Some("Shell 1".into()),
+                title_root: None,
                 commit: None,
                 cwd: None,
                 cwd_root: None,

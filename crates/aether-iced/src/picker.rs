@@ -1412,8 +1412,8 @@ fn render_item<'a>(
             buffer_id,
             display,
             commit,
+            root,
             status,
-            path_index,
             match_indices,
             transient,
             ..
@@ -1451,10 +1451,10 @@ fn render_item<'a>(
                     text, indices, p.fg_dim, SANS, hovered, ui, p,
                 ));
             }
-            // Multi-root workspaces: the root's label, dim, after the name — same placement as the
-            // Files picker. `path_index` is `None` for scratch/external buffers and for a
-            // materialised revision (which has no path, so never both of these), so those show none.
-            if let Some(label) = path_index.and_then(|i| root_label(roots, i)) {
+            // Multi-root workspaces: the root's label, dim, after the name and any revision — same
+            // placement as the Files picker. A file at a revision carries its working-tree twin's
+            // root, so its row lines up with the file's own; scratch and external buffers have none.
+            if let Some(label) = root.and_then(|i| root_label(roots, i)) {
                 r = r.push(
                     text(label)
                         .size(ui.body())

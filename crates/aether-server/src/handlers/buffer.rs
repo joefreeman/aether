@@ -1440,6 +1440,7 @@ async fn open_restored_scratch(
             cursor,
             lsp_server: None, // scratch buffers are never language-server-backed
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -1496,6 +1497,7 @@ pub fn describe_buffer(
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
     let doc = s.doc_of(buffer_id);
     let conversation_dir = s.conversation_dir(buffer_id);
+    let named = s.virtual_name(buffer_id);
     Ok(aether_protocol::view::BufferDescription {
         buffer_id,
         language: doc.language.clone(),
@@ -1507,8 +1509,9 @@ pub fn describe_buffer(
         scratch_number: buffer.scratch_number,
         cursor,
         lsp_server: buffer_lsp_server_ref(s, buffer_id),
-        title: doc.virtual_source.as_ref().map(|v| v.title.clone()),
-        commit: doc.virtual_source.as_ref().and_then(|v| v.commit.clone()),
+        title: named.as_ref().map(|n| n.title.clone()),
+        title_root: named.as_ref().and_then(|n| n.root),
+        commit: named.and_then(|n| n.commit),
         cwd: conversation_dir.as_ref().map(|(_, cwd)| cwd.clone()),
         cwd_root: conversation_dir.and_then(|(root, _)| root),
         read_only: doc.read_only(),
@@ -2456,7 +2459,9 @@ async fn open_generated_buffer(
             scratch_number: None,
             cursor: focused,
             lsp_server: None, // no file on disk for a server to have an opinion about
+            // Placed in the workspace below, once the buffer is in it.
             title: Some(content.title),
+            title_root: None,
             commit: content.commit,
             cwd: None,
             cwd_root: None,
@@ -2474,6 +2479,11 @@ async fn open_generated_buffer(
     }
     s.buffer_workspaces
         .insert(id, active_workspace_name.clone());
+    // Named where it lives in this workspace, as every later description of it is.
+    if let Some(named) = s.virtual_name(id) {
+        result.buffer.title = Some(named.title);
+        result.buffer.title_root = named.root;
+    }
     if focused.position.line != 0 {
         set_cursor(&mut s, (client_id, id), focused);
     }
@@ -2755,8 +2765,7 @@ async fn view_open_inner(
         let path = doc.canonical_path.as_ref().map(|p| p.display().to_string());
         // The only reopen path that can meet a virtual buffer: switching back to one through the
         // view picker, which opens by id because there's no path to dispatch on.
-        let virtual_title = doc.virtual_source.as_ref().map(|v| v.title.clone());
-        let virtual_commit = doc.virtual_source.as_ref().and_then(|v| v.commit.clone());
+        let named = s.virtual_name(buffer_id);
         let conversation_dir = s.conversation_dir(buffer_id);
         let read_only = doc.read_only();
         let is_patch = doc.patch().is_some();
@@ -2785,8 +2794,9 @@ async fn view_open_inner(
                 scratch_number,
                 cursor,
                 lsp_server: buffer_lsp_server_ref(&s, buffer_id),
-                title: virtual_title,
-                commit: virtual_commit,
+                title: named.as_ref().map(|n| n.title.clone()),
+                title_root: named.as_ref().and_then(|n| n.root),
+                commit: named.and_then(|n| n.commit),
                 cwd: conversation_dir.as_ref().map(|(_, cwd)| cwd.clone()),
                 cwd_root: conversation_dir.and_then(|(root, _)| root),
                 read_only,
@@ -2858,6 +2868,7 @@ async fn view_open_inner(
                         cursor,
                         lsp_server: None, // scratch buffers are never language-server-backed
                         title: None,
+                        title_root: None,
                         commit: None,
                         cwd: None,
                         cwd_root: None,
@@ -2983,6 +2994,7 @@ async fn view_open_inner(
                     cursor,
                     lsp_server: buffer_lsp_server_ref(&s, existing),
                     title: None,
+                    title_root: None,
                     commit: None,
                     cwd: None,
                     cwd_root: None,
@@ -3176,6 +3188,7 @@ async fn view_open_inner(
             cursor,
             lsp_server: buffer_lsp_server_ref(&s, id),
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,

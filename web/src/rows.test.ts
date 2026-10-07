@@ -153,6 +153,21 @@ describe("buffer rows", () => {
     expect(d.suffixMatches).toEqual([1, 2]); // 'a', 'b' of the hash
   });
 
+  it("in a multi-root workspace, names a version's commit and then its working file's root", () => {
+    const d = describeMulti(buffer({ commit: "abc1234", root: 1, match_indices: [10] }));
+    expect(d.primary).toBe("src/a.rs");
+    expect(d.suffix).toBe("(abc1234)  docs");
+    // The commit leads the suffix, so its matches still index it directly.
+    expect(d.suffixMatches).toEqual([1]);
+  });
+
+  it("names a file's root from `root`, not from where the row opens", () => {
+    expect(describeMulti(buffer({ root: 1 })).suffix).toBe("docs");
+    expect(
+      describeMulti(buffer({ path_index: 1, relative_path: "src/a.rs" })).suffix,
+    ).toBeUndefined();
+  });
+
   it("an ordinary buffer has no commit, and its offsets index the path alone", () => {
     const d = describe_(buffer({ match_indices: [0, 4] }));
     expect(d.suffix).toBeUndefined();

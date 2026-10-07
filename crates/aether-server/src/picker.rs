@@ -34,9 +34,12 @@ pub struct BufferCandidate {
     /// through [`Self::haystack`], which is this plus the commit.
     pub display: String,
     /// The revision this buffer is *as of*, abbreviated — `Some` only for a file at a revision.
-    /// Rendered muted after the name, in the slot [`Self::path`]'s root label takes: a
-    /// materialised revision has no path, so the two never collide.
+    /// Rendered muted after the name, ahead of the root label.
     pub commit: Option<String>,
+    /// The workspace root [`Self::display`] is relative to, for the row's label — a file's own
+    /// root, or a file at a revision's working-tree twin's. Apart from [`Self::path`], which says
+    /// where the row *opens*: a revision opens as itself, never as its working file.
+    pub root: Option<u32>,
     pub status: BufferDirtyState,
     /// Workspace-relative location (root index + path) when the buffer is a file inside a root;
     /// `None` for scratch buffers / out-of-root files. Sent so the client can build an opener URL.
@@ -980,6 +983,7 @@ impl PickerCandidates {
                     view_id: c.view_id,
                     display: c.display.clone(),
                     commit: c.commit.clone(),
+                    root: c.root,
                     status: c.status,
                     path_index: c.path.as_ref().map(|(i, _)| *i),
                     relative_path: c.path.as_ref().map(|(_, r)| r.clone()),

@@ -425,18 +425,26 @@ fn dormant_candidate(
     d: &crate::state::DormantView,
     roots: &[std::path::PathBuf],
 ) -> picker_state::BufferCandidate {
-    let (display, path, commit) = match &d.source {
-        crate::state::DormantSource::File(p) => (
-            crate::workspace_index::workspace_relative_display(p, roots)
-                .unwrap_or_else(|| p.display().to_string()),
-            crate::workspace_index::workspace_relative_parts(p, roots),
-            None,
-        ),
-        crate::state::DormantSource::Scratch { number } => {
-            (format!("(scratch {number})"), None, None)
+    let (display, path, commit, root) = match &d.source {
+        crate::state::DormantSource::File(p) => {
+            let path = crate::workspace_index::workspace_relative_parts(p, roots);
+            (
+                crate::workspace_index::workspace_relative_display(p, roots)
+                    .unwrap_or_else(|| p.display().to_string()),
+                path.clone(),
+                None,
+                path.map(|(root, _)| root),
+            )
         }
-        crate::state::DormantSource::Shell { number } => (format!("Shell {number}"), None, None),
-        crate::state::DormantSource::Agent { number } => (format!("Agent {number}"), None, None),
+        crate::state::DormantSource::Scratch { number } => {
+            (format!("(scratch {number})"), None, None, None)
+        }
+        crate::state::DormantSource::Shell { number } => {
+            (format!("Shell {number}"), None, None, None)
+        }
+        crate::state::DormantSource::Agent { number } => {
+            (format!("Agent {number}"), None, None, None)
+        }
         // Named as the live view names itself, as far as the key allows: a revision is its path,
         // with the short hash beside it — the subject is generated with the content, which a
         // dormant entry hasn't paid for yet. The hash is abbreviated from the key, which holds the
@@ -444,19 +452,25 @@ fn dormant_candidate(
         // Only a file at a revision reaches here (`RowKind::of_dormant`); the other shapes stay
         // written out so the naming is total rather than leaning on the filter above.
         crate::state::DormantSource::Virtual { key } => {
+            // Placed where its working-tree twin is, as the live buffer names itself.
             let short = |rev: &str| rev.chars().take(7).collect::<String>();
-            let (display, commit) =
-                match crate::state::VirtualTarget::parse_key(key).and_then(|t| t.what().cloned()) {
-                    Some(aether_protocol::git::ShowTarget::WorkingChanges) => {
-                        ("Working changes".to_string(), None)
-                    }
-                    Some(aether_protocol::git::ShowTarget::Commit { rev }) => (short(&rev), None),
-                    Some(aether_protocol::git::ShowTarget::File { rev, path }) => {
-                        (path, Some(short(&rev)))
-                    }
-                    None => (key.clone(), None),
-                };
-            (display, None, commit)
+            let target = crate::state::VirtualTarget::parse_key(key);
+            let (display, commit, root) = match target.as_ref().and_then(|t| t.what().cloned()) {
+                Some(aether_protocol::git::ShowTarget::WorkingChanges) => {
+                    ("Working changes".to_string(), None, None)
+                }
+                Some(aether_protocol::git::ShowTarget::Commit { rev }) => (short(&rev), None, None),
+                Some(aether_protocol::git::ShowTarget::File { rev, path }) => {
+                    let repo_id = target
+                        .as_ref()
+                        .and_then(|t| t.repo_id())
+                        .unwrap_or_default();
+                    let (root, display) = crate::state::revision_location(repo_id, &path, roots);
+                    (display, Some(short(&rev)), root)
+                }
+                None => (key.clone(), None, None),
+            };
+            (display, None, commit, root)
         }
     };
     // A dormant *file* row is Clean — its content lives safely on disk; closing it just forgets the
@@ -480,6 +494,7 @@ fn dormant_candidate(
         haystack: buffer_haystack(&display, commit.as_deref()),
         display,
         commit,
+        root,
         status,
         path,
         abs_path: match &d.source {
@@ -502,24 +517,37 @@ fn buffer_candidate(
     view: &crate::state::View,
     roots: &[std::path::PathBuf],
 ) -> picker_state::BufferCandidate {
-    let display = match (doc.canonical_path.as_deref(), &doc.virtual_source) {
-        (Some(p), _) => crate::workspace_index::workspace_relative_display(p, roots)
-            .unwrap_or_else(|| p.display().to_string()),
-        // A virtual buffer is pathless but named: show the revision title rather than calling a
-        // commit's diff "(scratch 3)". For a file at a revision that title is the path alone, and
-        // `commit` below carries the revision it is shown at.
-        (None, Some(v)) => v.title.clone(),
-        (None, None) => format!(
-            "(scratch {})",
-            buf.scratch_number.map(u64::from).unwrap_or(buf.id)
-        ),
-    };
     // The (root index, relative path) the client needs for an opener URL — `None` for scratch
-    // buffers and files outside every root (display still falls back to the absolute path above).
+    // buffers and files outside every root (display still falls back to the absolute path below).
     let path = doc
         .canonical_path
         .as_deref()
         .and_then(|p| crate::workspace_index::workspace_relative_parts(p, roots));
+    let (display, root) = match (doc.canonical_path.as_deref(), &doc.virtual_source) {
+        (Some(p), _) => (
+            crate::workspace_index::workspace_relative_display(p, roots)
+                .unwrap_or_else(|| p.display().to_string()),
+            path.as_ref().map(|(root, _)| *root),
+        ),
+        // A virtual buffer is pathless but named: show the revision title rather than calling a
+        // commit's diff "(scratch 3)". A file at a revision is named where its working-tree twin
+        // lives, relative to that root as the file's own row is, and `commit` below carries the
+        // revision it is shown at.
+        (None, Some(v)) => match (v.target.repo_id(), v.target.path()) {
+            (Some(repo_id), Some(file)) => {
+                let (root, display) = crate::state::revision_location(repo_id, file, roots);
+                (display, root)
+            }
+            _ => (v.title.clone(), None),
+        },
+        (None, None) => (
+            format!(
+                "(scratch {})",
+                buf.scratch_number.map(u64::from).unwrap_or(buf.id)
+            ),
+            None,
+        ),
+    };
     let commit = doc.virtual_source.as_ref().and_then(|v| v.commit.clone());
     picker_state::BufferCandidate {
         buffer_id: buf.id,
@@ -527,6 +555,7 @@ fn buffer_candidate(
         haystack: buffer_haystack(&display, commit.as_deref()),
         display,
         commit,
+        root,
         status: buffer_dirty_state(doc),
         path,
         abs_path: doc

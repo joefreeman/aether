@@ -1713,6 +1713,7 @@ async fn jumplist_captured_from_the_buffers_picker_includes_scratch_buffers() {
                 view_id: view_of(main),
                 display: "src/main.rs".into(),
                 commit: None,
+                root: None,
                 status: Default::default(),
                 match_indices: vec![],
                 path_index: Some(0),

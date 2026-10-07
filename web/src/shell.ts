@@ -966,20 +966,21 @@ export function describePickerItem(
       };
     }
     case "buffer": {
-      // Two dim suffixes, never both: the revision a file-at-a-commit row is shown at, or — for a
-      // file in a multi-root workspace — the disambiguated root label, same placement as the Files
-      // picker (a materialised revision has no path, so no `path_index` either). `display` is the
-      // bare path and the match indices index the composed `"{display}  {commit}"` haystack, so a
-      // hit highlights whichever part it landed in.
+      // Two dim suffixes, in order: the revision a file-at-a-commit row is shown at, then — in a
+      // multi-root workspace — the disambiguated root label, same placement as the Files picker. A
+      // file at a revision has both: its root is its working-tree twin's, so its row lines up with
+      // the file's own. `display` is the bare path and the match indices index the composed
+      // `"{display}  {commit}"` haystack, so a hit highlights whichever part it landed in; the
+      // commit leads the suffix, so its matches index it as they are.
       const parts: [string, string, string] = [item.display, item.commit ?? "", ""];
       const seg = rowMatchSegments(parts, item.match_indices);
       const commit = item.commit ? commitAnnotation(item.commit, seg.second) : undefined;
-      const root =
-        labels.length > 1 && item.path_index != null ? labels[item.path_index] : undefined;
+      const root = labels.length > 1 && item.root != null ? labels[item.root] : undefined;
+      const suffix = [commit?.text, root].filter((part) => part).join("  ");
       return {
         primary: item.display,
         matches: seg.first,
-        suffix: commit?.text ?? root ?? undefined,
+        suffix: suffix || undefined,
         suffixMatches: commit?.matches,
         italic: item.transient,
         dirty: item.status && item.status !== "clean" ? item.status : undefined,

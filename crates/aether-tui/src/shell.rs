@@ -4314,6 +4314,7 @@ mod scroll_tests {
                     cursor: Default::default(),
                     lsp_server: None,
                     title: None,
+                    title_root: None,
                     commit: None,
                     cwd: None,
                     cwd_root: None,

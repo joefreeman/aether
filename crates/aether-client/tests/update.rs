@@ -429,6 +429,7 @@ fn a_gone_jumplist_entry_toasts_instead_of_opening_the_file() {
                     cursor: Default::default(),
                     lsp_server: None,
                     title: Some("Working changes".into()),
+                    title_root: None,
                     commit: None,
                     cwd: None,
                     cwd_root: None,
@@ -3728,6 +3729,34 @@ fn a_file_at_a_revision_labels_by_path_with_the_commit_beside_it() {
     assert_eq!(s.view.view_label.joined(), "src/renamed.rs");
 }
 
+/// In a multi-root workspace a file at a revision carries its working file's root, and reads as
+/// that file does — `api: src/x.rs` — with the revision beside it.
+#[test]
+fn a_file_at_a_revision_under_a_root_reads_as_the_file_does() {
+    use aether_client::session::buffer_info;
+    use aether_protocol::view::BufferDescription;
+
+    let roots = vec!["/w/web".to_string(), "/w/api".to_string()];
+    let info = buffer_info(
+        serde_json::from_value::<BufferDescription>(json!({
+            "buffer_id": 7,
+            "line_count": 3,
+            "byte_count": 20,
+            "revision": 0,
+            "saved_revision": 0,
+            "path": null,
+            "title": "src/x.rs",
+            "title_root": 1,
+            "commit": "abc1234",
+            "read_only": true,
+        }))
+        .unwrap(),
+        &roots,
+    );
+    assert_eq!(info.label.name, "api: src/x.rs");
+    assert_eq!(info.label.joined(), "api: src/x.rs (abc1234)");
+}
+
 /// An **agent view** is labelled `Agent N` with the directory its agent runs in beside it, written
 /// as a file's location is: the root's label in a multi-root workspace, and nothing at all at the
 /// root of a single-root one — where the label is empty.
@@ -4895,6 +4924,7 @@ fn jumplist_step_adopts_the_opened_entry() {
             cursor,
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -6632,6 +6662,7 @@ fn buffers_picker_close_closes_in_place() {
             view_id: aether_protocol::ViewId(buffer_id),
             display: display.into(),
             commit: None,
+            root: None,
             status,
             path_index: None,
             relative_path: None,
@@ -6721,6 +6752,7 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
             view_id: aether_protocol::ViewId(buffer_id),
             display: display.into(),
             commit: None,
+            root: None,
             status: BufferDirtyState::Clean,
             path_index: None,
             relative_path: None,
@@ -6777,6 +6809,7 @@ fn buffers_picker_ctrl_d_closes_active_buffer_and_keeps_picker_open() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -9136,6 +9169,7 @@ fn a_booted_session_carries_the_workspace_declared_projects() {
                 cursor: aether_protocol::cursor::CursorState::default(),
                 lsp_server: None,
                 title: None,
+                title_root: None,
                 commit: None,
                 cwd: None,
                 cwd_root: None,
@@ -10245,6 +10279,7 @@ fn space_x_lands_on_the_successor_the_close_hands_back() {
             cursor,
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -10701,6 +10736,7 @@ fn open_path_prompt_submits_via_open_path_rpc() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -11045,6 +11081,7 @@ fn hint_session() -> Session {
                 cursor: aether_protocol::cursor::CursorState::default(),
                 lsp_server: None,
                 title: None,
+                title_root: None,
                 commit: None,
                 cwd: None,
                 cwd_root: None,
@@ -13318,6 +13355,7 @@ fn jumplist_step_presentation_follows_the_entry_shape() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -14347,6 +14385,7 @@ fn focus_on(
             scratch_number: None,
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
@@ -16109,6 +16148,7 @@ fn a_buffer_switch_drops_a_half_recorded_session() {
             cursor: Default::default(),
             lsp_server: None,
             title: None,
+            title_root: None,
             commit: None,
             cwd: None,
             cwd_root: None,
