@@ -2419,8 +2419,13 @@ impl Shell {
     /// focused element from the server cursor, reveal it when the focus changed, and clamp the
     /// scroll — which is the viewport's own `top_visual_row`, in the padded row space the painter
     /// draws.
+    ///
+    /// A reading view just left is still painted from here while its replacement is on the way
+    /// ([`aether_client::session::ViewState::shown_read`]) — as a frame only: it is no longer this
+    /// view's document, so nothing is measured, placed or revealed from it.
     fn read_view(&mut self) -> Option<crate::app::ReadViewState> {
-        let Some(read) = self.session.view.read.as_ref() else {
+        let holding = self.session.view.holds_read();
+        let Some((read, _)) = self.session.view.shown_read() else {
             if let Some(w) = self.session.view.window.as_ref() {
                 aether_client::grid::prune_measured(&mut self.measured, &w.root);
             }
@@ -2494,12 +2499,14 @@ impl Shell {
         // Every frame, not only the ones that laid the document out: the grid's copy goes whenever
         // the view shows something else (`prune_measured`), and the scroll, the anchor and every
         // reveal resolve through it.
-        self.measured
-            .elements
-            .insert(self.session.view.focused_element, measured);
+        if !holding {
+            self.measured
+                .elements
+                .insert(self.session.view.focused_element, measured);
+        }
         // A placement the window's adoption left for this layout: the content anchor a reader toggle
         // captured, else the subscribe's scroll — the same two answers the editor places by.
-        if std::mem::take(&mut self.read_place_pending) {
+        if !holding && std::mem::take(&mut self.read_place_pending) {
             let scroll = self.subscribe_scroll;
             let placed = self
                 .session
@@ -2517,12 +2524,11 @@ impl Shell {
                 self.top_visual_row = row;
             }
         }
-        let read = self.session.view.read.as_ref().expect("checked above");
+        let (read, cursor_state) = self.session.view.shown_read().expect("checked above");
         // Two projections of the one server cursor: the block bar always marks the reading
         // position; the interactive target inverts on top of it. An extended selection adds a third
         //: the selection tint over the selected blocks' rows — and suppresses the pill
         // (display_target), one selection on screen at a time.
-        let cursor_state = self.session.view.buffer.cursor;
         let block_focus = read.display_block_focus(&cursor_state);
         let target_focus = read.display_target(&cursor_state);
         // The selected block range, as rows: first..=last row whose element's span falls inside
@@ -2581,7 +2587,7 @@ impl Shell {
             .view
             .search_landing()
             .map(|index| (index, self.session.view.buffer.cursor));
-        if landing.is_some() && landing != self.read_last_landing {
+        if !holding && landing.is_some() && landing != self.read_last_landing {
             self.read_last_landing = landing;
             self.read_last_focus = reveal;
             let index = landing.map_or(0, |(i, _)| i);
@@ -2600,7 +2606,7 @@ impl Shell {
                 }
             }
         }
-        if reveal != self.read_last_focus {
+        if !holding && reveal != self.read_last_focus {
             self.read_last_focus = reveal;
             if let Some(row) = reveal.and_then(|f| {
                 aether_client::read_layout::first_row_of_element(&rows, &read.elements, f)
@@ -2614,8 +2620,11 @@ impl Shell {
             }
         }
         // The document's height is what the grid now knows of the element, padding included, so
-        // the viewport's own clamp is the reader's.
-        self.clamp_scroll();
+        // the viewport's own clamp is the reader's. Not a held frame's: the grid is the next view's
+        // by then, and clamping against it would scroll the held document out from under itself.
+        if !holding {
+            self.clamp_scroll();
+        }
         Some(crate::app::ReadViewState {
             rows,
             bar_rows,

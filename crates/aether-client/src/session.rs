@@ -1104,6 +1104,12 @@ pub struct ViewState {
     pub window: Option<Window>,
     /// The markdown reading view of the current buffer, when active.
     pub read: Option<ReadView>,
+    /// The reading view just left, with the cursor it was showing — kept for **painting** until
+    /// the window that replaces it arrives. Leaving the reader (a toggle, an edit, a switch) is
+    /// instant, but what replaces it takes a round trip; painting the held window as an editor in
+    /// between flashed the document full-width and unplaced in every shell. Behaviour reads
+    /// [`Self::read`]; painters read [`Self::shown_read`]. Cleared by the next window adoption.
+    held_read: Option<(ReadView, CursorState)>,
     pub diagnostics: DiagnosticCounts,
     pub lsp: Option<LspServerStatus>,
     /// The document-outline symbols enclosing the cursor, outermost first — the status bar's
@@ -1149,6 +1155,53 @@ pub struct ViewState {
 }
 
 impl ViewState {
+    /// The reading view to **paint**: the live one, else the one just left while its replacement
+    /// is on the way — each with the cursor to derive focus from, so a held frame keeps its focus
+    /// bar where it was rather than following a cursor that already belongs to what comes next.
+    pub fn shown_read(&self) -> Option<(&ReadView, CursorState)> {
+        match &self.read {
+            Some(read) => Some((read, self.buffer.cursor)),
+            None => self
+                .held_read
+                .as_ref()
+                .map(|(read, cursor)| (read, *cursor)),
+        }
+    }
+
+    /// Whether a left reading view is being held for painting — no reader, and its replacement
+    /// window not here yet.
+    pub fn holds_read(&self) -> bool {
+        self.read.is_none() && self.held_read.is_some()
+    }
+
+    /// Leave the reading view: the one place it goes before its window does. It is held for the
+    /// painters ([`Self::shown_read`]) until [`Self::release_held_read`].
+    pub(crate) fn leave_read(&mut self) {
+        if let Some(read) = self.read.take() {
+            self.held_read = Some((read, self.buffer.cursor));
+        }
+    }
+
+    /// The reading view this state shows, taken out for the view that replaces it — live or
+    /// already held, it is what is on screen until that view's window arrives.
+    pub(crate) fn hand_over_read(&mut self) -> Option<(ReadView, CursorState)> {
+        let cursor = self.buffer.cursor;
+        self.read
+            .take()
+            .map(|read| (read, cursor))
+            .or_else(|| self.held_read.take())
+    }
+
+    /// Hold a reading view handed over from the view this one replaced.
+    pub(crate) fn hold_read(&mut self, held: Option<(ReadView, CursorState)>) {
+        self.held_read = held;
+    }
+
+    /// A window arrived: whatever it presents replaces the held frame.
+    pub(crate) fn release_held_read(&mut self) {
+        self.held_read = None;
+    }
+
     /// Take the pending content anchor, leaving none — for a navigation that carries it to the
     /// view it lands in rather than letting it resolve here.
     pub(crate) fn take_relayout_anchor(&mut self) -> Option<crate::grid::ScrollAnchor> {
@@ -1373,6 +1426,7 @@ impl ViewState {
             focus: Default::default(),
             window: None,
             read: None,
+            held_read: None,
             diagnostics: DiagnosticCounts::default(),
             lsp: None,
             symbol_path: Vec::new(),

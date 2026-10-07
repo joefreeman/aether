@@ -3455,7 +3455,7 @@ impl App {
                         ..container::Style::default()
                     })
                     .into()
-            } else if self.session.view.read.is_some() {
+            } else if self.session.view.shown_read().is_some() {
                 // The markdown reading view replaces the editor wholesale while active — the same
                 // status bar and overlays around it. The whole page is the app's **ground**: the
                 // well is for text you can put a cursor in, and a rendered document is read. The
@@ -6220,7 +6220,9 @@ impl App {
     fn read_view(&self) -> Element<'_, Message> {
         let ui = self.ui();
         let p = self.palette();
-        let Some(read) = self.session.view.read.as_ref() else {
+        // The *shown* reading view: one just left stays painted, with the cursor it was showing,
+        // until the window replacing it arrives — rather than its document flashing up as an editor.
+        let Some((read, cursor_state)) = self.session.view.shown_read() else {
             return iced::widget::Space::new().into();
         };
         let body = self.session.editor_font_size as f32 * READ_SCALE;
@@ -6229,7 +6231,6 @@ impl App {
         // position; the target pill inverts the interactive span the cursor sits inside, on top of
         // it. An extended selection adds the NORD2 tint over its blocks and suppresses the pill
         // (`display_target`).
-        let cursor_state = self.session.view.buffer.cursor;
         let block_span = read
             .display_block_focus(&cursor_state)
             .map(|i| read.elements[i].span());

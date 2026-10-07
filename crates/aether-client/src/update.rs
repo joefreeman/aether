@@ -3618,7 +3618,7 @@ impl Session {
         if open.read != self.view.read.is_some() {
             let sneak_fx = self.cancel_sneak_on(self.view.buffer.buffer_id);
             self.view.rebind(open, &self.workspace_paths);
-            self.view.read = None;
+            self.view.leave_read();
             if self.view.mode == Mode::Read {
                 self.view.mode = Mode::Normal;
             }
@@ -3649,10 +3649,14 @@ impl Session {
         // render again with nothing here thinking it is sneaking. Cancel before the swap, while the
         // buffer they belong to is still the one we can name.
         let sneak_fx = self.cancel_sneak_on(self.view.buffer.buffer_id);
+        // What is on screen stays there until the new view's window replaces it — and a reading
+        // view stays one, rather than its document flashing up as an editor in between.
+        let held = self.view.hand_over_read();
         // One assignment, where this was sixteen hand-written resets that nothing checked. Anything
         // that must *survive* a switch — the sticky presentation preferences, the mirrors of
         // server-side follows — lives on the session and is untouched here by construction.
         self.view = ViewState::from_open(open, &self.workspace_paths);
+        self.view.hold_read(held);
         // Not view state, but bound to whatever was on screen when it opened, so a switch dismisses
         // it: a modal prompt is the session's, and it has nowhere to return to.
         self.prompt = None;
@@ -3742,7 +3746,9 @@ impl Session {
     fn sync_read_presentation(&mut self) -> Effects {
         let buffer_id = self.view.buffer.buffer_id;
         let Some((blocks, source)) = self.window_prose() else {
-            // The editor. A pending cross-file anchor could only have landed in a reading view.
+            // The editor, arrived: it replaces whatever reading view was held for painting until
+            // now. A pending cross-file anchor could only have landed in a reading view.
+            self.view.release_held_read();
             self.pending_read_anchor = None;
             if self.view.read.take().is_some() && self.view.mode == Mode::Read {
                 self.view.mode = Mode::Normal;
@@ -3767,6 +3773,8 @@ impl Session {
             .expect("checked above");
         let mut fx = Effects::none();
         if self.view.read.is_none() {
+            // The reading view this window carries replaces any one held from before it.
+            self.view.release_held_read();
             self.view.mode = Mode::Read;
             self.view.pending = Pending::None;
             self.view.count = None;
@@ -11962,7 +11970,7 @@ impl Session {
     /// destination mode, and asks for the source with [`Self::set_read`], or the next pushed
     /// window would bring the reading view straight back.
     fn read_exit_for_edit(&mut self) {
-        self.view.read = None;
+        self.view.leave_read();
         if self.view.mode == Mode::Read {
             self.view.mode = Mode::Normal;
         }
@@ -13333,6 +13341,71 @@ mod tests {
         let _ = s.sync_read_presentation();
         assert!(s.view.read.is_none());
         assert_eq!(s.view.mode, Mode::Normal);
+    }
+
+    /// Leaving the reader is instant, its replacement a round trip away: in between, the reading
+    /// view is **held** for the painters — still shown, with the cursor it was showing, while
+    /// behaviour already sees the editor — and the window that arrives next releases it, whichever
+    /// presentation it carries. A switch hands the held view to the view that replaces it.
+    #[test]
+    fn a_left_reading_view_is_held_until_its_replacement_arrives() {
+        let mut s = reading_session();
+        s.view.window = Some(prose_window("# Title\n\nbody\n"));
+        let _ = s.sync_read_presentation();
+        s.view.buffer.cursor.position = LogicalPosition { line: 2, col: 0 };
+
+        // An edit transition leaves it: behaviour sees no reader, the painters still do.
+        s.read_exit_for_edit();
+        assert!(s.view.read.is_none());
+        assert!(s.view.holds_read());
+        s.view.buffer.cursor.position = LogicalPosition { line: 0, col: 0 };
+        let (_, cursor) = s.view.shown_read().expect("held for painting");
+        assert_eq!(
+            cursor.position.line, 2,
+            "the focus it was showing, not the new cursor's"
+        );
+
+        // The editor's window arrives and takes the frame's place.
+        s.view.window = Some(editor_window(s.view.buffer.buffer_id));
+        let _ = s.sync_read_presentation();
+        assert!(!s.view.holds_read());
+        assert!(s.view.shown_read().is_none());
+
+        // A switch away from a reading view hands it to the view that replaces it…
+        let mut s = reading_session();
+        s.view.window = Some(prose_window("# Title\n\nbody\n"));
+        let _ = s.sync_read_presentation();
+        let _ = s.adopt_switch(aether_protocol::view::ViewOpenResult {
+            view_id: aether_protocol::ViewId(99),
+            scroll: None,
+            transient: true,
+            read: true,
+            buffer: aether_protocol::view::BufferDescription {
+                buffer_id: 99,
+                language: Some("markdown".into()),
+                line_count: 1,
+                byte_count: 8,
+                revision: 0,
+                saved_revision: 0,
+                path: Some("/proj/docs/b.md".into()),
+                scratch_number: None,
+                cursor: CursorState::default(),
+                lsp_server: None,
+                title: None,
+                commit: None,
+                cwd: None,
+                cwd_root: None,
+                read_only: false,
+                is_patch: false,
+            },
+        });
+        assert_eq!(s.view.buffer.buffer_id, 99);
+        assert!(s.view.holds_read(), "still on screen across the switch");
+        // …until that view's own window lands — a reading view of its own, here.
+        s.view.window = Some(prose_window("# Other\n"));
+        let _ = s.sync_read_presentation();
+        assert!(!s.view.holds_read());
+        assert!(s.view.read.is_some());
     }
 
     /// Cross-file anchors: following `[x](./other.md#section)` opens the file and arms the

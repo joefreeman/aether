@@ -36,6 +36,9 @@ export interface ReadDoc {
    *  intersecting top-level blocks tint `.md-selected`. Null while the cursor is a point. */
   selection_span?: MdSpan | null;
   buffer_id: number;
+  /** The reading view was just left and this is it **held** for painting until the window that
+   *  replaces it arrives: still on screen, but no longer what keys act on. */
+  held: boolean;
   /** Content revision the document was parsed at — the shell's DOM-rebuild key. */
   revision: number;
   /** Bumped as fence highlights land — the rebuild key's second half. */
@@ -97,6 +100,7 @@ export function renderReply(container: HTMLElement, blocks: MdBlock[]): void {
     focus_span: null,
     target_span: null,
     buffer_id: 0,
+    held: false,
     revision: 0,
     hl_gen: 0,
     parse_gen: 0,

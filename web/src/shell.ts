@@ -2960,7 +2960,8 @@ export class Shell {
     // view is *left* (the reader toggle) arrives before the render that clears the flag, and it is the
     // editor's grid that reveal positions.
     const v = this.view();
-    if (v.read !== null) return;
+    // A reading view held through the gap before its replacement arrives is already left.
+    if (v.read !== null && !v.read.held) return;
     if (!v.window) return;
     const cl = v.buffer.cursor.position.line;
     // Only a **cursor** waits on a line. A button's row is in the tree already, and a folded block

@@ -114,12 +114,15 @@ pub fn build_view(s: &Session) -> Value {
 /// one server cursor, so the shell carries no focus state of its own. `focus_span` is block-grain
 /// (always present for a non-empty document); `target_span` is the interactive span the cursor sits
 /// inside, absent otherwise.
+///
+/// The *shown* reading view: one just left stays here, with the cursor it was showing, until the
+/// window replacing it arrives — the shell keeps the document, its centring and its focus on
+/// screen through the gap rather than repainting it as an editor.
 fn read_view(s: &Session) -> Value {
-    let Some(read) = &s.view.read else {
+    let Some((read, cursor)) = s.view.shown_read() else {
         return Value::Null;
     };
     let span_json = |sp: aether_client::markdown::Span| json!({ "start": sp.start, "end": sp.end });
-    let cursor = s.view.buffer.cursor;
     let block = read
         .display_block_focus(&cursor)
         .map(|i| read.elements[i].span());
@@ -142,6 +145,8 @@ fn read_view(s: &Session) -> Value {
         "target_span": target.map(span_json),
         "selection_span": selection,
         "buffer_id": read.buffer_id,
+        // Left, and held on screen until its replacement arrives: painted, not acted on.
+        "held": s.view.holds_read(),
         // Rebuild keys for the shell: the DOM is rebuilt only when the parsed content or the
         // fence highlights change (focus changes just re-mark), so images aren't re-fetched on
         // unrelated re-renders.
