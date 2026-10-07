@@ -49,7 +49,7 @@ use aether_protocol::path::{PathDelete, PathRename};
 use aether_protocol::picker::{PickerHide, PickerQuery, PickerSelect, PickerSetGroup, PickerView};
 use aether_protocol::search::{SearchClear, SearchSet, SearchStep};
 use aether_protocol::settings::{SettingsGet, SettingsSet};
-use aether_protocol::shell::{ShellCancel, ShellRun, ShellStart};
+use aether_protocol::shell::{ShellCancel, ShellDelete, ShellRun, ShellStart};
 use aether_protocol::sneak::{SneakCancel, SneakSelect, SneakUpdate};
 use aether_protocol::syntax::SyntaxHighlightSnippet;
 use aether_protocol::view::ViewSubmitInput;
@@ -634,6 +634,7 @@ async fn dispatch(
         ShellStart::NAME => run!(ShellStart, handlers::shell_start),
         ShellRun::NAME => run!(ShellRun, handlers::shell_run),
         ShellCancel::NAME => run!(ShellCancel, handlers::shell_cancel),
+        ShellDelete::NAME => run!(ShellDelete, handlers::shell_delete),
         ViewSubmitInput::NAME => run!(ViewSubmitInput, handlers::view_submit_input),
         ActivityCancel::NAME => run!(ActivityCancel, handlers::activity_cancel),
         AgentStart::NAME => run!(AgentStart, handlers::agent_start),

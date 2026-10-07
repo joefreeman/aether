@@ -635,6 +635,10 @@ pub struct DormantView {
     /// ([`ServerState::drop_transient_dormant`]), because an unopened one is re-written on every
     /// persist and would otherwise never die.
     pub transient: bool,
+    /// A shell or conversation whose view was **closed**: kept and listed, but not open — so the
+    /// workspace never resumes onto it ([`ServerState::first_dormant_view`]). Every other row was
+    /// open when its session was recorded; it is dormant only because nobody has looked yet.
+    pub closed: bool,
     /// What to materialize: a file (by path) or a scratch (by per-workspace number, whose unsaved
     /// content is restored from its backup).
     pub source: DormantSource,
@@ -704,6 +708,8 @@ pub struct DormantPresentation {
     pub read: bool,
     /// The view was a **preview**, and comes back as one.
     pub transient: bool,
+    /// A shell or conversation whose view was closed — see [`DormantView::closed`].
+    pub closed: bool,
 }
 
 impl DormantView {
@@ -712,6 +718,7 @@ impl DormantView {
         DormantPresentation {
             read: self.read,
             transient: self.transient,
+            closed: self.closed,
         }
     }
 
@@ -992,6 +999,21 @@ impl ServerState {
                     || c.blocks.iter().any(|b| b.buffer == buffer_id)
             })
             .map(|(_, c)| c)
+    }
+
+    /// Whether the shell `id` presents holds nothing at all: no run, nothing queued, and nothing
+    /// typed. Such a shell is discarded rather than kept when its view closes, and deleted without
+    /// asking. `false` for a buffer that is not a shell.
+    pub fn shell_is_empty(&self, id: BufferId) -> bool {
+        self.try_doc_of(id)
+            .and_then(|d| d.transcript())
+            .is_some_and(|t| {
+                t.runs.is_empty()
+                    && t.queue.is_empty()
+                    && self
+                        .try_doc_of(t.input)
+                        .is_none_or(|d| d.text.len_chars() == 0)
+            })
     }
 
     /// Whether the conversation `id` presents holds nothing at all: no block, and nothing typed.
@@ -3095,7 +3117,11 @@ impl ServerState {
                 // at activation exactly as a scratch's is.
                 if let VirtualTarget::Shell { number, .. } = source.target {
                     if seen_shell.insert(number) {
-                        out.push(SessionView::Shell { number, transient });
+                        out.push(SessionView::Shell {
+                            number,
+                            transient,
+                            closed: false,
+                        });
                     }
                     continue;
                 }
@@ -3105,7 +3131,11 @@ impl ServerState {
                 // only finds buffers that are already live.
                 if let VirtualTarget::Agent { number, .. } = source.target {
                     if seen_agent.insert(number) {
-                        out.push(SessionView::Agent { number, transient });
+                        out.push(SessionView::Agent {
+                            number,
+                            transient,
+                            closed: false,
+                        });
                     }
                     continue;
                 }
@@ -3150,6 +3180,7 @@ impl ServerState {
                         out.push(SessionView::Shell {
                             number: *number,
                             transient: d.transient,
+                            closed: d.closed,
                         });
                     }
                 }
@@ -3158,6 +3189,7 @@ impl ServerState {
                         out.push(SessionView::Agent {
                             number: *number,
                             transient: d.transient,
+                            closed: d.closed,
                         });
                     }
                 }
@@ -3303,10 +3335,13 @@ impl ServerState {
     /// The reserved view of `workspace_name`'s most recently used dormant row — what a client
     /// lands on after a cold restore, when nothing is live yet.
     pub fn first_dormant_view(&self, workspace_name: &str) -> Option<ViewId> {
+        // Never a closed shell or conversation: its view was closed, so it is listed, not open,
+        // and resuming onto it would bring back what you closed.
         self.workspaces
             .get(workspace_name)?
             .dormant_views
-            .first()
+            .iter()
+            .find(|d| !d.closed)
             .map(|d| d.view)
     }
 
@@ -7111,6 +7146,7 @@ mod workspace_state_tests {
                 view: ViewId(d1),
                 read: false,
                 transient: false,
+                closed: false,
                 source: DormantSource::File(PathBuf::from("/p/c.rs")),
                 summary: None,
             },
@@ -7119,6 +7155,7 @@ mod workspace_state_tests {
                 view: ViewId(d_dup),
                 read: false,
                 transient: false,
+                closed: false,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
                 summary: None,
             },
@@ -7160,6 +7197,7 @@ mod workspace_state_tests {
                 view: ViewId(id),
                 read: false,
                 transient,
+                closed: false,
                 source: DormantSource::File(PathBuf::from(path)),
                 summary: None,
             }
@@ -7222,6 +7260,7 @@ mod workspace_state_tests {
                 DormantPresentation {
                     read: true,
                     transient: false,
+                    closed: false,
                 },
                 DormantPresentation::default(),
             ],
@@ -7263,6 +7302,7 @@ mod workspace_state_tests {
                 view: ViewId(d1),
                 read: false,
                 transient: false,
+                closed: false,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
                 summary: None,
             },
@@ -7271,6 +7311,7 @@ mod workspace_state_tests {
                 view: ViewId(d2),
                 read: false,
                 transient: false,
+                closed: false,
                 source: DormantSource::File(PathBuf::from("/p/b.rs")),
                 summary: None,
             },
@@ -7314,6 +7355,7 @@ mod workspace_state_tests {
                 view: ViewId(scratch),
                 read: false,
                 transient: false,
+                closed: false,
                 source: DormantSource::Scratch { number: 1 },
                 summary: None,
             },
@@ -7322,6 +7364,7 @@ mod workspace_state_tests {
                 view: ViewId(file),
                 read: false,
                 transient: false,
+                closed: false,
                 source: DormantSource::File(PathBuf::from("/p/a.rs")),
                 summary: None,
             },
@@ -7467,6 +7510,7 @@ mod workspace_state_tests {
             view: ViewId(n),
             read: false,
             transient: false,
+            closed: false,
             source: DormantSource::File(PathBuf::from(path)),
             summary: None,
         };

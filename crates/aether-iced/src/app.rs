@@ -7797,6 +7797,10 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::DeleteConversation { title } => {
             format!("Delete {title} — its conversation can't be recovered")
         }
+        // A shell's counterpart: closing its view keeps the transcript; this throws it away.
+        ConfirmKind::DeleteShell { title } => {
+            format!("Delete {title} — its transcript can't be recovered")
+        }
         ConfirmKind::Delete { noun, name } => format!("Delete {noun} \"{name}\""),
         ConfirmKind::RemoveRoot { path } => format!("Remove root \"{path}\""),
         ConfirmKind::RemoveProject { path } => format!("Stop pinning project \"{path}\""),

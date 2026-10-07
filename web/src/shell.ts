@@ -280,6 +280,7 @@ type ConfirmKind =
   | { kind: "close_running_shell"; title: string }
   | { kind: "close_busy_agent"; title: string }
   | { kind: "delete_conversation"; title: string }
+  | { kind: "delete_shell"; title: string }
   | { kind: "delete"; noun: string; name: string }
   | { kind: "remove_root"; path: string }
   | { kind: "remove_project"; path: string }
@@ -335,6 +336,9 @@ function confirmMessage(c: ConfirmKind): string {
     // The one irreversible step for a conversation: closing its view keeps it.
     case "delete_conversation":
       return `Delete ${c.title} — its conversation can't be recovered?`;
+    // A shell's counterpart: closing its view keeps the transcript.
+    case "delete_shell":
+      return `Delete ${c.title} — its transcript can't be recovered?`;
     case "delete":
       return `Delete ${c.noun} "${c.name}"?`;
     case "remove_root":

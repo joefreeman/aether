@@ -234,9 +234,12 @@ caret is there:
 caret out to the transcript and back, where `Enter` opens the file the line under the cursor names
 and edits are refused.
 
-Closing a shell (`Space x`, or `Ctrl-d` on its row) ends it. Closing an agent conversation stops
-the agent but keeps the conversation in `Space a`, where opening it reads it back and the next
-prompt picks up where it left off; `Ctrl-d` on its row deletes it, asking first if anything was said.
+Closing never deletes. Closing a shell (`Space x`, asking first if a command is running) stops its
+process but keeps its transcript in `Space h`, where opening it reads it back. Closing an agent
+conversation stops the agent but keeps the conversation in `Space a`, where opening it reads it back
+and the next prompt picks up where it left off. `Ctrl-d` on either row deletes it, asking first if
+there is anything to lose. A close lands on where you were before, else the most recent open view;
+closing the last one opens a blank scratch, and closing that does nothing.
 
 A task is a shortcut for starting a shell. `Space t` lists the justfile recipes, Makefile targets,
 `package.json` scripts and mise tasks defined in the current file's directory and each directory

@@ -15700,21 +15700,21 @@ fn closing_a_busy_agent_confirms() {
     assert!(find_request(&fx, "view/close").is_some());
 }
 
-/// `Ctrl-d` in the shells picker goes through the same gate, reading the row's own badge instead
-/// of the focused view's state — the picker can close something you are not looking at, so the
-/// current view says nothing about it. In the agents picker it deletes, asking whenever the row
-/// says there is something to lose.
+/// `Ctrl-d` in the shells picker **deletes** — closing a shell's view is what keeps it — reading
+/// the row's own state, since the picker can delete something you are not looking at: a shell that
+/// has run anything asks first (running or not: one question, the delete's), one that never ran
+/// anything goes straight away. The agents picker is the same, by its `empty` flag.
 #[test]
-fn picker_ctrl_d_confirms_a_running_row_and_closes_an_idle_one() {
+fn picker_ctrl_d_deletes_a_shell_asking_first_unless_it_never_ran() {
     use aether_client::session::{ConfirmKind, Prompt};
     use aether_protocol::picker::{AgentRowState, PickerItem, PickerKind};
 
-    let shell_row = |view_id: u64, title: &str, running: bool| PickerItem::Shell {
+    let shell_row = |view_id: u64, title: &str, running: bool, ran: bool| PickerItem::Shell {
         view_id: ViewId(view_id),
         title: title.into(),
         cwd: "~/proj".into(),
         cwd_root: None,
-        last_command: Some("cargo test".into()),
+        last_command: ran.then(|| "cargo test".into()),
         running,
         exit: None,
         elapsed_ms: None,
@@ -15727,36 +15727,44 @@ fn picker_ctrl_d_confirms_a_running_row_and_closes_an_idle_one() {
     {
         let p = s.picker.as_mut().unwrap();
         p.items = vec![
-            shell_row(31, "Shell 1", true),
-            shell_row(32, "Shell 2", false),
+            shell_row(31, "Shell 1", true, true),
+            shell_row(32, "Shell 2", false, true),
+            shell_row(33, "Shell 3", false, false),
         ];
         p.offset = 0;
-        p.total_matches = 2;
+        p.total_matches = 3;
         p.selected = 0;
     }
-    let fx = ctrl(&mut s, 'd');
-    assert!(
-        find_request(&fx, "view/close").is_none(),
-        "a running shell asks first"
-    );
-    match &s.prompt {
-        Some(Prompt::Confirm {
-            kind: ConfirmKind::CloseRunningShell { title },
-            ..
-        }) => assert_eq!(title, "Shell 1"),
-        other => panic!("expected a running-shell confirm, got {other:?}"),
+    for (selected, view_id, title) in [(0, 31, "Shell 1"), (1, 32, "Shell 2")] {
+        s.picker.as_mut().unwrap().selected = selected;
+        let fx = ctrl(&mut s, 'd');
+        assert!(
+            find_request(&fx, "shell/delete").is_none(),
+            "{title} has a transcript to lose, so it asks first"
+        );
+        match &s.prompt {
+            Some(Prompt::Confirm {
+                kind: ConfirmKind::DeleteShell { title: asked },
+                ..
+            }) => assert_eq!(asked, title),
+            other => panic!("expected a delete confirm, got {other:?}"),
+        }
+        let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
+        let delete = find_request(&fx, "shell/delete").expect("the confirm deletes it");
+        assert_eq!(delete["view_id"], json!(view_id));
+        assert!(
+            find_request(&fx, "view/close").is_none(),
+            "a delete, not a close"
+        );
     }
-    let fx = s.on_key(KeyCode::Char('y'), Mods::NONE, Some("y".into()));
-    let close = find_request(&fx, "view/close").expect("the confirm closes it");
-    assert_eq!(close["view_id"], json!(31));
 
-    // The idle row closes straight away.
-    s.picker.as_mut().unwrap().selected = 1;
+    // A shell that never ran anything has nothing to lose: it goes straight away.
+    s.picker.as_mut().unwrap().selected = 2;
     let fx = ctrl(&mut s, 'd');
     assert!(s.prompt.is_none());
     assert_eq!(
-        find_request(&fx, "view/close").expect("closes")["view_id"],
-        json!(32)
+        find_request(&fx, "shell/delete").expect("deletes")["view_id"],
+        json!(33)
     );
 
     // A conversation **deletes** rather than closes — closing its view is what keeps it — and asks

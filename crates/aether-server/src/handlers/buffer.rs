@@ -19,35 +19,36 @@ use super::*;
 /// pushed the other way — the closed view is gone, not left. Every other client the close *moves*
 /// gets the same rule applied to its own trail, as far as the `view/closed` push can name it.
 ///
-/// **Closing a conversation's view keeps the conversation** ([`ConversationClose::Keep`]): its agent
-/// stops, and it stays in the agents picker as a dormant row over its snapshot — the state a
-/// restart leaves it in. Deleting one is `agent/delete`, the other half of [`close_view`].
+/// **Closing never deletes** ([`CloseMode::Keep`]). A conversation's agent stops and a shell's
+/// process does, and each stays in its picker as a dormant row over its snapshot — the state a
+/// restart leaves it in. Deleting one is `agent/delete` or `shell/delete`, the other half of
+/// [`close_view`].
 pub async fn view_close(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: ViewCloseParams,
 ) -> Result<aether_protocol::view::ViewCloseResult, RpcError> {
-    close_view(state, ctx, params, ConversationClose::Keep).await
+    close_view(state, ctx, params, CloseMode::Keep).await
 }
 
-/// What closing a conversation's view does to the conversation.
+/// What closing a shell's or a conversation's view does to the record behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConversationClose {
+pub enum CloseMode {
     /// Keep it as a dormant row — `view/close`. Only when there is something to keep and its
-    /// snapshot is on disk to come back from: an empty conversation, or one in a workspace with
-    /// nowhere to write it (an ephemeral one, backups off), is discarded instead.
+    /// snapshot is on disk to come back from: an empty one, or one in a workspace with nowhere to
+    /// write it (an ephemeral one, backups off), is discarded instead.
     Keep,
-    /// Discard it, snapshot and all — `agent/delete`.
+    /// Discard it, snapshot and all — `agent/delete`, `shell/delete`.
     Discard,
 }
 
-/// [`view_close`], with what happens to a conversation said outright. Everything that is not a
-/// conversation closes the same either way.
+/// [`view_close`], with what happens to a shell or a conversation said outright. Everything else
+/// closes the same either way.
 pub async fn close_view(
     state: &SharedState,
     ctx: &mut ConnectionCtx,
     params: ViewCloseParams,
-    conversation: ConversationClose,
+    mode: CloseMode,
 ) -> Result<aether_protocol::view::ViewCloseResult, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
@@ -141,6 +142,26 @@ pub async fn close_view(
             }
         }
         return Err(RpcError::buffer_not_found(buffer_id));
+    }
+    // **Closing the last thing open, when it is a blank scratch, does nothing.** There is nothing
+    // behind it to land on, so the close could only tear it down and open another blank scratch
+    // in its place — the same nothing under a new number. The view stays, and the client is
+    // handed it back as its landing.
+    if params.open_next && is_blank_scratch(&s, buffer_id) && !other_view_open(&s, params.view_id) {
+        drop(s);
+        let opened = view_open(
+            state,
+            ctx,
+            ViewOpenParams {
+                view_id: Some(params.view_id),
+                ..Default::default()
+            },
+        )
+        .await?;
+        return Ok(aether_protocol::view::ViewCloseResult {
+            next_view_id: Some(params.view_id),
+            opened: Some(opened),
+        });
     }
     // Any *other* client viewing this buffer is about to have it pulled out from under it — capture
     // them before teardown drops their viewports, so we can tell them to switch (see below).
@@ -236,20 +257,51 @@ pub async fn close_view(
     // Kept only when there is something to keep and the record it would come back from is on
     // disk — written here, now, so a row is never listed over a snapshot that is not there.
     let keep_agent = agent.is_some()
-        && conversation == ConversationClose::Keep
+        && mode == CloseMode::Keep
         && !s.conversation_is_empty(buffer_id)
         && s.snapshot_agent(buffer_id);
+    // A shell is kept on the same terms: something in it, and a close rather than a delete.
+    let keep_shell =
+        shell_number.is_some() && mode == CloseMode::Keep && !s.shell_is_empty(buffer_id);
     // Canonical teardown (drops the buffer + all its per-client slices, sends LSP `didClose`,
     // clears diagnostics, and tears down the language server if this was its last buffer).
     let stopped_server = s.close_buffer(buffer_id);
-    // A shell writes itself down as it is torn down, so a workspace switch cannot lose it. This
-    // is an explicit close — a discard — so the snapshot goes again.
+    // A shell writes itself down as it is torn down, so a workspace switch cannot lose it. Kept,
+    // it is listed again as a row over that snapshot — the "Shell N" a restart brings back, first
+    // among the dormant ones since it was the last seen. Deleted, or with nothing worth keeping,
+    // the snapshot goes again. A row is only listed over a snapshot that is there: a workspace
+    // with nowhere to write one (backups off, an ephemeral one) discards.
     if let (Some(ws), Some(number), Some(root)) = (
         owning_workspace.as_deref(),
         shell_number,
-        s.backups_path.as_deref(),
+        s.backups_path.clone(),
     ) {
-        crate::backup::delete(&crate::backup::shell_backup_path(root, ws, number));
+        let source = crate::state::DormantSource::Shell { number };
+        let summary = keep_shell
+            .then(|| crate::state::DormantSummary::read(&root, ws, &source))
+            .flatten();
+        match summary {
+            Some(summary) => {
+                let id = s.allocate_buffer_id();
+                let view = s.allocate_view_id();
+                if let Some(entry) = s.workspaces.get_mut(ws) {
+                    entry.dormant_views.insert(
+                        0,
+                        crate::state::DormantView {
+                            id,
+                            view,
+                            read: false,
+                            transient: false,
+                            // Closed: listed, but never resumed onto.
+                            closed: true,
+                            source,
+                            summary: Some(summary),
+                        },
+                    );
+                }
+            }
+            None => crate::backup::delete(&crate::backup::shell_backup_path(&root, ws, number)),
+        }
     }
     // A conversation goes dormant or goes. Teardown stopped its agent and wrote it down either way
     // (as a workspace switch's would); kept, it is listed again as a row over that snapshot, first
@@ -267,6 +319,8 @@ pub async fn close_view(
                         view,
                         read: false,
                         transient: false,
+                        // Closed: listed, but never resumed onto.
+                        closed: true,
                         source: crate::state::DormantSource::Agent { number },
                         summary: Some(crate::state::DormantSummary::Agent(
                             crate::agent::SnapshotSummary { cwd },
@@ -346,6 +400,31 @@ pub async fn close_view(
         next_view_id,
         opened,
     })
+}
+
+/// A scratch with nothing in it: no path, nothing generated, no text, nothing unsaved.
+fn is_blank_scratch(s: &ServerState, buffer_id: BufferId) -> bool {
+    s.try_doc_of(buffer_id).is_some_and(|d| {
+        d.canonical_path.is_none()
+            && d.virtual_source.is_none()
+            && d.generated.is_none()
+            && !d.dirty
+            && d.text.len_chars() == 0
+    })
+}
+
+/// Whether the workspace holding `view` has any other view open — anything a close of `view` could
+/// land on.
+fn other_view_open(s: &ServerState, view: ViewId) -> bool {
+    let Some(workspace) = s
+        .try_presenting_buffer(view)
+        .and_then(|b| s.workspace_for_buffer(b))
+    else {
+        return false;
+    };
+    s.views
+        .iter()
+        .any(|(id, v)| *id != view && s.workspace_for_buffer(v.presenting) == Some(workspace))
 }
 
 /// Where a close puts the client that asked for it: the step back its history would have taken —
@@ -3573,11 +3652,13 @@ mod next_buffer_tests {
         (st, client_id)
     }
 
-    /// After a session restore, closing the last live view should land on the most-recent dormant
-    /// row's view (which `view/open` materializes) rather than returning `None` — which is what
-    /// makes the client spawn a blank scratch.
+    /// A close lands only on something open. Dormant rows — restored files nobody has looked at,
+    /// shells and conversations whose views were closed — are listed, not open, so with nothing
+    /// open the answer is `None` (a transient scratch) however many of them there are. Landing on
+    /// them made every `Space x` walk the session list, and brought a just-closed conversation
+    /// straight back.
     #[test]
-    fn next_view_falls_back_to_dormant_before_scratch() {
+    fn next_view_never_lands_on_a_dormant_row() {
         let (mut st, client_id) = state_with_active_workspace();
         // No live buffers; two dormant ones restored from the session (front = most-recent).
         let d1 = st.allocate_buffer_id();
@@ -3588,6 +3669,7 @@ mod next_buffer_tests {
                 view: ViewId(d1),
                 read: false,
                 transient: false,
+                closed: false,
                 source: crate::state::DormantSource::File(std::path::PathBuf::from("/p/a.rs")),
                 summary: None,
             },
@@ -3596,13 +3678,14 @@ mod next_buffer_tests {
                 view: ViewId(d2),
                 read: false,
                 transient: false,
+                closed: false,
                 source: crate::state::DormantSource::File(std::path::PathBuf::from("/p/b.rs")),
                 summary: None,
             },
         ];
-        assert_eq!(next_view_for_client(&st, client_id), Some(ViewId(d1)));
+        assert_eq!(next_view_for_client(&st, client_id), None);
 
-        // A live view still wins over the dormant fallback.
+        // An open view is the answer.
         let live = st.allocate_buffer_id();
         st.insert_buffer_with_document(live, None, false, |d| {
             Document::new_at_path(d, std::path::PathBuf::from("/p/live.rs"), None)

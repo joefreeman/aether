@@ -452,6 +452,7 @@ fn confirm_kind(k: &ConfirmKind) -> Value {
         ConfirmKind::DeleteConversation { title } => {
             json!({ "kind": "delete_conversation", "title": title })
         }
+        ConfirmKind::DeleteShell { title } => json!({ "kind": "delete_shell", "title": title }),
         ConfirmKind::Delete { noun, name } => {
             json!({ "kind": "delete", "noun": noun, "name": name })
         }

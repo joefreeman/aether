@@ -484,7 +484,7 @@ pub async fn agent_delete(
         state,
         ctx,
         params,
-        crate::handlers::buffer::ConversationClose::Discard,
+        crate::handlers::buffer::CloseMode::Discard,
     )
     .await
 }

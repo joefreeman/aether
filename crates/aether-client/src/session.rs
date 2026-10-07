@@ -795,6 +795,10 @@ pub enum ConfirmKind {
     /// with something in it: closing a conversation's view keeps it, and this is the one step that
     /// throws its record away. Busy or not, this is the only question — it already says the most.
     DeleteConversation { title: String },
+    /// Deleting a shell from the shells picker (`shell/delete`). Asked only of one that has run
+    /// something: closing a shell's view keeps it, and this is the one step that throws its
+    /// transcript away — and stops whatever it is running.
+    DeleteShell { title: String },
     /// Trashing a file/directory from the Files/Explorer picker. `noun` is "file"/"directory".
     Delete { noun: &'static str, name: String },
     /// Removing a root from the workspace-settings overlay.
@@ -880,6 +884,8 @@ pub enum ConfirmAction {
     /// Delete a conversation picked from the agents picker (`agent/delete`), by its row's view —
     /// the selection may have moved by the time the confirm resolves.
     DeletePickerConversation { view_id: ViewId },
+    /// Delete a shell picked from the shells picker (`shell/delete`), by its row's view.
+    DeletePickerShell { view_id: ViewId },
     /// Trash a file/directory from the Files/Explorer picker (`path/delete`). `noun` is
     /// "file"/"directory" for the success toast; the still-open picker is re-listed after.
     DeletePath { path: String, noun: &'static str },

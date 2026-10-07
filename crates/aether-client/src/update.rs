@@ -8613,21 +8613,27 @@ impl Session {
                     busy_agent: false,
                 },
             ),
+            // `Ctrl-d` on a shell **deletes** it, as on a conversation — closing its view keeps it —
+            // asking first unless it never ran anything, so there is nothing to lose.
             PickerItem::Shell {
                 view_id,
                 title,
                 running,
+                last_command,
                 ..
-            } => (
-                None,
-                *view_id,
-                Closing {
-                    label: title.clone(),
-                    unsaved: false,
-                    running_shell: *running,
-                    busy_agent: false,
-                },
-            ),
+            } => {
+                let view_id = *view_id;
+                if !*running && last_command.is_none() {
+                    return self.delete_picker_shell(view_id);
+                }
+                self.prompt = Some(Prompt::Confirm {
+                    kind: ConfirmKind::DeleteShell {
+                        title: title.clone(),
+                    },
+                    action: ConfirmAction::DeletePickerShell { view_id },
+                });
+                return Effects::none();
+            }
             // `Ctrl-d` on a conversation **deletes** it — closing its view keeps it, so the row's
             // key is the one way to throw the record away, and it asks first whenever there is
             // anything to lose.
@@ -8672,6 +8678,12 @@ impl Session {
     /// landing as [`Self::close_picker_view`], with the record discarded rather than kept.
     fn delete_picker_conversation(&mut self, view_id: ViewId) -> Effects {
         self.close_picker_row::<aether_protocol::agent::AgentDelete>(view_id)
+    }
+
+    /// Fire `shell/delete` for a shell chosen in the shells picker — the conversation's delete, for
+    /// a shell.
+    fn delete_picker_shell(&mut self, view_id: ViewId) -> Effects {
+        self.close_picker_row::<aether_protocol::shell::ShellDelete>(view_id)
     }
 
     /// Close (or delete) the picker row `view_id` through `M`: a view the editor is showing lands
@@ -9970,6 +9982,7 @@ impl Session {
             ConfirmAction::DeletePickerConversation { view_id } => {
                 self.delete_picker_conversation(view_id)
             }
+            ConfirmAction::DeletePickerShell { view_id } => self.delete_picker_shell(view_id),
             ConfirmAction::DeletePath { path, noun } => self
                 .request_str::<PathDelete>(PathDeleteParams { path }, move |result| {
                     Event::PathDeleted { noun, result }

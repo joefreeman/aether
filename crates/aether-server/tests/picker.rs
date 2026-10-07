@@ -5482,6 +5482,7 @@ async fn a_dormant_commit_key_is_never_a_buffers_row() {
                 view: ViewId(9100 + n as u64),
                 read: false,
                 transient: false,
+                closed: false,
                 source: DormantSource::Virtual { key },
                 summary: None,
             });

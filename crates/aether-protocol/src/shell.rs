@@ -157,6 +157,22 @@ pub struct ShellCancelResult {
     pub cancelled: bool,
 }
 
+// ---- shell/delete ------------------------------------------------------------------------------
+
+/// Delete a shell — `Ctrl-d` on its row in the shells picker. Stops its process, discards the
+/// snapshot it would come back from, and removes the row; live or dormant alike.
+///
+/// The shell counterpart of [`crate::agent::AgentDelete`], for the same reason: closing a shell's
+/// view **keeps** it — the row goes dormant, and opening it again reads the transcript back —
+/// while this destroys it. The shapes are a close's because the landing is. Errors for a view that
+/// is not a shell.
+pub struct ShellDelete;
+impl RpcMethod for ShellDelete {
+    const NAME: &'static str = "shell/delete";
+    type Params = crate::view::ViewCloseParams;
+    type Result = crate::view::ViewCloseResult;
+}
+
 // ---- shell/run_changed (notification) ----------------------------------------------------------
 
 /// Pushed when a shell's run starts and when it finishes. `run: None` means the shell is idle

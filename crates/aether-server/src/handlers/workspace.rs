@@ -407,6 +407,7 @@ pub async fn activate_context(
                             view: s.allocate_view_id(),
                             read: shown.read,
                             transient: shown.transient,
+                            closed: shown.closed,
                             source,
                             summary,
                         }
@@ -705,6 +706,7 @@ fn restore_dormant_sources(
     let shown = |read: bool, entry: &SessionView| DormantPresentation {
         read,
         transient: entry.transient(),
+        closed: entry.closed(),
     };
     // One row per file, the most recent entry's mode: a session written while a file's reader was
     // a view of its own holds an entry per view, and the file has one row now.
@@ -751,6 +753,7 @@ fn restore_dormant_sources(
                     read: false,
                     transient: entry.transient()
                         || crate::state::VirtualTarget::key_is_composed(key),
+                    closed: false,
                 },
             )),
             // A shell comes back only from its snapshot, as a scratch does from its backup.
@@ -2678,10 +2681,12 @@ mod restore_tests {
             SessionView::Shell {
                 number: 1,
                 transient: false,
+                closed: false,
             },
             SessionView::Shell {
                 number: 2,
                 transient: false,
+                closed: false,
             },
         ];
         let sources: Vec<DormantSource> = restore_dormant_sources(&entries, "p", Some(&backups))
@@ -2733,7 +2738,8 @@ mod restore_tests {
                     },
                     crate::state::DormantPresentation {
                         read: false,
-                        transient: true
+                        transient: true,
+                        closed: false,
                     }
                 ),
             ]

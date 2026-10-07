@@ -326,17 +326,21 @@ pub fn pin_view_if_requested(
     collect_view_state_pushes(s, &[view_id])
 }
 
-/// The buffer a client should land on after its current one is closed: the top of its active
-/// workspace's MRU, else any remaining buffer in that workspace, else the most-recently-used *dormant*
-/// buffer (a session-restored file `view/open` materializes by id), else `None` (caller opens a
-/// scratch). The dormant fallback means closing your last live buffer after a session restore drops
-/// you back onto a restored file rather than a blank scratch. Shared by `view/close` and the
-/// deletion paths so the requesting client and any other clients that were viewing the buffer
-/// resolve their next buffer identically.
+/// The view a client should land on after its current one is closed: the top of its active
+/// workspace's MRU, else any other open view in that workspace, else `None` — the caller's cue for
+/// a transient scratch. Shared by `view/close` and the deletion paths so the requesting client and
+/// any other clients that were viewing the buffer resolve their next view identically.
+///
+/// **Only ever an open view.** A dormant row — a file the session restored but nobody has looked
+/// at yet, a shell or conversation whose view was closed — is something listed, not something
+/// open, and a close never opens one. It used to: closing the last open view reopened the first
+/// dormant row, so each `Space x` walked the session list, and a conversation (which a close keeps
+/// as a dormant row, first in line) came straight back the moment its view closed.
 ///
 /// A plain close asks the closing client's own navigation history first and reaches this only when
-/// that trail has nothing to say (see `view_close`). This stays the answer to "is anything left in
-/// this workspace?" — a question about the workspace, not about where anyone has been.
+/// that trail has nothing to say (see `view_close`). This stays the answer to "is anything left
+/// open in this workspace?" — a question about the workspace, not about where anyone has been.
+/// Activation, which *does* resume onto a dormant row, asks its own question (`landing_view_id`).
 pub fn next_view_for_client(s: &ServerState, client_id: ClientId) -> Option<ViewId> {
     let workspace_name = s.active_workspace(client_id).map(|p| p.id.clone());
     workspace_name
@@ -354,11 +358,6 @@ pub fn next_view_for_client(s: &ServerState, client_id: ClientId) -> Option<View
                     .max_by_key(|(_, v)| v.last_used)
                     .map(|(id, _)| *id)
             })
-        })
-        .or_else(|| {
-            workspace_name
-                .as_deref()
-                .and_then(|name| s.first_dormant_view(name))
         })
 }
 

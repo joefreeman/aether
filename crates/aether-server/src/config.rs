@@ -935,6 +935,10 @@ pub enum SessionView {
         /// itself the moment you looked at a file, taking a running build with it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         transient: bool,
+        /// Its view was **closed**: the shell is kept and listed, but was not open when this was
+        /// recorded, so the workspace never resumes onto it. Off the wire when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        closed: bool,
     },
     /// An agent conversation, by its per-workspace number. Its content survives as a snapshot in
     /// the backups directory, keyed the same way; an entry with no snapshot is dropped at
@@ -944,6 +948,9 @@ pub enum SessionView {
         /// See [`SessionView::File::transient`]. Never a preview, for a shell's reason.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         transient: bool,
+        /// See [`SessionView::Shell::closed`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        closed: bool,
     },
 }
 
@@ -981,6 +988,14 @@ impl SessionView {
             // Written before a preview could be recorded at all, so it named a kept view.
             SessionView::Editor { .. } | SessionView::Reader { .. } => false,
         }
+    }
+
+    /// Whether this entry is a shell or conversation whose view was closed — listed, not open.
+    pub fn closed(&self) -> bool {
+        matches!(
+            self,
+            SessionView::Shell { closed: true, .. } | SessionView::Agent { closed: true, .. }
+        )
     }
 
     /// The file and whether it was being read, for a file entry — a legacy `editor`, `reader` or
@@ -2010,6 +2025,37 @@ mod tests {
             load_workspace_sessions_at(&path).unwrap(),
             WorkspaceSessions::default()
         );
+    }
+
+    /// A closed shell or conversation is recorded as closed — so the workspace never reopens onto
+    /// it — and nothing else carries the flag on the wire. A session written before the flag reads
+    /// every entry as open, which is what they were.
+    #[test]
+    fn a_closed_shell_or_agent_entry_says_so_and_nothing_else_does() {
+        let closed = SessionView::Shell {
+            number: 2,
+            transient: false,
+            closed: true,
+        };
+        let v = serde_json::to_value(&closed).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "kind": "shell", "number": 2, "closed": true })
+        );
+        assert!(closed.closed());
+        let open = SessionView::Agent {
+            number: 1,
+            transient: false,
+            closed: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&open).unwrap(),
+            serde_json::json!({ "kind": "agent", "number": 1 })
+        );
+        let legacy: SessionView =
+            serde_json::from_value(serde_json::json!({ "kind": "shell", "number": 3 })).unwrap();
+        assert!(!legacy.closed());
+        assert!(!SessionView::file(PathBuf::from("/p/a.rs"), false, false).closed());
     }
 
     #[test]

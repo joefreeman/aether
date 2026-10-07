@@ -1734,7 +1734,9 @@ async fn a_shell_survives_a_server_restart() {
     };
     assert_eq!(state_env, (Some("hello".to_string()), true));
 
-    // Closing it is a discard: the snapshot goes with it.
+    // Closing it keeps it: the snapshot stays, and the shell is listed again as a dormant row —
+    // what a restart leaves it as.
+    let snapshot = backups.join("shell").join("p").join("1");
     let _: aether_protocol::view::ViewCloseResult = send_request::<ViewClose>(
         &mut ws,
         &ViewCloseParams {
@@ -1743,10 +1745,35 @@ async fn a_shell_survives_a_server_restart() {
         },
     )
     .await;
-    assert!(
-        !backups.join("shell").join("p").join("1").exists(),
-        "closing discards the snapshot"
-    );
+    assert!(snapshot.exists(), "closing keeps the snapshot");
+    let rows = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Shells))
+        .await
+        .update
+        .and_then(|u| u.items)
+        .expect("a window");
+    let dormant = rows
+        .iter()
+        .find_map(|i| match i {
+            PickerItem::Shell {
+                view_id,
+                dormant: true,
+                ..
+            } => Some(*view_id),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the closed shell is listed, dormant: {rows:?}"));
+
+    // Deleting the row is the discard.
+    let _: aether_protocol::view::ViewCloseResult =
+        send_request::<aether_protocol::shell::ShellDelete>(
+            &mut ws,
+            &ViewCloseParams {
+                view_id: dormant,
+                open_next: false,
+            },
+        )
+        .await;
+    assert!(!snapshot.exists(), "deleting discards the snapshot");
 }
 
 /// The input is this shell's own command line, not bash: it is not highlighted as such.
@@ -2120,8 +2147,8 @@ async fn the_input_is_never_listed_never_saved_and_never_dirty() {
     );
     assert_eq!(
         format!("{:?}", s.session_views("shell-proj")),
-        "[Shell { number: 1, transient: false }]",
-        "the shell is written to the session file by its number, never a preview; \
+        "[Shell { number: 1, transient: false, closed: false }]",
+        "the shell is written to the session file by its number, never a preview, open; \
          its input is not written at all"
     );
     let doc = s.try_doc_of(input).expect("the input");
@@ -3168,4 +3195,148 @@ async fn a_silent_runs_command_is_current_without_moving_the_cursor() {
     );
     assert_eq!(focused_element(&server, viewport_id).await, before);
     drop(server);
+}
+
+/// Closing the last open view lands on a blank scratch — never on a dormant row. A shell that ran
+/// something is kept as one when its view closes, first in the dormant list; landing on dormant
+/// rows brought it straight back, and every further close walked the rest of the list. The kept
+/// shell is still listed, a picker away. Closing the blank scratch then does nothing: there is
+/// nothing behind it, and tearing it down would only open another one under a new number.
+#[tokio::test]
+async fn closing_the_last_view_lands_on_a_scratch_and_keeps_the_shell() {
+    // Backups on: a shell is kept only over a snapshot it can come back from.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![("p".to_string(), vec![root.clone()])],
+        Some(root.join("sessions.json")),
+        Some(root.join("backups")),
+    )
+    .await
+    .unwrap();
+    let mut ws = Ws::connect(&server).await;
+    activate_p(&mut ws).await;
+    let shell = start_shell(&mut ws).await;
+    run_and_wait(&mut ws, &server, &shell, "echo kept").await;
+
+    let closed: aether_protocol::view::ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: shell.opened.view_id,
+            open_next: true,
+        },
+    )
+    .await;
+    let landed = closed.opened.expect("a close always lands somewhere");
+    assert!(
+        landed.title.is_none() && landed.path.is_none(),
+        "a blank scratch, not the shell brought back: {landed:?}"
+    );
+    let rows = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Shells))
+        .await
+        .update
+        .and_then(|u| u.items)
+        .expect("a window");
+    assert!(
+        rows.iter().any(|i| matches!(
+            i,
+            PickerItem::Shell { dormant: true, title, .. } if title == "Shell 1"
+        )),
+        "the shell is kept, dormant: {rows:?}"
+    );
+
+    let again: aether_protocol::view::ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: landed.view_id,
+            open_next: true,
+        },
+    )
+    .await;
+    let still = again.opened.expect("handed back");
+    assert_eq!(still.view_id, landed.view_id, "the same scratch, untouched");
+    assert_eq!(still.buffer_id, landed.buffer_id);
+}
+
+/// A closed shell stays closed across a restart. Its view was closed, so it is listed — a dormant
+/// row in the shells picker — but it was not open at quit, and reopening the workspace never
+/// resumes onto it: with nothing else open you come back to a blank scratch, as you left. Before,
+/// the kept shell was the session's first entry and reopening brought it straight back.
+#[tokio::test]
+async fn a_closed_shell_is_not_where_the_workspace_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let sessions_path = root.join("sessions.json");
+    let backups = root.join("backups");
+    {
+        let server = aether_server::spawn_for_test_multi_with_persistence(
+            vec![("p".to_string(), vec![root.clone()])],
+            Some(sessions_path.clone()),
+            Some(backups.clone()),
+        )
+        .await
+        .unwrap();
+        let mut ws = Ws::connect(&server).await;
+        activate_p(&mut ws).await;
+        let shell = start_shell(&mut ws).await;
+        run_and_wait(&mut ws, &server, &shell, "echo kept").await;
+        let closed: aether_protocol::view::ViewCloseResult = send_request::<ViewClose>(
+            &mut ws,
+            &ViewCloseParams {
+                view_id: shell.opened.view_id,
+                open_next: true,
+            },
+        )
+        .await;
+        assert!(closed
+            .opened
+            .is_some_and(|o| o.title.is_none() && o.path.is_none()));
+        drop(ws);
+        drop(server);
+    }
+
+    // Second life, cold-loaded so the session restores (see `a_shell_survives_a_server_restart`).
+    let store = root.join("workspaces");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("p.toml"),
+        format!("[[roots]]\npath = {:?}\n", root.display().to_string()),
+    )
+    .unwrap();
+    let server = aether_server::spawn_for_test_multi_with_persistence(
+        vec![],
+        Some(sessions_path.clone()),
+        Some(backups.clone()),
+    )
+    .await
+    .unwrap();
+    server.state.lock().await.workspaces_dir = Some(store);
+    let mut ws = Ws::connect(&server).await;
+    let reopened: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "p".into(),
+            open_last: true,
+        },
+    )
+    .await;
+    let landed = reopened.opened.expect("a landing");
+    assert!(
+        landed.title.is_none() && landed.path.is_none(),
+        "a blank scratch, not the closed shell: {landed:?} (session: {:?})",
+        std::fs::read_to_string(&sessions_path)
+    );
+    let rows = send_request::<PickerView>(&mut ws, &view_params(PickerKind::Shells))
+        .await
+        .update
+        .and_then(|u| u.items)
+        .expect("a window");
+    assert!(
+        rows.iter().any(|i| matches!(
+            i,
+            PickerItem::Shell { dormant: true, title, .. } if title == "Shell 1"
+        )),
+        "still listed, a picker away: {rows:?}"
+    );
 }

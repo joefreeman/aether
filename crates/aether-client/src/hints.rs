@@ -349,13 +349,16 @@ pub static CURRICULUM: &[HintDef] = &[
         trigger: Trigger::Picker(PickerCmd::Dismiss),
         text: "Use {} to close the picker" },
     HintDef { id: "picker-close", tier: 4,
-        contexts: &[
-            C::Picker(PickerKind::Buffers),
-            C::Picker(PickerKind::Shells),
-            C::Picker(PickerKind::Agents),
-        ], keys: "Ctrl-d",
+        contexts: &[C::Picker(PickerKind::Buffers)], keys: "Ctrl-d",
         trigger: Trigger::Picker(PickerCmd::CloseView),
         text: "Use {} to close the selected view" },
+    // The same key on a shell or a conversation throws it away — closing its view keeps it — so
+    // it says so, under its own id rather than reworded in place: hint ids are what the server
+    // remembers you have seen.
+    HintDef { id: "picker-delete", tier: 4,
+        contexts: &[C::Picker(PickerKind::Shells), C::Picker(PickerKind::Agents)], keys: "Ctrl-d",
+        trigger: Trigger::Picker(PickerCmd::CloseView),
+        text: "Use {} to delete the selected one" },
     // The branch picker's least guessable key, and the one the merge made necessary. `Enter` on a
     // branch with no tree checks it out — which is what the *worktree* picker's Enter used to
     // create a tree for — so anyone carrying that muscle memory needs pointing here. The text says

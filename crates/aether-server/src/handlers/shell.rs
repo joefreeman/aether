@@ -1614,3 +1614,36 @@ pub async fn view_submit_input(
         }
     }
 }
+
+/// `shell/delete` — `Ctrl-d` on a shells-picker row: the close that discards. Live or dormant, the
+/// process stops, the snapshot goes and so does the row; a plain close keeps all but the process.
+pub async fn shell_delete(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::view::ViewCloseParams,
+) -> Result<aether_protocol::view::ViewCloseResult, RpcError> {
+    {
+        let s = state.lock().await;
+        let is_shell = match s.try_presenting_buffer(params.view_id) {
+            Some(buffer) => s
+                .try_doc_of(buffer)
+                .is_some_and(|d| d.transcript().is_some()),
+            None => s.active_workspace(ctx.client_id).is_some_and(|w| {
+                w.dormant_views.iter().any(|d| {
+                    d.view == params.view_id
+                        && matches!(d.source, crate::state::DormantSource::Shell { .. })
+                })
+            }),
+        };
+        if !is_shell {
+            return Err(RpcError::not_a_shell(params.view_id));
+        }
+    }
+    crate::handlers::buffer::close_view(
+        state,
+        ctx,
+        params,
+        crate::handlers::buffer::CloseMode::Discard,
+    )
+    .await
+}

@@ -1043,6 +1043,7 @@ pub async fn rebind_loaded_workspace(
                 // open in the tree you left, not peeked at.
                 read: false,
                 transient: false,
+                closed: false,
                 source: crate::state::DormantSource::File(path),
                 summary: None,
             }
