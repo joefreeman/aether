@@ -120,6 +120,17 @@ pub struct Theme {
     /// Shares dark's shade with [`Self::warning`] but is match emphasis, not a severity — the
     /// two tune independently.
     pub match_highlight: Rgb,
+    /// A search match that is not the current one: a pale tint of the current match's hue, so the
+    /// two read as one family — and as nothing else on the page. Not [`Self::fill_dim`], the neutral
+    /// grey a markdown code chip sits a step away from, which made a match read as more code.
+    /// Symbol highlights keep `fill_dim`: they are not a search.
+    pub search_hit_bg: Rgb,
+    /// The current search match where no cursor selects it — in prose, on a removed line of the
+    /// diff, on a shell's command — and the text on it. Its own pair rather than the selection's:
+    /// the reader tints a selected block in the selection shade, and a current match inside one has
+    /// to read apart from it, as it must from the dim fill of the other matches.
+    pub search_current_bg: Rgb,
+    pub search_current_fg: Rgb,
     /// The paired-bracket highlight under the cursor. Shares dark's shade with
     /// [`Self::syn_macro`]; chrome, not syntax.
     pub match_bracket: Rgb,
@@ -294,6 +305,9 @@ impl Theme {
         fill_dim: NORD3,
         sneak_prefix_bg: NORD3_BRIGHT,
         match_highlight: NORD13,
+        search_hit_bg: rgb(0x676156), // NORD13 at ~30% over NORD0
+        search_current_bg: NORD13,    // = match_highlight today; free to diverge
+        search_current_fg: NORD0,     // = fg_on_accent today
         match_bracket: NORD12,
         cursor_line_bg: rgb(0x343a48), // ~40% from NORD0 toward NORD1
         overlay_border: NORD3_BRIGHTER,
@@ -395,6 +409,9 @@ impl Theme {
         fill_dim: rgb(0xd8dfe8),
         sneak_prefix_bg: rgb(0xc4cedb), // darker than fill_dim: prominence inverts on light
         match_highlight: rgb(0x9a7522), // = warning today; free to diverge
+        search_hit_bg: rgb(0xf6e8cb),   // NORD13 at ~55% toward white: a highlighter's yellow
+        search_current_bg: rgb(0x9a7522), // = match_highlight today; free to diverge
+        search_current_fg: NORD6,       // = fg_on_accent today
         match_bracket: rgb(0xab5f38),   // = syn_macro today; free to diverge
         cursor_line_bg: rgb(0xe4e9f0),  // a step up from the well toward the ground
         overlay_border: rgb(0xaab4c4),
@@ -560,6 +577,8 @@ impl Theme {
             // A folded box's count of the search matches inside it, on its title: match emphasis,
             // as a picker's matched characters are.
             "search.count" => color(self.match_highlight),
+            // The text of the current search match, on its own fill — see `search_current_bg`.
+            "search.current" => color(self.search_current_fg),
             _ => return None,
         })
     }

@@ -140,6 +140,11 @@ pub enum Element {
     /// resolving that against a block means knowing where each line starts. The line table is what
     /// a client wanted the source for; the source itself stays where the buffer is.
     ///
+    /// A search over the view arrives **in the parse**: its matches are marked on the text runs
+    /// they cover ([`aether_markdown::Mark`]), in the coordinates a shell paints in. The server
+    /// matched the text a reader sees and has the source to map it back to; a shell has neither,
+    /// and needs neither.
+    ///
     /// Still no buffer id: the one path that resolves an element to a buffer — a pointer press —
     /// walks the editors, and which of a block's inlines a *pixel* is in is unanswered, so it is
     /// not guessed at here in the meantime.

@@ -11,10 +11,14 @@
 /** A source byte range — mirrors `aether_client::markdown::Span`. */
 export type MdSpan = { start: number; end: number };
 
+/** A search match over a run of rendered text — mirrors `aether_markdown::Mark`: UTF-8 byte offsets
+ *  into the run's text, and the match's place in the count. */
+export type MdMark = { start: number; end: number; index: number };
+
 /** An inline (span-level) AST node — mirrors `aether_client::markdown::Inline` (serde `kind` tag). */
 export type MdInline =
-  | { kind: "text"; text: string }
-  | { kind: "code"; text: string }
+  | { kind: "text"; text: string; marks?: MdMark[] }
+  | { kind: "code"; text: string; marks?: MdMark[] }
   | { kind: "emphasis"; content: MdInline[] }
   | { kind: "strong"; content: MdInline[] }
   | { kind: "strikethrough"; content: MdInline[] }
@@ -30,7 +34,7 @@ export type MdListItem = { checked?: boolean; blocks: MdBlock[]; span: MdSpan };
 export type MdBlock =
   | { kind: "heading"; level: number; content: MdInline[]; span: MdSpan }
   | { kind: "paragraph"; content: MdInline[]; span: MdSpan }
-  | { kind: "code"; language: string | null; code: string; span: MdSpan }
+  | { kind: "code"; language: string | null; code: string; span: MdSpan; marks?: MdMark[] }
   | { kind: "list"; ordered: boolean; start: number; items: MdListItem[]; span: MdSpan }
   | { kind: "quote"; alert?: string; content: MdBlock[]; span: MdSpan }
   | { kind: "rule"; span: MdSpan }

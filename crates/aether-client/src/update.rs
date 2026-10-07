@@ -894,7 +894,11 @@ impl Session {
             }
 
             Event::Switched(Ok(open)) => self.adopt_open(open),
-            Event::ReadSet(Ok(_)) => self.adopt_read_flip(),
+            Event::ReadSet(Ok(r)) => {
+                // Arriving in the reader collapsed any selection; the server says where to.
+                self.view.buffer.cursor = r.cursor;
+                self.adopt_read_flip()
+            }
             Event::ReadSet(Err(e)) => Effects::error_detail("Couldn't switch view", e),
 
             // Worded for the working tree because that is the only target that can answer nothing:

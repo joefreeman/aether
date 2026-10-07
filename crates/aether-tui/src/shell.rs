@@ -269,6 +269,8 @@ pub struct Shell {
     /// The focus last revealed, so the view scrolls only when the focus *changes* (manual
     /// scrolling doesn't fight the reveal).
     read_last_focus: Option<usize>,
+    /// The search landing the reader last revealed: the match, and the cursor it left.
+    read_last_landing: Option<(u32, aether_protocol::cursor::CursorState)>,
     /// Reading-view layout cache, keyed by `(buffer, revision, hl_gen, content_cols)` —
     /// `hl_gen` moves when fence highlights land, which revision alone doesn't capture.
     ///
@@ -381,6 +383,7 @@ async fn run_events(
         server_url,
         read_place_pending: false,
         read_last_focus: None,
+        read_last_landing: None,
         read_cache: None,
         read_hscroll: std::collections::HashMap::new(),
     };
@@ -2529,11 +2532,12 @@ impl Shell {
             .and_then(|(min, max)| {
                 let mut range: Option<(usize, usize)> = None;
                 for (i, row) in rows.iter().enumerate() {
-                    // Containment, not overlap: an item's span contains its nested children's,
-                    // so overlap would tint every ancestor of the selected item as well.
                     let hit = row.element.is_some_and(|e| {
-                        let s = read.elements[e].span();
-                        s.start >= min && s.end <= max + 1
+                        aether_client::markdown::edit::selection_paints(
+                            read.elements[e].span(),
+                            min,
+                            max,
+                        )
                     });
                     if hit {
                         range = Some(match range {
@@ -2570,6 +2574,32 @@ impl Shell {
         // target when the cursor is inside one (a Tab step must reveal the link, not just its
         // paragraph). Coordinates are padded rows (READ_PAD_TOP blanks precede the document).
         let reveal = target_focus.or(block_focus);
+        // A search that just landed shows its match: inside a tall block the block's top is not
+        // where it is. It takes the place of the block reveal its landing would otherwise cause.
+        let landing = self
+            .session
+            .view
+            .search_landing()
+            .map(|index| (index, self.session.view.buffer.cursor));
+        if landing.is_some() && landing != self.read_last_landing {
+            self.read_last_landing = landing;
+            self.read_last_focus = reveal;
+            let index = landing.map_or(0, |(i, _)| i);
+            let marked = |r: &aether_client::read_layout::ReadRow| {
+                r.spans.iter().any(|s| s.search == Some(index))
+            };
+            if let (Some(first), Some(last)) =
+                (rows.iter().position(marked), rows.iter().rposition(marked))
+            {
+                let pad = u32::from(crate::ui::READ_PAD_TOP);
+                let (top, bottom) = (first as u32 + pad, last as u32 + 1 + pad);
+                let at = self.top_visual_row.get();
+                if top < at || bottom > at.saturating_add(u32::from(visible)) {
+                    // Rest the match ~20% down, as a block is rested.
+                    self.top_visual_row = VisualRow(top.saturating_sub(u32::from(visible / 5)));
+                }
+            }
+        }
         if reveal != self.read_last_focus {
             self.read_last_focus = reveal;
             if let Some(row) = reveal.and_then(|f| {
@@ -3832,6 +3862,7 @@ mod scroll_tests {
             server_url: String::new(),
             read_place_pending: false,
             read_last_focus: None,
+            read_last_landing: None,
             read_cache: None,
             read_hscroll: std::collections::HashMap::new(),
         }

@@ -190,6 +190,18 @@ pub fn block_content_end(text: &str, span: Span) -> u32 {
     }
 }
 
+/// Whether a reading-view selection over source bytes `min..=max` paints the block at `span` —
+/// the one rule every shell tints selected blocks by. **Containment**: a container's span holds its
+/// children's, so overlap would tint every ancestor of a selected item.
+///
+/// The reader only ever holds whole-block selections (search there lands at a point or grows by
+/// whole blocks, and arriving in it collapses whatever the editor selected), and over those this
+/// paints exactly the blocks [`selection_block_range`] acts on — which needs the text, where this
+/// needs only the spans a shell has.
+pub fn selection_paints(span: Span, min: u32, max: u32) -> bool {
+    span.start >= min && span.end <= max + 1
+}
+
 pub fn selection_block_range(
     text: &str,
     stops: &[Stop],
@@ -1415,6 +1427,52 @@ mod tests {
         let blocks = parse(md);
         let els = stops(&blocks);
         (blocks, els)
+    }
+
+    /// Over every whole-block selection the reader can hold — from any block's first line through
+    /// any later block's last, the shape `x`, `Shift-x`, `%` and a `?` landing make — the blocks a
+    /// shell paints are the blocks the block commands act on: the same source, end to end.
+    #[test]
+    fn what_a_reader_paints_is_what_its_block_commands_act_on() {
+        let md = "# Title\n\nA paragraph\nover two lines.\n\n- one\n- two\n  - nested\n\n> quoted\n> text\n\n```\ncode\n```\n\nLast.\n";
+        let (_, els) = fixture(md);
+        let blocks: Vec<usize> = (0..els.len()).filter(|&i| els[i].is_block()).collect();
+        let mut checked = 0;
+        for &first in &blocks {
+            for &last in &blocks {
+                let (a, b) = (els[first].span(), els[last].span());
+                if b.start < a.start {
+                    continue;
+                }
+                // Whole lines, as the server's line normal form makes them: the first line's start
+                // through the newline ending the last block's last line.
+                let min = line_start(md, a.start as usize) as u32;
+                let max =
+                    (line_end_incl(md, b.end.saturating_sub(1).max(b.start) as usize) - 1) as u32;
+                let Some((top, bottom)) = selection_block_range(md, &els, min, max) else {
+                    continue;
+                };
+                let acted = (els[top].span().start, els[bottom].span().end);
+                let painted: Vec<Span> = blocks
+                    .iter()
+                    .map(|&i| els[i].span())
+                    .filter(|s| selection_paints(*s, min, max))
+                    .collect();
+                let painted = (
+                    painted.iter().map(|s| s.start).min(),
+                    painted.iter().map(|s| s.end).max(),
+                );
+                assert_eq!(
+                    painted,
+                    (Some(acted.0), Some(acted.1)),
+                    "selecting {:?} through {:?}",
+                    &md[a.start as usize..a.end as usize],
+                    &md[b.start as usize..b.end as usize],
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 30, "only {checked} selections checked");
     }
 
     /// Apply a resolved edit and return the new text.

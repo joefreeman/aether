@@ -45,6 +45,9 @@
   --fill-dim: var(--nord3); /* muted fills: search-hit tint, sneak word band */
   --sneak-prefix-bg: var(--nord3-bright); /* sneak typed-prefix band */
   --match-highlight: var(--nord13); /* fuzzy-match/sneak emphasis: picker match chars, the sneak label */
+  --search-hit-bg: #676156; /* the other search matches: NORD13 at ~30% over NORD0 */
+  --search-current-bg: var(--nord13); /* the current search match where no cursor selects it */
+  --search-current-fg: var(--nord0);
   --match-bracket: var(--nord12); /* paired-bracket highlight under the cursor — chrome, not syntax */
   --cursor-line-bg: #343a48; /* current-line tint, ~40% from NORD0 toward NORD1 */
   --overlay-border: var(--nord3-brighter); /* outline for floating overlays' frames */
@@ -178,6 +181,9 @@
   --fill-dim: #d8dfe8;
   --sneak-prefix-bg: #c4cedb; /* darker than fill-dim: prominence inverts on light */
   --match-highlight: #9a7522; /* = warning today; free to diverge */
+  --search-hit-bg: #f6e8cb; /* NORD13 at ~55% toward white */
+  --search-current-bg: #9a7522; /* = match-highlight today; free to diverge */
+  --search-current-fg: var(--nord6);
   --match-bracket: #ab5f38; /* = syn-macro today; free to diverge */
   --cursor-line-bg: #e4e9f0; /* ~40% from NORD6 toward NORD5 */
   --overlay-border: #aab4c4;
@@ -1080,16 +1086,25 @@ html, body, #app {
    the normal foreground so they stay legible on the vivid fill — the fg flip is part of the
    signal (mirrors the terminal and iced clients). */
 .deleted-phantom .diff-emph { color: var(--fg); }
-/* Matches the terminal: a search match is a quiet NORD3 fill — the brightest of Nord's Polar Night
-   shades, so it stays visible on the NORD1 current-line tint while sitting below the selection. The
-   selection paints over it in the more saturated NORD10, and the cursor over that. Precedence is
-   source order (all single-class): search-hit < selection < cursor. */
-.search-hit { background: var(--fill-dim); }
+/* Matches the terminal: a search match is a pale tint of the current match's warm hue — one family
+   with it, and apart from a code chip's neutral shade — while the occurrences of the symbol under
+   the cursor keep the quiet neutral fill. The selection paints over either in the more saturated
+   NORD10, and the cursor over that. Precedence is source order (all single-class): search-hit /
+   symbol-hit < selection < cursor. */
+.search-hit { background: var(--search-hit-bg); }
+.symbol-hit { background: var(--fill-dim); }
+/* The current match where no cursor selects it — prose, a removed line, a command: its own fill,
+   apart from the other matches and from a selected block alike. */
+.search-current, .search-hit.current {
+  background: var(--search-current-bg);
+  color: var(--search-current-fg);
+}
 /* Comments are themed NORD3-BRIGHTER — only ~2:1 against the NORD3 fill — so a match inside one
    would be barely legible. Lift just that text to the normal foreground (the italic from
    .hl-comment stays); the compound selector outranks .hl-comment so this wins. Every other
    syntax color reads fine on NORD3. Patch chrome is the same dim shade and needs the same lift. */
-.search-hit.hl-comment, .search-hit.hl-diff-meta { color: var(--fg); }
+.search-hit.hl-comment, .search-hit.hl-diff-meta,
+.symbol-hit.hl-comment, .symbol-hit.hl-diff-meta { color: var(--fg); }
 .sel { background: var(--bg-visual); }
 /* Whitespace indicators (terminal parity): a muted NORD3 glyph, over the selection blue when
    selected — `·` for trailing spaces and `↵` for the consumed newline (width-neutral text), and `→`

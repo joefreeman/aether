@@ -1167,11 +1167,14 @@ impl ViewState {
         }
         // A search step that landed on a row the cursor can't be in — a removed line, a command —
         // shows that row, for as long as the cursor is where the step put it.
-        if let Some((index, at)) = self.search.landing {
-            if at == self.buffer.cursor {
-                if let Some(row) = crate::grid::search_match_row(&window.root, measured, index) {
-                    return Some(row);
-                }
+        // A search step that landed on a row the cursor can't be in — a removed line, a command,
+        // a match inside prose — shows that, for as long as the cursor is where the step put it.
+        if let Some(index) = self.search_landing() {
+            if let Some(row) = crate::grid::search_match_row(&window.root, measured, index) {
+                return Some(row);
+            }
+            if let Some((row, _)) = crate::grid::search_mark_rows(&window.root, measured, index) {
+                return Some(row);
             }
         }
         crate::grid::position_cell(
@@ -1182,6 +1185,28 @@ impl ViewState {
             measured,
         )
         .map(|(row, _, _)| row)
+    }
+
+    /// The current match a search step or keystroke just landed on, by its place in the count —
+    /// while the cursor is still where that landing put it, which is what makes the match (rather
+    /// than the cursor) what a reveal shows. `None` once anything else has moved the cursor.
+    pub fn search_landing(&self) -> Option<u32> {
+        let (index, at) = self.search.landing?;
+        let current = self.search.summary.as_ref()?.current_index;
+        (index != 0 && index == current && at == self.buffer.cursor).then_some(index)
+    }
+
+    /// Where the current match a search just landed on was drawn in prose — its top and bottom
+    /// rows — for a shell revealing it: inside a tall block, the block's top is not where it is.
+    pub fn search_mark_rows(
+        &self,
+        measured: &crate::grid::Measured,
+    ) -> Option<(
+        aether_protocol::coords::VisualRow,
+        aether_protocol::coords::VisualRow,
+    )> {
+        let window = self.window.as_ref()?;
+        crate::grid::search_mark_rows(&window.root, measured, self.search_landing()?)
     }
 
     /// Whether the reveal owed for this view is waiting on a **line**: only a cursor is, and only
@@ -1539,6 +1564,10 @@ pub struct ReadView {
     /// Bumped whenever `code_highlights` grows — the shells' layout-cache invalidation key
     /// (revision alone doesn't move when highlights land).
     pub hl_gen: u64,
+    /// Bumped whenever a parse is adopted: the document changed, or where a search matched it did.
+    /// The browser's DOM-rebuild key — it patches fence highlights in place, so `hl_gen` would
+    /// rebuild too often, and the revision alone misses a search, which changes no text.
+    pub parse_gen: u64,
     /// A fully-parsed document held back while a cross-file anchor's `cursor/move` is in flight:
     /// the visible view stays `loading` so the first paint happens with the cursor already on the
     /// heading — the editor's paint-once-in-place property. Installed by the cursor reply
@@ -1559,6 +1588,7 @@ impl ReadView {
             loading: true,
             code_highlights: std::collections::HashMap::new(),
             hl_gen: 0,
+            parse_gen: 0,
             staged: None,
         }
     }
@@ -1566,13 +1596,21 @@ impl ReadView {
     /// Adopt the document a window's prose element carries: the server's parse, and the line table
     /// that places it. Only the stop list is derived here — it is an index into the parse, not a
     /// second opinion about it. Fence highlights reset, since the spans they were keyed to may
-    /// have moved, and re-request via the update loop.
+    /// have moved, and re-request via the update loop — unless all that changed is where a search
+    /// matched, which moves no span: a search is typed a key at a time, and dropping the fences'
+    /// colour on every key would flicker the whole document.
     pub fn adopt(
         &mut self,
         revision: u64,
         blocks: Vec<crate::markdown::Block>,
         source: aether_protocol::ui::SourceLines,
     ) {
+        let same_text = !self.loading && self.same_source(&source) && {
+            let (mut was, mut now) = (self.blocks.clone(), blocks.clone());
+            crate::markdown::strip_marks(&mut was);
+            crate::markdown::strip_marks(&mut now);
+            was == now
+        };
         self.elements = crate::markdown::stops(&blocks);
         self.blocks = blocks;
         self.source = source;
@@ -1580,8 +1618,12 @@ impl ReadView {
         self.loading = false;
         // Newer content outranks a parse held back for an anchor landing.
         self.staged = None;
-        self.code_highlights.clear();
+        if !same_text {
+            self.code_highlights.clear();
+        }
+        // Moved either way: a shell's layout caches on it, and the marks are in the layout.
         self.hl_gen += 1;
+        self.parse_gen += 1;
     }
 
     /// [`Self::adopt`] from source text, standing in for the server's parse of it.

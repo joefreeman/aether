@@ -2679,7 +2679,7 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         // and diff text no shell will ever paint, on every frame of a conversation. An element is
         // prose by construction (an agent's reply) or because this client reads the file.
         let prose = (binding.prose || reading)
-            .then(|| element_prose(doc, range))
+            .then(|| element_prose(doc, range, matches))
             .filter(|_| !collapsed);
         let (first_row, first_buffer_line, lines) =
             match loaded.filter(|_| prose.is_none() && !collapsed) {
@@ -2826,14 +2826,40 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
 /// unit a shell renders and the unit it measures, and a span that pointed outside it would name
 /// bytes the shell was never sent. The line table is in those same coordinates, and is built from
 /// the same string the parse is — one slice, so the two cannot describe different text.
-fn element_prose(doc: &Document, range: BufferRange) -> (Vec<aether_markdown::Block>, SourceLines) {
-    let lines = range.lines();
-    let chars = |line: u32| doc.text.line_to_char(line as usize);
-    let text = doc
-        .text
-        .slice(chars(lines.start)..chars(lines.end))
-        .to_string();
-    (aether_markdown::parse(&text), SourceLines::of(&text))
+fn element_prose(
+    doc: &Document,
+    range: BufferRange,
+    matches: ElementMatches<'_>,
+) -> (Vec<aether_markdown::Block>, SourceLines) {
+    let (text, base) = crate::view_search::element_source(doc, range.lines());
+    // The view's search, as source spans of this element's text — the parse marks them on the
+    // runs they rendered as.
+    let byte = |p: LogicalPosition| {
+        doc.text
+            .line_to_byte(p.line as usize)
+            .saturating_add(p.col as usize)
+            .saturating_sub(base) as u32
+    };
+    let marks: Vec<(aether_markdown::Span, u32)> = match matches {
+        ElementMatches::Search(matches) => matches
+            .iter()
+            .filter_map(|(index, m)| match m.at {
+                crate::view_search::MatchAt::Text { start, end } => Some((
+                    aether_markdown::Span {
+                        start: byte(start),
+                        end: byte(end),
+                    },
+                    *index,
+                )),
+                _ => None,
+            })
+            .collect(),
+        ElementMatches::Symbols(_) | ElementMatches::None => Vec::new(),
+    };
+    (
+        aether_markdown::parse_marked(&text, &marks),
+        SourceLines::of(&text),
+    )
 }
 
 /// How an element's rows are counted: the viewport's wrapping and the element's phantom rows for
@@ -3810,7 +3836,7 @@ mod tests {
     /// Install `query` as `vp`'s client's search over its view, the way `search/set` would.
     fn install_search(s: &mut ServerState, vp: &Viewport, query: &str) {
         let regex = crate::picker::build_match_regex(query, &Default::default()).unwrap();
-        let (matches, truncated) = crate::view_search::find(s, s.view(vp.view_id), &regex);
+        let (matches, truncated) = crate::view_search::find(s, vp.client_id, vp.view_id, &regex);
         s.searches.insert(
             (vp.client_id, vp.view_id),
             crate::view_search::ViewSearch {

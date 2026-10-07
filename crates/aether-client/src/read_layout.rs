@@ -96,6 +96,9 @@ pub struct ReadSpan {
     /// Tree-sitter capture name for a code-block token (`"keyword"`, `"string"`, …) — the shell
     /// styles it through the same theme table the editor uses. `None` everywhere else.
     pub syntax: Option<String>,
+    /// The search match this text is part of, by its place in the count — the shell paints it as a
+    /// match, and as the current one when that is its index. `None` for text no search matched.
+    pub search: Option<u32>,
 }
 
 /// Colour/render family of a span; the shell maps these to its theme. Font-ish attributes ride
@@ -300,6 +303,7 @@ fn layout_blocks(
                     style: SpanStyle::plain(SpanKind::Text),
                     element: None,
                     syntax: None,
+                    search: None,
                 }],
                 element: own,
             });
@@ -362,6 +366,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                         style: SpanStyle::plain(SpanKind::Rule),
                         element: None,
                         syntax: None,
+                        search: None,
                     }],
                     element: own,
                 });
@@ -380,6 +385,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
             language,
             code,
             span,
+            marks,
         } => {
             // The panel opens on its top pad row, which pins the language tag (a CodeFrame
             // span — the painter styles it and holds it fixed while the code pans; no header
@@ -391,6 +397,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                 style: SpanStyle::plain(SpanKind::CodeBlock),
                 element: None,
                 syntax: None,
+                search: None,
             };
             let has_tag = language.as_deref().is_some_and(|t| !t.is_empty());
             let mut top = ReadRow {
@@ -403,6 +410,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                     style: SpanStyle::plain(SpanKind::CodeFrame),
                     element: None,
                     syntax: None,
+                    search: None,
                 });
             }
             top.spans.push(pad_span());
@@ -428,13 +436,43 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
             let mut widest = 0usize;
             for raw in code.split('\n') {
                 widest = widest.max(raw.width());
+                // The line's marks, in its own bytes, cut into the highlighted runs.
+                let line_marks: Vec<crate::markdown::Mark> = marks
+                    .iter()
+                    .filter(|m| {
+                        (m.start as usize) < line_start + raw.len() && m.end as usize > line_start
+                    })
+                    .map(|m| crate::markdown::Mark {
+                        start: (m.start as usize).saturating_sub(line_start) as u32,
+                        end: ((m.end as usize).min(line_start + raw.len()) - line_start) as u32,
+                        index: m.index,
+                    })
+                    .collect();
+                let mut run_start = 0u32;
                 let spans: Vec<ReadSpan> = code_line_segments(raw, line_start, hls)
                     .into_iter()
-                    .map(|(text, kind)| ReadSpan {
-                        text,
-                        style: SpanStyle::plain(SpanKind::CodeBlock),
-                        element: None,
-                        syntax: kind,
+                    .flat_map(|(text, kind)| {
+                        let len = text.len() as u32;
+                        let run_marks: Vec<crate::markdown::Mark> = line_marks
+                            .iter()
+                            .filter(|m| m.start < run_start + len && m.end > run_start)
+                            .map(|m| crate::markdown::Mark {
+                                start: m.start.saturating_sub(run_start),
+                                end: m.end.min(run_start + len) - run_start,
+                                index: m.index,
+                            })
+                            .collect();
+                        run_start += len;
+                        crate::markdown::split_marks(&text, &run_marks)
+                            .into_iter()
+                            .map(|(piece, search)| ReadSpan {
+                                text: piece.to_string(),
+                                style: SpanStyle::plain(SpanKind::CodeBlock),
+                                element: None,
+                                syntax: kind.clone(),
+                                search,
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .collect();
                 out.push(ReadRow {
@@ -469,6 +507,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                 style: SpanStyle::plain(SpanKind::QuoteBar(*alert)),
                 element: None,
                 syntax: None,
+                search: None,
             };
             if let Some(kind) = alert {
                 let label = match kind {
@@ -489,6 +528,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                             },
                             element: None,
                             syntax: None,
+                            search: None,
                         },
                     ],
                     element: own,
@@ -527,6 +567,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                 style: SpanStyle::plain(SpanKind::Rule),
                 element: None,
                 syntax: None,
+                search: None,
             }],
             element: own,
         }),
@@ -550,6 +591,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                     style: SpanStyle::plain(SpanKind::Dim),
                     element: element_index(ctx.elements, *inner_span),
                     syntax: None,
+                    search: None,
                 }],
                 element: own,
             });
@@ -566,6 +608,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                             style: SpanStyle::plain(SpanKind::Dim),
                             element: None,
                             syntax: None,
+                            search: None,
                         },
                         ReadSpan {
                             text: line.to_string(),
@@ -575,6 +618,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                             },
                             element: None,
                             syntax: None,
+                            search: None,
                         },
                     ],
                     element: own,
@@ -588,6 +632,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                     style: SpanStyle::plain(SpanKind::Dim),
                     element: None,
                     syntax: None,
+                    search: None,
                 }],
                 element: own,
             });
@@ -607,6 +652,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                     style: SpanStyle::plain(SpanKind::Text),
                     element: None,
                     syntax: None,
+                    search: None,
                 }];
                 spans.append(&mut row.spans);
                 out.push(ReadRow {
@@ -624,6 +670,7 @@ fn layout_block(block: &Block, ctx: Ctx, own: Option<usize>, cols: usize, out: &
                             style: SpanStyle::plain(SpanKind::Dim),
                             element: None,
                             syntax: None,
+                            search: None,
                         }],
                         element: own,
                     });
@@ -674,6 +721,7 @@ fn layout_list(
                     style: SpanStyle::plain(SpanKind::Marker),
                     element: None,
                     syntax: None,
+                    search: None,
                 }],
                 element: own,
             });
@@ -697,6 +745,7 @@ fn layout_list(
                 style: SpanStyle::plain(SpanKind::Marker),
                 element: None,
                 syntax: None,
+                search: None,
             }];
             spans.append(&mut row.spans);
             out.push(ReadRow {
@@ -801,6 +850,7 @@ fn layout_table(
                 style: SpanStyle::plain(SpanKind::TableBorder),
                 element: None,
                 syntax: None,
+                search: None,
             }],
             element: own,
         }
@@ -818,6 +868,7 @@ fn layout_table(
             style: SpanStyle::plain(kind),
             element: None,
             syntax: None,
+            search: None,
         })
     };
 
@@ -863,6 +914,7 @@ fn layout_table(
                         style: SpanStyle::plain(pad_kind),
                         element: None,
                         syntax: None,
+                        search: None,
                     });
                     spans.extend(line);
                     spans.push(ReadSpan {
@@ -870,6 +922,7 @@ fn layout_table(
                         style: SpanStyle::plain(pad_kind),
                         element: None,
                         syntax: None,
+                        search: None,
                     });
                     bar(&mut spans, ci + 1 == ncols);
                 }
@@ -900,6 +953,8 @@ struct Segment {
     text: String,
     style: SpanStyle,
     element: Option<usize>,
+    /// The search match this text is part of — see [`ReadSpan::search`].
+    search: Option<u32>,
 }
 
 fn segments_width(segs: &[Segment]) -> usize {
@@ -945,19 +1000,29 @@ fn collect(
 ) {
     for inl in inlines {
         match inl {
-            Inline::Text { text } => out.push(Segment {
-                text: text.clone(),
-                style: base,
-                element,
-            }),
-            Inline::Code { text } => out.push(Segment {
-                text: text.clone(),
-                style: SpanStyle {
-                    kind: SpanKind::Code,
-                    ..base
-                },
-                element,
-            }),
+            Inline::Text { text, marks } => {
+                out.extend(crate::markdown::split_marks(text, marks).into_iter().map(
+                    |(piece, search)| Segment {
+                        text: piece.to_string(),
+                        style: base,
+                        element,
+                        search,
+                    },
+                ))
+            }
+            Inline::Code { text, marks } => {
+                out.extend(crate::markdown::split_marks(text, marks).into_iter().map(
+                    |(piece, search)| Segment {
+                        text: piece.to_string(),
+                        style: SpanStyle {
+                            kind: SpanKind::Code,
+                            ..base
+                        },
+                        element,
+                        search,
+                    },
+                ))
+            }
             Inline::Emphasis { content } => collect(
                 content,
                 SpanStyle {
@@ -1009,6 +1074,7 @@ fn collect(
                         ..base
                     },
                     element: idx.or(element),
+                    search: None,
                 });
             }
             Inline::FootnoteRef { label, span } => {
@@ -1020,6 +1086,7 @@ fn collect(
                         ..base
                     },
                     element: idx.or(element),
+                    search: None,
                 });
             }
             // A hard break forces a wrap point; encode it as a zero-width sentinel the wrapper
@@ -1028,6 +1095,7 @@ fn collect(
                 text: "\n".into(),
                 style: base,
                 element,
+                search: None,
             }),
         }
     }
@@ -1044,7 +1112,7 @@ fn wrap_segments(segs: &[Segment], width: usize) -> Vec<Vec<ReadSpan>> {
     // Tokenize into word/space runs, each a list of styled pieces (one per contributing
     // segment). Within a segment words and spaces alternate, so a run only ever grows where
     // a segment boundary cuts it.
-    type Piece = (String, SpanStyle, Option<usize>);
+    type Piece = (String, SpanStyle, Option<usize>, Option<u32>);
     enum Run {
         Word(Vec<Piece>),
         Space(Vec<Piece>),
@@ -1067,7 +1135,7 @@ fn wrap_segments(segs: &[Segment], width: usize) -> Vec<Vec<ReadSpan>> {
             };
             let (token, tail) = rest.split_at(split);
             rest = tail;
-            let piece = (token.to_string(), seg.style, seg.element);
+            let piece = (token.to_string(), seg.style, seg.element, seg.search);
             match (runs.last_mut(), is_space) {
                 (Some(Run::Word(pieces)), false) | (Some(Run::Space(pieces)), true) => {
                     pieces.push(piece)
@@ -1096,15 +1164,17 @@ fn wrap_segments(segs: &[Segment], width: usize) -> Vec<Vec<ReadSpan>> {
         lines.push(std::mem::take(cur));
         *cur_w = 0;
     };
-    let push = |cur: &mut Vec<ReadSpan>, cur_w: &mut usize, (text, style, element): Piece| {
-        *cur_w += text.width();
-        cur.push(ReadSpan {
-            text,
-            style,
-            element,
-            syntax: None,
-        });
-    };
+    let push =
+        |cur: &mut Vec<ReadSpan>, cur_w: &mut usize, (text, style, element, search): Piece| {
+            *cur_w += text.width();
+            cur.push(ReadSpan {
+                text,
+                style,
+                element,
+                syntax: None,
+                search,
+            });
+        };
 
     for run in &runs {
         match run {
@@ -1118,7 +1188,7 @@ fn wrap_segments(segs: &[Segment], width: usize) -> Vec<Vec<ReadSpan>> {
                 }
             }
             Run::Word(pieces) => {
-                let w: usize = pieces.iter().map(|(t, _, _)| t.width()).sum();
+                let w: usize = pieces.iter().map(|(t, _, _, _)| t.width()).sum();
                 if cur_w > 0 && cur_w + w > width {
                     flush(&mut cur, &mut cur_w, &mut lines);
                 }
@@ -1130,7 +1200,7 @@ fn wrap_segments(segs: &[Segment], width: usize) -> Vec<Vec<ReadSpan>> {
                 }
                 // Longer than the whole width: hard-break at the width, chunk by chunk, each
                 // chunk keeping the style of the segment it came from.
-                for (text, style, element) in pieces {
+                for (text, style, element, search) in pieces {
                     let mut chunk = String::new();
                     let mut chunk_w = 0usize;
                     for c in text.chars() {
@@ -1140,7 +1210,7 @@ fn wrap_segments(segs: &[Segment], width: usize) -> Vec<Vec<ReadSpan>> {
                                 push(
                                     &mut cur,
                                     &mut cur_w,
-                                    (std::mem::take(&mut chunk), *style, *element),
+                                    (std::mem::take(&mut chunk), *style, *element, *search),
                                 );
                                 chunk_w = 0;
                             }
@@ -1154,7 +1224,7 @@ fn wrap_segments(segs: &[Segment], width: usize) -> Vec<Vec<ReadSpan>> {
                         chunk_w += cw;
                     }
                     if !chunk.is_empty() {
-                        push(&mut cur, &mut cur_w, (chunk, *style, *element));
+                        push(&mut cur, &mut cur_w, (chunk, *style, *element, *search));
                     }
                 }
             }
@@ -1237,6 +1307,7 @@ pub fn clip_spans(spans: &[ReadSpan], skip: usize, width: usize) -> Vec<ReadSpan
                 style: span.style,
                 element: span.element,
                 syntax: span.syntax.clone(),
+                search: span.search,
             });
         }
     }
@@ -1274,6 +1345,100 @@ mod tests {
         rows.iter()
             .map(|r| r.spans.iter().map(|s| s.text.as_str()).collect())
             .collect()
+    }
+
+    /// Where a match lands in a laid-out document is recorded row by row, so a reveal can find a
+    /// match deep inside a paragraph many rows tall — and, for the shells that can only measure
+    /// blocks, how far through its block's text it is.
+    #[test]
+    fn a_marks_place_is_recorded_inside_its_block() {
+        let words = "word ".repeat(60);
+        let md = format!("# Title\n\n{words}needle {words}\n");
+        let at = md.find("needle").unwrap() as u32;
+        let blocks = crate::markdown::parse_marked(
+            &md,
+            &[(
+                crate::markdown::Span {
+                    start: at,
+                    end: at + 6,
+                },
+                1,
+            )],
+        );
+        let elements = stops(&blocks);
+        let rows = layout(&blocks, &elements, 40, &CodeHighlights::new());
+        let marks = mark_extents(&rows, 2, 10);
+        let needle_row = rows
+            .iter()
+            .position(|r| r.spans.iter().any(|s| s.search == Some(1)))
+            .unwrap() as u32;
+        assert!(needle_row > 4, "deep in the paragraph, not at its top");
+        assert_eq!(
+            marks,
+            vec![crate::grid::MarkExtent {
+                index: 1,
+                top: (needle_row + 2) * 10,
+                bottom: (needle_row + 3) * 10,
+            }]
+        );
+        let fractions = mark_fractions(&blocks);
+        assert_eq!(fractions.len(), 1);
+        assert!(
+            (fractions[0].in_block - 0.5).abs() < 0.05,
+            "halfway through its paragraph: {:?}",
+            fractions[0]
+        );
+        assert_eq!(fractions[0].block, blocks[1].span());
+    }
+
+    /// A search's marks come through the layout on the spans they cover — split from the text
+    /// around them, kept across wrapping and emphasis, and cut into a fence's highlighted runs —
+    /// so a shell paints a match without knowing where it came from.
+    #[test]
+    fn search_marks_ride_the_spans_they_cover() {
+        let md = "A **bold\nclaim** here.\n\n```\nlet needle = 1;\n```";
+        let span = |needle: &str| {
+            let at = md.find(needle).unwrap() as u32;
+            crate::markdown::Span {
+                start: at,
+                end: at + needle.len() as u32,
+            }
+        };
+        let blocks =
+            crate::markdown::parse_marked(md, &[(span("bold\nclaim"), 1), (span("needle"), 2)]);
+        let elements = stops(&blocks);
+        let hl: CodeHighlights = std::iter::once((
+            blocks[1].span().start,
+            vec![aether_protocol::viewport::Highlight {
+                start: 0,
+                end: 3,
+                kind: "keyword".into(),
+            }],
+        ))
+        .collect();
+        let rows = layout(&blocks, &elements, 80, &hl);
+        let marked: Vec<(String, u32)> = rows
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .filter_map(|s| s.search.map(|i| (s.text.clone(), i)))
+            .collect();
+        assert_eq!(
+            marked,
+            vec![
+                ("bold".to_string(), 1),
+                (" ".to_string(), 1),
+                ("claim".to_string(), 1),
+                ("needle".to_string(), 2),
+            ]
+        );
+        // The keyword run before the mark keeps its capture and carries no match.
+        let code_row = rows
+            .iter()
+            .find(|r| r.spans.iter().any(|s| s.text == "needle"))
+            .unwrap();
+        assert_eq!(code_row.spans[0].text, "let");
+        assert_eq!(code_row.spans[0].syntax.as_deref(), Some("keyword"));
+        assert_eq!(code_row.spans[0].search, None);
     }
 
     /// The presence invariant: a block that parses is a block that shows. Rows are pushed by
@@ -1629,6 +1794,7 @@ mod tests {
             style: SpanStyle::plain(SpanKind::CodeBlock),
             element: None,
             syntax: syntax.map(str::to_string),
+            search: None,
         };
         let row = vec![span("let ", Some("keyword")), span("x = 1;", None)];
         // Window over the middle: styles and captures survive the cut.
@@ -1960,7 +2126,146 @@ pub fn measured_element(
         (rows.len() as u32)
             .saturating_add(pad_top)
             .saturating_add(pad_bottom),
+        mark_extents(rows, pad_top, 1),
     )
+}
+
+/// Where each search match marked in the layout landed: the first and last row any span of it is
+/// on, `pad_top` rows down, in units of `unit` to the row. What a shell laying prose out in rows
+/// records so a reveal can find a match inside a block ([`crate::grid::MarkExtent`]).
+pub fn mark_extents(rows: &[ReadRow], pad_top: u32, unit: u32) -> Vec<crate::grid::MarkExtent> {
+    let mut out: Vec<crate::grid::MarkExtent> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let at = (i as u32).saturating_add(pad_top);
+        for index in row.spans.iter().filter_map(|s| s.search) {
+            match out.iter_mut().find(|m| m.index == index) {
+                Some(m) => m.bottom = (at + 1) * unit,
+                None => out.push(crate::grid::MarkExtent {
+                    index,
+                    top: at * unit,
+                    bottom: (at + 1) * unit,
+                }),
+            }
+        }
+    }
+    out
+}
+
+/// Where each search match sits in a parse's text, as fractions — of the leaf block it is in, and
+/// of the whole document — for a shell that can measure blocks but not the runs inside them: it
+/// places a match that far down the block (or the document) it did measure. An estimate, and a
+/// reveal rests a match a fifth of the way down the view, so being a line or two out still shows
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarkFraction {
+    pub index: u32,
+    /// The leaf block — paragraph, heading, code — the match's text is in.
+    pub block: Span,
+    pub in_block: f32,
+    pub in_document: f32,
+}
+
+/// [`MarkFraction`] for every match marked in `blocks`, first occurrence of each.
+pub fn mark_fractions(blocks: &[Block]) -> Vec<MarkFraction> {
+    // (index, block, chars into block, chars into document) and each block's length, then divided.
+    fn inline_text(inlines: &[Inline], at: &mut usize, found: &mut Vec<(u32, usize)>) {
+        for i in inlines {
+            match i {
+                Inline::Text { text, marks } | Inline::Code { text, marks } => {
+                    for m in marks {
+                        found.push((
+                            m.index,
+                            *at + text[..(m.start as usize).min(text.len())].chars().count(),
+                        ));
+                    }
+                    *at += text.chars().count();
+                }
+                Inline::Emphasis { content }
+                | Inline::Strong { content }
+                | Inline::Strikethrough { content }
+                | Inline::Link { content, .. } => inline_text(content, at, found),
+                Inline::Image { .. } | Inline::FootnoteRef { .. } => *at += 1,
+                Inline::HardBreak => *at += 1,
+            }
+        }
+    }
+    struct Leaf {
+        span: Span,
+        start: usize,
+        len: usize,
+        found: Vec<(u32, usize)>,
+    }
+    /// Counts a leaf's text into `at`, noting each mark's index and offset in `found`.
+    type Count<'a> = &'a dyn Fn(&mut usize, &mut Vec<(u32, usize)>);
+    fn walk(blocks: &[Block], doc: &mut usize, leaves: &mut Vec<Leaf>) {
+        for b in blocks {
+            let mut leaf = |span: Span, f: Count<'_>| {
+                let (mut at, mut found) = (0usize, Vec::new());
+                f(&mut at, &mut found);
+                leaves.push(Leaf {
+                    span,
+                    start: *doc,
+                    len: at.max(1),
+                    found,
+                });
+                *doc += at.max(1);
+            };
+            match b {
+                Block::Heading { content, span, .. } | Block::Paragraph { content, span } => {
+                    leaf(*span, &|at, found| inline_text(content, at, found))
+                }
+                Block::Code {
+                    code, span, marks, ..
+                } => leaf(*span, &|at, found| {
+                    for m in marks {
+                        found.push((
+                            m.index,
+                            code[..(m.start as usize).min(code.len())].chars().count(),
+                        ));
+                    }
+                    *at += code.chars().count();
+                }),
+                Block::Table {
+                    head, rows, span, ..
+                } => leaf(*span, &|at, found| {
+                    for cell in head.iter().chain(rows.iter().flatten()) {
+                        inline_text(cell, at, found);
+                    }
+                }),
+                Block::List { items, .. } => {
+                    for item in items {
+                        walk(&item.blocks, doc, leaves);
+                    }
+                }
+                Block::Quote { content, .. } | Block::FootnoteDef { content, .. } => {
+                    walk(content, doc, leaves)
+                }
+                Block::Rule { .. }
+                | Block::Image { .. }
+                | Block::FrontMatter { .. }
+                | Block::Html { .. } => *doc += 1,
+            }
+        }
+    }
+    let mut leaves = Vec::new();
+    let mut total = 0usize;
+    walk(blocks, &mut total, &mut leaves);
+    let total = total.max(1) as f32;
+    let mut out: Vec<MarkFraction> = Vec::new();
+    for leaf in &leaves {
+        for &(index, at) in &leaf.found {
+            if out.iter().any(|m| m.index == index) {
+                continue;
+            }
+            out.push(MarkFraction {
+                index,
+                block: leaf.span,
+                in_block: at as f32 / leaf.len as f32,
+                in_document: (leaf.start + at) as f32 / total,
+            });
+        }
+    }
+    out
 }
 
 /// [`measured_element`] from wherever a shell knows its blocks' places: each block as its source
@@ -1975,6 +2280,7 @@ pub fn measured_from_spans(
     line_count: u32,
     pad_top: u32,
     end: u32,
+    marks: Vec<crate::grid::MarkExtent>,
 ) -> crate::grid::MeasuredElement {
     let line_count = line_count.max(1) as usize;
     // Per line: the span length of the innermost block seen so far, and where that block starts.
@@ -2004,6 +2310,7 @@ pub fn measured_from_spans(
         first_row: aether_protocol::coords::ElementRow::ZERO,
         starts,
         end,
+        marks,
     }
 }
 
@@ -2214,6 +2521,7 @@ pub fn element(
             .saturating_add(pad_top)
             .saturating_add(pad_bottom)
             .saturating_mul(unit),
+        marks: mark_extents(&rows, pad_top, unit),
     };
     ReadElement { rows, measured }
 }

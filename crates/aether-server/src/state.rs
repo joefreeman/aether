@@ -1159,7 +1159,15 @@ impl ServerState {
             return false;
         }
         let mode = self.read_mode(client, buffer_id);
-        self.read.insert((client, buffer_id), mode);
+        if mode {
+            self.collapse_for_reading(client, buffer_id);
+        }
+        if self.read.insert((client, buffer_id), mode) != Some(mode) {
+            // Read, the file is searched as the prose it shows; edited, as its lines.
+            for view in self.views_presenting(buffer_id) {
+                crate::view_search::refresh_view(self, view);
+            }
+        }
         self.doc_of_mut(buffer_id).read_last.get_or_insert(mode);
         mode
     }
@@ -1171,11 +1179,30 @@ impl ServerState {
         if !self.readable(buffer_id) {
             return false;
         }
+        if read {
+            self.collapse_for_reading(client, buffer_id);
+        }
         self.read.insert((client, buffer_id), read);
         self.doc_of_mut(buffer_id).read_last = Some(read);
         // The session records how each file was last shown, so a toggle is a change to it.
         self.dirty_session_for_buffer(buffer_id);
+        // Read, the file is searched as the prose it shows; edited, as its lines.
+        for view in self.views_presenting(buffer_id) {
+            crate::view_search::refresh_view(self, view);
+        }
         true
+    }
+
+    /// Collapse `client`'s selection in `buffer_id` to its cursor, as it arrives in the reader.
+    ///
+    /// The reader's grain is the block: every selection it makes is whole blocks, and that is the
+    /// only kind it can paint and the only kind its block commands read the same way it is painted.
+    /// A selection made in the editor rarely lines up with blocks, and kept, it would sit there
+    /// unpainted while `Ctrl-x` cut whatever it overlapped.
+    fn collapse_for_reading(&mut self, client: ClientId, buffer_id: BufferId) {
+        if let Some(cursor) = self.cursors.get_mut(&(client, buffer_id)) {
+            cursor.anchor = cursor.position;
+        }
     }
 
     /// Forget a client's reading modes. Used on disconnect.

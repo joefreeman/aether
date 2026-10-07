@@ -1538,6 +1538,27 @@ fn search_wire_shapes() {
         folded: 4,
         ..summary.clone()
     };
+    // A prose element carries its search inside the parse: a run's marks, off the wire when none.
+    let plain = aether_markdown::Inline::Text {
+        text: "hay".into(),
+        marks: vec![],
+    };
+    assert_eq!(
+        to_value(&plain).unwrap(),
+        json!({"kind": "text", "text": "hay"})
+    );
+    let marked = aether_markdown::Inline::Text {
+        text: "needle".into(),
+        marks: vec![aether_markdown::Mark {
+            start: 0,
+            end: 6,
+            index: 3,
+        }],
+    };
+    assert_eq!(
+        to_value(&marked).unwrap()["marks"],
+        json!([{"start": 0, "end": 6, "index": 3}])
+    );
     assert_eq!(to_value(&folded).unwrap()["folded"], 4);
     round_trips(&folded);
 
@@ -2215,8 +2236,13 @@ fn view_set_read_shape() {
     let parsed: ViewSetReadParams = from_value(json!({"view_id": 9, "read": false})).unwrap();
     assert_eq!(parsed.view_id, aether_protocol::ViewId(9));
     assert!(!parsed.read);
-    let r = to_value(ViewSetReadResult { read: true }).unwrap();
-    assert_eq!(r, json!({"read": true}));
+    let r = to_value(ViewSetReadResult {
+        read: true,
+        cursor: Default::default(),
+    })
+    .unwrap();
+    assert_eq!(r["read"], json!(true));
+    assert!(r.get("cursor").is_some(), "the flip can move the cursor");
 }
 
 /// An open reports whether this client is reading the file: off the wire when it is not (every

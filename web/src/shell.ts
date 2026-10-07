@@ -32,6 +32,7 @@ import { RpcClient, type ConnState } from "./client";
 import { renderBuffer } from "./render";
 import {
   applyFenceHighlights,
+  markCurrentMatch,
   markFocus,
   MEASURABLE_BLOCKS,
   renderReadView,
@@ -1454,6 +1455,8 @@ export class Shell {
   private readActive = false;
   /** The focus last revealed (`buffer:start:end`), so the view scrolls only on focus changes. */
   private lastReadFocus: string | null = null;
+  /** The search landing the reader last revealed — see the reader branch of `render`. */
+  private lastReadLanding: string | null = null;
   /** The document last rendered (`buffer:revision:loading`) — the DOM-rebuild key. */
   private lastReadDoc: string | null = null;
   /** Socket up? Gates scroll-driven window prefetches — while down, a smooth-scroll animation fires
@@ -3364,7 +3367,7 @@ export class Shell {
   /** The heights this shell last told the core for each rendered reply, so a measure pass only
    *  disturbs the view when the browser's answer actually moved. Dropped for elements the current
    *  window no longer has, so a stale height cannot place a view it was never measured for. */
-  private mdHeights: Record<number, number> = {};
+  private mdHeights: Record<number, string> = {};
 
   private forgetStaleReplyHeights(window: BufferWindow): void {
     const live = new Set(proseOf(window.root).map((n) => n.element));
@@ -3395,12 +3398,37 @@ export class Shell {
         UNITS_PER_ROW,
         Math.round((el.offsetHeight / this.cell.h) * UNITS_PER_ROW),
       );
-      if (this.mdHeights[element] === units) continue;
-      this.mdHeights[element] = units;
-      this.measured = this.session.set_element_measured(element, units) as Measured;
+      const marks = this.markExtents(el, el.getBoundingClientRect().top);
+      const key = `${units}|${marks.join(";")}`;
+      if (this.mdHeights[element] === key) continue;
+      this.mdHeights[element] = key;
+      this.measured = this.session.set_element_measured(element, units, marks) as Measured;
       moved = true;
     }
     return moved;
+  }
+
+  /** Where the search matches marked under `root` were drawn: `[index, top, bottom]` each, in units
+   *  below `origin` (a client-space y). What lets a reveal show a match inside a block rather than
+   *  the block's top. */
+  private markExtents(root: ParentNode, origin: number): [number, number, number][] {
+    const out = new Map<number, [number, number, number]>();
+    for (const node of root.querySelectorAll(".search-hit[data-match]")) {
+      if (!(node instanceof HTMLElement)) continue;
+      const index = Number(node.dataset.match);
+      const rect = node.getBoundingClientRect();
+      const top = Math.max(0, Math.round(((rect.top - origin) / this.cell.h) * UNITS_PER_ROW));
+      const bottom = Math.max(
+        top + 1,
+        Math.round(((rect.bottom - origin) / this.cell.h) * UNITS_PER_ROW),
+      );
+      const have = out.get(index);
+      out.set(
+        index,
+        have ? [index, Math.min(have[1], top), Math.max(have[2], bottom)] : [index, top, bottom],
+      );
+    }
+    return [...out.values()];
   }
 
   /** Re-read the core's measured table into the painter's mirror  /** Re-read the core's measured table into the painter's mirror — after every adoption, which
@@ -3464,7 +3492,8 @@ export class Shell {
       spans.push([start, end, Math.max(0, Math.round((top / this.cell.h) * UNITS_PER_ROW))]);
     }
     const end = Math.round((el.scrollHeight / this.cell.h) * UNITS_PER_ROW);
-    this.measured = this.session.set_read_measured(v.focused_element, spans, end) as Measured;
+    const marks = this.markExtents(root, origin);
+    this.measured = this.session.set_read_measured(v.focused_element, spans, end, marks) as Measured;
   }
 
   /** Bring a reading-view block on screen, framed the way the reader always framed it: left alone
@@ -3472,7 +3501,11 @@ export class Shell {
    *  viewport pins nearer the top). The block's place comes from the shared layout, not the DOM. */
   private revealBlock(span: { start: number; end: number }, smooth: boolean): void {
     const extent = this.session.read_block_extent(span.start, span.end) as [number, number] | null;
-    if (!extent) return;
+    if (extent) this.revealExtent(extent, smooth);
+  }
+
+  /** Frame `[top, bottom]` (units) the way the reader frames a block — see `revealBlock`. */
+  private revealExtent(extent: [number, number], smooth: boolean): void {
     const el = this.bufferEl;
     const height = el.clientHeight;
     const top = this.pxOfUnits(extent[0]) - el.scrollTop;
@@ -3609,7 +3642,7 @@ export class Shell {
       // re-render (hint tick, toast) just re-marks focus, so <img> elements aren't re-fetched.
       // Rebuild only when the *content* changes; arriving fence highlights patch in place
       // (a rebuild per fence result made code-heavy documents take seconds to settle).
-      const docKey = `${v.read.buffer_id}:${v.read.revision}:${v.read.loading}`;
+      const docKey = `${v.read.buffer_id}:${v.read.parse_gen}:${v.read.loading}`;
       if (docKey !== this.lastReadDoc) {
         this.lastReadDoc = docKey;
         // Relative doc links render as real `<a href>`s onto the app itself (the picker-row
@@ -3629,12 +3662,25 @@ export class Shell {
         // A fence painting in changes no heights; one arriving from the loading placeholder does.
         if (this.bufferEl.scrollHeight !== before) this.measureReader();
       }
+      markCurrentMatch(this.bufferEl, v.search.summary?.current_index ?? 0);
       // Reveal keyed on the target when the cursor sits inside one (a Tab step must reveal
       // the link, not just its paragraph), else the block bar.
       const revealSpan = v.read.target_span ?? v.read.focus_span;
       const focusKey = revealSpan
         ? `${v.read.buffer_id}:${revealSpan.start}:${revealSpan.end}`
         : null;
+      // A search that just landed shows its match — inside a tall block, the block's top is not
+      // where it is — and takes the place of the block reveal its landing would otherwise cause.
+      const landing = this.session.search_mark_rows() as [number, number] | null;
+      const pos = v.buffer.cursor.position;
+      const landingKey = landing
+        ? `${v.read.buffer_id}:${v.search.summary?.current_index}:${pos.line}:${pos.col}`
+        : null;
+      if (landing && landingKey !== this.lastReadLanding) {
+        this.lastReadLanding = landingKey;
+        this.lastReadFocus = focusKey;
+        this.revealExtent(landing, true);
+      }
       if (focusKey !== this.lastReadFocus) {
         // A reveal into a buffer this view hasn't revealed in yet — a cross-file landing, or
         // the reading view just appearing — is a placement, not a motion: it snaps (the

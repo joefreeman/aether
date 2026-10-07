@@ -135,14 +135,26 @@ pub fn seen(m: &ViewMatch, view: &View, vp: Option<&Viewport>) -> Seen {
 }
 
 /// Whether the view's search reads an element at all. A shell's input is where the next command
-/// is typed, not something the view shows; an agent's reply is prose, whose matches have nowhere
-/// to be painted yet.
+/// is typed, not something the view shows.
 fn searched(binding: &ElementBinding) -> bool {
-    !binding.role.is_input() && !binding.prose
+    !binding.role.is_input()
 }
 
-/// Every match of `regex` in `view`, in view order, capped at [`SEARCH_MAX_MATCHES`].
-pub fn find(s: &ServerState, view: &View, regex: &regex::Regex) -> (Vec<ViewMatch>, bool) {
+/// Every match of `regex` in the view `view_id`, as `client_id` sees it, in view order, capped at
+/// [`SEARCH_MAX_MATCHES`].
+///
+/// As the client sees it because what an element shows can be the client's: a markdown file it
+/// reads shows prose, where another client editing it shows lines, and the two read different text.
+pub fn find(
+    s: &ServerState,
+    client_id: aether_protocol::ClientId,
+    view_id: ViewId,
+    regex: &regex::Regex,
+) -> (Vec<ViewMatch>, bool) {
+    let Some(view) = s.views.get(&view_id) else {
+        return (Vec::new(), false);
+    };
+    let reading = s.reads(client_id, view_id);
     let mut out: Vec<ViewMatch> = Vec::new();
     for (idx, binding) in view.elements.iter().enumerate() {
         if !searched(binding) {
@@ -151,7 +163,7 @@ pub fn find(s: &ServerState, view: &View, regex: &regex::Regex) -> (Vec<ViewMatc
         // One more than there is room for, so a full list knows whether anything was left out.
         let room = SEARCH_MAX_MATCHES - out.len();
         let element = idx as FieldId;
-        let mut found = element_matches(s, binding, element, regex, room + 1);
+        let mut found = element_matches(s, binding, element, reading, regex, room + 1);
         // Collected per kind and then ordered, so a cap reached mid-element keeps the matches
         // nearest the top of it rather than whichever kind was scanned first.
         found.sort_by_key(ViewMatch::key);
@@ -170,6 +182,7 @@ fn element_matches(
     s: &ServerState,
     binding: &ElementBinding,
     element: FieldId,
+    reading: bool,
     regex: &regex::Regex,
     limit: usize,
 ) -> Vec<ViewMatch> {
@@ -178,6 +191,30 @@ fn element_matches(
         return out;
     };
     let lines = binding.lines_in(doc.line_count());
+
+    // Prose — an agent's reply, or a markdown file this client reads — is searched as it reads:
+    // markup gone, soft breaks as spaces, quotes as rendered. Each match comes back as the source
+    // it was rendered from, which is a place in the buffer like any other text match.
+    if (binding.prose || reading) && !binding.is_empty() {
+        let (text, base) = element_source(doc, lines.clone());
+        let visible = aether_markdown::visible(&text);
+        for m in regex
+            .find_iter(visible.text())
+            .filter(|m| m.start() != m.end())
+            .take(limit)
+        {
+            if let Some(span) = visible.source_span(m.start(), m.end()) {
+                out.push(ViewMatch {
+                    element,
+                    at: MatchAt::Text {
+                        start: crate::handlers::byte_to_logical(doc, base + span.start as usize),
+                        end: crate::handlers::byte_to_logical(doc, base + span.end as usize),
+                    },
+                });
+            }
+        }
+        return out;
+    }
 
     if binding.chrome_searched {
         for (node, text) in chrome_texts(&binding.chrome_above).into_iter().enumerate() {
@@ -245,6 +282,21 @@ fn element_matches(
         });
     }
     out
+}
+
+/// The text an element windows, and the document byte it starts at — what a prose element is
+/// parsed from, so a span in its parse is `base` bytes short of the document's.
+pub fn element_source(
+    doc: &crate::state::Document,
+    lines: std::ops::Range<u32>,
+) -> (String, usize) {
+    let lines = lines.start..lines.end.min(doc.text.len_lines() as u32);
+    let chars = |line: u32| doc.text.line_to_char(line as usize);
+    let (from, to) = (chars(lines.start), chars(lines.end.max(lines.start)));
+    (
+        doc.text.slice(from..to).to_string(),
+        doc.text.char_to_byte(from),
+    )
 }
 
 /// Non-empty matches of `regex` in `text`, as byte ranges. Zero-width matches are skipped so a
@@ -437,14 +489,17 @@ pub fn derive_current(
 pub fn recompute(
     s: &ServerState,
     client_id: aether_protocol::ClientId,
+    view_id: ViewId,
     search: &mut ViewSearch,
-    view: &View,
-    vp: Option<&Viewport>,
 ) -> bool {
+    let Some(view) = s.views.get(&view_id) else {
+        return false;
+    };
+    let vp = s.viewport_on(client_id, view_id);
     let Ok(regex) = crate::picker::build_match_regex(&search.query, &search.options) else {
         return false;
     };
-    let (matches, truncated) = find(s, view, &regex);
+    let (matches, truncated) = find(s, client_id, view_id, &regex);
     search.matches = matches;
     search.truncated = truncated;
     let kept = search.current.filter(|key| {
@@ -470,12 +525,9 @@ pub fn refresh_view(s: &mut ServerState, view_id: ViewId) {
         let Some(mut search) = s.searches.remove(&key) else {
             continue;
         };
-        let Some(view) = s.views.get(&view_id) else {
-            continue;
-        };
-        let vp = s.viewport_on(key.0, view_id);
-        if recompute(s, key.0, &mut search, view, vp) {
-            search.last_pushed_index = summary(&search, view_id, view, vp).current_index;
+        if recompute(s, key.0, view_id, &mut search) {
+            let vp = s.viewport_on(key.0, view_id);
+            search.last_pushed_index = summary(&search, view_id, s.view(view_id), vp).current_index;
             s.searches.insert(key, search);
         }
     }

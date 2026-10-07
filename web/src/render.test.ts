@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { renderBuffer, splitTitle } from "./render";
-import { MEASURABLE_BLOCKS, renderReply } from "./read";
+import { markCurrentMatch, MEASURABLE_BLOCKS, renderReply } from "./read";
 import { editorsOf, focusRing, paintedRows, totalRows } from "./protocol";
 import { WHOLE_ROWS } from "./protocol";
 import type { BufferWindow, CursorState, LogicalLineRender, Measured, ViewNode } from "./protocol";
@@ -1430,9 +1430,10 @@ describe("search matches", () => {
       focusedElement: 0,
       currentMatch,
     });
-    const filled = ".patch-chrome .search-hit, .patch-chrome .sel, .deleted-phantom .search-hit, .deleted-phantom .sel";
+    const filled =
+      ".patch-chrome .search-hit, .patch-chrome .search-current, .deleted-phantom .search-hit, .deleted-phantom .search-current";
     return [...container.querySelectorAll(filled)].map(
-      (el) => `${el.classList.contains("sel") ? "current" : "hit"} ${el.textContent}`,
+      (el) => `${el.classList.contains("search-current") ? "current" : "hit"} ${el.textContent}`,
     );
   }
 
@@ -1462,8 +1463,51 @@ describe("search matches", () => {
     expect(hits(window, 0)).toEqual(["hit needle", "hit needle"]);
   });
 
-  it("paints the current one in the selection's fill — the only mark it has", () => {
+  it("paints the current one in its own fill — the only mark it has", () => {
     expect(hits(window, 1)).toEqual(["current needle", "hit needle"]);
     expect(hits(window, 2)).toEqual(["hit needle", "current needle"]);
+  });
+});
+
+describe("search matches in prose", () => {
+  // `The **needle** isn’t here.` with "needle isn’t" matched (1), and a fence matching "needle" (2).
+  const blocks: MdBlock[] = [
+    {
+      kind: "paragraph",
+      span: { start: 0, end: 30 },
+      content: [
+        { kind: "text", text: "The " },
+        { kind: "strong", content: [{ kind: "text", text: "needle", marks: [{ start: 0, end: 6, index: 1 }] }] },
+        // "isn’t" — the curly quote is three UTF-8 bytes, one UTF-16 unit.
+        { kind: "text", text: " isn\u2019t here.", marks: [{ start: 0, end: 8, index: 1 }] },
+      ],
+    },
+    {
+      kind: "code",
+      language: null,
+      code: "let needle = 1;",
+      span: { start: 31, end: 55 },
+      marks: [{ start: 4, end: 10, index: 2 }],
+    },
+  ];
+
+  const hits = (box: HTMLElement): string[] =>
+    [...box.querySelectorAll(".search-hit")].map(
+      (el) => `${el.classList.contains("current") ? "current" : "hit"} ${el.textContent}`,
+    );
+
+  it("wraps what each mark covers, across emphasis and multi-byte text", () => {
+    const box = document.createElement("div");
+    renderReply(box, blocks);
+    expect(hits(box)).toEqual(["hit needle", "hit  isn\u2019t", "hit needle"]);
+  });
+
+  it("lights the current match without a rebuild", () => {
+    const box = document.createElement("div");
+    renderReply(box, blocks);
+    markCurrentMatch(box, 1);
+    expect(hits(box)).toEqual(["current needle", "current  isn\u2019t", "hit needle"]);
+    markCurrentMatch(box, 2);
+    expect(hits(box)).toEqual(["hit needle", "hit  isn\u2019t", "current needle"]);
   });
 });

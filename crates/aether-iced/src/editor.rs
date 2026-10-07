@@ -889,7 +889,12 @@ where
                                             fill_color,
                                         );
                                     }
-                                    draw_runs(renderer, text, highlights, x_of, col, y, title_clip);
+                                    let ink = with_current_ink(
+                                        highlights,
+                                        search_matches,
+                                        self.content.current_match,
+                                    );
+                                    draw_runs(renderer, text, &ink, x_of, col, y, title_clip);
                                     col += text.chars().count() as u32;
                                 }
                                 _ => {}
@@ -978,8 +983,7 @@ where
                                 search_matches,
                             } => {
                                 // A search's matches over chrome the view counts as content — a
-                                // run's command — under the text, the current one in the
-                                // selection's fill as when the cursor selects a match in text.
+                                // run's command — under the text, the current one in its own fill.
                                 for (start, end, fill_color) in chrome_match_fills(
                                     text,
                                     search_matches,
@@ -997,15 +1001,12 @@ where
                                         fill_color,
                                     );
                                 }
-                                draw_runs(
-                                    renderer,
-                                    text,
+                                let ink = with_current_ink(
                                     highlights,
-                                    &text_x,
-                                    col,
-                                    y,
-                                    content_clip,
+                                    search_matches,
+                                    self.content.current_match,
                                 );
+                                draw_runs(renderer, text, &ink, &text_x, col, y, content_clip);
                                 col += text.chars().count() as u32;
                             }
                             _ => {}
@@ -1121,19 +1122,40 @@ where
                     if pos < v_text.len() {
                         segments.push((pos, v_text.len(), false));
                     }
+                    // The current match's text takes the ink that reads on its fill.
+                    let current = b
+                        .search_matches
+                        .iter()
+                        .find(|m| m.index != 0 && m.index == self.content.current_match)
+                        .map(|m| (m.start as usize, m.end as usize));
                     for (s, e, emph) in segments {
-                        let seg = v_text[s..e]
-                            .replace('\t', &" ".repeat(self.content.tab_width as usize));
-                        draw_text_run(
-                            renderer,
-                            seg,
-                            Point::new(text_x(col_of(s)), y),
-                            cell,
-                            if emph { p.fg } else { fg },
-                            EDITOR_FONT,
-                            content_clip,
-                            text_shaping,
-                        );
+                        let mut cuts = vec![s, e];
+                        if let Some((cs, ce)) = current {
+                            cuts.extend([cs, ce].into_iter().filter(|c| *c > s && *c < e));
+                        }
+                        cuts.sort_unstable();
+                        for w in cuts.windows(2).filter(|w| w[0] < w[1]) {
+                            let (a, z) = (w[0], w[1]);
+                            let on_current = current.is_some_and(|(cs, ce)| a >= cs && z <= ce);
+                            let seg = v_text[a..z]
+                                .replace('\t', &" ".repeat(self.content.tab_width as usize));
+                            draw_text_run(
+                                renderer,
+                                seg,
+                                Point::new(text_x(col_of(a)), y),
+                                cell,
+                                if on_current {
+                                    p.search_current_fg
+                                } else if emph {
+                                    p.fg
+                                } else {
+                                    fg
+                                },
+                                EDITOR_FONT,
+                                content_clip,
+                                text_shaping,
+                            );
+                        }
                     }
                     continue;
                 }
@@ -1260,15 +1282,27 @@ where
                 }
             }
 
-            // Search-match fills: the quiet dim fill, under selection and cursor (matching
-            // the web's search-hit < selection < cursor stacking). The spans are kept — the
-            // text pass below lifts comment-coloured glyphs inside them.
-            let hit_spans: Vec<(u32, u32)> = line
+            // Search-match fills, under selection and cursor (matching the web's search-hit <
+            // selection < cursor stacking): a search's in the pale tint of the current match's
+            // hue, the symbol under the cursor's occurrences in the neutral one. The spans are
+            // kept — the text pass below lifts comment-coloured glyphs inside them.
+            let hit_spans: Vec<(u32, u32, Color)> = line
                 .search_matches
                 .iter()
-                .filter_map(|m| grid::byte_range_span(&cells, m.start, m.end))
+                .filter_map(|m| {
+                    let (s, e) = grid::byte_range_span(&cells, m.start, m.end)?;
+                    Some((
+                        s,
+                        e,
+                        if m.index != 0 {
+                            p.search_hit_bg
+                        } else {
+                            p.fill_dim
+                        },
+                    ))
+                })
                 .collect();
-            for &(start, end) in &hit_spans {
+            for &(start, end, fill_color) in &hit_spans {
                 fill_content(
                     renderer,
                     Rectangle {
@@ -1277,7 +1311,7 @@ where
                         width: (end - start) as f32 * cell.width,
                         height: cell.height,
                     },
-                    p.fill_dim,
+                    fill_color,
                 );
             }
 
@@ -1467,7 +1501,7 @@ where
             // that text to the normal foreground (the web's `.search-hit.hl-comment`
             // rule; every other syntax colour reads fine on the fill).
             let in_hit = |dcol: u32| {
-                hit_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
+                hit_spans.iter().any(|&(s, e, _)| dcol >= s && dcol < e)
                     || emph_spans.iter().any(|&(s, e)| dcol >= s && dcol < e)
                     || sneak_spans
                         .iter()
@@ -2157,17 +2191,53 @@ fn diagnostic_at(line: &LogicalLineRender, col: u32) -> Option<DiagnosticSeverit
         .max_by_key(|s| severity_rank(*s))
 }
 
-/// The fill a search range paints: the selection's for the current match, the dim fill otherwise.
+/// The fill a search range paints: the current match's own where it is the current one — it holds no
+/// cursor to be selected by — the pale tint of its hue otherwise.
 fn match_fill(
     m: &aether_protocol::search::SearchMatchRange,
     current: u32,
     p: &theme::Palette,
 ) -> Color {
     if m.index != 0 && m.index == current {
-        p.bg_visual
+        p.search_current_bg
     } else {
-        p.fill_dim
+        p.search_hit_bg
     }
+}
+
+/// `highlights` with the current match's range, if one of `matches` is it, cut out and coloured as
+/// the current match's text — the ink that reads on its fill.
+fn with_current_ink(
+    highlights: &[aether_protocol::viewport::Highlight],
+    matches: &[aether_protocol::search::SearchMatchRange],
+    current: u32,
+) -> Vec<aether_protocol::viewport::Highlight> {
+    use aether_protocol::viewport::Highlight;
+    let Some(m) = matches.iter().find(|m| m.index != 0 && m.index == current) else {
+        return highlights.to_vec();
+    };
+    let mut out: Vec<Highlight> = Vec::new();
+    for h in highlights {
+        if h.start < m.start {
+            out.push(Highlight {
+                end: h.end.min(m.start),
+                ..h.clone()
+            });
+        }
+        if h.end > m.end {
+            out.push(Highlight {
+                start: h.start.max(m.end),
+                ..h.clone()
+            });
+        }
+    }
+    out.push(Highlight {
+        start: m.start,
+        end: m.end,
+        kind: "search.current".into(),
+    });
+    out.sort_by_key(|h| h.start);
+    out
 }
 
 /// A chrome text's search ranges as `(start col, end col, fill)`, in columns of `text` — chrome is

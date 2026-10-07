@@ -106,6 +106,9 @@ fn seat(
         return Ok(None);
     }
     let buffer_id = binding.buffer_id;
+    // The reader is block-grain: it paints a selection by the blocks it covers and its block
+    // commands act on those, so a selection there is whole blocks or nothing.
+    let reading = s.reads(client_id, view_id);
     let doc = s
         .try_doc_of(buffer_id)
         .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
@@ -126,6 +129,9 @@ fn seat(
                 motion::char_to_pos(doc, last_char),
             );
             match take {
+                // In the reader a match is shown by its mark, and the cursor sits at its start —
+                // in the block whose bar then lights, which is what the block commands act on.
+                Take::Select(_) if reading => (first, first),
                 Take::Select(Direction::Forward) => (first, last),
                 Take::Select(Direction::Backward) => (last, first),
                 Take::Extend { anchor, direction } => {
@@ -133,7 +139,11 @@ fn seat(
                         Direction::Forward => last,
                         Direction::Backward => first,
                     };
-                    (anchor, head)
+                    if reading {
+                        whole_blocks(doc, anchor, head)
+                    } else {
+                        (anchor, head)
+                    }
                 }
             }
         }
@@ -170,6 +180,41 @@ fn seat(
         buffer: describe_buffer(s, buffer_id, cursor)?,
         buffer_status: buffer_status_for(s, client_id, buffer_id),
     }))
+}
+
+/// `(anchor, head)` grown out to the blocks each end falls in, in whole-line normal form, keeping
+/// which end is the head — the reader's grain, and the same shape `x` makes there.
+fn whole_blocks(
+    doc: &Document,
+    anchor: LogicalPosition,
+    head: LogicalPosition,
+) -> (LogicalPosition, LogicalPosition) {
+    let text = doc.text.to_string();
+    let stops = aether_markdown::stops(&aether_markdown::parse(&text));
+    let byte =
+        |p: LogicalPosition| (doc.text.line_to_byte(p.line as usize) + p.col as usize) as u32;
+    let block = |p: LogicalPosition| {
+        aether_markdown::element_at_matching(&stops, byte(p), aether_markdown::Stop::is_block)
+            .map(|i| stops[i].span())
+    };
+    let forward = pos_tuple(anchor) <= pos_tuple(head);
+    let (lo, hi) = if forward {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    };
+    // Off every block (a blank line between two), an end stays where it is.
+    let lo = block(lo).map_or(lo, |span| byte_to_logical(doc, span.start as usize));
+    let hi = block(hi).map_or(hi, |span| {
+        byte_to_logical(doc, span.end.saturating_sub(1).max(span.start) as usize)
+    });
+    let scope = crate::cursor::Scope::whole(doc);
+    let (head, anchor) = if forward {
+        motion::snap_selection(&scope, hi, lo, Granularity::Line)
+    } else {
+        motion::snap_selection(&scope, lo, hi, Granularity::Line)
+    };
+    (anchor, head)
 }
 
 /// The client's viewport on `view_id`, re-rendered — how a search set or cleared repaints.
@@ -234,7 +279,7 @@ pub async fn search_set(
     } else {
         let regex = picker_state::build_match_regex(&params.query, &params.options)
             .map_err(|e| RpcError::new(ErrorCode::INVALID_PARAMS, format!("invalid regex: {e}")))?;
-        let (matches, truncated) = view_search::find(&s, s.view(view_id), &regex);
+        let (matches, truncated) = view_search::find(&s, client_id, view_id, &regex);
         s.searches.insert(
             key,
             ViewSearch {

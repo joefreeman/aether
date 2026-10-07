@@ -1205,7 +1205,15 @@ pub async fn view_set_read(
             "only a markdown file presented on its own can be read",
         ));
     }
-    Ok(ViewSetReadResult { read: params.read })
+    let cursor = s
+        .cursors
+        .get(&(client_id, buffer_id))
+        .copied()
+        .unwrap_or_default();
+    Ok(ViewSetReadResult {
+        read: params.read,
+        cursor: wrap_for_response(&s, client_id, buffer_id, cursor),
+    })
 }
 
 /// Re-read a buffer from disk inside the lock, returning the RPC result and the pushes the

@@ -2757,3 +2757,195 @@ async fn a_kept_file_comes_back_in_the_mode_it_was_left() {
     assert!(restored.read, "the reader entry, first, is what it was");
     assert!(presents_as_reader(&mut ws, restored.view_id).await);
 }
+
+// ---- search over prose --------------------------------------------------------------------------
+
+/// A workspace with `doc.md` holding `text`, open, read, and subscribed.
+async fn reading(text: &str) -> (aether_server::ServerHandle, Ws, ViewOpenResult) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("doc.md"), text).unwrap();
+    let mut server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    server.keep_alive(dir);
+    let mut ws = Ws::connect(&server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let open: ViewOpenResult =
+        send_request::<ViewOpen>(&mut ws, &file_open_params("doc.md", None)).await;
+    set_read(&mut ws, open.view_id, true).await;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            cols: 80,
+            rows: 40,
+            ..reader_sub_params(open.view_id)
+        },
+    )
+    .await;
+    (server, ws, open)
+}
+
+async fn search_for(ws: &mut Ws, view: aether_protocol::ViewId, query: &str) -> SearchSetResult {
+    send_request::<SearchSet>(
+        ws,
+        &SearchSetParams {
+            view_id: view,
+            query: query.into(),
+            anchor: None,
+            extend: false,
+            from_selection: false,
+            options: Default::default(),
+        },
+    )
+    .await
+}
+
+async fn next_match(ws: &mut Ws, view: aether_protocol::ViewId) -> SearchNavResult {
+    send_request::<SearchStep>(
+        ws,
+        &SearchStepParams {
+            view_id: view,
+            direction: Direction::Forward,
+            extend: false,
+            count: 1,
+            set_query: None,
+            options: Default::default(),
+        },
+    )
+    .await
+}
+
+/// The reader is searched as it reads — markup gone, a soft break a space — and the matches come
+/// back marked on the runs of the parse they cover, so a shell paints them where it drew the text.
+/// The cursor still lands on the source the match was rendered from.
+#[tokio::test]
+async fn the_reader_searches_the_text_it_shows() {
+    let (server, mut ws, open) = reading("# Title\n\nA **bold\nclaim** here.\n").await;
+    let view = open.view_id;
+
+    let set = search_for(&mut ws, view, "bold claim").await;
+    assert_eq!(
+        set.summary.total, 1,
+        "found across the emphasis and the line break"
+    );
+    let repaint = loop {
+        let p = expect_notification_or_backlog::<ViewportLinesChanged>(&mut ws).await;
+        if p.window.search.is_some() {
+            break p.window;
+        }
+    };
+    let (blocks, _) = the_prose(&repaint);
+    let aether_markdown::Block::Paragraph { content, .. } = &blocks[1] else {
+        panic!("{blocks:?}")
+    };
+    let aether_markdown::Inline::Strong { content: strong } = &content[1] else {
+        panic!("{content:?}")
+    };
+    assert_eq!(
+        strong[0],
+        aether_markdown::Inline::Text {
+            text: "bold claim".into(),
+            marks: vec![aether_markdown::Mark {
+                start: 0,
+                end: 10,
+                index: 1
+            }],
+        },
+        "the mark covers what the reader shows"
+    );
+
+    let nav = next_match(&mut ws, view).await;
+    assert_eq!(nav.summary.current_index, 1);
+    assert_eq!(
+        (nav.cursor.anchor, nav.cursor.position),
+        (
+            LogicalPosition { line: 2, col: 4 },
+            LogicalPosition { line: 2, col: 4 }
+        ),
+        "at the start of the source the match was rendered from, selecting nothing: the reader is \
+         block-grain, and the match shows by its mark"
+    );
+
+    // Edited rather than read, the file is searched as its lines — where `**` sits between them.
+    set_read(&mut ws, view, false).await;
+    let _: ViewportSubscribeResult =
+        send_request::<ViewportSubscribe>(&mut ws, &reader_sub_params(view)).await;
+    assert_eq!(next_match(&mut ws, view).await.summary.total, 0);
+    drop(server);
+}
+
+/// `?` in the reader grows the selection by whole blocks — from the block it was pressed in through
+/// the block the match is in, in whole-line form — since a selection there is blocks or nothing.
+#[tokio::test]
+async fn select_to_match_in_the_reader_takes_whole_blocks() {
+    let (server, mut ws, open) =
+        reading("# Title\n\nFirst paragraph.\n\nSecond with the needle in it.\n\nAfter.\n").await;
+    let set: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        &SearchSetParams {
+            view_id: open.view_id,
+            query: "needle".into(),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 2, col: 3 },
+            }),
+            extend: true,
+            from_selection: false,
+            options: Default::default(),
+        },
+    )
+    .await;
+    assert_eq!(
+        (set.cursor.anchor, set.cursor.position),
+        (
+            LogicalPosition { line: 2, col: 0 },
+            LogicalPosition { line: 4, col: 29 }
+        ),
+        "the first paragraph through the second, whole"
+    );
+    drop(server);
+}
+
+/// Arriving in the reader collapses a selection made in the editor to its cursor: the reader can
+/// only paint whole blocks, and a selection it cannot paint is one its block commands would act on
+/// unseen.
+#[tokio::test]
+async fn entering_the_reader_collapses_a_selection() {
+    let (server, mut ws, open) = reading("# Title\n\nSome text here.\n").await;
+    set_read(&mut ws, open.view_id, false).await;
+    let _: CursorState = send_request::<CursorSet>(
+        &mut ws,
+        &CursorSetParams {
+            buffer_id: open.buffer_id,
+            position: LogicalPosition { line: 2, col: 8 },
+            anchor: LogicalPosition { line: 2, col: 2 },
+            granularity: Granularity::Char,
+        },
+    )
+    .await;
+    let flipped = send_request::<aether_protocol::view::ViewSetRead>(
+        &mut ws,
+        &aether_protocol::view::ViewSetReadParams {
+            view_id: open.view_id,
+            read: true,
+        },
+    )
+    .await;
+    assert!(flipped.read);
+    assert_eq!(
+        (flipped.cursor.anchor, flipped.cursor.position),
+        (
+            LogicalPosition { line: 2, col: 8 },
+            LogicalPosition { line: 2, col: 8 }
+        )
+    );
+    drop(server);
+}

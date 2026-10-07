@@ -195,6 +195,24 @@ pub struct MeasuredElement {
     pub starts: Vec<u32>,
     /// The offset after the last loaded line's last unit.
     pub end: u32,
+    /// Where the search matches marked in this prose were drawn — see [`MarkExtent`]. Empty for an
+    /// element no search marked, and for one that is not prose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<MarkExtent>,
+}
+
+/// Where a shell drew one search match in prose it laid out itself: the match's place in the count,
+/// and its top and bottom as offsets within the element, in the [`Measured`]'s units.
+///
+/// The line starts beside it say where each *source line* begins, and a source line is a block's
+/// worth of prose — a paragraph, one row of it or forty. A match is somewhere inside that, and
+/// only the shell that laid the text out knows where; this is it saying so, so a reveal can show
+/// the match itself rather than the top of the block it is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkExtent {
+    pub index: u32,
+    pub top: u32,
+    pub bottom: u32,
 }
 
 impl MeasuredElement {
@@ -1320,6 +1338,28 @@ pub fn painted_rows_of<'a>(
     );
     resolve_joins(&mut out);
     out
+}
+
+/// The rows the search match `index` was drawn on — its top and the row after it — in prose a shell
+/// laid out and recorded the marks of ([`MeasuredElement::marks`]). `None` for a match anywhere
+/// else, which a row or a cursor already locates, and while the prose is unmeasured.
+pub fn search_mark_rows(
+    root: &Element,
+    measured: &Measured,
+    index: u32,
+) -> Option<(VisualRow, VisualRow)> {
+    if index == 0 {
+        return None;
+    }
+    let origins = element_origins(root, measured);
+    measured.elements.iter().find_map(|(element, m)| {
+        let mark = m.marks.iter().find(|x| x.index == index)?;
+        let origin = origins.get(element)?.row;
+        Some((
+            origin.saturating_add(mark.top),
+            origin.saturating_add(mark.bottom.max(mark.top + 1)),
+        ))
+    })
 }
 
 /// Where each content element starts — its visual row in the units [`Measured`] counts in, and the
@@ -3587,6 +3627,7 @@ mod tests {
                 first_row: ElementRow(first_row),
                 starts,
                 end: at,
+                marks: Vec::new(),
             },
         );
         m
@@ -3686,6 +3727,7 @@ mod tests {
                 first_row: ElementRow(2),
                 starts: vec![2000, 3000, 6500],
                 end: 8500,
+                marks: Vec::new(),
             },
         );
         assert_eq!(
@@ -3892,6 +3934,43 @@ mod prose_tests {
         }
     }
 
+    /// A match inside prose is found where the shell drew it — its element's origin plus the mark's
+    /// own offset — not at the top of the block or the element it is in.
+    #[test]
+    fn a_search_mark_is_found_where_the_shell_drew_it() {
+        let root = Element::column(vec![prose(0, 2), prose(1, 1)]);
+        let mut measured = Measured::at_resolution(1000);
+        let element = |end, marks| MeasuredElement {
+            first_row: ElementRow::ZERO,
+            starts: vec![0],
+            end,
+            marks,
+        };
+        measured.elements.insert(0, element(5_000, vec![]));
+        measured.elements.insert(
+            1,
+            element(
+                30_000,
+                vec![MarkExtent {
+                    index: 3,
+                    top: 22_000,
+                    bottom: 23_000,
+                }],
+            ),
+        );
+        assert_eq!(
+            search_mark_rows(&root, &measured, 3),
+            Some((VisualRow(27_000), VisualRow(28_000))),
+            "twenty-two rows into a reply that starts five down"
+        );
+        assert_eq!(search_mark_rows(&root, &measured, 4), None, "no such match");
+        assert_eq!(
+            search_mark_rows(&root, &measured, 0),
+            None,
+            "no current match"
+        );
+    }
+
     /// Prose is a content element: it has an origin, it is measured by the shell, and until the
     /// shell has measured it the view is not placeable.
     ///
@@ -3913,6 +3992,7 @@ mod prose_tests {
                 first_row: ElementRow::ZERO,
                 starts: vec![0],
                 end: 5_000,
+                marks: Vec::new(),
             },
         );
         measured.elements.insert(
@@ -3921,6 +4001,7 @@ mod prose_tests {
                 first_row: ElementRow::ZERO,
                 starts: vec![0],
                 end: 2_000,
+                marks: Vec::new(),
             },
         );
         assert!(!awaits_measure(&root, &measured));
@@ -3962,6 +4043,7 @@ mod prose_tests {
                 // A heading, a blank, then a paragraph wrapping to two rows' worth.
                 starts: vec![0, 1_500, 1_500, 4_000],
                 end: 6_000,
+                marks: Vec::new(),
             },
         );
         (window, measured)

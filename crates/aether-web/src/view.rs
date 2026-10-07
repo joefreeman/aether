@@ -147,6 +147,7 @@ fn read_view(s: &Session) -> Value {
         // unrelated re-renders.
         "revision": read.revision,
         "hl_gen": read.hl_gen,
+        "parse_gen": read.parse_gen,
         // Fenced-code tree-sitter runs, keyed by the fence's span start (as a string — JSON
         // object keys). The shell styles them with the editor's own `hl-*` classes.
         "code_highlights": read

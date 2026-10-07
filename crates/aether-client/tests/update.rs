@@ -1390,6 +1390,65 @@ fn a_reveal_follows_the_button_tab_reached() {
     );
 }
 
+/// A search step that lands on a match inside prose — a reply, which holds no cursor — reveals the
+/// match where the shell drew it, not the cursor and not the top of the reply. Once anything else
+/// moves the cursor, the reveal is the cursor's again.
+#[test]
+fn a_reveal_follows_a_search_landing_into_prose() {
+    use aether_client::update::Event;
+    use aether_protocol::viewport::Element;
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    let reply = Element::Prose {
+        element: 1,
+        blocks: vec![],
+        source: Default::default(),
+    };
+    s.view.window = Some(aether_protocol::viewport::Window {
+        search: None,
+        other_elements_dirty: false,
+        max_line_width: 0,
+        git_status: None,
+        root: Element::column(vec![
+            Element::chrome(vec![Element::text("you", vec![])]),
+            reply,
+        ]),
+    });
+    let mut measured = aether_client::grid::Measured::default();
+    measured.elements.insert(
+        1,
+        aether_client::grid::MeasuredElement {
+            first_row: aether_protocol::coords::ElementRow::ZERO,
+            starts: vec![0],
+            end: 40,
+            marks: vec![aether_client::grid::MarkExtent {
+                index: 2,
+                top: 30,
+                bottom: 31,
+            }],
+        },
+    );
+    s.view.search.active = true;
+    let landed = s.view.buffer.cursor;
+    let _ = s.on_event(Event::SearchNav(Ok(serde_json::from_value(json!({
+        "cursor": landed,
+        "summary": { "view_id": 0, "total": 3, "truncated": false, "current_index": 2 },
+    }))
+    .unwrap())));
+    assert_eq!(
+        s.view.reveal_row(&measured),
+        Some(aether_protocol::coords::VisualRow(31)),
+        "thirty rows into a reply below one row of chrome"
+    );
+
+    s.view.buffer.cursor.position.col += 1;
+    assert_ne!(
+        s.view.reveal_row(&measured),
+        Some(aether_protocol::coords::VisualRow(31)),
+        "the cursor moved on: it is the cursor's reveal again"
+    );
+}
+
 /// `Tab` asks the server to move focus to the next editor element; `Shift-Tab` the previous.
 ///
 /// The request needs a viewport — focus is a property of a presentation, and there is nothing to
@@ -8065,7 +8124,7 @@ fn reader_toggle_leaves_the_views_keep_state_alone() {
     let view = s.view.view_id;
     let fx = leader(&mut s, '.');
     let token = the_read_request(&s, &fx, true);
-    let _ = s.on_rpc_result(token, Ok(read_set(true)));
+    let _ = s.on_rpc_result(token, Ok(read_set(&s, true)));
     assert_eq!(s.view.view_id, view, "the same view");
     assert!(
         s.view.view_transient,
@@ -11852,8 +11911,14 @@ fn adopt_reader_window(s: &mut Session, text: &str) -> Effects {
 }
 
 /// The server's answer to a `view/set_read`: the mode it now has this client in.
-fn read_set(read: bool) -> serde_json::Value {
-    json!({ "read": read })
+/// The server's answer to a `view/set_read`: the mode, and the cursor after the flip — collapsed to
+/// its head on the way into the reader, which keeps no selection it cannot paint.
+fn read_set(s: &Session, read: bool) -> serde_json::Value {
+    let mut cursor = s.view.buffer.cursor;
+    if read {
+        cursor.anchor = cursor.position;
+    }
+    json!({ "read": read, "cursor": cursor })
 }
 
 /// The `view/set_read` a reader toggle (or an edit transition) sends: naming the session's own view,
@@ -11884,7 +11949,7 @@ fn enter_reader(s: &mut Session, text: &str) -> Effects {
     let view = s.view.view_id;
     let fx = leader(s, '.');
     let token = the_read_request(s, &fx, true);
-    let fx = s.on_rpc_result(token, Ok(read_set(true)));
+    let fx = s.on_rpc_result(token, Ok(read_set(s, true)));
     assert!(
         fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)),
         "the mode flipped: re-subscribe"
@@ -11933,7 +11998,7 @@ fn reader_toggle_asks_to_read_and_the_window_delivers_it() {
     assert_eq!(all_requests(&fx).len(), 1);
     assert_eq!(s.view.mode, Mode::Normal, "until the window says otherwise");
     assert!(s.view.read.is_none());
-    let fx = s.on_rpc_result(token, Ok(read_set(true)));
+    let fx = s.on_rpc_result(token, Ok(read_set(&s, true)));
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
     assert_eq!(
         s.view.view_id, view,
@@ -11972,7 +12037,7 @@ fn a_mode_flip_keeps_your_place() {
         .relayout_anchor_position()
         .expect("an anchor for the flip");
     let token = the_read_request(&s, &fx, false);
-    let fx = s.on_rpc_result(token, Ok(read_set(false)));
+    let fx = s.on_rpc_result(token, Ok(read_set(&s, false)));
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
     assert_eq!(
         s.relayout_anchor_position(),
@@ -12586,7 +12651,7 @@ fn read_edit_transitions_ask_for_the_source() {
     assert_eq!(s.view.mode, Mode::Insert);
     assert!(s.view.read.is_none(), "handed over to the editor at once");
     let token = the_read_request(&s, &fx, false);
-    let fx = s.on_rpc_result(token, Ok(read_set(false)));
+    let fx = s.on_rpc_result(token, Ok(read_set(&s, false)));
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
     assert_eq!(s.view.view_id, view);
     assert_eq!(s.view.mode, Mode::Insert, "the transition's mode stands");
@@ -12920,7 +12985,7 @@ fn reader_toggle_goes_back_to_the_editor() {
             .collect();
     assert_eq!(order, vec!["reveal", "anchor", "flip"]);
     let token = the_read_request(&s, &fx, false);
-    let fx = s.on_rpc_result(token, Ok(read_set(false)));
+    let fx = s.on_rpc_result(token, Ok(read_set(&s, false)));
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
     // The editor's window confirms it.
     let id = s.view.buffer.buffer_id;

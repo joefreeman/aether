@@ -6,7 +6,7 @@
 
 import { decodeRow, utf8ByteLen } from "./text";
 import type { MdBlock } from "./markdown";
-import { renderReply } from "./read";
+import { markCurrentMatch, renderReply } from "./read";
 import type {
   Band,
   BufferWindow,
@@ -120,7 +120,9 @@ const SEVERITY_RANK: Record<DiagnosticSeverity, number> = {
 interface CellStyle {
   hl: string | null;
   diag: DiagnosticSeverity | null;
-  search: boolean;
+  /** Inside a search's match (`hit`), or an occurrence of the symbol under the cursor (`symbol`) —
+   *  the two paint apart: a search in the pale tint of the current match's hue, a symbol neutral. */
+  search: "hit" | "symbol" | null;
   sel: boolean;
   cursor: boolean;
   bracket: boolean;
@@ -179,7 +181,7 @@ function makeSpan(text: string, style: CellStyle, cursorClass: string): Node {
   // Emphasis is NOT a class here: renderVisualRow wraps each contiguous emphasized run in a
   // single `.diff-emph` wrapper span, so the rounded band is one box (per-span classes would
   // notch the rounding at every internal syntax-colour boundary).
-  if (style.search) classes.push("search-hit");
+  if (style.search) classes.push(style.search === "hit" ? "search-hit" : "symbol-hit");
   if (style.sneak) classes.push("sneak-target");
   if (style.sel) classes.push("sel");
   if (style.cursor) classes.push(cursorClass);
@@ -305,7 +307,7 @@ function renderVisualRow(
 
   const hl: (string | null)[] = new Array(n).fill(null);
   const diag: (DiagnosticSeverity | null)[] = new Array(n).fill(null);
-  const search: boolean[] = new Array(n).fill(false);
+  const search: ("hit" | "symbol" | null)[] = new Array(n).fill(null);
   const emph: boolean[] = new Array(n).fill(false);
   const sneak: boolean[] = new Array(n).fill(false);
   const chip: boolean[] = new Array(n).fill(false);
@@ -349,7 +351,7 @@ function renderVisualRow(
     });
   }
   for (const m of line.search_matches ?? []) {
-    markRange(byteStart, n, m.start - row.byte_offset, m.end - row.byte_offset, (i) => (search[i] = true));
+    markRange(byteStart, n, m.start - row.byte_offset, m.end - row.byte_offset, (i) => (search[i] = m.index ? "hit" : "symbol"));
   }
   // Intra-line diff emphasis (diff view only; the server omits it otherwise).
   for (const r of changeEmphasis(line.change)) {
@@ -477,7 +479,7 @@ function renderVisualRow(
     const style = {
       hl: null,
       diag: eolDiag,
-      search: false,
+      search: null,
       sel: selTrailing,
       cursor: cursorAtEnd,
       bracket: false,
@@ -596,10 +598,11 @@ function appendInline(
   }
 }
 
-/** The class a search range paints with: the selection's fill for the current match, the dim
- *  search fill for the rest. A range with no index (a symbol highlight) is never current. */
+/** The class a search range paints with: the current match's own fill — the row holds no cursor
+ *  to select it — and the dim search fill for the rest. A range with no index (a symbol highlight)
+ *  is never current. */
 function matchClass(m: SearchMatchRange, currentMatch: number): string {
-  return m.index && m.index === currentMatch ? "sel" : "search-hit";
+  return m.index && m.index === currentMatch ? "search-current" : "search-hit";
 }
 
 /** One row of a box's own border or padding.
@@ -870,6 +873,7 @@ export function renderBuffer(
       box.dataset.element = String(node.element);
       replies.push(box);
       renderReply(box, node.blocks);
+      markCurrentMatch(box, currentMatch);
       frag.appendChild(insetBy(place, box));
       // The measured height if the shell has one; a single row until then, which is wrong and is
       // corrected the moment the measure lands.

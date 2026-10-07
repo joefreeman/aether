@@ -552,6 +552,8 @@ pub struct App {
     /// The reading-view focus last revealed (`(buffer, span.start, span.end)`), so the document
     /// scrolls only when the focus *changes*.
     read_last_focus: Option<(u64, u32, u32)>,
+    /// The search landing the reader last revealed: the match, and the cursor it left.
+    read_last_landing: Option<(u32, aether_protocol::cursor::CursorState)>,
     /// The read scrollable's viewport height as last measured (0 before the first probe).
     read_view_h: f32,
     /// The document geometry the layout table was last measured for — see
@@ -656,6 +658,7 @@ impl App {
             chased_window: false,
             picker_scroll_y: 0.0,
             read_last_focus: None,
+            read_last_landing: None,
             read_view_h: 0.0,
             read_measure_key: None,
             read_click_target: None,
@@ -1401,6 +1404,7 @@ impl App {
                             }
                         }
                         ReadThen::Reveal { span, smooth } => self.read_reveal_block(span, smooth),
+                        ReadThen::RevealMatch => self.read_reveal_match(),
                         ReadThen::Place(place) => self.read_place_block(place),
                     }
                 }
@@ -1411,14 +1415,48 @@ impl App {
                 // so a changed one moves the view: a conversation whose tail you were watching
                 // follows the reply as it grows, and the scroll bound follows its new height.
                 let mut moved = false;
+                let line_px = self.session.editor_font_size as f32 * READ_SCALE * READ_LINE_HEIGHT;
                 for (element, px) in heights {
                     let end = (self.units_of_px(px).round().max(0.0) as u32).max(UNITS_PER_ROW);
+                    // Where each search match in the reply sits, estimated as far down its height
+                    // as the match is through its text: rich text keeps its runs' places to itself.
+                    let marks = self
+                        .session
+                        .view
+                        .window
+                        .as_ref()
+                        .and_then(|w| {
+                            w.root.content().into_iter().find_map(|n| match n {
+                                aether_protocol::viewport::Element::Prose {
+                                    element: e,
+                                    blocks,
+                                    ..
+                                } if *e == element => Some(blocks),
+                                _ => None,
+                            })
+                        })
+                        .map(|blocks| {
+                            aether_client::read_layout::mark_fractions(blocks)
+                                .into_iter()
+                                .map(|m| {
+                                    let at = m.in_document * px;
+                                    grid::MarkExtent {
+                                        index: m.index,
+                                        top: self.units_of_px(at).round().max(0.0) as u32,
+                                        bottom: self.units_of_px(at + line_px).round().max(0.0)
+                                            as u32,
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     let measured = grid::MeasuredElement {
                         first_row: aether_protocol::coords::ElementRow::ZERO,
                         // Prose has no wire rows — the window carries its parse, not its lines —
                         // so there is no source line for an offset to name. One indivisible thing.
                         starts: vec![0],
                         end,
+                        marks,
                     };
                     moved |= self.measured.elements.get(&element) != Some(&measured);
                     self.measured.elements.insert(element, measured);
@@ -1779,6 +1817,18 @@ impl App {
             // Keyed to the Enter target when the cursor sits inside one (a Tab step must
             // reveal the link, not just its paragraph), else the block-grain position.
             let focus = self.read_focus_key();
+            // A search that just landed shows its match, which inside a tall block is not where
+            // the block starts — and takes the place of the block reveal its landing would cause.
+            let landing = self
+                .session
+                .view
+                .search_landing()
+                .map(|index| (index, self.session.view.buffer.cursor));
+            if landing.is_some() && landing != self.read_last_landing {
+                self.read_last_landing = landing;
+                self.read_last_focus = focus;
+                read_measure = Some(ReadThen::RevealMatch);
+            }
             if focus != self.read_last_focus {
                 // A reveal into a buffer this view hasn't revealed in yet — a cross-file
                 // landing, or the reading view just appearing — is a placement, not a
@@ -2923,18 +2973,43 @@ impl App {
     fn adopt_read_geometry(&mut self, geometry: ReadGeometry) {
         let unit = self.unit_px();
         let element = self.session.view.focused_element;
+        let line_px = self.session.editor_font_size as f32 * READ_SCALE * READ_LINE_HEIGHT;
         let measured = self.session.view.read.as_ref().map(|read| {
             let line_count = read.line_count();
             let spans = geometry
                 .spans
                 .iter()
                 .map(|&(start, end, top)| (start, end, (top / unit).round().max(0.0) as u32));
+            // Where each search match sits, estimated: rich text keeps its runs' places to itself,
+            // so a match is put as far down its measured block as it is through the block's text.
+            let marks = aether_client::read_layout::mark_fractions(&read.blocks)
+                .into_iter()
+                .filter_map(|m| {
+                    let &(_, _, top) = geometry
+                        .spans
+                        .iter()
+                        .find(|(s, e, _)| *s == m.block.start && *e == m.block.end)?;
+                    let bottom = geometry
+                        .spans
+                        .iter()
+                        .filter(|(s, _, t)| *s >= m.block.end && *t > top)
+                        .map(|&(_, _, t)| t)
+                        .fold(geometry.content_h, f32::min);
+                    let at = top + m.in_block * (bottom - top).max(0.0);
+                    Some(aether_client::grid::MarkExtent {
+                        index: m.index,
+                        top: (at / unit).round().max(0.0) as u32,
+                        bottom: ((at + line_px) / unit).round().max(0.0) as u32,
+                    })
+                })
+                .collect();
             aether_client::read_layout::measured_from_spans(
                 spans,
                 |byte| read.pos_of(byte).line,
                 line_count,
                 0,
                 (geometry.content_h / unit).round().max(0.0) as u32,
+                marks,
             )
         });
         tracing::debug!(
@@ -2953,6 +3028,17 @@ impl App {
         if self.read_scroll_anim.is_none() {
             self.read_scroll_px = geometry.offset;
         }
+    }
+
+    /// The current search match's place in the count, or `0` when there is none — what a marked
+    /// run of prose compares its match with.
+    fn current_match(&self) -> u32 {
+        self.session
+            .view
+            .search
+            .summary
+            .as_ref()
+            .map_or(0, |s| s.current_index)
     }
 
     /// A block's `(top, bottom)` in the read scrollable's px, off the layout table.
@@ -2975,6 +3061,29 @@ impl App {
     /// Rest a block ~20% down the reading view unless it's already comfortably visible
     /// ([`read_layout::reveal_offset`]) — through the glide when short, a snap when far or when
     /// `smooth` is off (a placement into a fresh document).
+    /// Rest the current match a search just landed on, as a block is rested — inside a tall block
+    /// its top is not where the match is.
+    fn read_reveal_match(&mut self) -> Task<Message> {
+        let Some((top, bottom)) = self.session.view.search_mark_rows(&self.measured) else {
+            return Task::none();
+        };
+        let (top, bottom) = (
+            self.px_of_units(top.get() as f32),
+            self.px_of_units(bottom.get() as f32),
+        );
+        let scroll = self.read_scroll_px;
+        let height = self.read_viewport_px();
+        match aether_client::read_layout::reveal_offset(
+            top - scroll,
+            bottom - scroll,
+            scroll,
+            height,
+        ) {
+            Some(y) => self.read_scroll_to(y, true),
+            None => Task::none(),
+        }
+    }
+
     fn read_reveal_block(&mut self, span: (u32, u32), smooth: bool) -> Task<Message> {
         let Some((top, bottom)) = self.read_block_px(span) else {
             return Task::none();
@@ -3385,13 +3494,7 @@ impl App {
                         measured: &self.measured,
                         ligatures: self.session.ligatures,
                         font_size: self.session.editor_font_size as f32,
-                        current_match: self
-                            .session
-                            .view
-                            .search
-                            .summary
-                            .as_ref()
-                            .map_or(0, |s| s.current_index),
+                        current_match: self.current_match(),
                     },
                     Message::Editor,
                 );
@@ -5675,8 +5778,8 @@ fn cell_text_width(inlines: &[MdInline], size: f32) -> (f32, f32) {
     fn walk(inlines: &[MdInline], size: f32, natural: &mut f32, word: &mut f32, minimum: &mut f32) {
         for inl in inlines {
             match inl {
-                MdInline::Text { text } => chars(text, false, size, natural, word, minimum),
-                MdInline::Code { text } => chars(text, true, size, natural, word, minimum),
+                MdInline::Text { text, .. } => chars(text, false, size, natural, word, minimum),
+                MdInline::Code { text, .. } => chars(text, true, size, natural, word, minimum),
                 MdInline::Emphasis { content }
                 | MdInline::Strong { content }
                 | MdInline::Strikethrough { content }
@@ -5738,7 +5841,7 @@ fn md_plain(inlines: &[MdInline]) -> String {
     let mut out = String::new();
     for inl in inlines {
         match inl {
-            MdInline::Text { text } | MdInline::Code { text } => out.push_str(text),
+            MdInline::Text { text, .. } | MdInline::Code { text, .. } => out.push_str(text),
             MdInline::Strong { content }
             | MdInline::Emphasis { content }
             | MdInline::Strikethrough { content }
@@ -5859,6 +5962,8 @@ pub enum ReadThen {
     Anchor,
     /// The focus moved: rest the block, gliding when `smooth`.
     Reveal { span: (u32, u32), smooth: bool },
+    /// A search landed: rest the match it landed on, wherever in its block that is.
+    RevealMatch,
     /// `;` / `Alt-;`: edge-matched placement of the focused block.
     Place(ViewportPlace),
 }
@@ -6311,6 +6416,7 @@ impl App {
                     READ_SANS_FAMILY,
                     1.3, // headings stay tight; the body carries the airiness
                     target,
+                    self.current_match(),
                     p,
                     ReadMsg::Link,
                 );
@@ -6342,6 +6448,7 @@ impl App {
                 READ_FONT_FAMILY,
                 READ_LINE_HEIGHT,
                 target,
+                self.current_match(),
                 p,
                 ReadMsg::Link,
             ),
@@ -6507,6 +6614,7 @@ impl App {
                 language,
                 code,
                 span,
+                marks,
             } => {
                 // The panel's inset lives on the tag and the *scrollable content*, not the
                 // panel container — the scrollable then spans the panel edge-to-edge, so its
@@ -6538,39 +6646,59 @@ impl App {
                     .as_ref()
                     .and_then(|r| r.code_highlights.get(&span.start))
                     .filter(|h| !h.is_empty());
-                let code_el: Element<'static, ReadMsg> = match hls {
-                    Some(hls) => {
-                        let mono = iced::Font::MONOSPACE;
-                        let mut spans: Vec<iced::advanced::text::Span<'static, String>> =
-                            Vec::new();
-                        let mut push = |s: &str, color: iced::Color| {
-                            if !s.is_empty() {
-                                spans.push(
-                                    iced::widget::span(s.to_string()).font(mono).color(color),
-                                );
-                            }
-                        };
-                        let mut pos = 0usize;
-                        for h in hls {
-                            let s = (h.start as usize).min(code.len());
-                            let e = (h.end as usize).clamp(s, code.len());
-                            push(&code[pos..s], p.fg);
-                            let color = theme::highlight_color(p.mode, &h.kind).unwrap_or(p.fg);
-                            push(&code[s..e], color);
-                            pos = e;
-                        }
-                        push(&code[pos..], p.fg);
-                        iced::widget::rich_text(spans)
-                            .size(body * 0.85)
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .into()
-                    }
-                    None => text(code.clone())
+                let code_el: Element<'static, ReadMsg> = if hls.is_none() && marks.is_empty() {
+                    text(code.clone())
                         .font(iced::Font::MONOSPACE)
                         .size(body * 0.85)
                         .color(p.fg)
                         .wrapping(iced::widget::text::Wrapping::None)
-                        .into(),
+                        .into()
+                } else {
+                    let mono = iced::Font::MONOSPACE;
+                    // Runs of one colour — the fence's tokens where they've landed, the body colour
+                    // between — then cut where a search matched, which paints under the text.
+                    let mut runs: Vec<(usize, usize, iced::Color)> = Vec::new();
+                    let mut pos = 0usize;
+                    for h in hls.into_iter().flatten() {
+                        let s = (h.start as usize).clamp(pos, code.len());
+                        let e = (h.end as usize).clamp(s, code.len());
+                        runs.push((pos, s, p.fg));
+                        let color = theme::highlight_color(p.mode, &h.kind).unwrap_or(p.fg);
+                        runs.push((s, e, color));
+                        pos = e;
+                    }
+                    runs.push((pos, code.len(), p.fg));
+                    let current = self.current_match();
+                    let mut spans: Vec<iced::advanced::text::Span<'static, String>> = Vec::new();
+                    for (s, e, color) in runs.into_iter().filter(|(s, e, _)| s < e) {
+                        let local: Vec<aether_client::markdown::Mark> = marks
+                            .iter()
+                            .filter(|m| (m.start as usize) < e && m.end as usize > s)
+                            .map(|m| aether_client::markdown::Mark {
+                                start: (m.start as usize).saturating_sub(s) as u32,
+                                end: ((m.end as usize).min(e) - s) as u32,
+                                index: m.index,
+                            })
+                            .collect();
+                        for (piece, search) in
+                            aether_client::markdown::split_marks(&code[s..e], &local)
+                        {
+                            let span = iced::widget::span(piece.to_string())
+                                .font(mono)
+                                .color(color);
+                            spans.push(match search {
+                                Some(index) if index == current => span
+                                    .background(p.search_current_bg)
+                                    .color(p.search_current_fg),
+                                Some(_) => span.background(p.search_hit_bg),
+                                None => span,
+                            });
+                        }
+                    }
+                    iced::widget::rich_text(spans)
+                        .size(body * 0.85)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into()
                 };
                 // Long lines don't wrap — the panel scrolls horizontally, like the web's
                 // `<pre>`. A vertical wheel passes through: a scrollable only captures events
@@ -6750,6 +6878,7 @@ impl App {
                 family,
                 1.4,
                 target,
+                self.current_match(),
                 p,
                 ReadMsg::Link,
             ))
@@ -6991,6 +7120,7 @@ fn md_rich<M: 'static>(
         iced::font::Family::SansSerif,
         1.3,
         None, // hover has no reading target
+        0,    // nor a search
         p,
         on_link,
     )
@@ -7005,12 +7135,23 @@ fn md_rich_in<M: 'static>(
     family: iced::font::Family,
     line_height: f32,
     target: Option<MdSpan>,
+    current_match: u32,
     p: &'static theme::Palette,
     on_link: fn(String) -> M,
 ) -> Element<'static, M> {
     let mut spans = Vec::new();
     md_spans(
-        inlines, weight, false, None, base_color, size, family, target, p, &mut spans,
+        inlines,
+        weight,
+        false,
+        None,
+        base_color,
+        size,
+        family,
+        target,
+        current_match,
+        p,
+        &mut spans,
     );
     iced::widget::rich_text(shape_split(spans))
         .size(size)
@@ -7060,7 +7201,7 @@ fn alert_style(kind: AlertKind, p: &'static theme::Palette) -> (&'static str, ic
 /// selected item too; containment tints the item alone, and a parent selected whole still tints
 /// its whole subtree because the children are inside it.
 fn span_selected(sel: Option<(u32, u32)>, span: MdSpan) -> bool {
-    sel.is_some_and(|(min, max)| span.start >= min && span.end <= max + 1)
+    sel.is_some_and(|(min, max)| aether_client::markdown::edit::selection_paints(span, min, max))
 }
 
 fn read_focus_wrap(
@@ -7151,16 +7292,27 @@ fn md_spans(
     size: f32,
     family: iced::font::Family,
     target: Option<MdSpan>,
+    current_match: u32,
     p: &'static theme::Palette,
     out: &mut Vec<iced::advanced::text::Span<'static, String>>,
 ) {
     for inl in inlines {
         match inl {
-            MdInline::Text { text } => {
-                out.push(md_span(text, weight, italic, false, link, base, family, p))
-            }
-            MdInline::Code { text } => {
-                out.push(md_span(text, weight, italic, true, link, base, family, p))
+            MdInline::Text { text, marks } | MdInline::Code { text, marks } => {
+                let code = matches!(inl, MdInline::Code { .. });
+                // A search's marks, under the text: the current match's own fill and ink — prose
+                // holds no cursor to select it, and it must read apart from a selected block — and
+                // the pale tint of its hue otherwise, apart from a code chip's neutral shade.
+                for (piece, search) in aether_client::markdown::split_marks(text, marks) {
+                    let span = md_span(piece, weight, italic, code, link, base, family, p);
+                    out.push(match search {
+                        Some(index) if index == current_match => span
+                            .background(p.search_current_bg)
+                            .color(p.search_current_fg),
+                        Some(_) => span.background(p.search_hit_bg),
+                        None => span,
+                    });
+                }
             }
             MdInline::Strong { content } => md_spans(
                 content,
@@ -7171,11 +7323,22 @@ fn md_spans(
                 size,
                 family,
                 target,
+                current_match,
                 p,
                 out,
             ),
             MdInline::Emphasis { content } => md_spans(
-                content, weight, true, link, base, size, family, target, p, out,
+                content,
+                weight,
+                true,
+                link,
+                base,
+                size,
+                family,
+                target,
+                current_match,
+                p,
+                out,
             ),
             MdInline::Link {
                 href,
@@ -7205,6 +7368,7 @@ fn md_spans(
                         size,
                         family,
                         None,
+                        current_match,
                         p,
                         &mut inner,
                     );
@@ -7219,6 +7383,7 @@ fn md_spans(
                         size,
                         family,
                         target,
+                        current_match,
                         p,
                         out,
                     )
@@ -7227,7 +7392,17 @@ fn md_spans(
             MdInline::Strikethrough { content } => {
                 let mut inner = Vec::new();
                 md_spans(
-                    content, weight, italic, link, base, size, family, target, p, &mut inner,
+                    content,
+                    weight,
+                    italic,
+                    link,
+                    base,
+                    size,
+                    family,
+                    target,
+                    current_match,
+                    p,
+                    &mut inner,
                 );
                 out.extend(inner.into_iter().map(|s| s.strikethrough(true)));
             }
@@ -7420,7 +7595,7 @@ fn md_text_len(inlines: &[MdInline]) -> usize {
     inlines
         .iter()
         .map(|i| match i {
-            MdInline::Text { text } | MdInline::Code { text } => text.len(),
+            MdInline::Text { text, .. } | MdInline::Code { text, .. } => text.len(),
             MdInline::Strong { content }
             | MdInline::Emphasis { content }
             | MdInline::Strikethrough { content }
@@ -8349,7 +8524,7 @@ mod tests {
         let p = theme::palette(aether_protocol::settings::ThemeMode::Dark);
         let mut spans = Vec::new();
         md_spans(
-            inlines, weight, false, None, p.fg, MD_TEXT, family, None, p, &mut spans,
+            inlines, weight, false, None, p.fg, MD_TEXT, family, None, 0, p, &mut spans,
         );
         shape_split(spans)
             .into_iter()
@@ -8360,12 +8535,14 @@ mod tests {
     fn text(s: &str) -> MdInline {
         MdInline::Text {
             text: s.to_string(),
+            marks: vec![],
         }
     }
 
     fn code(s: &str) -> MdInline {
         MdInline::Code {
             text: s.to_string(),
+            marks: vec![],
         }
     }
 

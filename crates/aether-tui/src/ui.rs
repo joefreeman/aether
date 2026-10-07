@@ -750,8 +750,8 @@ fn md_inline_segs(inlines: &[MdInline], base: Style) -> Vec<(String, Style)> {
 fn md_collect_segs(inlines: &[MdInline], base: Style, out: &mut Vec<(String, Style)>) {
     for inl in inlines {
         match inl {
-            MdInline::Text { text } => out.push((text.clone(), base)),
-            MdInline::Code { text } => {
+            MdInline::Text { text, .. } => out.push((text.clone(), base)),
+            MdInline::Code { text, .. } => {
                 out.push((text.clone(), base.fg(c(th().accent)).bg(c(th().md_code_bg))));
             }
             MdInline::Strong { content } => {
@@ -5067,6 +5067,7 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
     let Some(rv) = state.read.as_ref() else {
         return;
     };
+    let current = current_match(state);
     let (content_cols, margin) = read_measure(area.width, rv.width);
     // The rect hosts the gutter *plus* the text measure: the layout wraps rows to
     // `content_cols` alone, so a full line just reaches the right edge instead of losing its
@@ -5245,7 +5246,10 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                     None => read_span_style(rs.style),
                 };
                 shown += rs.text.width();
-                spans.push(Span::styled(rs.text.clone(), style));
+                spans.push(Span::styled(
+                    rs.text.clone(),
+                    with_search(style, rs.search, current),
+                ));
             }
             // The block's bottom pad row hosts a horizontal scrollbar when the block
             // overflows — the horizontal twin of the page bar (`─` track, bolder `━` thumb),
@@ -5397,7 +5401,10 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                     if rs.element.is_some() && rs.element == rv.target_focus {
                         style = style.add_modifier(Modifier::REVERSED);
                     }
-                    spans.push(Span::styled(rs.text.clone(), style));
+                    spans.push(Span::styled(
+                        rs.text.clone(),
+                        with_search(style, rs.search, current),
+                    ));
                 }
             }
             let shown: usize = clipped.iter().map(|s| s.text.width()).sum();
@@ -5433,7 +5440,10 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
                 style = style.add_modifier(Modifier::REVERSED);
             }
             used += rs.text.width();
-            spans.push(Span::styled(rs.text.clone(), style));
+            spans.push(Span::styled(
+                rs.text.clone(),
+                with_search(style, rs.search, current),
+            ));
         }
         if let Some(bg) = band {
             // Out to the measure's edge, so a short line inside a quote does not leave the panel
@@ -5520,6 +5530,7 @@ fn markdown_row_line(
     row: &aether_client::read_layout::ReadRow,
     indent: u16,
     focused: bool,
+    current_match: u32,
 ) -> Line<'static> {
     // Focus is here and no caret can be: the row wears the cursorline, which is what says "the
     // cursor's row" everywhere else. Prose is what `o` and the outline picker can land on and a
@@ -5540,16 +5551,40 @@ fn markdown_row_line(
     }
     for s in &row.spans {
         let style = read_span_style(s.style);
+        let style = if focused && style.bg.is_none() {
+            style.bg(bg)
+        } else {
+            style
+        };
         spans.push(Span::styled(
             s.text.clone(),
-            if focused && style.bg.is_none() {
-                style.bg(bg)
-            } else {
-                style
-            },
+            with_search(style, s.search, current_match),
         ));
     }
     Line::from(spans)
+}
+
+/// The current search match's place in the count, or `0` when there is none.
+fn current_match(state: &AppState) -> u32 {
+    state
+        .ed()
+        .search
+        .summary
+        .as_ref()
+        .map_or(0, |s| s.current_index)
+}
+
+/// `style` with a search match's fill when the text is part of one: the current match's own — prose
+/// holds no cursor to select it, so this is its mark, and it must read apart from a selected block
+/// it sits in — and the dim fill for the rest.
+fn with_search(style: Style, search: Option<u32>, current: u32) -> Style {
+    match search {
+        Some(index) if index == current => style
+            .bg(c(th().search_current_bg))
+            .fg(c(th().search_current_fg)),
+        Some(_) => style.bg(c(th().search_hit_bg)),
+        None => style,
+    }
 }
 
 fn read_span_style(s: aether_client::read_layout::SpanStyle) -> Style {
@@ -5621,12 +5656,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     );
     let lit = Lit {
         button: focused.lit(),
-        current_match: state
-            .ed()
-            .search
-            .summary
-            .as_ref()
-            .map_or(0, |s| s.current_index),
+        current_match: current_match(state),
     };
     // **Exactly one of these three is Some/true.** `Focused` is one answer, so a frame showing an
     // editor's caret over a filled button — or, worse, showing nothing at all because focus landed
@@ -6061,6 +6091,7 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
             &clipped_highlights,
             clipped_sel,
             &clipped_matches,
+            None,
             &clipped_emphasis,
             // A patch line's emphasis follows its own side's hue; everywhere else the change
             // is a *modification* of one line, so the olive pair applies.
@@ -6169,7 +6200,9 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
                 lines.push(match md {
                     // Indented by whatever box encloses the element: an agent's reply is bare, but
                     // prose inside a box has to start inside its rails.
-                    Some((row, indent, focused)) => markdown_row_line(row, indent, focused),
+                    Some((row, indent, focused)) => {
+                        markdown_row_line(row, indent, focused, lit.current_match)
+                    }
                     None => Line::default(),
                 });
                 continue;
@@ -6369,10 +6402,11 @@ fn children_spans(children: &[Element], width: u16, bg: Color, lit: Lit<'_>) -> 
                 search_matches,
             } => {
                 // A search's matches over chrome the view counts as content — a run's command —
-                // and the current one in the selection's fill, as it is when the cursor selects a
-                // match in text.
-                let matches: Vec<(u32, u32)> =
-                    search_matches.iter().map(|m| (m.start, m.end)).collect();
+                // and the current one in its own fill.
+                let matches: Vec<(u32, u32, bool)> = search_matches
+                    .iter()
+                    .map(|m| (m.start, m.end, m.index != 0))
+                    .collect();
                 let current = search_matches
                     .iter()
                     .find(|m| m.index != 0 && m.index == lit.current_match)
@@ -6380,8 +6414,9 @@ fn children_spans(children: &[Element], width: u16, bg: Color, lit: Lit<'_>) -> 
                 let mut text_spans = build_spans(
                     text,
                     highlights,
-                    current,
+                    None,
                     &matches,
+                    current,
                     &[],
                     Color::Reset,
                     &[],
@@ -6529,8 +6564,8 @@ fn deleted_virtual_row_spans(
         )
     };
     let within = |r: (u32, u32), byte: usize| (r.0 as usize) <= byte && byte < r.1 as usize;
-    // What fills a byte, strongest first: the current search match (in the selection's fill, as a
-    // match the cursor selects is), any other match, then the change's own emphasis.
+    // What fills a byte, strongest first: the current search match (in its own fill — the row holds
+    // no cursor to select it), any other match, then the change's own emphasis.
     let fill_at = |byte: usize| -> Fill {
         if matches
             .iter()
@@ -6566,8 +6601,8 @@ fn deleted_virtual_row_spans(
             let (fill, ink) = match fill {
                 Fill::Base => (bg, fg),
                 Fill::Emphasis => (emph_bg, c(th().fg)),
-                Fill::Match => (c(th().fill_dim), c(th().fg)),
-                Fill::Current => (c(th().bg_visual), c(th().fg)),
+                Fill::Match => (c(th().search_hit_bg), c(th().fg)),
+                Fill::Current => (c(th().search_current_bg), c(th().search_current_fg)),
             };
             spans.push(Span::styled(
                 std::mem::take(run),
@@ -6888,14 +6923,14 @@ fn clip_horizontal(
     text: &str,
     highlights: &[Highlight],
     sel: Option<(u32, u32)>,
-    matches: &[(u32, u32)],
+    matches: &[(u32, u32, bool)],
     diags: &[(u32, u32, DiagnosticSeverity)],
     clip: HClip,
 ) -> (
     String,
     Vec<Highlight>,
     Option<(u32, u32)>,
-    Vec<(u32, u32)>,
+    Vec<(u32, u32, bool)>,
     Vec<(u32, u32, DiagnosticSeverity)>,
 ) {
     if clip.skip == 0 {
@@ -6921,7 +6956,10 @@ fn clip_horizontal(
         })
         .collect();
     let new_sel = sel.and_then(|r| clip.range(r));
-    let new_matches = matches.iter().filter_map(|&r| clip.range(r)).collect();
+    let new_matches = matches
+        .iter()
+        .filter_map(|&(s, e, search)| clip.range((s, e)).map(|(s, e)| (s, e, search)))
+        .collect();
     let new_diags = diags
         .iter()
         .filter_map(|&(s, e, sev)| clip.range((s, e)).map(|(s, e)| (s, e, sev)))
@@ -6937,11 +6975,14 @@ fn clip_horizontal(
 
 /// Clip per-logical-line search match ranges (delivered by the server in `LogicalLineRender`) to
 /// this visual row's byte range, returning row-relative offsets.
+///
+/// Each comes back with whether it is a search's (`index` set) rather than a symbol highlight's,
+/// which the two paint apart.
 fn matches_on_visual_row(
     row_byte_offset: u32,
     row_text_len: u32,
     matches: &[SearchMatchRange],
-) -> Vec<(u32, u32)> {
+) -> Vec<(u32, u32, bool)> {
     if row_text_len == 0 {
         return Vec::new();
     }
@@ -6952,7 +6993,7 @@ fn matches_on_visual_row(
             let s = m.start.max(row_byte_offset);
             let e = m.end.min(row_end);
             if s < e {
-                Some((s - row_byte_offset, e - row_byte_offset))
+                Some((s - row_byte_offset, e - row_byte_offset, m.index != 0))
             } else {
                 None
             }
@@ -7171,7 +7212,8 @@ fn build_spans(
     text: &str,
     highlights: &[Highlight],
     sel: Option<(u32, u32)>,
-    matches: &[(u32, u32)],
+    matches: &[(u32, u32, bool)],
+    current: Option<(u32, u32)>,
     emphasis: &[(u32, u32)],
     emphasis_bg: Color,
     match_brackets: &[u32],
@@ -7197,12 +7239,13 @@ fn build_spans(
         }
     }
 
-    let mut byte_in_match: Vec<bool> = vec![false; trunc_len];
-    for (s, e) in matches {
+    // Per byte: `Some(true)` inside a search match, `Some(false)` inside a symbol highlight.
+    let mut byte_in_match: Vec<Option<bool>> = vec![None; trunc_len];
+    for (s, e, search) in matches {
         let s = (*s as usize).min(trunc_len);
         let e = (*e as usize).min(trunc_len);
         for in_match in &mut byte_in_match[s..e] {
-            *in_match = true;
+            *in_match = Some(*search);
         }
     }
 
@@ -7281,14 +7324,27 @@ fn build_spans(
         // Search match: the quiet dim fill behind the normal syntax text — visible on the
         // current-line tint while still sitting clearly below the more saturated visual
         // selection, which paints over it.
-        if byte_in_match[byte_idx] {
-            style = style.bg(c(th().fill_dim));
+        if let Some(search) = byte_in_match[byte_idx] {
+            // A search's matches wear the pale tint of the current match's hue; the occurrences of
+            // the symbol under the cursor, the neutral fill.
+            style = style.bg(c(if search {
+                th().search_hit_bg
+            } else {
+                th().fill_dim
+            }));
             // Comments sit on the dimmest legible rung — only ~2:1 against the fill in dark —
             // so a match inside one would be barely legible (faint text would vanish outright).
             // Lift just that text to the normal foreground; every other syntax color reads fine.
             if style.fg == Some(c(th().fg_faint)) || style.fg == Some(c(th().syn_comment)) {
                 style = style.fg(c(th().fg));
             }
+        }
+        // The current match where no cursor selects it — a command, chrome text: its own fill, so
+        // it reads apart from the other matches and from a selection alike.
+        if current.is_some_and(|(s, e)| byte_idx >= s as usize && byte_idx < e as usize) {
+            style = style
+                .bg(c(th().search_current_bg))
+                .fg(c(th().search_current_fg));
         }
         // Sneak candidate word: the quiet dim fill marking the jump targets (the label cell itself
         // is painted separately, below, in the char loop).
@@ -11275,7 +11331,8 @@ mod tests {
             "abcdef",
             &[],
             Some((4, 5)),
-            &[(2, 4)],
+            &[(2, 4, true)],
+            None,
             &[(0, 6)],
             emph_bg,
             &[],
@@ -11288,7 +11345,7 @@ mod tests {
         assert_eq!(cells[0].2, Some(emph_bg), "plain emphasis cell");
         assert_eq!(
             cells[2].2,
-            Some(c(th().fill_dim)),
+            Some(c(th().search_hit_bg)),
             "search wins over emphasis"
         );
         assert_eq!(
@@ -11329,6 +11386,36 @@ mod tests {
         assert_eq!(cells[8].1, Some(c(th().git_deleted)));
     }
 
+    /// A removed line holds no cursor, so its current match wears the current-match pair — not the
+    /// selection's shade, which a selected block in the reader also wears — and the other matches
+    /// the dim fill.
+    #[test]
+    fn a_removed_lines_current_match_reads_apart_from_the_rest() {
+        use aether_protocol::search::SearchMatchRange;
+        let range = |start, end, index| SearchMatchRange { start, end, index };
+        let spans = deleted_virtual_row_spans(
+            "ab cd",
+            8,
+            DiffStage::Unstaged,
+            &[],
+            &[range(0, 2, 1), range(3, 5, 2)],
+            2,
+        );
+        let cells = cells_of(&spans);
+        assert_eq!(cells[0].2, Some(c(th().search_hit_bg)), "another match");
+        assert_eq!(
+            cells[3].2,
+            Some(c(th().search_current_bg)),
+            "the current one"
+        );
+        assert_eq!(cells[3].1, Some(c(th().search_current_fg)));
+        assert_ne!(
+            th().search_current_bg,
+            th().bg_visual,
+            "apart from a selection"
+        );
+    }
+
     #[test]
     fn deleted_virtual_row_spans_expand_tabs_inside_emphasis() {
         use aether_protocol::viewport::EmphasisRange;
@@ -11364,6 +11451,7 @@ mod tests {
                 &[],
                 None,
                 &[],
+                None,
                 &[],
                 Color::Reset,
                 &[],
@@ -11393,6 +11481,7 @@ mod tests {
             &[],
             None,
             &[],
+            None,
             &[],
             c(th().git_modified_emph_bg),
             &[],
@@ -11426,6 +11515,7 @@ mod tests {
             &[],
             None,
             &[],
+            None,
             &[],
             c(th().git_modified_emph_bg),
             &[],
@@ -11457,6 +11547,7 @@ mod tests {
             &[],
             None,
             &[],
+            None,
             &[],
             c(th().git_modified_emph_bg),
             &[],

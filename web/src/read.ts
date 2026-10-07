@@ -8,7 +8,7 @@
 //! the focused node into view when the focus *changes*, off the shared layout the shell measured
 //! this document into (`Shell.measureReader` / `revealBlock`).
 
-import type { MdBlock, MdInline, MdSpan } from "./markdown";
+import type { MdBlock, MdInline, MdMark, MdSpan } from "./markdown";
 import { highlightClass } from "./render";
 
 /** One tree-sitter run into a fence's code (mirrors the viewport `Highlight` wire type). */
@@ -40,6 +40,8 @@ export interface ReadDoc {
   revision: number;
   /** Bumped as fence highlights land — the rebuild key's second half. */
   hl_gen: number;
+  /** Bumped whenever a parse is adopted — new text, or new search marks on it. The DOM-rebuild key. */
+  parse_gen: number;
   /** Fence highlights keyed by the code block's span start (stringified). */
   code_highlights: Record<string, CodeHighlight[]>;
   /** Shell-provided (not part of the wasm view): the app URL for a relative doc link, or
@@ -97,6 +99,7 @@ export function renderReply(container: HTMLElement, blocks: MdBlock[]): void {
     buffer_id: 0,
     revision: 0,
     hl_gen: 0,
+    parse_gen: 0,
     code_highlights: {},
   };
   const root = document.createElement("div");
@@ -124,15 +127,82 @@ export function markFocus(
   }
   if (selection) {
     // Every *contained* stamped node gets the class; the CSS scopes the tint to the same
-    // block-node list the focus bar uses, so inline spans inside stay unpainted. Containment
-    // rather than overlap: a list item's span contains its nested children's, so overlap would
-    // tint every ancestor of the selected item too.
+    // block-node list the focus bar uses, so inline spans inside stay unpainted. Mirrors
+    // `aether_markdown::edit::selection_paints`, which is held to what the block commands act on.
     for (const el of container.querySelectorAll("[data-espan]")) {
       const parts = (el.getAttribute("data-espan") ?? "").split(":").map(Number);
       if (parts.length === 2 && parts[0] >= selection.start && parts[1] <= selection.end + 1) {
         el.classList.add("md-selected");
       }
     }
+  }
+}
+
+/** Wrap where a search matched `text` — the text `el` holds, however it is split into nodes — in
+ *  `search-hit` spans carrying their match's place in the count (`data-match`), so
+ *  `markCurrentMatch` can light the current one without a rebuild. Marks are UTF-8 byte offsets
+ *  (the server's); the DOM counts UTF-16 units. */
+function markSearch(el: HTMLElement, text: string, marks: MdMark[] | undefined): void {
+  if (!marks?.length) return;
+  const unitAt = utf16Offsets(text);
+  const ranges = marks.map((m) => ({ start: unitAt(m.start), end: unitAt(m.end), index: m.index }));
+  // Every text node under `el`, with where it starts in `text`.
+  const nodes: { node: Text; at: number }[] = [];
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let at = 0;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    nodes.push({ node: n as Text, at });
+    at += (n as Text).data.length;
+  }
+  for (const { node, at } of nodes) {
+    const len = node.data.length;
+    const cuts = ranges
+      .map((r) => ({ start: Math.max(r.start - at, 0), end: Math.min(r.end - at, len), index: r.index }))
+      .filter((r) => r.start < r.end);
+    if (cuts.length === 0) continue;
+    const frag = document.createDocumentFragment();
+    let pos = 0;
+    for (const c of cuts) {
+      if (c.start > pos) frag.append(node.data.slice(pos, c.start));
+      const hit = document.createElement("span");
+      hit.className = "search-hit";
+      hit.dataset.match = String(c.index);
+      hit.textContent = node.data.slice(c.start, c.end);
+      frag.append(hit);
+      pos = c.end;
+    }
+    if (pos < len) frag.append(node.data.slice(pos));
+    node.replaceWith(frag);
+  }
+}
+
+/** A map from UTF-8 byte offsets in `text` to UTF-16 offsets — how the server's ranges land on a
+ *  JavaScript string. */
+function utf16Offsets(text: string): (byte: number) => number {
+  const starts: number[] = [];
+  let bytes = 0;
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i) ?? 0;
+    starts.push(bytes, i);
+    bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    i += cp >= 0x10000 ? 2 : 1;
+  }
+  return (byte) => {
+    for (let k = 0; k < starts.length; k += 2) {
+      if (starts[k] >= byte) return starts[k + 1];
+    }
+    return text.length;
+  };
+}
+
+/** Light the current search match among the marks a render left — `current` is its place in the
+ *  count; 0 lights none. Cheap enough to run on every paint, so moving between matches needs no
+ *  rebuild. */
+export function markCurrentMatch(root: ParentNode, current: number): void {
+  for (const el of root.querySelectorAll(".search-hit.current")) el.classList.remove("current");
+  if (!current) return;
+  for (const el of root.querySelectorAll(`.search-hit[data-match="${current}"]`)) {
+    el.classList.add("current");
   }
 }
 
@@ -169,7 +239,10 @@ export function applyFenceHighlights(container: HTMLElement, doc: ReadDoc): void
     if (!(block instanceof HTMLElement) || block.dataset.hl === "1") continue;
     const code = block.querySelector("code");
     if (!code) continue;
-    fillCode(code as HTMLElement, code.textContent ?? "", hls);
+    const text = code.textContent ?? "";
+    fillCode(code as HTMLElement, text, hls);
+    const marks = (code as HTMLElement).dataset.marks;
+    if (marks) markSearch(code as HTMLElement, text, JSON.parse(marks) as MdMark[]);
     block.dataset.hl = "1";
   }
 }
@@ -233,6 +306,9 @@ function renderBlock(b: MdBlock, doc: ReadDoc): Node {
       } else {
         code.textContent = b.code;
       }
+      // Kept on the element so a fence's highlights patching in later can put them back.
+      if (b.marks?.length) code.dataset.marks = JSON.stringify(b.marks);
+      markSearch(code, b.code, b.marks);
       pre.append(code);
       wrap.append(pre);
       return wrap;
@@ -410,11 +486,17 @@ function renderInlines(inlines: MdInline[], parent: HTMLElement, doc: ReadDoc): 
 function renderInline(inl: MdInline, doc: ReadDoc): Node {
   const bufferId = doc.buffer_id;
   switch (inl.kind) {
-    case "text":
-      return document.createTextNode(inl.text);
+    case "text": {
+      if (!inl.marks?.length) return document.createTextNode(inl.text);
+      const run = document.createElement("span");
+      run.textContent = inl.text;
+      markSearch(run, inl.text, inl.marks);
+      return run;
+    }
     case "code": {
       const c = document.createElement("code");
       c.textContent = inl.text;
+      markSearch(c, inl.text, inl.marks);
       return c;
     }
     case "emphasis": {

@@ -200,11 +200,20 @@ impl WasmSession {
     /// Proportional type can only be measured once it is laid out, so a reply's height is the
     /// shell's answer rather than the core's — and everything that scrolls or places this view
     /// positions by it.
-    pub fn set_element_measured(&mut self, element: u32, end: u32) -> Result<JsValue, JsValue> {
+    ///
+    /// `marks` is one `[index, top, bottom]` per search match drawn in it, in units from the
+    /// element's top — where a reveal finds a match inside a reply.
+    pub fn set_element_measured(
+        &mut self,
+        element: u32,
+        end: u32,
+        marks: JsValue,
+    ) -> Result<JsValue, JsValue> {
         let measured = aether_client::grid::MeasuredElement {
             first_row: aether_protocol::coords::ElementRow::ZERO,
             starts: vec![0],
             end,
+            marks: mark_extents(marks)?,
         };
         self.measured.elements.insert(element, measured);
         measured_to_js(&self.measured)
@@ -337,8 +346,10 @@ impl WasmSession {
         element: u32,
         spans: JsValue,
         end: u32,
+        marks: JsValue,
     ) -> Result<JsValue, JsValue> {
         let spans: Vec<(u32, u32, u32)> = from_js(spans)?;
+        let marks = mark_extents(marks)?;
         if let Some(read) = self.inner.view.read.as_ref() {
             let line_count = read.line_count();
             let measured = aether_client::read_layout::measured_from_spans(
@@ -347,10 +358,21 @@ impl WasmSession {
                 line_count,
                 0,
                 end,
+                marks,
             );
             self.measured.elements.insert(element, measured);
         }
         measured_to_js(&self.measured)
+    }
+
+    /// Where the current match a search just landed on was drawn in prose, as `[top, bottom]` in
+    /// units — what a reveal frames when the match is inside a block too tall to show whole. `null`
+    /// when no landing is in force or the match is not in measured prose.
+    pub fn search_mark_rows(&self) -> Result<JsValue, JsValue> {
+        match self.inner.view.search_mark_rows(&self.measured) {
+            Some((top, bottom)) => to_js(&json!([top.get(), bottom.get()])),
+            None => Ok(JsValue::NULL),
+        }
     }
 
     /// Where a reading-view block sits in the view: the offsets its first line starts at and the
@@ -1247,6 +1269,19 @@ fn intern(method: &str) -> &'static str {
         p.borrow_mut().insert(method.to_string(), leaked);
         leaked
     })
+}
+
+/// A shell's `[index, top, bottom]` triples as the mark extents a measured element holds.
+fn mark_extents(marks: JsValue) -> Result<Vec<aether_client::grid::MarkExtent>, JsValue> {
+    let marks: Vec<(u32, u32, u32)> = if marks.is_undefined() || marks.is_null() {
+        Vec::new()
+    } else {
+        from_js(marks)?
+    };
+    Ok(marks
+        .into_iter()
+        .map(|(index, top, bottom)| aether_client::grid::MarkExtent { index, top, bottom })
+        .collect())
 }
 
 #[cfg(test)]

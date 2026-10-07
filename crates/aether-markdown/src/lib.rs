@@ -54,6 +54,20 @@ impl Span {
     }
 }
 
+/// A search match over a piece of rendered text: `start..end` bytes of the text it marks, and the
+/// match's 1-based place in the search's count, which a shell compares with the current one.
+///
+/// Marks are put in by the server ([`parse_marked`]) rather than worked out by a shell, because the
+/// text a reader sees is not the text that was searched for it to see: markup is gone, a soft break
+/// is a space, a quote is curly. The server holds the source and the parse, and is the one place
+/// both are; a shell gets the answer in the coordinates it paints in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Mark {
+    pub start: u32,
+    pub end: u32,
+    pub index: u32,
+}
+
 /// A block-level node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -71,6 +85,9 @@ pub enum Block {
         language: Option<String>,
         code: String,
         span: Span,
+        /// Where a search matches the code — see [`Mark`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        marks: Vec<Mark>,
     },
     List {
         ordered: bool,
@@ -207,16 +224,23 @@ pub enum ColAlign {
 }
 
 /// An inline (span-level) node. Interactive inlines (link, image, footnote ref) carry source spans —
-/// they're focusable stops in the reading view; plain text runs don't (match painting, which
-/// needs text-run spans, is a later phase).
+/// they're focusable stops in the reading view. Text runs carry no spans: what a shell needs of
+/// them beyond the text is where a search matched it, which the server works out and marks in
+/// ([`parse_marked`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Inline {
     Text {
         text: String,
+        /// Where a search matches this run — see [`Mark`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        marks: Vec<Mark>,
     },
     Code {
         text: String,
+        /// Where a search matches this run — see [`Mark`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        marks: Vec<Mark>,
     },
     Emphasis {
         content: Vec<Inline>,
@@ -259,38 +283,80 @@ fn options() -> Options {
 
 /// Parse Markdown into the AST.
 pub fn parse(md: &str) -> Vec<Block> {
-    let mut b = Builder::default();
-    for (ev, range) in Parser::new_ext(md, options()).into_offset_iter() {
-        let span = Span {
-            start: range.start as u32,
-            end: range.end as u32,
-        };
-        match ev {
-            Event::Start(tag) => b.start(tag, span),
-            Event::End(te) => b.end(te),
-            Event::Text(s) => b.text(&s),
-            Event::Code(s) => b.push_inline(Inline::Code {
-                text: s.to_string(),
-            }),
-            // A soft break separates words in flowed text; a hard break is kept explicit.
-            Event::SoftBreak => b.text(" "),
-            Event::HardBreak => b.push_inline(Inline::HardBreak),
-            Event::Rule => b.push_block(Block::Rule { span }),
-            Event::TaskListMarker(done) => b.task_marker(done),
-            Event::FootnoteReference(label) => b.push_inline(Inline::FootnoteRef {
-                label: label.to_string(),
-                span,
-            }),
-            // Raw HTML: block-level chunks collect into the enclosing Html block; inline HTML
-            // degrades to its literal text (never interpreted).
-            Event::Html(s) => b.html(&s),
-            Event::InlineHtml(s) => b.text(&s),
-            // Math is not enabled; anything else degrades to nothing.
-            _ => {}
-        }
-    }
+    parse_marked(md, &[])
+}
+
+/// Parse Markdown into the AST, with each search match in `marks` — a source span and its place in
+/// the count — marked on the text it covers ([`Mark`]).
+///
+/// A match is marked on whatever text came from inside its span. Where that text is the source
+/// verbatim the mark is exact; where it is not — a curly quote for a straight one, an entity — the
+/// whole of that run is marked, since no part of it corresponds to a part of the source.
+pub fn parse_marked(md: &str, marks: &[(Span, u32)]) -> Vec<Block> {
+    let mut b = Builder::new(md, marks);
+    b.run();
     promote_lone_images(&mut b.out);
     b.out
+}
+
+/// What a reader sees of a document, as one string a search can run over, and the way back from
+/// it to the source.
+///
+/// The rendered text, not the source: `**foo** bar` reads `foo bar`, a soft break is a space, a
+/// code span is its contents. Blocks are separated by a line break, so a match can span them only
+/// as it would span lines. Image alt text, front matter and raw HTML are not text a reader reads as
+/// the document's, and are left out.
+#[derive(Debug, Clone, Default)]
+pub struct Visible {
+    text: String,
+    pieces: Vec<Piece>,
+}
+
+/// One run of [`Visible`] text: where it sits in the visible string, the source span of the event
+/// it came from, and — when the run is the source verbatim — the source byte it starts at.
+#[derive(Debug, Clone, Copy)]
+struct Piece {
+    at: usize,
+    len: usize,
+    src: Span,
+    verbatim: Option<u32>,
+}
+
+impl Visible {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The source span a match over `start..end` of [`Self::text`] covers: exact inside verbatim
+    /// text, out to the whole of a run that is not. `None` for a match of nothing but the breaks
+    /// between blocks.
+    pub fn source_span(&self, start: usize, end: usize) -> Option<Span> {
+        let first = self.pieces.partition_point(|p| p.at + p.len <= start);
+        let last = self.pieces.partition_point(|p| p.at < end).checked_sub(1)?;
+        let (p, q) = (self.pieces.get(first)?, self.pieces.get(last)?);
+        if first > last {
+            return None;
+        }
+        let from = match p.verbatim {
+            Some(base) => base + (start.max(p.at) - p.at) as u32,
+            None => p.src.start,
+        };
+        let to = match q.verbatim {
+            Some(base) => base + (end.min(q.at + q.len) - q.at) as u32,
+            None => q.src.end,
+        };
+        (from < to).then_some(Span {
+            start: from,
+            end: to,
+        })
+    }
+}
+
+/// The visible text of `md` — see [`Visible`].
+pub fn visible(md: &str) -> Visible {
+    let mut b = Builder::new(md, &[]);
+    b.run();
+    b.visible
 }
 
 /// Replace any paragraph whose content is exactly one image with [`Block::Image`], recursively — a
@@ -355,7 +421,8 @@ enum Frame {
         content: Vec<Block>,
         span: Span,
     },
-    Code(Option<String>, String, Span),
+    /// Language, the code so far, the block's span, and the marks on the code so far.
+    Code(Option<String>, String, Span, Vec<Mark>),
     Table {
         alignments: Vec<ColAlign>,
         head: Vec<Vec<Inline>>,
@@ -371,13 +438,125 @@ enum Frame {
     FrontMatter(String, Span),
 }
 
-#[derive(Default)]
-struct Builder {
+struct Builder<'a> {
+    md: &'a str,
     stack: Vec<Frame>,
     out: Vec<Block>,
+    /// The search matches to mark, as source spans and their places in the count.
+    marks: &'a [(Span, u32)],
+    /// What a reader sees, built alongside the tree — see [`Visible`].
+    visible: Visible,
+    /// A block ended since the last visible text: the next text starts on a new line.
+    broke: bool,
 }
 
-impl Builder {
+impl<'a> Builder<'a> {
+    fn new(md: &'a str, marks: &'a [(Span, u32)]) -> Self {
+        Builder {
+            md,
+            stack: Vec::new(),
+            out: Vec::new(),
+            marks,
+            visible: Visible::default(),
+            broke: false,
+        }
+    }
+
+    fn run(&mut self) {
+        for (ev, range) in Parser::new_ext(self.md, options()).into_offset_iter() {
+            let span = Span {
+                start: range.start as u32,
+                end: range.end as u32,
+            };
+            match ev {
+                Event::Start(tag) => self.start(tag, span),
+                Event::End(te) => self.end(te),
+                Event::Text(s) => self.text(&s, span),
+                Event::Code(s) => {
+                    let marks = self.leaf(&s, span);
+                    self.push_inline(Inline::Code {
+                        text: s.to_string(),
+                        marks,
+                    })
+                }
+                // A soft break separates words in flowed text; a hard break is kept explicit.
+                Event::SoftBreak => self.text(" ", span),
+                Event::HardBreak => {
+                    self.broke = true;
+                    self.push_inline(Inline::HardBreak)
+                }
+                Event::Rule => {
+                    self.broke = true;
+                    self.push_block(Block::Rule { span })
+                }
+                Event::TaskListMarker(done) => self.task_marker(done),
+                Event::FootnoteReference(label) => self.push_inline(Inline::FootnoteRef {
+                    label: label.to_string(),
+                    span,
+                }),
+                // Raw HTML: block-level chunks collect into the enclosing Html block; inline HTML
+                // degrades to its literal text (never interpreted).
+                Event::Html(s) => self.html(&s),
+                Event::InlineHtml(s) => self.text(&s, span),
+                // Math is not enabled; anything else degrades to nothing.
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether text arriving now is text a reader reads as the document's: not an image's alt
+    /// text, front matter or raw HTML.
+    fn read_as_text(&self) -> bool {
+        !self.stack.iter().any(|f| {
+            matches!(
+                f,
+                Frame::Image(..) | Frame::FrontMatter(..) | Frame::Html(..)
+            )
+        })
+    }
+
+    /// Record a run of text `s` that the event at `src` produced: append it to what a reader sees,
+    /// and answer the marks that fall on it, in its own bytes.
+    fn leaf(&mut self, s: &str, src: Span) -> Vec<Mark> {
+        if s.is_empty() || !self.read_as_text() {
+            return Vec::new();
+        }
+        // The run is the source verbatim when it appears inside its event's span — a code span
+        // inside its backticks, an escaped character after its backslash. A replacement (a curly
+        // quote, an entity's character) does not, and maps to its event as a whole.
+        let verbatim = self
+            .md
+            .get(src.start as usize..src.end as usize)
+            .and_then(|source| source.find(s))
+            .map(|i| src.start + i as u32);
+        if std::mem::take(&mut self.broke) && !self.visible.text.is_empty() {
+            self.visible.text.push('\n');
+        }
+        self.visible.pieces.push(Piece {
+            at: self.visible.text.len(),
+            len: s.len(),
+            src,
+            verbatim,
+        });
+        self.visible.text.push_str(s);
+
+        let len = s.len() as u32;
+        self.marks
+            .iter()
+            .filter(|(span, _)| span.start < src.end && span.end > src.start)
+            .filter_map(|&(span, index)| {
+                let (start, end) = match verbatim {
+                    Some(base) => (
+                        span.start.saturating_sub(base).min(len),
+                        span.end.saturating_sub(base).min(len),
+                    ),
+                    None => (0, len),
+                };
+                (start < end).then_some(Mark { start, end, index })
+            })
+            .collect()
+    }
+
     /// The inline list of the innermost inline-collecting frame, if any.
     fn inlines_mut(&mut self) -> Option<&mut Vec<Inline>> {
         match self.stack.last_mut() {
@@ -433,8 +612,13 @@ impl Builder {
     fn push_inline(&mut self, inl: Inline) {
         let target = self.inline_target();
         // Coalesce adjacent text (soft breaks split it into runs) for a tidier tree.
-        if let Inline::Text { text } = &inl {
-            if let Some(Inline::Text { text: prev }) = target.last_mut() {
+        if let Inline::Text { text, marks } = &inl {
+            if let Some(Inline::Text {
+                text: prev,
+                marks: prev_marks,
+            }) = target.last_mut()
+            {
+                append_marks(prev_marks, marks, prev.len() as u32);
                 prev.push_str(text);
                 return;
             }
@@ -456,13 +640,18 @@ impl Builder {
         }
     }
 
-    fn text(&mut self, s: &str) {
+    fn text(&mut self, s: &str, src: Span) {
+        let marks = self.leaf(s, src);
         match self.stack.last_mut() {
-            Some(Frame::Code(_, code, _)) => code.push_str(s),
+            Some(Frame::Code(_, code, _, code_marks)) => {
+                append_marks(code_marks, &marks, code.len() as u32);
+                code.push_str(s);
+            }
             Some(Frame::FrontMatter(text, _)) => text.push_str(s),
             Some(Frame::Html(raw, _)) => raw.push_str(s),
             _ => self.push_inline(Inline::Text {
                 text: s.to_string(),
+                marks,
             }),
         }
     }
@@ -470,8 +659,12 @@ impl Builder {
     fn html(&mut self, s: &str) {
         match self.stack.last_mut() {
             Some(Frame::Html(raw, _)) => raw.push_str(s),
-            // A stray HTML chunk outside an HtmlBlock: keep its text.
-            _ => self.text(s),
+            // A stray HTML chunk outside an HtmlBlock: keep its text. It has no span of its own
+            // here, so it is not text a search reads.
+            _ => self.push_inline(Inline::Text {
+                text: s.to_string(),
+                marks: Vec::new(),
+            }),
         }
     }
 
@@ -530,7 +723,7 @@ impl Builder {
                     CodeBlockKind::Fenced(l) if !l.is_empty() => Some(l.to_string()),
                     _ => None,
                 };
-                Frame::Code(lang, String::new(), span)
+                Frame::Code(lang, String::new(), span, Vec::new())
             }
             Tag::Table(aligns) => Frame::Table {
                 alignments: aligns
@@ -563,6 +756,19 @@ impl Builder {
         let Some(frame) = self.stack.pop() else {
             return;
         };
+        // Text after a block reads on a line of its own; text after an inline run of its own
+        // block does not.
+        if !matches!(
+            frame,
+            Frame::Emphasis(_)
+                | Frame::Strong(_)
+                | Frame::Strikethrough(_)
+                | Frame::Link(..)
+                | Frame::Image(..)
+                | Frame::Transparent(_)
+        ) {
+            self.broke = true;
+        }
         match frame {
             Frame::Paragraph(content, span) => self.push_block(Block::Paragraph { content, span }),
             Frame::Heading(level, content, span) => self.push_block(Block::Heading {
@@ -621,13 +827,19 @@ impl Builder {
                 content,
                 span,
             }),
-            Frame::Code(language, code, span) => {
+            Frame::Code(language, code, span, mut marks) => {
                 // pulldown emits a trailing newline after the last code line — drop it.
                 let code = code.strip_suffix('\n').map(str::to_string).unwrap_or(code);
+                let len = code.len() as u32;
+                marks.retain_mut(|m| {
+                    m.end = m.end.min(len);
+                    m.start < m.end
+                });
                 self.push_block(Block::Code {
                     language,
                     code,
                     span,
+                    marks,
                 });
             }
             Frame::Table {
@@ -668,6 +880,83 @@ impl Builder {
                 let text = text.trim().to_string();
                 self.push_block(Block::FrontMatter { text, span });
             }
+        }
+    }
+}
+
+/// `text` cut where its marks start and end: each piece in order, with the index of the match it is
+/// part of. What a shell paints a run of marked text from; text with no marks is one piece.
+pub fn split_marks<'t>(text: &'t str, marks: &[Mark]) -> Vec<(&'t str, Option<u32>)> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for m in marks {
+        let (start, end) = (
+            (m.start as usize).clamp(at, text.len()),
+            (m.end as usize).min(text.len()),
+        );
+        if start >= end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+        if start > at {
+            out.push((&text[at..start], None));
+        }
+        out.push((&text[start..end], Some(m.index)));
+        at = end;
+    }
+    if at < text.len() || out.is_empty() {
+        out.push((&text[at..], None));
+    }
+    out
+}
+
+/// Take every [`Mark`] off a parse — what it is with no search over it. For telling a change of
+/// search from a change of document: the two parses are the same document when they agree after
+/// this, and a shell keeps what it derived from the text (fence highlights) across the first.
+pub fn strip_marks(blocks: &mut [Block]) {
+    fn inlines(content: &mut [Inline]) {
+        for inline in content {
+            match inline {
+                Inline::Text { marks, .. } | Inline::Code { marks, .. } => marks.clear(),
+                Inline::Emphasis { content }
+                | Inline::Strong { content }
+                | Inline::Strikethrough { content }
+                | Inline::Link { content, .. } => inlines(content),
+                Inline::Image { .. } | Inline::FootnoteRef { .. } | Inline::HardBreak => {}
+            }
+        }
+    }
+    for block in blocks {
+        match block {
+            Block::Heading { content, .. } | Block::Paragraph { content, .. } => inlines(content),
+            Block::Code { marks, .. } => marks.clear(),
+            Block::List { items, .. } => items.iter_mut().for_each(|i| strip_marks(&mut i.blocks)),
+            Block::Quote { content, .. } | Block::FootnoteDef { content, .. } => {
+                strip_marks(content)
+            }
+            Block::Table { head, rows, .. } => {
+                head.iter_mut().for_each(|c| inlines(c));
+                rows.iter_mut().flatten().for_each(|c| inlines(c));
+            }
+            Block::Rule { .. }
+            | Block::Image { .. }
+            | Block::FrontMatter { .. }
+            | Block::Html { .. } => {}
+        }
+    }
+}
+
+/// Append `new`, marks on a run of text joined on at byte `shift`, to `into` — merging a mark that
+/// continues the last one, as a match running across a soft break does.
+fn append_marks(into: &mut Vec<Mark>, new: &[Mark], shift: u32) {
+    for m in new {
+        let m = Mark {
+            start: m.start + shift,
+            end: m.end + shift,
+            index: m.index,
+        };
+        match into.last_mut() {
+            Some(last) if last.index == m.index && last.end == m.start => last.end = m.end,
+            _ => into.push(m),
         }
     }
 }
@@ -1067,6 +1356,7 @@ fn collect_fences(blocks: &[Block], out: &mut Vec<(Span, String, String)>) {
                 language: Some(lang),
                 code,
                 span,
+                ..
             } => out.push((*span, lang.clone(), code.clone())),
             Block::Quote { content, .. } | Block::FootnoteDef { content, .. } => {
                 collect_fences(content, out)
@@ -1241,7 +1531,7 @@ fn push_blocks_plain(blocks: &[Block], out: &mut String, indent: &str) {
 fn push_inlines_plain(inlines: &[Inline], out: &mut String) {
     for inl in inlines {
         match inl {
-            Inline::Text { text } | Inline::Code { text } => out.push_str(text),
+            Inline::Text { text, .. } | Inline::Code { text, .. } => out.push_str(text),
             Inline::Emphasis { content }
             | Inline::Strong { content }
             | Inline::Strikethrough { content }
@@ -1262,7 +1552,10 @@ mod tests {
     use super::*;
 
     fn text(s: &str) -> Inline {
-        Inline::Text { text: s.into() }
+        Inline::Text {
+            text: s.into(),
+            marks: vec![],
+        }
     }
 
     /// The span of `needle`'s (first) occurrence in `md` — tests state spans by content, not by
@@ -1275,6 +1568,135 @@ mod tests {
         }
     }
 
+    // ---- what a search reads, and marking it ---------------------------------------------------
+
+    /// Where `needle` sits in `v`'s visible text, mapped back to the source.
+    fn source_of(v: &Visible, needle: &str) -> Option<Span> {
+        let at = v.text().find(needle).expect("needle visible");
+        v.source_span(at, at + needle.len())
+    }
+
+    #[test]
+    fn a_search_reads_the_rendered_text_not_the_markup() {
+        let md = "**foo** bar\nbaz `code` and [a link](https://x.y).";
+        let v = visible(md);
+        assert_eq!(v.text(), "foo bar baz code and a link.");
+        // Across emphasis and a soft break, out to the source that rendered it.
+        assert_eq!(
+            source_of(&v, "foo bar baz"),
+            Some(span_of(md, "foo** bar\nbaz"))
+        );
+        // Inside a code span: its contents, not its backticks.
+        assert_eq!(source_of(&v, "code"), Some(span_of(md, "code")));
+        // A link's text is read; its destination is not.
+        assert!(!v.text().contains("x.y"));
+    }
+
+    #[test]
+    fn blocks_read_on_lines_of_their_own() {
+        let md = "# Title\n\nFirst para.\n\n- one\n- two\n\n```\nlet x;\n```";
+        assert_eq!(visible(md).text(), "Title\nFirst para.\none\ntwo\nlet x;\n");
+    }
+
+    #[test]
+    fn what_a_reader_does_not_read_is_not_searched() {
+        let md = "---\ntitle: needle\n---\n\n![needle](x.png) and needle";
+        let v = visible(md);
+        assert_eq!(v.text().matches("needle").count(), 1, "{:?}", v.text());
+    }
+
+    /// A curly quote is not the straight one it stands for, so no part of it maps to a part of the
+    /// source: a match on it covers the whole of what produced it.
+    #[test]
+    fn a_replacement_maps_to_what_it_replaced() {
+        let md = "don't";
+        let v = visible(md);
+        assert_eq!(v.text(), "don\u{2019}t");
+        assert_eq!(source_of(&v, "\u{2019}"), Some(span_of(md, "'")));
+        assert_eq!(source_of(&v, "don\u{2019}t"), Some(span_of(md, "don't")));
+    }
+
+    #[test]
+    fn a_match_is_marked_on_the_runs_it_covers() {
+        let md = "**foo** bar\nbaz";
+        let blocks = parse_marked(md, &[(span_of(md, "foo** bar\nbaz"), 3)]);
+        let mark = |start, end| Mark {
+            start,
+            end,
+            index: 3,
+        };
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph {
+                content: vec![
+                    Inline::Strong {
+                        content: vec![Inline::Text {
+                            text: "foo".into(),
+                            marks: vec![mark(0, 3)],
+                        }],
+                    },
+                    // One mark across the soft break, which the run joined.
+                    Inline::Text {
+                        text: " bar baz".into(),
+                        marks: vec![mark(0, 8)],
+                    },
+                ],
+                span: span_of(md, md),
+            }]
+        );
+        let mut stripped = blocks;
+        strip_marks(&mut stripped);
+        assert_eq!(
+            stripped,
+            parse(md),
+            "without its marks it is the plain parse"
+        );
+    }
+
+    #[test]
+    fn code_is_marked_where_it_matched() {
+        let md = "Use `the needle` here.\n\n```\nlet needle = 1;\n```";
+        let marks: Vec<(Span, u32)> = md
+            .match_indices("needle")
+            .zip(1..)
+            .map(|((at, n), index)| {
+                (
+                    Span {
+                        start: at as u32,
+                        end: (at + n.len()) as u32,
+                    },
+                    index,
+                )
+            })
+            .collect();
+        let blocks = parse_marked(md, &marks);
+        let Block::Paragraph { content, .. } = &blocks[0] else {
+            panic!("{blocks:?}")
+        };
+        assert_eq!(
+            content[1],
+            Inline::Code {
+                text: "the needle".into(),
+                marks: vec![Mark {
+                    start: 4,
+                    end: 10,
+                    index: 1
+                }],
+            }
+        );
+        let Block::Code { marks, .. } = &blocks[1] else {
+            panic!("{blocks:?}")
+        };
+        assert_eq!(
+            marks,
+            &vec![Mark {
+                start: 4,
+                end: 10,
+                index: 2
+            }]
+        );
+    }
+
     #[test]
     fn paragraph_with_inline_code_and_link() {
         let md = "See `foo` and [docs](https://x.y).";
@@ -1284,7 +1706,10 @@ mod tests {
             vec![Block::Paragraph {
                 content: vec![
                     text("See "),
-                    Inline::Code { text: "foo".into() },
+                    Inline::Code {
+                        text: "foo".into(),
+                        marks: vec![],
+                    },
                     text(" and "),
                     Inline::Link {
                         href: "https://x.y".into(),
@@ -1308,6 +1733,7 @@ mod tests {
                 language: Some("rust".into()),
                 code: "fn x() {}".into(),
                 span: span_of(md, md),
+                marks: vec![],
             }]
         );
     }

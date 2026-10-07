@@ -1391,6 +1391,126 @@ async fn the_agents_reply_is_prose_on_the_wire() {
     );
 }
 
+/// An agent's reply is searched as it reads, and its matches are marked in the parse that carries
+/// it — which is also how a shell finds where it drew one, to reveal it. A reply holds no cursor,
+/// so `n` makes a match there current without moving one.
+#[tokio::test]
+async fn a_reply_is_searched_as_it_reads() {
+    let script = Script {
+        steps: vec![Step::Say {
+            message_id: Some("m1"),
+            text: "# Heading\n\nThe **needle** is here.\n",
+        }],
+        ..Script::default()
+    };
+    let (server, mut ws, _dir, _t) = setup(script).await;
+    let open = start_agent(&mut ws).await;
+    prompt_and_wait(&mut ws, &server, &open, "hi").await;
+    let view = open.opened.view_id;
+    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: view,
+            cols: 100,
+            rows: 60,
+            overscan_rows: 0,
+            scroll: ScrollPosition::default(),
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+
+    let set: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        &SearchSetParams {
+            view_id: view,
+            query: "needle is".into(),
+            anchor: None,
+            extend: false,
+            from_selection: false,
+            options: Default::default(),
+        },
+    )
+    .await;
+    assert_eq!(set.summary.total, 1, "across the emphasis");
+
+    let nav: SearchNavResult = send_request::<SearchStep>(
+        &mut ws,
+        &SearchStepParams {
+            view_id: view,
+            direction: Direction::Forward,
+            extend: false,
+            count: 1,
+            set_query: None,
+            options: Default::default(),
+        },
+    )
+    .await;
+    assert_eq!(nav.summary.current_index, 1);
+    assert!(
+        nav.crossed.is_none(),
+        "a reply holds no cursor to move into it"
+    );
+    // Marked in the parse the search's repaint carried — prose goes out whole, loaded or not.
+    let window = searched_window(&mut ws).await;
+    let marked: Vec<String> = window
+        .root
+        .content()
+        .into_iter()
+        .filter_map(|e| match e {
+            aether_protocol::viewport::Element::Prose { blocks, .. } => Some(blocks),
+            _ => None,
+        })
+        .flat_map(|blocks| marked_text(blocks))
+        .collect();
+    assert_eq!(marked, vec!["needle".to_string(), " is".to_string()]);
+    drop(server);
+}
+
+/// The first repaint carrying a search.
+async fn searched_window(ws: &mut Ws) -> aether_protocol::viewport::Window {
+    loop {
+        let p = expect_notification_or_backlog::<ViewportLinesChanged>(ws).await;
+        if p.window.search.is_some() {
+            return p.window;
+        }
+    }
+}
+
+/// The marked pieces of text in a parse, in order.
+fn marked_text(blocks: &[aether_markdown::Block]) -> Vec<String> {
+    fn inlines(content: &[aether_markdown::Inline], out: &mut Vec<String>) {
+        use aether_markdown::Inline;
+        for i in content {
+            match i {
+                Inline::Text { text, marks } | Inline::Code { text, marks } => out.extend(
+                    marks
+                        .iter()
+                        .map(|m| text[m.start as usize..m.end as usize].to_string()),
+                ),
+                Inline::Strong { content }
+                | Inline::Emphasis { content }
+                | Inline::Strikethrough { content }
+                | Inline::Link { content, .. } => inlines(content, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for b in blocks {
+        if let aether_markdown::Block::Paragraph { content, .. }
+        | aether_markdown::Block::Heading { content, .. } = b
+        {
+            inlines(content, &mut out);
+        }
+    }
+    out
+}
+
 #[tokio::test]
 async fn a_plan_keeps_each_entrys_state() {
     // The plan is the most useful thing on screen during a long turn, and its value is per entry:

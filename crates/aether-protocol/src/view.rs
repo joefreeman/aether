@@ -380,6 +380,10 @@ pub struct ViewSetReadParams {
 pub struct ViewSetReadResult {
     /// The mode after the change — echoes the request so the client can confirm.
     pub read: bool,
+    /// The cursor after the change. Arriving in the reader collapses a selection to its cursor —
+    /// the reader is block-grain, and a selection it cannot paint is one it does not keep — so the
+    /// flip can move it.
+    pub cursor: crate::cursor::CursorState,
 }
 
 // ---- view/set_transient -----------------------------------------------------------------------
