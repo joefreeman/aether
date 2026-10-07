@@ -50,9 +50,14 @@ pub struct ViewOpenParams {
     /// the mode the file was last shown as by anyone, else the app setting — except that a
     /// `jump_to` open lands in the editor, where a `line:col` means something, unless the client
     /// has the file on screen and is reading it: a jump inside the document being read (its
-    /// outline, a reference, a grep hit) stays on the page. A client sends `Some` only when its
-    /// route decided: a followed `#anchor` asks to read, the web shell's `as=` URL for what it
-    /// recorded, a history step for the mode it left. Ignored for any file that is not markdown,
+    /// outline, a reference, a grep hit) stays on the page.
+    ///
+    /// The rule for a route: **a navigation that continues what you were doing keeps your mode;
+    /// an open that starts something new leaves it to the target.** So a client sends `Some` only
+    /// when its route decided: a link followed from the reader asks to read, a history step for
+    /// the mode it left, the web shell's `as=` URL for what it recorded. A picker, the explorer or
+    /// a session restore sends `None`. (`git/step_version` keeps the mode server-side, since it
+    /// opens for itself.) Ignored for any file that is not markdown,
     /// and for a view a driver built. The reader toggle flips the mode in place with
     /// [`ViewSetRead`] instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]

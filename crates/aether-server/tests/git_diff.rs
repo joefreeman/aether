@@ -13540,3 +13540,58 @@ async fn a_buffer_without_history_says_so() {
     assert_eq!(r.note, Some(VersionNote::Untracked));
     drop(server);
 }
+
+/// A step keeps the mode you were in: editing a markdown file's source steps into the source of
+/// its versions, reading one steps into reading the next — all the way back to the working file —
+/// rather than each new version starting in whatever the app setting says.
+#[tokio::test]
+async fn a_version_step_keeps_the_reader_mode() {
+    use aether_protocol::git::VersionScope::File;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo_at(dir.path());
+    commit_file(&repo, "notes.md", "# Notes\n\nFirst.\n");
+    commit_file(&repo, "notes.md", "# Notes\n\nSecond.\n");
+    let (server, mut ws, working) = setup_git_apply(dir.path(), "versions", "notes.md").await;
+    let flipped = send_request::<aether_protocol::view::ViewSetRead>(
+        &mut ws,
+        &aether_protocol::view::ViewSetReadParams {
+            view_id: view_of(working),
+            read: false,
+        },
+    )
+    .await;
+    assert!(!flipped.read, "editing the source");
+
+    let at_two = step_version(&mut ws, working, File, Direction::Backward)
+        .await
+        .opened
+        .unwrap();
+    assert!(!at_two.read, "still editing the source");
+
+    let reading = send_request::<aether_protocol::view::ViewSetRead>(
+        &mut ws,
+        &aether_protocol::view::ViewSetReadParams {
+            view_id: at_two.view_id,
+            read: true,
+        },
+    )
+    .await;
+    assert!(reading.read);
+    let at_one = step_version(&mut ws, at_two.buffer_id, File, Direction::Backward)
+        .await
+        .opened
+        .unwrap();
+    assert!(at_one.read, "still reading");
+    let home = step_version(&mut ws, at_one.buffer_id, File, Direction::Forward)
+        .await
+        .opened
+        .unwrap();
+    let home = step_version(&mut ws, home.buffer_id, File, Direction::Forward)
+        .await
+        .opened
+        .unwrap();
+    assert_eq!(home.buffer_id, working);
+    assert!(home.read, "reading the working file, as the walk was");
+
+    drop(server);
+}

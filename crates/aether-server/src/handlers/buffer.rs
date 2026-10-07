@@ -2181,7 +2181,8 @@ pub async fn git_step_version(
     // names, or a working-tree file's repo location. The working tree's text rides along — the
     // origin's own text for a working-tree file, any live buffer's for a revision (a newer step
     // can run off the end of the commits into it); a file no buffer holds is read off disk below.
-    let (workdir, rev, path, line, live_text, from_working_file) = {
+    // So does this client's reader/editor mode, where the file has one.
+    let (read, (workdir, rev, path, line, live_text, from_working_file)) = {
         let s = state.lock().await;
         let doc = s
             .try_doc_of(params.buffer_id)
@@ -2191,48 +2192,54 @@ pub async fn git_step_version(
             .get(&(client_id, params.buffer_id))
             .map(|c| c.position.line)
             .unwrap_or_default();
-        match doc.virtual_source.as_ref().map(|v| &v.target) {
-            Some(target) => {
-                // A commit's patch, a shell, an agent: none of them is one file.
-                let (Some(repo_id), Some(rev), Some(path)) =
-                    (target.repo_id(), target.rev(), target.path())
-                else {
-                    return note(VersionNote::Untracked);
-                };
-                let workdir = std::path::PathBuf::from(repo_id);
-                let live = s
-                    .active_workspace_or_err(client_id)
-                    .ok()
-                    .and_then(|w| s.buffer_for_path_in_workspace(&w.id, &workdir.join(path)))
-                    .and_then(|b| s.try_doc_of(b))
-                    .map(|d| d.text.to_string());
-                (
-                    workdir,
-                    Some(rev.to_string()),
-                    path.to_string(),
-                    line,
-                    live,
-                    false,
-                )
-            }
-            None => {
-                let Some(repo) = s
-                    .git_baseline
-                    .get(&params.buffer_id)
-                    .and_then(|b| b.repo.as_ref())
-                else {
-                    return note(VersionNote::Untracked);
-                };
-                (
-                    repo.workdir.clone(),
-                    None,
-                    repo.rel_path.to_string_lossy().into_owned(),
-                    line,
-                    Some(doc.text.to_string()),
-                    true,
-                )
-            }
-        }
+        let read = s
+            .readable(params.buffer_id)
+            .then(|| s.read_mode(client_id, params.buffer_id));
+        (
+            read,
+            match doc.virtual_source.as_ref().map(|v| &v.target) {
+                Some(target) => {
+                    // A commit's patch, a shell, an agent: none of them is one file.
+                    let (Some(repo_id), Some(rev), Some(path)) =
+                        (target.repo_id(), target.rev(), target.path())
+                    else {
+                        return note(VersionNote::Untracked);
+                    };
+                    let workdir = std::path::PathBuf::from(repo_id);
+                    let live = s
+                        .active_workspace_or_err(client_id)
+                        .ok()
+                        .and_then(|w| s.buffer_for_path_in_workspace(&w.id, &workdir.join(path)))
+                        .and_then(|b| s.try_doc_of(b))
+                        .map(|d| d.text.to_string());
+                    (
+                        workdir,
+                        Some(rev.to_string()),
+                        path.to_string(),
+                        line,
+                        live,
+                        false,
+                    )
+                }
+                None => {
+                    let Some(repo) = s
+                        .git_baseline
+                        .get(&params.buffer_id)
+                        .and_then(|b| b.repo.as_ref())
+                    else {
+                        return note(VersionNote::Untracked);
+                    };
+                    (
+                        repo.workdir.clone(),
+                        None,
+                        repo.rel_path.to_string_lossy().into_owned(),
+                        line,
+                        Some(doc.text.to_string()),
+                        true,
+                    )
+                }
+            },
+        )
     };
 
     let step = match params.direction {
@@ -2298,11 +2305,25 @@ pub async fn git_step_version(
                 ViewOpenParams {
                     absolute_path: Some(workdir.join(path).to_string_lossy().into_owned()),
                     jump_to: Some(LogicalPosition { line, col: 0 }),
+                    read,
                     ..Default::default()
                 },
             ))
             .await?,
         ),
+    };
+    // A step continues what you were doing, so it keeps your mode: reading a version of a
+    // markdown file lands you reading the next one, editing it lands you in its source. Recorded
+    // as this client's mode for the version, as a toggle there would be, so returning to it agrees
+    // with what was on screen.
+    let opened = match (opened, read) {
+        (Some(mut opened), Some(read)) => {
+            let mut s = state.lock().await;
+            s.set_read_mode(client_id, opened.buffer_id, read);
+            opened.read = s.read_mode(client_id, opened.buffer_id);
+            Some(opened)
+        }
+        (opened, _) => opened,
     };
     Ok(GitStepVersionResult {
         opened,

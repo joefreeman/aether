@@ -12431,11 +12431,12 @@ impl Session {
         };
         match self.read_resolve_path(path_part) {
             Some(path) => {
-                // An anchor asks to read outright: only a rendered document can land a heading
-                // slug, whatever the file was last shown as. Set *after* the open —
-                // `open_path_as` clears any stale anchor at entry.
-                let read = fragment.is_some().then_some(true);
-                let fx = self.open_path_as(path, None, None, read);
+                // Following a link continues the reading you were doing, so the target is read
+                // whatever it was last shown as — and an anchor needs the rendered document to
+                // land on anyway. A target that isn't markdown has no reader, and the server
+                // ignores the ask. Anchor set *after* the open — `open_path_as` clears any stale
+                // anchor at entry.
+                let fx = self.open_path_as(path, None, None, Some(true));
                 self.pending_read_anchor = fragment;
                 fx
             }
@@ -13131,12 +13132,11 @@ mod tests {
         }
     }
 
-    /// A link anchor decides the open: `[x](./other.md#section)` asks to read outright, whatever
-    /// the file was last shown as, because a heading slug only resolves against the rendered
-    /// document — landing in the editor would silently drop it. A plain link asks for nothing and
-    /// takes the server's answer.
+    /// A followed link keeps reading, whatever the target was last shown as: following one
+    /// continues what you were doing, and an anchor (`[x](./other.md#section)`) only resolves
+    /// against the rendered document anyway.
     #[test]
-    fn a_followed_anchor_asks_for_the_reader() {
+    fn a_followed_link_asks_for_the_reader() {
         let mut s = reading_session();
         let fx = s.read_follow_link("./other.md#section-two");
         let open =
@@ -13162,7 +13162,11 @@ mod tests {
                     _ => None,
                 })
                 .expect("the link target opens");
-        assert!(open.get("read").is_none(), "no anchor, no opinion");
+        assert_eq!(
+            open["read"],
+            serde_json::json!(true),
+            "no anchor, still reading"
+        );
 
         // A switch to a non-markdown target drops a pending anchor: nothing could land it.
         let mut s = reading_session();
