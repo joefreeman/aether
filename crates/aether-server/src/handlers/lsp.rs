@@ -1229,7 +1229,7 @@ pub async fn lsp_document_highlight(
     }
     let epoch = {
         let mut s = state.lock().await;
-        if s.searches.contains_key(&key) {
+        if search_covers(&s, client_id, buffer_id) {
             s.symbol_highlights.remove(&key);
             s.symbol_highlight_gen.remove(&key);
             return Ok(());
@@ -1332,19 +1332,10 @@ async fn apply_symbol_highlights(
     } else {
         // Moving between occurrences of the same symbol resolves to the identical set; skip the
         // full-window repaint when nothing actually changed.
-        if s.symbol_highlights.get(&key).map(|e| &e.matches) == Some(&ranges) {
+        if s.symbol_highlights.get(&key) == Some(&ranges) {
             return;
         }
-        s.symbol_highlights.insert(
-            key,
-            SearchEntry {
-                query: String::new(),
-                options: MatchOptions::default(),
-                matches: ranges,
-                truncated: false,
-                last_pushed_index: 0,
-            },
-        );
+        s.symbol_highlights.insert(key, ranges);
     }
     let pushes = collect_viewport_refresh(&s, client_id, buffer_id);
     drop(s);
@@ -1629,8 +1620,8 @@ pub async fn lsp_format(
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
 
-    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
-    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
+    let promoted_pushes = promote_transient(&mut s, buffer_id);
+    refresh_searches_for_buffer(&mut s, buffer_id);
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     notify_lsp_change(&mut s, buffer_id);
 
@@ -1647,7 +1638,7 @@ pub async fn lsp_format(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    for (sender, notif) in search_summary_pushes {
+    for (sender, notif) in promoted_pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in picker_pushes {
@@ -1872,7 +1863,7 @@ fn lsp_pos_to_logical(
 
 /// Parse a `textDocument/documentHighlight` response (`DocumentHighlight[]` or null) into the
 /// end-exclusive `(start, end)` ranges of each occurrence, in the buffer's byte coordinates. LSP
-/// ranges are already end-exclusive, matching the `SearchEntry::matches` convention. Entries
+/// ranges are already end-exclusive, matching how search matches are kept. Entries
 /// without a parseable range, and empty/degenerate ranges, are dropped.
 fn parse_document_highlights(
     v: &serde_json::Value,
@@ -2238,34 +2229,6 @@ mod document_highlight_tests {
         assert_eq!(
             parse_document_highlights(&v, &buf, PositionEncoding::Utf16),
             vec![(pos(0, 3), pos(0, 6))]
-        );
-    }
-
-    #[test]
-    fn render_matches_prefers_search_then_symbol_then_none() {
-        let mut st = ServerState::new();
-        let client = uuid::Uuid::nil();
-        let buffer = 1u64;
-        let entry = |q: &str, n: u32| SearchEntry {
-            query: q.to_string(),
-            options: MatchOptions::default(),
-            matches: (0..n).map(|i| (pos(0, i), pos(0, i + 1))).collect(),
-            truncated: false,
-            last_pushed_index: 0,
-        };
-        // Nothing stored → no highlights.
-        assert!(render_matches(&st, client, buffer).is_none());
-        // Symbol set only → it renders.
-        st.symbol_highlights.insert((client, buffer), entry("", 2));
-        assert_eq!(
-            render_matches(&st, client, buffer).map(|e| e.matches.len()),
-            Some(2)
-        );
-        // A real search always wins, enforcing "symbol highlights only when no search is active".
-        st.searches.insert((client, buffer), entry("needle", 5));
-        assert_eq!(
-            render_matches(&st, client, buffer).map(|e| e.query.as_str()),
-            Some("needle")
         );
     }
 }

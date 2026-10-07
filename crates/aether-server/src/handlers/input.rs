@@ -1049,8 +1049,8 @@ async fn apply_toggle_comment(
     s.clear_virtual_col_for_buffer(buffer_id);
 
     let edit_last_excl = edit_last_incl + 1;
-    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
-    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
+    let promoted_pushes = promote_transient(&mut s, buffer_id);
+    refresh_searches_for_buffer(&mut s, buffer_id);
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     let pushes: PendingPushes = collect_doc_edit_pushes(&s, buffer_id, edit_first, edit_last_excl);
 
@@ -1063,7 +1063,7 @@ async fn apply_toggle_comment(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    for (sender, notif) in search_summary_pushes {
+    for (sender, notif) in promoted_pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in picker_pushes {
@@ -1601,8 +1601,8 @@ async fn apply_indent_or_dedent(
 
     let edit_first = a;
     let edit_last_excl = b + 1;
-    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
-    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
+    let promoted_pushes = promote_transient(&mut s, buffer_id);
+    refresh_searches_for_buffer(&mut s, buffer_id);
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     let pushes: PendingPushes = collect_doc_edit_pushes(&s, buffer_id, edit_first, edit_last_excl);
 
@@ -1615,7 +1615,7 @@ async fn apply_indent_or_dedent(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    for (sender, notif) in search_summary_pushes {
+    for (sender, notif) in promoted_pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in picker_pushes {

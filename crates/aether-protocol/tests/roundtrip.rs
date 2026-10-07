@@ -611,6 +611,7 @@ fn logical_line_render_baseline_rows_shape() {
             text: "old line".into(),
             stage: DiffStage::Staged,
             emphasis: vec![EmphasisRange { start: 4, end: 8 }],
+            search_matches: vec![],
         }],
         change: LineChange::Changed {
             marker: DiffMarker::Modified,
@@ -652,6 +653,7 @@ fn logical_line_render_baseline_rows_shape() {
             text: "old line".into(),
             stage: DiffStage::Staged,
             emphasis: vec![EmphasisRange { start: 4, end: 8 }],
+            search_matches: vec![],
         }
     );
     assert_eq!(
@@ -798,6 +800,7 @@ fn patch_chrome_virtual_row_shape() {
         text: "gone".into(),
         stage: DiffStage::Unstaged,
         emphasis: vec![],
+        search_matches: vec![],
     };
     let v = to_value(&del).unwrap();
     assert_eq!(v["text"], "gone");
@@ -1461,11 +1464,15 @@ fn search_set_params() {
     use aether_protocol::envelope::RpcMethod;
     assert_eq!(SearchSet::NAME, "search/set");
 
-    // Full shape: anchor present, extend set. Default `options` is skipped on the wire.
+    // Full shape: anchor present, extend set. Default `options` is skipped on the wire. The anchor
+    // names its element, since the position is a line of that element's buffer.
     let v = to_value(SearchSetParams {
-        buffer_id: 3,
+        view_id: aether_protocol::ViewId(3),
         query: "foo".into(),
-        anchor: Some(LogicalPosition { line: 2, col: 5 }),
+        anchor: Some(aether_protocol::search::SearchAnchor {
+            element: 4,
+            position: LogicalPosition { line: 2, col: 5 },
+        }),
         extend: true,
         from_selection: false,
         options: MatchOptions::default(),
@@ -1474,9 +1481,9 @@ fn search_set_params() {
     assert_eq!(
         v,
         json!({
-            "buffer_id": 3,
+            "view_id": 3,
             "query": "foo",
-            "anchor": {"line": 2, "col": 5},
+            "anchor": {"element": 4, "position": {"line": 2, "col": 5}},
             "extend": true,
             "from_selection": false,
         })
@@ -1484,7 +1491,7 @@ fn search_set_params() {
 
     // Non-default options serialize as a nested object (case skipped when smart).
     let v = to_value(SearchSetParams {
-        buffer_id: 3,
+        view_id: aether_protocol::ViewId(3),
         query: "foo".into(),
         anchor: None,
         extend: false,
@@ -1504,10 +1511,79 @@ fn search_set_params() {
     // `extend` defaults to false and `options` to all-default when omitted on the wire
     // (back-compat with older clients).
     let p: SearchSetParams =
-        from_value(json!({"buffer_id": 3, "query": "foo", "anchor": null})).unwrap();
+        from_value(json!({"view_id": 3, "query": "foo", "anchor": null})).unwrap();
     assert!(!p.extend);
     assert!(p.anchor.is_none());
     assert_eq!(p.options, MatchOptions::default());
+}
+
+/// A search's summary, its painted ranges and its results. The summary and the ranges ride every
+/// window, so what is empty stays off the wire: `folded` at zero, a range's `index` when it is a
+/// symbol highlight's (never current), a result's `crossed` when the landing stayed put.
+#[test]
+fn search_wire_shapes() {
+    use aether_protocol::search::{SearchMatchRange, SearchNavResult, SearchSummary};
+    let summary = SearchSummary {
+        view_id: aether_protocol::ViewId(2),
+        total: 7,
+        truncated: false,
+        current_index: 3,
+        folded: 0,
+    };
+    assert_eq!(
+        to_value(&summary).unwrap(),
+        json!({"view_id": 2, "total": 7, "truncated": false, "current_index": 3})
+    );
+    let folded = SearchSummary {
+        folded: 4,
+        ..summary.clone()
+    };
+    assert_eq!(to_value(&folded).unwrap()["folded"], 4);
+    round_trips(&folded);
+
+    assert_eq!(
+        to_value(SearchMatchRange {
+            start: 1,
+            end: 4,
+            index: 2
+        })
+        .unwrap(),
+        json!({"start": 1, "end": 4, "index": 2})
+    );
+    assert_eq!(
+        to_value(SearchMatchRange {
+            start: 1,
+            end: 4,
+            index: 0
+        })
+        .unwrap(),
+        json!({"start": 1, "end": 4})
+    );
+
+    // Chrome text carries its ranges the way a line does, and only when it has any.
+    let plain = Element::text("cargo test", vec![]);
+    assert!(to_value(&plain).unwrap().get("search_matches").is_none());
+    let marked = Element::Text {
+        text: "cargo test".into(),
+        highlights: vec![],
+        search_matches: vec![SearchMatchRange {
+            start: 0,
+            end: 5,
+            index: 1,
+        }],
+    };
+    assert_eq!(
+        to_value(&marked).unwrap()["search_matches"],
+        json!([{"start": 0, "end": 5, "index": 1}])
+    );
+    round_trips(&marked);
+
+    let nav = SearchNavResult {
+        cursor: Default::default(),
+        summary,
+        crossed: None,
+    };
+    assert!(to_value(&nav).unwrap().get("crossed").is_none());
 }
 
 #[test]
@@ -6906,6 +6982,7 @@ fn sample_window() -> aether_protocol::viewport::Window {
     use aether_protocol::viewport::{Highlight, Segment, Window, WrappedRow};
     Window {
         other_elements_dirty: false,
+        search: None,
         max_line_width: 88,
         git_status: None,
         root: Element::Editor {
@@ -7305,24 +7382,29 @@ fn previously_unpinned_params_round_trip() {
         },
         &["kind"],
     );
-    wire_keys(&SearchClearParams { buffer_id: 1 }, &["buffer_id"]);
+    wire_keys(
+        &SearchClearParams {
+            view_id: aether_protocol::ViewId(1),
+        },
+        &["view_id"],
+    );
     // `search/step` skips its defaults hard: `direction` is absent when Forward and `options` when
     // default, while `extend` is never skipped. Both branches are pinned, so a name can't drift on
     // the side that happens not to be exercised.
     wire_keys(
         &SearchStepParams {
-            buffer_id: 1,
+            view_id: aether_protocol::ViewId(1),
             direction: aether_protocol::cursor::Direction::Forward,
             extend: false,
             count: 2,
             set_query: Some("needle".into()),
             options: MatchOptions::default(),
         },
-        &["buffer_id", "extend", "count", "set_query"],
+        &["view_id", "extend", "count", "set_query"],
     );
     wire_keys(
         &SearchStepParams {
-            buffer_id: 1,
+            view_id: aether_protocol::ViewId(1),
             direction: aether_protocol::cursor::Direction::Backward,
             extend: true,
             count: 1,
@@ -7332,7 +7414,7 @@ fn previously_unpinned_params_round_trip() {
                 ..MatchOptions::default()
             },
         },
-        &["buffer_id", "direction", "extend", "options"],
+        &["view_id", "direction", "extend", "options"],
     );
 }
 
@@ -7353,6 +7435,13 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
     let ts = include_str!("../../../web/src/protocol.ts");
     let window = Window {
         other_elements_dirty: false,
+        search: Some(aether_protocol::search::SearchSummary {
+            view_id: aether_protocol::ViewId(1),
+            total: 1,
+            truncated: false,
+            current_index: 0,
+            folded: 0,
+        }),
         max_line_width: 0,
         // `None` would be skipped, and a field that never serialises cannot be checked.
         git_status: Some(Default::default()),
@@ -7410,6 +7499,7 @@ fn every_subscribe_carries_the_focus_it_resolved() {
     use aether_protocol::viewport::{ViewportFocusElementResult, ViewportSubscribeResult, Window};
     let window = || Window {
         other_elements_dirty: false,
+        search: None,
         max_line_width: 0,
         git_status: None,
         root: aether_protocol::viewport::Element::Editor {

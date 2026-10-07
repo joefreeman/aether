@@ -126,6 +126,9 @@ pub struct Content<'a> {
     /// scales from `ui_font_size` instead; see [`crate::theme::Ui`]). Drives the cell measurement
     /// and glyph size; the cell height is `font_size * LINE_HEIGHT_FACTOR`.
     pub font_size: f32,
+    /// The current search match's place in the count — what a painted range's `index` is compared
+    /// with. `0` when there is none.
+    pub current_match: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -864,7 +867,28 @@ where
                                     );
                                     col += cols;
                                 }
-                                ViewElement::Text { text, highlights } => {
+                                ViewElement::Text {
+                                    text,
+                                    highlights,
+                                    search_matches,
+                                } => {
+                                    for (start, end, fill_color) in chrome_match_fills(
+                                        text,
+                                        search_matches,
+                                        self.content.current_match,
+                                        p,
+                                    ) {
+                                        fill(
+                                            renderer,
+                                            Rectangle {
+                                                x: x_of(col + start),
+                                                y,
+                                                width: (end - start) as f32 * cell.width,
+                                                height: cell.height,
+                                            },
+                                            fill_color,
+                                        );
+                                    }
                                     draw_runs(renderer, text, highlights, x_of, col, y, title_clip);
                                     col += text.chars().count() as u32;
                                 }
@@ -948,7 +972,31 @@ where
                                 col += cols;
                             }
                             // `inline()` yields only leaves, so nothing else can appear here.
-                            ViewElement::Text { text, highlights } => {
+                            ViewElement::Text {
+                                text,
+                                highlights,
+                                search_matches,
+                            } => {
+                                // A search's matches over chrome the view counts as content — a
+                                // run's command — under the text, the current one in the
+                                // selection's fill as when the cursor selects a match in text.
+                                for (start, end, fill_color) in chrome_match_fills(
+                                    text,
+                                    search_matches,
+                                    self.content.current_match,
+                                    p,
+                                ) {
+                                    fill_content(
+                                        renderer,
+                                        Rectangle {
+                                            x: text_x(col + start),
+                                            y,
+                                            width: (end - start) as f32 * cell.width,
+                                            height: cell.height,
+                                        },
+                                        fill_color,
+                                    );
+                                }
                                 draw_runs(
                                     renderer,
                                     text,
@@ -1034,6 +1082,23 @@ where
                                     emphasis_radius(cell.height),
                                 );
                             }
+                        }
+                    }
+                    // The view's search over the removed line: the dim fill, and the current match in
+                    // the selection's — the row holds no cursor, so this is the only mark of it.
+                    for m in &b.search_matches {
+                        let (s, e) = (col_of(m.start as usize), col_of(m.end as usize));
+                        if e > s {
+                            fill_content(
+                                renderer,
+                                Rectangle {
+                                    x: text_x(s),
+                                    y,
+                                    width: (e - s) as f32 * cell.width,
+                                    height: cell.height,
+                                },
+                                match_fill(m, self.content.current_match, p),
+                            );
                         }
                     }
                     // The row's text as segments split at the emphasis boundaries (one run when
@@ -2090,6 +2155,35 @@ fn diagnostic_at(line: &LogicalLineRender, col: u32) -> Option<DiagnosticSeverit
         .filter(|d| d.start <= col && col < d.end.max(d.start + 1))
         .map(|d| d.severity)
         .max_by_key(|s| severity_rank(*s))
+}
+
+/// The fill a search range paints: the selection's for the current match, the dim fill otherwise.
+fn match_fill(
+    m: &aether_protocol::search::SearchMatchRange,
+    current: u32,
+    p: &theme::Palette,
+) -> Color {
+    if m.index != 0 && m.index == current {
+        p.bg_visual
+    } else {
+        p.fill_dim
+    }
+}
+
+/// A chrome text's search ranges as `(start col, end col, fill)`, in columns of `text` — chrome is
+/// one row of plain characters, so a column is a char.
+fn chrome_match_fills(
+    text: &str,
+    matches: &[aether_protocol::search::SearchMatchRange],
+    current: u32,
+    p: &theme::Palette,
+) -> Vec<(u32, u32, Color)> {
+    let col_of = |byte: u32| text[..(byte as usize).min(text.len())].chars().count() as u32;
+    matches
+        .iter()
+        .map(|m| (col_of(m.start), col_of(m.end), match_fill(m, current, p)))
+        .filter(|(s, e, _)| e > s)
+        .collect()
 }
 
 /// Draw a run of editor text with an explicit shaping mode. Code-text runs pass the ligature-driven

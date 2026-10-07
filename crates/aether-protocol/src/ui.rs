@@ -155,6 +155,12 @@ pub enum Element {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         highlights: Vec<Highlight>,
+        /// Where the view's search matches this text, as byte offsets into `text` — painted exactly
+        /// as a line's [`LogicalLineRender::search_matches`] are. Only chrome a view's builder
+        /// counts as content is ever searched (a shell run's command), so this is empty on every
+        /// other piece of text.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        search_matches: Vec<crate::search::SearchMatchRange>,
     },
     /// Something the view offers to **do**, drawn as a button and reachable with `Tab`.
     ///
@@ -353,6 +359,7 @@ impl Element {
         Element::Text {
             text: text.into(),
             highlights,
+            search_matches: Vec::new(),
         }
     }
 

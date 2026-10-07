@@ -5619,7 +5619,15 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
         state.ed().focused_element,
         state.ed().focus,
     );
-    let lit = focused.lit();
+    let lit = Lit {
+        button: focused.lit(),
+        current_match: state
+            .ed()
+            .search
+            .summary
+            .as_ref()
+            .map_or(0, |s| s.current_index),
+    };
     // **Exactly one of these three is Some/true.** `Focused` is one answer, so a frame showing an
     // editor's caret over a filled button — or, worse, showing nothing at all because focus landed
     // on a reply — is not a thing this painter can build.
@@ -5807,7 +5815,14 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
     // used when there's no band.
     let baseline_row =
         |brow: &aether_protocol::viewport::BaselineRow, cols: u16| -> Line<'static> {
-            let mut spans = deleted_virtual_row_spans(&brow.text, cols, brow.stage, &brow.emphasis);
+            let mut spans = deleted_virtual_row_spans(
+                &brow.text,
+                cols,
+                brow.stage,
+                &brow.emphasis,
+                &brow.search_matches,
+                lit.current_match,
+            );
             // Deletion bar in the git gutter column: bright red unstaged, dimmed red staged.
             spans.insert(
                 0,
@@ -6255,6 +6270,21 @@ fn draw_buffer(f: &mut Frame, state: &AppState, area: Rect) {
 /// only styles them and draws the rule that makes a file boundary read as one. No change-bar in
 /// the gutter: chrome belongs to no line of either side, which is the same reason the cursor can't
 /// reach it.
+/// What a frame lights up among the nodes it paints: the button `Tab` has reached, and the current
+/// search match.
+///
+/// `button` is compared **by address**, not by value: two buttons can carry identical fields — a
+/// file offering `Stage` on each of two hunks — so where a node is in the tree is the only thing
+/// that tells them apart. The painter walks the same tree [`aether_client::grid::focus_ring`] did,
+/// so the comparison is sound.
+#[derive(Clone, Copy, Default)]
+struct Lit<'a> {
+    button: Option<&'a Element>,
+    /// The current match's place in the count — what a painted range's `index` is compared with.
+    /// `0` when there is none.
+    current_match: u32,
+}
+
 /// Paint one row of generated presentation: a blank gutter cell, then the row's element tree
 /// across the content width, on whatever shade its band names.
 ///
@@ -6270,7 +6300,7 @@ fn chrome_virtual_row_spans(
     content: &[Element],
     width: u16,
     band: Band,
-    lit: Option<&Element>,
+    lit: Lit<'_>,
 ) -> Vec<Span<'static>> {
     // A presentation row with no band paints none: it still draws, it just sits on whatever the
     // pane filled behind it. Nothing produces one today; the vocabulary allows it, so the painter
@@ -6300,17 +6330,12 @@ fn chrome_virtual_row_spans(
 /// a nested row banded the slack and then its parent banded the same slack again, so a chrome row
 /// came out at twice the width it asked for. Harmless while the row ended at the screen's edge;
 /// inside a box the row ends at a right rail, and an over-long one pushes that rail off the screen.
-/// [`element_spans`], told which button is lit.
-///
-/// `lit` is compared **by address**, not by value: two buttons can carry identical fields — a file
-/// offering `Stage` on each of two hunks — so where a node is in the tree is the only thing that
-/// tells them apart. The painter walks the same tree [`aether_client::grid::focus_ring`] did, so
-/// the comparison is sound.
+/// Paint an [`Element`] into `width` cells, on `bg`, told what this frame lights ([`Lit`]).
 fn element_spans_focused(
     element: &Element,
     width: u16,
     bg: Color,
-    lit: Option<&Element>,
+    lit: Lit<'_>,
 ) -> Vec<Span<'static>> {
     match element {
         Element::Row { children, .. } => children_spans(children, width, bg, lit),
@@ -6325,12 +6350,7 @@ fn element_spans_focused(
 /// Takes the children rather than a row **so that no caller has to build one**: a synthesized
 /// `Element::row(children.to_vec())` clones every node, and a clone has a different address than
 /// the tree the focus ring walked — which is exactly what tells two identical buttons apart.
-fn children_spans(
-    children: &[Element],
-    width: u16,
-    bg: Color,
-    lit: Option<&Element>,
-) -> Vec<Span<'static>> {
+fn children_spans(children: &[Element], width: u16, bg: Color, lit: Lit<'_>) -> Vec<Span<'static>> {
     let banded = |n: usize| Span::styled(" ".repeat(n), Style::default().bg(bg));
 
     // Everything except the fill, measured first, so the fill knows what is left for it. Measured
@@ -6343,12 +6363,25 @@ fn children_spans(
     for child in children {
         match child {
             Element::Space { cols } => out.push(banded(*cols as usize)),
-            Element::Text { text, highlights } => {
+            Element::Text {
+                text,
+                highlights,
+                search_matches,
+            } => {
+                // A search's matches over chrome the view counts as content — a run's command —
+                // and the current one in the selection's fill, as it is when the cursor selects a
+                // match in text.
+                let matches: Vec<(u32, u32)> =
+                    search_matches.iter().map(|m| (m.start, m.end)).collect();
+                let current = search_matches
+                    .iter()
+                    .find(|m| m.index != 0 && m.index == lit.current_match)
+                    .map(|m| (m.start, m.end));
                 let mut text_spans = build_spans(
                     text,
                     highlights,
-                    None,
-                    &[],
+                    current,
+                    &matches,
                     &[],
                     Color::Reset,
                     &[],
@@ -6382,7 +6415,7 @@ fn children_spans(
                 label,
                 enabled,
             } => {
-                let focused = lit.is_some_and(|n| std::ptr::eq(n, child));
+                let focused = lit.button.is_some_and(|n| std::ptr::eq(n, child));
                 use aether_protocol::ui::ActionKind;
                 let fg = match action.kind() {
                     ActionKind::Accept => c(th().git_added),
@@ -6479,6 +6512,8 @@ fn deleted_virtual_row_spans(
     width: u16,
     stage: DiffStage,
     emphasis: &[EmphasisRange],
+    matches: &[SearchMatchRange],
+    current_match: u32,
 ) -> Vec<Span<'static>> {
     let (fg, bg, emph_bg) = if stage == DiffStage::Staged {
         (
@@ -6493,26 +6528,46 @@ fn deleted_virtual_row_spans(
             c(th().git_deleted_emph_bg),
         )
     };
-    let in_emphasis = |byte: usize| {
-        emphasis
+    let within = |r: (u32, u32), byte: usize| (r.0 as usize) <= byte && byte < r.1 as usize;
+    // What fills a byte, strongest first: the current search match (in the selection's fill, as a
+    // match the cursor selects is), any other match, then the change's own emphasis.
+    let fill_at = |byte: usize| -> Fill {
+        if matches
             .iter()
-            .any(|r| (r.start as usize) <= byte && byte < r.end as usize)
+            .any(|m| m.index != 0 && m.index == current_match && within((m.start, m.end), byte))
+        {
+            Fill::Current
+        } else if matches.iter().any(|m| within((m.start, m.end), byte)) {
+            Fill::Match
+        } else if emphasis.iter().any(|r| within((r.start, r.end), byte)) {
+            Fill::Emphasis
+        } else {
+            Fill::Base
+        }
     };
-    // Walk chars (expanding tabs) and group into runs by emphasis, tracking the *original* byte
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fill {
+        Base,
+        Emphasis,
+        Match,
+        Current,
+    }
+    // Walk chars (expanding tabs) and group into runs by fill, tracking the *original* byte
     // position so the ranges keep meaning after expansion.
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut run = String::new();
-    let mut run_emph = false;
+    let mut run_fill = Fill::Base;
     let mut used = 0usize;
-    // Emphasized runs get the vivid fill with the *normal* foreground: the red-on-red of the
-    // base row is too low-contrast on the stronger fill, and the fg switch is itself part of
-    // the signal (matching the web's `.deleted-phantom .diff-emph` rule).
-    let flush = |spans: &mut Vec<Span<'static>>, run: &mut String, emph: bool| {
+    // Every fill but the base takes the *normal* foreground: the red-on-red of the base row is too
+    // low-contrast on a stronger fill, and the fg switch is itself part of the signal (matching the
+    // web's `.deleted-phantom .diff-emph` rule).
+    let flush = |spans: &mut Vec<Span<'static>>, run: &mut String, fill: Fill| {
         if !run.is_empty() {
-            let (fill, ink) = if emph {
-                (emph_bg, c(th().fg))
-            } else {
-                (bg, fg)
+            let (fill, ink) = match fill {
+                Fill::Base => (bg, fg),
+                Fill::Emphasis => (emph_bg, c(th().fg)),
+                Fill::Match => (c(th().fill_dim), c(th().fg)),
+                Fill::Current => (c(th().bg_visual), c(th().fg)),
             };
             spans.push(Span::styled(
                 std::mem::take(run),
@@ -6524,10 +6579,10 @@ fn deleted_virtual_row_spans(
         if used >= width as usize {
             break;
         }
-        let emph = in_emphasis(i);
-        if emph != run_emph {
-            flush(&mut spans, &mut run, run_emph);
-            run_emph = emph;
+        let fill = fill_at(i);
+        if fill != run_fill {
+            flush(&mut spans, &mut run, run_fill);
+            run_fill = fill;
         }
         if ch == '\t' {
             let n = (TAB_WIDTH as usize).min(width as usize - used);
@@ -6538,7 +6593,7 @@ fn deleted_virtual_row_spans(
             used += 1;
         }
     }
-    flush(&mut spans, &mut run, run_emph);
+    flush(&mut spans, &mut run, run_fill);
     // Pad to the content width so the band reaches the right edge (in the base fill).
     if used < width as usize {
         spans.push(Span::styled(
@@ -11254,6 +11309,8 @@ mod tests {
             12,
             DiffStage::Unstaged,
             &[EmphasisRange { start: 4, end: 8 }],
+            &[],
+            0,
         );
         let cells = cells_of(&spans);
         assert_eq!(cells.len(), 12, "padded to the content width");
@@ -11282,6 +11339,8 @@ mod tests {
             10,
             DiffStage::Unstaged,
             &[EmphasisRange { start: 1, end: 2 }],
+            &[],
+            0,
         );
         let cells = cells_of(&spans);
         assert_eq!(cells[0].2, Some(c(th().git_deleted_bg)));
@@ -11921,6 +11980,7 @@ mod painter_tests {
             .collect();
         let chrome = |text: &str| UiElement::chrome(vec![UiElement::text(text, Vec::new())]);
         let window = aether_protocol::viewport::Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
@@ -12047,6 +12107,7 @@ mod painter_tests {
     fn two_files_starting_at_the_same_line_each_keep_their_heading() {
         let chrome = |text: &str| UiElement::chrome(vec![UiElement::text(text, Vec::new())]);
         let window = aether_protocol::viewport::Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
@@ -12104,6 +12165,7 @@ mod painter_tests {
         let chrome = |text: &str| UiElement::chrome(vec![UiElement::text(text, Vec::new())]);
         // Both files show lines 10 and 11 — the collision that made one cursor into two.
         let window = aether_protocol::viewport::Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
@@ -12183,6 +12245,7 @@ mod painter_tests {
         let a: Vec<LogicalLineRender> = (16..20).map(|n| line(n, &format!("a{n}"))).collect();
         let b: Vec<LogicalLineRender> = (0..3).map(|n| line(n, &format!("b{n}"))).collect();
         let window = aether_protocol::viewport::Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,

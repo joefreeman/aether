@@ -879,7 +879,7 @@ async fn search_set_from_selection_echoes_literal() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: String::new(),
             anchor: None,
             extend: false,
@@ -909,7 +909,7 @@ async fn search_set_from_selection_echoes_literal() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: String::new(),
             anchor: None,
             extend: false,
@@ -931,7 +931,7 @@ async fn search_nav_count_and_revive() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 2,
             set_query: Some("x".into()),
@@ -951,7 +951,7 @@ async fn search_nav_count_and_revive() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: Some("zzz".into()),
@@ -6589,56 +6589,6 @@ async fn every_motion_stays_inside_the_focused_element() {
     drop(server);
 }
 
-/// `/` is scoped like a motion: it matches the focused element's text, so `n` cannot step the cursor
-/// onto a line the view doesn't show — and the count in the status bar is a count of what's there.
-#[tokio::test]
-async fn search_matches_only_the_focused_element() {
-    let dir = tempfile::tempdir().unwrap();
-    let (server, mut ws, buffer_id, extent, _vp) = hunk_view(dir.path()).await;
-
-    // `fn ` is on all forty lines of the file, and on every line of the hunk.
-    let set: SearchSetResult = send_request::<SearchSet>(
-        &mut ws,
-        &SearchSetParams {
-            buffer_id,
-            query: "fn ".into(),
-            options: Default::default(),
-            anchor: None,
-            extend: false,
-            from_selection: false,
-        },
-    )
-    .await;
-    assert_eq!(
-        set.summary.total,
-        extent.len() as u32,
-        "the hunk's lines are the matches; the file's other thirty are not in view"
-    );
-
-    // Stepping can't leave the element either — thirty `n` presses over a handful of matches.
-    for _ in 0..30 {
-        let nav: SearchNavResult = send_request::<aether_protocol::search::SearchStep>(
-            &mut ws,
-            &aether_protocol::search::SearchStepParams {
-                buffer_id,
-                direction: Direction::Forward,
-                extend: false,
-                count: 1,
-                set_query: None,
-                options: Default::default(),
-            },
-        )
-        .await;
-        assert!(
-            extent.contains(&nav.cursor.position.line),
-            "`n` stepped outside the hunk: {:?}",
-            nav.cursor.position
-        );
-    }
-
-    drop(server);
-}
-
 /// `s` labels words in the focused element only.
 ///
 /// Sneak scopes its candidates to the range the *client* says is on screen — which is the right
@@ -6703,135 +6653,6 @@ async fn sneak_labels_only_the_focused_element() {
     assert!(
         extent.contains(&jumped.position.line) && extent.contains(&jumped.anchor.line),
         "the jump left the element: {jumped:?}"
-    );
-
-    drop(server);
-}
-
-/// Moving focus re-runs the active search where the cursor now is.
-///
-/// Two hunks of one file are two elements over one buffer, and a search is stored per
-/// `(client, buffer)` — so without this the matches of the hunk you left stay live, and `n` steps
-/// the cursor back into it. Focus is the one thing that changes a scoped search's answer without
-/// touching a character of text.
-#[tokio::test]
-async fn moving_focus_rescopes_the_active_search() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().canonicalize().unwrap();
-    let repo = init_repo_at(&root);
-    let mut lines: Vec<String> = (0..40).map(|n| format!("fn line{n}() {{}}")).collect();
-    commit_file(&repo, "a.rs", &format!("{}\n", lines.join("\n")));
-    // Two changes far enough apart to be two hunks of the same file.
-    lines[5] = "fn FIRST() {}".into();
-    lines[30] = "fn SECOND() {}".into();
-    std::fs::write(root.join("a.rs"), format!("{}\n", lines.join("\n"))).unwrap();
-
-    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
-    let opened: ViewOpenResult = show_buffer(
-        &mut ws,
-        &GitShowParams {
-            repo_id: Some(root.to_string_lossy().into_owned()),
-            buffer_id: None,
-            target: ShowTarget::WorkingChanges,
-            focus_path: None,
-            record_nav_from: None,
-        },
-    )
-    .await;
-    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
-        &mut ws,
-        &ViewportSubscribeParams {
-            view_id: opened.view_id,
-            cols: 120,
-            rows: 80,
-            overscan_rows: 0,
-            scroll: ScrollPosition {
-                element: 0,
-                line: 0,
-                sub_row: 0.0,
-            },
-            focus: None,
-            wrap: WrapMode::None,
-            continuation_marker_width: 0,
-            tab_width: 4,
-            diff_view: false,
-        },
-    )
-    .await;
-    // Line extents, so from the lines — `rows` is a height in visual rows (phantoms included) —
-    // of the whole view, since a subscribe loads only the element it opens on.
-    let whole = whole_view(&mut ws, sub.viewport_id, sub.window).await;
-    let extents: Vec<std::ops::Range<u32>> = whole
-        .root
-        .editors()
-        .iter()
-        .filter_map(|n| match n {
-            aether_protocol::viewport::Element::Editor { lines, .. } if !lines.is_empty() => {
-                Some(lines[0].logical_line..lines[lines.len() - 1].logical_line + 1)
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(extents.len(), 2, "two hunks, two elements: {extents:?}");
-
-    async fn focus(
-        ws: &mut Ws,
-        viewport_id: aether_protocol::ViewportId,
-        element: u32,
-    ) -> aether_protocol::viewport::ViewportFocusElementResult {
-        send_request::<aether_protocol::viewport::ViewportFocusElement>(
-            ws,
-            &aether_protocol::viewport::ViewportFocusElementParams {
-                viewport_id,
-                target: aether_protocol::viewport::FocusTarget::Element { element },
-            },
-        )
-        .await
-    }
-
-    let first = focus(&mut ws, sub.viewport_id, 0).await;
-    let buffer_id = first.buffer.buffer_id;
-    let set: SearchSetResult = send_request::<SearchSet>(
-        &mut ws,
-        &SearchSetParams {
-            buffer_id,
-            query: "fn ".into(),
-            options: Default::default(),
-            anchor: None,
-            extend: false,
-            from_selection: false,
-        },
-    )
-    .await;
-    assert_eq!(set.summary.total, extents[0].len() as u32);
-
-    // `Tab` to the second hunk — same buffer, different element.
-    let second = focus(&mut ws, sub.viewport_id, 1).await;
-    assert_eq!(
-        second.buffer.buffer_id, buffer_id,
-        "both hunks window the same file"
-    );
-    let nav: SearchNavResult = send_request::<aether_protocol::search::SearchStep>(
-        &mut ws,
-        &aether_protocol::search::SearchStepParams {
-            buffer_id,
-            direction: Direction::Forward,
-            extend: false,
-            count: 1,
-            set_query: None,
-            options: Default::default(),
-        },
-    )
-    .await;
-    assert_eq!(
-        nav.summary.total,
-        extents[1].len() as u32,
-        "the search re-ran in the element focus moved to"
-    );
-    assert!(
-        extents[1].contains(&nav.cursor.position.line),
-        "`n` stepped into the hunk we left: {:?}",
-        nav.cursor.position
     );
 
     drop(server);

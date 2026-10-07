@@ -20,6 +20,33 @@ use aether_protocol::picker::PickerKind;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// A search's total as a count shows it: `"47"`, `"10000+"` past the server's cap, and the matches
+/// folded away inside elements counted apart — `"47 · 3 folded"` — since `n` does not visit them
+/// and nothing of them is on screen but their box's title.
+pub fn search_total(s: &aether_protocol::search::SearchSummary) -> String {
+    let total = if s.truncated {
+        format!("{}+", s.total)
+    } else {
+        s.total.to_string()
+    };
+    match s.folded {
+        0 => total,
+        folded => format!("{total} · {folded} folded"),
+    }
+}
+
+/// The search prompt's count: `"3/47"` on a match, the bare total off one, `"no matches"` — or,
+/// when every match is folded away, just how many are (`"3 folded"`), which is not the same as
+/// none.
+pub fn search_count(s: &aether_protocol::search::SearchSummary) -> String {
+    match (s.total, s.folded, s.current_index) {
+        (0, 0, _) => "no matches".to_string(),
+        (0, folded, _) => format!("{folded} folded"),
+        (_, _, 0) => search_total(s),
+        (_, _, current) => format!("{current}/{}", search_total(s)),
+    }
+}
+
 /// Cap on disambiguation passes. Real workspaces never need more than a couple, but the loop has
 /// to terminate when two paths are literally identical (which `add_root` refuses, but defensive
 /// belt-and-braces is cheap).

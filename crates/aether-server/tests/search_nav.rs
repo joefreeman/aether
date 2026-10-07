@@ -12,9 +12,12 @@ async fn search_set_returns_summary_and_jumps_to_first_match() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 0 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -37,7 +40,7 @@ async fn search_set_honours_match_options() {
         let r: SearchSetResult = send_request::<SearchSet>(
             ws,
             &SearchSetParams {
-                buffer_id,
+                view_id: view_of(buffer_id),
                 query: q.into(),
                 anchor: None,
                 extend: false,
@@ -112,9 +115,12 @@ async fn search_set_extend_grows_selection_from_anchor_through_match() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 4 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 4 },
+            }),
             extend: true,
             from_selection: false,
             options: Default::default(),
@@ -137,9 +143,12 @@ async fn search_set_extend_resets_to_match_on_wrap() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 1, col: 4 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 1, col: 4 },
+            }),
             extend: true,
             from_selection: false,
             options: Default::default(),
@@ -159,7 +168,7 @@ async fn search_smartcase_lowercase_is_case_insensitive() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
             anchor: None,
             extend: false,
@@ -179,7 +188,7 @@ async fn search_smartcase_uppercase_is_case_sensitive() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "Foo".into(),
             anchor: None,
             extend: false,
@@ -200,7 +209,7 @@ async fn search_regex_metacharacters() {
     let lit: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: r"\d+".into(),
             anchor: None,
             extend: false,
@@ -213,7 +222,7 @@ async fn search_regex_metacharacters() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: r"\d+".into(),
             anchor: None,
             extend: false,
@@ -236,7 +245,7 @@ async fn search_no_matches_returns_zero_summary() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "zzz".into(),
             anchor: None,
             extend: false,
@@ -258,7 +267,7 @@ async fn search_empty_query_clears_active_search() {
     let _: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "alpha".into(),
             anchor: None,
             extend: false,
@@ -270,7 +279,7 @@ async fn search_empty_query_clears_active_search() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: String::new(),
             anchor: None,
             extend: false,
@@ -290,9 +299,12 @@ async fn search_next_cycles_forward_and_wraps() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 0 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -303,7 +315,7 @@ async fn search_next_cycles_forward_and_wraps() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -317,7 +329,7 @@ async fn search_next_cycles_forward_and_wraps() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -331,7 +343,7 @@ async fn search_next_cycles_forward_and_wraps() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -350,9 +362,12 @@ async fn search_prev_cycles_backward_with_wrap() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 0 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -364,7 +379,7 @@ async fn search_prev_cycles_backward_with_wrap() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Backward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -384,9 +399,12 @@ async fn search_prev_orients_backward() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 8 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 8 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -399,7 +417,7 @@ async fn search_prev_orients_backward() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Backward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -421,9 +439,12 @@ async fn search_next_wrap_stays_forward_oriented() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 1, col: 0 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 1, col: 0 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -437,7 +458,7 @@ async fn search_next_wrap_stays_forward_oriented() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -459,9 +480,12 @@ async fn search_prev_wrap_stays_backward_oriented() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 0 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -475,7 +499,7 @@ async fn search_prev_wrap_stays_backward_oriented() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Backward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -500,9 +524,12 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 8 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 8 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -514,7 +541,7 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Backward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -530,7 +557,7 @@ async fn search_backward_oriented_then_extend_forward_grows_over_both() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: true,
             count: 1,
             set_query: None,
@@ -553,9 +580,12 @@ async fn search_extend_resets_to_single_match_on_wrap() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 4 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 4 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -567,7 +597,7 @@ async fn search_extend_resets_to_single_match_on_wrap() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: true,
             count: 1,
             set_query: None,
@@ -579,7 +609,7 @@ async fn search_extend_resets_to_single_match_on_wrap() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: true,
             count: 1,
             set_query: None,
@@ -595,7 +625,7 @@ async fn search_extend_resets_to_single_match_on_wrap() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: true,
             count: 1,
             set_query: None,
@@ -619,9 +649,12 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 0 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -633,7 +666,7 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -647,7 +680,7 @@ async fn search_reverse_off_a_match_steps_to_adjacent_not_current() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Backward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -668,9 +701,12 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 0 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -682,7 +718,7 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: true,
             count: 1,
             set_query: None,
@@ -695,7 +731,7 @@ async fn search_plain_next_steps_off_multi_match_extend_selection() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -717,9 +753,12 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 0 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 0 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -732,7 +771,7 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: true,
             count: 1,
             set_query: None,
@@ -751,7 +790,7 @@ async fn search_next_extend_keeps_anchor_and_grows_selection() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: true,
             count: 1,
             set_query: None,
@@ -772,9 +811,12 @@ async fn search_prev_extend_keeps_anchor_and_grows_backward() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 1, col: 0 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 1, col: 0 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -789,7 +831,7 @@ async fn search_prev_extend_keeps_anchor_and_grows_backward() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Backward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: true,
             count: 1,
             set_query: None,
@@ -812,9 +854,12 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
-            anchor: Some(LogicalPosition { line: 0, col: 8 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 0, col: 8 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
@@ -827,7 +872,7 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Backward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: true,
             count: 1,
             set_query: None,
@@ -844,7 +889,7 @@ async fn search_extend_reversing_direction_grows_instead_of_shrinking() {
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: true,
             count: 1,
             set_query: None,
@@ -864,7 +909,7 @@ async fn search_clear_removes_active_search() {
     let _ = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "foo".into(),
             anchor: None,
             extend: false,
@@ -873,13 +918,19 @@ async fn search_clear_removes_active_search() {
         },
     )
     .await;
-    let _: () = send_request::<SearchClear>(&mut ws, &SearchClearParams { buffer_id }).await;
+    let _: () = send_request::<SearchClear>(
+        &mut ws,
+        &SearchClearParams {
+            view_id: view_of(buffer_id),
+        },
+    )
+    .await;
     // After clear, n/prev should report no matches.
     let r: SearchNavResult = send_request::<SearchStep>(
         &mut ws,
         &SearchStepParams {
             direction: Direction::Forward,
-            buffer_id,
+            view_id: view_of(buffer_id),
             extend: false,
             count: 1,
             set_query: None,
@@ -1437,5 +1488,548 @@ async fn the_handed_over_trail_is_a_copy() {
         Some(a1),
         "stepping in one window did not move the other's trail"
     );
+    drop(server);
+}
+
+// ---- search over a view -------------------------------------------------------------------------
+
+/// A repo whose working tree differs from what was committed, its working-changes view open,
+/// subscribed with the inline diff `diff_view`, and the whole of it loaded.
+async fn working_changes(
+    dir: &std::path::Path,
+    committed: &[(&str, &str)],
+    working: &[(&str, &str)],
+    diff_view: bool,
+) -> (
+    aether_server::ServerHandle,
+    Ws,
+    ViewId,
+    ViewportSubscribeResult,
+) {
+    let root = dir.canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    for (name, text) in committed {
+        commit_file(&repo, name, text);
+    }
+    for (name, text) in working {
+        std::fs::write(root.join(name), text).unwrap();
+    }
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let opened: ViewOpenResult = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    let mut sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: opened.view_id,
+            cols: 120,
+            rows: 200,
+            overscan_rows: 0,
+            scroll: ScrollPosition {
+                element: 0,
+                line: 0,
+                sub_row: 0.0,
+            },
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view,
+        },
+    )
+    .await;
+    sub.window = whole_view(&mut ws, sub.viewport_id, sub.window).await;
+    (server, ws, opened.view_id, sub)
+}
+
+async fn search(
+    ws: &mut Ws,
+    view_id: ViewId,
+    query: &str,
+    anchor: Option<SearchAnchor>,
+) -> SearchSetResult {
+    send_request::<SearchSet>(
+        ws,
+        &SearchSetParams {
+            view_id,
+            query: query.into(),
+            anchor,
+            extend: false,
+            from_selection: false,
+            options: Default::default(),
+        },
+    )
+    .await
+}
+
+async fn step(ws: &mut Ws, view_id: ViewId, direction: Direction, extend: bool) -> SearchNavResult {
+    send_request::<SearchStep>(
+        ws,
+        &SearchStepParams {
+            view_id,
+            direction,
+            extend,
+            count: 1,
+            set_query: None,
+            options: Default::default(),
+        },
+    )
+    .await
+}
+
+/// Every rendered line as `(element, buffer line, text, search ranges)`, in view order.
+fn rendered_lines(
+    window: &aether_protocol::viewport::Window,
+) -> Vec<(
+    u32,
+    u32,
+    String,
+    Vec<aether_protocol::search::SearchMatchRange>,
+)> {
+    window
+        .root
+        .editors()
+        .iter()
+        .filter_map(|n| match n {
+            Element::Editor { element, lines, .. } => Some((*element, lines)),
+            _ => None,
+        })
+        .flat_map(|(element, lines)| {
+            lines.iter().map(move |l| {
+                let text: String = l
+                    .visual_rows
+                    .iter()
+                    .flat_map(|r| r.segments.iter())
+                    .map(|s| s.text.as_str())
+                    .collect();
+                (element, l.logical_line, text, l.search_matches.clone())
+            })
+        })
+        .collect()
+}
+
+/// Files by name, with their text.
+type Files = Vec<(&'static str, String)>;
+
+/// Three hunks over two files: `fn FIRST`/`fn SECOND` far apart in `a.rs`, `fn THIRD` in `b.rs`.
+fn three_changes() -> (Files, Files) {
+    let file = |marks: &[(usize, &str)]| {
+        let mut lines: Vec<String> = (0..40).map(|n| format!("fn line{n}() {{}}")).collect();
+        for (at, name) in marks {
+            lines[*at] = format!("fn {name}() {{}}");
+        }
+        format!("{}\n", lines.join("\n"))
+    };
+    (
+        vec![("a.rs", file(&[])), ("b.rs", file(&[]))],
+        vec![
+            ("a.rs", file(&[(5, "FIRST"), (30, "SECOND")])),
+            ("b.rs", file(&[(12, "THIRD")])),
+        ],
+    )
+}
+
+/// `/` searches every element of the view, not the one holding the cursor, and the count is a count
+/// of what the view shows: the hunks' lines, and none of the files' other lines.
+///
+/// `n` walks every match once in view order — crossing from hunk to hunk and file to file the way
+/// `j` does — and wraps at the end of the view.
+#[tokio::test]
+async fn search_covers_the_whole_view_and_n_crosses_its_elements() {
+    let dir = tempfile::tempdir().unwrap();
+    let (committed, working) = three_changes();
+    let c: Vec<(&str, &str)> = committed.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let w: Vec<(&str, &str)> = working.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let (server, mut ws, view, sub) = working_changes(dir.path(), &c, &w, false).await;
+
+    let lines = rendered_lines(&sub.window);
+    let with_fn: Vec<(u32, u32)> = lines
+        .iter()
+        .filter(|(_, _, text, _)| text.contains("fn "))
+        .map(|(e, l, _, _)| (*e, *l))
+        .collect();
+    let elements: std::collections::BTreeSet<u32> = with_fn.iter().map(|(e, _)| *e).collect();
+    assert!(
+        elements.len() >= 3,
+        "three hunks, three elements: {elements:?}"
+    );
+    assert!(
+        with_fn.len() < 80,
+        "the hunks are a fraction of the two files"
+    );
+
+    let set = search(&mut ws, view, "fn ", None).await;
+    assert_eq!(
+        set.summary.total,
+        with_fn.len() as u32,
+        "every hunk's lines are matches, and nothing outside them is"
+    );
+
+    // Step once per match: each is visited exactly once, in view order, across every element.
+    let mut focused = sub.focus.element;
+    let mut visited = Vec::new();
+    let mut crossings = 0;
+    for _ in 0..with_fn.len() {
+        let nav = step(&mut ws, view, Direction::Forward, false).await;
+        if let Some(crossed) = &nav.crossed {
+            assert_eq!(
+                crossed.buffer.cursor, nav.cursor,
+                "the rebind carries the landing"
+            );
+            focused = crossed.element;
+            crossings += 1;
+        }
+        visited.push((
+            (focused, nav.cursor.position.line),
+            nav.summary.current_index,
+        ));
+    }
+    assert!(crossings >= elements.len() - 1, "{crossings} crossings");
+    let mut indices: Vec<u32> = visited.iter().map(|(_, i)| *i).collect();
+    indices.sort_unstable();
+    assert_eq!(
+        indices,
+        (1..=with_fn.len() as u32).collect::<Vec<_>>(),
+        "every match once: {visited:?}"
+    );
+    let mut places: Vec<(u32, u32)> = visited.iter().map(|(p, _)| *p).collect();
+    places.sort_unstable();
+    assert_eq!(places, with_fn, "and each one is where the view shows it");
+    // In view order: the indices climb by one, wrapping once from the last match to the first.
+    for pair in visited.windows(2) {
+        let (a, b) = (pair[0].1, pair[1].1);
+        assert!(
+            b == a + 1 || (a == with_fn.len() as u32 && b == 1),
+            "{visited:?}"
+        );
+    }
+
+    drop(server);
+}
+
+/// An incremental search anchors where the prompt opened — a position in a named element — and
+/// lands on the first match at-or-after it in view order, moving focus there.
+#[tokio::test]
+async fn an_anchored_search_lands_at_or_after_its_element() {
+    let dir = tempfile::tempdir().unwrap();
+    let (committed, working) = three_changes();
+    let c: Vec<(&str, &str)> = committed.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let w: Vec<(&str, &str)> = working.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let (server, mut ws, view, sub) = working_changes(dir.path(), &c, &w, false).await;
+    let lines = rendered_lines(&sub.window);
+    let (last_element, first_line) = lines
+        .iter()
+        .filter(|(_, _, t, _)| t.contains("fn "))
+        .map(|(e, l, _, _)| (*e, *l))
+        .max_by_key(|(e, _)| *e)
+        .map(|(e, _)| {
+            let first = lines
+                .iter()
+                .filter(|(el, _, t, _)| *el == e && t.contains("fn "))
+                .map(|(_, l, _, _)| *l)
+                .min()
+                .unwrap();
+            (e, first)
+        })
+        .unwrap();
+    assert_ne!(sub.focus.element, last_element, "the anchor is elsewhere");
+
+    let set = search(
+        &mut ws,
+        view,
+        "fn ",
+        Some(SearchAnchor {
+            element: last_element,
+            position: LogicalPosition {
+                line: first_line,
+                col: 0,
+            },
+        }),
+    )
+    .await;
+    let crossed = set.crossed.expect("landing in another element moves focus");
+    assert_eq!(crossed.element, last_element);
+    assert_eq!(set.cursor.position.line, first_line);
+    assert_eq!(
+        set.cursor.anchor,
+        LogicalPosition {
+            line: first_line,
+            col: 0
+        },
+        "the match is selected"
+    );
+    assert_eq!(
+        set.summary.current_index,
+        set.summary.total
+            - lines
+                .iter()
+                .filter(|(e, _, t, _)| *e == last_element && t.contains("fn "))
+                .count() as u32
+            + 1,
+        "the first match of the last element"
+    );
+    drop(server);
+}
+
+/// `Shift-n` grows the selection inside its element, and at the element's last match it does
+/// nothing: the next match is in another element, and a selection lives in one buffer. Stopping
+/// keeps the selection; carrying on would have to throw it away.
+#[tokio::test]
+async fn extending_stops_at_the_edge_of_its_element() {
+    let dir = tempfile::tempdir().unwrap();
+    let (committed, working) = three_changes();
+    let c: Vec<(&str, &str)> = committed.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let w: Vec<(&str, &str)> = working.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let (server, mut ws, view, sub) = working_changes(dir.path(), &c, &w, false).await;
+    search(&mut ws, view, "fn ", None).await;
+    let start = sub.focus.buffer.cursor.anchor;
+
+    let mut last = None;
+    for _ in 0..40 {
+        let nav = step(&mut ws, view, Direction::Forward, true).await;
+        assert!(
+            nav.crossed.is_none(),
+            "an extending step never leaves its element"
+        );
+        assert_eq!(nav.cursor.anchor, start, "the anchor holds");
+        if last == Some(nav.cursor) {
+            break;
+        }
+        last = Some(nav.cursor);
+    }
+    let stopped = last.expect("it stepped");
+    assert!(
+        stopped.position.line > start.line,
+        "it grew before it stopped: {stopped:?}"
+    );
+    // A plain step from there goes on into the next element.
+    let on = step(&mut ws, view, Direction::Forward, false).await;
+    assert!(on.crossed.is_some(), "the next match is in another element");
+    drop(server);
+}
+
+/// `?` lands on text in the element it was pressed in, for the same reason: a match past it
+/// leaves the cursor where the prompt opened.
+#[tokio::test]
+async fn select_to_match_stays_in_its_element() {
+    let dir = tempfile::tempdir().unwrap();
+    let (committed, working) = three_changes();
+    let c: Vec<(&str, &str)> = committed.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let w: Vec<(&str, &str)> = working.iter().map(|(n, t)| (*n, t.as_str())).collect();
+    let (server, mut ws, view, sub) = working_changes(dir.path(), &c, &w, false).await;
+    let at = sub.focus.buffer.cursor.position;
+    let anchor = SearchAnchor {
+        element: sub.focus.element,
+        position: at,
+    };
+    // `THIRD` is only in `b.rs`, which the focused hunk of `a.rs` is not.
+    let set: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        &SearchSetParams {
+            view_id: view,
+            query: "THIRD".into(),
+            anchor: Some(anchor),
+            extend: true,
+            from_selection: false,
+            options: Default::default(),
+        },
+    )
+    .await;
+    assert_eq!(set.summary.total, 1, "it is found");
+    assert!(set.crossed.is_none());
+    assert_eq!(
+        (set.cursor.position, set.cursor.anchor),
+        (at, sub.focus.buffer.cursor.anchor),
+        "and the cursor stays where `?` was pressed"
+    );
+    drop(server);
+}
+
+/// A removed line the inline diff draws is searched while it is drawn: counted and painted with the
+/// diff on, and `n` stops on it — seating the cursor on the line it sits above, since a removed line
+/// holds no cursor. With the diff off it is not on screen and not counted.
+///
+/// The current match is the search's own: moving the cursor off clears it.
+#[tokio::test]
+async fn removed_lines_are_searched_while_the_diff_draws_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let committed = "fn keep() {}\nfn OLDNAME() {}\nfn tail() {}\n";
+    let working = "fn keep() {}\nfn NEWNAME() {}\nfn tail() {}\n";
+    let (server, mut ws, view, sub) = working_changes(
+        dir.path(),
+        &[("a.rs", committed)],
+        &[("a.rs", working)],
+        false,
+    )
+    .await;
+
+    let set = search(&mut ws, view, "OLDNAME", None).await;
+    assert_eq!(
+        set.summary.total, 0,
+        "the diff is off, so the removed line is not on screen"
+    );
+
+    // The diff toggle re-renders, and the count rides the window it answers with.
+    let on: ViewportWindowResult = send_request::<GitSetDiffView>(
+        &mut ws,
+        &GitSetDiffViewParams {
+            viewport_id: sub.viewport_id,
+            enabled: true,
+        },
+    )
+    .await;
+    assert_eq!(on.window.search.as_ref().map(|s| s.total), Some(1));
+
+    let nav = step(&mut ws, view, Direction::Forward, false).await;
+    assert_eq!(nav.summary.current_index, 1);
+    assert_eq!(
+        (nav.cursor.position, nav.cursor.anchor),
+        (
+            LogicalPosition { line: 1, col: 0 },
+            LogicalPosition { line: 1, col: 0 }
+        ),
+        "seated on the line the removed one sits above, with nothing selected"
+    );
+
+    // Painted on the removed row, as the current match.
+    let window = whole_view(&mut ws, sub.viewport_id, on.window).await;
+    let rows: Vec<_> = window
+        .root
+        .lines()
+        .iter()
+        .flat_map(|l| l.baseline_above.iter())
+        .filter(|r| r.text.contains("OLDNAME"))
+        .map(|r| r.search_matches.clone())
+        .collect();
+    assert_eq!(
+        rows,
+        vec![vec![aether_protocol::search::SearchMatchRange {
+            start: 3,
+            end: 10,
+            index: 1
+        }]]
+    );
+
+    // Moving off it clears the current match — the one change that re-renders nothing, so it is
+    // pushed.
+    let buffer = nav
+        .crossed
+        .as_ref()
+        .map_or(sub.focus.buffer.buffer_id, |c| c.buffer.buffer_id);
+    let _ = move_cursor(
+        &mut ws,
+        &CursorMoveParams {
+            buffer_id: buffer,
+            motion: Motion::Char {
+                direction: Direction::Forward,
+                count: 1,
+            },
+            extend_selection: false,
+        },
+    )
+    .await;
+    let pushed = expect_notification_or_backlog::<SearchStateChanged>(&mut ws).await;
+    assert_eq!(pushed.current_index, 0);
+
+    // `n` from the line below steps back onto the removed row, which comes before its line.
+    let back = step(&mut ws, view, Direction::Backward, false).await;
+    assert_eq!(back.summary.current_index, 1);
+    drop(server);
+}
+
+/// An ordinary file's own inline diff: its removed lines come from the file's diff against its
+/// baseline rather than from a patch, and are searched the same way.
+#[tokio::test]
+async fn a_files_own_diff_is_searched_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn keep() {}\nfn OLDNAME() {}\n");
+    std::fs::write(root.join("a.rs"), "fn keep() {}\nfn NEWNAME() {}\n").unwrap();
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let buffer = open_test_buffer(&mut ws, "a.rs").await;
+    let view = view_of(buffer);
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: view,
+            cols: 120,
+            rows: 50,
+            overscan_rows: 0,
+            scroll: ScrollPosition::default(),
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: true,
+        },
+    )
+    .await;
+    // The baseline attaches asynchronously; wait for the file's diff before searching it.
+    let mut total = 0;
+    for _ in 0..100 {
+        total = search(&mut ws, view, "OLDNAME", None).await.summary.total;
+        if total == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(total, 1);
+    let nav = step(&mut ws, view, Direction::Forward, false).await;
+    assert_eq!(nav.cursor.position, LogicalPosition { line: 1, col: 0 });
+    let _ = sub;
+    drop(server);
+}
+
+/// What changes a search's count mostly changes the view too, and the count rides the re-render: an
+/// edit that adds a match reports the new total on the window it pushes.
+#[tokio::test]
+async fn the_count_rides_the_window_an_edit_pushes() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("foo\n").await;
+    let view = view_of(buffer_id);
+    let _sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+        &mut ws,
+        &ViewportSubscribeParams {
+            view_id: view,
+            cols: 80,
+            rows: 24,
+            overscan_rows: 0,
+            scroll: ScrollPosition::default(),
+            focus: None,
+            wrap: WrapMode::None,
+            continuation_marker_width: 0,
+            tab_width: 4,
+            diff_view: false,
+        },
+    )
+    .await;
+    assert_eq!(search(&mut ws, view, "foo", None).await.summary.total, 1);
+    let _: EditResult = send_request::<InputText>(
+        &mut ws,
+        &InputTextParams {
+            buffer_id,
+            text: "foo ".into(),
+            select_pasted: false,
+            at: None,
+            replace_selection: false,
+        },
+    )
+    .await;
+    // The set's own repaint can arrive after its reply; the edit's is the one at a later revision.
+    let edited = loop {
+        let p = expect_notification_or_backlog::<ViewportLinesChanged>(&mut ws).await;
+        if p.revision > 0 {
+            break p;
+        }
+    };
+    assert_eq!(edited.window.search.map(|s| s.total), Some(2));
     drop(server);
 }

@@ -1000,6 +1000,34 @@ pub fn focus_of(ring: &[Stop<'_>], i: usize) -> Option<Focus> {
     })
 }
 
+/// The row the search's current match (`index`, its place in the count) is drawn on, when that row
+/// holds no cursor: a removed line the inline diff draws, or chrome the view counts as content (a
+/// shell run's command). `None` for a match in text — its row is the cursor's, which selects it —
+/// and while the row is not loaded.
+pub fn search_match_row(root: &Element, measured: &Measured, index: u32) -> Option<VisualRow> {
+    if index == 0 {
+        return None;
+    }
+    let current = |ranges: &[aether_protocol::search::SearchMatchRange]| {
+        ranges.iter().any(|m| m.index == index)
+    };
+    painted_rows_of(root, measured)
+        .into_iter()
+        .find_map(|(at, row)| {
+            match row {
+            PaintedRow::Baseline { row, .. } if current(&row.search_matches) => Some(at.row),
+            PaintedRow::Chrome(chrome)
+                if chrome.inline().iter().any(|n| {
+                    matches!(n, Element::Text { search_matches, .. } if current(search_matches))
+                }) =>
+            {
+                Some(at.row)
+            }
+            _ => None,
+        }
+        })
+}
+
 /// The visual row a focus-ring stop is drawn on.
 ///
 /// **Not the cursor's row.** A button lives in chrome — a box's title row, the question above a
@@ -2023,6 +2051,7 @@ mod tests {
     fn window(first_logical: u32, first_row: u32, lines: Vec<LogicalLineRender>) -> Window {
         let loaded: u32 = lines.iter().map(line_rows).sum();
         Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
@@ -2222,6 +2251,7 @@ mod tests {
     #[test]
     fn phantom_rows_count_but_hold_no_cursor() {
         let deleted = |text: &str| BaselineRow {
+            search_matches: vec![],
             text: text.into(),
             stage: Default::default(),
             emphasis: vec![],
@@ -2786,6 +2816,41 @@ mod tests {
         Element::chrome(vec![Element::text(text, Vec::new())])
     }
 
+    /// A current match on a row with no cursor — a removed line, a command — is found on the row it
+    /// is drawn on; one in text is the cursor's business, and an index nothing carries is nowhere.
+    #[test]
+    fn the_current_match_is_found_on_the_row_with_no_cursor() {
+        use aether_protocol::search::SearchMatchRange;
+        let range = |index| SearchMatchRange {
+            start: 0,
+            end: 3,
+            index,
+        };
+        let command = Element::chrome(vec![Element::Text {
+            text: "cargo test".into(),
+            highlights: vec![],
+            search_matches: vec![range(1)],
+        }]);
+        let mut changed = line(4, vec![row(0, 0, "new")]);
+        changed.baseline_above = vec![aether_protocol::viewport::BaselineRow {
+            text: "old".into(),
+            stage: Default::default(),
+            emphasis: vec![],
+            search_matches: vec![range(2)],
+        }];
+        changed.search_matches = vec![range(3)];
+        let root = Element::column(vec![command, editor(0, 0, 2, vec![changed])]);
+        let measured = Measured::default();
+        assert_eq!(search_match_row(&root, &measured, 1), Some(VisualRow(0)));
+        assert_eq!(search_match_row(&root, &measured, 2), Some(VisualRow(1)));
+        assert_eq!(
+            search_match_row(&root, &measured, 3),
+            None,
+            "text: the cursor's row"
+        );
+        assert_eq!(search_match_row(&root, &measured, 0), None);
+    }
+
     // ---- the shared corpus ------------------------------------------------------------------
 
     /// One painted row, reduced to what **both** walks can produce — the common denominator the
@@ -3113,6 +3178,7 @@ mod tests {
     fn every_kind_of_row_lands_where_the_shells_must_draw_it() {
         let mut l16 = line(16, vec![row(0, 0, "a"), row(1, 0, "wrapped")]);
         l16.baseline_above = vec![BaselineRow {
+            search_matches: vec![],
             text: "was".into(),
             stage: Default::default(),
             emphasis: vec![],
@@ -3879,6 +3945,7 @@ mod prose_tests {
     /// shell drew. Lines inside one block share that block's offset.
     fn measured_reader() -> (Window, Measured) {
         let window = Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
@@ -3955,6 +4022,7 @@ mod prose_tests {
 
         // The editor of the same file, at the same resolution: line 3 is its fourth wire row.
         let editor = Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,

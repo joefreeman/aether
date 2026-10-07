@@ -988,16 +988,8 @@ pub fn search_counter_label(state: &AppState) -> Option<String> {
     Some(format!(
         "{}/{}",
         summary.current_index,
-        format_total(summary)
+        aether_client::labels::search_total(summary)
     ))
-}
-
-fn format_total(s: &SearchSummary) -> String {
-    if s.truncated {
-        format!("{}+", s.total)
-    } else {
-        s.total.to_string()
-    }
 }
 
 /// `Some("(3/12)")` when the server reports the cursor is currently on an entry of the captured
@@ -1017,15 +1009,7 @@ pub fn search_match_count_label(state: &AppState) -> Option<String> {
         return None;
     }
     let summary = ed.search.summary.as_ref()?;
-    if summary.total == 0 {
-        return Some(String::from("no matches"));
-    }
-    let total = format_total(summary);
-    Some(if summary.current_index == 0 {
-        total
-    } else {
-        format!("{}/{total}", summary.current_index)
-    })
+    Some(aether_client::labels::search_count(summary))
 }
 
 // The selection/clipboard Ctrl shortcuts no longer branch on mode here: each mode binds its own

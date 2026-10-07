@@ -288,6 +288,11 @@ pub struct BaselineRow {
     /// changes and pure deletions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emphasis: Vec<EmphasisRange>,
+    /// Where the view's search matches this removed line, painted as a line's are. A removed line
+    /// holds no cursor, but it is on screen, so it is searched: `n` stops on it and seats the
+    /// cursor on the line it sits above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub search_matches: Vec<SearchMatchRange>,
 }
 
 /// The **content** of one row a logical line wrapped into: where it starts in the line, how far it
@@ -356,6 +361,16 @@ pub struct Window {
     /// either.
     #[serde(default)]
     pub other_elements_dirty: bool,
+    /// The client's search over this view as of this render, when one is active.
+    ///
+    /// On the window because what changes a search's answer mostly changes the view too — a run
+    /// prints, an agent appends a block, staging rebuilds a patch, an edit lands — and every one of
+    /// those reaches the client as a re-render. Riding that, the count is current by construction
+    /// rather than by each of those paths remembering to say so. The step and set results carry it
+    /// as well, and [`crate::search::SearchStateChanged`] covers the changes that re-render
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<crate::search::SearchSummary>,
     /// What the view is composed of. A single [`Element::Editor`] for an ordinary buffer; chrome
     /// and hunks interleaved for a generated patch. Use [`Element::lines`] where the structure is
     /// irrelevant and every rendered line is what's wanted.
@@ -618,7 +633,7 @@ pub struct ViewSeat {
     pub buffer_id: crate::BufferId,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewportFocusElementResult {
     /// Where focus ended up — unchanged at the ends, which is what makes repeated presses stop
     /// rather than wrap.

@@ -120,8 +120,8 @@ use aether_protocol::picker::{
     PickerViewParams, PickerViewResult, ScopedPath, MIN_GREP_QUERY_LEN,
 };
 use aether_protocol::search::{
-    SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
-    SearchStateChanged, SearchStep, SearchStepParams, SearchSummary,
+    SearchAnchor, SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams,
+    SearchSetResult, SearchStateChanged, SearchStep, SearchStepParams, SearchSummary,
 };
 use aether_protocol::settings::{
     AppSettings, MarkdownWidth, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
@@ -1227,25 +1227,27 @@ impl Session {
             Event::PromptCancel => self.decline_prompt(),
 
             Event::SearchApplied(Ok(r)) => {
-                self.view.buffer.cursor = r.cursor;
                 let zero = r.summary.total == 0;
+                let index = r.summary.current_index;
                 self.view.search.summary = Some(r.summary);
+                let fx = self.adopt_search_landing(index, r.cursor, r.crossed);
                 if zero {
                     // A failed keystroke shouldn't strand the user wherever the previous
                     // query had jumped them.
-                    self.revert_to_snapshot_cursor()
+                    fx.and(self.revert_to_snapshot_cursor())
                 } else {
-                    Effects::one(Effect::RevealCursor(RevealStyle::Jump))
+                    fx.and(Effects::one(Effect::RevealCursor(RevealStyle::Jump)))
                 }
             }
             Event::SearchApplied(Err(_)) => {
                 // Most commonly an invalid regex mid-type (e.g. a trailing `\`): treat as a
                 // transient zero-match state.
                 self.view.search.summary = Some(SearchSummary {
-                    buffer_id: self.view.buffer.buffer_id,
+                    view_id: self.view.view_id,
                     total: 0,
                     truncated: false,
                     current_index: 0,
+                    folded: 0,
                 });
                 // Re-fires on every keystroke of an in-progress bad pattern; grouped so the shells
                 // refresh one toast in place rather than stacking one per key.
@@ -1260,8 +1262,10 @@ impl Session {
             Event::SearchRestored(Err(e)) => Effects::error_detail("Search failed", e),
 
             Event::SearchNav(Ok(r)) => {
+                let index = r.summary.current_index;
                 self.view.search.summary = Some(r.summary);
-                self.jump_to_cursor(r.cursor)
+                let fx = self.adopt_search_landing(index, r.cursor, r.crossed);
+                fx.and(Effects::one(Effect::RevealCursor(RevealStyle::Jump)))
             }
             Event::SearchNav(Err(e)) => Effects::error_detail("Search failed", e),
 
@@ -2995,7 +2999,7 @@ impl Session {
                 if same_file && self.view.search.active && !self.view.search.query.is_empty() {
                     fx = fx.and(self.request::<SearchSet>(
                         SearchSetParams {
-                            buffer_id,
+                            view_id: self.view.view_id,
                             query: self.view.search.query.clone(),
                             anchor: None,
                             extend: false,
@@ -4163,6 +4167,7 @@ impl Session {
     /// this is, and a reader's parse asks for its fence highlights.
     pub fn adopt_subscribe(&mut self, res: ViewportSubscribeResult) -> Effects {
         self.view.viewport_id = Some(res.viewport_id);
+        self.adopt_search_summary(res.window.search.clone());
         self.view.window = Some(res.window);
         // The server decides which element holds the cursor (from the scroll the subscribe named,
         // today), so the mirror starts from its answer — whichever element that is, including
@@ -4205,6 +4210,7 @@ impl Session {
     /// two agreeing without a focus field on every push.
     fn replace_window(&mut self, window: aether_protocol::viewport::Window) {
         let on_input = self.shell_input_focused();
+        self.adopt_search_summary(window.search.clone());
         self.view.window = Some(window);
         if on_input {
             if let Some(input) = self.shell_input() {
@@ -7659,11 +7665,7 @@ impl Session {
             SearchStateChanged::NAME => {
                 // Matches recomputed (buffer edit) or the cursor crossed a match boundary.
                 if let Ok(s) = serde_json::from_value::<SearchSummary>(n.params) {
-                    if s.buffer_id == self.view.buffer.buffer_id
-                        && (self.view.search.active || self.view.mode == Mode::Search)
-                    {
-                        self.view.search.summary = Some(s);
-                    }
+                    self.adopt_search_summary(Some(s));
                 }
                 Effects::none()
             }
@@ -7867,6 +7869,8 @@ impl Session {
     /// taken *before* the reset, so Esc still restores a committed search exactly as it was.
     pub fn enter_search(&mut self, extend_to_cursor: bool) -> Effects {
         self.view.search.snapshot = Some(SearchSnapshot {
+            element: self.view.focused_element,
+            buffer_id: self.view.buffer.buffer_id,
             cursor: self.view.buffer.cursor,
             query: std::mem::take(&mut self.view.search.query),
             active: self.view.search.active,
@@ -7883,7 +7887,7 @@ impl Session {
         let mut fx = Effects::one(Effect::SaveScrollAnchor);
         fx = fx.and(self.request::<SearchClear>(
             SearchClearParams {
-                buffer_id: self.view.buffer.buffer_id,
+                view_id: self.view.view_id,
             },
             move |__r| {
                 let _ = __r;
@@ -7896,11 +7900,11 @@ impl Session {
     /// One incremental step: hand the server the latest query; it jumps the cursor to the
     /// first match at-or-after the prompt's entry point. An emptied query clears instead.
     fn incremental_search(&mut self) -> Effects {
-        let buffer_id = self.view.buffer.buffer_id;
+        let view_id = self.view.view_id;
         if self.view.search.query.is_empty() {
             self.view.search.summary = None;
 
-            let fx = self.request::<SearchClear>(SearchClearParams { buffer_id }, move |__r| {
+            let fx = self.request::<SearchClear>(SearchClearParams { view_id }, move |__r| {
                 let _ = __r;
                 Event::Noop
             });
@@ -7910,14 +7914,14 @@ impl Session {
 
         self.request::<SearchSet>(
             SearchSetParams {
-                buffer_id,
+                view_id,
                 query: self.view.search.query.clone(),
-                anchor: self
-                    .view
-                    .search
-                    .snapshot
-                    .as_ref()
-                    .map(|s| min_pos(s.cursor.position, s.cursor.anchor)),
+                // Where the prompt opened — which may no longer be the focused element once a
+                // keystroke has landed in another.
+                anchor: self.view.search.snapshot.as_ref().map(|s| SearchAnchor {
+                    element: s.element,
+                    position: min_pos(s.cursor.position, s.cursor.anchor),
+                }),
                 extend: self.view.search.extend_to_cursor,
                 from_selection: false,
                 options: self.view.search.options,
@@ -7932,21 +7936,73 @@ impl Session {
         let Some(snap) = self.view.search.snapshot.as_ref() else {
             return Effects::none();
         };
-        if self.view.buffer.cursor.position == snap.cursor.position
+        if self.view.focused_element == snap.element
+            && self.view.buffer.cursor.position == snap.cursor.position
             && self.view.buffer.cursor.anchor == snap.cursor.anchor
         {
             return Effects::none();
         }
+        let (element, buffer_id, cursor) = (snap.element, snap.buffer_id, snap.cursor);
+        self.restore_cursor_in(element, buffer_id, cursor)
+    }
 
-        self.request::<CursorSet>(
-            CursorSetParams {
-                buffer_id: self.view.buffer.buffer_id,
-                position: snap.cursor.position,
-                anchor: snap.cursor.anchor,
-                granularity: Granularity::Char,
-            },
-            move |__r| Event::CursorMsg(__r.map_err(|e| e.message)),
-        )
+    /// Put focus back on `element` and the cursor back where it was in it — how a search returns
+    /// to where its prompt opened. Focus first, as a click does: the requests are ordered, so the
+    /// server has moved focus by the time the cursor lands, and a no-op when focus never left.
+    fn restore_cursor_in(
+        &mut self,
+        element: aether_protocol::viewport::FieldId,
+        buffer_id: BufferId,
+        cursor: CursorState,
+    ) -> Effects {
+        self.focus_clicked_element(element)
+            .and(self.request::<CursorSet>(
+                CursorSetParams {
+                    buffer_id,
+                    position: cursor.position,
+                    anchor: cursor.anchor,
+                    granularity: Granularity::Char,
+                },
+                move |__r| Event::CursorMsg(__r.map_err(|e| e.message)),
+            ))
+    }
+
+    /// Land where a search put the cursor: in the same element, a plain cursor; in another, the
+    /// rebind a line motion walking out of its element takes. The landing is recorded so the reveal
+    /// that follows shows the match it landed on (`index`), which may be a row the cursor is beside.
+    fn adopt_search_landing(
+        &mut self,
+        index: u32,
+        cursor: CursorState,
+        crossed: Option<ViewportFocusElementResult>,
+    ) -> Effects {
+        self.view.search.landing = Some((index, cursor));
+        match crossed {
+            Some(crossed) => {
+                let (_moved, fx) = self.adopt_focus(crossed);
+                self.view.buffer.cursor = cursor;
+                fx
+            }
+            None => {
+                self.view.buffer.cursor = cursor;
+                Effects::none()
+            }
+        }
+    }
+
+    /// Adopt a search summary from any of the routes it arrives by — a window, a result, a push —
+    /// when it is about this view and a search is in play here.
+    fn adopt_search_summary(&mut self, summary: Option<SearchSummary>) {
+        if !(self.view.search.active || self.view.mode == Mode::Search) {
+            return;
+        }
+        if summary
+            .as_ref()
+            .is_some_and(|s| s.view_id != self.view.view_id)
+        {
+            return;
+        }
+        self.view.search.summary = summary;
     }
 
     // ---- pointer (mouse) -----------------------------------------------------------------
@@ -8072,11 +8128,11 @@ impl Session {
         let Some(snap) = self.view.search.snapshot.take() else {
             return Effects::none();
         };
-        let buffer_id = self.view.buffer.buffer_id;
+        let view_id = self.view.view_id;
         let mut fx = if snap.active && !snap.query.is_empty() {
             self.request::<SearchSet>(
                 SearchSetParams {
-                    buffer_id,
+                    view_id,
                     query: snap.query.clone(),
                     anchor: None,
                     extend: false,
@@ -8088,7 +8144,7 @@ impl Session {
         } else {
             self.view.search.summary = None;
 
-            self.request::<SearchClear>(SearchClearParams { buffer_id }, move |__r| {
+            self.request::<SearchClear>(SearchClearParams { view_id }, move |__r| {
                 let _ = __r;
                 Event::Noop
             })
@@ -8097,15 +8153,7 @@ impl Session {
         self.view.search.active = snap.active;
         self.view.search.options = snap.options;
 
-        fx = fx.and(self.request::<CursorSet>(
-            CursorSetParams {
-                buffer_id,
-                position: snap.cursor.position,
-                anchor: snap.cursor.anchor,
-                granularity: Granularity::Char,
-            },
-            move |__r| Event::CursorMsg(__r.map_err(|e| e.message)),
-        ));
+        fx = fx.and(self.restore_cursor_in(snap.element, snap.buffer_id, snap.cursor));
         fx.push(Effect::RestoreScrollAnchor);
         fx
     }
@@ -8167,7 +8215,7 @@ impl Session {
         // step when it has no matches), then steps `count` times.
         self.request_str::<SearchStep>(
             SearchStepParams {
-                buffer_id: self.view.buffer.buffer_id,
+                view_id: self.view.view_id,
                 direction,
                 extend,
                 count,
@@ -8183,7 +8231,7 @@ impl Session {
     pub fn search_from_selection(&mut self) -> Effects {
         self.request_str::<SearchSet>(
             SearchSetParams {
-                buffer_id: self.view.buffer.buffer_id,
+                view_id: self.view.view_id,
                 query: String::new(),
                 anchor: None,
                 extend: false,
@@ -8212,7 +8260,7 @@ impl Session {
 
         self.request::<SearchClear>(
             SearchClearParams {
-                buffer_id: self.view.buffer.buffer_id,
+                view_id: self.view.view_id,
             },
             move |__r| {
                 let _ = __r;
@@ -12963,6 +13011,7 @@ mod tests {
     fn prose_window(text: &str) -> aether_protocol::viewport::Window {
         use aether_protocol::viewport::Window;
         Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
@@ -12978,6 +13027,7 @@ mod tests {
     /// loaded — enough to be recognised as not the reader.
     fn editor_window(buffer: BufferId) -> aether_protocol::viewport::Window {
         aether_protocol::viewport::Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,

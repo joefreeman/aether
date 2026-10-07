@@ -1408,3 +1408,62 @@ describe("breathing room", () => {
     expect((spacer.querySelector(".buffer-content") as HTMLElement).style.top).toBe("0px");
   });
 });
+
+// ---- search ------------------------------------------------------------------------------------
+
+describe("search matches", () => {
+  /** The text of each search-filled span on a row with no cursor, and whether it is current. */
+  function hits(window: BufferWindow, currentMatch: number): string[] {
+    const container = document.createElement("div");
+    renderBuffer(container, {
+      window,
+      cursor,
+      insertMode: false,
+      awaitingKey: false,
+      contentWidthPx: 0,
+      spacerHeightPx: 0,
+      padPx: 0,
+      rowHeightPx: 0,
+      measured: WHOLE_ROWS,
+      blame: null,
+      diffView: true,
+      focusedElement: 0,
+      currentMatch,
+    });
+    const filled = ".patch-chrome .search-hit, .patch-chrome .sel, .deleted-phantom .search-hit, .deleted-phantom .sel";
+    return [...container.querySelectorAll(filled)].map(
+      (el) => `${el.classList.contains("sel") ? "current" : "hit"} ${el.textContent}`,
+    );
+  }
+
+  // A run's command (chrome the view counts as content) over a line with a removed line above it.
+  const changed = line(0, "new needle");
+  changed.baseline_above = [{ text: "old needle", search_matches: [{ start: 4, end: 10, index: 2 }] }];
+  const window = windowOf({
+    node: "column",
+    children: [
+      {
+        node: "row",
+        band: "chrome",
+        children: [
+          {
+            node: "text",
+            text: "grep needle",
+            highlights: [],
+            search_matches: [{ start: 5, end: 11, index: 1 }],
+          },
+        ],
+      },
+      editor(0, 0, [changed]),
+    ],
+  });
+
+  it("paints matches on a command and a removed line, which hold no cursor", () => {
+    expect(hits(window, 0)).toEqual(["hit needle", "hit needle"]);
+  });
+
+  it("paints the current one in the selection's fill — the only mark it has", () => {
+    expect(hits(window, 1)).toEqual(["current needle", "hit needle"]);
+    expect(hits(window, 2)).toEqual(["hit needle", "current needle"]);
+  });
+});

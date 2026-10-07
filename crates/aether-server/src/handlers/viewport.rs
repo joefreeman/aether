@@ -404,8 +404,8 @@ pub async fn viewport_focus_element(
     // An element just moved to has no remembered position inside it, so the cursor takes its first
     // line — unless it is already inside this one. See [`seat_cursor_in_element`].
     let cursor = seat_cursor_in_element(&mut s, client_id, buffer_id, start_line)?;
-    // An active search is the focused element's, so moving focus re-runs it where the cursor now is.
-    let pushes = rescope_search(&mut s, client_id, buffer_id);
+    // The current match follows the cursor, which focus just moved.
+    let update = collect_cursor_search_update(&mut s, client_id, buffer_id);
 
     let result = aether_protocol::viewport::ViewportFocusElementResult {
         element: focused,
@@ -413,7 +413,7 @@ pub async fn viewport_focus_element(
         buffer_status: buffer_status_for(&mut s, client_id, buffer_id),
     };
     drop(s);
-    for (sender, notif) in pushes {
+    if let Some((sender, notif)) = update {
         let _ = sender.send(notif).await;
     }
     Ok(result)
@@ -1190,15 +1190,14 @@ pub async fn viewport_navigate_change(
     };
     // Landed like any motion: recorded for motion undo, the virtual column and tree-selection
     // history dropped — what `c` over one file always did, so the two paths cannot drift.
-    let (cursor, _) = commit_move(&mut s, client_id, buffer_id, current, cursor, None);
-    let pushes = rescope_search(&mut s, client_id, buffer_id);
+    let (cursor, update) = commit_move(&mut s, client_id, buffer_id, current, cursor, None);
     let result = aether_protocol::viewport::ViewportFocusElementResult {
         element,
         buffer: crate::handlers::describe_buffer(&s, buffer_id, cursor)?,
         buffer_status: buffer_status_for(&mut s, client_id, buffer_id),
     };
     drop(s);
-    for (sender, notif) in pushes {
+    if let Some((sender, notif)) = update {
         let _ = sender.send(notif).await;
     }
     Ok(result)
@@ -1573,7 +1572,7 @@ pub fn recompute_diff_hunks_if_viewed(s: &mut ServerState, buffer_id: BufferId) 
 /// staged and an unstaged layer would stack at one anchor (a region modified, staged, then
 /// modified again), only the unstaged rows are kept — what's shown deleted is exactly what a
 /// revert would restore, and HEAD's text resurfaces once the top layer is staged or reverted.
-fn deleted_rows_by_anchor(
+pub fn deleted_rows_by_anchor(
     hunks: &[crate::git::DiffHunk],
     line_count: u32,
     intraline: Option<&IntralineEmphasis>,
@@ -1596,6 +1595,7 @@ fn deleted_rows_by_anchor(
                     .and_then(|m| m.rows.get(&(hunk_idx, row_idx)))
                     .cloned()
                     .unwrap_or_default(),
+                search_matches: Vec::new(),
             }
         }));
     }
@@ -1614,7 +1614,7 @@ fn deleted_rows_by_anchor(
 /// pairs that can appear in the window — the phantom rows all sit at the hunk's anchor, the new
 /// side on `anchor + i` — so cost scales with what's on screen, not with the diff.
 #[derive(Default)]
-struct IntralineEmphasis {
+pub struct IntralineEmphasis {
     /// Old-side ranges, keyed by (index into the hunk slice, index into that hunk's `deleted`).
     rows: HashMap<(usize, usize), Vec<EmphasisRange>>,
     /// New-side ranges, keyed by buffer line.
@@ -2217,11 +2217,11 @@ fn slice_from(
     first..last_excl
 }
 
-/// Everything that decorates a rendered window beyond the text itself: search highlights, the
-/// inline-diff state, diagnostics squiggles, and the buffer's git status. Bundled because every
-/// `render_window` caller assembles the same set from `ServerState`.
+/// Everything that decorates a rendered window beyond the text itself: the inline-diff state,
+/// diagnostics squiggles, and the buffer's git status. Bundled because every `render_window` caller
+/// assembles the same set from `ServerState`. Search matches are the *view's*, not the buffer's, and
+/// arrive separately ([`ElementMatches`]).
 struct WindowDecorations<'a> {
-    search: Option<&'a SearchEntry>,
     sneak: Option<&'a SneakEntry>,
     diff_view: bool,
     hunks: &'a [crate::git::DiffHunk],
@@ -2256,7 +2256,6 @@ fn window_decorations(
     sneak: SneakLabels,
 ) -> WindowDecorations<'_> {
     WindowDecorations {
-        search: render_matches(s, client_id, buffer_id),
         sneak: match sneak {
             SneakLabels::Shown => s.sneaks.get(&(client_id, buffer_id)),
             SneakLabels::Hidden => None,
@@ -2266,6 +2265,106 @@ fn window_decorations(
         conflicts: buffer_conflicts(s, buffer_id),
         diagnostics: buffer_diagnostics(s, buffer_id),
     }
+}
+
+/// What a render paints as matches over one element: the view's search when the client has one —
+/// the matches the viewport shows, each with its index in the count — else the occurrences of the
+/// symbol under the cursor in the element's buffer. A search always wins, which is what enforces
+/// "symbol highlights only when no search is active".
+#[derive(Clone, Copy)]
+enum ElementMatches<'a> {
+    Search(&'a [(u32, crate::view_search::ViewMatch)]),
+    Symbols(&'a [(LogicalPosition, LogicalPosition)]),
+    None,
+}
+
+/// A match's footprint on one line, before the line's length is known: where it starts (0 when it
+/// began on an earlier line), where it ends (`None` when it runs on past the line), and its index.
+type LineSpan = (u32, Option<u32>, u32);
+
+impl ElementMatches<'_> {
+    /// Bucket the matches by the lines `first..last_excl` they touch — text by buffer line, removed
+    /// lines by `(line, row)` — so painting a line costs its own matches, not every match's.
+    #[allow(clippy::type_complexity)]
+    fn by_line(
+        &self,
+        first: u32,
+        last_excl: u32,
+    ) -> (
+        HashMap<u32, Vec<LineSpan>>,
+        HashMap<(u32, u32), Vec<SearchMatchRange>>,
+    ) {
+        use crate::view_search::MatchAt;
+        let mut text: HashMap<u32, Vec<LineSpan>> = HashMap::new();
+        let mut phantoms: HashMap<(u32, u32), Vec<SearchMatchRange>> = HashMap::new();
+        let mut spread = |start: LogicalPosition, end: LogicalPosition, index: u32| {
+            for line in start.line.max(first)..=end.line.min(last_excl.saturating_sub(1)) {
+                let from = if line == start.line { start.col } else { 0 };
+                let to = (line == end.line).then_some(end.col);
+                text.entry(line).or_default().push((from, to, index));
+            }
+        };
+        match self {
+            ElementMatches::Search(matches) => {
+                for (index, m) in matches.iter() {
+                    match m.at {
+                        MatchAt::Text { start, end } => spread(start, end, *index),
+                        MatchAt::Phantom {
+                            line,
+                            row,
+                            start,
+                            end,
+                        } if (first..last_excl).contains(&line) => phantoms
+                            .entry((line, row))
+                            .or_default()
+                            .push(SearchMatchRange {
+                                start,
+                                end,
+                                index: *index,
+                            }),
+                        MatchAt::Phantom { .. } | MatchAt::Chrome { .. } => {}
+                    }
+                }
+            }
+            ElementMatches::Symbols(ranges) => {
+                for (start, end) in ranges.iter() {
+                    spread(*start, *end, 0);
+                }
+            }
+            ElementMatches::None => {}
+        }
+        (text, phantoms)
+    }
+
+    /// The ranges over the chrome above the element, by the text they fall in.
+    fn chrome(&self) -> HashMap<u32, Vec<SearchMatchRange>> {
+        let mut out: HashMap<u32, Vec<SearchMatchRange>> = HashMap::new();
+        if let ElementMatches::Search(matches) = self {
+            for (index, m) in matches.iter() {
+                if let crate::view_search::MatchAt::Chrome { node, start, end } = m.at {
+                    out.entry(node).or_default().push(SearchMatchRange {
+                        start,
+                        end,
+                        index: *index,
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Clip a line's match spans to the line's length.
+fn spans_on_line(spans: Option<&Vec<LineSpan>>, line_len: u32) -> Vec<SearchMatchRange> {
+    spans
+        .into_iter()
+        .flatten()
+        .filter_map(|&(from, to, index)| {
+            let start = from.min(line_len);
+            let end = to.unwrap_or(line_len).min(line_len);
+            (start < end).then_some(SearchMatchRange { start, end, index })
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)] // the view's geometry, spelled out
@@ -2285,6 +2384,7 @@ fn render_element_lines(
     geom: wrap::WrapGeometry,
     diff_view: bool,
     sneak_labels: SneakLabels,
+    matches: ElementMatches<'_>,
 ) -> Vec<LogicalLineRender> {
     let buffer_id = binding.buffer_id;
     let buf = s.doc_of(buffer_id);
@@ -2295,7 +2395,6 @@ fn render_element_lines(
         tab_width,
     } = geom;
     let WindowDecorations {
-        search,
         sneak,
         diff_view,
         hunks,
@@ -2350,6 +2449,7 @@ fn render_element_lines(
     // Generated read-only content (a commit's patch) instead of a parse tree — see
     // [`crate::patch::GeneratedPatch`]. Both are never present at once.
     let generated = buf.patch().map(|g| &g.decorations);
+    let (match_spans, phantom_matches) = matches.by_line(first, last_excl);
 
     let mut lines: Vec<LogicalLineRender> =
         Vec::with_capacity(last_excl.saturating_sub(first) as usize);
@@ -2384,9 +2484,7 @@ fn render_element_lines(
 
         let mut render =
             wrap::render_line(&text, i, cols, wrap, marker_width, tab_width, highlights);
-        if let Some(entry) = search {
-            render.search_matches = matches_on_line(entry, i, text.len() as u32);
-        }
+        render.search_matches = spans_on_line(match_spans.get(&i), text.len() as u32);
         if let Some(entry) = sneak {
             render.sneak_targets = sneak_targets_on_line(entry, i, text.len() as u32);
         }
@@ -2394,6 +2492,11 @@ fn render_element_lines(
         // into the tree below, as siblings of the hunks it separates.
         if let Some(rows) = baseline_rows.get(&i) {
             render.baseline_above = rows.clone();
+            for (row_idx, row) in render.baseline_above.iter_mut().enumerate() {
+                if let Some(ranges) = phantom_matches.get(&(i, row_idx as u32)) {
+                    row.search_matches = ranges.clone();
+                }
+            }
         }
         // The line's change-state. A match rather than the sequence of writes this used to be:
         // the three cases are mutually exclusive by construction (a conflicted file's blocks are
@@ -2519,6 +2622,30 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
         .map(|binding| element_geometry(s, binding, geom, diff_view, reading))
         .collect();
 
+    // The client's search over the view, as this viewport shows it: each element's shown matches
+    // with their place in the count, and how many each folded element is hiding.
+    let search = s.searches.get(&(client_id, vp.view_id));
+    let mut shown: Vec<Vec<(u32, crate::view_search::ViewMatch)>> =
+        vec![Vec::new(); elements.len()];
+    let mut folded: Vec<u32> = vec![0; elements.len()];
+    if let Some(search) = search {
+        let view = s.view_of(vp);
+        let mut index = 0;
+        for m in &search.matches {
+            let Some(slot) = shown.get_mut(m.element as usize) else {
+                continue;
+            };
+            match crate::view_search::seen(m, view, Some(vp)) {
+                crate::view_search::Seen::Shown => {
+                    index += 1;
+                    slot.push((index, *m));
+                }
+                crate::view_search::Seen::Folded => folded[m.element as usize] += 1,
+                crate::view_search::Seen::Hidden => {}
+            }
+        }
+    }
+
     // Render each element's loaded slice, if it has one. An element with nothing loaded contributes
     // no lines — but still reports its height, which is what lets a client place the ones that
     // are. A loaded slice is clipped to the lines the element has *now*: a slice comes from an
@@ -2541,6 +2668,13 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
             .and_then(|slice| layout.clip(element, slice));
         let (geom, phantom_rows) = &geometry[idx];
         let geom = *geom;
+        let matches = match search {
+            Some(_) => ElementMatches::Search(&shown[idx]),
+            None => s
+                .symbol_highlights
+                .get(&(client_id, binding.buffer_id))
+                .map_or(ElementMatches::None, |r| ElementMatches::Symbols(r)),
+        };
         // Prose ships its parse and nothing else: rendering its lines as well would wrap, highlight
         // and diff text no shell will ever paint, on every frame of a conversation. An element is
         // prose by construction (an agent's reply) or because this client reads the file.
@@ -2561,6 +2695,7 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
                         geom,
                         diff_view,
                         sneak_labels,
+                        matches,
                     ),
                 ),
                 None => (ElementRow::ZERO, range.start(), Vec::new()),
@@ -2586,7 +2721,15 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
             chrome_above: if collapsed {
                 Default::default()
             } else {
-                binding.chrome_above.clone()
+                let ranges = matches.chrome();
+                if ranges.is_empty() {
+                    binding.chrome_above.clone()
+                } else {
+                    std::sync::Arc::new(crate::view_search::mark_chrome(
+                        &binding.chrome_above,
+                        &ranges,
+                    ))
+                }
             },
             chrome_before: binding.chrome_before.clone(),
             first_buffer_line,
@@ -2623,6 +2766,24 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
                 });
                 title.push(Element::Space { cols: 1 });
                 title.extend(binding.title.iter().cloned());
+                // Folded, a box's matches are nowhere on screen and `n` passes them by; its title
+                // is the one row left to say they are in there.
+                if collapsed && folded[idx] > 0 {
+                    let count = folded_match_count(folded[idx]);
+                    let at = title
+                        .iter()
+                        .position(|n| matches!(n, Element::Fill { .. }))
+                        .unwrap_or(title.len());
+                    let highlights = vec![aether_protocol::viewport::Highlight {
+                        start: 0,
+                        end: count.len() as u32,
+                        kind: SEARCH_COUNT.into(),
+                    }];
+                    title.splice(
+                        at..at,
+                        [Element::Space { cols: 2 }, Element::text(count, highlights)],
+                    );
+                }
                 std::sync::Arc::new(title)
             } else {
                 binding.title.clone()
@@ -2643,6 +2804,8 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
     };
 
     Window {
+        search: search
+            .map(|search| crate::view_search::summary(search, vp.view_id, s.view_of(vp), Some(vp))),
         max_line_width,
         // The status bar's git cluster is about the *focused* element's buffer: it sits beside a
         // label naming the focused file, so reading it off element 0 put a different file's change
@@ -2897,43 +3060,16 @@ fn compose_tree(rendered: Vec<RenderedElement>, trailing_chrome: &[Element]) -> 
     Element::column(children)
 }
 
-/// The match set to paint for `(client, buffer)`: the active search if there is one, else the LSP
-/// document-highlight set (the symbol under the cursor). Both render through `matches_on_line` with
-/// the identical fill, and a real search always wins — which is exactly what enforces "symbol
-/// highlights only when no search is active". Used by every *view-change* render path (subscribe,
-/// scroll, resize, wrap, diff-view, and the cursor-settle refresh); the post-mutation broadcast
-/// paths keep reading `searches` directly, since a mutation clears the symbol set anyway.
-pub fn render_matches(
-    s: &ServerState,
-    client_id: ClientId,
-    buffer_id: BufferId,
-) -> Option<&SearchEntry> {
-    s.searches
-        .get(&(client_id, buffer_id))
-        .or_else(|| s.symbol_highlights.get(&(client_id, buffer_id)))
-}
+/// The capture a folded box's match count wears on its title.
+const SEARCH_COUNT: &str = "search.count";
 
-/// Per-line byte ranges from `entry.matches` clipped to `[0, line_len)` for `line_idx`. Matches
-/// that span multiple lines contribute one range per line they touch.
-fn matches_on_line(entry: &SearchEntry, line_idx: u32, line_len: u32) -> Vec<SearchMatchRange> {
-    let mut out = Vec::new();
-    for (start, end_excl) in &entry.matches {
-        if line_idx < start.line || line_idx > end_excl.line {
-            continue;
-        }
-        let s = if line_idx == start.line { start.col } else { 0 };
-        let e = if line_idx == end_excl.line {
-            end_excl.col
-        } else {
-            line_len
-        };
-        let s = s.min(line_len);
-        let e = e.min(line_len);
-        if s < e {
-            out.push(SearchMatchRange { start: s, end: e });
-        }
+/// How a folded box's title counts the matches inside it.
+fn folded_match_count(n: u32) -> String {
+    if n == 1 {
+        "1 match".to_string()
+    } else {
+        format!("{n} matches")
     }
-    out
 }
 
 /// Sneak word-jump targets on `line_idx` as byte ranges (clamped to the line), each carrying its
@@ -3521,6 +3657,7 @@ mod slice_tests {
             box_group: None,
             title: Default::default(),
             band: aether_protocol::ui::Band::None,
+            chrome_searched: false,
         };
         ViewLayout::of(std::slice::from_ref(&binding), |_| doc.line_count()).element_range(0)
     }
@@ -3641,6 +3778,7 @@ mod tests {
                         box_group: None,
                         title: Default::default(),
                         band: aether_protocol::ui::Band::None,
+                        chrome_searched: false,
                     })
                     .collect(),
             },
@@ -3667,6 +3805,167 @@ mod tests {
     /// The elements of the view `vp` presents, to set a test's shape up.
     fn elements_mut<'a>(s: &'a mut ServerState, vp: &Viewport) -> &'a mut Vec<ElementBinding> {
         &mut s.views.get_mut(&vp.view_id).expect("installed").elements
+    }
+
+    /// Install `query` as `vp`'s client's search over its view, the way `search/set` would.
+    fn install_search(s: &mut ServerState, vp: &Viewport, query: &str) {
+        let regex = crate::picker::build_match_regex(query, &Default::default()).unwrap();
+        let (matches, truncated) = crate::view_search::find(s, s.view(vp.view_id), &regex);
+        s.searches.insert(
+            (vp.client_id, vp.view_id),
+            crate::view_search::ViewSearch {
+                query: query.into(),
+                options: Default::default(),
+                matches,
+                truncated,
+                current: None,
+                last_pushed_index: 0,
+            },
+        );
+    }
+
+    /// Every piece of text in a run of nodes, depth first, with the search ranges painted on it.
+    fn texts_with_matches(nodes: &[Element]) -> Vec<(String, Vec<SearchMatchRange>)> {
+        fn walk(n: &Element, out: &mut Vec<(String, Vec<SearchMatchRange>)>) {
+            match n {
+                Element::Text {
+                    text,
+                    search_matches,
+                    ..
+                } => out.push((text.clone(), search_matches.clone())),
+                Element::Row { children, .. } | Element::Column { children, .. } => {
+                    children.iter().for_each(|c| walk(c, out))
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        nodes.iter().for_each(|n| walk(n, &mut out));
+        out
+    }
+
+    /// Matches are numbered in the order their rows are drawn — the chrome above an element, then
+    /// each line's removed rows before its text — and each painted range carries its number, which
+    /// is what a shell compares with the current one.
+    #[test]
+    fn matches_are_numbered_in_the_order_their_rows_are_drawn() {
+        let mut s = ServerState::new();
+        let a = buffer_with(
+            &mut s,
+            "/a.txt",
+            "keep
+needle here
+",
+        );
+        let mut vp = viewport_over(&mut s, vec![a]);
+        vp.diff_view = true;
+        {
+            let e = &mut elements_mut(&mut s, &vp)[0];
+            e.lines = ElementLines::Range {
+                start: 0,
+                end_exclusive: 2,
+            };
+            e.chrome_above = std::sync::Arc::new(crate::shell::command_row(
+                "grep needle",
+                crate::shell::Mark::Queued,
+            ));
+            e.chrome_searched = true;
+            let mut decorations = crate::state::ElementDecorations::default();
+            decorations.baseline_above.insert(
+                1,
+                vec![BaselineRow {
+                    text: "the needle it replaced".into(),
+                    stage: DiffStage::Unstaged,
+                    emphasis: Vec::new(),
+                    search_matches: Vec::new(),
+                }],
+            );
+            e.decorations = Some(std::sync::Arc::new(decorations));
+        }
+        install_search(&mut s, &vp, "needle");
+
+        let window = render_window(&s, &vp, SneakLabels::Hidden);
+        assert_eq!(window.search.as_ref().map(|s| s.total), Some(3));
+        let range = |start, end, index| SearchMatchRange { start, end, index };
+        let chrome: Vec<Element> = match &window.root {
+            Element::Column { children, .. } => children
+                .iter()
+                .filter(|n| !matches!(n, Element::Editor { .. }))
+                .cloned()
+                .collect(),
+            _ => panic!("chrome composes"),
+        };
+        assert!(
+            texts_with_matches(&chrome).contains(&("grep needle".into(), vec![range(5, 11, 1)])),
+            "the command first: {:?}",
+            texts_with_matches(&chrome)
+        );
+        let line = &window.root.lines()[1];
+        assert_eq!(line.baseline_above[0].search_matches, vec![range(4, 10, 2)]);
+        assert_eq!(line.search_matches, vec![range(0, 6, 3)]);
+
+        // With the diff off the removed row is not drawn, so it is neither painted nor counted, and
+        // the text match takes its number.
+        vp.diff_view = false;
+        let window = render_window(&s, &vp, SneakLabels::Hidden);
+        assert_eq!(window.search.as_ref().map(|s| s.total), Some(2));
+        assert_eq!(window.root.lines()[1].search_matches, vec![range(0, 6, 2)]);
+    }
+
+    /// A folded element's matches are nowhere on screen: they are counted apart from the total, and
+    /// its title — the one row left of it — says how many it holds. Opening it moves them back in.
+    #[test]
+    fn a_folded_elements_matches_are_counted_apart_and_named_on_its_title() {
+        let mut s = ServerState::new();
+        let a = buffer_with(
+            &mut s, "/a.txt", "needle
+",
+        );
+        let b = buffer_with(
+            &mut s,
+            "/b.txt",
+            "needle needle
+",
+        );
+        let mut vp = viewport_over(&mut s, vec![a, b]);
+        {
+            let e = &mut elements_mut(&mut s, &vp)[1];
+            e.collapsible = true;
+            e.box_group = Some(1);
+            e.edges = aether_protocol::ui::Edges {
+                border: aether_protocol::ui::Sides::all(1),
+                padding: aether_protocol::ui::Sides::ZERO,
+                collapse: false,
+            };
+            e.title = std::sync::Arc::new(vec![Element::text("✓ Read b.txt", Vec::new())]);
+        }
+        install_search(&mut s, &vp, "needle");
+
+        let window = render_window(&s, &vp, SneakLabels::Hidden);
+        let summary = window.search.clone().expect("a search");
+        assert_eq!((summary.total, summary.folded), (1, 2));
+        fn titles(n: &Element, out: &mut Vec<String>) {
+            if let Element::Column {
+                title, children, ..
+            } = n
+            {
+                if !title.is_empty() {
+                    out.push(title.iter().map(Element::text_content).collect());
+                }
+                children.iter().for_each(|c| titles(c, out));
+            }
+        }
+        let mut found = Vec::new();
+        titles(&window.root, &mut found);
+        assert!(
+            found.iter().any(|t| t.contains("2 matches")),
+            "the folded box says what it holds: {found:?}"
+        );
+
+        vp.expanded.insert(b);
+        let window = render_window(&s, &vp, SneakLabels::Hidden);
+        let summary = window.search.expect("a search");
+        assert_eq!((summary.total, summary.folded), (3, 0));
     }
 
     /// Chrome belongs to the element it introduces, not to a line of some document.
@@ -3779,6 +4078,7 @@ mod tests {
                 text: "the line it replaced".into(),
                 stage: DiffStage::Unstaged,
                 emphasis: Vec::new(),
+                search_matches: Vec::new(),
             }],
         );
         elements_mut(&mut s, &vp)[1].decorations = Some(std::sync::Arc::new(decorations));
@@ -3893,6 +4193,7 @@ mod tests {
             box_group: None,
             title: Default::default(),
             band: aether_protocol::ui::Band::None,
+            chrome_searched: false,
         };
         let vp = viewport_over(&mut s, vec![a, b]); // no generated view behind these plain buffers
         *elements_mut(&mut s, &vp) = vec![binding(a), binding(b)];

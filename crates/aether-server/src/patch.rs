@@ -877,6 +877,7 @@ pub fn layout_over_files(
                     text: text.clone(),
                     stage: stage_at(line),
                     emphasis: Vec::new(),
+                    search_matches: Vec::new(),
                 });
         }
         for &added in &region.added {

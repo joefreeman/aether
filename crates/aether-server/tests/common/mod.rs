@@ -88,8 +88,8 @@ pub use aether_protocol::picker::{
     PickerViewParams, ScopedPath,
 };
 pub use aether_protocol::search::{
-    SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams, SearchSetResult,
-    SearchStep, SearchStepParams,
+    SearchAnchor, SearchClear, SearchClearParams, SearchNavResult, SearchSet, SearchSetParams,
+    SearchSetResult, SearchStateChanged, SearchStep, SearchStepParams, SearchSummary,
 };
 pub use aether_protocol::settings::{
     AppSettings, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,

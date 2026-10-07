@@ -2995,3 +2995,177 @@ async fn a_task_reuses_a_restored_shell() {
         "run below the first"
     );
 }
+
+// ---- search -------------------------------------------------------------------------------------
+
+/// The ranges a window paints on each command row, in view order.
+fn command_matches(
+    window: &aether_protocol::viewport::Window,
+) -> Vec<Vec<aether_protocol::search::SearchMatchRange>> {
+    fn walk(n: &Element, out: &mut Vec<aether_protocol::search::SearchMatchRange>) {
+        match n {
+            Element::Text { search_matches, .. } => out.extend(search_matches.iter().copied()),
+            Element::Row { children, .. } | Element::Column { children, .. } => {
+                children.iter().for_each(|c| walk(c, out))
+            }
+            _ => {}
+        }
+    }
+    chrome_nodes(window)
+        .iter()
+        .map(|row| {
+            let mut out = Vec::new();
+            walk(row, &mut out);
+            out
+        })
+        .collect()
+}
+
+/// A shell's commands are searched with its output — a command is what you typed and what you will
+/// look for. `n` lands on a command by seating the cursor on its run's first line, and on a run's
+/// output as on any text. The input is not searched: it is where the next command is typed.
+#[tokio::test]
+async fn search_finds_commands_and_output_and_n_lands_on_their_run() {
+    let (server, mut ws, _dir) = setup().await;
+    let shell = start_shell(&mut ws).await;
+    run_and_wait(&mut ws, &server, &shell, "echo alpha").await;
+    run_and_wait(&mut ws, &server, &shell, "echo beta").await;
+    let input = input_buffer_of(&server, &shell).await;
+    type_command(&mut ws, &shell, input, "echo alpha again").await;
+    let (viewport_id, _) = shell_window(&mut ws, &shell).await;
+    let view = shell.opened.view_id;
+    // The caret in the input, where it is while you type.
+    use aether_protocol::viewport::FocusTarget;
+    let r = focus(&mut ws, viewport_id, FocusTarget::Element { element: 2 }).await;
+    assert_eq!(r.element, 2, "the input");
+
+    let set: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        &SearchSetParams {
+            view_id: view,
+            query: "alpha".into(),
+            anchor: None,
+            extend: false,
+            from_selection: false,
+            options: Default::default(),
+        },
+    )
+    .await;
+    assert_eq!(
+        set.summary.total, 2,
+        "the first run's command and its output, and not the line being typed"
+    );
+
+    // From the input, the next match wraps to the top: the first run's command.
+    async fn step(ws: &mut Ws, view_id: ViewId) -> SearchNavResult {
+        send_request::<SearchStep>(
+            ws,
+            &SearchStepParams {
+                view_id,
+                direction: Direction::Forward,
+                extend: false,
+                count: 1,
+                set_query: None,
+                options: Default::default(),
+            },
+        )
+        .await
+    }
+    let on_command: SearchNavResult = step(&mut ws, view).await;
+    assert_eq!(on_command.summary.current_index, 1);
+    let crossed = on_command.crossed.expect("out of the input, into the run");
+    assert_eq!(crossed.element, 0);
+    let first_line = run_start(&server, &shell, 0).await;
+    assert_eq!(
+        (on_command.cursor.position, on_command.cursor.anchor),
+        (
+            LogicalPosition {
+                line: first_line,
+                col: 0
+            },
+            LogicalPosition {
+                line: first_line,
+                col: 0
+            }
+        ),
+        "seated on the run's first line"
+    );
+    assert_eq!(focused_element(&server, viewport_id).await, 0);
+    let (_, window) = shell_window(&mut ws, &shell).await;
+    assert_eq!(
+        command_matches(&window)[0],
+        vec![aether_protocol::search::SearchMatchRange {
+            start: 5,
+            end: 10,
+            index: 1
+        }],
+        "painted on the command, as the current match"
+    );
+
+    // Then its output, selected like any text match.
+    let on_output: SearchNavResult = step(&mut ws, view).await;
+    assert_eq!(on_output.summary.current_index, 2);
+    assert!(on_output.crossed.is_none(), "the same run");
+    assert_eq!(
+        (on_output.cursor.anchor, on_output.cursor.position),
+        (
+            LogicalPosition {
+                line: first_line,
+                col: 0
+            },
+            LogicalPosition {
+                line: first_line,
+                col: 4
+            }
+        )
+    );
+
+    // And back round to the command: stepped from the cursor, which is past it.
+    let again: SearchNavResult = step(&mut ws, view).await;
+    assert_eq!(again.summary.current_index, 1);
+    drop(server);
+}
+
+/// A run that printed nothing has no line to seat the cursor on: its command is still a match `n`
+/// stops at — current, and painted so — and the cursor stays where it was.
+#[tokio::test]
+async fn a_silent_runs_command_is_current_without_moving_the_cursor() {
+    let (server, mut ws, _dir) = setup().await;
+    let shell = start_shell(&mut ws).await;
+    run_and_wait(&mut ws, &server, &shell, "true").await;
+    let (viewport_id, _) = shell_window(&mut ws, &shell).await;
+    let view = shell.opened.view_id;
+    let before = focused_element(&server, viewport_id).await;
+
+    let _: SearchSetResult = send_request::<SearchSet>(
+        &mut ws,
+        &SearchSetParams {
+            view_id: view,
+            query: "true".into(),
+            anchor: None,
+            extend: false,
+            from_selection: false,
+            options: Default::default(),
+        },
+    )
+    .await;
+    let nav: SearchNavResult = send_request::<SearchStep>(
+        &mut ws,
+        &SearchStepParams {
+            view_id: view,
+            direction: Direction::Forward,
+            extend: false,
+            count: 1,
+            set_query: None,
+            options: Default::default(),
+        },
+    )
+    .await;
+    assert_eq!((nav.summary.total, nav.summary.current_index), (1, 1));
+    assert!(
+        nav.crossed.is_none(),
+        "nowhere to seat the cursor, so focus stays"
+    );
+    assert_eq!(focused_element(&server, viewport_id).await, before);
+    drop(server);
+}

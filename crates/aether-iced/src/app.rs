@@ -31,7 +31,6 @@ use aether_protocol::view::{ViewOpen, ViewOpenParams, ViewOpenResult};
 use aether_client::theme::LspDot;
 use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::PickerKind;
-use aether_protocol::search::SearchSummary;
 use aether_protocol::settings::MarkdownWidth;
 use aether_protocol::viewport::{
     ScrollPosition, ViewportResize, ViewportResizeParams, ViewportSetWrap, ViewportSetWrapParams,
@@ -3386,6 +3385,13 @@ impl App {
                         measured: &self.measured,
                         ligatures: self.session.ligatures,
                         font_size: self.session.editor_font_size as f32,
+                        current_match: self
+                            .session
+                            .view
+                            .search
+                            .summary
+                            .as_ref()
+                            .map_or(0, |s| s.current_index),
                     },
                     Message::Editor,
                 );
@@ -4893,15 +4899,7 @@ impl App {
             return None;
         }
         let summary = self.session.view.search.summary.as_ref()?;
-        if summary.total == 0 {
-            return Some("no matches".into());
-        }
-        let total = format_total(summary);
-        Some(if summary.current_index == 0 {
-            total
-        } else {
-            format!("{}/{total}", summary.current_index)
-        })
+        Some(aether_client::labels::search_count(summary))
     }
 
     /// Buffer-state accent colour, in the web client's precedence order: deleted-on-disk →
@@ -5113,7 +5111,11 @@ impl App {
         if self.session.view.search.active {
             if let Some(s) = self.session.view.search.summary.as_ref() {
                 if s.current_index > 0 && s.total > 0 {
-                    let seg = format!("{}/{}", s.current_index, format_total(s));
+                    let seg = format!(
+                        "{}/{}",
+                        s.current_index,
+                        aether_client::labels::search_total(s)
+                    );
                     gap(&mut right_used, &seg);
                     right = right.push(t(seg, p.fg));
                 }
@@ -7558,15 +7560,6 @@ fn session_state_color(s: &Session) -> Option<iced::Color> {
         return Some(p.state_unsaved);
     }
     None
-}
-
-/// `"47"` or `"10000+"` when the server hit its match cap.
-fn format_total(s: &SearchSummary) -> String {
-    if s.truncated {
-        format!("{}+", s.total)
-    } else {
-        s.total.to_string()
-    }
 }
 
 /// Box geometry for the modal prompt overlay.

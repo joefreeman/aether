@@ -256,6 +256,7 @@ fn window_with_a_box(element: u32) -> aether_protocol::viewport::Window {
         lines: vec![],
     };
     aether_protocol::viewport::Window {
+        search: None,
         other_elements_dirty: false,
         max_line_width: 0,
         git_status: None,
@@ -281,6 +282,7 @@ fn window_with_a_box(element: u32) -> aether_protocol::viewport::Window {
 
 fn window_with_an_input(element: u32) -> aether_protocol::viewport::Window {
     aether_protocol::viewport::Window {
+        search: None,
         other_elements_dirty: false,
         max_line_width: 0,
         git_status: None,
@@ -305,6 +307,7 @@ fn goto_line_from_end_counts_up_from_the_bottom() {
     use aether_protocol::viewport::Window;
     let mut s = session();
     s.view.window = Some(Window {
+        search: None,
         other_elements_dirty: false,
         max_line_width: 0,
         git_status: None,
@@ -358,7 +361,7 @@ fn search_and_diagnostic_navigation_reveal_as_jumps() {
     let mut s = session();
     let fx = s.on_event(Event::SearchNav(Ok(serde_json::from_value(json!({
         "cursor": { "position": {"line": 20, "col": 0}, "anchor": {"line": 20, "col": 0} },
-        "summary": { "buffer_id": 0, "total": 3, "truncated": false, "current_index": 1 },
+        "summary": { "view_id": 0, "total": 3, "truncated": false, "current_index": 1 },
     }))
     .unwrap())));
     assert_eq!(reveal_style(&fx), Some(RevealStyle::Jump));
@@ -3326,6 +3329,7 @@ fn diff_toggle_toast_is_grouped() {
     // updates one toast instead of stacking on/off pairs.
     let mut s = session();
     let window = Window {
+        search: None,
         other_elements_dirty: false,
         max_line_width: 0,
         git_status: None,
@@ -7348,6 +7352,7 @@ fn abandoning_a_stopped_operation_confirms_and_names_it() {
     use aether_protocol::viewport::Window;
 
     let window = |operation| Window {
+        search: None,
         other_elements_dirty: false,
         max_line_width: 0,
         git_status: Some(GitBufferStatus {
@@ -8202,6 +8207,7 @@ fn space_k_refuses_a_view_with_another_element_dirty() {
     s.view.buffer.saved_revision = 3;
     // ...but the view knows something else in it is not.
     s.view.window = Some(aether_protocol::viewport::Window {
+        search: None,
         other_elements_dirty: true,
         max_line_width: 0,
         git_status: None,
@@ -11797,6 +11803,7 @@ fn reader_subscribe(
         buffer_status: Default::default(),
         focus: focus_on(0, buffer_id, 0),
         window: Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
@@ -11818,6 +11825,7 @@ fn editor_subscribe(buffer_id: u64) -> aether_protocol::viewport::ViewportSubscr
         buffer_status: Default::default(),
         focus: focus_on(0, buffer_id, 0),
         window: Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,
@@ -14134,6 +14142,7 @@ fn subscribe_over(
         buffer_status: Default::default(),
         focus,
         window: Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,

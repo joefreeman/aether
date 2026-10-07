@@ -576,8 +576,8 @@ pub async fn buffer_cut(
     s.clear_tree_selection_history_for_buffer(params.buffer_id);
     s.clear_virtual_col_for_buffer(params.buffer_id);
 
-    let mut search_summary_pushes = promote_transient(&mut s, params.buffer_id);
-    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, params.buffer_id));
+    let promoted_pushes = promote_transient(&mut s, params.buffer_id);
+    refresh_searches_for_buffer(&mut s, params.buffer_id);
     refresh_viewport_ranges_for_buffer(&mut s, params.buffer_id);
 
     let mut pushes: PendingPushes = Vec::new();
@@ -616,7 +616,7 @@ pub async fn buffer_cut(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    for (sender, notif) in search_summary_pushes {
+    for (sender, notif) in promoted_pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in picker_pushes {
@@ -1232,7 +1232,7 @@ pub(crate) fn reload_buffer_locked(
     s.clear_tree_selection_history_for_buffer(buffer_id);
     s.clear_virtual_col_for_buffer(buffer_id);
 
-    let search_summary_pushes = refresh_searches_for_buffer(s, buffer_id);
+    refresh_searches_for_buffer(s, buffer_id);
     refresh_viewport_ranges_for_buffer(s, buffer_id);
     // LSP: reload swapped the rope (manual or watcher-driven) — keep the server's analysis fresh.
     notify_lsp_change(s, buffer_id);
@@ -1243,7 +1243,6 @@ pub(crate) fn reload_buffer_locked(
     let state_pushes = collect_buffer_state_pushes(s, buffer_id);
     let picker_pushes = maybe_refresh_dirty(s, buffer_id, was_dirty);
 
-    pushes.extend(search_summary_pushes);
     pushes.extend(state_pushes);
     pushes.extend(picker_pushes);
 

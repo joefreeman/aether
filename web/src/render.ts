@@ -21,6 +21,7 @@ import type {
   LogicalPosition,
   PatchLine,
   RailJoin,
+  SearchMatchRange,
   UiElement,
   BaselineRow,
   ElementPlacement,
@@ -94,6 +95,7 @@ const HL_CLASS: Record<string, string> = {
   "status.running": "status-running",
   "status.warning": "status-warning",
   "status.error": "status-error",
+  "search.count": "search-count",
 };
 
 export function highlightClass(kind: string): string | null {
@@ -539,7 +541,12 @@ function gutter(
  *
  *  Shared by a chrome row and a box's title: the same vocabulary, in the same roles, drawn in two
  *  different places on the row. */
-function appendInline(into: HTMLElement, nodes: ViewNode[], lit?: ViewNode): void {
+function appendInline(
+  into: HTMLElement,
+  nodes: ViewNode[],
+  lit?: ViewNode,
+  currentMatch = 0,
+): void {
   for (const w of nodes) {
     if (w.node === "action") {
       // A button the view declared. Its label is the view's own wording; what this decides is the
@@ -569,6 +576,12 @@ function appendInline(into: HTMLElement, nodes: ViewNode[], lit?: ViewNode): voi
         const c = highlightClass(h.kind);
         markRange(byteStart, n, h.start, h.end, (i) => (cls[i] = c));
       }
+      // A search's matches over chrome the view counts as content — a run's command — on top of
+      // the role, the current one in the selection's fill as when the cursor selects a match.
+      for (const m of w.search_matches ?? []) {
+        const hit = matchClass(m, currentMatch);
+        markRange(byteStart, n, m.start, m.end, (i) => (cls[i] = cls[i] ? `${cls[i]} ${hit}` : hit));
+      }
       let i = 0;
       while (i < n) {
         let j = i + 1;
@@ -581,6 +594,12 @@ function appendInline(into: HTMLElement, nodes: ViewNode[], lit?: ViewNode): voi
       }
     }
   }
+}
+
+/** The class a search range paints with: the selection's fill for the current match, the dim
+ *  search fill for the rest. A range with no index (a symbol highlight) is never current. */
+function matchClass(m: SearchMatchRange, currentMatch: number): string {
+  return m.index && m.index === currentMatch ? "sel" : "search-hit";
 }
 
 /** One row of a box's own border or padding.
@@ -598,6 +617,7 @@ function edgeRow(
   title: ViewNode[],
   holdsCursor: boolean,
   lit: ViewNode | undefined,
+  currentMatch: number,
 ): HTMLElement {
   const rowEl = document.createElement("div");
   rowEl.className = `row box-edge ${side} ${join}`;
@@ -621,7 +641,7 @@ function edgeRow(
     if (!half.length) continue;
     const named = document.createElement("span");
     named.className = cls;
-    appendInline(named, half.flatMap(inlineOf), lit);
+    appendInline(named, half.flatMap(inlineOf), lit, currentMatch);
     content.appendChild(named);
   }
   rowEl.appendChild(content);
@@ -642,7 +662,12 @@ export function splitTitle(title: ViewNode[]): [ViewNode[], ViewNode[]] {
  *  rather than a buffer line) and carries no gutter change-bar, since it belongs to no line of
  *  either side. The file separator's trailing rule is drawn in CSS, so it fills whatever width is
  *  left. */
-function chromeRow(v: ViewNode, band: Band, lit: ViewNode | undefined): HTMLElement {
+function chromeRow(
+  v: ViewNode,
+  band: Band,
+  lit: ViewNode | undefined,
+  currentMatch: number,
+): HTMLElement {
   const rowEl = document.createElement("div");
   rowEl.className = "row";
   // A row of presentation with no band paints none — since one vocabulary covers both axes, an
@@ -655,12 +680,18 @@ function chromeRow(v: ViewNode, band: Band, lit: ViewNode | undefined): HTMLElem
   rowEl.appendChild(g);
   const content = document.createElement("span");
   content.className = "content";
-  appendInline(content, inlineOf(v), lit);
+  appendInline(content, inlineOf(v), lit, currentMatch);
   rowEl.appendChild(content);
   return rowEl;
 }
 
-function phantomRow(text: string, stage: DiffStage, emphasis: EmphasisRange[]): HTMLElement {
+function phantomRow(
+  text: string,
+  stage: DiffStage,
+  emphasis: EmphasisRange[],
+  matches: SearchMatchRange[],
+  currentMatch: number,
+): HTMLElement {
   const rowEl = document.createElement("div");
   rowEl.className = "row deleted-phantom";
   const g = document.createElement("span");
@@ -672,23 +703,29 @@ function phantomRow(text: string, stage: DiffStage, emphasis: EmphasisRange[]): 
   rowEl.appendChild(g);
   const content = document.createElement("span");
   content.className = "content";
-  if (emphasis.length === 0) {
+  if (emphasis.length === 0 && matches.length === 0) {
     content.textContent = text;
   } else {
-    // Split the text at the emphasis boundaries; the changed sub-ranges get the stronger fill.
-    // Ranges are byte offsets from the server — decode to code points like the buffer rows.
+    // Split the text where its fill changes: the changed sub-ranges take the stronger fill, and a
+    // search match — this row holds no cursor, so its current match is marked here or nowhere —
+    // paints over that. Ranges are byte offsets from the server — decode to code points like the
+    // buffer rows.
     const { cps, byteStart } = decodeRow(text);
     const n = cps.length;
-    const inEmph: boolean[] = new Array(n).fill(false);
-    for (const r of emphasis) markRange(byteStart, n, r.start, r.end, (i) => (inEmph[i] = true));
+    const cls: (string | null)[] = new Array(n).fill(null);
+    for (const r of emphasis) markRange(byteStart, n, r.start, r.end, (i) => (cls[i] = "diff-emph"));
+    for (const m of matches) {
+      const hit = matchClass(m, currentMatch);
+      markRange(byteStart, n, m.start, m.end, (i) => (cls[i] = hit));
+    }
     let i = 0;
     while (i < n) {
       let j = i + 1;
-      while (j < n && inEmph[j] === inEmph[i]) j++;
+      while (j < n && cls[j] === cls[i]) j++;
       const run = cps.slice(i, j).join("");
-      if (inEmph[i]) {
+      if (cls[i]) {
         const span = document.createElement("span");
-        span.className = "diff-emph";
+        span.className = cls[i] as string;
         span.textContent = run;
         content.appendChild(span);
       } else {
@@ -734,6 +771,9 @@ export interface RenderOpts {
   /** The stop `Tab` left — which button it lit, named by element and ordinal. Absent means none
    *  is: the cursor is in text rather than on a button. */
   focusedStop?: FocusStop;
+  /** The current search match's place in the count — what a painted range's `index` is compared
+   *  with. Absent or 0 when there is none. */
+  currentMatch?: number;
 }
 
 /** Repaint the whole buffer area from the current window + cursor. `container` is the shell's
@@ -757,6 +797,7 @@ export function renderBuffer(
     diffView,
     focusedElement,
     focusedStop,
+    currentMatch = 0,
   } = opts;
   // Where focus is, as one answer: the button `Tab` lit (compared by identity, so it comes from the
   // same tree the painting walks) *or* the cursor — never both.
@@ -841,12 +882,22 @@ export function renderBuffer(
     next = item.at + unit;
     const inset = (el: HTMLElement): HTMLElement => insetBy(item, el);
     if (item.kind === "chrome") {
-      frag.appendChild(inset(chromeRow(item.node, item.band, lit)));
+      frag.appendChild(inset(chromeRow(item.node, item.band, lit, currentMatch)));
       continue;
     }
     if (item.kind === "baseline") {
       const v = item.row;
-      frag.appendChild(inset(phantomRow(v.text, v.stage ?? "unstaged", v.emphasis ?? [])));
+      frag.appendChild(
+        inset(
+          phantomRow(
+            v.text,
+            v.stage ?? "unstaged",
+            v.emphasis ?? [],
+            v.search_matches ?? [],
+            currentMatch,
+          ),
+        ),
+      );
       continue;
     }
     if (item.kind === "edge") {
@@ -862,6 +913,7 @@ export function renderBuffer(
             title,
             holdsCollapsed(item.owner, focusedElement),
             lit,
+            currentMatch,
           ),
         ),
       );

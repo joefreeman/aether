@@ -29,6 +29,7 @@ mod surround;
 mod symbols;
 mod syntax;
 mod tasks;
+mod view_search;
 mod watcher;
 mod workspace_index;
 mod worktree;

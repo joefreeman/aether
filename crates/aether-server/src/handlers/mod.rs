@@ -14,8 +14,8 @@ use crate::picker as picker_state;
 use crate::state::MOTION_HISTORY_CAP;
 use crate::state::{
     BlameCache, Buffer, BufferRange, DeferredToken, Document, DocumentId, EditKindTag,
-    ElementBinding, Generated, LineEnding, NavEntry, SearchEntry, ServerState, SharedState,
-    SneakCandidate, SneakEntry, Viewport,
+    ElementBinding, Generated, LineEnding, NavEntry, ServerState, SharedState, SneakCandidate,
+    SneakEntry, Viewport,
 };
 use crate::surround;
 use crate::wrap;
@@ -85,10 +85,10 @@ use aether_protocol::path::{
     PathDeleteParams, PathDeleteResult, PathRenameParams, PathRenameResult,
 };
 use aether_protocol::picker::{
-    AgentRowState, BufferDirtyState, GroupHeader, MatchOptions, PickerGroupAction,
-    PickerHideParams, PickerItem, PickerKind, PickerQueryParams, PickerReset, PickerSelectParams,
-    PickerSelectResult, PickerSetGroupParams, PickerSetGroupResult, PickerUpdate,
-    PickerUpdateParams, PickerViewParams, PickerViewResult, ReferenceRole,
+    AgentRowState, BufferDirtyState, GroupHeader, PickerGroupAction, PickerHideParams, PickerItem,
+    PickerKind, PickerQueryParams, PickerReset, PickerSelectParams, PickerSelectResult,
+    PickerSetGroupParams, PickerSetGroupResult, PickerUpdate, PickerUpdateParams, PickerViewParams,
+    PickerViewResult, ReferenceRole,
 };
 use aether_protocol::search::{
     SearchClearParams, SearchMatchRange, SearchNavResult, SearchSetParams, SearchSetResult,

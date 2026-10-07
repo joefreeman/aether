@@ -557,6 +557,9 @@ impl Theme {
             "status.running" => color(self.info),
             "status.warning" => color(self.warning),
             "status.error" => color(self.error),
+            // A folded box's count of the search matches inside it, on its title: match emphasis,
+            // as a picker's matched characters are.
+            "search.count" => color(self.match_highlight),
             _ => return None,
         })
     }

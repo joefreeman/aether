@@ -148,6 +148,11 @@ pub struct SearchState {
     pub chip_selected: Option<usize>,
     /// State to restore on Esc, snapshotted when the prompt opens.
     pub snapshot: Option<SearchSnapshot>,
+    /// Where the last step or incremental keystroke landed: the current match's place in the count,
+    /// and the cursor it left. While the cursor is still there, the match is what a reveal shows —
+    /// it may be a removed line or a command the cursor only sits beside — and once the cursor has
+    /// moved on, it is the cursor again ([`ViewState::reveal_row`]).
+    pub landing: Option<(u32, CursorState)>,
 }
 
 impl SearchState {
@@ -273,6 +278,10 @@ impl InputHistory {
 }
 
 pub struct SearchSnapshot {
+    /// The element the cursor was in, and that element's buffer — the search can move focus to
+    /// another element, and putting the cursor back means putting focus back first.
+    pub element: aether_protocol::viewport::FieldId,
+    pub buffer_id: BufferId,
     pub cursor: CursorState,
     pub query: String,
     pub active: bool,
@@ -1136,7 +1145,8 @@ pub struct ViewState {
 }
 
 impl ViewState {
-    /// **The row a reveal is about**: the stop `Tab` reached, else the cursor's line. `None` when
+    /// **The row a reveal is about**: the stop `Tab` reached, else the current search match where a
+    /// step just landed on a row with no cursor, else the cursor's line. `None` when
     /// neither can be located — which for the cursor means its line is not loaded, and is the
     /// shell's signal to fetch a window around it and pay the reveal then.
     ///
@@ -1154,6 +1164,15 @@ impl ViewState {
         let focused = crate::grid::focused(&window.root, self.focused_element, self.focus);
         if let Some(row) = crate::grid::focused_row_of(&window.root, measured, &focused) {
             return Some(row);
+        }
+        // A search step that landed on a row the cursor can't be in — a removed line, a command —
+        // shows that row, for as long as the cursor is where the step put it.
+        if let Some((index, at)) = self.search.landing {
+            if at == self.buffer.cursor {
+                if let Some(row) = crate::grid::search_match_row(&window.root, measured, index) {
+                    return Some(row);
+                }
+            }
         }
         crate::grid::position_cell(
             window,
@@ -2291,6 +2310,7 @@ mod tests {
         };
         let mut s = Session::placeholder();
         s.view.window = Some(aether_protocol::viewport::Window {
+            search: None,
             other_elements_dirty: false,
             max_line_width: 0,
             git_status: None,

@@ -135,8 +135,8 @@ pub async fn input_move_lines_once(
         VerticalDirection::Up => (a - 1, b + 1),
     };
 
-    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
-    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
+    let promoted_pushes = promote_transient(&mut s, buffer_id);
+    refresh_searches_for_buffer(&mut s, buffer_id);
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     let pushes: PendingPushes = collect_doc_edit_pushes(&s, buffer_id, edit_first, edit_last_excl);
 
@@ -149,7 +149,7 @@ pub async fn input_move_lines_once(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    for (sender, notif) in search_summary_pushes {
+    for (sender, notif) in promoted_pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in picker_pushes {
@@ -326,23 +326,23 @@ async fn input_join_lines_once(
     };
 
     // Push viewport/lines_changed for affected viewports (we changed multiple lines).
-    let (pushes, search_summary_pushes, picker_pushes, new_cursor): (Vec<_>, Vec<_>, Vec<_>, _) = {
+    let (pushes, promoted_pushes, picker_pushes, new_cursor): (Vec<_>, Vec<_>, Vec<_>, _) = {
         let mut s = state.lock().await;
-        let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
-        search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
+        let promoted_pushes = promote_transient(&mut s, buffer_id);
+        refresh_searches_for_buffer(&mut s, buffer_id);
         refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
         let pushes = collect_doc_lines_changed_pushes(&s, buffer_id);
         let picker_pushes = maybe_refresh_dirty(&mut s, buffer_id, was_dirty);
         // LSP: full-document sync.
         notify_lsp_change(&mut s, buffer_id);
         let new_cursor = wrap_for_response(&s, client_id, buffer_id, new_cursor);
-        (pushes, search_summary_pushes, picker_pushes, new_cursor)
+        (pushes, promoted_pushes, picker_pushes, new_cursor)
     };
 
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    for (sender, notif) in search_summary_pushes {
+    for (sender, notif) in promoted_pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in picker_pushes {
@@ -466,8 +466,8 @@ pub async fn apply_undo_or_redo(
 
     // Push the full visible window to every viewport on this buffer — the rope was swapped
     // wholesale, so we can't be surgical about it.
-    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
-    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
+    let promoted_pushes = promote_transient(&mut s, buffer_id);
+    refresh_searches_for_buffer(&mut s, buffer_id);
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     // LSP: the rope was swapped wholesale — tell the server so its diagnostics aren't stale.
     notify_lsp_change(&mut s, buffer_id);
@@ -479,7 +479,7 @@ pub async fn apply_undo_or_redo(
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
-    for (sender, notif) in search_summary_pushes {
+    for (sender, notif) in promoted_pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in picker_pushes {
@@ -1258,8 +1258,8 @@ pub async fn apply_edit_reporting(
 
     // Recompute every active search on this buffer so the embedded `search_matches` in the
     // line-render data we're about to send out reflects the post-edit text.
-    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
-    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
+    let promoted_pushes = promote_transient(&mut s, buffer_id);
+    refresh_searches_for_buffer(&mut s, buffer_id);
 
     // Recompute every viewport's pushed range against the new line count, so a mutation that
     // *grew* the buffer (e.g. typing a newline) extends the window to cover the new lines.
@@ -1285,7 +1285,7 @@ pub async fn apply_edit_reporting(
         // If the receiver's gone, the client's connection has dropped; not our problem.
         let _ = sender.send(notif).await;
     }
-    for (sender, notif) in search_summary_pushes {
+    for (sender, notif) in promoted_pushes {
         let _ = sender.send(notif).await;
     }
     for (sender, notif) in picker_pushes {
@@ -1314,7 +1314,7 @@ pub fn push_buffer_changed(s: &ServerState, vp: &Viewport, pushes: &mut PendingP
     let buffer_id = s.focused_buffer(vp);
     let revision = s.doc_of(buffer_id).revision;
     pushes.push((
-        sender,
+        sender.clone(),
         Notification {
             jsonrpc: JsonRpc,
             method: BufferChanged::NAME.into(),
@@ -1325,6 +1325,19 @@ pub fn push_buffer_changed(s: &ServerState, vp: &Viewport, pushes: &mut PendingP
             .expect("infallible"),
         },
     ));
+    // A search's count usually rides the window an edit re-renders; this edit re-renders nothing,
+    // so the count it may have changed goes as a push of its own.
+    if let Some(search) = s.searches.get(&(vp.client_id, vp.view_id)) {
+        let summary = crate::view_search::summary(search, vp.view_id, s.view_of(vp), Some(vp));
+        pushes.push((
+            sender,
+            Notification {
+                jsonrpc: JsonRpc,
+                method: SearchStateChanged::NAME.into(),
+                params: serde_json::to_value(&summary).expect("infallible"),
+            },
+        ));
+    }
 }
 
 /// Workspace-switcher candidates: every persisted workspace (`names`, read from disk by the caller)

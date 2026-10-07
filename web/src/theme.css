@@ -829,6 +829,9 @@ html, body, #app {
 .hl-status-running { color: var(--info); }
 .hl-status-warning { color: var(--warning); }
 .hl-status-error { color: var(--error); }
+/* A folded box's count of the search matches inside it: match emphasis, as a picker's matched
+   characters are. */
+.hl-search-count { color: var(--match-highlight); }
 
 .row.deleted-phantom { background: var(--git-deleted-bg); color: var(--git-deleted); }
 .row.deleted-phantom.staged { background: var(--git-staged-deleted-bg); color: var(--git-staged-deleted); }

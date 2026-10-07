@@ -265,7 +265,7 @@ interface SearchView {
   chips: { label: string; flag: boolean }[];
   /** The keyboard-selected option chip (index into `chips`), or null when the query owns focus. */
   chip_selected: number | null;
-  summary: { total: number; current_index: number; truncated: boolean } | null;
+  summary: { total: number; current_index: number; truncated: boolean; folded?: number } | null;
 }
 
 /** The structured reason for a confirmation (the core states the reason; the shell composes the
@@ -659,10 +659,16 @@ function bufferStateColor(v: CoreView): string | null {
   return null;
 }
 
+/** A search's count — mirrors `aether_client::labels::search_count`: `3/47` on a match, the bare
+ *  total off one, `+` past the server's cap, and the matches folded away inside elements counted
+ *  apart (`47 · 3 folded`), since nothing of them is on screen but their box's title. */
 function searchCountLabel(s: SearchView["summary"]): string {
   if (!s) return "";
-  if (s.total === 0) return "no matches";
-  return `${s.current_index}/${s.total}${s.truncated ? "+" : ""}`;
+  const folded = s.folded ?? 0;
+  if (s.total === 0) return folded ? `${folded} folded` : "no matches";
+  let total = `${s.total}${s.truncated ? "+" : ""}`;
+  if (folded) total += ` · ${folded} folded`;
+  return s.current_index ? `${s.current_index}/${total}` : total;
 }
 
 /** Cursor `line:col`, or a `lo-hi` selection range (Normal mode with an extended selection). */
@@ -3671,6 +3677,7 @@ export class Shell {
       focusedElement: v.focused_element,
       focusedStop: v.focused_stop ?? undefined,
       diffView: v.diff_view,
+      currentMatch: v.search.summary?.current_index ?? 0,
     });
     // A reply's height is whatever the browser made of it, and the grid places everything below by
     // that. Measured after the paint, and the paint repeated once when an answer moved — the same
@@ -3805,9 +3812,7 @@ export class Shell {
         return el;
       }),
     );
-    this.searchCountEl.textContent = s.summary
-      ? `${s.summary.current_index}/${s.summary.total}${s.summary.truncated ? "+" : ""}`
-      : "";
+    this.searchCountEl.textContent = searchCountLabel(s.summary);
     // Focus follows selection: a selected option chip parks focus on the hidden capture field (so
     // its row keys route through the global handler, like the picker); otherwise the query input
     // holds focus for native typing.

@@ -3461,7 +3461,7 @@ pub async fn cursor_follow_loop(
             });
             // An active search owns the highlight layer (the enable handler refuses too);
             // don't fight it from the follow side even if the unfollow is still in flight.
-            let hl = (s.symbol_highlight_follow.contains(&key) && !s.searches.contains_key(&key))
+            let hl = (s.symbol_highlight_follow.contains(&key) && !search_covers(&s, key.0, key.1))
                 .then(|| {
                     let epoch = next_symbol_hl_epoch();
                     s.symbol_highlight_gen.insert(key, epoch);
@@ -4360,8 +4360,8 @@ pub async fn git_apply_hunk(
             s.clear_tree_selection_history_for_buffer(buffer_id);
             s.clear_virtual_col_for_buffer(buffer_id);
 
-            let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
-            search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
+            let promoted_pushes = promote_transient(&mut s, buffer_id);
+            refresh_searches_for_buffer(&mut s, buffer_id);
             // Also recomputes the cached hunks, so the pushed gutter markers are post-revert.
             refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
             notify_lsp_change(&mut s, buffer_id);
@@ -4374,7 +4374,7 @@ pub async fn git_apply_hunk(
             for (sender, notif) in pushes {
                 let _ = sender.send(notif).await;
             }
-            for (sender, notif) in search_summary_pushes {
+            for (sender, notif) in promoted_pushes {
                 let _ = sender.send(notif).await;
             }
             for (sender, notif) in picker_pushes {
@@ -4478,8 +4478,8 @@ pub async fn git_resolve_conflict(
         },
     );
 
-    let mut search_summary_pushes = promote_transient(&mut s, buffer_id);
-    search_summary_pushes.extend(refresh_searches_for_buffer(&mut s, buffer_id));
+    let promoted_pushes = promote_transient(&mut s, buffer_id);
+    refresh_searches_for_buffer(&mut s, buffer_id);
     refresh_viewport_ranges_for_buffer(&mut s, buffer_id);
     // Explicitly, *not* relying on the refresh above: that rescan is gated on the buffer having a
     // viewport (the per-edit work is only worth doing for something on screen), and the count this
@@ -4495,7 +4495,7 @@ pub async fn git_resolve_conflict(
     drop(s);
     for (sender, notif) in pushes
         .into_iter()
-        .chain(search_summary_pushes)
+        .chain(promoted_pushes)
         .chain(picker_pushes)
     {
         let _ = sender.send(notif).await;

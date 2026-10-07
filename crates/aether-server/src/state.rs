@@ -8,7 +8,7 @@ use crate::workspace_index::WorkspaceIndex;
 use aether_protocol::cursor::CursorState;
 use aether_protocol::envelope::Notification;
 use aether_protocol::lsp::SymbolCrumb;
-use aether_protocol::picker::{MatchOptions, PickerKind};
+use aether_protocol::picker::PickerKind;
 use aether_protocol::ui::LayoutOwner;
 use aether_protocol::viewport::{ScrollPosition, WrapMode};
 use aether_protocol::{BufferId, ClientId, LogicalPosition, Revision, ViewId, ViewportId};
@@ -115,21 +115,21 @@ pub struct ServerState {
     /// that `cursor/contract` will restore. Pushed by `cursor/expand`; cleared by any other
     /// cursor RPC (or buffer mutation) to keep contraction well-defined.
     pub tree_selection_history: HashMap<(ClientId, BufferId), Vec<CursorState>>,
-    /// Per-`(client, buffer)` active search. Set by `search/set`, cleared by `search/clear` or
-    /// when the client disconnects / the buffer closes. Re-run whenever the buffer mutates.
-    pub searches: HashMap<(ClientId, BufferId), SearchEntry>,
+    /// Per-`(client, view)` active search. Set by `search/set`, cleared by `search/clear` or when
+    /// the client disconnects / the view closes. Re-run whenever the view's composition changes or
+    /// a document it windows mutates ([`crate::view_search::refresh_view`]).
+    pub searches: HashMap<(ClientId, ViewId), crate::view_search::ViewSearch>,
     /// Per-`(client, buffer)` active sneak (`s`/`S`) word-jump session. Set/refined by
     /// `sneak/update`, cleared by `sneak/select` / `sneak/cancel` or when the client disconnects /
     /// the buffer closes. Purely transient view-layer state — no buffer mutation happens during a
     /// sneak, so unlike searches it never needs an after-edit recompute.
     pub sneaks: HashMap<(ClientId, BufferId), SneakEntry>,
     /// Per-`(client, buffer)` LSP document-highlight set: the occurrences of the symbol under the
-    /// cursor, painted with the same styling as search matches when no search is active. Stored as a
-    /// [`SearchEntry`] so it renders through the very same path (`render_matches` → `matches_on_line`);
-    /// only `matches` is meaningful (the other fields go unused). Refreshed — debounced — as the
-    /// cursor settles, and cleared when a search is set, the cursor leaves a symbol, the buffer
-    /// mutates, or the client disconnects / the buffer closes.
-    pub symbol_highlights: HashMap<(ClientId, BufferId), SearchEntry>,
+    /// cursor, as end-exclusive ranges, painted with the same styling as search matches when no
+    /// search is active. Refreshed — debounced — as the cursor settles, and cleared when a search is
+    /// set, the cursor leaves a symbol, the buffer mutates, or the client disconnects / the buffer
+    /// closes.
+    pub symbol_highlights: HashMap<(ClientId, BufferId), Vec<(LogicalPosition, LogicalPosition)>>,
     /// Debounce generation for [`symbol_highlights`], bumped per cursor-settle request. A spawned
     /// refresh applies its result only while the generation still matches — a newer cursor move (or a
     /// buffer mutation) supersedes any in-flight round-trip. Mirrors the picker async-load epoch.
@@ -358,26 +358,6 @@ pub struct DocumentId(pub u64);
 pub struct BlameCache {
     pub revision: Revision,
     pub lines: Vec<Option<aether_protocol::git::BlameInfo>>,
-}
-
-/// Server-side state for one client's active search on a specific buffer.
-#[derive(Debug, Clone)]
-pub struct SearchEntry {
-    pub query: String,
-    /// How the query matches (case / whole-word / literal). Recorded so an after-edit recompute
-    /// ([`crate::handlers::refresh_searches_for_buffer`]) re-runs with the same options the
-    /// search was set with.
-    pub options: MatchOptions,
-    /// Sorted by start position. Each match is `(start_inclusive, end_exclusive)` in
-    /// buffer-line / byte-col coords.
-    pub matches: Vec<(LogicalPosition, LogicalPosition)>,
-    /// `true` when the server hit its match cap (`SEARCH_MAX_MATCHES`) and the real count is
-    /// higher. `matches.len()` is then a prefix.
-    pub truncated: bool,
-    /// 1-based match index most recently sent in a `search/state_changed` notification for this
-    /// client+buffer. Used to dedup cursor-move-driven pushes so we only fire when the cursor
-    /// actually crosses a match boundary.
-    pub last_pushed_index: u32,
 }
 
 /// Server-side state for one client's active sneak word-jump on a specific buffer. The candidate
@@ -1609,6 +1589,9 @@ impl ServerState {
     /// After a view's elements were rebuilt: a rebuild can have fewer elements than the one a
     /// viewport's focus was in, and a focus index past the end would fall back to element 0
     /// silently. The viewports reference the view, so this is all a rebuild has to tell them.
+    ///
+    /// It is also where a view's searches are re-run: every change to what a view is composed of
+    /// passes through here, and a search's matches are indices into exactly that composition.
     pub fn rebind_viewports_of(&mut self, view_buffer: BufferId) {
         for view_id in self.views_presenting(view_buffer) {
             let last = self
@@ -1621,7 +1604,15 @@ impl ServerState {
                     vp.focused = vp.focused.min(last);
                 }
             }
+            crate::view_search::refresh_view(self, view_id);
         }
+    }
+
+    /// The viewport `client_id` presents `view_id` in, if it has one.
+    pub fn viewport_on(&self, client_id: ClientId, view_id: ViewId) -> Option<&Viewport> {
+        self.viewports
+            .values()
+            .find(|vp| vp.client_id == client_id && vp.view_id == view_id)
     }
 
     /// Non-panicking [`Self::doc_of`], for paths where the buffer may already be gone.
@@ -2621,7 +2612,9 @@ impl ServerState {
         self.motion_history.retain(|(_, b), _| *b != id);
         self.virtual_col.retain(|(_, b), _| *b != id);
         self.tree_selection_history.retain(|(_, b), _| *b != id);
-        self.searches.retain(|(_, b), _| *b != id);
+        // A search belongs to a view, and the views presenting this buffer went above.
+        let views = &self.views;
+        self.searches.retain(|(_, v), _| views.contains_key(v));
         self.sneaks.retain(|(_, b), _| *b != id);
         self.symbol_highlights.retain(|(_, b), _| *b != id);
         self.symbol_highlight_gen.retain(|(_, b), _| *b != id);
@@ -3405,7 +3398,13 @@ impl ServerState {
         // don't leak into the UI, but they still let us reattach to "the buffer you last had"
         // when you come back. The nav trail is preserved too, and for a stronger reason: it
         // belongs to the context, not to the switch (see the hand-over below).
-        self.searches.retain(|(c, b), _| !in_proj(c, b));
+        let views = &self.views;
+        self.searches.retain(|(c, v), _| {
+            !(*c == client_id
+                && views
+                    .get(v)
+                    .is_none_or(|view| workspace_buffers.contains(&view.presenting)))
+        });
         self.sneaks.retain(|(c, b), _| !in_proj(c, b));
         self.symbol_highlights.retain(|(c, b), _| !in_proj(c, b));
         self.symbol_highlight_gen.retain(|(c, b), _| !in_proj(c, b));
@@ -5117,6 +5116,7 @@ impl View {
                 collapsible: false,
                 title: Default::default(),
                 band: aether_protocol::ui::Band::None,
+                chrome_searched: false,
             }],
         }
     }
@@ -5211,6 +5211,8 @@ impl View {
                 collapsible: false,
                 title: std::sync::Arc::new(title),
                 band: Band::Chrome,
+                // The command is what you typed, and what you will look for.
+                chrome_searched: true,
             }
         };
         let mut elements: Vec<ElementBinding> = t
@@ -5265,6 +5267,7 @@ impl View {
             collapsible: false,
             title: std::sync::Arc::new(crate::shell::input_title(&t.cwd)),
             band: Band::Chrome,
+            chrome_searched: false,
         });
         View {
             presenting: view_buffer,
@@ -5354,6 +5357,7 @@ impl View {
                         crate::agent::block_title(block)
                     }),
                     band: if bare { Band::None } else { Band::Chrome },
+                    chrome_searched: false,
                 }
             })
             .collect();
@@ -5381,6 +5385,7 @@ impl View {
             collapsible: false,
             title: Default::default(),
             band: Band::None,
+            chrome_searched: false,
         });
         View {
             presenting: view_buffer,
@@ -5424,6 +5429,7 @@ impl View {
                     collapsible: false,
                     title: Default::default(),
                     band: aether_protocol::ui::Band::None,
+                    chrome_searched: false,
                 })
                 .collect(),
         }
@@ -5564,6 +5570,7 @@ impl ElementLayout {
             collapsible: false,
             title: self.title.clone(),
             band: self.band,
+            chrome_searched: false,
         }
     }
 }
@@ -5687,6 +5694,11 @@ pub struct ElementBinding {
     pub title: std::sync::Arc<Vec<aether_protocol::viewport::Element>>,
     /// What the box paints behind its own border and padding cells.
     pub band: aether_protocol::ui::Band,
+    /// Whether the text of `chrome_above` is **content** the view's search reads — a shell run's
+    /// command, which is what you typed and what you will look for — rather than a label the view
+    /// put there. `false` everywhere else: a patch's file heading or an agent's speaker row would
+    /// only turn up as noise between the matches you wanted.
+    pub chrome_searched: bool,
 }
 
 impl ElementBinding {
@@ -6001,6 +6013,7 @@ mod view_layout_tests {
             box_group: None,
             title: Default::default(),
             band: aether_protocol::ui::Band::None,
+            chrome_searched: false,
         };
         vec![binding(1), binding(2)]
     }

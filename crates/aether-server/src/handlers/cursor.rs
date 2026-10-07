@@ -337,15 +337,15 @@ async fn cross_element(
             s.virtual_col.remove(&(client_id, target));
         }
     }
-    // An active search is the focused element's, so crossing re-runs it where the cursor now is.
-    let pushes = rescope_search(s, client_id, target);
+    // The current match follows the cursor, which just crossed into another element.
+    let update = collect_cursor_search_update(s, client_id, target);
     let cursor = s.cursors[&(client_id, target)];
     let crossed = aether_protocol::viewport::ViewportFocusElementResult {
         element: landing,
         buffer: crate::handlers::describe_buffer(s, target, cursor)?,
         buffer_status: buffer_status_for(s, client_id, target),
     };
-    for (sender, notif) in pushes {
+    if let Some((sender, notif)) = update {
         let _ = sender.send(notif).await;
     }
     Ok(Some(aether_protocol::cursor::CursorMoveResult {

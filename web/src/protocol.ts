@@ -77,6 +77,19 @@ export interface WrappedRow {
 export interface SearchMatchRange {
   start: number;
   end: number;
+  /** The match's 1-based place in the count; the range whose index is the summary's
+   *  `current_index` is the current match. Absent (0) on a symbol highlight, never current. */
+  index?: number;
+}
+
+/** A search over the view, as this viewport shows it. Mirrors `aether_protocol::search::SearchSummary`. */
+export interface SearchSummary {
+  view_id: number;
+  total: number;
+  truncated: boolean;
+  current_index: number;
+  /** Matches inside folded elements, counted apart from `total`. Absent when zero. */
+  folded?: number;
 }
 
 /** A sneak (s/S) word-jump target: byte range of a matched word within the logical line. The chip
@@ -178,6 +191,8 @@ export interface BaselineRow {
   /** Omitted on the wire when "unstaged". */
   stage?: DiffStage;
   emphasis?: EmphasisRange[];
+  /** Where the view's search matches this removed line — painted as a line's are. */
+  search_matches?: SearchMatchRange[];
 }
 
 /** A view's content: what it is composed of, in order.
@@ -204,7 +219,14 @@ export type ViewNode =
       children: ViewNode[];
     }
   | { node: "row"; edges?: Edges; band?: Band; children: ViewNode[] }
-  | { node: "text"; text: string; highlights?: Highlight[] }
+  | {
+      node: "text";
+      text: string;
+      highlights?: Highlight[];
+      /** Where the view's search matches this text — only chrome the view counts as content (a
+       *  shell run's command) is searched. Painted as a line's matches are. */
+      search_matches?: SearchMatchRange[];
+    }
   | { node: "space"; cols: number }
   | { node: "fill"; glyph: string }
   | {
@@ -845,6 +867,8 @@ export interface BufferWindow {
    *  that one first-hand and instantly, so the dot is `focused dirty || this`, which stays right
    *  across a save (a save pushes buffer/state, not a new window). Always false for one element. */
   other_elements_dirty?: boolean;
+  /** The client's search over this view as of this render, when one is active. */
+  search?: SearchSummary;
   /** What the view is composed of. Use `nodeLines` where the structure is irrelevant. */
   root: ViewNode;
 }

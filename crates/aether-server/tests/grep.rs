@@ -1799,9 +1799,12 @@ async fn search_set_response_carries_jumplist_position() {
     let r: SearchSetResult = send_request::<SearchSet>(
         &mut ws,
         &SearchSetParams {
-            buffer_id,
+            view_id: view_of(buffer_id),
             query: "needle".into(),
-            anchor: Some(LogicalPosition { line: 1, col: 4 }),
+            anchor: Some(SearchAnchor {
+                element: 0,
+                position: LogicalPosition { line: 1, col: 4 },
+            }),
             extend: false,
             from_selection: false,
             options: Default::default(),
