@@ -1149,6 +1149,17 @@ pub struct ViewState {
 }
 
 impl ViewState {
+    /// Take the pending content anchor, leaving none — for a navigation that carries it to the
+    /// view it lands in rather than letting it resolve here.
+    pub(crate) fn take_relayout_anchor(&mut self) -> Option<crate::grid::ScrollAnchor> {
+        self.relayout_anchor.take()
+    }
+
+    /// Hand this view a content anchor captured on the one it replaced.
+    pub(crate) fn carry_relayout_anchor(&mut self, anchor: crate::grid::ScrollAnchor) {
+        self.relayout_anchor = Some(anchor);
+    }
+
     /// **The row a reveal is about**: the stop `Tab` reached, else the current search match where a
     /// step just landed on a row with no cursor, else the cursor's line. `None` when
     /// neither can be located — which for the cursor means its line is not loaded, and is the

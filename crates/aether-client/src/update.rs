@@ -1032,19 +1032,27 @@ impl Session {
             },
             Event::LineFollowed(Err(e)) => Effects::error_detail("Couldn't open the file", e),
 
-            // A note can come with a landing — the line was added or removed in the version
-            // arrived at — so the two are independent.
+            // A note can come with a landing — the line was removed in the version arrived at —
+            // so the two are independent.
             Event::VersionStepped(Ok(r)) => {
                 let arrived = match r.opened {
-                    Some(open) => self.adopt_navigation(open),
-                    None => Effects::none(),
+                    Some(open) => self.adopt_version(open),
+                    None => {
+                        // Nowhere to go: the anchor the keystroke captured must not linger for
+                        // the next unrelated window to resolve.
+                        self.view.take_relayout_anchor();
+                        Effects::none()
+                    }
                 };
                 match r.note {
                     Some(note) => arrived.and(version_note_toast(&note)),
                     None => arrived,
                 }
             }
-            Event::VersionStepped(Err(e)) => Effects::error_detail("Couldn't step versions", e),
+            Event::VersionStepped(Err(e)) => {
+                self.view.take_relayout_anchor();
+                Effects::error_detail("Couldn't step versions", e)
+            }
 
             Event::Switched(Err(e)) => self.open_failed(e),
 
@@ -3552,6 +3560,28 @@ impl Session {
             }
         }
         self.adopt_navigation(open)
+    }
+
+    /// Land a version step, keeping the page still: the server carried the cursor to the matching
+    /// line, so putting it back on the screen row it held keeps the content around it where it
+    /// was, and only what the commit changed moves.
+    ///
+    /// Only a cursor anchor crosses. One that pinned a line to the top names a line of the
+    /// *previous* version, and line numbers shift between versions, so that case frames the
+    /// cursor as any other open does.
+    fn adopt_version(&mut self, open: ViewOpenResult) -> Effects {
+        let anchor = self.view.take_relayout_anchor();
+        let left = self.view.view_id;
+        let fx = self.adopt_navigation(open);
+        // Only into a switch, whose resubscribe is what resolves it: a landing in the view
+        // already on screen moves the cursor without a new window, and an anchor left pending
+        // there would resolve against whatever window came next.
+        if let Some(anchor @ crate::grid::ScrollAnchor::Cursor { .. }) = anchor {
+            if self.view.view_id != left {
+                self.view.carry_relayout_anchor(anchor);
+            }
+        }
+        fx
     }
 
     /// An open that failed, from whichever RPC was asked to do it.
@@ -11486,8 +11516,11 @@ impl Session {
                 },
                 Event::Shown,
             ),
-            A::StepVersion { scope, dir } => self
-                .request_str::<aether_protocol::git::GitStepVersion>(
+            // The content anchor is captured first, while the shell can still say where this view
+            // is scrolled: the version arrives as another buffer, and keeping the cursor on the
+            // same screen row is what keeps the page still across the step.
+            A::StepVersion { scope, dir } => Effects::one(Effect::SaveContentAnchor).and(
+                self.request_str::<aether_protocol::git::GitStepVersion>(
                     aether_protocol::git::GitStepVersionParams {
                         buffer_id: self.view.buffer.buffer_id,
                         scope,
@@ -11495,6 +11528,7 @@ impl Session {
                     },
                     Event::VersionStepped,
                 ),
+            ),
             A::GitFetch => self.request_str::<GitFetch>(
                 GitFetchParams {
                     // Resolved server-side from the buffer we're on, like every other git verb.
@@ -13089,6 +13123,88 @@ mod tests {
         s.view.mode = Mode::Read;
         s.view.read = Some(ReadView::loading(s.view.buffer.buffer_id));
         s
+    }
+
+    /// A version step lands as another view, and the cursor anchor the keystroke captured crosses
+    /// with it, so the resubscribe frames the cursor on the row it held. A top-line anchor names a
+    /// line of the old version and is dropped; a step that went nowhere drops whatever it captured.
+    #[test]
+    fn a_version_step_carries_the_cursor_anchor_across() {
+        use crate::grid::ScrollAnchor;
+        use aether_protocol::git::{GitStepVersionResult, VersionNote};
+        use aether_protocol::view::{BufferDescription, ViewOpenResult};
+
+        let version = || ViewOpenResult {
+            view_id: aether_protocol::ViewId(41),
+            scroll: None,
+            transient: true,
+            read: false,
+            buffer: BufferDescription {
+                buffer_id: 41,
+                language: None,
+                line_count: 20,
+                byte_count: 200,
+                revision: 0,
+                saved_revision: 0,
+                path: None,
+                scratch_number: None,
+                cursor: CursorState {
+                    position: LogicalPosition { line: 9, col: 0 },
+                    anchor: LogicalPosition { line: 9, col: 0 },
+                    ..Default::default()
+                },
+                lsp_server: None,
+                title: Some("a.md".into()),
+                commit: Some("abc1234".into()),
+                cwd: None,
+                cwd_root: None,
+                read_only: true,
+                is_patch: false,
+            },
+        };
+        let stepped =
+            |opened| Event::VersionStepped(Ok(GitStepVersionResult { opened, note: None }));
+
+        let mut s = Session::placeholder();
+        s.view.carry_relayout_anchor(ScrollAnchor::Cursor {
+            screen_row_offset: 4,
+        });
+        let _ = s.on_event(stepped(Some(version())));
+        assert_eq!(s.view.buffer.buffer_id, 41, "switched to the version");
+        assert_eq!(
+            s.view.take_relayout_anchor(),
+            Some(ScrollAnchor::Cursor {
+                screen_row_offset: 4
+            }),
+            "the cursor keeps its screen row"
+        );
+
+        let mut s = Session::placeholder();
+        s.view.carry_relayout_anchor(ScrollAnchor::Line {
+            element: 0,
+            logical_line: 30,
+            sub_row: 0,
+        });
+        let _ = s.on_event(stepped(Some(version())));
+        assert_eq!(
+            s.view.take_relayout_anchor(),
+            None,
+            "line 30 of another version"
+        );
+
+        let mut s = Session::placeholder();
+        s.view.carry_relayout_anchor(ScrollAnchor::Cursor {
+            screen_row_offset: 4,
+        });
+        let _ = s.on_event(Event::VersionStepped(Ok(GitStepVersionResult {
+            opened: None,
+            note: Some(VersionNote::Newest),
+        })));
+        assert_eq!(
+            s.view.take_relayout_anchor(),
+            None,
+            "nothing left to resolve later"
+        );
     }
 
     /// The window the server sends for a markdown file presented as the reader: one prose element

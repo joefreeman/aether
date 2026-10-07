@@ -7370,6 +7370,10 @@ fn space_g_brackets_step_versions() {
         let _ = key(&mut s, ' ');
         let _ = key(&mut s, 'g');
         let fx = key(&mut s, c);
+        assert!(
+            matches!(fx.0.first(), Some(Effect::SaveContentAnchor)),
+            "the anchor is captured before the step leaves this view"
+        );
         let params = find_request(&fx, "git/step_version").expect("Space g steps versions");
         assert_eq!(
             *params,
