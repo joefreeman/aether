@@ -49,11 +49,17 @@ pub struct Origin<'a> {
     pub worktree: Option<&'a str>,
 }
 
-/// Which way, and how much.
+/// Which way, and how far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
+    /// The nearest older stop.
     Older,
+    /// The nearest newer stop.
     Newer,
+    /// The end of the older walk: where the line was first added, or the file's first version.
+    Oldest,
+    /// The end of the newer walk: the working file, the line carried through every change.
+    Newest,
 }
 
 /// Where a step lands.
@@ -92,7 +98,7 @@ impl Stepped {
     }
 }
 
-/// Step one version older or newer, by file or by line.
+/// Step one version older or newer, or to either end of the walk, by file or by line.
 pub fn step(workdir: &Path, origin: &Origin<'_>, line_scope: bool, step: Step) -> Stepped {
     let Ok(repo) = git2::Repository::discover(workdir) else {
         return Stepped::note(VersionNote::Untracked);
@@ -103,12 +109,12 @@ pub fn step(workdir: &Path, origin: &Origin<'_>, line_scope: bool, step: Step) -
     };
     let Some(rev) = origin.rev else {
         return match (step, origin.worktree) {
-            (Step::Older, Some(worktree)) => {
-                history.older_than_worktree(worktree, origin.line, line_scope)
+            (Step::Older | Step::Oldest, Some(worktree)) => {
+                history.older_than_worktree(worktree, origin.line, line_scope, step == Step::Oldest)
             }
-            (Step::Older, None) => Stepped::note(VersionNote::Untracked),
+            (Step::Older | Step::Oldest, None) => Stepped::note(VersionNote::Untracked),
             // The working tree is the end of the line.
-            (Step::Newer, _) => Stepped::note(VersionNote::Newest),
+            (Step::Newer | Step::Newest, _) => Stepped::note(VersionNote::Newest),
         };
     };
     let Ok(at) = repo.revparse_single(rev).and_then(|o| o.peel_to_commit()) else {
@@ -117,7 +123,11 @@ pub fn step(workdir: &Path, origin: &Origin<'_>, line_scope: bool, step: Step) -
     match step {
         Step::Older if line_scope => history.line_older(&at, origin.line),
         Step::Older => history.file_older(&at, origin.line),
-        Step::Newer => history.newer(&at, origin.line, line_scope, origin.worktree),
+        Step::Oldest if line_scope => history.line_origin(&at, origin.line),
+        Step::Oldest => history.file_first(&at, origin.line),
+        Step::Newer => history.newer(&at, origin.line, line_scope, origin.worktree, false),
+        // Both scopes end at the working file, and the line rides along either way.
+        Step::Newest => history.newer(&at, origin.line, false, origin.worktree, true),
     }
 }
 
@@ -271,6 +281,56 @@ impl<'r> History<'r> {
         }
     }
 
+    /// Where the line was first added: [`Self::last_change`] repeated until there is no before —
+    /// the bottom of the line's walk.
+    fn origin_of(&self, version: git2::Commit<'r>, line: u32) -> Change<'r> {
+        let mut change = self.last_change(version, line);
+        for _ in 0..MAX_WALK {
+            match change.before {
+                Before::Line(parent, line) => change = self.last_change(parent, line),
+                Before::Nothing => break,
+            }
+        }
+        change
+    }
+
+    /// The version that first added the line — unless that is the version on screen.
+    fn line_origin(&self, version: &git2::Commit<'r>, line: u32) -> Stepped {
+        let origin = self.origin_of(version.clone(), line);
+        if origin.commit.id() == version.id() {
+            return Stepped::note(VersionNote::LineAdded {
+                at: Some(self.label(version)),
+            });
+        }
+        Stepped::to(self.revision(&origin.commit, origin.line))
+    }
+
+    /// The commit that created the path, down the first-parent chain from `version`.
+    fn creation_of(&self, version: git2::Commit<'r>) -> git2::Commit<'r> {
+        let mut at = version;
+        for _ in 0..MAX_WALK {
+            match at.parent(0) {
+                Ok(p) if self.blob(&p).is_some() => at = p,
+                _ => break,
+            }
+        }
+        at
+    }
+
+    /// The file's first version — unless that is the version on screen. The line is carried
+    /// across in one diff: the file's whole history is one change from here.
+    fn file_first(&self, version: &git2::Commit<'r>, line: u32) -> Stepped {
+        let first = self.creation_of(version.clone());
+        if first.id() == version.id() {
+            return Stepped::note(VersionNote::Oldest {
+                at: self.label(version),
+            });
+        }
+        let text_of = |c: &git2::Commit<'_>| self.blob(c).map(|b| self.text(b)).unwrap_or_default();
+        let line = map_to_old(&text_of(&first), &text_of(version), line).line();
+        Stepped::to(self.revision(&first, line))
+    }
+
     /// Whether `commit` changed the file — the stops of a file step. A root commit that has the
     /// file created it.
     fn touches(&self, commit: &git2::Commit<'_>) -> bool {
@@ -302,7 +362,16 @@ impl<'r> History<'r> {
     /// Older than the working tree: the working file's own change is its inline diff, so the
     /// first stop is always in HEAD's history — the commit that wrote HEAD's version of the file,
     /// or of the line.
-    fn older_than_worktree(&self, worktree: &str, line: u32, line_scope: bool) -> Stepped {
+    ///
+    /// `to_end` goes all the way instead: where the line was first added, or the file's first
+    /// version.
+    fn older_than_worktree(
+        &self,
+        worktree: &str,
+        line: u32,
+        line_scope: bool,
+        to_end: bool,
+    ) -> Stepped {
         let Some(head) = self.repo.head().ok().and_then(|h| h.peel_to_commit().ok()) else {
             return Stepped::note(VersionNote::Untracked);
         };
@@ -311,25 +380,36 @@ impl<'r> History<'r> {
         };
         let mapped = map_to_old(&self.text(head_blob), worktree, line);
         if !line_scope {
+            if to_end {
+                let first = self.creation_of(head);
+                let text = self.blob(&first).map(|b| self.text(b)).unwrap_or_default();
+                let line = map_to_old(&text, worktree, line).line();
+                return Stepped::to(self.revision(&first, line));
+            }
             return Stepped::to(self.revision(&self.introducer(head), mapped.line()));
         }
         match mapped {
             // Written in the working tree: nothing committed is a version of it.
             Mapped::Gone(_) => Stepped::note(VersionNote::LineAdded { at: None }),
             Mapped::Same(l) | Mapped::Changed(l) => {
-                let change = self.last_change(head, l);
+                let change = match to_end {
+                    true => self.origin_of(head, l),
+                    false => self.last_change(head, l),
+                };
                 Stepped::to(self.revision(&change.commit, change.line))
             }
         }
     }
 
     /// One version newer: up HEAD's first-parent chain to the next change, then the working tree.
+    /// `to_end` runs through every change to the working tree.
     fn newer(
         &self,
         version: &git2::Commit<'r>,
         line: u32,
         line_scope: bool,
         worktree: Option<&str>,
+        to_end: bool,
     ) -> Stepped {
         let Some(chain) = self.chain_above(version.id()) else {
             return Stepped::note(VersionNote::Unreachable);
@@ -348,7 +428,13 @@ impl<'r> History<'r> {
                 blob.map(|b| self.text(b)).unwrap_or_default(),
                 self.text(next),
             );
-            match map_to_new(&old, &new, line) {
+            let mapped = map_to_new(&old, &new, line);
+            if to_end {
+                // Through every change to the working file, the line carried across each.
+                (blob, line) = (Some(next), mapped.line());
+                continue;
+            }
+            match mapped {
                 Mapped::Same(l) if line_scope => line = l,
                 Mapped::Same(l) | Mapped::Changed(l) => {
                     return Stepped::to(self.revision(&commit, l));
@@ -872,6 +958,54 @@ mod tests {
         assert!(
             matches!(s.note, Some(VersionNote::LineAdded { at: Some(at) }) if at.subject == "four")
         );
+    }
+
+    #[test]
+    fn newest_runs_through_every_change_to_the_working_file() {
+        let (r, [c1, .., c4]) = three_edits();
+        // `b` from one, past two and three changing it and four inserting above it.
+        assert_eq!(
+            r.step(Some(&c1), 1, false, Step::Newest).landing,
+            working(2)
+        );
+        assert_eq!(r.step(Some(&c1), 1, true, Step::Newest).landing, working(2));
+        assert_eq!(
+            r.step(Some(&c4), 3, false, Step::Newest).landing,
+            working(3)
+        );
+        assert_eq!(
+            r.step(None, 3, false, Step::Newest).note,
+            Some(VersionNote::Newest)
+        );
+    }
+
+    #[test]
+    fn oldest_finds_where_the_line_was_first_added() {
+        let (r, [c1, _, c3, c4]) = three_edits();
+        // `b`, edited by two and three, was written by one.
+        assert_eq!(r.step(None, 2, true, Step::Oldest).landing, at(&c1, 1));
+        assert_eq!(r.step(Some(&c3), 1, true, Step::Oldest).landing, at(&c1, 1));
+        // Already there: nothing further back, and nothing moves.
+        let s = r.step(Some(&c1), 1, true, Step::Oldest);
+        assert_eq!(s.landing, None);
+        assert!(
+            matches!(s.note, Some(VersionNote::LineAdded { at: Some(at) }) if at.subject == "one")
+        );
+        // A line added partway: its origin is that commit, not the file's first.
+        assert_eq!(r.step(None, 0, true, Step::Oldest).landing, at(&c4, 0));
+    }
+
+    #[test]
+    fn oldest_by_file_is_its_first_version() {
+        let (r, [c1, .., c4]) = three_edits();
+        assert_eq!(r.step(None, 3, false, Step::Oldest).landing, at(&c1, 2));
+        assert_eq!(
+            r.step(Some(&c4), 3, false, Step::Oldest).landing,
+            at(&c1, 2)
+        );
+        let s = r.step(Some(&c1), 2, false, Step::Oldest);
+        assert_eq!(s.landing, None);
+        assert!(matches!(s.note, Some(VersionNote::Oldest { at }) if at.subject == "one"));
     }
 
     #[test]

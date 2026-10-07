@@ -1485,8 +1485,8 @@ pub struct GitFollowPatchLineResult {
 
 // ---- git/step_version ---------------------------------------------------------------------------
 
-/// Step to the neighbouring version of the file in front of you, or of its cursor line
-/// (`Space g [`/`]`, `Space g {`/`}`).
+/// Step to the neighbouring version of the file in front of you or of its cursor line
+/// (`Space g [`/`]`, `Space g m`/`Alt-m`), or to either end of that walk (`Space g {`/`}`).
 ///
 /// The stops are the commits that changed the file, or the cursor line, and each lands on the
 /// file as of that commit — which diffs against the commit's parent, so the gutter shows that
@@ -1512,6 +1512,11 @@ pub struct GitStepVersionParams {
     pub scope: VersionScope,
     /// `Backward` is older, `Forward` newer.
     pub direction: crate::cursor::Direction,
+    /// Keep going to the end of the walk rather than stopping at the nearest version: newer, the
+    /// working file (the same place by either scope); older by line, the version that first added
+    /// the line; older by file, the file's first version.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub to_end: bool,
 }
 
 /// How far a step reaches.

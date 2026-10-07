@@ -560,13 +560,16 @@ pub enum Action {
     /// `Space g w` — everything not yet committed ("working" changes), as one read-only patch
     /// buffer: the same view a commit gets, over the changes you haven't made into one yet.
     ShowWorkingChanges,
-    /// `Space g [`/`]` — the older/newer version of this file in history; `Space g {`/`}` — of
-    /// the cursor line, skipping every version that left it alone. Brackets are the wide scope and
-    /// braces the narrow one, as they are for the jumplist. Works from the working file and from a
-    /// file at a revision, so repeated presses walk the history.
+    /// Walk the file's versions in history. `Space g [`/`]` step to the older/newer version of
+    /// the file; `Space g m`/`Alt-m` to the older/newer version of the cursor line, skipping every
+    /// version that left it alone — `m` beside `Space m`, the line's blame, since walking a line
+    /// back *is* walking its blame. Braces go to the ends (`to_end`): `Space g }` the working file,
+    /// `Space g {` the version that first added the cursor line. Works from the working file and
+    /// from a file at a revision, so repeated presses walk the history.
     StepVersion {
         scope: VersionScope,
         dir: Direction,
+        to_end: bool,
     },
     /// `Space g Alt-p` — publish the current branch's commits (`↑ahead`). Never force-pushes: the
     /// Alt slot here is the *outward* sibling of pull, not an escalation of it, and force-push has
@@ -1699,10 +1702,12 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('c'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
     bind!(LG, ch('z'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
     bind!(LG, ch('w'), Exact(Mods::NONE), A::ShowWorkingChanges, "Git", "Working changes (uncommitted diff)"),
-    bind!(LG, ch('['), Exact(Mods::NONE), A::StepVersion { scope: VersionScope::File, dir: Direction::Backward }, "Git", "Older version of this file"),
-    bind!(LG, ch(']'), Exact(Mods::NONE), A::StepVersion { scope: VersionScope::File, dir: Direction::Forward }, "Git", "Newer version of this file"),
-    bind!(LG, ch('{'), IgnoreShift(Mods::NONE), A::StepVersion { scope: VersionScope::Line, dir: Direction::Backward }, "Git", "Older version of the cursor line"),
-    bind!(LG, ch('}'), IgnoreShift(Mods::NONE), A::StepVersion { scope: VersionScope::Line, dir: Direction::Forward }, "Git", "Newer version of the cursor line"),
+    bind!(LG, ch('['), Exact(Mods::NONE), A::StepVersion { scope: VersionScope::File, dir: Direction::Backward, to_end: false }, "Git", "Older version of this file"),
+    bind!(LG, ch(']'), Exact(Mods::NONE), A::StepVersion { scope: VersionScope::File, dir: Direction::Forward, to_end: false }, "Git", "Newer version of this file"),
+    bind!(LG, ch('m'), Exact(Mods::NONE), A::StepVersion { scope: VersionScope::Line, dir: Direction::Backward, to_end: false }, "Git", "Older version of the cursor line"),
+    bind!(LG, ch('m'), Exact(Mods::ALT), A::StepVersion { scope: VersionScope::Line, dir: Direction::Forward, to_end: false }, "Git", "Newer version of the cursor line"),
+    bind!(LG, ch('{'), IgnoreShift(Mods::NONE), A::StepVersion { scope: VersionScope::Line, dir: Direction::Backward, to_end: true }, "Git", "Version that first added the cursor line"),
+    bind!(LG, ch('}'), IgnoreShift(Mods::NONE), A::StepVersion { scope: VersionScope::File, dir: Direction::Forward, to_end: true }, "Git", "Latest version of this file (the working file)"),
     bind!(LG, ch('f'), Exact(Mods::NONE), A::GitFetch, "Git", "Fetch from remote"),
     bind!(LG, ch('p'), Exact(Mods::NONE), A::GitPull, "Git", "Pull from remote"),
     bind!(LG, ch('p'), Exact(Mods::ALT), A::GitPush, "Git", "Push commits to remote"),
@@ -2413,37 +2418,28 @@ mod tests {
             git(ch('w'), Mods::NONE),
             Some(Action::ShowWorkingChanges)
         ));
-        // Version steps: brackets walk the file's versions, braces the cursor line's — the wide
-        // and narrow scopes, as on the jumplist. A brace arrives shifted from most keyboards.
-        assert!(matches!(
-            git(ch('['), Mods::NONE),
-            Some(Action::StepVersion {
-                scope: VersionScope::File,
-                dir: Direction::Backward
-            })
-        ));
-        assert!(matches!(
-            git(ch(']'), Mods::NONE),
-            Some(Action::StepVersion {
-                scope: VersionScope::File,
-                dir: Direction::Forward
-            })
-        ));
-        for mods in [Mods::NONE, Mods::SHIFT] {
-            assert!(matches!(
-                git(ch('{'), mods),
-                Some(Action::StepVersion {
-                    scope: VersionScope::Line,
-                    dir: Direction::Backward
-                })
-            ));
-            assert!(matches!(
-                git(ch('}'), mods),
-                Some(Action::StepVersion {
-                    scope: VersionScope::Line,
-                    dir: Direction::Forward
-                })
-            ));
+        // Version steps: brackets step the file's versions, `m`/`Alt-m` the cursor line's (`m`
+        // beside `Space m`, the line's blame), and braces go to the ends — the line's first
+        // version, and the working file. A brace arrives shifted from most keyboards.
+        let step = |scope, dir, to_end| Action::StepVersion { scope, dir, to_end };
+        use Direction::{Backward, Forward};
+        use VersionScope::{File, Line};
+        for (code, mods, want) in [
+            (ch('['), Mods::NONE, step(File, Backward, false)),
+            (ch(']'), Mods::NONE, step(File, Forward, false)),
+            (ch('m'), Mods::NONE, step(Line, Backward, false)),
+            (ch('m'), Mods::ALT, step(Line, Forward, false)),
+            (ch('{'), Mods::NONE, step(Line, Backward, true)),
+            (ch('{'), Mods::SHIFT, step(Line, Backward, true)),
+            (ch('}'), Mods::NONE, step(File, Forward, true)),
+            (ch('}'), Mods::SHIFT, step(File, Forward, true)),
+        ] {
+            // `Action` has no `PartialEq`; its Debug form names every field.
+            assert_eq!(
+                format!("{:?}", git(code, mods)),
+                format!("{:?}", Some(want)),
+                "Space g {code:?} {mods:?}"
+            );
         }
         // A key with no git meaning resolves to nothing, so the chord just cancels.
         assert!(git(ch('j'), Mods::NONE).is_none());

@@ -13319,12 +13319,24 @@ async fn step_version(
     scope: aether_protocol::git::VersionScope,
     direction: Direction,
 ) -> aether_protocol::git::GitStepVersionResult {
+    step_versions(ws, buffer_id, scope, direction, false).await
+}
+
+/// Step `buffer_id` one version along, or with `to_end` all the way.
+async fn step_versions(
+    ws: &mut Ws,
+    buffer_id: u64,
+    scope: aether_protocol::git::VersionScope,
+    direction: Direction,
+    to_end: bool,
+) -> aether_protocol::git::GitStepVersionResult {
     send_request::<aether_protocol::git::GitStepVersion>(
         ws,
         &aether_protocol::git::GitStepVersionParams {
             buffer_id,
             scope,
             direction,
+            to_end,
         },
     )
     .await
@@ -13592,6 +13604,45 @@ async fn a_version_step_keeps_the_reader_mode() {
         .unwrap();
     assert_eq!(home.buffer_id, working);
     assert!(home.read, "reading the working file, as the walk was");
+
+    drop(server);
+}
+
+/// The ends of the walk: `Space g {` goes straight to where the cursor line was first added, past
+/// every edit to it, and `Space g }` straight back to the working file with the line carried
+/// through every change on the way.
+#[tokio::test]
+async fn version_steps_go_to_either_end() {
+    use aether_protocol::git::{
+        VersionNote,
+        VersionScope::{File, Line},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let [one, ..] = three_versions(dir.path());
+    let (server, mut ws, working) = setup_git_apply(dir.path(), "versions", "a.rs").await;
+    set_point_cursor(&mut ws, working, LogicalPosition { line: 2, col: 0 }).await;
+
+    let origin = step_versions(&mut ws, working, Line, Direction::Backward, true)
+        .await
+        .opened
+        .expect("where `let x` was first added");
+    assert_eq!(origin.commit.as_deref(), Some(one.as_str()));
+    assert_eq!(origin.cursor.position.line, 1);
+    let already = step_versions(&mut ws, origin.buffer_id, Line, Direction::Backward, true).await;
+    assert!(already.opened.is_none(), "nothing further back");
+    assert!(matches!(already.note, Some(VersionNote::LineAdded { .. })));
+
+    let latest = step_versions(&mut ws, origin.buffer_id, File, Direction::Forward, true)
+        .await
+        .opened
+        .expect("the working file");
+    assert_eq!(latest.buffer_id, working);
+    assert_eq!(
+        latest.cursor.position.line, 2,
+        "carried past two's edit and three's header"
+    );
+    let newest = step_versions(&mut ws, working, File, Direction::Forward, true).await;
+    assert_eq!(newest.note, Some(VersionNote::Newest));
 
     drop(server);
 }

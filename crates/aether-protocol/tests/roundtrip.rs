@@ -3456,12 +3456,17 @@ fn step_version_shape() {
         buffer_id: 7,
         scope: VersionScope::Line,
         direction: Direction::Backward,
+        to_end: false,
     })
     .unwrap();
     assert_eq!(
         v,
-        json!({ "buffer_id": 7, "scope": "line", "direction": "backward" })
+        json!({ "buffer_id": 7, "scope": "line", "direction": "backward" }),
+        "a single step is the default, so the flag stays off the wire"
     );
+    let v = json!({ "buffer_id": 7, "scope": "file", "direction": "forward", "to_end": true });
+    let back: GitStepVersionParams = from_value(v).unwrap();
+    assert!(back.to_end, "to the end of the walk");
     assert_eq!(to_value(VersionScope::File).unwrap(), json!("file"));
 
     // Nowhere to go and nothing to say never happens, but each half drops off the wire alone.

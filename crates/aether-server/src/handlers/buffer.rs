@@ -2242,9 +2242,11 @@ pub async fn git_step_version(
         )
     };
 
-    let step = match params.direction {
-        Direction::Backward => Step::Older,
-        Direction::Forward => Step::Newer,
+    let step = match (params.direction, params.to_end) {
+        (Direction::Backward, false) => Step::Older,
+        (Direction::Forward, false) => Step::Newer,
+        (Direction::Backward, true) => Step::Oldest,
+        (Direction::Forward, true) => Step::Newest,
     };
     let line_scope = params.scope == VersionScope::Line;
     let stepped = tokio::task::spawn_blocking({

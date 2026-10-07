@@ -7355,31 +7355,34 @@ fn space_g_f_fetches() {
     assert!(req.get("buffer_id").is_some());
 }
 
-/// `Space g [`/`]` step the file's versions and `Space g {`/`}` the cursor line's. The request
-/// names the buffer and nothing positional — the cursor line is the server's.
+/// `Space g [`/`]` step the file's versions, `Space g m`/`Alt-m` the cursor line's, and braces go
+/// to the ends of the walk. The request names the buffer and nothing positional — the cursor line
+/// is the server's.
 #[test]
-fn space_g_brackets_step_versions() {
-    for (c, scope, direction) in [
-        ('[', "file", "backward"),
-        (']', "file", "forward"),
-        ('{', "line", "backward"),
-        ('}', "line", "forward"),
+fn space_g_steps_versions() {
+    for (c, mods, scope, direction, to_end) in [
+        ('[', Mods::NONE, "file", "backward", false),
+        (']', Mods::NONE, "file", "forward", false),
+        ('m', Mods::NONE, "line", "backward", false),
+        ('m', Mods::ALT, "line", "forward", false),
+        ('{', Mods::NONE, "line", "backward", true),
+        ('}', Mods::NONE, "file", "forward", true),
     ] {
         let mut s = session();
         s.view.buffer.buffer_id = 7;
         let _ = key(&mut s, ' ');
         let _ = key(&mut s, 'g');
-        let fx = key(&mut s, c);
+        let fx = s.on_key(KeyCode::Char(c), mods, None);
         assert!(
             matches!(fx.0.first(), Some(Effect::SaveContentAnchor)),
             "the anchor is captured before the step leaves this view"
         );
         let params = find_request(&fx, "git/step_version").expect("Space g steps versions");
-        assert_eq!(
-            *params,
-            json!({ "buffer_id": 7, "scope": scope, "direction": direction }),
-            "Space g {c}"
-        );
+        let mut want = json!({ "buffer_id": 7, "scope": scope, "direction": direction });
+        if to_end {
+            want["to_end"] = json!(true);
+        }
+        assert_eq!(*params, want, "Space g {c} {mods:?}");
     }
 }
 

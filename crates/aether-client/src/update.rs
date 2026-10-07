@@ -11519,12 +11519,13 @@ impl Session {
             // The content anchor is captured first, while the shell can still say where this view
             // is scrolled: the version arrives as another buffer, and keeping the cursor on the
             // same screen row is what keeps the page still across the step.
-            A::StepVersion { scope, dir } => Effects::one(Effect::SaveContentAnchor).and(
+            A::StepVersion { scope, dir, to_end } => Effects::one(Effect::SaveContentAnchor).and(
                 self.request_str::<aether_protocol::git::GitStepVersion>(
                     aether_protocol::git::GitStepVersionParams {
                         buffer_id: self.view.buffer.buffer_id,
                         scope,
                         direction: dir,
+                        to_end,
                     },
                     Event::VersionStepped,
                 ),
