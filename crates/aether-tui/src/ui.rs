@@ -5134,23 +5134,37 @@ fn draw_read_view(f: &mut Frame, state: &AppState, area: Rect) {
         // link, the link's containing block keeps its bar (two projections of one cursor).
         // `bar_rows` is the focused block's whole subtree (nested items included).
         let row_focused = rv.bar_rows.is_some_and(|(a, b)| idx >= a && idx <= b);
-        // An extended selection tints its blocks' rows with the editor's selection shade:
-        // page-background cells swap to the selection shade at push time (`finish_row`); spans with
-        // their own background — code panels, chips — keep it, exactly like the table band. Blank
-        // separator rows inside the range stay on the page background (only their gutter stub would
-        // tint) — per-block bands with clean gaps, matching the GUI/web per-block tint.
+        // An extended selection tints its blocks' rows with the editor's selection shade, applied
+        // at push time (`finish_row`): page-background cells take the selection shade, and a raised
+        // surface — a code panel, a chip, a quote, a table's header and stripes — takes its deeper
+        // shade, so the block keeps its structure in two shades of the selection instead of its own
+        // surfaces punching holes in the tint. A search's fills keep theirs: they are what is being
+        // looked at. Each selected row runs to the measure's edge, so a short heading is as much a
+        // band as a long paragraph. Blank separator rows inside the range stay on the page
+        // background — per-block bands with clean gaps, matching the GUI/web per-block tint.
         let row_selected =
             rv.sel_rows.is_some_and(|(a, b)| idx >= a && idx <= b) && !row.spans.is_empty();
-        let finish_row = move |spans: Vec<Span<'static>>| -> Line<'static> {
+        let measure = content.width as usize;
+        let finish_row = move |mut spans: Vec<Span<'static>>| -> Line<'static> {
             if !row_selected {
                 return Line::from(spans);
             }
+            let used: usize = spans.iter().map(|s| s.content.width()).sum();
+            if used < measure {
+                spans.push(Span::raw(" ".repeat(measure - used)));
+            }
+            let page = |bg: Option<Color>| bg.is_none() || bg == Some(c(th().bg_app));
+            let searched = |bg: Option<Color>| {
+                bg == Some(c(th().search_hit_bg)) || bg == Some(c(th().search_current_bg))
+            };
             Line::from(
                 spans
                     .into_iter()
                     .map(|mut s| {
-                        if s.style.bg.is_none() || s.style.bg == Some(c(th().bg_app)) {
+                        if page(s.style.bg) {
                             s.style = s.style.bg(c(th().bg_visual));
+                        } else if !searched(s.style.bg) {
+                            s.style = s.style.bg(c(th().bg_visual_raised));
                         }
                         s
                     })
@@ -13854,6 +13868,11 @@ mod read_surface_tests {
 
     /// Paint a document in the reading view and return each row as `(text, background colours)`.
     fn painted(md: &str, cols: u16, rows: u16) -> Vec<(String, Vec<Color>)> {
+        painted_with(md, cols, rows, false)
+    }
+
+    /// [`painted`], with the whole document selected when `selected`.
+    fn painted_with(md: &str, cols: u16, rows: u16, selected: bool) -> Vec<(String, Vec<Color>)> {
         let blocks = aether_client::markdown::parse(md);
         let stops = aether_client::markdown::stops(&blocks);
         let (content_cols, _) =
@@ -13865,10 +13884,11 @@ mod read_surface_tests {
             &std::collections::HashMap::new(),
         );
         let mut state = crate::app::test_state(crate::app::test_editor_state());
+        let sel_rows = selected.then(|| (0, laid.len().saturating_sub(1)));
         state.read = Some(crate::app::ReadViewState {
             rows: std::sync::Arc::new(laid),
             bar_rows: None,
-            sel_rows: None,
+            sel_rows,
             target_focus: None,
             scroll: 0,
             hscroll: std::collections::HashMap::new(),
@@ -13892,6 +13912,45 @@ mod read_surface_tests {
                 (text.trim_end().to_string(), bgs)
             })
             .collect()
+    }
+
+    /// A selected block keeps its structure in two shades of the selection: the page under it takes
+    /// the selection shade, and its raised surfaces — a code chip, a table's header and stripes —
+    /// the deeper one, rather than punching holes in the tint with their own shades. Every selected
+    /// row runs to the measure's edge, a short heading included.
+    #[test]
+    fn a_selected_block_is_tinted_through_its_surfaces() {
+        let md = "Type `Space y` for the list.\n\n# Motions\n\n| Key | Action |\n|---|---|\n| `h` | left |\n| `j` | down |\n| `k` | up |\n";
+        let rows = painted_with(md, 70, 24, true);
+        let unselected = [c(th().md_chip_bg), c(th().md_code_bg), c(th().md_panel_bg)];
+        let content: Vec<&(String, Vec<Color>)> =
+            rows.iter().filter(|(t, _)| !t.trim().is_empty()).collect();
+        for (text, bgs) in &content {
+            assert!(
+                !bgs.iter().any(|bg| unselected.contains(bg)),
+                "an unselected surface shows through the selection on {text:?}: {bgs:?}"
+            );
+        }
+        let all: Vec<Color> = content
+            .iter()
+            .flat_map(|(_, b)| b.iter().copied())
+            .collect();
+        assert!(all.contains(&c(th().bg_visual)), "the selection shade");
+        assert!(
+            all.contains(&c(th().bg_visual_raised)),
+            "the chips, header and stripes in the deeper one"
+        );
+        let heading = rows
+            .iter()
+            .find(|(t, _)| t.contains("Motions"))
+            .expect("the heading");
+        let (measure, margin) = read_measure(70, aether_protocol::settings::MarkdownWidth::Narrow);
+        let edge = (margin + measure + READ_GUTTER - 1) as usize;
+        assert_eq!(
+            heading.1[edge.min(69)],
+            c(th().bg_visual),
+            "the heading's band runs to the measure's edge"
+        );
     }
 
     /// A quote is a **panel**: its rows carry the quote shade across the interior, not just the

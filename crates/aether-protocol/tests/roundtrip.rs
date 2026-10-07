@@ -1529,6 +1529,7 @@ fn search_wire_shapes() {
         truncated: false,
         current_index: 3,
         folded: 0,
+        generation: 0,
     };
     assert_eq!(
         to_value(&summary).unwrap(),
@@ -7467,6 +7468,7 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
             truncated: false,
             current_index: 0,
             folded: 0,
+            generation: 0,
         }),
         max_line_width: 0,
         // `None` would be skipped, and a field that never serialises cannot be checked.

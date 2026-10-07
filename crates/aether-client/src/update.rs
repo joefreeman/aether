@@ -1232,9 +1232,9 @@ impl Session {
 
             Event::SearchApplied(Ok(r)) => {
                 let zero = r.summary.total == 0;
-                let index = r.summary.current_index;
+                let (index, generation) = (r.summary.current_index, r.summary.generation);
                 self.view.search.summary = Some(r.summary);
-                let fx = self.adopt_search_landing(index, r.cursor, r.crossed);
+                let fx = self.adopt_search_landing(index, generation, r.cursor, r.crossed);
                 if zero {
                     // A failed keystroke shouldn't strand the user wherever the previous
                     // query had jumped them.
@@ -1252,6 +1252,7 @@ impl Session {
                     truncated: false,
                     current_index: 0,
                     folded: 0,
+                    generation: 0,
                 });
                 // Re-fires on every keystroke of an in-progress bad pattern; grouped so the shells
                 // refresh one toast in place rather than stacking one per key.
@@ -1266,9 +1267,9 @@ impl Session {
             Event::SearchRestored(Err(e)) => Effects::error_detail("Search failed", e),
 
             Event::SearchNav(Ok(r)) => {
-                let index = r.summary.current_index;
+                let (index, generation) = (r.summary.current_index, r.summary.generation);
                 self.view.search.summary = Some(r.summary);
-                let fx = self.adopt_search_landing(index, r.cursor, r.crossed);
+                let fx = self.adopt_search_landing(index, generation, r.cursor, r.crossed);
                 fx.and(Effects::one(Effect::RevealCursor(RevealStyle::Jump)))
             }
             Event::SearchNav(Err(e)) => Effects::error_detail("Search failed", e),
@@ -2187,10 +2188,9 @@ impl Session {
             },
 
             Event::ActionInvoked(result) => match result {
-                Ok(r) => {
-                    self.replace_window(r.window);
-                    Effects::one(Effect::WindowAdopted)
-                }
+                Ok(r) => self
+                    .replace_window(r.window)
+                    .and(Effects::one(Effect::WindowAdopted)),
                 // The refusal an element gives back for a button it no longer offers — a
                 // permission already answered, most often. Said out loud rather than swallowed:
                 // a window that came back identical is indistinguishable from a dropped press.
@@ -2200,8 +2200,9 @@ impl Session {
             Event::DiffViewSet { enabled, result } => match result {
                 Ok(r) => {
                     self.diff_view = enabled;
-                    self.replace_window(r.window);
-                    let mut fx = Effects::one(Effect::WindowAdopted);
+                    let mut fx = self
+                        .replace_window(r.window)
+                        .and(Effects::one(Effect::WindowAdopted));
                     // Grouped so repeated toggling updates one toast in place rather than stacking.
                     fx.push(Effect::Toast {
                         title: format!("Diff {}", if enabled { "on" } else { "off" }),
@@ -4171,6 +4172,7 @@ impl Session {
     /// this is, and a reader's parse asks for its fence highlights.
     pub fn adopt_subscribe(&mut self, res: ViewportSubscribeResult) -> Effects {
         self.view.viewport_id = Some(res.viewport_id);
+        let waiting = self.view.search_landing().is_none();
         self.adopt_search_summary(res.window.search.clone());
         self.view.window = Some(res.window);
         // The server decides which element holds the cursor (from the scroll the subscribe named,
@@ -4194,15 +4196,17 @@ impl Session {
         // After the rebind, deliberately: the status is about the buffer named above, and its
         // external-change notice is the one thing here that speaks to the user.
         let status_fx = self.adopt_buffer_status(res.buffer_status);
-        status_fx.and(self.sync_read_presentation())
+        status_fx
+            .and(self.sync_read_presentation())
+            .and(self.search_landing_ready(waiting))
     }
 
     /// Adopt the window from a geometry RPC the shell issued (`view/window`, `view/set_wrap`,
     /// `view/resize`). Pure core state; the shell clamps its scroll and reveals the cursor around it.
     /// The effects are the reading view's, as for [`Self::adopt_subscribe`].
     pub fn adopt_window(&mut self, res: ViewportWindowResult) -> Effects {
-        self.replace_window(res.window);
-        self.sync_read_presentation()
+        let fx = self.replace_window(res.window);
+        fx.and(self.sync_read_presentation())
     }
 
     /// Replace the window of the view on screen, keeping the caret in the shell's input if that
@@ -4212,14 +4216,31 @@ impl Session {
     /// number that named the input before this window names the new run in it. The server moves
     /// its own focus the same way when it rebuilds the view; doing it here too is what keeps the
     /// two agreeing without a focus field on every push.
-    fn replace_window(&mut self, window: aether_protocol::viewport::Window) {
+    ///
+    /// Answers with the reveal a search landing was waiting on, if this is the window that carries
+    /// its marks (see [`ViewState::search_landing`]).
+    #[must_use]
+    fn replace_window(&mut self, window: aether_protocol::viewport::Window) -> Effects {
         let on_input = self.shell_input_focused();
+        let waiting = self.view.search_landing().is_none();
         self.adopt_search_summary(window.search.clone());
         self.view.window = Some(window);
         if on_input {
             if let Some(input) = self.shell_input() {
                 self.view.focused_element = input;
             }
+        }
+        self.search_landing_ready(waiting)
+    }
+
+    /// The reveal a search landing owes now that the window on screen marks it — when it was still
+    /// `waiting` for one before. Revealing at the answer would have aimed at the previous search's
+    /// marks; this is the first moment the match has a place.
+    fn search_landing_ready(&self, waiting: bool) -> Effects {
+        if waiting && self.view.search_landing().is_some() {
+            Effects::one(Effect::RevealCursor(RevealStyle::Jump))
+        } else {
+            Effects::none()
         }
     }
 
@@ -7465,10 +7486,12 @@ impl Session {
                 if let Some(cursor) = p.cursor {
                     self.view.buffer.cursor = cursor;
                 }
-                self.replace_window(p.window);
+                let landed_fx = self.replace_window(p.window);
                 // A reader's lines are all in the window, so this is also its re-parse.
                 let read_fx = self.sync_read_presentation();
-                Effects::one(Effect::WindowAdopted).and(read_fx)
+                Effects::one(Effect::WindowAdopted)
+                    .and(read_fx)
+                    .and(landed_fx)
             }
             GitBlameChanged::NAME => {
                 // The blame-follow push (`git/set_blame_follow`): the settled cursor line's
@@ -7977,10 +8000,11 @@ impl Session {
     fn adopt_search_landing(
         &mut self,
         index: u32,
+        generation: u32,
         cursor: CursorState,
         crossed: Option<ViewportFocusElementResult>,
     ) -> Effects {
-        self.view.search.landing = Some((index, cursor));
+        self.view.search.landing = Some((index, cursor, generation));
         match crossed {
             Some(crossed) => {
                 let (_moved, fx) = self.adopt_focus(crossed);

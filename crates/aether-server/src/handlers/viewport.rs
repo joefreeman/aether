@@ -3846,6 +3846,7 @@ mod tests {
                 truncated,
                 current: None,
                 last_pushed_index: 0,
+                generation: 1,
             },
         );
     }

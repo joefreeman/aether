@@ -39,6 +39,7 @@ fn summary_of(s: &ServerState, client_id: ClientId, view_id: ViewId) -> SearchSu
             truncated: false,
             current_index: 0,
             folded: 0,
+            generation: 0,
         },
     }
 }
@@ -280,6 +281,8 @@ pub async fn search_set(
         let regex = picker_state::build_match_regex(&params.query, &params.options)
             .map_err(|e| RpcError::new(ErrorCode::INVALID_PARAMS, format!("invalid regex: {e}")))?;
         let (matches, truncated) = view_search::find(&s, client_id, view_id, &regex);
+        s.search_generation += 1;
+        let generation = s.search_generation;
         s.searches.insert(
             key,
             ViewSearch {
@@ -289,6 +292,7 @@ pub async fn search_set(
                 truncated,
                 current: None,
                 last_pushed_index: 0,
+                generation,
             },
         );
         // A real search owns the highlight layer: drop any symbol-highlight set so it can't show

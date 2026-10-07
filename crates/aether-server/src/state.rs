@@ -119,6 +119,9 @@ pub struct ServerState {
     /// the client disconnects / the view closes. Re-run whenever the view's composition changes or
     /// a document it windows mutates ([`crate::view_search::refresh_view`]).
     pub searches: HashMap<(ClientId, ViewId), crate::view_search::ViewSearch>,
+    /// The last [`crate::view_search::ViewSearch::generation`] handed out — every search's matches
+    /// found afresh take the next.
+    pub search_generation: u32,
     /// Per-`(client, buffer)` active sneak (`s`/`S`) word-jump session. Set/refined by
     /// `sneak/update`, cleared by `sneak/select` / `sneak/cancel` or when the client disconnects /
     /// the buffer closes. Purely transient view-layer state — no buffer mutation happens during a
@@ -848,6 +851,7 @@ impl ServerState {
             virtual_col: HashMap::new(),
             tree_selection_history: HashMap::new(),
             searches: HashMap::new(),
+            search_generation: 0,
             sneaks: HashMap::new(),
             symbol_highlights: HashMap::new(),
             symbol_highlight_gen: HashMap::new(),

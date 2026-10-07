@@ -101,6 +101,8 @@ pub struct ViewSearch {
     /// `current_index` as last pushed in `search/state_changed`, so a cursor move that does not
     /// change it sends nothing.
     pub last_pushed_index: u32,
+    /// Which finding of the matches this is — see [`SearchSummary::generation`].
+    pub generation: u32,
 }
 
 /// Whether the viewport is showing a match.
@@ -446,6 +448,7 @@ pub fn summary(
         truncated: search.truncated,
         current_index,
         folded,
+        generation: search.generation,
     }
 }
 
@@ -487,11 +490,14 @@ pub fn derive_current(
 /// match still exists and isn't text (text re-derives from the cursor, which an edit moves with
 /// it). `false` when the query no longer builds — never, for a query that built once.
 pub fn recompute(
-    s: &ServerState,
+    s: &mut ServerState,
     client_id: aether_protocol::ClientId,
     view_id: ViewId,
     search: &mut ViewSearch,
 ) -> bool {
+    s.search_generation += 1;
+    search.generation = s.search_generation;
+    let s = &*s;
     let Some(view) = s.views.get(&view_id) else {
         return false;
     };

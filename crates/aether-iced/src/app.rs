@@ -6391,7 +6391,14 @@ impl App {
         // The probe measures this container's bounds, and it finding nothing is what made
         // `;`/`Alt-;` silently do nothing for anything but a top-level block (list *items*
         // anchor themselves in the List arm below, since an item is not a block).
-        let p = self.palette();
+        //
+        // A selected block draws itself and everything in it from the selection's palette, whose
+        // raised surfaces are the selection's deeper shade.
+        let p = if span_selected(sel, b.span()) {
+            theme::selected_palette(self.session.theme)
+        } else {
+            self.palette()
+        };
         let el = match b {
             MdBlock::Heading { level, content, .. } => {
                 let size = read_heading_size(*level, body);
@@ -6457,7 +6464,7 @@ impl App {
                 head,
                 rows,
                 ..
-            } => self.read_table(alignments, head, rows, body, target),
+            } => self.read_table(alignments, head, rows, body, target, p),
             MdBlock::Image {
                 src,
                 alt,
@@ -6830,6 +6837,7 @@ impl App {
         rows: &[Vec<Vec<MdInline>>],
         body: f32,
         target: Option<MdSpan>,
+        p: &'static theme::Palette,
     ) -> Element<'static, ReadMsg> {
         let ncols = rows
             .iter()
@@ -6859,7 +6867,6 @@ impl App {
                 }
             }
         }
-        let p = self.palette();
         let widths = table_column_widths(&naturals, &minimums, self.read_table_avail(body));
         let cell = |content: &[MdInline], header: bool, w: f32| -> Element<'static, ReadMsg> {
             let color = if header { p.fg_bright } else { p.fg };

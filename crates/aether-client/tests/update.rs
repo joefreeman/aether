@@ -1393,27 +1393,40 @@ fn a_reveal_follows_the_button_tab_reached() {
 /// A search step that lands on a match inside prose — a reply, which holds no cursor — reveals the
 /// match where the shell drew it, not the cursor and not the top of the reply. Once anything else
 /// moves the cursor, the reveal is the cursor's again.
+///
+/// The answer to a search arrives **before** the repaint that marks it (the server writes replies
+/// ahead of pushes), so until that window is on screen the landing waits — revealing then would
+/// aim at the previous search's marks, which is what left the first match of a fresh `/` off
+/// screen. The window that carries the marks is what asks for the reveal.
 #[test]
 fn a_reveal_follows_a_search_landing_into_prose() {
+    use aether_client::effect::RevealStyle;
     use aether_client::update::Event;
-    use aether_protocol::viewport::Element;
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::viewport::ViewportLinesChanged;
     let mut s = session();
     s.view.viewport_id = Some(7);
-    let reply = Element::Prose {
-        element: 1,
-        blocks: vec![],
-        source: Default::default(),
+    s.view.search.active = true;
+    let window = |generation: u32| {
+        json!({
+            "root": {"node": "column", "children": [
+                {"node": "row", "band": "chrome", "children": [{"node": "text", "text": "you"}]},
+                {"node": "prose", "element": 1, "blocks": [], "source": {"starts": [0], "byte_len": 0}},
+            ]},
+            "max_line_width": 0,
+            "search": {"view_id": 0, "total": 3, "truncated": false, "current_index": 2,
+                       "generation": generation},
+        })
     };
-    s.view.window = Some(aether_protocol::viewport::Window {
-        search: None,
-        other_elements_dirty: false,
-        max_line_width: 0,
-        git_status: None,
-        root: Element::column(vec![
-            Element::chrome(vec![Element::text("you", vec![])]),
-            reply,
-        ]),
-    });
+    let push = |generation: u32| {
+        Event::ServerPush(Notification {
+            jsonrpc: JsonRpc,
+            method: ViewportLinesChanged::NAME.into(),
+            params: json!({"viewport_id": 7, "buffer": 0, "revision": 0, "window": window(generation)}),
+        })
+    };
+    // The previous search's window is on screen.
+    let _ = s.on_event(push(1));
     let mut measured = aether_client::grid::Measured::default();
     measured.elements.insert(
         1,
@@ -1428,13 +1441,28 @@ fn a_reveal_follows_a_search_landing_into_prose() {
             }],
         },
     );
-    s.view.search.active = true;
+
+    // The answer to the new search, ahead of its repaint: nothing to reveal by yet.
     let landed = s.view.buffer.cursor;
     let _ = s.on_event(Event::SearchNav(Ok(serde_json::from_value(json!({
         "cursor": landed,
-        "summary": { "view_id": 0, "total": 3, "truncated": false, "current_index": 2 },
+        "summary": { "view_id": 0, "total": 3, "truncated": false, "current_index": 2,
+                     "generation": 2 },
     }))
     .unwrap())));
+    assert_eq!(
+        s.view.search_landing(),
+        None,
+        "the window on screen marks another search"
+    );
+
+    // Its repaint arrives, carrying its marks: the landing counts, and asks for its reveal.
+    let fx = s.on_event(push(2));
+    assert!(
+        fx.0.iter()
+            .any(|e| matches!(e, Effect::RevealCursor(RevealStyle::Jump))),
+        "the window that marks the match asks for the reveal it was waiting on"
+    );
     assert_eq!(
         s.view.reveal_row(&measured),
         Some(aether_protocol::coords::VisualRow(31)),

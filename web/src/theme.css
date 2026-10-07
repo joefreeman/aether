@@ -42,6 +42,7 @@
   --bg-panel: var(--nord1); /* panels, picker surfaces */
   --bg-selection: var(--nord2); /* chrome selection: picker active row, chips */
   --bg-visual: var(--nord10); /* content selection: visual mode, and the reader's blocks */
+  --bg-visual-raised: #485e7b; /* a raised surface (chip, code panel, table band) inside a selection */
   --fill-dim: var(--nord3); /* muted fills: search-hit tint, sneak word band */
   --sneak-prefix-bg: var(--nord3-bright); /* sneak typed-prefix band */
   --match-highlight: var(--nord13); /* fuzzy-match/sneak emphasis: picker match chars, the sneak label */
@@ -178,6 +179,7 @@
   --bg-panel: var(--nord5);
   --bg-selection: var(--nord4);
   --bg-visual: #c2d6e7; /* pale Frost — dark text stays readable inside a selection */
+  --bg-visual-raised: #adc6dd; /* a step deeper Frost */
   --fill-dim: #d8dfe8;
   --sneak-prefix-bg: #c4cedb; /* darker than fill-dim: prominence inverts on light */
   --match-highlight: #9a7522; /* = warning today; free to diverge */
@@ -2153,6 +2155,17 @@ a.picker-row:not(.selected):hover .picker-main {
 .md-read :where(p, h1, h2, h3, h4, h5, h6, li, blockquote, .md-codeblock, .md-table-outer,
     .md-rawhtml, .md-front-matter, .md-footnote-def, .md-rule, .md-image-block).md-selected {
   background: var(--bg-visual);
+}
+/* Inside a selection a raised surface keeps its shape in a deeper shade of the selection — a code
+   chip, a code panel, a quote, a table's header and stripes — rather than punching a hole in it
+   with its unselected shade. */
+.md-read .md-selected :not(pre) > code,
+.md-read .md-codeblock.md-selected,
+.md-read blockquote.md-selected,
+.md-read .md-selected blockquote,
+.md-read .md-selected th,
+.md-read .md-selected tbody tr:nth-child(even) {
+  background: var(--bg-visual-raised);
 }
 /* The Enter target — the interactive span (link, footnote ref, image) the cursor sits inside —
    inverts *on top of* the block bar: the bar says "you are reading here", the pill says "Enter

@@ -2011,7 +2011,12 @@ async fn the_count_rides_the_window_an_edit_pushes() {
         },
     )
     .await;
-    assert_eq!(search(&mut ws, view, "foo", None).await.summary.total, 1);
+    let set = search(&mut ws, view, "foo", None).await;
+    assert_eq!(set.summary.total, 1);
+    assert!(
+        set.summary.generation > 0,
+        "a search's matches carry their generation"
+    );
     let _: EditResult = send_request::<InputText>(
         &mut ws,
         &InputTextParams {
@@ -2030,6 +2035,12 @@ async fn the_count_rides_the_window_an_edit_pushes() {
             break p;
         }
     };
-    assert_eq!(edited.window.search.map(|s| s.total), Some(2));
+    let summary = edited.window.search.expect("the count rides the window");
+    assert_eq!(summary.total, 2);
+    assert!(
+        summary.generation > set.summary.generation,
+        "found afresh after the edit, so a later generation — what tells a client the window has \
+         caught up with the marks"
+    );
     drop(server);
 }

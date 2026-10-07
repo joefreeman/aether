@@ -29,6 +29,7 @@ pub struct Palette {
     pub bg_panel: Color,
     pub bg_selection: Color,
     pub bg_visual: Color,
+    pub bg_visual_raised: Color,
     pub fill_dim: Color,
     pub sneak_prefix_bg: Color,
     pub match_highlight: Color,
@@ -115,6 +116,7 @@ impl Palette {
             bg_panel: color(t.bg_panel),
             bg_selection: color(t.bg_selection),
             bg_visual: color(t.bg_visual),
+            bg_visual_raised: color(t.bg_visual_raised),
             fill_dim: color(t.fill_dim),
             sneak_prefix_bg: color(t.sneak_prefix_bg),
             match_highlight: color(t.match_highlight),
@@ -189,6 +191,27 @@ pub fn palette(mode: ThemeMode) -> &'static Palette {
         LazyLock::new(|| Palette::from_theme(Theme::of(ThemeMode::Dark)));
     static LIGHT: LazyLock<Palette> =
         LazyLock::new(|| Palette::from_theme(Theme::of(ThemeMode::Light)));
+    match mode {
+        ThemeMode::Dark => &DARK,
+        ThemeMode::Light => &LIGHT,
+    }
+}
+
+/// [`palette`] as drawn **inside a content selection**: every raised surface — a code chip, a code
+/// panel, a quote, a table's header and stripes — is the selection's deeper shade. A selected
+/// reader block draws itself and everything in it with this, so it keeps its structure in two
+/// shades of the selection rather than its unselected surfaces punching holes in the tint.
+pub fn selected_palette(mode: ThemeMode) -> &'static Palette {
+    fn selected(p: &Palette) -> Palette {
+        Palette {
+            md_code_bg: p.bg_visual_raised,
+            md_chip_bg: p.bg_visual_raised,
+            md_panel_bg: p.bg_visual_raised,
+            ..*p
+        }
+    }
+    static DARK: LazyLock<Palette> = LazyLock::new(|| selected(palette(ThemeMode::Dark)));
+    static LIGHT: LazyLock<Palette> = LazyLock::new(|| selected(palette(ThemeMode::Light)));
     match mode {
         ThemeMode::Dark => &DARK,
         ThemeMode::Light => &LIGHT,

@@ -176,6 +176,12 @@ pub struct SearchSummary {
     /// element's title.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub folded: u32,
+    /// Which computation of the search this describes — moved every time its matches are found
+    /// afresh (a new query, an edit, the view rebuilt). The reply to a search and the repaint that
+    /// carries its marks travel separately, and a reply usually arrives first; a client tells
+    /// whether the window it holds has caught up by comparing this with the window's own.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u32,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]

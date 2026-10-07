@@ -152,7 +152,11 @@ pub struct SearchState {
     /// and the cursor it left. While the cursor is still there, the match is what a reveal shows —
     /// it may be a removed line or a command the cursor only sits beside — and once the cursor has
     /// moved on, it is the cursor again ([`ViewState::reveal_row`]).
-    pub landing: Option<(u32, CursorState)>,
+    ///
+    /// The third field is the search's generation the landing was answered at: the window that
+    /// carries that search's marks arrives after the answer, and until it has, a match drawn only by
+    /// its mark — in prose, on a removed line, on a command — has nowhere known to be revealed at.
+    pub landing: Option<(u32, CursorState, u32)>,
 }
 
 impl SearchState {
@@ -1190,10 +1194,20 @@ impl ViewState {
     /// The current match a search step or keystroke just landed on, by its place in the count —
     /// while the cursor is still where that landing put it, which is what makes the match (rather
     /// than the cursor) what a reveal shows. `None` once anything else has moved the cursor.
+    ///
+    /// And only once the window on screen carries that search's marks (its summary's generation is
+    /// the landing's): the answer to a search usually arrives before the repaint that marks it, and
+    /// revealing against the window before it aims at the previous search's marks, or at none.
     pub fn search_landing(&self) -> Option<u32> {
-        let (index, at) = self.search.landing?;
+        let (index, at, generation) = self.search.landing?;
         let current = self.search.summary.as_ref()?.current_index;
-        (index != 0 && index == current && at == self.buffer.cursor).then_some(index)
+        let marked = self
+            .window
+            .as_ref()?
+            .search
+            .as_ref()
+            .is_some_and(|s| s.generation == generation);
+        (index != 0 && index == current && at == self.buffer.cursor && marked).then_some(index)
     }
 
     /// Where the current match a search just landed on was drawn in prose — its top and bottom

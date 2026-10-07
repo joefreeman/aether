@@ -112,6 +112,11 @@ pub struct Theme {
     /// in dark, and a selection you cannot see on a quote is not a selection; a selected block is
     /// selected content either way, which is what this role is for.
     pub bg_visual: Rgb,
+    /// A raised surface inside a content selection — a code chip, a code panel, a table's header
+    /// and stripes — a step deeper than [`Self::bg_visual`]. A selected block keeps its structure
+    /// in two shades of the selection rather than punching holes in it with the unselected
+    /// surfaces' own shades, which is what skipping them did.
+    pub bg_visual_raised: Rgb,
     /// Muted fills: search-hit tint, the sneak word band, scroll tracks.
     pub fill_dim: Rgb,
     /// Sneak typed-prefix band — between [`Self::fill_dim`] and the label cell in prominence.
@@ -302,6 +307,7 @@ impl Theme {
         bg_panel: NORD1,
         bg_selection: NORD2,
         bg_visual: NORD10,
+        bg_visual_raised: rgb(0x485e7b), // NORD10 ~55% over NORD0: deeper, and kinder to text
         fill_dim: NORD3,
         sneak_prefix_bg: NORD3_BRIGHT,
         match_highlight: NORD13,
@@ -406,6 +412,7 @@ impl Theme {
         bg_panel: NORD5,
         bg_selection: NORD4,
         bg_visual: rgb(0xc2d6e7), // pale Frost — dark text stays readable inside a selection
+        bg_visual_raised: rgb(0xadc6dd), // a step deeper Frost
         fill_dim: rgb(0xd8dfe8),
         sneak_prefix_bg: rgb(0xc4cedb), // darker than fill_dim: prominence inverts on light
         match_highlight: rgb(0x9a7522), // = warning today; free to diverge
