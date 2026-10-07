@@ -3444,6 +3444,72 @@ fn follow_patch_line_shape() {
 }
 
 #[test]
+fn step_version_shape() {
+    use aether_protocol::cursor::Direction;
+    use aether_protocol::git::{
+        GitStepVersionParams, GitStepVersionResult, VersionLabel, VersionNote, VersionScope,
+    };
+
+    // The cursor line stays server-side, like every cursor-relative command: the request names
+    // only the buffer, how far, and which way.
+    let v = to_value(GitStepVersionParams {
+        buffer_id: 7,
+        scope: VersionScope::Line,
+        direction: Direction::Backward,
+    })
+    .unwrap();
+    assert_eq!(
+        v,
+        json!({ "buffer_id": 7, "scope": "line", "direction": "backward" })
+    );
+    assert_eq!(to_value(VersionScope::File).unwrap(), json!("file"));
+
+    // Nowhere to go and nothing to say never happens, but each half drops off the wire alone.
+    let v = to_value(GitStepVersionResult {
+        opened: None,
+        note: Some(VersionNote::Newest),
+    })
+    .unwrap();
+    assert_eq!(v, json!({ "note": { "kind": "newest" } }));
+
+    // A note names its commit; the working tree is the absent label, and an empty subject drops.
+    for (note, wire) in [
+        (
+            VersionNote::Oldest {
+                at: VersionLabel {
+                    short_hash: "abc1234".into(),
+                    subject: "Start".into(),
+                },
+            },
+            json!({ "kind": "oldest", "at": { "short_hash": "abc1234", "subject": "Start" } }),
+        ),
+        (
+            VersionNote::LineAdded {
+                at: Some(VersionLabel {
+                    short_hash: "abc1234".into(),
+                    subject: String::new(),
+                }),
+            },
+            json!({ "kind": "line_added", "at": { "short_hash": "abc1234" } }),
+        ),
+        (
+            VersionNote::LineRemoved { at: None },
+            json!({ "kind": "line_removed", "at": null }),
+        ),
+        (
+            VersionNote::FileRemoved { at: None },
+            json!({ "kind": "file_removed", "at": null }),
+        ),
+        (VersionNote::Unreachable, json!({ "kind": "unreachable" })),
+        (VersionNote::Untracked, json!({ "kind": "untracked" })),
+    ] {
+        assert_eq!(to_value(&note).unwrap(), wire);
+        let back: VersionNote = from_value(wire).unwrap();
+        assert_eq!(back, note);
+    }
+}
+
+#[test]
 fn nav_goto_params_shape() {
     use aether_protocol::cursor::CursorState;
     use aether_protocol::nav::NavGotoParams;

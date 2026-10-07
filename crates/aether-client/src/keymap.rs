@@ -12,7 +12,7 @@
 //! time, and tables are scanned in order so more-specific chords precede catch-alls.
 
 use aether_protocol::cursor::{Direction, VerticalDirection, WordBoundary};
-use aether_protocol::git::{ApplyScope, ConflictSide};
+use aether_protocol::git::{ApplyScope, ConflictSide, VersionScope};
 use aether_protocol::input::{BlockUnit, CommentStyle, SurroundTarget};
 use aether_protocol::picker::PickerKind;
 
@@ -560,6 +560,14 @@ pub enum Action {
     /// `Space g w` — everything not yet committed ("working" changes), as one read-only patch
     /// buffer: the same view a commit gets, over the changes you haven't made into one yet.
     ShowWorkingChanges,
+    /// `Space g [`/`]` — the older/newer version of this file in history; `Space g {`/`}` — of
+    /// the cursor line, skipping every version that left it alone. Brackets are the wide scope and
+    /// braces the narrow one, as they are for the jumplist. Works from the working file and from a
+    /// file at a revision, so repeated presses walk the history.
+    StepVersion {
+        scope: VersionScope,
+        dir: Direction,
+    },
     /// `Space g Alt-p` — publish the current branch's commits (`↑ahead`). Never force-pushes: the
     /// Alt slot here is the *outward* sibling of pull, not an escalation of it, and force-push has
     /// no key at all.
@@ -1691,6 +1699,10 @@ static LEADER_GIT: &[Binding] = &[
     bind!(LG, ch('c'), Exact(Mods::ALT), A::GitCommit { amend: true }, "Git", "Amend previous commit"),
     bind!(LG, ch('z'), Exact(Mods::NONE), A::GitUncommit, "Git", "Uncommit (keep changes staged)"),
     bind!(LG, ch('w'), Exact(Mods::NONE), A::ShowWorkingChanges, "Git", "Working changes (uncommitted diff)"),
+    bind!(LG, ch('['), Exact(Mods::NONE), A::StepVersion { scope: VersionScope::File, dir: Direction::Backward }, "Git", "Older version of this file"),
+    bind!(LG, ch(']'), Exact(Mods::NONE), A::StepVersion { scope: VersionScope::File, dir: Direction::Forward }, "Git", "Newer version of this file"),
+    bind!(LG, ch('{'), IgnoreShift(Mods::NONE), A::StepVersion { scope: VersionScope::Line, dir: Direction::Backward }, "Git", "Older version of the cursor line"),
+    bind!(LG, ch('}'), IgnoreShift(Mods::NONE), A::StepVersion { scope: VersionScope::Line, dir: Direction::Forward }, "Git", "Newer version of the cursor line"),
     bind!(LG, ch('f'), Exact(Mods::NONE), A::GitFetch, "Git", "Fetch from remote"),
     bind!(LG, ch('p'), Exact(Mods::NONE), A::GitPull, "Git", "Pull from remote"),
     bind!(LG, ch('p'), Exact(Mods::ALT), A::GitPush, "Git", "Push commits to remote"),
@@ -2401,6 +2413,38 @@ mod tests {
             git(ch('w'), Mods::NONE),
             Some(Action::ShowWorkingChanges)
         ));
+        // Version steps: brackets walk the file's versions, braces the cursor line's — the wide
+        // and narrow scopes, as on the jumplist. A brace arrives shifted from most keyboards.
+        assert!(matches!(
+            git(ch('['), Mods::NONE),
+            Some(Action::StepVersion {
+                scope: VersionScope::File,
+                dir: Direction::Backward
+            })
+        ));
+        assert!(matches!(
+            git(ch(']'), Mods::NONE),
+            Some(Action::StepVersion {
+                scope: VersionScope::File,
+                dir: Direction::Forward
+            })
+        ));
+        for mods in [Mods::NONE, Mods::SHIFT] {
+            assert!(matches!(
+                git(ch('{'), mods),
+                Some(Action::StepVersion {
+                    scope: VersionScope::Line,
+                    dir: Direction::Backward
+                })
+            ));
+            assert!(matches!(
+                git(ch('}'), mods),
+                Some(Action::StepVersion {
+                    scope: VersionScope::Line,
+                    dir: Direction::Forward
+                })
+            ));
+        }
         // A key with no git meaning resolves to nothing, so the chord just cancels.
         assert!(git(ch('j'), Mods::NONE).is_none());
 

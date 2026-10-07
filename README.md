@@ -265,6 +265,8 @@ scopes — plain takes the change under the cursor (or the selected lines), Alt 
 | `Space g z` | Uncommit (keep the changes staged) |
 | `Space g w` | Working changes — everything uncommitted, as one patch |
 | `Space g l`/`Space g Alt-l` | History / this file's history |
+| `Space g [`/`Space g ]` | Older / newer version of this file (from the file, or a version of it) |
+| `Space g {`/`Space g }` | Older / newer version of the cursor line — skips versions that left it alone |
 | `Space g b` | Branches and worktrees |
 | `Space g f` | Fetch from the remote |
 | `Space g p`/`Space g Alt-p` | Pull from / push to the remote |

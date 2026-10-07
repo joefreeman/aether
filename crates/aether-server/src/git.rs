@@ -2729,6 +2729,25 @@ pub fn first_parent(repo_path: &Path, rev: &str) -> Option<String> {
     commit.parent(0).ok().map(|p| p.id().to_string())
 }
 
+/// `path` as it was in `rev`'s first parent, LF-normalised — what a file at a revision diffs
+/// against, so its gutter shows the change that commit made. Empty when the commit created the
+/// file (or is a root): the whole file reads as added. `None` only when `rev` doesn't resolve.
+pub fn parent_blob(repo_path: &Path, rev: &str, path: &Path) -> Option<Vec<u8>> {
+    let repo = git2::Repository::discover(repo_path).ok()?;
+    let commit = repo
+        .revparse_single(rev)
+        .and_then(|o| o.peel_to_commit())
+        .ok()?;
+    let bytes = commit
+        .parent(0)
+        .ok()
+        .and_then(|p| p.tree().ok()?.get_path(path).ok())
+        .and_then(|entry| entry.to_object(&repo).ok()?.peel_to_blob().ok())
+        .map(|blob| blob.content().to_vec())
+        .unwrap_or_default();
+    Some(normalize_lf(bytes))
+}
+
 /// One file's content as of `rev` — `git show <rev>:<path>`. `path` is repo-relative. Binary
 /// content is refused rather than dumped into a text buffer.
 pub fn show_file(repo_path: &Path, rev: &str, path: &str) -> Result<RevisionContent, String> {

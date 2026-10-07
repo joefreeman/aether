@@ -2159,6 +2159,186 @@ pub async fn git_follow_patch_line(
     })
 }
 
+/// `git/step_version`: the neighbouring version of the file in front of you, or of its cursor
+/// line. The walk is `crate::versions`; this reads where it starts and opens where it lands.
+pub async fn git_step_version(
+    state: &SharedState,
+    ctx: &mut ConnectionCtx,
+    params: aether_protocol::git::GitStepVersionParams,
+) -> Result<aether_protocol::git::GitStepVersionResult, RpcError> {
+    use crate::versions::{Landing, Origin, Step};
+    use aether_protocol::git::{GitShowParams, GitStepVersionResult, VersionNote, VersionScope};
+
+    let client_id = ctx.client_id;
+    let note = |note| {
+        Ok(GitStepVersionResult {
+            opened: None,
+            note: Some(note),
+        })
+    };
+
+    // Where the step starts, under one short lock: the revision and path a file at a revision
+    // names, or a working-tree file's repo location. The working tree's text rides along — the
+    // origin's own text for a working-tree file, any live buffer's for a revision (a newer step
+    // can run off the end of the commits into it); a file no buffer holds is read off disk below.
+    let (workdir, rev, path, line, live_text, from_working_file) = {
+        let s = state.lock().await;
+        let doc = s
+            .try_doc_of(params.buffer_id)
+            .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
+        let line = s
+            .cursors
+            .get(&(client_id, params.buffer_id))
+            .map(|c| c.position.line)
+            .unwrap_or_default();
+        match doc.virtual_source.as_ref().map(|v| &v.target) {
+            Some(target) => {
+                // A commit's patch, a shell, an agent: none of them is one file.
+                let (Some(repo_id), Some(rev), Some(path)) =
+                    (target.repo_id(), target.rev(), target.path())
+                else {
+                    return note(VersionNote::Untracked);
+                };
+                let workdir = std::path::PathBuf::from(repo_id);
+                let live = s
+                    .active_workspace_or_err(client_id)
+                    .ok()
+                    .and_then(|w| s.buffer_for_path_in_workspace(&w.id, &workdir.join(path)))
+                    .and_then(|b| s.try_doc_of(b))
+                    .map(|d| d.text.to_string());
+                (
+                    workdir,
+                    Some(rev.to_string()),
+                    path.to_string(),
+                    line,
+                    live,
+                    false,
+                )
+            }
+            None => {
+                let Some(repo) = s
+                    .git_baseline
+                    .get(&params.buffer_id)
+                    .and_then(|b| b.repo.as_ref())
+                else {
+                    return note(VersionNote::Untracked);
+                };
+                (
+                    repo.workdir.clone(),
+                    None,
+                    repo.rel_path.to_string_lossy().into_owned(),
+                    line,
+                    Some(doc.text.to_string()),
+                    true,
+                )
+            }
+        }
+    };
+
+    let step = match params.direction {
+        Direction::Backward => Step::Older,
+        Direction::Forward => Step::Newer,
+    };
+    let line_scope = params.scope == VersionScope::Line;
+    let stepped = tokio::task::spawn_blocking({
+        let (workdir, path) = (workdir.clone(), path.clone());
+        move || {
+            let worktree = live_text.or_else(|| {
+                std::fs::read(workdir.join(&path)).ok().map(|bytes| {
+                    String::from_utf8_lossy(&crate::git::normalize_lf(bytes)).into_owned()
+                })
+            });
+            let origin = Origin {
+                rev: rev.as_deref(),
+                path: &path,
+                line,
+                worktree: worktree.as_deref(),
+            };
+            crate::versions::step(&workdir, &origin, line_scope, step)
+        }
+    })
+    .await
+    .map_err(|e| RpcError::internal(format!("git step: {e}")))?;
+    let Some(landing) = stepped.landing else {
+        return Ok(GitStepVersionResult {
+            opened: None,
+            note: stepped.note,
+        });
+    };
+
+    // Only leaving the working file is recorded, so one `Backspace` returns to it from however many
+    // versions back you have stepped, rather than retracing every one.
+    if from_working_file {
+        record_nav_origin(state, client_id, Some(params.buffer_id)).await;
+    }
+    let opened = match landing {
+        Landing::Revision { rev, path, line } => {
+            let shown = git_show(
+                state,
+                ctx,
+                GitShowParams {
+                    repo_id: None,
+                    buffer_id: Some(params.buffer_id),
+                    target: aether_protocol::git::ShowTarget::File { rev, path },
+                    focus_path: None,
+                    record_nav_from: None,
+                },
+            )
+            .await?;
+            match shown.opened {
+                Some(opened) => Some(land_on_line(state, client_id, opened, line).await),
+                None => None,
+            }
+        }
+        // An ordinary open of your own file — kept or a preview, as it already was.
+        Landing::WorkingFile { path, line } => Some(
+            Box::pin(view_open(
+                state,
+                ctx,
+                ViewOpenParams {
+                    absolute_path: Some(workdir.join(path).to_string_lossy().into_owned()),
+                    jump_to: Some(LogicalPosition { line, col: 0 }),
+                    ..Default::default()
+                },
+            ))
+            .await?,
+        ),
+    };
+    Ok(GitStepVersionResult {
+        opened,
+        note: stepped.note,
+    })
+}
+
+/// Put this client's cursor at the start of `line` in what an open landed on, and say so in the
+/// result. The scroll goes: one remembered from an earlier visit frames wherever the cursor was
+/// then, and without it the client centres on the cursor.
+async fn land_on_line(
+    state: &SharedState,
+    client_id: ClientId,
+    opened: ViewOpenResult,
+    line: u32,
+) -> ViewOpenResult {
+    let mut s = state.lock().await;
+    let position =
+        motion::clamp_position(s.doc_of(opened.buffer_id), LogicalPosition { line, col: 0 });
+    let cursor = CursorState {
+        position,
+        anchor: position,
+        match_bracket: None,
+        jumplist_position: None,
+    };
+    set_cursor(&mut s, (client_id, opened.buffer_id), cursor);
+    ViewOpenResult {
+        scroll: None,
+        buffer: BufferDescription {
+            cursor,
+            ..opened.buffer
+        },
+        ..opened
+    }
+}
+
 /// Install a freshly materialised revision or diff as a new read-only buffer.
 ///
 /// Takes whatever `git/show` materialised — a commit's patch, a file at a revision, the working
@@ -2283,15 +2463,65 @@ async fn open_generated_buffer(
     };
     let parse_pending = s.doc_of(id).syntax_pending;
     let parse_token = parse_pending.then(|| s.deferred.start());
+    let is_revision_file = revision_file_of(s.doc_of(id)).is_some();
+    let diff_token = (is_revision_file && intent == OpenIntent::Bind).then(|| s.deferred.start());
     drop(s);
     // The tree lands later and a `viewport/lines_changed` push restyles whatever is on screen.
     if let Some(token) = parse_token {
         tokio::spawn(finish_pending_parse(state.clone(), id, token));
     }
+    // A navigation shows the commit's change from its first frame; a binding defers it with the
+    // parse, since the view that bound it draws the patch's own decorations over it anyway.
+    if let Some(token) = diff_token {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _token = token;
+            attach_revision_diff(&state, id).await;
+        });
+    } else if is_revision_file {
+        attach_revision_diff(state, id).await;
+    }
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }
     Ok(result)
+}
+
+/// Diff a file at a revision against that commit's first parent, so its gutter, inline diff and
+/// `c` show the change the commit made — the question you are usually asking of an old version.
+///
+/// Once per buffer, at creation: a revision's text can't change, so neither can its diff, and no
+/// baseline refresh ever touches it (it has no `git_baseline` — that is the working tree's
+/// index-and-HEAD machinery, and none of it applies to history).
+async fn attach_revision_diff(state: &SharedState, buffer_id: BufferId) {
+    let Some((workdir, path, rev)) = ({
+        let s = state.lock().await;
+        s.try_doc_of(buffer_id).and_then(revision_file_of)
+    }) else {
+        return;
+    };
+    let parent =
+        tokio::task::spawn_blocking(move || crate::git::parent_blob(&workdir, &rev, &path))
+            .await
+            .ok()
+            .flatten();
+    let Some(parent) = parent else {
+        return;
+    };
+    let pushes = {
+        let mut s = state.lock().await;
+        let Some(doc) = s.try_doc_of(buffer_id) else {
+            return; // closed while reading
+        };
+        let hunks = crate::git::diff_hunks(Some(&parent), &doc.text);
+        s.git_both_hunks
+            .insert(buffer_id, crate::git::compose_both(&[], &hunks));
+        s.git_unstaged_hunks.insert(buffer_id, hunks);
+        collect_buffer_refresh_pushes(&s, buffer_id)
+    };
+    for (sender, notif) in pushes {
+        let _ = sender.send(notif).await;
+    }
 }
 
 /// Present a live buffer the server already holds — a revision found materialised, a scratch

@@ -1483,6 +1483,87 @@ pub struct GitFollowPatchLineResult {
     pub opened: Option<crate::view::ViewOpenResult>,
 }
 
+// ---- git/step_version ---------------------------------------------------------------------------
+
+/// Step to the neighbouring version of the file in front of you, or of its cursor line
+/// (`Space g [`/`]`, `Space g {`/`}`).
+///
+/// The stops are the commits that changed the file, or the cursor line, and each lands on the
+/// file as of that commit — which diffs against the commit's parent, so the gutter shows that
+/// commit's change. Older is the nearest stop older than the version on screen: from your working
+/// file or a commit that left the line alone, the change that set what you are looking at; from a
+/// stop, the change before it. Newer past HEAD is the working-tree file itself. The cursor rides
+/// along on the line it came from.
+///
+/// History is HEAD's **first-parent** chain in both directions, so the two are inverses: a merged
+/// side branch arrives as one step at its merge commit. A rename ends the history.
+pub struct GitStepVersion;
+impl RpcMethod for GitStepVersion {
+    const NAME: &'static str = "git/step_version";
+    type Params = GitStepVersionParams;
+    type Result = GitStepVersionResult;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitStepVersionParams {
+    /// The file being read — a working-tree buffer or a file at a revision. The cursor line is
+    /// this client's cursor in it.
+    pub buffer_id: BufferId,
+    pub scope: VersionScope,
+    /// `Backward` is older, `Forward` newer.
+    pub direction: crate::cursor::Direction,
+}
+
+/// How far a step reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionScope {
+    /// The neighbouring version of the whole file.
+    File,
+    /// The neighbouring version of the cursor line: versions that left it alone are skipped.
+    Line,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitStepVersionResult {
+    /// Where the step landed, in the shape `git/show` returns, cursor already placed. `None` when
+    /// there was nowhere to go — [`Self::note`] says why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened: Option<crate::view::ViewOpenResult>,
+    /// Something the user should be told: why nothing opened, or that the line arrived at is not
+    /// the line left (it was added or removed there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<VersionNote>,
+}
+
+/// A commit, as a step's note names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionLabel {
+    pub short_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subject: String,
+}
+
+/// What a [`GitStepVersion`] has to say. `at: None` names the working tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VersionNote {
+    /// No older version of the file: `at` created it.
+    Oldest { at: VersionLabel },
+    /// Already on the working tree, the newest version there is.
+    Newest,
+    /// The line didn't exist before `at`, so there is no older version of it to open.
+    LineAdded { at: Option<VersionLabel> },
+    /// `at` removed the line; the step landed where it used to be.
+    LineRemoved { at: Option<VersionLabel> },
+    /// `at` deleted the file, so there is no newer version to open.
+    FileRemoved { at: Option<VersionLabel> },
+    /// The version on screen isn't in HEAD's first-parent history, so "newer" names nothing.
+    Unreachable,
+    /// The buffer has no history: not a file in a repo, or not committed yet.
+    Untracked,
+}
+
 // ---- git/stash_* --------------------------------------------------------------------------------
 
 /// Stash the working tree (`git stash push`). Rewrites the working tree, so it carries the same

@@ -13309,3 +13309,234 @@ async fn tab_through_a_patch_stops_only_in_text() {
     );
     drop(server);
 }
+
+// ---- git/step_version ---------------------------------------------------------------------------
+
+/// Step `buffer_id` one version along, by file or by line.
+async fn step_version(
+    ws: &mut Ws,
+    buffer_id: u64,
+    scope: aether_protocol::git::VersionScope,
+    direction: Direction,
+) -> aether_protocol::git::GitStepVersionResult {
+    send_request::<aether_protocol::git::GitStepVersion>(
+        ws,
+        &aether_protocol::git::GitStepVersionParams {
+            buffer_id,
+            scope,
+            direction,
+        },
+    )
+    .await
+}
+
+/// Three commits: one sets `x`, two changes it, three inserts a header above everything. The
+/// working tree is clean. Returns the short hashes, oldest first.
+fn three_versions(dir: &std::path::Path) -> [String; 3] {
+    let repo = init_repo_at(dir);
+    let mut hashes = Vec::new();
+    for content in [
+        "fn a() {}\nlet x = 1;\nfn b() {}\n",
+        "fn a() {}\nlet x = 2;\nfn b() {}\n",
+        "// header\nfn a() {}\nlet x = 2;\nfn b() {}\n",
+    ] {
+        commit_file(&repo, "a.rs", content);
+        let head = repo.head().unwrap().peel_to_commit().unwrap().id();
+        hashes.push(head.to_string().chars().take(7).collect::<String>());
+    }
+    hashes.try_into().unwrap()
+}
+
+/// File steps visit every change to the file and back, carrying the cursor line across each; the
+/// first older stop from the working file is HEAD's change, past HEAD is the working file itself,
+/// and one `Backspace` from anywhere in the walk returns to it.
+#[tokio::test]
+async fn file_versions_step_older_and_newer() {
+    use aether_protocol::git::{VersionNote, VersionScope::File};
+    let dir = tempfile::tempdir().unwrap();
+    let [one, two, three] = three_versions(dir.path());
+    let (server, mut ws, working) = setup_git_apply(dir.path(), "versions", "a.rs").await;
+    set_point_cursor(&mut ws, working, LogicalPosition { line: 2, col: 0 }).await;
+
+    let at_three = step_version(&mut ws, working, File, Direction::Backward)
+        .await
+        .opened
+        .expect("the last change to the file");
+    assert_eq!(at_three.commit.as_deref(), Some(three.as_str()));
+    assert_eq!(at_three.title.as_deref(), Some("a.rs"));
+    assert!(at_three.read_only);
+    assert_eq!(at_three.cursor.position.line, 2);
+
+    let at_two = step_version(&mut ws, at_three.buffer_id, File, Direction::Backward)
+        .await
+        .opened
+        .expect("an older version");
+    assert_eq!(at_two.commit.as_deref(), Some(two.as_str()));
+    assert_eq!(
+        at_two.cursor.position.line, 1,
+        "`let x` sits one line higher before the header"
+    );
+    let at_one = step_version(&mut ws, at_two.buffer_id, File, Direction::Backward)
+        .await
+        .opened
+        .expect("the first version");
+    assert_eq!(at_one.commit.as_deref(), Some(one.as_str()));
+    let oldest = step_version(&mut ws, at_one.buffer_id, File, Direction::Backward).await;
+    assert!(oldest.opened.is_none());
+    assert!(
+        matches!(&oldest.note, Some(VersionNote::Oldest { at }) if at.short_hash == one),
+        "{:?}",
+        oldest.note
+    );
+
+    // And forward again, through three, to the working file.
+    let at_two = step_version(&mut ws, at_one.buffer_id, File, Direction::Forward)
+        .await
+        .opened
+        .unwrap();
+    assert_eq!(at_two.commit.as_deref(), Some(two.as_str()));
+    let at_three = step_version(&mut ws, at_two.buffer_id, File, Direction::Forward)
+        .await
+        .opened
+        .unwrap();
+    assert_eq!(at_three.commit.as_deref(), Some(three.as_str()));
+    assert_eq!(at_three.cursor.position.line, 2);
+    let back_home = step_version(&mut ws, at_three.buffer_id, File, Direction::Forward)
+        .await
+        .opened
+        .expect("the working file");
+    assert_eq!(back_home.buffer_id, working);
+    assert!(!back_home.read_only);
+    assert_eq!(back_home.cursor.position.line, 2);
+    let newest = step_version(&mut ws, working, File, Direction::Forward).await;
+    assert!(newest.opened.is_none());
+    assert_eq!(newest.note, Some(VersionNote::Newest));
+
+    // Steps between versions record nothing, so one `Backspace` from deep in the walk is home.
+    let at_three = step_version(&mut ws, working, File, Direction::Backward)
+        .await
+        .opened
+        .unwrap();
+    let at_two = step_version(&mut ws, at_three.buffer_id, File, Direction::Backward)
+        .await
+        .opened
+        .unwrap();
+    let back: NavStepResult = send_request::<NavStep>(
+        &mut ws,
+        &NavStepParams {
+            buffer_id: at_two.buffer_id,
+            direction: Direction::Backward,
+        },
+    )
+    .await;
+    let returned = back.target.expect("a step back");
+    assert_eq!(returned.buffer_id, working);
+    assert_eq!(returned.cursor.position.line, 2);
+
+    drop(server);
+}
+
+/// A version shows the change its commit made: it diffs against the commit's parent, so `c` steps
+/// to exactly what that commit changed — two's `let x`, three's header — and a commit that created
+/// the file is all addition.
+#[tokio::test]
+async fn a_version_diffs_against_its_commits_parent() {
+    use aether_protocol::git::VersionScope::File;
+    use aether_protocol::viewport::FocusStep;
+    let dir = tempfile::tempdir().unwrap();
+    three_versions(dir.path());
+    let (server, mut ws, working) = setup_git_apply(dir.path(), "versions", "a.rs").await;
+
+    let at_three = step_version(&mut ws, working, File, Direction::Backward)
+        .await
+        .opened
+        .unwrap();
+    let landed = navigate_change_from(&mut ws, at_three.buffer_id, 3, FocusStep::Previous, 1).await;
+    assert_eq!(landed.cursor.position.line, 0, "three added the header");
+    let landed = navigate_change_from(&mut ws, at_three.buffer_id, 0, FocusStep::Next, 1).await;
+    assert!(!landed.moved, "and changed nothing else");
+
+    let at_two = step_version(&mut ws, at_three.buffer_id, File, Direction::Backward)
+        .await
+        .opened
+        .unwrap();
+    let landed = navigate_change_from(&mut ws, at_two.buffer_id, 0, FocusStep::Next, 1).await;
+    assert_eq!(landed.cursor.position.line, 1, "two changed `let x`");
+    let landed = navigate_change_from(&mut ws, at_two.buffer_id, 1, FocusStep::Next, 1).await;
+    assert!(!landed.moved, "and nothing below it");
+
+    drop(server);
+}
+
+/// Line steps visit the changes to the cursor line: from the working file, `let x` was last set by
+/// two and before that by one — three's header insertion is no version of it.
+#[tokio::test]
+async fn line_versions_visit_the_lines_changes() {
+    use aether_protocol::git::{VersionNote, VersionScope::Line};
+    let dir = tempfile::tempdir().unwrap();
+    let [one, two, _] = three_versions(dir.path());
+    let (server, mut ws, working) = setup_git_apply(dir.path(), "versions", "a.rs").await;
+    set_point_cursor(&mut ws, working, LogicalPosition { line: 2, col: 0 }).await;
+
+    let at_two = step_version(&mut ws, working, Line, Direction::Backward)
+        .await
+        .opened
+        .expect("the change that set the line");
+    assert_eq!(at_two.commit.as_deref(), Some(two.as_str()));
+    assert_eq!(at_two.cursor.position.line, 1);
+
+    let at_one = step_version(&mut ws, at_two.buffer_id, Line, Direction::Backward)
+        .await
+        .opened
+        .expect("the line's previous version");
+    assert_eq!(at_one.commit.as_deref(), Some(one.as_str()));
+    let content: BufferContentResult = send_request::<BufferContent>(
+        &mut ws,
+        &BufferContentParams {
+            buffer_id: at_one.buffer_id,
+        },
+    )
+    .await;
+    assert_eq!(content.text.lines().nth(1), Some("let x = 1;"));
+
+    // Nothing older: one wrote the line along with the file.
+    let first = step_version(&mut ws, at_one.buffer_id, Line, Direction::Backward).await;
+    assert!(first.opened.is_none());
+    assert!(
+        matches!(&first.note, Some(VersionNote::LineAdded { at: Some(at) }) if at.short_hash == one),
+        "{:?}",
+        first.note
+    );
+
+    // Newer is the inverse: two's change, then — three left it alone — the working file.
+    let newer = step_version(&mut ws, at_one.buffer_id, Line, Direction::Forward)
+        .await
+        .opened
+        .unwrap();
+    assert_eq!(newer.commit.as_deref(), Some(two.as_str()));
+    assert_eq!(newer.cursor.position.line, 1);
+    let home = step_version(&mut ws, newer.buffer_id, Line, Direction::Forward)
+        .await
+        .opened
+        .unwrap();
+    assert_eq!(home.buffer_id, working);
+    assert_eq!(home.cursor.position.line, 2);
+
+    drop(server);
+}
+
+/// A buffer with no history answers with a note, never an error: a scratch has no file, and a file
+/// nobody committed has no versions.
+#[tokio::test]
+async fn a_buffer_without_history_says_so() {
+    use aether_protocol::git::{VersionNote, VersionScope::File};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = init_repo_at(dir.path());
+    commit_file(&repo, "other.rs", "x\n");
+    std::fs::write(dir.path().join("new.rs"), "fresh\n").unwrap();
+    let (server, mut ws, untracked) = setup_git_apply(dir.path(), "versions", "new.rs").await;
+    let r = step_version(&mut ws, untracked, File, Direction::Backward).await;
+    assert!(r.opened.is_none());
+    assert_eq!(r.note, Some(VersionNote::Untracked));
+    drop(server);
+}

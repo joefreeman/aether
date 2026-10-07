@@ -3300,7 +3300,9 @@ pub async fn git_blame_line(
 ///
 /// `None` for everything else, including a *commit's* patch: that names many files and is not one
 /// of them, so nothing here can be asked of it.
-fn revision_file_of(doc: &Document) -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
+pub fn revision_file_of(
+    doc: &Document,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
     let target = &doc.virtual_source.as_ref()?.target;
     Some((
         std::path::PathBuf::from(target.repo_id()?),
@@ -3546,7 +3548,15 @@ pub fn buffer_change_anchors(s: &ServerState, buffer_id: BufferId) -> Vec<u32> {
         // pinned baseline there is no second layer to union in: a revision puts the same content in
         // both blobs, and the saved file has no HEAD side at all.
         let buf = s.doc_of(buffer_id);
-        let baseline = s.git_baseline.get(&buffer_id);
+        let Some(baseline) = s.git_baseline.get(&buffer_id) else {
+            // No working-tree baseline: a file at a revision, whose diff against its parent was
+            // cached once when it opened and can't go stale. Anything else has no hunks at all.
+            return buffer_both_hunks(s, buffer_id)
+                .iter()
+                .map(|h| h.anchor_line)
+                .collect();
+        };
+        let baseline = Some(baseline);
         // A pending baseline offers no anchors — the gutter they would step between hasn't been
         // drawn yet either, and the push that draws it arrives a moment later.
         let effective =

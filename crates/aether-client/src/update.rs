@@ -226,6 +226,8 @@ pub enum Event {
     /// `Enter` in a composed view resolved (or didn't) to the file the line under the cursor
     /// named — a patch line's blob, a shell line's `path:line:col`.
     LineFollowed(Result<aether_protocol::view::ViewFollowLineResult, String>),
+    /// A version step (`Space g [`/`]`, `{`/`}`) landed, or said why it couldn't.
+    VersionStepped(Result<aether_protocol::git::GitStepVersionResult, String>),
     /// A new shell's open answered with the shell to show and which of its elements to type into.
     ShellStarted(Result<aether_protocol::shell::ShellStartResult, RpcError>),
     /// A submit landed, or was refused — the refusal is the interesting half, since it names the
@@ -1029,6 +1031,20 @@ impl Session {
                 None => Effects::none(),
             },
             Event::LineFollowed(Err(e)) => Effects::error_detail("Couldn't open the file", e),
+
+            // A note can come with a landing — the line was added or removed in the version
+            // arrived at — so the two are independent.
+            Event::VersionStepped(Ok(r)) => {
+                let arrived = match r.opened {
+                    Some(open) => self.adopt_navigation(open),
+                    None => Effects::none(),
+                };
+                match r.note {
+                    Some(note) => arrived.and(version_note_toast(&note)),
+                    None => arrived,
+                }
+            }
+            Event::VersionStepped(Err(e)) => Effects::error_detail("Couldn't step versions", e),
 
             Event::Switched(Err(e)) => self.open_failed(e),
 
@@ -11470,6 +11486,15 @@ impl Session {
                 },
                 Event::Shown,
             ),
+            A::StepVersion { scope, dir } => self
+                .request_str::<aether_protocol::git::GitStepVersion>(
+                    aether_protocol::git::GitStepVersionParams {
+                        buffer_id: self.view.buffer.buffer_id,
+                        scope,
+                        direction: dir,
+                    },
+                    Event::VersionStepped,
+                ),
             A::GitFetch => self.request_str::<GitFetch>(
                 GitFetchParams {
                     // Resolved server-side from the buffer we're on, like every other git verb.
@@ -12848,6 +12873,39 @@ fn nothing_to_commit(baseline: Option<&aether_protocol::git::GitBaselineSource>)
         Some(aether_protocol::git::GitBaselineSource::Rev { label, .. }) => {
             format!("Nothing to commit (versus {label})")
         }
+    }
+}
+
+/// The toast for what a version step had to say. The commit is the title — it is what the
+/// sentence is about — and its subject the detail. One group, so a held key replaces rather than
+/// stacks.
+fn version_note_toast(note: &aether_protocol::git::VersionNote) -> Effects {
+    use aether_protocol::git::{VersionLabel, VersionNote};
+    let toast = |title: String, label: Option<&VersionLabel>| match label {
+        Some(l) if !l.subject.is_empty() => {
+            Effects::toast_grouped_detail(title, l.subject.clone(), ToastKind::Info, "version-step")
+        }
+        _ => Effects::toast_grouped(title, ToastKind::Info, "version-step"),
+    };
+    let named = |what: &str, at: &Option<VersionLabel>| match at {
+        Some(l) => toast(format!("{what} in {}", l.short_hash), Some(l)),
+        None => toast(format!("{what} in the working tree"), None),
+    };
+    match note {
+        VersionNote::Oldest { at } => toast(
+            format!("Oldest version — created in {}", at.short_hash),
+            Some(at),
+        ),
+        VersionNote::Newest => toast("Already the newest version".to_string(), None),
+        VersionNote::LineAdded { at: None } => toast("Line not committed yet".to_string(), None),
+        VersionNote::LineAdded { at } => named("Line added", at),
+        VersionNote::LineRemoved { at } => named("Line removed", at),
+        VersionNote::FileRemoved { at } => named("File deleted", at),
+        VersionNote::Unreachable => toast(
+            "This version isn't in the current branch's history".to_string(),
+            None,
+        ),
+        VersionNote::Untracked => toast("No history for this buffer".to_string(), None),
     }
 }
 

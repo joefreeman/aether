@@ -7355,6 +7355,65 @@ fn space_g_f_fetches() {
     assert!(req.get("buffer_id").is_some());
 }
 
+/// `Space g [`/`]` step the file's versions and `Space g {`/`}` the cursor line's. The request
+/// names the buffer and nothing positional — the cursor line is the server's.
+#[test]
+fn space_g_brackets_step_versions() {
+    for (c, scope, direction) in [
+        ('[', "file", "backward"),
+        (']', "file", "forward"),
+        ('{', "line", "backward"),
+        ('}', "line", "forward"),
+    ] {
+        let mut s = session();
+        s.view.buffer.buffer_id = 7;
+        let _ = key(&mut s, ' ');
+        let _ = key(&mut s, 'g');
+        let fx = key(&mut s, c);
+        let params = find_request(&fx, "git/step_version").expect("Space g steps versions");
+        assert_eq!(
+            *params,
+            json!({ "buffer_id": 7, "scope": scope, "direction": direction }),
+            "Space g {c}"
+        );
+    }
+}
+
+/// A step's note reaches the user whether or not it landed anywhere, naming the commit in the
+/// title and its subject beneath.
+#[test]
+fn a_version_step_says_what_happened_to_the_line() {
+    use aether_client::update::Event;
+    use aether_protocol::git::{GitStepVersionResult, VersionLabel, VersionNote};
+
+    let mut s = session();
+    let fx = s.on_event(Event::VersionStepped(Ok(GitStepVersionResult {
+        opened: None,
+        note: Some(VersionNote::LineRemoved {
+            at: Some(VersionLabel {
+                short_hash: "abc1234".into(),
+                subject: "Drop the cache".into(),
+            }),
+        }),
+    })));
+    assert_eq!(
+        toast_parts(&fx),
+        vec![(
+            "Line removed in abc1234".to_string(),
+            Some("Drop the cache".to_string())
+        )]
+    );
+
+    let fx = s.on_event(Event::VersionStepped(Ok(GitStepVersionResult {
+        opened: None,
+        note: Some(VersionNote::Newest),
+    })));
+    assert_eq!(
+        toast_messages(&fx),
+        vec!["Already the newest version".to_string()]
+    );
+}
+
 /// A completed fetch reports the *divergence*, not the transfer: "fetched" on its own leaves the
 /// user hunting for what changed, and the counts are the reason to fetch at all. The three cases
 /// read differently on purpose — no upstream, level, diverged.
