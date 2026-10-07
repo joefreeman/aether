@@ -1905,3 +1905,89 @@ fn a_quote_paints_one_panel() {
         "no page above the quote"
     );
 }
+
+/// The picker's query keeps focus when the row around it changes shape.
+///
+/// iced keeps a child's state by its *index*, and the query's caret is state. The row led with
+/// slots that came and went — the explorer's breadcrumb, the filter chips — so stepping out to the
+/// Roots list (no breadcrumb) moved the query to another index, where it started over unfocused:
+/// the caret vanished, and keys fell through to the core, which can type but not delete. The
+/// simulator rebuilds from scratch, so this drives iced's `UserInterface` directly, carrying the
+/// widget-state cache across the change the way the runtime does.
+#[test]
+fn the_picker_query_keeps_focus_when_the_explorer_steps_out_to_its_roots() {
+    use iced::advanced::widget::operation::{focusable, Focusable, Operation};
+    use iced_test::core::renderer::Headless;
+    use iced_test::runtime::user_interface::{Cache, UserInterface};
+
+    /// Whether the widget with this id is focused, as the tree reports it.
+    struct IsFocused {
+        id: iced::advanced::widget::Id,
+        focused: Option<bool>,
+    }
+    impl Operation for IsFocused {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&iced::advanced::widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn Focusable,
+        ) {
+            if id == Some(&self.id) {
+                self.focused = Some(state.is_focused());
+            }
+        }
+    }
+
+    let mut session = session_showing(two_files());
+    session.workspace_paths = vec!["/ws/api".into(), "/ws/web".into()];
+    let _ = session.open_picker(PickerKind::Explorer, None, None, false, None);
+    session.picker.as_mut().expect("open").directory = Some("/ws/api/src".into());
+    let mut app = app_with(session);
+    // Pins the CPU backend and loads the bundled fonts, as every test here does.
+    drop(simulate(&app));
+    let id = crate::picker::query_input_id(app.window);
+    let mut renderer =
+        iced_test::futures::futures::executor::block_on(iced_test::renderer::Renderer::new(
+            iced::Font::with_name("Fira Sans"),
+            settings().default_text_size,
+            Some("tiny-skia"),
+        ))
+        .expect("a headless renderer");
+    let size = Size::new(WIDTH, HEIGHT);
+
+    let mut ui = UserInterface::build(app.view(), size, Cache::default(), &mut renderer);
+    ui.operate(&renderer, &mut focusable::focus(id.clone()));
+    let mut cache = ui.into_cache();
+
+    let mut focused_after = |app: &App, cache: Cache| {
+        let mut ui = UserInterface::build(app.view(), size, cache, &mut renderer);
+        let mut probe = IsFocused {
+            id: id.clone(),
+            focused: None,
+        };
+        ui.operate(&renderer, &mut probe);
+        (probe.focused, ui.into_cache())
+    };
+
+    // `Alt-Backspace` out of the root's top: the Roots list, which has no breadcrumb.
+    app.session.picker.as_mut().expect("open").directory = None;
+    let (focused, next) = focused_after(&app, cache);
+    assert_eq!(
+        focused,
+        Some(true),
+        "the query lost focus stepping out to the roots"
+    );
+    cache = next;
+
+    // And back into a root, where the breadcrumb returns.
+    app.session.picker.as_mut().expect("open").directory = Some("/ws/web".into());
+    let (focused, _) = focused_after(&app, cache);
+    assert_eq!(
+        focused,
+        Some(true),
+        "the query lost focus stepping into a root"
+    );
+}

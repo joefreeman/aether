@@ -260,21 +260,30 @@ pub fn overlay<'a>(
     // right. Sits on the editor bg against the panel bg (web's .picker-input-row). The explorer
     // leads with a `label: rel/` breadcrumb (workspace-relative, terminal format), flush
     // against the query; the placeholder only shows when there's no breadcrumb.
+    //
+    // **The row's shape never changes.** iced keeps a child's state — the query `text_input`'s
+    // focus and caret among it — by the child's *index*, so a slot that came and went in front of
+    // the query moved it to another index, where it started over unfocused: stepping out to the
+    // explorer's Roots list (no breadcrumb), or the first filter chip toggling on, dropped the
+    // caret, and keys fell through to the core, which types but cannot delete. Every slot before
+    // the query is therefore always present, empty when it has nothing to show.
     let mut input = row![].align_y(iced::Alignment::Center);
     // Filter chips lead the row, before the explorer breadcrumb.
     let chip_row = state.chip_row(roots);
-    if !chip_row.is_empty() {
-        let mut chips_el = row![].spacing(6).align_y(iced::Alignment::Center);
-        for (i, c) in chip_row.iter().enumerate() {
-            chips_el = chips_el.push(chip_el(c, i, state.chip_selected == Some(i), ui, p));
-        }
-        input = input.push(chips_el);
-        input = input.push(iced::widget::Space::new().width(8));
+    let mut chips_el = row![].spacing(6).align_y(iced::Alignment::Center);
+    for (i, c) in chip_row.iter().enumerate() {
+        chips_el = chips_el.push(chip_el(c, i, state.chip_selected == Some(i), ui, p));
     }
+    input = input.push(chips_el);
+    let chip_gap = if chip_row.is_empty() { 0 } else { 8 };
+    input = input.push(iced::widget::Space::new().width(chip_gap));
     let prefix = explorer_prefix(state, roots);
-    if let Some(pfx) = &prefix {
-        input = input.push(text(pfx.clone()).size(ui.body()).font(SANS).color(p.accent));
-    }
+    input = input.push(
+        text(prefix.clone().unwrap_or_default())
+            .size(ui.body())
+            .font(SANS)
+            .color(p.accent),
+    );
     // The breadcrumb / a non-empty chip row already says where typing will act, so the per-kind
     // placeholder is suppressed there.
     let show_placeholder = prefix.is_none() && chip_row.is_empty();
