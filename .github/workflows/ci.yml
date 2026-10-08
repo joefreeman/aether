@@ -50,6 +50,7 @@ jobs:
       # System libraries the GUI build (iced/winit/wgpu) links against.
       - name: Install GUI build deps
         run: |
+          sudo apt-get update
           sudo apt-get install -y \
             libxkbcommon-dev libwayland-dev libx11-dev \
             libxcursor-dev libxrandr-dev libxi-dev \
