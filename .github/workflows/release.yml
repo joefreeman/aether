@@ -149,11 +149,15 @@ jobs:
 
           # Ship the .app inside a compressed, read-only .dmg with an /Applications shortcut, so the
           # install is the conventional drag-across. UDZO = zlib-compressed.
+          # hdiutil's own sizing of the staging image (APFS by default) comes out too small and fails
+          # with "No space left on device"; size it ourselves, with headroom, on HFS+. The headroom
+          # costs nothing in the result — UDZO compresses the free space away.
           mkdir -p dmg
           cp -R "$APP" dmg/
           ln -s /Applications dmg/Applications
-          hdiutil create -volname "Aether" -srcfolder dmg -ov -format UDZO \
-            "dist/aether-${VER}-${T}.dmg"
+          SIZE_MB=$(( $(du -sm dmg | cut -f1) + 50 ))
+          hdiutil create -volname "Aether" -srcfolder dmg -fs HFS+ -size "${SIZE_MB}m" \
+            -ov -format UDZO "dist/aether-${VER}-${T}.dmg"
 
       # AppImage (Linux, GUI variant). The binary links nothing beyond glibc/libz — winit/wgpu
       # dlopen the display/GL stack at runtime — so a bare AppDir is enough; no linuxdeploy-style
