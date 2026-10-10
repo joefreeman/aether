@@ -7711,8 +7711,9 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal, ui: theme::Ui) 
     let bottom = top + ui.row_h();
     // Kinds that pin a sticky group header over the top row (grep's file path, Keybindings'
     // group label) need a revealed row to clear one row's height or it slides under the header
-    // (the bug grep hit first, then Keybindings). Same predicate as the pin itself.
-    let clearance = if p.kind.pins_group_header() {
+    // (the bug grep hit first, then Keybindings). Same predicate as the pin itself, spans included:
+    // the outline pins over a patch and has nothing to pin over a buffer.
+    let clearance = if p.kind.pins_group_header() && !p.groups.is_empty() {
         ui.row_h()
     } else {
         0.0

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 ///
 /// Cache layout: `items` is over-fetched — we ask the server for several pane-heights' worth so
 /// most scrolls stay client-side. The renderer expands the fetched window into view rows (header /
-/// gap / item — [`crate::ui::picker_window_rows`]); `visible_start` is the first *view row* drawn
+/// item — [`crate::ui::picker_window_rows`]); `visible_start` is the first *view row* drawn
 /// and slides through that cache without RPCs, so grouped results scroll one screen row at a time.
 /// `selected` is an index into `items` clamped to keep the highlight on-screen. We only round-trip
 /// when a selection move leaves the cached window — the core's `move_selection` recenters the
@@ -62,7 +62,7 @@ pub struct PickerState {
     /// picker is flat). Drives the row-space math, the item indent and the sticky pin.
     pub collapsible: bool,
     /// First *view row* rendered by the picker pane — an index into the window's expanded rows
-    /// ([`crate::ui::picker_window_rows`]: header / gap / item rows), not an item index, so the
+    /// ([`crate::ui::picker_window_rows`]: header / item rows), not an item index, so the
     /// grouped kinds scroll one screen row at a time. Slides forward / backward on selection moves
     /// to keep `selected` on-screen without an RPC. Refetch happens only when scrolling approaches
     /// the edge of `items`.

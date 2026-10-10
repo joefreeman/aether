@@ -951,17 +951,57 @@ pub fn plan_diff(diff: &git2::Diff<'_>) -> Result<PatchPlan, String> {
     plan_diff_keeping_patches(diff).map(|(plan, _)| plan)
 }
 
-/// [`plan_diff`], handing back the per-delta [`git2::Patch`] it walked as well.
+/// The order a patch shows its deltas in: **directory by directory**, each directory's own files
+/// together and by name, the directories in tree order.
+///
+/// libgit2 sorts by whole path, which splits a directory around its subdirectories — `a/b.rs`,
+/// `a/c/d.rs`, `a/e.rs` — and the outline groups files under their directory, so a directory split
+/// in the view would be a directory listed twice. The view and its outline read one order; this is
+/// where it is decided, for the working changes and a commit alike.
+fn delta_order(diff: &git2::Diff<'_>) -> Vec<usize> {
+    let key = |idx: usize| -> (Vec<String>, String) {
+        let delta = diff.get_delta(idx);
+        let path = delta
+            .as_ref()
+            .and_then(|d| path_of(&d.new_file()).or_else(|| path_of(&d.old_file())))
+            .unwrap_or_default();
+        let (dir, name) = split_dir(&path);
+        (
+            dir.split('/')
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect(),
+            name.to_string(),
+        )
+    };
+    let mut order: Vec<usize> = (0..diff.deltas().len()).collect();
+    order.sort_by_cached_key(|&idx| key(idx));
+    order
+}
+
+/// A repo-relative path split into its directory (no trailing slash; empty at the top level) and
+/// its file name.
+pub fn split_dir(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
+/// [`plan_diff`], handing back the per-delta [`git2::Patch`] it walked as well, each with the index
+/// of the delta it is for — planned in [`delta_order`], which is not the diff's own.
 ///
 /// Materialising a patch is where libgit2 runs the file's line diff, so it is the expensive half
 /// of planning — and rendering needs the same patches for the same deltas, in the same order.
 /// Planning keeps them rather than have rendering diff every file a second time.
+#[allow(clippy::type_complexity)]
 fn plan_diff_keeping_patches<'d>(
     diff: &'d git2::Diff<'_>,
-) -> Result<(PatchPlan, Vec<Option<git2::Patch<'d>>>), String> {
+) -> Result<(PatchPlan, Vec<(usize, Option<git2::Patch<'d>>)>), String> {
     let mut files = Vec::new();
     let mut patches = Vec::new();
-    for (idx, delta) in diff.deltas().enumerate() {
+    for idx in delta_order(diff) {
+        let delta = diff.get_delta(idx).expect("an index under the delta count");
         let patch = git2::Patch::from_diff(diff, idx).map_err(|e| e.message().to_string())?;
         let hunk_count = patch.as_ref().map(|p| p.num_hunks()).unwrap_or(0);
         let (_, added, removed) = patch
@@ -1051,7 +1091,7 @@ fn plan_diff_keeping_patches<'d>(
             removed: removed as u32,
             regions,
         });
-        patches.push(patch);
+        patches.push((idx, patch));
     }
     Ok((PatchPlan { files }, patches))
 }
@@ -1121,8 +1161,8 @@ pub fn render_diff(
         emit_summary(b, &plan, since);
     }
     let mut parsed_files = 0usize;
-    for ((idx, delta), patch) in diff.deltas().enumerate().zip(patches) {
-        let planned = &plan.files[idx];
+    for (planned, (idx, patch)) in plan.files.iter().zip(patches) {
+        let delta = diff.get_delta(idx).expect("an index under the delta count");
         let old_path = planned.old_path.clone();
         let new_path = planned.new_path.clone();
         let hunk_count = planned.regions.len();

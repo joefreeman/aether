@@ -219,7 +219,7 @@ pub struct Shell {
     /// why it's a debt rather than a one-shot callback.
     pending_reveal: PendingReveal,
     /// Picker results scroll continuity — the first-visible *view row* (`top`, an index into
-    /// [`crate::ui::picker_window_rows`]: header / gap / item rows, so grep / keybindings scroll one
+    /// [`crate::ui::picker_window_rows`]: header / item rows, so grep / keybindings scroll one
     /// screen row at a time), the selection's on-screen pane row, and the `core.offset` they were
     /// computed against. Threaded through `crate::ui::picker_scroll_step` each sync so the scroll
     /// survives a recentering refetch (and its empty-items frames). Reset by
@@ -3063,9 +3063,9 @@ impl Shell {
         p.completion = core.explorer_completion();
         p.explorer_parent = core.directory_parent.clone();
         // Keep the highlight on-screen within the fetched slice (the shell half of
-        // RevealPickerSelection). Scroll is a *view row* over the window's header / gap / item
+        // RevealPickerSelection). Scroll is a *view row* over the window's header / item
         // rows, so grep / keybindings advance one screen row at a time even across a group
-        // boundary — the item-index math jumped a header + gap there. `picker_scroll_step` also
+        // boundary — the item-index math jumped a header there. `picker_scroll_step` also
         // carries the on-screen position across a recentering refetch (and preserves it through
         // the empty-items frames a fast scroll produces, rather than snapping to the top).
         let rows = crate::ui::picker_window_rows(p.items.len(), &p.groups, core.collapsible);

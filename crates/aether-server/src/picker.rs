@@ -186,16 +186,8 @@ pub struct GitChangeCandidate {
     pub path_index: u32,
     /// Path relative to `roots[path_index]` (forward-slash). The file-group key.
     pub relative_path: String,
-    /// Whether `relative_path` names a **group of its own** — whether the picker renders a header
-    /// for it and collapses the rows under it.
-    ///
-    /// True for everything with a file behind it, which is what the header says. False for the
-    /// outline of a view whose rows have no files at all — a shell's runs, a conversation's turns:
-    /// they all belong to the one shell, so a header would be a group holding the whole list, an
-    /// extra row and an extra keystroke that separates nothing from nothing. The label is still
-    /// carried, because a row captured into the jumplist lands among rows from everywhere and
-    /// "which shell" is the thing it then has to say.
-    pub grouped: bool,
+    /// Whether `relative_path` names a **group of its own**, and what kind. See [`RowGrouping`].
+    pub grouping: RowGrouping,
     /// Absolute path, returned via `PickerSelectResult::FileAt` for `view/open`.
     pub abs_path: String,
     /// Position of this hunk within its file's change list (0-based, anchor order).
@@ -219,6 +211,28 @@ pub struct GitChangeCandidate {
     /// Set when this row points into an open **patch** buffer rather than a file on disk — the
     /// rows `Space c` shows while you are reading a commit. See [`PatchRowTarget`].
     pub patch: Option<PatchRowTarget>,
+}
+
+/// How a changes row's `relative_path` groups it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowGrouping {
+    /// Under a header that collapses its rows: a file's changes, wherever there is a file behind
+    /// them, which is what the header says.
+    Collapsible,
+    /// Under a plain section header that does not collapse: a patch outline's files, each under
+    /// its directory. A collapsed directory would hide the very rows the outline is for, and a
+    /// review is short enough to read whole.
+    ///
+    /// A view of sections may **lead** with [`Self::None`] rows — the top-level files, which have
+    /// no directory to sit under. They must come first: a header-less row after a section would
+    /// read as one of its rows.
+    Section,
+    /// Under no header: a patch outline's top-level files, and the outline of a view whose rows
+    /// have no files at all — a shell's runs, a conversation's turns. They all belong to the one shell, so a header would be a group
+    /// holding the whole list, an extra row that separates nothing from nothing. The label is
+    /// still carried, because a row captured into the jumplist lands among rows from everywhere
+    /// and "which shell" is the thing it then has to say.
+    None,
 }
 
 /// Addressing for a changes row that points into an open patch buffer.
@@ -281,7 +295,7 @@ impl GitChangeCandidate {
             lines,
             untracked: false,
             patch: None,
-            grouped: true,
+            grouping: RowGrouping::Collapsible,
         }
     }
 
@@ -310,7 +324,7 @@ impl GitChangeCandidate {
             lines,
             untracked: false,
             patch: Some(target),
-            grouped: true,
+            grouping: RowGrouping::Collapsible,
         }
     }
 
@@ -321,10 +335,9 @@ impl GitChangeCandidate {
         self
     }
 
-    /// Builder tweak: this row's label is not a group of its own. See
-    /// [`GitChangeCandidate::grouped`].
-    pub fn ungrouped(mut self) -> Self {
-        self.grouped = false;
+    /// Builder tweak: how this row's label groups it. See [`RowGrouping`].
+    pub fn grouped_as(mut self, grouping: RowGrouping) -> Self {
+        self.grouping = grouping;
         self
     }
 
@@ -2575,8 +2588,8 @@ impl PickerState {
             // `group_header_at`, same convention as the jumplist's label groups. A row whose label
             // is no group of its own (a shell's runs, a conversation's turns) keys nothing, exactly
             // as a flat kind's rows do.
-            PickerCandidates::GitChanges(v) if v[ci].patch.is_some() => v[ci]
-                .grouped
+            PickerCandidates::GitChanges(v) if v[ci].patch.is_some() => (v[ci].grouping
+                != RowGrouping::None)
                 .then(|| (LABEL_KEY, v[ci].relative_path.as_str())),
             PickerCandidates::GitChanges(v) => {
                 Some((v[ci].path_index, v[ci].relative_path.as_str()))
@@ -2616,7 +2629,7 @@ impl PickerState {
             // outside every workspace root, so there is no `path_index` to render a root label
             // from. Same reasoning as WorkspaceSymbols below.
             PickerCandidates::GitChanges(v) if v[ci].patch.is_some() => {
-                v[ci].grouped.then(|| GroupHeader::Label {
+                (v[ci].grouping != RowGrouping::None).then(|| GroupHeader::Label {
                     label: v[ci].relative_path.clone(),
                 })
             }
@@ -2671,10 +2684,10 @@ impl PickerState {
         match &self.candidates {
             // Except where the rows have no files to group by at all: a shell's or a conversation's
             // outline is one view's own structure, so a header over it is one group holding the
-            // whole list. See [`GitChangeCandidate::grouped`].
-            PickerCandidates::GitChanges(v) if v.first().is_some_and(|c| c.patch.is_some()) => {
-                v.first().is_some_and(|c| c.grouped)
-            }
+            // whole list. See [`RowGrouping`].
+            PickerCandidates::GitChanges(v) if v.first().is_some_and(|c| c.patch.is_some()) => v
+                .first()
+                .is_some_and(|c| c.grouping == RowGrouping::Collapsible),
             PickerCandidates::Jumplist(v) => {
                 self.kind.collapsible() && v.first().is_none_or(|e| e.group.is_some())
             }
@@ -2689,9 +2702,17 @@ impl PickerState {
     /// Collapsible implies it: a collapsible view's headers *are* window rows, so a view that
     /// collapses necessarily renders them. That's what carries the buffer-locked changes picker
     /// over a patch, whose kind is headerless because over a *file* one header would only repeat
-    /// the filename.
+    /// the filename. And a patch's outline renders its directories as plain sections, though the
+    /// outline's kind is headerless over an ordinary buffer.
     pub fn renders_group_headers(&self) -> bool {
-        self.collapsible() || self.kind.renders_group_headers()
+        // Any row, not the first: a patch outline lists its top-level files first, under no
+        // section, and only the directories after them have one.
+        let sectioned = matches!(
+            &self.candidates,
+            PickerCandidates::GitChanges(v)
+                if v.iter().any(|c| c.grouping == RowGrouping::Section)
+        );
+        self.collapsible() || sectioned || self.kind.renders_group_headers()
     }
 
     /// The collapsible views' row-space layout ([`RowLayout`]); `None` for the flat ones. Derived
@@ -2949,17 +2970,22 @@ impl PickerState {
         if let Some(layout) = self.row_layout() {
             return Some((offset, layout.total_rows()));
         }
-        self.group_key_at(*self.ranked.first()? as usize)?; // bail for non-grouped kinds (and empty sets)
+        // Bail for empty sets. Not on the first row's key: a sectioned view can lead with rows
+        // that belong to no group (a patch outline's top-level files), and they count as rows
+        // with no header — a `None` key opens no group below.
+        self.ranked.first()?;
         let mut total_groups = 0u32;
         let mut headers_at_or_before = 0u32;
         let mut prev: Option<(u32, &str)> = None;
         for (rank, &ci) in self.ranked.iter().enumerate() {
             let key = self.group_key_at(ci as usize);
             if prev != key {
-                total_groups += 1;
                 prev = key;
-                if (rank as u32) <= offset {
-                    headers_at_or_before += 1;
+                if key.is_some() {
+                    total_groups += 1;
+                    if (rank as u32) <= offset {
+                        headers_at_or_before += 1;
+                    }
                 }
             }
         }

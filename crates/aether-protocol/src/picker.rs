@@ -294,8 +294,12 @@ impl PickerKind {
     }
 
     /// Whether this picker pins a **sticky group header** over the list's first visible row: the
-    /// file-grouped kinds, plus Keybindings and Jumplist. References renders section labels but
-    /// deliberately doesn't pin.
+    /// file-grouped kinds, plus Keybindings, Jumplist and DocumentSymbols. References renders
+    /// section labels but deliberately doesn't pin.
+    ///
+    /// DocumentSymbols has groups only over a patch, whose outline lists files under their
+    /// directories; over a buffer or a shell it sends no spans, and with no span there is nothing
+    /// to pin — every shell gates the pin on the spans as well as the kind.
     ///
     /// The pin covers the top row, so the shells that draw it also owe a revealed row one row of
     /// clearance or it slides underneath. Lives here beside [`Self::groups_by_file`], which it is
@@ -303,7 +307,11 @@ impl PickerKind {
     /// character-for-character in both the terminal and native clients. The browser has no copy:
     /// it pins with CSS `position: sticky` and never asks the question.
     pub fn pins_group_header(self) -> bool {
-        self.groups_by_file() || matches!(self, PickerKind::Keybindings | PickerKind::Jumplist)
+        self.groups_by_file()
+            || matches!(
+                self,
+                PickerKind::Keybindings | PickerKind::Jumplist | PickerKind::DocumentSymbols
+            )
     }
 
     /// Whether this kind's groups are collapsible: group headers are pushed as first-class
@@ -371,7 +379,7 @@ impl PickerKind {
         matches!(
             self,
             // The outline: land on the entry the cursor is *in*. Over a composed view that is the
-            // change you are reading; over an ordinary buffer the enclosing symbol, resolved the
+            // file you are reading; over an ordinary buffer the enclosing symbol, resolved the
             // same way every other cursor-anchored kind resolves.
             PickerKind::DocumentSymbols
                 | PickerKind::Jumplist
@@ -2020,6 +2028,8 @@ mod tests {
         assert!(PickerKind::DiagnosticsWorkspace.pins_group_header());
         assert!(PickerKind::Keybindings.pins_group_header());
         assert!(PickerKind::Jumplist.pins_group_header());
+        // A patch outline's directories.
+        assert!(PickerKind::DocumentSymbols.pins_group_header());
         // Renders section labels, but deliberately doesn't pin one.
         assert!(!PickerKind::References.pins_group_header());
         assert!(!PickerKind::Files.pins_group_header());

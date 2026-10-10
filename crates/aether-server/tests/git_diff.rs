@@ -1747,7 +1747,8 @@ async fn every_captured_outline_entry_lands_in_the_review() {
     let repo = init_repo_at(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
-    for name in ["src/aaa.rs", "top.rs"] {
+    // Four files in two directories: four outline entries to walk.
+    for name in ["src/aaa.rs", "src/bbb.rs", "top.rs", "zzz.rs"] {
         commit_file(&repo, name, &base);
         std::fs::write(
             root.join(name),
@@ -1988,7 +1989,8 @@ async fn a_review_hidden_and_brought_back_still_lands_every_entry() {
     let repo = init_repo_at(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
-    for name in ["src/aaa.rs", "top.rs"] {
+    // Four files in two directories: four outline entries to walk.
+    for name in ["src/aaa.rs", "src/bbb.rs", "top.rs", "zzz.rs"] {
         commit_file(&repo, name, &base);
         std::fs::write(
             root.join(name),
@@ -2352,8 +2354,9 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
         .count();
     assert_eq!(unbound, 2, "the fixture wants aaa.rs's two hunks unbound");
 
-    // The cursor sits at the top of aaa.rs's first hunk — that entry is current — so `]` is its
-    // second: seated in the review's own document, on the row that shows file line 42.
+    // The cursor sits at the top of top.rs — the top level lists first, so that entry is current —
+    // and `]` is aaa.rs: seated in the review's own document, on the row that shows file line 2,
+    // the top of its first hunk.
     let stepped: JumplistStepResult = send_request::<JumplistStep>(
         &mut ws,
         &JumplistStepParams {
@@ -2368,7 +2371,7 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
     let t = stepped.moved().expect("lands");
     assert_eq!(t.index, 2, "{t:?}");
     let seat = t.seat.expect("in the review");
-    assert_eq!(seat.element, 1);
+    assert_eq!(seat.element, 2, "aaa.rs's first hunk, after top.rs's two");
     assert_eq!(
         seat.buffer_id, patch.buffer_id,
         "the element windows the patch itself"
@@ -2390,8 +2393,8 @@ async fn an_entry_seats_in_an_unbound_element_at_its_patch_row() {
         .nth(t.position.unwrap().line as usize)
         .unwrap_or("");
     assert_eq!(
-        row, "fn line42() {}",
-        "the seat is the patch row showing file line 42, not file line 42 of the patch"
+        row, "fn line2() {}",
+        "the seat is the patch row showing file line 2, not line 2 of the patch"
     );
 
     drop(server);
@@ -2567,8 +2570,8 @@ async fn a_reverted_change_is_stepped_over_not_opened_as_a_file() {
     assert_eq!(t.index, 1);
     assert!(t.seat.is_some(), "and the landing is in the review");
 
-    // Enter on a gone row in the jumplist picker says so too. The list groups by file and opens
-    // collapsed, so m.rs's group is expanded to reach its row.
+    // Enter on a gone row in the jumplist picker says so too. The list groups as the outline did —
+    // by directory — and opens collapsed, so the top level's group is expanded to reach m.rs.
     use aether_protocol::picker::{
         GroupHeader, PickerGroupAction, PickerReset, PickerSetGroup, PickerSetGroupParams,
         PickerSetGroupResult,
@@ -2586,9 +2589,7 @@ async fn a_reverted_change_is_stepped_over_not_opened_as_a_file() {
         &PickerSetGroupParams {
             kind: PickerKind::Jumplist,
             action: PickerGroupAction::Expand {
-                header: GroupHeader::Label {
-                    label: "m.rs".into(),
-                },
+                header: GroupHeader::Label { label: "./".into() },
             },
         },
     )
@@ -2607,7 +2608,7 @@ async fn a_reverted_change_is_stepped_over_not_opened_as_a_file() {
         .map(|u| u.items().to_vec())
         .unwrap_or_default()
         .into_iter()
-        .find(|i| matches!(i, PickerItem::JumplistEntry { .. }))
+        .find(|i| matches!(i, PickerItem::JumplistEntry { display, .. } if display == "m.rs"))
         .expect("m.rs's row, under its expanded group");
     let selected: PickerSelectResult = send_request::<PickerSelect>(
         &mut ws,
@@ -10456,14 +10457,15 @@ async fn leaving_a_composed_view_collects_the_patch_and_its_elements() {
     drop(server);
 }
 
-/// `Space o` in a patch outlines the **patch**: a row per change, grouped by file, labelled by the
-/// enclosing signature git records in the hunk header.
+/// `Space o` in a patch outlines the **patch**: a row per file, by name, with the file's diffstat —
+/// the top-level files first under no header, then a plain section per directory.
 ///
-/// It used to resolve document symbols for whichever file the cursor was in — an outline of one
-/// hunk's file, describing nothing about the review. The label is *where the change is*, not what it
-/// says, which is what makes this an outline rather than a second changes picker.
+/// The directories come in tree order with each one's files together — including a directory whose
+/// files git's whole-path order splits around a subdirectory (`src/b.rs`, `src/sub/c.rs`,
+/// `src/z.rs`), which would otherwise be listed twice. The sections do not collapse: a collapsed
+/// directory hides the rows the outline is for.
 #[tokio::test]
-async fn the_outline_of_a_patch_is_its_changes_grouped_by_file() {
+async fn the_outline_of_a_patch_is_its_files_by_directory() {
     use aether_protocol::picker::{
         GroupHeader, PickerKind, PickerView, PickerViewParams, PickerViewResult,
     };
@@ -10471,21 +10473,31 @@ async fn the_outline_of_a_patch_is_its_changes_grouped_by_file() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
-    // A change *inside* a function, with enough context above it that the hunk starts below the
-    // signature — otherwise git has nothing to name the hunk after.
-    let body = |marker: &str| {
-        let mut out = String::from("fn outer() {\n");
-        for i in 0..20 {
-            out.push_str(&format!(
-                "    let v{i} = {};\n",
-                if i == 10 { marker } else { "0" }
-            ));
-        }
-        out.push_str("}\n");
-        out
+    let lines = |n: usize, marker: usize| -> String {
+        (0..n)
+            .map(|i| {
+                if i == marker {
+                    "changed\n".to_string()
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect()
     };
-    commit_file(&repo, "one.rs", &body("0"));
-    std::fs::write(root.join("one.rs"), body("999")).unwrap();
+    for path in ["top.rs", "src/b.rs", "src/sub/c.rs", "src/z.rs"] {
+        commit_file(&repo, path, &lines(40, usize::MAX));
+    }
+    // `src/b.rs` changes in two places, far enough apart to be two hunks — still one row.
+    std::fs::write(
+        root.join("src/b.rs"),
+        lines(40, usize::MAX)
+            .replace("line 2\n", "two\n")
+            .replace("line 30\n", "thirty\nmore\n"),
+    )
+    .unwrap();
+    for path in ["top.rs", "src/sub/c.rs", "src/z.rs"] {
+        std::fs::write(root.join(path), lines(40, 5)).unwrap();
+    }
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
     let patch = show_buffer(
@@ -10532,32 +10544,49 @@ async fn the_outline_of_a_patch_is_its_changes_grouped_by_file() {
         },
     )
     .await;
-    let rows = view.update.map(|u| u.items().to_vec()).unwrap_or_default();
-
-    let groups: Vec<String> = rows
+    assert!(!view.collapsible, "directory sections do not collapse");
+    let update = view.update.expect("the outline has rows");
+    let rows: Vec<(String, u32, u32)> = update
+        .items()
         .iter()
-        .filter_map(|i| match i {
-            PickerItem::Group {
-                header: GroupHeader::Label { label },
+        .map(|i| match i {
+            PickerItem::GitChange {
+                preview,
+                added,
+                removed,
                 ..
-            } => Some(label.clone()),
-            _ => None,
+            } => (preview.clone(), *added, *removed),
+            other => panic!("a section is a header, not a row: {other:?}"),
         })
         .collect();
     assert_eq!(
-        groups,
-        vec!["one.rs".to_string()],
-        "grouped by file, not by directory: {rows:?}"
+        rows,
+        vec![
+            ("top.rs".to_string(), 1, 1),
+            ("b.rs".to_string(), 3, 2),
+            ("z.rs".to_string(), 1, 1),
+            ("c.rs".to_string(), 1, 1),
+        ],
+        "one row per file, each directory's files together, with its diffstat"
     );
-
-    // The row's label is the enclosing signature, which is what makes it an outline.
-    let labelled = rows.iter().any(|i| match i {
-        PickerItem::GitChange { preview, .. } => preview.contains("fn outer"),
-        _ => false,
-    });
-    assert!(
-        labelled || rows.len() == 1,
-        "the change's row is labelled by its enclosing function: {rows:?}"
+    let sections: Vec<(u32, String)> = update
+        .groups
+        .iter()
+        .map(|g| match &g.header {
+            GroupHeader::Label { label } => (g.start, label.clone()),
+            other => panic!("a directory is a label: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        sections,
+        vec![(1, "src/".to_string()), (3, "src/sub/".to_string())],
+        "the top-level file under no header, then a section per directory, each listed once, in \
+         tree order"
+    );
+    assert_eq!(
+        update.total_display_rows,
+        Some(6),
+        "four rows and two headers: the ungrouped lead opens no group"
     );
 
     drop(server);
@@ -10657,7 +10686,8 @@ async fn scrolling_the_patch_outline_keeps_its_rows() {
     drop(server);
 }
 
-/// Every outline row selects **its own** hunk top — distinct rows, distinct targets.
+/// Every outline row selects **its own** file, at its first hunk's top — distinct rows, distinct
+/// targets.
 ///
 /// The weaker property (a row resolves "to somewhere") was already covered, and it holds even when
 /// every row resolves to the *same* somewhere. That is the shape the bug actually took: selecting
@@ -10665,10 +10695,9 @@ async fn scrolling_the_patch_outline_keeps_its_rows() {
 /// showing. So this asserts the identities — each row's `(element, buffer, line)` equals the hunk
 /// the row names, and no two rows share a target — rather than counting rows that resolved.
 #[tokio::test]
-async fn each_outline_row_selects_its_own_hunk_top() {
+async fn each_outline_row_selects_its_own_file() {
     use aether_protocol::picker::{
-        GroupHeader, PickerGroupAction, PickerKind, PickerReset, PickerSelect, PickerSelectParams,
-        PickerSelectResult, PickerSetGroup, PickerSetGroupParams, PickerSetGroupResult, PickerView,
+        PickerKind, PickerSelect, PickerSelectParams, PickerSelectResult, PickerView,
         PickerViewParams, PickerViewResult,
     };
 
@@ -10676,7 +10705,7 @@ async fn each_outline_row_selects_its_own_hunk_top() {
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
     // Two files, two well-separated changes each: four hunks, so "every row lands on row 0's
-    // target" and "every row lands on its file's first hunk" are both distinguishable failures.
+    // target" and "a row lands on its file's *last* hunk" are both distinguishable failures.
     let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
     for name in ["aaa.rs", "zzz.rs"] {
         commit_file(&repo, name, &base);
@@ -10723,38 +10752,12 @@ async fn each_outline_row_selects_its_own_hunk_top() {
     )
     .await;
 
-    let _view: PickerViewResult = send_request::<PickerView>(
-        &mut ws,
-        &PickerViewParams {
-            view_id: Some(patch.view_id),
-            buffer_id: Some(patch.buffer_id),
-            limit: 100,
-            ..view_params(PickerKind::DocumentSymbols)
-        },
-    )
-    .await;
-    // Groups start collapsed, so the change rows only exist once both files are open.
-    for label in ["aaa.rs", "zzz.rs"] {
-        let _: PickerSetGroupResult = send_request::<PickerSetGroup>(
-            &mut ws,
-            &PickerSetGroupParams {
-                kind: PickerKind::DocumentSymbols,
-                action: PickerGroupAction::Expand {
-                    header: GroupHeader::Label {
-                        label: label.to_string(),
-                    },
-                },
-            },
-        )
-        .await;
-    }
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
             view_id: Some(patch.view_id),
             buffer_id: Some(patch.buffer_id),
             limit: 100,
-            reset: PickerReset::Keep, // a default re-view resets the expansion we just set
             ..view_params(PickerKind::DocumentSymbols)
         },
     )
@@ -10765,15 +10768,12 @@ async fn each_outline_row_selects_its_own_hunk_top() {
         .filter(|i| matches!(i, PickerItem::GitChange { .. }))
         .cloned()
         .collect();
-    assert!(
-        changes.len() >= 4,
-        "two files x two changes should each get an outline row: {rows:?}"
-    );
+    assert_eq!(changes.len(), 2, "one outline row per file: {rows:?}");
 
     let mut targets = Vec::new();
     for item in changes {
         let PickerItem::GitChange {
-            relative_path,
+            preview: relative_path,
             hunk_index,
             line,
             ..
@@ -10819,10 +10819,10 @@ async fn each_outline_row_selects_its_own_hunk_top() {
         ));
     }
 
-    // Each hunk is its own element, and each lands on its own hunk *top*: the changes sit at lines
-    // 5 and 45, and a hunk opens three context lines above its change. Named constants rather than
-    // "four distinct values", because every row resolving to a distinct-but-wrong line is the
-    // failure this is here to catch.
+    // Each hunk is its own element, and each file lands on its *first* hunk's top: the changes sit
+    // at lines 5 and 45, and a hunk opens three context lines above its change. Named constants
+    // rather than "distinct values", because every row resolving to a distinct-but-wrong line is
+    // the failure this is here to catch.
     let landed: Vec<(String, u32, aether_protocol::viewport::FieldId, u32)> = targets
         .iter()
         .map(|(path, hunk, element, _, pos, _)| (path.clone(), *hunk, *element, *pos))
@@ -10831,11 +10831,9 @@ async fn each_outline_row_selects_its_own_hunk_top() {
         landed,
         vec![
             ("aaa.rs".to_string(), 0, 0, 2),
-            ("aaa.rs".to_string(), 1, 1, 42),
-            ("zzz.rs".to_string(), 2, 2, 2),
-            ("zzz.rs".to_string(), 3, 3, 42),
+            ("zzz.rs".to_string(), 1, 2, 2),
         ],
-        "each row selects its own element at its own hunk top"
+        "each row selects its own file's first element at its hunk top"
     );
 
     drop(server);
@@ -10859,10 +10857,10 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
-    // Several files, several changes each — the shape a real review has, and the one where the
-    // captured entries can interleave.
+    // Several files in two directories, several changes each — the shape a real review has, and
+    // the one where the captured entries can interleave.
     let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
-    for name in ["src/aaa.rs", "top.rs"] {
+    for name in ["src/aaa.rs", "src/bbb.rs", "top.rs", "zzz.rs"] {
         commit_file(&repo, name, &base);
         std::fs::write(
             root.join(name),
@@ -10930,7 +10928,7 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
     )
     .await
     .expect("the outline captures");
-    assert_eq!(captured.total, 4, "one entry per change in the outline");
+    assert_eq!(captured.total, 4, "one entry per file in the outline");
 
     // The captured entries must not be file-shaped: a directory in a `File` target is what made a
     // later jump try to open one.
@@ -10963,7 +10961,7 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
     assert_eq!(
         headers.len(),
         unique.len(),
-        "each file groups once: {headers:?}"
+        "each directory groups once: {headers:?}"
     );
     for h in &headers {
         assert!(
@@ -11010,7 +11008,9 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
         landed
             .path
             .as_deref()
-            .is_some_and(|p| p.ends_with("aaa.rs") || p.ends_with("top.rs")),
+            .is_some_and(|p| ["aaa.rs", "bbb.rs", "top.rs", "zzz.rs"]
+                .iter()
+                .any(|name| p.ends_with(name))),
         "and it names one of the view's own files — got {:?}",
         landed.path
     );
@@ -11091,8 +11091,8 @@ async fn capturing_a_patch_picker_into_the_jumplist_addresses_the_buffer() {
         "the second press advances to entry 2 instead of answering with the first again"
     );
     assert_ne!(
-        (again.view_id, again.position),
-        (landed.view_id, landed.position),
+        (&again.path, again.position),
+        (&landed.path, landed.position),
         "and lands somewhere else"
     );
 
@@ -11213,7 +11213,7 @@ async fn a_patch_jumplist_steps_from_another_editor() {
     )
     .await
     .expect("the outline captures");
-    assert_eq!(captured.total, 4);
+    assert_eq!(captured.total, 2, "one entry per file");
 
     // Now go and look at something else: opening a file supersedes the client's viewport, so the
     // patch view is no longer on screen.
@@ -11506,7 +11506,8 @@ async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
     for name in ["aaa.rs", "zzz.rs"] {
         commit_file(&repo, name, &base);
     }
-    // A second commit touching both files, in two places each — the patch the outline describes.
+    // A commit per file, each touching it in two places. The one examined is zzz.rs's: one file,
+    // two hunks — one outline entry.
     for name in ["aaa.rs", "zzz.rs"] {
         commit_file(
             &repo,
@@ -11585,7 +11586,7 @@ async fn a_commit_patch_jumplist_goes_back_to_the_commit() {
     )
     .await
     .expect("the commit outline captures");
-    assert!(captured.total >= 2, "one entry per hunk in the commit");
+    assert_eq!(captured.total, 1, "one entry per file in the commit");
 
     // Go and look at something else, which closes the commit patch (it is transient).
     let other: ViewOpenResult = send_request::<ViewOpen>(
@@ -11700,7 +11701,9 @@ async fn jumplist_rows(ws: &mut Ws) -> Vec<PickerItem> {
 /// `view_outline`, and this asserts they agree rather than asserting each is individually plausible.
 #[tokio::test]
 async fn the_outline_the_motion_and_the_breadcrumb_agree() {
-    use aether_protocol::picker::{PickerKind, PickerView, PickerViewParams, PickerViewResult};
+    use aether_protocol::picker::{
+        GroupHeader, PickerKind, PickerView, PickerViewParams, PickerViewResult,
+    };
     use aether_protocol::viewport::{
         FocusStep, NavigateGrain, ViewportFocusElementResult, ViewportNavigateChange,
         ViewportNavigateChangeParams,
@@ -11709,19 +11712,11 @@ async fn the_outline_the_motion_and_the_breadcrumb_agree() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
-    let body = |marker: &str| {
-        let mut out = String::from("fn outer() {\n");
-        for i in 0..20 {
-            out.push_str(&format!(
-                "    let v{i} = {};\n",
-                if i == 10 { marker } else { "0" }
-            ));
-        }
-        out.push_str("}\n");
-        out
-    };
-    commit_file(&repo, "one.rs", &body("0"));
-    std::fs::write(root.join("one.rs"), body("999")).unwrap();
+    let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
+    for name in ["src/one.rs", "src/two.rs"] {
+        commit_file(&repo, name, &base);
+        std::fs::write(root.join(name), base.replace("fn line5() {}", "fn A() {}")).unwrap();
+    }
 
     let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
     let patch = show_buffer(
@@ -11756,7 +11751,7 @@ async fn the_outline_the_motion_and_the_breadcrumb_agree() {
     )
     .await;
 
-    // What the picker says.
+    // What the picker says: the second row, under its directory.
     let view: PickerViewResult = send_request::<PickerView>(
         &mut ws,
         &PickerViewParams {
@@ -11767,60 +11762,17 @@ async fn the_outline_the_motion_and_the_breadcrumb_agree() {
         },
     )
     .await;
-    let _ = view;
-    // Groups open collapsed, so query to surface the change rows themselves.
-    use aether_protocol::picker::{PickerQuery, PickerQueryParams};
-    let _: () = send_request::<PickerQuery>(
-        &mut ws,
-        &PickerQueryParams {
-            kind: PickerKind::DocumentSymbols,
-            query: "outer".into(),
-            generation: 1,
-            filters: Default::default(),
-        },
-    )
-    .await;
-    // Groups open collapsed, so the change rows only appear once one is expanded.
-    use aether_protocol::picker::{
-        GroupHeader, PickerGroupAction, PickerSetGroup, PickerSetGroupParams, PickerSetGroupResult,
+    let update = view.update.expect("the outline has rows");
+    let Some(PickerItem::GitChange { preview, .. }) = update.items().get(1) else {
+        panic!("the outline has a second row, got {:?}", update.items());
     };
-    let _: PickerSetGroupResult = send_request::<PickerSetGroup>(
-        &mut ws,
-        &PickerSetGroupParams {
-            kind: PickerKind::DocumentSymbols,
-            action: PickerGroupAction::Expand {
-                header: GroupHeader::Label {
-                    label: "one.rs".into(),
-                },
-            },
-        },
-    )
-    .await;
-    // The query's results arrive as a push; re-view (without wiping) to read the current window.
-    let narrowed: PickerViewResult = send_request::<PickerView>(
-        &mut ws,
-        &PickerViewParams {
-            reset: aether_protocol::picker::PickerReset::Keep,
-            view_id: Some(patch.view_id),
-            buffer_id: Some(patch.buffer_id),
-            limit: 50,
-            ..view_params(PickerKind::DocumentSymbols)
-        },
-    )
-    .await;
-    let rows = narrowed
-        .update
-        .map(|u| u.items().to_vec())
-        .unwrap_or_default();
-    let picker_label = rows
-        .iter()
-        .find_map(|i| match i {
-            PickerItem::GitChange { preview, .. } => Some(preview.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("the outline has a change row, got {rows:?}"));
+    let Some(GroupHeader::Label { label: section }) = update.groups.first().map(|g| &g.header)
+    else {
+        panic!("the rows sit under their directory: {:?}", update.groups);
+    };
+    let picker_says = format!("{section}{preview}");
 
-    // What the motion does — step to that same change.
+    // What the motion does — step to that same file.
     let stepped: ViewportFocusElementResult = send_request::<ViewportNavigateChange>(
         &mut ws,
         &ViewportNavigateChangeParams {
@@ -11841,27 +11793,23 @@ async fn the_outline_the_motion_and_the_breadcrumb_agree() {
         .map(|c| c.name.clone())
         .collect();
 
+    assert_eq!(picker_says, "src/two.rs");
     assert_eq!(
-        crumbs.first().map(String::as_str),
-        Some("one.rs"),
-        "the breadcrumb leads with the file the outline grouped under: {crumbs:?}"
-    );
-    assert_eq!(
-        crumbs.get(1),
-        Some(&picker_label),
-        "and names the change in the *same words* the picker used — {crumbs:?} vs {picker_label:?}"
+        crumbs,
+        vec![picker_says],
+        "the breadcrumb names the file the motion landed in, as the picker's section and row do"
     );
 
     drop(server);
 }
 
-/// Opening the outline lands on the change the cursor is in, not at the top.
+/// Opening the outline lands on the file the cursor is in, not at the top.
 ///
 /// Resolved by the same `outline_entry_at` the breadcrumb uses, so the row the picker opens on is
 /// the one the status bar is already naming — the picker and the status bar cannot disagree about
 /// where you are.
 #[tokio::test]
-async fn the_outline_opens_on_the_change_the_cursor_is_in() {
+async fn the_outline_opens_on_the_file_the_cursor_is_in() {
     use aether_protocol::picker::{PickerKind, PickerView, PickerViewParams, PickerViewResult};
     use aether_protocol::viewport::{
         FocusStep, NavigateGrain, ViewportFocusElementResult, ViewportNavigateChange,
@@ -11871,14 +11819,20 @@ async fn the_outline_opens_on_the_change_the_cursor_is_in() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let repo = init_repo_at(&root);
-    // Two well-separated changes in one file, so "the second one" is a distinct answer from "the
-    // first" and centring on the top would be visibly wrong.
+    // Two files, the first with two well-separated changes: the third change is in the second file,
+    // so its row is a distinct answer from the top *and* from the third hunk's index.
     let base: String = (0..60).map(|n| format!("fn line{n}() {{}}\n")).collect();
     commit_file(&repo, "one.rs", &base);
+    commit_file(&repo, "two.rs", &base);
     std::fs::write(
         root.join("one.rs"),
         base.replace("fn line5() {}", "fn A() {}")
             .replace("fn line45() {}", "fn B() {}"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("two.rs"),
+        base.replace("fn line5() {}", "fn C() {}"),
     )
     .unwrap();
 
@@ -11915,9 +11869,9 @@ async fn the_outline_opens_on_the_change_the_cursor_is_in() {
     )
     .await;
 
-    // Step to the *second* change, so the cursor is somewhere other than the top of the outline.
+    // Step to the *third* change, so the cursor is somewhere other than the top of the outline.
     let mut at: Option<ViewportFocusElementResult> = None;
-    for _ in 0..2 {
+    for _ in 0..3 {
         at = Some(
             send_request::<ViewportNavigateChange>(
                 &mut ws,
@@ -11932,7 +11886,7 @@ async fn the_outline_opens_on_the_change_the_cursor_is_in() {
             .await,
         );
     }
-    let at = at.expect("two steps");
+    let at = at.expect("three steps");
     let focused_buffer = at.buffer.buffer_id;
 
     let view: PickerViewResult = send_request::<PickerView>(
@@ -11952,12 +11906,18 @@ async fn the_outline_opens_on_the_change_the_cursor_is_in() {
         .effective_center_on
         .as_ref()
         .expect("the outline resolves an opening row from the cursor");
-    let PickerItem::GitChange { hunk_index, .. } = centred else {
+    let PickerItem::GitChange {
+        hunk_index,
+        preview,
+        ..
+    } = centred
+    else {
         panic!("the outline's rows are change rows, got {centred:?}");
     };
     assert_eq!(
-        *hunk_index, 1,
-        "the cursor is in the second change, so that is the row to open on — not the first"
+        (*hunk_index, preview.as_str()),
+        (1, "two.rs"),
+        "the cursor is in the second file, so that is the row to open on — not the first"
     );
 
     // And selecting that row resolves to somewhere: the element's own buffer at its own line.

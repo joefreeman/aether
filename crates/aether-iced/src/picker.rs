@@ -169,8 +169,9 @@ pub fn window_row_at(state: &PickerState, y: f32, ui: theme::Ui) -> Option<usize
     if y < top {
         return None;
     }
-    for (i, r) in state.display_rows().iter().enumerate() {
-        if i > 0 && matches!(r, DisplayRow::Header { .. } | DisplayRow::Section { .. }) {
+    let rows = state.display_rows();
+    for i in 0..rows.len() {
+        if aether_client::picker::opens_with_gap(&rows, i) {
             top += GROUP_GAP;
         }
         if y < top + ui.row_h() {
@@ -446,10 +447,14 @@ pub fn overlay<'a>(
         .push(iced::widget::Space::new().height(
             window_base as f32 * ui.row_h() + state.gaps_above_window() as f32 * GROUP_GAP,
         ));
+    let gaps: Vec<bool> = (0..rows.len())
+        .map(|i| aether_client::picker::opens_with_gap(&rows, i))
+        .collect();
     for (i, r) in rows.into_iter().enumerate() {
-        // The gap precedes every header except the window's leading row (the governing header
-        // of a mid-group window sits flush at the top).
-        if i > 0 && matches!(r, DisplayRow::Header { .. } | DisplayRow::Section { .. }) {
+        // The gap precedes every header but the window's first (the governing header of a
+        // mid-group window sits flush at the top, and one after a patch outline's top-level files
+        // needs none).
+        if gaps[i] {
             list = list.push(iced::widget::Space::new().height(GROUP_GAP));
         }
         match r {

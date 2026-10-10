@@ -887,8 +887,8 @@ impl PickerState {
     /// Inter-group gap accounting, for the pixel-based shells (iced / web). The grouped pickers
     /// render a small gap after each group except the last; the gap is *pixels outside the
     /// display-row unit* (display rows stay uniform — the virtual-scroll invariant), so the
-    /// shells add `gap_px × count` to their spacer sizes and row positions. The TUI instead
-    /// renders the gap as a real blank line, purely locally. One gap sits *before* every group
+    /// shells add `gap_px × count` to their spacer sizes and row positions. The TUI draws
+    /// no gaps at all — a blank line is too big a gap. One gap sits *before* every group
     /// header except the list's very first — equivalently, after each group but the last.
     ///
     /// Total gaps across the whole result set: `total groups − 1`. Total groups falls out of the
@@ -917,15 +917,13 @@ impl PickerState {
     }
 
     /// Gaps inside the window at or before window-relative display row `rel` (an index into
-    /// [`Self::display_rows`]): one before each header row except the window's first display
-    /// row. A header row's own gap counts toward its position (the gap sits above it).
+    /// [`Self::display_rows`]): one before each header row but the window's first header (see
+    /// [`opens_with_gap`]). A header row's own gap counts toward its position (the gap sits above
+    /// it).
     pub fn gaps_before_display_rel(&self, rel: u32) -> u32 {
-        self.display_rows()
-            .iter()
-            .enumerate()
-            .take(rel as usize + 1)
-            .skip(1)
-            .filter(|(_, r)| matches!(r, DisplayRow::Header { .. } | DisplayRow::Section { .. }))
+        let rows = self.display_rows();
+        (0..rows.len().min(rel as usize + 1))
+            .filter(|&i| opens_with_gap(&rows, i))
             .count() as u32
     }
 
@@ -1189,6 +1187,18 @@ pub fn item_key(item: &PickerItem) -> ItemKey<'_> {
     }
 }
 
+/// Whether display row `i` of a window opens with a group gap: a header with **another header
+/// above it** in the window. The gap closes the group before; it does not separate a header from
+/// the rows that belong to no group at all — a patch outline's top-level files, listed before
+/// the first directory — any more than from the top of the list. So a window has one gap fewer
+/// than headers, whatever leads it, which is what keeps the totals (`groups − 1`) honest: the
+/// ungrouped rows only ever lead the list.
+pub fn opens_with_gap(rows: &[DisplayRow], i: usize) -> bool {
+    let is_header =
+        |r: &DisplayRow| matches!(r, DisplayRow::Header { .. } | DisplayRow::Section { .. });
+    rows.get(i).is_some_and(is_header) && rows[..i].iter().any(is_header)
+}
+
 /// One uniform-height row of the rendered list.
 pub enum DisplayRow<'a> {
     Header {
@@ -1387,6 +1397,45 @@ mod tests {
         assert_eq!(s.gaps_before_display_rel(2), 0);
         assert_eq!(s.gaps_before_display_rel(3), 1);
         assert_eq!(s.gaps_before_display_rel(4), 1);
+
+        // A list that **leads with ungrouped rows** — a patch outline's top-level files, before
+        // its first directory. The first header closes no group, so it opens with no gap: the
+        // window's gaps stay one fewer than its headers, as the totals assume.
+        let mut lead = PickerState::new(PickerKind::DocumentSymbols);
+        assert!(lead.apply_update(PickerUpdateParams {
+            kind: PickerKind::DocumentSymbols,
+            generation: 0,
+            offset: 0,
+            items: Some(vec![
+                reference("top.rs", 1),
+                reference("a.rs", 1),
+                reference("b.rs", 1)
+            ]),
+            total_matches: 3,
+            total_candidates: 3,
+            ticking: false,
+            groups: vec![label_span(1, "src/"), label_span(2, "src/sub/")],
+            display_offset: Some(0),
+            total_display_rows: Some(5),
+            focus_run: None,
+            center_on: None,
+            explorer_peek_missing: false,
+        }));
+        // Window rows: [0]=top.rs, [1]=hdr src/, [2]=a.rs, [3]=hdr src/sub/, [4]=b.rs.
+        assert_eq!(
+            lead.window_base(),
+            0,
+            "an ungrouped row leads, not a header"
+        );
+        assert_eq!(lead.total_gap_count(), 1);
+        assert_eq!(lead.gaps_above_window(), 0);
+        assert_eq!(
+            lead.gaps_before_display_rel(1),
+            0,
+            "the first header has no gap"
+        );
+        assert_eq!(lead.gaps_before_display_rel(3), 1);
+
         // Flat kinds have no gaps anywhere.
         let flat = PickerState::new(PickerKind::Files);
         assert_eq!(flat.total_gap_count(), 0);

@@ -1543,19 +1543,19 @@ fn build_file_git_status(
 /// document symbols for whichever file the cursor was in: an outline of one hunk's file, describing
 /// nothing about the review.
 ///
-/// The label is *where the change is*, not what it says — which is what makes this an outline and
-/// not a second changes picker. Where git offers no signature (the top of a file, a non-code file)
-/// the changed text stands in, because a row with no label at all cannot be picked out of a list.
+/// A patch's rows are its files, by name, with each file's diffstat — the top-level files first
+/// under no header, then a section per directory. The changes themselves are the changes picker's. A shell's runs and a conversation's turns are
+/// rows by their own label, under no header.
 fn build_outline_candidates(
     s: &ServerState,
     vp: &crate::state::Viewport,
     text: &ropey::Rope,
 ) -> Vec<crate::picker::GitChangeCandidate> {
     let view_buffer = s.view_of(vp).presenting;
-    // Whether the rows group by file. A patch's do — that is what its outline is *of*. A shell's
-    // runs and a conversation's turns have no files at all, and their one label would head a group
-    // holding every row; see [`crate::picker::GitChangeCandidate::grouped`].
-    let by_file = matches!(
+    // Whether the rows are files. A patch's are — that is what its outline is *of* — and group
+    // under their directories. A shell's runs and a conversation's turns have no files at all, and
+    // their one label would head a group holding every row; see [`crate::picker::RowGrouping`].
+    let files = matches!(
         s.try_doc_of(view_buffer).and_then(|d| d.generated.as_ref()),
         Some(crate::state::Generated::Patch(_))
     );
@@ -1563,14 +1563,34 @@ fn build_outline_candidates(
         .into_iter()
         .enumerate()
         .map(|(i, e)| {
-            let label = if e.label.is_empty() {
-                text.line(e.patch_line as usize)
+            // A file's row is its name, under its directory; anything else is its own label, under
+            // the view's title, with the line it starts on standing in for a missing one — a row
+            // with no label at all cannot be picked out of a list.
+            let (group, label, grouping) = if files {
+                let (dir, name) = crate::patch::split_dir(&e.file);
+                // A top-level file has no directory to sit under, so it sits under no section —
+                // which is why the patch lists the top level first. The label is still carried for
+                // the jumplist, where a captured row lands among rows from everywhere.
+                let (dir, grouping) = if dir.is_empty() {
+                    ("./".to_string(), crate::picker::RowGrouping::None)
+                } else {
+                    (format!("{dir}/"), crate::picker::RowGrouping::Section)
+                };
+                (dir, name.to_string(), grouping)
+            } else if e.label.is_empty() {
+                let line = text
+                    .line(e.patch_line as usize)
                     .chunks()
                     .collect::<String>()
                     .trim()
-                    .to_string()
+                    .to_string();
+                (e.file.clone(), line, crate::picker::RowGrouping::None)
             } else {
-                e.label.clone()
+                (
+                    e.file.clone(),
+                    e.label.clone(),
+                    crate::picker::RowGrouping::None,
+                )
             };
             // Where the row is **in the view**: its element, the buffer that element windows, and
             // the line within it — which is the coordinate `OutlineEntry::line` already speaks,
@@ -1603,18 +1623,14 @@ fn build_outline_candidates(
                     durable,
                     line_of: vec![e.patch_line],
                 },
-                e.file,
+                group,
                 i as u32,
                 e.patch_line,
-                0,
-                0,
+                e.added,
+                e.removed,
                 vec![label],
             );
-            if by_file {
-                row
-            } else {
-                row.ungrouped()
-            }
+            row.grouped_as(grouping)
         })
         .collect()
 }
@@ -2114,7 +2130,8 @@ pub async fn picker_view(
         // DocumentSymbols also resolves asynchronously (a `textDocument/documentSymbol` round-trip),
         // so it opens empty and the spawned task (below) fills it; resume/scroll re-views preserve
         // the prior snapshot via `preserve_existing`.
-        // A composed view's outline is its **files**; an ordinary buffer's is its document symbols,
+        // A composed view's outline is its own structure (a patch's files, a shell's runs); an
+        // ordinary buffer's is its document symbols,
         // which arrive asynchronously (hence the empty open). Asked of the *view*, because the
         // outline describes what is on screen — the focused element's symbols describe one hunk's
         // file and nothing else about the review.

@@ -748,9 +748,8 @@ pub enum NavigateGrain {
     /// not to any buffer. `o` over an ordinary buffer steps document symbols, which is the same
     /// idea — the structure of what you are reading, above the grain of its lines.
     ///
-    /// A composed view's outline is its *changes*, so this steps hunk to hunk. It stepped file to
-    /// file while the outline's rows were files; the rows moved and this followed them, which is
-    /// the point of the two reading one source.
+    /// A patch's outline is its *files*, so this steps file to file — the grain nothing else
+    /// steps, where `Change` steps the edits within them.
     Outline,
 }
 

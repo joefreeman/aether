@@ -1607,9 +1607,8 @@ fn picker_empty_message(picker: &crate::picker::PickerState) -> Option<&str> {
 
 /// Rows the full result set needs in the results pane — what the picker box collapses to when
 /// that's shorter than the full-size box (mirroring the web client, whose list shrinks to fit
-/// content). Grep uses the server-reported display-row total (hits + per-file headers), plus
-/// one blank gap row between each pair of groups (`total groups − 1`, where the group count is
-/// the header rows: `total_display_rows − total_matches`); an empty picker with a message
+/// content). Grouped views use the server-reported display-row total (items + one header per
+/// group); an empty picker with a message
 /// ([`picker_empty_message`]) needs one row for it; the client-side synthetic "Create …" row
 /// isn't counted in `total_matches`.
 fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
@@ -1620,17 +1619,11 @@ fn picker_content_rows(picker: &crate::picker::PickerState) -> u32 {
     // server's `total_display_rows` — it has to be added on whichever path we take. Worktrees is
     // the first kind to be *both* grouped and creatable, which is how it came to be missing here.
     let create = picker.synthetic_create_idx.is_some() as u32;
-    // `collapsible` first, not the kind alone: a collapsible view's headers *are* rows, and the
-    // buffer-locked changes picker collapses over a patch though its kind is headerless.
-    if picker.collapsible || picker.kind.is_some_and(|k| k.renders_group_headers()) {
-        let rows = picker.total_display_rows.unwrap_or(picker.total_matches);
-        if picker.groups.is_empty() {
-            return rows + create;
-        }
-        let gaps = rows.saturating_sub(picker.total_matches).saturating_sub(1);
-        return rows + gaps + create;
-    }
-    picker.total_matches + create
+    // Asked of the view's data, never the kind: a collapsible view's headers *are* rows, the
+    // buffer-locked changes picker collapses over a patch though its kind is headerless, and the
+    // outline renders a patch's directories as sections though over a buffer it renders none. A
+    // flat view's display rows are its matches and it has no group spans, so it falls out as one.
+    picker.total_display_rows.unwrap_or(picker.total_matches) + create
 }
 
 /// The picker box, collapsed to its content when the result set is shorter than the full-size
@@ -1677,18 +1670,19 @@ pub fn picker_result_rows(buffer_area_cols: u32, buffer_area_rows: u32) -> u32 {
     (box_rect.height as u32).saturating_sub(4)
 }
 
-/// One rendered row of the fetched picker window. The grouped kinds (grep, changes, keybindings)
-/// interleave non-selectable `Header` rows and `Gap` spacer rows with the `Item` rows; the flat
-/// kinds are all `Item`. This is the TUI's local expansion of the fetched window into screen rows
-/// — the analogue of the core's `display_rows` that the pixel shells virtual-scroll, except the
-/// TUI materialises the inter-group gap as a real blank row rather than pixel spacing. Picker
-/// scroll is a *view-row* offset into this sequence, so it advances one screen row at a time even
-/// across a group boundary. (An item-index scroll can't: consecutive items straddle a header + gap
-/// there, so the view jumps 2–3 rows — the grep/keybindings scroll bug.)
+/// One rendered row of the fetched picker window. The grouped kinds (keybindings, references,
+/// the patch outline) interleave non-selectable `Header` rows with the `Item` rows; the flat kinds
+/// are all `Item`. This is the TUI's local expansion of the fetched window into screen rows — the
+/// analogue of the core's `display_rows` that the pixel shells virtual-scroll. Picker scroll is a
+/// *view-row* offset into this sequence, so it advances one screen row at a time even across a
+/// group boundary. (An item-index scroll can't: consecutive items straddle a header there, so the
+/// view jumps — the grep/keybindings scroll bug.)
+///
+/// No gap rows between groups. The pixel shells put a few pixels between runs; here the smallest
+/// gap is a whole blank line, which spaces a short group out of all proportion — and the header
+/// is already coloured and bold, which is separation enough.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PickerRow {
-    /// Blank spacer above an interior group header.
-    Gap,
     /// A group header; the index is into the window's `groups` spans.
     Header(usize),
     /// A selectable item; the index is into the window's `items`.
@@ -1696,8 +1690,7 @@ pub enum PickerRow {
 }
 
 /// Expand the fetched window (`items_len` items described by the window's `groups` spans) into
-/// view rows: a header before each group run and a blank gap above each *interior* header (never
-/// above the pane's first row). The server repeats a split group's header at span `start == 0`, so
+/// view rows: a header before each group run. The server repeats a split group's header at span `start == 0`, so
 /// a window that begins mid-group still leads with its group's header. Flat windows (no spans) map
 /// one item to one row, so view-row scroll collapses to item scroll — exactly the flat-picker
 /// behaviour.
@@ -1707,18 +1700,15 @@ pub fn picker_window_rows(
     collapsible: bool,
 ) -> Vec<PickerRow> {
     // Collapsible kinds: headers arrive as real, selectable `PickerItem::Group` rows, so the window
-    // maps 1:1 — no interleaved headers, no gaps. The spans only feed the sticky stamp
+    // maps 1:1 — no interleaved headers. The spans only feed the sticky stamp
     // ([`collapsible_pin`]).
     if collapsible {
         return (0..items_len).map(PickerRow::Item).collect();
     }
-    let mut rows = Vec::with_capacity(items_len + groups.len() * 2);
+    let mut rows = Vec::with_capacity(items_len + groups.len());
     let mut gi = 0;
     for i in 0..items_len {
         while gi < groups.len() && groups[gi].start as usize == i {
-            if !rows.is_empty() {
-                rows.push(PickerRow::Gap); // interior header opens with a gap; the list top never does
-            }
             rows.push(PickerRow::Header(gi));
             gi += 1;
         }
@@ -1985,8 +1975,8 @@ pub enum PickerHit {
     /// A selectable row: the item's index *within the fetched window* (add `picker.offset` for the
     /// absolute index the core's click event takes).
     Item(usize),
-    /// Somewhere else inside the box — input row, chip editor, a group header, an inter-group gap,
-    /// the borders, the padding, the scrollbar. Swallowed: the press does nothing.
+    /// Somewhere else inside the box — input row, chip editor, a group header, the
+    /// borders, the padding, the scrollbar. Swallowed: the press does nothing.
     Chrome,
     /// Outside the box, on the dimmed backdrop.
     Backdrop,
@@ -2033,7 +2023,7 @@ pub fn picker_hit(state: &AppState, cols: u16, rows: u16, row: u16, col: u16) ->
     }
     match view_rows.get(top + pane_row) {
         Some(PickerRow::Item(i)) => PickerHit::Item(*i),
-        // A header, a gap, or past the last row: nothing to select.
+        // A header, or past the last row: nothing to select.
         _ => PickerHit::Chrome,
     }
 }
@@ -2709,11 +2699,6 @@ fn draw_picker_results(f: &mut Frame, state: &AppState, area: Rect) {
     };
     for row in &rows[top..end] {
         let i = match row {
-            // Inter-group gap: an empty line — the Paragraph's page background fills the row.
-            PickerRow::Gap => {
-                lines.push(Line::default());
-                continue;
-            }
             PickerRow::Header(gi) => {
                 lines.push(Line::from(header_spans(&groups[*gi].header)));
                 continue;
@@ -9053,11 +9038,10 @@ mod tests {
         );
     }
 
-    /// Expanding a fetched window into view rows: a header before each group run, a blank gap
-    /// above each *interior* header (never the first), items in between. Flat windows map one item
-    /// to one row with no headers or gaps.
+    /// Expanding a fetched window into view rows: a header before each group run, items in between,
+    /// and no blank gap rows anywhere. Flat windows map one item to one row with no headers.
     #[test]
-    fn window_rows_expand_headers_and_gaps() {
+    fn window_rows_expand_headers_without_gaps() {
         let (items, spans) = grep_items(&[("a.rs", 2), ("b.rs", 2)]);
         assert_eq!(
             picker_window_rows(items.len(), &spans, false),
@@ -9065,7 +9049,6 @@ mod tests {
                 PickerRow::Header(0),
                 PickerRow::Item(0),
                 PickerRow::Item(1),
-                PickerRow::Gap,
                 PickerRow::Header(1),
                 PickerRow::Item(2),
                 PickerRow::Item(3),
@@ -9075,21 +9058,100 @@ mod tests {
             picker_window_rows(3, &[], false),
             vec![PickerRow::Item(0), PickerRow::Item(1), PickerRow::Item(2)]
         );
+        // A window that leads with ungrouped rows — a patch outline's top-level files — runs
+        // straight into its first header, as every header follows the row above it.
+        let label = |start: u32, label: &str| GroupSpan {
+            start,
+            header: GroupHeader::Label {
+                label: label.into(),
+            },
+            count: None,
+            expanded: None,
+        };
+        assert_eq!(
+            picker_window_rows(3, &[label(1, "src/"), label(2, "src/sub/")], false),
+            vec![
+                PickerRow::Item(0),
+                PickerRow::Header(0),
+                PickerRow::Item(1),
+                PickerRow::Header(1),
+                PickerRow::Item(2),
+            ]
+        );
+    }
+
+    /// The patch outline pins its directory like any sectioned picker: scrolled into `src/`, the
+    /// section's header is stamped over the pane's top row. Over the top-level files, which sit
+    /// under no section, nothing is.
+    #[test]
+    fn the_patch_outline_pins_its_directory() {
+        let file = |i: u32, name: &str| PickerItem::GitChange {
+            path_index: 0,
+            relative_path: if i == 0 { "./".into() } else { "src/".into() },
+            hunk_index: i,
+            line: 0,
+            stage: aether_protocol::viewport::DiffStage::Unstaged,
+            added: 1,
+            removed: 0,
+            preview: name.into(),
+            match_indices: Vec::new(),
+        };
+        let mut items = vec![file(0, "TOPFILE")];
+        items.extend((1..=12).map(|i| file(i, &format!("FILE{i:02}"))));
+        let state_at = |visible_start: usize| {
+            picker_app(crate::picker::PickerState {
+                open: true,
+                kind: Some(PickerKind::DocumentSymbols),
+                items: items.clone(),
+                groups: vec![GroupSpan {
+                    start: 1,
+                    header: GroupHeader::Label {
+                        label: "src/".into(),
+                    },
+                    count: None,
+                    expanded: None,
+                }],
+                total_matches: 13,
+                total_display_rows: Some(14),
+                selected: 8,
+                visible_start,
+                ..Default::default()
+            })
+        };
+        // View rows: 0=TOPFILE, 1=src/ header, 2..=13 = FILE01..FILE12. Top row FILE03.
+        let rows = render_rows(&state_at(4));
+        let src = cell_of(&rows, "src/");
+        assert_eq!(
+            hit_at(&state_at(4), src),
+            PickerHit::Chrome,
+            "the directory is stamped over the top row"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("FILE03")),
+            "and covers the row it is stamped over"
+        );
+        // At the top, the ungrouped file leads and nothing is pinned over it.
+        let rows = render_rows(&state_at(0));
+        assert!(rows.iter().any(|r| r.contains("TOPFILE")));
     }
 
     /// The pinned (sticky) header for a scroll position is the governing group — the last group
     /// starting at or before the top view row — so scrolling mid-group keeps its header pinned.
     #[test]
     fn governing_group_follows_the_scroll() {
-        // rows: 0=Hdr a, 1=Item0, 2=Item1, 3=Gap, 4=Hdr b, 5=Item2, 6=Item3
+        // rows: 0=Hdr a, 1=Item0, 2=Item1, 3=Hdr b, 4=Item2, 5=Item3
         let (items, spans) = grep_items(&[("a.rs", 2), ("b.rs", 2)]);
         let rows = picker_window_rows(items.len(), &spans, false);
         assert_eq!(picker_governing_group(&rows, 0), Some(0)); // on a's header
         assert_eq!(picker_governing_group(&rows, 2), Some(0)); // mid a → still a
-        assert_eq!(picker_governing_group(&rows, 3), Some(0)); // the gap still belongs to a
-        assert_eq!(picker_governing_group(&rows, 4), Some(1)); // on b's header
-        assert_eq!(picker_governing_group(&rows, 6), Some(1)); // mid b
-                                                               // Flat windows have no groups to pin.
+        assert_eq!(picker_governing_group(&rows, 3), Some(1)); // on b's header
+        assert_eq!(picker_governing_group(&rows, 5), Some(1)); // mid b
+
+        // Rows before the first header belong to no group: nothing to pin over them.
+        let lead = [PickerRow::Item(0), PickerRow::Header(0), PickerRow::Item(1)];
+        assert_eq!(picker_governing_group(&lead, 0), None);
+        assert_eq!(picker_governing_group(&lead, 2), Some(0));
+        // Flat windows have no groups to pin.
         assert_eq!(
             picker_governing_group(&picker_window_rows(3, &[], false), 1),
             None
@@ -10036,33 +10098,33 @@ mod tests {
         // The synthetic "Create …" row is client-side, on top of total_matches.
         p.synthetic_create_idx = Some(5);
         assert_eq!(picker_content_rows(&p), 6);
-        // Grep counts the server-reported display rows (per-file headers included). With no
-        // window spans yet (`groups` empty) there's nothing to space.
+        // A grouped view counts the server-reported display rows — its items plus one header per
+        // group, and nothing between groups: the terminal draws no gap rows.
         p.synthetic_create_idx = None;
-        p.kind = Some(PickerKind::Grep);
+        p.kind = Some(PickerKind::Keybindings);
         p.total_display_rows = Some(8);
-        assert_eq!(picker_content_rows(&p), 8);
-        // A grouped result set also needs the inter-group gap rows: 8 display rows − 5 matches
-        // = 3 headers → 2 gaps between the 3 groups → 10 rows total.
         p.groups = vec![GroupSpan {
             start: 0,
-            header: GroupHeader::File {
-                path_index: 0,
-                relative_path: "a.rs".into(),
+            header: GroupHeader::Label {
+                label: "Motion".into(),
             },
             count: None,
             expanded: None,
         }];
-        assert_eq!(picker_content_rows(&p), 10);
-        // A single group (display rows = matches + 1) adds no gaps — and never underflows.
-        p.total_matches = 7;
         assert_eq!(picker_content_rows(&p), 8);
         // Grouped *and* creatable — the Worktrees picker, and the first kind to be both. The
         // create row is in neither `total_matches` nor the server's display rows, so it has to be
-        // added on this path too; the grouped branch used to return before reaching it.
+        // added on this path too.
         p.synthetic_create_idx = Some(7);
         assert_eq!(picker_content_rows(&p), 9);
         p.synthetic_create_idx = None;
+        // A kind that renders no headers over a buffer still renders them where the view says it
+        // does: the outline over a patch lists its files under directory sections. The box is
+        // sized off the display rows, never the kind — 4 files and 2 headers is 6 rows.
+        p.kind = Some(PickerKind::DocumentSymbols);
+        p.total_matches = 4;
+        p.total_display_rows = Some(6);
+        assert_eq!(picker_content_rows(&p), 6);
         p.groups.clear();
         // An empty async picker reserves a row for its "Finding…" loading line...
         p.kind = Some(PickerKind::References);

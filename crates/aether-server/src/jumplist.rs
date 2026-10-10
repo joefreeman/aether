@@ -586,8 +586,9 @@ pub fn capture(picker: &PickerState, matcher: &mut Matcher) -> Option<(Jumplist,
                     // A **patch** row has to say so itself. It has no path, so the fallback grouped
                     // it by its own row text — which for the outline is the enclosing signature, so
                     // rows of one file landed in as many groups as they had signatures, and two
-                    // files sharing one produced a group that appeared twice. Grouping by the file
-                    // is both correct and what the picker it came from already shows.
+                    // files sharing one produced a group that appeared twice. Grouping by the row's
+                    // group — the file, or for the outline the directory — is both correct and what
+                    // the picker it came from already shows.
                     group: c.patch.as_ref().map(|_| GroupHeader::Label {
                         label: c.relative_path.clone(),
                     }),

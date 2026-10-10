@@ -555,10 +555,11 @@ pub struct OutlineEntry {
     /// generated document for one with no file behind it. This is the coordinate every consumer
     /// needs, and the one the patch's own index does *not* store: the index speaks patch lines.
     pub line: u32,
-    /// Repo-relative path of the file the change is in — the outline's group.
+    /// Repo-relative path of the file the entry is — or, for a shell or a conversation, the title
+    /// of the view it belongs to.
     pub file: String,
-    /// What to call the change: git's enclosing signature for its hunk, which is the same thing the
-    /// hunk header renders. Empty when git offered none.
+    /// What to call the entry within its `file`: a run's command, a turn's words. Empty for a
+    /// patch's entries, which are files and named by `file` alone.
     pub label: String,
     /// The change's line in the **patch document**, for the callers that address the patch itself.
     pub patch_line: u32,
@@ -574,6 +575,9 @@ pub struct OutlineEntry {
     /// The hunk's lines **in the file** (0-based, new side), whatever the element's binding —
     /// empty for a pure removal, which sits above `start`, and for a delta with no hunks.
     pub file_lines: std::ops::Range<u32>,
+    /// The file's diffstat — lines added and removed — for a patch's entries; zero for the rest.
+    pub added: u32,
+    pub removed: u32,
 }
 
 /// Every buffer a **view** shows, in view order, each named once.
@@ -669,7 +673,9 @@ pub fn seat_in(
     identity: &str,
     line: u32,
 ) -> Option<(aether_protocol::viewport::ViewSeat, LogicalPosition)> {
-    let entries = view_outline_of(s, view_buffer, elements);
+    // Hunks, not the outline's files: the line has to resolve to the element that holds it, and a
+    // file's hunks are each an element of their own.
+    let entries = patch_hunks(s, view_buffer, elements);
     let named = |e: &OutlineEntry| -> bool {
         let Some(own) = e.identity.as_deref() else {
             return false;
@@ -746,7 +752,8 @@ pub fn seat_in_fresh_view(
     seat_in(s, view_buffer, &elements, identity, line)
 }
 
-/// A composed view's outline: its changes, in reading order, each with its file and label.
+/// A composed view's outline: a patch's files, a shell's runs, a conversation's turns — in reading
+/// order, each with its group and label.
 ///
 /// **The one source.** `Space o` lists it, `o`/`Alt-o` steps it, and the status bar's breadcrumb is
 /// the path through it to the cursor — so the three cannot disagree about what the stops are or what
@@ -777,11 +784,54 @@ pub fn view_outline_of(
     // Per kind, exhaustively. A shell's structure is its runs, labelled by the command that
     // produced them, which is what makes `o`, `Space o` and the breadcrumb work in one without a
     // single client-side check of what sort of view this is.
-    let generated = match doc.generated.as_ref() {
-        None => return Vec::new(),
-        Some(crate::state::Generated::Shell(t)) => return transcript_outline(t),
-        Some(crate::state::Generated::Agent(c)) => return conversation_outline(s, c),
-        Some(crate::state::Generated::Patch(g)) => g,
+    match doc.generated.as_ref() {
+        None => Vec::new(),
+        Some(crate::state::Generated::Shell(t)) => transcript_outline(t),
+        Some(crate::state::Generated::Agent(c)) => conversation_outline(s, c),
+        Some(crate::state::Generated::Patch(_)) => files_of(patch_hunks(s, view_buffer, elements)),
+    }
+}
+
+/// A patch's outline: one entry per **file**, folded from its hunks.
+///
+/// Files, not hunks, because the hunk is the one grain the view already has a key for twice over:
+/// `c` steps its change blocks, and a hunk is barely coarser than those. Nothing stepped *files*,
+/// and "the next file" is the move a review wants most. So `o` steps files, `c` steps changes, and
+/// the outline's rows group under their directory ([`crate::patch::split_dir`]) — the order the
+/// patch lays its files out in, so no directory is listed twice.
+///
+/// Each file's entry is its first hunk's — where `o` and a picked row land, at the top of the
+/// file's first change — widened to account for all of the file's elements and lines.
+fn files_of(hunks: Vec<OutlineEntry>) -> Vec<OutlineEntry> {
+    let mut out: Vec<OutlineEntry> = Vec::new();
+    for hunk in hunks {
+        match out.last_mut() {
+            Some(file) if file.file == hunk.file => {
+                file.covers.end = hunk.covers.end;
+                file.patch_lines.end = hunk.patch_lines.end;
+                file.file_lines.end = file.file_lines.end.max(hunk.file_lines.end);
+            }
+            _ => out.push(OutlineEntry {
+                // A file has no signature; its name is the row.
+                label: String::new(),
+                ..hunk
+            }),
+        }
+    }
+    out
+}
+
+/// A patch's **hunks**, each as an [`OutlineEntry`] of its own: what the outline is folded from,
+/// and what [`seat_in`] resolves a captured line against — a file's entry is too coarse to say
+/// which of the file's elements holds a line.
+fn patch_hunks(
+    s: &ServerState,
+    view_buffer: BufferId,
+    elements: &[crate::state::ElementBinding],
+) -> Vec<OutlineEntry> {
+    let doc = s.doc_of(view_buffer);
+    let Some(crate::state::Generated::Patch(generated)) = doc.generated.as_ref() else {
+        return Vec::new();
     };
     // How a file the view shows is named when nothing windows it: the same name the buffer a bound
     // element windows would have, derived from the view's own target rather than read off a buffer
@@ -821,11 +871,7 @@ pub fn view_outline_of(
     };
     // One entry per **hunk**, not per change block. A hunk is the display region git names in its
     // header; a change block is a maximal run of `+`/`-` lines, and one hunk routinely holds several
-    // (see `PatchChangeBlock`). Outlining the blocks gave several rows per hunk all carrying the
-    // *same* signature — the hunk's — which is a list that cannot be read.
-    //
-    // It is also what separates `o` from `c`: `o` steps the structure (hunks), `c` steps the things
-    // you act on (changes). Different keys because they are different questions.
+    // (see `PatchChangeBlock`).
     let mut out = Vec::new();
     for file in &generated.index.files {
         // A delta with no hunks — a binary swap, a bare mode change, a deletion with nothing to
@@ -891,6 +937,8 @@ pub fn view_outline_of(
                 patch_lines: anchor..end.max(anchor + 1),
                 identity,
                 file_lines,
+                added: file.added,
+                removed: file.removed,
             });
         }
     }
@@ -931,6 +979,8 @@ fn transcript_outline(t: &crate::shell::Transcript) -> Vec<OutlineEntry> {
             // captured from one can never be found again in another.
             identity: None,
             file_lines: run.start_line..run.end_line_exclusive,
+            added: 0,
+            removed: 0,
         })
         .collect()
 }
@@ -995,6 +1045,8 @@ fn conversation_outline(s: &ServerState, c: &crate::agent::Conversation) -> Vec<
                 // captured from one can never be found again in another.
                 identity: None,
                 file_lines: 0..lines,
+                added: 0,
+                removed: 0,
             }
         })
         .collect()
@@ -1041,8 +1093,8 @@ pub fn outline_entry_at(
         .iter()
         .enumerate()
         .filter(|(_, e)| e.covers.contains(&focused))
-        // The line only decides between entries of the focused element itself — several hunks of
-        // one file. One that covers the element from further up covers all of it.
+        // The line only decides between entries that start in the focused element itself. One
+        // that covers the element from further up covers all of it.
         .filter(|(_, e)| e.element < focused || e.line <= line)
         .next_back()
         // Before the element's first change — still in its file, which is the answer that matters.
@@ -1095,9 +1147,8 @@ pub async fn viewport_navigate_change(
     let forward = params.direction == FocusStep::Next;
     let anchors = match params.grain {
         NavigateGrain::Change => change_anchors(&s, &vp),
-        // One stop per **outline entry** — which is one per change, since that is what the outline's
-        // rows are. Same source as the picker, so `o` and `Space o` cannot disagree about the stops
-        // or their order.
+        // One stop per **outline entry** — a patch's files, a shell's runs. Same source as the
+        // picker, so `o` and `Space o` cannot disagree about the stops or their order.
         NavigateGrain::Outline => {
             let outline = view_outline(&s, &vp);
             if outline.is_empty() {
