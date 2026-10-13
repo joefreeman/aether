@@ -823,7 +823,7 @@ async fn handle_progress(
     state: &SharedState,
     key: &LspServerKey,
     params: &Value,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+) -> Vec<(crate::state::Outbound, Notification)> {
     let token = match params.get("token") {
         Some(Value::String(s)) => s.clone(),
         Some(other) => other.to_string(), // numeric tokens → their JSON form
@@ -1088,7 +1088,7 @@ async fn push_status(state: &SharedState, key: &LspServerKey) {
 fn collect_status_pushes(
     s: &ServerState,
     key: &LspServerKey,
-) -> Vec<(mpsc::Sender<Notification>, Notification)> {
+) -> Vec<(crate::state::Outbound, Notification)> {
     let Some(handle) = s.lsp.servers.get(key) else {
         return Vec::new();
     };
@@ -1114,7 +1114,7 @@ fn collect_status_pushes(
         .collect()
 }
 
-async fn send_all(pushes: Vec<(mpsc::Sender<Notification>, Notification)>) {
+async fn send_all(pushes: Vec<(crate::state::Outbound, Notification)>) {
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;
     }

@@ -403,12 +403,23 @@ impl RpcMethod for ViewSave {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ViewSaveParams {
     pub view_id: crate::ViewId,
-    /// Acknowledges a divergence from disk, exactly as [`crate::buffer::BufferSaveParams`] does —
-    /// and with the same two-step handshake. The first document that needs confirming aborts the
-    /// call with its own error code; documents already written stay written, and the retry with
-    /// `overwrite` finds them clean and skips them.
-    #[serde(default)]
-    pub overwrite: bool,
+    /// The documents whose divergence from disk the user has confirmed overwriting — named one by
+    /// one, not acknowledged as a whole: a single flag let the confirmation of one file overwrite
+    /// every other file that had changed on disk too. A conflicted document not listed here is
+    /// left unsaved and reported in [`ViewSaveResult::conflicts`]; the rest are written either way,
+    /// so the retry finds them clean.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirmed: Vec<crate::BufferId>,
+}
+
+/// A document `view/save` left unsaved because it changed on disk and wasn't confirmed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SaveConflict {
+    pub buffer_id: crate::BufferId,
+    /// The file, relative to the workspace root holding it (absolute when none does).
+    pub path: String,
+    /// Removed on disk rather than changed: saving recreates it.
+    pub deleted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -419,6 +430,10 @@ pub struct ViewSaveResult {
     /// into the buffer state it is already tracking. `None` when the focused element was clean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused: Option<crate::buffer::BufferSaveResult>,
+    /// Every document left unsaved because it changed on disk and wasn't in
+    /// [`ViewSaveParams::confirmed`] — all of them, so one confirmation can name them all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<SaveConflict>,
 }
 
 // ---- viewport/subscribe -------------------------------------------------------------------------

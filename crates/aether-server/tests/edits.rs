@@ -5176,3 +5176,239 @@ async fn a_disconnect_releases_the_hold() {
 
     drop(server);
 }
+
+/// Open `buffer.txt` from setup_with_buffer's workspace on a second connection: one path, one
+/// document, one buffer id.
+async fn second_client(server: &aether_server::ServerHandle, buffer_id: u64) -> Ws {
+    let mut b = Ws::connect(server).await;
+    let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+        &mut b,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "test-proj".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
+        &mut b,
+        &ViewOpenParams {
+            transient: Some(false),
+            path_index: Some(0),
+            relative_path: Some("buf.txt".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(opened.buffer_id, buffer_id, "same path, same buffer");
+    b
+}
+
+fn numbered_lines(n: usize) -> String {
+    (0..n).map(|i| format!("line {i}\n")).collect()
+}
+
+/// Another client's cursor follows an edit above it: it stays on the same text rather than the
+/// same line and column. It used to stay put, so B's next keystroke landed three lines early.
+#[tokio::test]
+async fn another_clients_cursor_follows_an_insert_above_it() {
+    let (server, mut a, buffer_id) = setup_with_buffer(&numbered_lines(20)).await;
+    let mut b = second_client(&server, buffer_id).await;
+
+    set_cursor(&mut b, buffer_id, 10, 2).await;
+    set_cursor(&mut a, buffer_id, 0, 0).await;
+    type_text(&mut a, buffer_id, "x\ny\nz\n").await;
+    type_text(&mut b, buffer_id, "!").await;
+
+    let text = buffer_text(&mut b, buffer_id).await;
+    assert_eq!(text.lines().nth(13), Some("li!ne 10"), "{text}");
+    drop(server);
+}
+
+/// After another client deletes most of the document, a line edit at this client's cursor acts on
+/// the line it was on. Its cursor used to keep line 290 in a 21-line rope, and `element/delete_line`
+/// panicked in `line_to_char`, taking the connection with it.
+#[tokio::test]
+async fn a_cursor_past_another_clients_delete_still_edits_its_own_line() {
+    let (server, mut a, buffer_id) = setup_with_buffer(&numbered_lines(300)).await;
+    let mut b = second_client(&server, buffer_id).await;
+
+    set_cursor(&mut b, buffer_id, 290, 0).await;
+    let _: CursorState = send_request::<CursorSet>(
+        &mut a,
+        &CursorSetParams {
+            buffer_id,
+            anchor: LogicalPosition { line: 0, col: 0 },
+            position: LogicalPosition { line: 280, col: 0 },
+            granularity: Granularity::Char,
+        },
+    )
+    .await;
+    // The inclusive selection ends on the `l` of `line 280`; leave that line whole.
+    let _: CursorState = send_request::<CursorSet>(
+        &mut a,
+        &CursorSetParams {
+            buffer_id,
+            anchor: LogicalPosition { line: 0, col: 0 },
+            position: LogicalPosition { line: 279, col: 8 },
+            granularity: Granularity::Char,
+        },
+    )
+    .await;
+    let _: EditResult = send_request::<InputDelete>(
+        &mut a,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert!(buffer_text(&mut a, buffer_id)
+        .await
+        .starts_with("line 280\n"));
+
+    let _: EditResult =
+        send_request::<InputDeleteLine>(&mut b, &BufferOnlyParams { buffer_id }).await;
+    let text = buffer_text(&mut b, buffer_id).await;
+    assert!(!text.contains("line 290\n"), "{text}");
+    assert!(text.contains("line 289\nline 291\n"), "{text}");
+    drop(server);
+}
+
+/// Save `buffer_id` in place and return the bytes that landed on disk.
+async fn save_and_read(
+    server: &aether_server::ServerHandle,
+    ws: &mut Ws,
+    buffer_id: u64,
+) -> String {
+    let _: BufferSaveResult = send_request::<BufferSave>(
+        ws,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    let path = server
+        .state
+        .lock()
+        .await
+        .doc_of(buffer_id)
+        .canonical_path
+        .clone()
+        .expect("a file buffer");
+    std::fs::read_to_string(path).unwrap()
+}
+
+/// A system-clipboard paste of CRLF text into a CRLF file saves as CRLF, not `\r\r\n`: the paste's
+/// own CRs used to go into the rope, and the save added another before every LF.
+#[tokio::test]
+async fn a_crlf_paste_into_a_crlf_file_saves_clean() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("one\r\ntwo\r\n").await;
+    set_cursor(&mut ws, buffer_id, 1, 0).await;
+    type_text(&mut ws, buffer_id, "x\r\ny\r\n").await;
+    assert_eq!(
+        save_and_read(&server, &mut ws, buffer_id).await,
+        "one\r\nx\r\ny\r\ntwo\r\n"
+    );
+    drop(server);
+}
+
+/// A file with mixed endings keeps every line's ending through an edit and save: only the edited
+/// line changes. One CRLF used to make the whole file CRLF, so this save rewrote every LF line.
+#[tokio::test]
+async fn a_mixed_ending_file_saves_byte_exact_but_for_the_edit() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("a\r\nb\nc\n").await;
+    set_cursor(&mut ws, buffer_id, 2, 0).await;
+    type_text(&mut ws, buffer_id, "X").await;
+    assert_eq!(
+        save_and_read(&server, &mut ws, buffer_id).await,
+        "a\r\nb\nXc\n"
+    );
+    drop(server);
+}
+
+/// Only `\n` breaks a line, as it does for git, grep, tree-sitter and LSP. A form feed or a raw
+/// U+2028 used to start a new rope line, so every line below it was one off from where everything
+/// else in the editor put it.
+#[tokio::test]
+async fn form_feed_and_line_separator_are_not_line_breaks() {
+    for separator in ["\u{0c}", "\u{2028}", "\r"] {
+        let (server, mut ws, buffer_id) = setup_with_buffer(&format!("a\n{separator}b\nc\n")).await;
+        set_cursor(&mut ws, buffer_id, 2, 0).await;
+        type_text(&mut ws, buffer_id, "!").await;
+        assert_eq!(
+            buffer_text(&mut ws, buffer_id).await,
+            format!("a\n{separator}b\n!c\n"),
+            "separator {separator:?}"
+        );
+        drop(server);
+    }
+}
+
+/// An edit that removes nothing and inserts nothing isn't an edit: Backspace at the buffer's start
+/// keeps the revision (so a clean document stays clean) and leaves redo intact.
+#[tokio::test]
+async fn backspace_at_buffer_start_is_no_edit() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("hello\n").await;
+    type_text(&mut ws, buffer_id, "x").await;
+    let before = send_request::<EditUndo>(
+        &mut ws,
+        &UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        },
+    )
+    .await
+    .revision;
+    set_cursor(&mut ws, buffer_id, 0, 0).await;
+
+    let r: EditResult =
+        send_request::<InputBackspace>(&mut ws, &BufferOnlyParams { buffer_id }).await;
+    assert_eq!(r.revision, before, "no revision for an empty edit");
+    assert_eq!(r.cursor.position, LogicalPosition { line: 0, col: 0 });
+
+    let _: UndoResult = send_request::<EditRedo>(
+        &mut ws,
+        &UndoRedoParams {
+            buffer_id,
+            count: 1,
+            collapse_selection: false,
+        },
+    )
+    .await;
+    assert_eq!(
+        buffer_text(&mut ws, buffer_id).await,
+        "xhello\n",
+        "redo survived"
+    );
+    drop(server);
+}
+
+/// Delete in an empty buffer has nothing to delete, so the buffer doesn't turn dirty.
+#[tokio::test]
+async fn delete_in_an_empty_buffer_is_no_edit() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("").await;
+    let first: EditResult = send_request::<InputDelete>(
+        &mut ws,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    let second: EditResult = send_request::<InputDelete>(
+        &mut ws,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(first.revision, second.revision);
+    assert_eq!(buffer_text(&mut ws, buffer_id).await, "");
+    drop(server);
+}

@@ -118,7 +118,13 @@ pub async fn spawn(state: SharedState) -> anyhow::Result<()> {
     tokio::spawn(async move {
         while let Some(res) = rx.recv().await {
             match res {
-                Ok(event) => handle_event(&state, event).await,
+                Ok(event) => {
+                    crate::handlers::contain_panic(
+                        "file watcher event",
+                        handle_event(&state, event),
+                    )
+                    .await;
+                }
                 Err(e) => tracing::warn!(error = %e, "file watcher error"),
             }
         }
@@ -775,7 +781,16 @@ fn handle_buffer_event(
                 match reload_buffer_locked(s, buf_id) {
                     Ok((_, reload_pushes)) => pushes.extend(reload_pushes),
                     Err(e) => {
+                        // Unreadable now (no longer UTF-8, say). The buffer still holds the old
+                        // text, so it no longer matches the file: flag it, or the next edit and
+                        // save would overwrite the external version unasked.
                         tracing::warn!(?buf_id, error = ?e, "reload after watch event failed");
+                        if let Some(doc) = s.try_doc_of_mut(buf_id) {
+                            if !doc.externally_modified {
+                                doc.externally_modified = true;
+                                pushes.extend(collect_buffer_state_pushes(s, buf_id));
+                            }
+                        }
                     }
                 }
             } else {

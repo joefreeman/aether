@@ -109,10 +109,7 @@ pub(crate) async fn push_activity_to(state: &SharedState, client_id: ClientId) {
 
 /// The clients whose active workspace is the one `view_id`'s view belongs to — who a shell's or a
 /// conversation's own notices go to. None when the view has gone.
-pub(crate) fn clients_of_view(
-    s: &ServerState,
-    view_id: ViewId,
-) -> Vec<tokio::sync::mpsc::Sender<Notification>> {
+pub(crate) fn clients_of_view(s: &ServerState, view_id: ViewId) -> Vec<crate::state::Outbound> {
     let Some(workspace) = s
         .try_presenting_buffer(view_id)
         .and_then(|b| s.buffer_workspaces.get(&b))
@@ -129,7 +126,7 @@ pub(crate) fn clients_of_view(
 fn activity_notification(
     s: &ServerState,
     client_id: ClientId,
-) -> Option<(tokio::sync::mpsc::Sender<Notification>, Notification)> {
+) -> Option<(crate::state::Outbound, Notification)> {
     let sender = s.clients.get(&client_id)?.outbound.clone();
     let params = ActivityChangedParams {
         items: activity_for(s, client_id),

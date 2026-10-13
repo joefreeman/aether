@@ -1442,6 +1442,15 @@ pub(crate) fn normalize_lf(bytes: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// `bytes` with every CR that ends a line removed, borrowed when there are none.
+fn without_cr_before_lf(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if bytes.windows(2).any(|w| w == b"\r\n") {
+        std::borrow::Cow::Owned(normalize_lf(bytes.to_vec()))
+    } else {
+        std::borrow::Cow::Borrowed(bytes)
+    }
+}
+
 /// Diff a cached `baseline` against the live buffer. Cheap — no repo I/O — so it's fine on every
 /// edit. Empty when there's no baseline (untracked / no repo) or the sides match. The buffer text
 /// is only materialised when a baseline exists.
@@ -1457,6 +1466,13 @@ pub fn diff_hunks(baseline: Option<&[u8]>, current: &ropey::Rope) -> Vec<DiffHun
 /// [`compute_hunks`] so it's testable without touching a repo. `pub(crate)` so the Git-changes
 /// picker can diff an index blob against working-tree / buffer content off the keystroke path.
 pub(crate) fn hunks_from_buffers(old: &[u8], new: &[u8]) -> Vec<DiffHunk> {
+    // Line endings are not a change the gutter reports. A document only drops the CR from a file
+    // that is CRLF throughout; a mixed file keeps its CRs as content. Comparing without them on
+    // both sides keeps a file whose ending style differs from its blob's — CRLF committed, a line
+    // since added with LF — from diffing as wholly changed. Line numbers are unaffected.
+    let old = without_cr_before_lf(old);
+    let new = without_cr_before_lf(new);
+    let (old, new) = (old.as_ref(), new.as_ref());
     let mut opts = git2::DiffOptions::new();
     // No surrounding context: we want one hunk per actual change run, and `force_text` keeps
     // libgit2 from guessing "binary" on path-less buffers (which would yield zero hunks).
@@ -3695,6 +3711,16 @@ mod tests {
             Some(&b"hello\n"[..])
         );
         assert!(content(&baseline).blob.is_none(), "still not in HEAD");
+    }
+
+    #[test]
+    fn line_endings_alone_are_not_a_change() {
+        // A CRLF-committed file with one line since added in LF: only that line is new.
+        let hunks = hunks_from_buffers(b"one\r\ntwo\r\n", b"one\r\ntwo\r\nthree\n");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!((hunks[0].anchor_line, hunks[0].new_lines), (2, 1));
+        // And a real edit still shows through.
+        assert_eq!(hunks_from_buffers(b"one\r\n", b"uno\n").len(), 1);
     }
 
     #[test]

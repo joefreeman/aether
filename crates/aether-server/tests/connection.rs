@@ -612,6 +612,30 @@ async fn ws_rejects_foreign_origin() {
     );
 }
 
+/// A page served by another localhost server (a dev server, a notebook) is loopback but not ours:
+/// its `Origin` names a different port, so it can't open a socket and drive the API.
+#[tokio::test]
+async fn ws_rejects_loopback_origin_on_another_port() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+
+    let other = if server.port == 8888 { 8889 } else { 8888 };
+    for origin in [
+        format!("http://localhost:{other}"),
+        format!("http://127.0.0.1:{other}"),
+        "http://localhost".to_string(),
+    ] {
+        let mut req = server.ws_url().into_client_request().unwrap();
+        req.headers_mut().insert("origin", origin.parse().unwrap());
+        let result = tokio_tungstenite::connect_async(req).await;
+        assert!(result.is_err(), "connect should fail from {origin}, got Ok");
+    }
+}
+
 /// The page served from our own loopback origin *can* connect: its `Origin` matches, so a browser
 /// client served by the daemon authenticates fine.
 #[tokio::test]
@@ -1193,4 +1217,39 @@ async fn settings_set_pushes_to_other_clients_but_not_the_setter() {
         "the setter already has the answer in its own result"
     );
     drop(server);
+}
+
+/// A handler that panics answers with an error, and the connection carries on. The panic used to
+/// unwind out of the connection task and skip its teardown: the client stayed registered forever,
+/// and with it the idle reaper's reason to wait.
+///
+/// The panic is provoked by planting a cursor no edit could leave behind — past the end of the
+/// rope — which `element/delete_line` indexes the rope with directly.
+#[tokio::test]
+async fn a_panicking_handler_answers_with_an_error_and_keeps_the_connection() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("a\nb\n").await;
+    set_cursor(&mut ws, buffer_id, 1, 0).await;
+    {
+        let mut s = server.state.lock().await;
+        let cursor = s
+            .cursors
+            .iter_mut()
+            .find(|((_, b), _)| *b == buffer_id)
+            .map(|(_, c)| c)
+            .expect("the opener has a cursor");
+        cursor.position.line = 10_000;
+        cursor.anchor.line = 10_000;
+    }
+
+    let message =
+        send_request_expect_err::<InputDeleteLine>(&mut ws, &BufferOnlyParams { buffer_id }).await;
+    assert!(message.contains("internal error"), "{message}");
+
+    // Same connection, still served, still registered.
+    assert_eq!(buffer_text(&mut ws, buffer_id).await, "a\nb\n");
+    assert_eq!(server.state.lock().await.clients.len(), 1);
+
+    // And a disconnect after a panic still tears the client down.
+    drop(ws);
+    wait_for_client_count(&server, 0).await;
 }

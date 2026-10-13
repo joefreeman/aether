@@ -203,10 +203,15 @@ async fn input_join_lines_once(
     let client_id = ctx.client_id;
     let buffer_id = params.buffer_id;
 
+    // One lock from reading the cursor to applying the edit: the range below is char offsets
+    // into the rope as it stands now, and an edit landing in between (another client, a reload,
+    // an agent's write) made them stale — a panic in the rope when the document had shrunk, and a
+    // silent overwrite of the other edit when it hadn't.
+    let mut s = state.lock().await;
+
     // Figure out which line(s) we're joining. If the cursor has a selection that spans multiple
     // lines, join all of them. Otherwise, join the cursor's line with the one below.
     let (first_line, last_line) = {
-        let s = state.lock().await;
         let cursor = s
             .cursors
             .get(&(client_id, buffer_id))
@@ -216,7 +221,9 @@ async fn input_join_lines_once(
         let buf = s
             .try_doc_of(buffer_id)
             .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
-        let line_count = buf.line_count();
+        // The phantom line after a final `\n` isn't a line to pull up: joining into it deleted
+        // the file's final newline.
+        let content_lines = buf.content_lines();
         let first = a.line;
         // If single line, join with the line below it. If multi-line selection, join through
         // last selected line.
@@ -231,13 +238,12 @@ async fn input_join_lines_once(
         let scope = s.motion_scope(client_id, buffer_id)?;
         let last = last
             .min(scope.last_line())
-            .min(line_count.saturating_sub(1));
+            .min(content_lines.saturating_sub(1));
         (first, last)
     };
 
     if first_line >= last_line {
         // Nothing to join (we're on the last line).
-        let s = state.lock().await;
         let buf = s.doc_of(buffer_id);
         return Ok(EditResult {
             buffer: buffer_id,
@@ -253,7 +259,6 @@ async fn input_join_lines_once(
     // Compute the joined range, in char offsets. For each pair of consecutive lines, the range
     // to replace is `[end_of_trailing_ws_on_line_i, first_non_ws_on_line_i+1)` — replaced with
     // a single space. We do them in a single sweep on the rope.
-    let s = state.lock().await;
     let buf = s.doc_of(buffer_id);
 
     // Build the full replacement: concatenate the lines, dropping each continuation's leading
@@ -289,15 +294,9 @@ async fn input_join_lines_once(
     } else {
         buf.text.len_chars()
     };
-    drop(s);
-
-    let cursors_before = {
-        let s = state.lock().await;
-        document_cursor_snapshot(&s, buffer_id)
-    };
+    let cursors_before = document_cursor_snapshot(&s, buffer_id);
 
     let (revision, new_cursor, was_dirty) = {
-        let mut s = state.lock().await;
         let was_dirty = s.doc_of(buffer_id).dirty;
         let mut buf = s.editable_doc(buffer_id)?;
         let revision = buf.apply_edit(
@@ -324,6 +323,7 @@ async fn input_join_lines_once(
         s.clear_virtual_col_for_buffer(buffer_id);
         (revision, new_cursor, was_dirty)
     };
+    drop(s);
 
     // Push viewport/lines_changed for affected viewports (we changed multiple lines).
     let (pushes, promoted_pushes, picker_pushes, new_cursor): (Vec<_>, Vec<_>, Vec<_>, _) = {
@@ -799,6 +799,13 @@ pub async fn apply_edit_reporting(
         EditKind::AdjustNumber { .. } => number_edit.is_none(),
         EditKind::TransformCase { .. } => transform_edit.is_none(),
         EditKind::BlockEdit { .. } => matches!(block_edit, Some(None)),
+        // `input_unsurround` checked for a pair under its own lock; re-checked under this one,
+        // because the range below steps one char outside the selection on each side and a pair
+        // that's gone by now would put that step before the rope's start or past its end.
+        EditKind::Unsurround { line: true } => {
+            !line_has_enclosing_pair(buf, cursor.position.line as usize)
+        }
+        EditKind::Unsurround { line: false } => !has_enclosing_pair(&scope, &cursor),
         _ => false,
     };
     if resolved_noop {

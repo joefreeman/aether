@@ -299,7 +299,9 @@ async fn git_fetch_loop(state: SharedState) {
 
         // Read per tick, not at boot: toggling the setting takes effect on the next tick rather
         // than at the next restart, and there is no cached copy to keep in sync.
-        let enabled = config::load_app_settings()
+        let settings_path = state.lock().await.app_settings_path();
+        let enabled = settings_path
+            .and_then(|path| config::load_app_settings_at(&path))
             .map(|s| s.git_auto_fetch)
             .unwrap_or(false);
         if !enabled {
@@ -626,6 +628,7 @@ pub async fn spawn_for_test_full(
         .unwrap_or_default();
 
     let worktree_store = std::env::temp_dir().join(format!("aether-test-worktrees-{port}"));
+    let config_dir = std::env::temp_dir().join(format!("aether-test-config-{port}"));
     let state = Arc::new(Mutex::new(ServerState::new()));
     {
         let mut s = state.lock().await;
@@ -639,6 +642,12 @@ pub async fn spawn_for_test_full(
         // server, so parallel tests can't collide. Swept when the handle drops (see below) — a
         // worktree is a full checkout, and leaking one per test is how /tmp ran out of inodes.
         s.worktree_store = Some(worktree_store.clone());
+        // The same for the two profile files whose `None` means "the real one": workspace
+        // definitions and app settings. Left unset, `workspace/delete` in a test removed the
+        // developer's own `<name>.toml`, and `settings/set` overwrote their `settings.toml`. A test
+        // that wants a populated store still points `workspaces_dir` elsewhere after spawning.
+        s.workspaces_dir = Some(config_dir.join("workspaces"));
+        s.settings_path = Some(config_dir.join("settings.toml"));
         // No test server may launch a real coding agent. Unconditional and without a parameter,
         // like the worktree store above and for a sharper version of the same reason: falling
         // through to `npx @agentclientprotocol/claude-agent-acp` would spawn a real agent with the
@@ -708,6 +717,7 @@ pub async fn spawn_for_test_full(
         keep_alive: Vec::new(),
     };
     handle.keep_alive(RemoveOnDrop(worktree_store));
+    handle.keep_alive(RemoveOnDrop(config_dir));
     Ok(handle)
 }
 

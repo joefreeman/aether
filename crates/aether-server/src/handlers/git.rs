@@ -3454,41 +3454,55 @@ pub async fn cursor_follow_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<(ClientId, BufferId, DeferredToken)>,
 ) {
     while let Some((client_id, buffer_id, token)) = rx.recv().await {
-        let key = (client_id, buffer_id);
-        let (blame_epoch, hl_epoch, symbol_path_pushes) = {
-            let mut s = state.lock().await;
-            let blame = s.blame_follow.contains(&key).then(|| {
-                let gen = s.blame_follow_gen.entry(key).or_insert(0);
-                *gen += 1;
-                *gen
+        contain_panic(
+            "cursor follow",
+            follow_cursor(&state, client_id, buffer_id, token),
+        )
+        .await;
+    }
+}
+
+/// One cursor move's follow-up work for [`cursor_follow_loop`].
+async fn follow_cursor(
+    state: &SharedState,
+    client_id: ClientId,
+    buffer_id: BufferId,
+    token: DeferredToken,
+) {
+    let key = (client_id, buffer_id);
+    let (blame_epoch, hl_epoch, symbol_path_pushes) = {
+        let mut s = state.lock().await;
+        let blame = s.blame_follow.contains(&key).then(|| {
+            let gen = s.blame_follow_gen.entry(key).or_insert(0);
+            *gen += 1;
+            *gen
+        });
+        // An active search owns the highlight layer (the enable handler refuses too);
+        // don't fight it from the follow side even if the unfollow is still in flight.
+        let hl = (s.symbol_highlight_follow.contains(&key) && !search_covers(&s, key.0, key.1))
+            .then(|| {
+                let epoch = next_symbol_hl_epoch();
+                s.symbol_highlight_gen.insert(key, epoch);
+                epoch
             });
-            // An active search owns the highlight layer (the enable handler refuses too);
-            // don't fight it from the follow side even if the unfollow is still in flight.
-            let hl = (s.symbol_highlight_follow.contains(&key) && !search_covers(&s, key.0, key.1))
-                .then(|| {
-                    let epoch = next_symbol_hl_epoch();
-                    s.symbol_highlight_gen.insert(key, epoch);
-                    epoch
-                });
-            // Resolved inline, not spawned: the breadcrumb is a lookup in the cached outline, so
-            // there's nothing to debounce and no round-trip to supersede. Recomputed from the
-            // *current* cursor rather than anything carried on the event, so a burst of moves
-            // collapses onto the latest position by construction.
-            let crumbs = collect_symbol_path_pushes(&mut s, key.1);
-            (blame, hl, crumbs)
-        };
-        // The token rides into whatever this arms, so the work stays counted until the debounced
-        // task actually finishes — or returns early, superseded. Nothing armed means it drops here
-        // and the server is quiet again.
-        if let Some(epoch) = blame_epoch {
-            spawn_blame_refresh(state.clone(), key.0, key.1, epoch, token.clone());
-        }
-        if let Some(epoch) = hl_epoch {
-            spawn_symbol_highlight_refresh(state.clone(), key.0, key.1, epoch, token.clone());
-        }
-        for (sender, notif) in symbol_path_pushes {
-            let _ = sender.send(notif).await;
-        }
+        // Resolved inline, not spawned: the breadcrumb is a lookup in the cached outline, so
+        // there's nothing to debounce and no round-trip to supersede. Recomputed from the
+        // *current* cursor rather than anything carried on the event, so a burst of moves
+        // collapses onto the latest position by construction.
+        let crumbs = collect_symbol_path_pushes(&mut s, key.1);
+        (blame, hl, crumbs)
+    };
+    // The token rides into whatever this arms, so the work stays counted until the debounced
+    // task actually finishes — or returns early, superseded. Nothing armed means it drops here
+    // and the server is quiet again.
+    if let Some(epoch) = blame_epoch {
+        spawn_blame_refresh(state.clone(), key.0, key.1, epoch, token.clone());
+    }
+    if let Some(epoch) = hl_epoch {
+        spawn_symbol_highlight_refresh(state.clone(), key.0, key.1, epoch, token.clone());
+    }
+    for (sender, notif) in symbol_path_pushes {
+        let _ = sender.send(notif).await;
     }
 }
 

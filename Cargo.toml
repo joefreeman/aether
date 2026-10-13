@@ -73,7 +73,10 @@ anyhow = "1"
 thiserror = "2"
 
 # Server-only
-ropey = "1"
+# Only `\n` breaks a line. The default `unicode_lines` also breaks on a lone `\r`, form feed, NEL
+# and U+2028/9, which git, grep, tree-sitter and LSP don't, so every line below one was off by one
+# against diagnostics, grep hits and the diff gutter.
+ropey = { version = "1", default-features = false, features = ["simd"] }
 regex = "1"
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"

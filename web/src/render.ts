@@ -194,7 +194,7 @@ function makeSpan(text: string, style: CellStyle, cursorClass: string): Node {
 
 /** A whitespace-indicator span (tab/trailing-space/newline). Reuses `makeSpan`'s styling (the `sel`
  *  blue background when selected) and tags it `ws-{kind}` so CSS paints the muted glyph. */
-function wsSpan(text: string, style: CellStyle, kind: "tab" | "dot" | "nl", cursorClass: string): HTMLElement {
+function wsSpan(text: string, style: CellStyle, kind: "tab" | "dot" | "nl" | "cr", cursorClass: string): HTMLElement {
   const node = makeSpan(text, style, cursorClass);
   let span: HTMLElement;
   if (node instanceof HTMLElement) {
@@ -384,16 +384,21 @@ function renderVisualRow(
   }
   // Whitespace indicator glyphs (terminal parity): `→` for tabs, `·` for trailing spaces. Selected,
   // every tab and the spaces of the row's trailing run are glyphed; unselected, the line's own
-  // trailing whitespace (that run on its last row). Per code-point: "tab" | "dot" | null.
-  const wsGlyph: (null | "tab" | "dot")[] = new Array(n).fill(null);
+  // trailing whitespace (that run on its last row). A carriage return the document kept as content
+  // always draws as `␍`: a real character the cursor can stand on, and the only sign a file mixes
+  // CRLF with LF. Per code-point: "tab" | "dot" | "cr" | null.
+  const wsGlyph: (null | "tab" | "dot" | "cr")[] = new Array(n).fill(null);
   let trailingWsStart = n;
+  // A kept carriage return belongs to the run — it is how a CRLF line in a mixed file ends — so
+  // the spaces before it still show.
   for (let k = n - 1; k >= 0; k--) {
-    if (cps[k] === " " || cps[k] === "\t") trailingWsStart = k;
+    if (cps[k] === " " || cps[k] === "\t" || cps[k] === "\r") trailingWsStart = k;
     else break;
   }
   for (let i = 0; i < n; i++) {
     const trailing = i >= trailingWsStart;
-    if (cps[i] === "\t" && (selected[i] || (trailing && isLastRow))) wsGlyph[i] = "tab";
+    if (cps[i] === "\r") wsGlyph[i] = "cr";
+    else if (cps[i] === "\t" && (selected[i] || (trailing && isLastRow))) wsGlyph[i] = "tab";
     else if (cps[i] === " " && trailing && (selected[i] || isLastRow)) wsGlyph[i] = "dot";
   }
 
@@ -454,6 +459,8 @@ function renderVisualRow(
     if (g === "dot") {
       // Trailing spaces → `·`, width-neutral, in NORD3 (over the selection blue when selected).
       sink(wsSpan("·".repeat(j - i), style, "dot", cursorClass), style.emph);
+    } else if (g === "cr") {
+      sink(wsSpan("\u240D".repeat(j - i), style, "cr", cursorClass), style.emph);
     } else {
       sink(makeSpan(cps.slice(i, j).join(""), style, cursorClass), style.emph);
     }

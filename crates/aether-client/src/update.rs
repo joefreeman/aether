@@ -3111,6 +3111,26 @@ impl Session {
             // document's own result still updates the buffer state the client tracks, when it was
             // one of them — a save that wrote only *other* elements leaves this one as it was.
             Event::SaveTried(Ok(SaveTry::SavedView { result, after })) => {
+                // Some documents changed on disk: the rest are written, these wait for a yes that
+                // names them all. The `after` (quit / close) waits with them.
+                if !result.conflicts.is_empty() {
+                    let (deleted, modified): (Vec<_>, Vec<_>) =
+                        result.conflicts.iter().partition(|c| c.deleted);
+                    let paths = |cs: Vec<&aether_protocol::viewport::SaveConflict>| {
+                        cs.into_iter().map(|c| c.path.clone()).collect()
+                    };
+                    self.prompt = Some(Prompt::Confirm {
+                        kind: ConfirmKind::SaveConflicts {
+                            modified: paths(modified),
+                            deleted: paths(deleted),
+                        },
+                        action: ConfirmAction::SaveView {
+                            confirmed: result.conflicts.iter().map(|c| c.buffer_id).collect(),
+                            after,
+                        },
+                    });
+                    return Effects::none();
+                }
                 let note = match result.saved {
                     0 => "Nothing to save".to_string(),
                     1 => "Saved".to_string(),
@@ -3183,45 +3203,7 @@ impl Session {
         // ordinary view is the one document and so is unchanged. Save-*as* stays per-document —
         // it names a path, and a path names one file.
         if target.is_none() {
-            let view_id = self.view.view_id;
-            {
-                return self.request::<ViewSave>(
-                    ViewSaveParams { view_id, overwrite },
-                    move |__r| {
-                        Event::SaveTried(match __r {
-                            Ok(result) => Ok(SaveTry::SavedView { result, after }),
-                            Err(e) if e.code == ErrorCode::WOULD_OVERWRITE.code() => {
-                                Ok(SaveTry::NeedsConfirm {
-                                    kind: ConfirmKind::Overwrite { path: None },
-                                    action: ConfirmAction::Save {
-                                        target: None,
-                                        after,
-                                    },
-                                })
-                            }
-                            Err(e) if e.code == ErrorCode::EXTERNALLY_MODIFIED.code() => {
-                                Ok(SaveTry::NeedsConfirm {
-                                    kind: ConfirmKind::OverwriteModified,
-                                    action: ConfirmAction::Save {
-                                        target: None,
-                                        after,
-                                    },
-                                })
-                            }
-                            Err(e) if e.code == ErrorCode::EXTERNALLY_DELETED.code() => {
-                                Ok(SaveTry::NeedsConfirm {
-                                    kind: ConfirmKind::RecreateDeleted,
-                                    action: ConfirmAction::Save {
-                                        target: None,
-                                        after,
-                                    },
-                                })
-                            }
-                            Err(e) => Err(e.message),
-                        })
-                    },
-                );
-            }
+            return self.save_view(Vec::new(), after);
         }
 
         self.request::<BufferSave>(
@@ -3262,6 +3244,18 @@ impl Session {
                 })
             },
         )
+    }
+
+    /// `view/save`, overwriting on-disk changes only in the documents named in `confirmed`. The
+    /// documents it leaves unsaved come back in the result and become one confirmation.
+    fn save_view(&mut self, confirmed: Vec<BufferId>, after: AfterSave) -> Effects {
+        let view_id = self.view.view_id;
+        self.request::<ViewSave>(ViewSaveParams { view_id, confirmed }, move |r| {
+            Event::SaveTried(match r {
+                Ok(result) => Ok(SaveTry::SavedView { result, after }),
+                Err(e) => Err(e.message),
+            })
+        })
     }
 
     /// Fire an edit RPC; the result lands as [`Event::EditDone`]. Allocate a token, park the result
@@ -9962,6 +9956,7 @@ impl Session {
     fn run_confirm(&mut self, action: ConfirmAction) -> Effects {
         match action {
             ConfirmAction::Save { target, after } => self.save(target, true, after),
+            ConfirmAction::SaveView { confirmed, after } => self.save_view(confirmed, after),
             ConfirmAction::DropStash { repo_id, oid } => self.request_str::<GitStashDrop>(
                 GitStashDropParams {
                     repo_id: Some(repo_id),

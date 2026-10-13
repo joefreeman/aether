@@ -3434,7 +3434,7 @@ mod subscribe_snapshot_tests {
             client_id,
             crate::state::ClientSession {
                 client_id,
-                outbound: tx,
+                outbound: crate::state::Outbound::new(tx),
                 pushes_written: Default::default(),
                 active_workspace: Some("p".to_string()),
             },
@@ -3527,7 +3527,7 @@ mod subscribe_snapshot_tests {
             client_id,
             crate::state::ClientSession {
                 client_id,
-                outbound: tx,
+                outbound: crate::state::Outbound::new(tx),
                 pushes_written: Default::default(),
                 active_workspace: Some("p".to_string()),
             },
@@ -4367,6 +4367,7 @@ pub async fn view_save(
 
     let mut saved = 0;
     let mut focused_result = None;
+    let mut conflicts = Vec::new();
     for buffer_id in buffers {
         let result = crate::handlers::buffer_save(
             state,
@@ -4375,17 +4376,36 @@ pub async fn view_save(
                 buffer_id,
                 path_index: None,
                 relative_path: None,
-                overwrite: params.overwrite,
+                overwrite: params.confirmed.contains(&buffer_id),
             },
         )
-        .await?;
-        saved += 1;
-        if buffer_id == focused_buffer {
-            focused_result = Some(result);
+        .await;
+        match result {
+            Ok(result) => {
+                saved += 1;
+                if buffer_id == focused_buffer {
+                    focused_result = Some(result);
+                }
+            }
+            // Gathered rather than returned, so one confirmation names every conflicted file and
+            // the files that needed none are written now.
+            Err(e)
+                if e.code == ErrorCode::EXTERNALLY_MODIFIED.code()
+                    || e.code == ErrorCode::EXTERNALLY_DELETED.code() =>
+            {
+                let s = state.lock().await;
+                conflicts.push(aether_protocol::viewport::SaveConflict {
+                    buffer_id,
+                    path: s.display_path(buffer_id).unwrap_or_default(),
+                    deleted: e.code == ErrorCode::EXTERNALLY_DELETED.code(),
+                });
+            }
+            Err(e) => return Err(e),
         }
     }
     Ok(aether_protocol::viewport::ViewSaveResult {
         saved,
         focused: focused_result,
+        conflicts,
     })
 }

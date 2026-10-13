@@ -101,8 +101,13 @@ pub async fn close_view(
                         // content is document-scoped now, so an explicit discard here discards it
                         // for every workspace whose session references the same path — the same
                         // way closing a shared live buffer with discard would.
+                        // Unless the document is live in another workspace: then the backup is
+                        // that document's, current as far as its flush knows, and deleting it
+                        // would leave its unsaved edits with no copy on disk until the next edit.
                         crate::state::DormantSource::File(p) => {
-                            crate::backup::delete(&crate::backup::file_backup_path(root, p))
+                            if s.document_for_path(p).is_none() {
+                                crate::backup::delete(&crate::backup::file_backup_path(root, p))
+                            }
                         }
                         crate::state::DormantSource::Scratch { number } => crate::backup::delete(
                             &crate::backup::scratch_backup_path(root, &workspace, *number),
@@ -893,7 +898,7 @@ pub async fn buffer_save(
         // above; the buffer's external-change state for its prior path is no longer relevant.
         if !params.overwrite {
             let buf = s
-                .try_doc_of(params.buffer_id)
+                .try_doc_of_mut(params.buffer_id)
                 .ok_or_else(|| RpcError::buffer_not_found(params.buffer_id))?;
             let saving_in_place = buf
                 .canonical_path
@@ -903,6 +908,13 @@ pub async fn buffer_save(
             if saving_in_place {
                 if buf.externally_deleted {
                     return Err(RpcError::externally_deleted(params.buffer_id));
+                }
+                // The flag is the watcher's verdict, and the watcher can miss: it may have failed
+                // to start or hit the watch limit, the file may be on a mount that sends no
+                // events, or the change may still be inside the debounce. So look at the file
+                // itself too, the same content comparison the watcher settles on.
+                if !buf.externally_modified && target.exists() && !buf.disk_unchanged() {
+                    buf.externally_modified = true;
                 }
                 if buf.externally_modified {
                     return Err(RpcError::externally_modified(params.buffer_id));
@@ -3139,12 +3151,25 @@ async fn view_open_inner(
             // changed externally while we were down — surfaced via the same `externally_modified`
             // flag as an in-session collision.
             if let Some((content, backup_mtime)) = &backup {
+                // Did the file change while we were down? Compare the disk text the edits started
+                // from, recorded beside the backup, with what is on disk now; a backup from before
+                // that record existed falls back to "is the file newer than the backup".
+                let recorded_base = s.backups_path.as_deref().and_then(|root| {
+                    crate::backup::read_base(&crate::backup::file_backup_path(root, &canonical))
+                });
+                let changed_on_disk = !doc.externally_deleted
+                    && match recorded_base {
+                        Some(base) => {
+                            crate::backup::content_hash(doc.text.chunks().map(str::as_bytes))
+                                != base
+                        }
+                        None => doc
+                            .last_modified_unix_ms
+                            .is_some_and(|disk| disk > *backup_mtime),
+                    };
                 doc.restore_unsaved(content);
                 doc.backed_up_revision = Some(doc.revision);
-                if doc
-                    .last_modified_unix_ms
-                    .is_some_and(|disk| disk > *backup_mtime)
-                {
+                if changed_on_disk {
                     doc.externally_modified = true;
                     // Worth a line in the log: what the buffer now holds is not what the file
                     // holds, and the two diverged while we were not running. The flag is how a
@@ -3644,7 +3669,7 @@ mod next_buffer_tests {
             client_id,
             crate::state::ClientSession {
                 client_id,
-                outbound: tx,
+                outbound: crate::state::Outbound::new(tx),
                 pushes_written: Default::default(),
                 active_workspace: Some("p".to_string()),
             },
@@ -3746,7 +3771,7 @@ mod tests {
             client_id,
             crate::state::ClientSession {
                 client_id,
-                outbound: tx,
+                outbound: crate::state::Outbound::new(tx),
                 pushes_written: Default::default(),
                 active_workspace: Some(workspace),
             },

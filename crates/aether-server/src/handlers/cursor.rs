@@ -356,10 +356,7 @@ async fn cross_element(
 
 /// What landing a motion yields: the cursor as the client should see it, and the search update the
 /// move owes — sent by the caller once the state lock is dropped.
-pub type MoveOutcome = (
-    CursorState,
-    Option<(mpsc::Sender<Notification>, Notification)>,
-);
+pub type MoveOutcome = (CursorState, Option<(crate::state::Outbound, Notification)>);
 
 /// Land a resolved motion: set the cursor, record the move for motion undo, drop the
 /// tree-selection history, keep the virtual column only when the motion says to, and collect the
@@ -722,6 +719,23 @@ pub async fn cursor_set(
 ) -> Result<CursorState, RpcError> {
     let client_id = ctx.client_id;
     let mut s = state.lock().await;
+    let (response, search_update) = cursor_set_locked(&mut s, client_id, &params)?;
+    drop(s);
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
+    Ok(response)
+}
+
+/// [`cursor_set`] under a lock the caller already holds, for a handler that has to work out the
+/// position and place the cursor in one step — a position read under one lock and set under
+/// another is stale the moment another client's edit lands in between. Returns the response
+/// cursor and the search push to send once the lock is dropped.
+pub(super) fn cursor_set_locked(
+    s: &mut ServerState,
+    client_id: ClientId,
+    params: &CursorSetParams,
+) -> Result<(CursorState, Option<(crate::state::Outbound, Notification)>), RpcError> {
     // A click names the element it landed in and the client focuses that element first, so by the
     // time this arrives the scope *is* the clicked element — which is what keeps a drag running off
     // its bottom edge from selecting into the next hunk's file.
@@ -736,17 +750,15 @@ pub async fn cursor_set(
         match_bracket: None,
         jumplist_position: None,
     };
-    set_cursor(&mut s, key, result);
+    set_cursor(s, key, result);
     s.record_motion(key, current, result);
     s.virtual_col.remove(&key);
     s.clear_tree_selection_history(client_id, params.buffer_id);
-    let search_update = collect_cursor_search_update(&mut s, client_id, params.buffer_id);
-    let response = wrap_for_response(&s, client_id, params.buffer_id, result);
-    drop(s);
-    if let Some((sender, notif)) = search_update {
-        let _ = sender.send(notif).await;
-    }
-    Ok(response)
+    let search_update = collect_cursor_search_update(s, client_id, params.buffer_id);
+    Ok((
+        wrap_for_response(s, client_id, params.buffer_id, result),
+        search_update,
+    ))
 }
 
 /// Rewind one step on this client's per-buffer motion history. Independent of `input/undo`.

@@ -442,7 +442,7 @@ pub async fn input_paste_block(
     params: PasteBlockParams,
 ) -> Result<BlockEditResult, RpcError> {
     let op = BlockOp::PasteBlock {
-        text: params.text,
+        text: crate::state::normalize_line_breaks(&params.text).into_owned(),
         replace: params.replace,
     };
     block_edit_rpc(state, ctx, params.buffer_id, op).await

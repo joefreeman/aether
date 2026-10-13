@@ -1549,11 +1549,12 @@ where
             // Byte offset where the row's trailing whitespace run begins (row end if none) —
             // only spaces from here on get the `·` glyph, matching the terminal client. On the
             // line's last row the run is the line's own trailing whitespace, glyphed unselected
-            // too.
+            // too. A kept carriage return belongs to the run (it is how a CRLF line in a mixed
+            // file ends), so the spaces before it still show.
             let trailing_ws_start = {
                 let mut start = grid::row_end_byte(row);
                 for c in cells.iter().rev() {
-                    if c.ch == ' ' || c.ch == '\t' {
+                    if matches!(c.ch, ' ' | '\t' | '\r') {
                         start = c.byte;
                     } else {
                         break;
@@ -2332,9 +2333,12 @@ fn pos_in_selection(line: u32, byte: u32, min: LogicalPosition, max: LogicalPosi
 
 /// The indicator glyph a whitespace char draws as, `→` for a tab and `·` for a space. Selected:
 /// every tab, and the spaces of the row's trailing run (`trailing`). Unselected: the line's own
-/// trailing whitespace — that run on the line's last row (`line_end`).
+/// trailing whitespace — that run on the line's last row (`line_end`). A carriage return the
+/// document kept as content always draws as `␍` (U+240D): a real character the cursor can stand
+/// on, and the only sign a file mixes CRLF with LF.
 fn ws_glyph(ch: char, selected: bool, trailing: bool, line_end: bool) -> Option<&'static str> {
     match ch {
+        '\r' => Some("\u{240D}"),
         '\t' if selected || (trailing && line_end) => Some("→"),
         ' ' if trailing && (selected || line_end) => Some("·"),
         _ => None,
@@ -2365,10 +2369,10 @@ fn cursor_ws_glyph(
     let cells = grid::row_cells(row, tab_width);
     match cells.iter().find(|c| c.byte == pos.col) {
         Some(c) => {
-            // The row's trailing-whitespace run.
+            // The row's trailing-whitespace run, a kept carriage return included.
             let mut start = grid::row_end_byte(row);
             for cc in cells.iter().rev() {
-                if cc.ch == ' ' || cc.ch == '\t' {
+                if matches!(cc.ch, ' ' | '\t' | '\r') {
                     start = cc.byte;
                 } else {
                     break;
@@ -2493,6 +2497,8 @@ mod tests {
         assert_eq!(ws_glyph('\t', true, false, false), Some("→"));
         assert_eq!(ws_glyph(' ', true, false, true), None);
         assert_eq!(ws_glyph('x', true, true, true), None);
+        // A kept carriage return shows whatever the selection.
+        assert_eq!(ws_glyph('\r', false, false, false), Some("\u{240D}"));
     }
 
     fn line_with(diags: Vec<(u32, u32, DiagnosticSeverity)>) -> LogicalLineRender {

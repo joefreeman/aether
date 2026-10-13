@@ -5611,21 +5611,29 @@ fn picker_select_result_file_at_is_tagged() {
 #[test]
 fn view_save_wire_shape() {
     use aether_protocol::buffer::BufferSaveResult;
-    use aether_protocol::viewport::{ViewSaveParams, ViewSaveResult};
+    use aether_protocol::viewport::{SaveConflict, ViewSaveParams, ViewSaveResult};
 
+    // Nothing confirmed: no `confirmed` on the wire.
     let p = ViewSaveParams {
         view_id: aether_protocol::ViewId(7),
-        overwrite: false,
+        confirmed: Vec::new(),
+    };
+    assert_eq!(to_value(&p).unwrap(), json!({ "view_id": 7 }));
+    // Confirmation names each document it covers.
+    let p = ViewSaveParams {
+        view_id: aether_protocol::ViewId(7),
+        confirmed: vec![3, 5],
     };
     assert_eq!(
         to_value(&p).unwrap(),
-        json!({ "view_id": 7, "overwrite": false })
+        json!({ "view_id": 7, "confirmed": [3, 5] })
     );
 
     // Nothing dirty: no `focused` on the wire at all.
     let r = ViewSaveResult {
         saved: 0,
         focused: None,
+        conflicts: Vec::new(),
     };
     assert_eq!(to_value(&r).unwrap(), json!({ "saved": 0 }));
 
@@ -5637,12 +5645,41 @@ fn view_save_wire_shape() {
             saved_at_unix_ms: 1_700_000_000_000,
             revision: 12,
         }),
+        conflicts: Vec::new(),
     };
     assert_eq!(
         to_value(&r).unwrap(),
         json!({
             "saved": 3,
             "focused": { "saved_at_unix_ms": 1_700_000_000_000u64, "revision": 12 },
+        })
+    );
+
+    // Documents left unsaved because they changed on disk, every one named.
+    let r = ViewSaveResult {
+        saved: 1,
+        focused: None,
+        conflicts: vec![
+            SaveConflict {
+                buffer_id: 3,
+                path: "src/a.rs".into(),
+                deleted: false,
+            },
+            SaveConflict {
+                buffer_id: 5,
+                path: "src/b.rs".into(),
+                deleted: true,
+            },
+        ],
+    };
+    assert_eq!(
+        to_value(&r).unwrap(),
+        json!({
+            "saved": 1,
+            "conflicts": [
+                { "buffer_id": 3, "path": "src/a.rs", "deleted": false },
+                { "buffer_id": 5, "path": "src/b.rs", "deleted": true },
+            ],
         })
     );
 }

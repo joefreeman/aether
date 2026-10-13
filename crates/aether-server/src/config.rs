@@ -705,7 +705,7 @@ pub(crate) fn write_app_settings_at(path: &Path, settings: &AppSettings) -> anyh
             .with_context(|| format!("creating config dir {}", parent.display()))?;
     }
     let body = toml::to_string_pretty(settings).context("serializing app settings")?;
-    std::fs::write(path, body)
+    write_atomic(path, body.as_bytes())
         .with_context(|| format!("writing app settings at {}", path.display()))?;
     Ok(())
 }
@@ -1044,6 +1044,40 @@ pub struct WorkspaceSessions {
     pub workspaces: BTreeMap<String, WorkspaceSession>,
 }
 
+/// Replace `path` with `contents` so that a reader — or the next start after a crash or a full disk
+/// — sees either the old file or the new one, never a truncated mix. Written beside the target and
+/// renamed over it; a plain `fs::write` truncates first, and dying mid-write left an empty or
+/// half-written file behind.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 /// Path to the single machine-managed session file
 /// (`<state>/aether/profiles/<name>/sessions.json`). One file for all workspaces so the switcher can
 /// read every recency stamp in one go. JSON (not TOML) signals "machine-managed, don't hand-edit";
@@ -1066,8 +1100,26 @@ pub fn load_workspace_sessions_at(path: &Path) -> anyhow::Result<WorkspaceSessio
                 .with_context(|| format!("reading workspace sessions at {}", path.display()))
         }
     };
-    let mut sessions: WorkspaceSessions = serde_json::from_str(&content)
-        .with_context(|| format!("parsing workspace sessions at {}", path.display()))?;
+    let mut sessions: WorkspaceSessions = match serde_json::from_str(&content) {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            // Callers read-modify-write this file, and an error here used to read as empty: the
+            // next write kept only the workspace being persisted and erased every other one's
+            // dormant rows — the only route back to their file backups. Set the damaged file aside
+            // instead, so the next write starts a fresh one and what was there can still be read.
+            let aside = path.with_extension(format!("json.corrupt-{}", unix_millis()));
+            tracing::warn!(
+                path = %path.display(),
+                moved_to = %aside.display(),
+                error = %e,
+                "workspace sessions file is unreadable; setting it aside"
+            );
+            std::fs::rename(path, &aside).with_context(|| {
+                format!("setting aside unreadable sessions at {}", path.display())
+            })?;
+            WorkspaceSessions::default()
+        }
+    };
     drop_stale_variant_sessions(&mut sessions);
     sessions.normalise();
     Ok(sessions)
@@ -1123,7 +1175,7 @@ pub fn write_workspace_sessions_at(
             .with_context(|| format!("creating config dir {}", parent.display()))?;
     }
     let body = serde_json::to_string_pretty(sessions).context("serializing workspace sessions")?;
-    std::fs::write(path, body)
+    write_atomic(path, body.as_bytes())
         .with_context(|| format!("writing workspace sessions at {}", path.display()))?;
     Ok(())
 }
@@ -1282,7 +1334,8 @@ pub fn write_hints_at(path: &Path, hints: &HintsState) -> anyhow::Result<()> {
             .with_context(|| format!("creating state dir {}", parent.display()))?;
     }
     let body = serde_json::to_string_pretty(hints).context("serializing hints")?;
-    std::fs::write(path, body).with_context(|| format!("writing hints at {}", path.display()))?;
+    write_atomic(path, body.as_bytes())
+        .with_context(|| format!("writing hints at {}", path.display()))?;
     Ok(())
 }
 
@@ -1344,7 +1397,8 @@ pub fn write_history_at(path: &Path, history: &HistoryFile) -> anyhow::Result<()
             .with_context(|| format!("creating state dir {}", parent.display()))?;
     }
     let body = serde_json::to_string_pretty(history).context("serializing history")?;
-    std::fs::write(path, body).with_context(|| format!("writing history at {}", path.display()))?;
+    write_atomic(path, body.as_bytes())
+        .with_context(|| format!("writing history at {}", path.display()))?;
     Ok(())
 }
 
@@ -1648,7 +1702,7 @@ pub fn write_workspace_config_in(dir: &Path, config: &WorkspaceConfig) -> anyhow
     }
     let body = toml::to_string_pretty(config)
         .with_context(|| format!("serializing workspace config {}", config.name))?;
-    std::fs::write(&path, body)
+    write_atomic(&path, body.as_bytes())
         .with_context(|| format!("writing workspace config at {}", path.display()))?;
     Ok(())
 }
@@ -1691,6 +1745,40 @@ pub fn delete_workspace_config_in(dir: &Path, name: &str) -> anyhow::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unreadable session file is set aside, not read as empty and then overwritten: the next
+    /// write starts a fresh file, and the damaged one is still there to recover from.
+    #[test]
+    fn an_unreadable_sessions_file_is_set_aside_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        std::fs::write(&path, "{\"workspaces\": {\"a\": ").unwrap(); // torn mid-write
+
+        let loaded = load_workspace_sessions_at(&path).unwrap();
+        assert!(loaded.workspaces.is_empty());
+        assert!(!path.exists());
+        let aside: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("sessions.json.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(&aside[0])).unwrap(),
+            "{\"workspaces\": {\"a\": "
+        );
+    }
+
+    /// The atomic write replaces the file whole and leaves no temp file behind.
+    #[test]
+    fn write_atomic_replaces_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "old").unwrap();
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     fn wks(name: &str, roots: &[&str]) -> (String, Vec<PathBuf>) {
         (name.to_string(), roots.iter().map(PathBuf::from).collect())

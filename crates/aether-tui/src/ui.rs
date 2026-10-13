@@ -53,6 +53,11 @@ pub fn text_cols(total: u16) -> u16 {
     total.saturating_sub(GUTTER_WIDTH)
 }
 
+/// What a carriage return kept as content draws as: U+240D SYMBOL FOR CARRIAGE RETURN, the Control
+/// Pictures glyph made for showing one. Only a file that mixes CRLF with LF, or has a stray CR,
+/// keeps CRs in its text; a wholly CRLF file holds its breaks as LF.
+const CR_GLYPH: &str = "\u{240D}";
+
 /// Display width of a tab character. Tabs render as spaces aligned to the next multiple of
 /// this — i.e. proper tab stops, not a fixed-width substitution. Hardcoded for v1; making it
 /// per-buffer (driven by `IndentStyle::Tab(width)`) is the obvious follow-up.
@@ -64,6 +69,9 @@ pub const TAB_WIDTH: u32 = 4;
 fn char_display_width(c: char, current_col: u32) -> u32 {
     if c == '\t' {
         TAB_WIDTH - (current_col % TAB_WIDTH)
+    } else if c == '\r' {
+        // Drawn as `␍` — see `CR_GLYPH`.
+        1
     } else {
         UnicodeWidthChar::width(c).unwrap_or(0) as u32
     }
@@ -7379,11 +7387,13 @@ fn build_spans(
     };
 
     // Byte offset at which trailing whitespace starts on the row. If the row is all
-    // whitespace this is 0; if there's no trailing whitespace it's the row length.
+    // whitespace this is 0; if there's no trailing whitespace it's the row length. A kept
+    // carriage return is part of the run — it is how a CRLF line in a mixed file ends — so the
+    // spaces before it still show (it keeps its own `␍`).
     let trailing_ws_start = {
         let bytes = truncated.as_bytes();
         let mut i = bytes.len();
-        while i > 0 && matches!(bytes[i - 1], b' ' | b'\t') {
+        while i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b'\r') {
             i -= 1;
         }
         i
@@ -7464,6 +7474,16 @@ fn build_spans(
                     style,
                 );
             }
+        } else if c == '\r' {
+            // A carriage return the document kept as content is always shown: it is a real
+            // character the cursor can stand on, and the only sign a file has mixed endings.
+            push_text(
+                &mut spans,
+                &mut current_text,
+                &mut current_style,
+                CR_GLYPH,
+                style.fg(self::c(th().fg_faint)),
+            );
         } else if c == ' ' && glyphed && trailing {
             push_text(
                 &mut spans,
@@ -11570,6 +11590,68 @@ mod tests {
         // edge doesn't show its end: neither run is the line's trailing whitespace.
         assert_eq!(text(&spans("wrap ", 80, false)), "wrap ");
         assert_eq!(text(&spans("ab  cd", 4, true)), "ab  ");
+    }
+
+    /// A carriage return the document kept as content (a mixed-ending file's CRLF line, a stray
+    /// CR) draws as a muted `␍` in one cell, selected or not, at the line's end or inside it. Raw,
+    /// the terminal drew nothing there and every column after it shifted left of where the
+    /// cursor and selection put it.
+    #[test]
+    fn build_spans_always_shows_a_kept_carriage_return() {
+        let spans = |s: &str| {
+            build_spans(
+                s,
+                &[],
+                None,
+                &[],
+                None,
+                &[],
+                Color::Reset,
+                &[],
+                &[],
+                &[],
+                80,
+                false,
+                0,
+            )
+        };
+        let cells = cells_of(&spans("crlf line\r"));
+        assert_eq!(
+            cells.iter().map(|c| c.0).collect::<String>(),
+            "crlf line\u{240D}"
+        );
+        assert_eq!(cells[9].1, Some(c(th().fg_faint)), "muted glyph");
+        let cells = cells_of(&spans("x\ry"));
+        assert_eq!(cells.iter().map(|c| c.0).collect::<String>(), "x\u{240D}y");
+        // It ends the line's trailing whitespace rather than hiding it: the spaces before a CRLF
+        // line's CR are trailing.
+        let trailing = |s: &str| {
+            build_spans(
+                s,
+                &[],
+                None,
+                &[],
+                None,
+                &[],
+                Color::Reset,
+                &[],
+                &[],
+                &[],
+                80,
+                true,
+                0,
+            )
+        };
+        let cells = cells_of(&trailing("end:  \r"));
+        assert_eq!(
+            cells.iter().map(|c| c.0).collect::<String>(),
+            "end:··\u{240D}"
+        );
+        assert_eq!(
+            display_span("x\ry", 2),
+            (2, 1),
+            "one cell, so `y` stays in column 2"
+        );
     }
 
     #[test]

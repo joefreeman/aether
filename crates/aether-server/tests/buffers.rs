@@ -161,7 +161,7 @@ async fn saving_an_ordinary_view_writes_its_one_document() {
         &mut ws,
         &ViewSaveParams {
             view_id: view_of(buffer_id),
-            overwrite: false,
+            confirmed: Vec::new(),
         },
     )
     .await;
@@ -177,7 +177,7 @@ async fn saving_an_ordinary_view_writes_its_one_document() {
         &mut ws,
         &ViewSaveParams {
             view_id: view_of(buffer_id),
-            overwrite: false,
+            confirmed: Vec::new(),
         },
     )
     .await;
@@ -2197,7 +2197,9 @@ async fn shared_dirty_document_writes_one_backup() {
     let count = std::fs::read_dir(backups.join("files"))
         .unwrap()
         .flatten()
-        .filter(|e| !e.file_name().to_string_lossy().starts_with(".tmp-"))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        // Not the in-flight temp files, nor the disk-text record kept beside each backup.
+        .filter(|name| !name.starts_with(".tmp-") && !name.ends_with(".base"))
         .count();
     assert_eq!(
         count, 1,
@@ -5037,4 +5039,251 @@ async fn subscribing_to_an_ordinary_view_names_its_one_element() {
         "the one element windows the buffer the view is"
     );
     drop(server);
+}
+
+/// A save keeps the file's mode. The save writes a temp file and renames it over the original, so
+/// the new inode starts with default permissions: a saved script lost `+x`, and a `0600` secrets
+/// file came back `0644`. Both modes are checked because they fail in opposite directions — one
+/// loses bits, the other gains them.
+#[cfg(unix)]
+#[tokio::test]
+async fn save_preserves_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in [0o755, 0o600] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.sh");
+        std::fs::write(&path, "before\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let server = spawn_for_test("test-proj", vec![dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        let mut ws = Ws::connect(&server).await;
+        let _: WorkspaceActivateResult = send_request::<WorkspaceActivate>(
+            &mut ws,
+            &WorkspaceActivateParams {
+                worktrees: None,
+                name: "test-proj".into(),
+                open_last: false,
+            },
+        )
+        .await;
+        let opened: ViewOpenResult = send_request::<ViewOpen>(
+            &mut ws,
+            &ViewOpenParams {
+                path_index: Some(0),
+                relative_path: Some("file.sh".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let _: EditResult = send_request::<InputText>(
+            &mut ws,
+            &InputTextParams {
+                buffer_id: opened.buffer_id,
+                text: "x".into(),
+                select_pasted: false,
+                replace_selection: false,
+                at: None,
+            },
+        )
+        .await;
+        let _: BufferSaveResult = send_request::<BufferSave>(
+            &mut ws,
+            &BufferSaveParams {
+                buffer_id: opened.buffer_id,
+                path_index: None,
+                relative_path: None,
+                overwrite: false,
+            },
+        )
+        .await;
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "xbefore\n");
+        let saved = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(saved, mode, "mode {mode:o} came back as {saved:o}");
+        // And no temp file is left behind next to it.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().starts_with(".aether-tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        drop(server);
+    }
+}
+
+/// Activate workspace `p` and open its `notes.txt`.
+async fn open_notes(ws: &mut Ws) -> u64 {
+    send_request::<WorkspaceActivate>(
+        ws,
+        &WorkspaceActivateParams {
+            worktrees: None,
+            name: "p".into(),
+            open_last: false,
+        },
+    )
+    .await;
+    let opened: ViewOpenResult = send_request::<ViewOpen>(
+        ws,
+        &ViewOpenParams {
+            transient: Some(false),
+            path_index: Some(0),
+            relative_path: Some("notes.txt".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    opened.buffer_id
+}
+
+/// Edit `file` under a persisting server, wait for the backup and the disk-text record beside it,
+/// shut down, run `between`, then reopen it on a fresh server and report whether the restored
+/// buffer is flagged as changed on disk.
+async fn restored_flagged_external(between: impl FnOnce(&std::path::Path)) -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("notes.txt");
+    std::fs::write(&file, "hello\n").unwrap();
+    let sessions = dir.path().join("sessions.json");
+    let backups = dir.path().join("backups");
+    let spawn = || {
+        aether_server::spawn_for_test_multi_with_persistence(
+            vec![("p".to_string(), vec![root.clone()])],
+            Some(sessions.clone()),
+            Some(backups.clone()),
+        )
+    };
+    {
+        let server = spawn().await.unwrap();
+        let mut ws = Ws::connect(&server).await;
+        let buffer_id = open_notes(&mut ws).await;
+        send_request::<InputText>(
+            &mut ws,
+            &InputTextParams {
+                buffer_id,
+                text: "T-".into(),
+                select_pasted: false,
+                replace_selection: false,
+                at: None,
+            },
+        )
+        .await;
+        let files = backups.join("files");
+        for _ in 0..120 {
+            let recorded = std::fs::read_dir(&files).is_ok_and(|rd| {
+                rd.flatten()
+                    .any(|e| e.file_name().to_string_lossy().ends_with(".base"))
+            });
+            if recorded {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        drop(ws);
+        drop(server);
+    }
+
+    between(&file);
+
+    let server = spawn().await.unwrap();
+    let mut ws = Ws::connect(&server).await;
+    let buffer_id = open_notes(&mut ws).await;
+    assert_eq!(
+        buffer_text(&mut ws, buffer_id).await,
+        "T-hello\n",
+        "restored"
+    );
+    let flagged = server
+        .state
+        .lock()
+        .await
+        .try_doc_of(buffer_id)
+        .unwrap()
+        .externally_modified;
+    flagged
+}
+
+/// A change made on disk while the server was down is caught on restore by content, not by
+/// comparing the file's mtime with the backup's. The mtime test missed a file whose mtime was set
+/// back (`cp -p`, `rsync -t`) or written before the last backup, and saving then overwrote it.
+#[tokio::test]
+async fn a_restore_notices_a_disk_change_by_content_not_mtime() {
+    let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    assert!(
+        restored_flagged_external(|file| {
+            std::fs::write(file, "changed elsewhere\n").unwrap();
+            let f = std::fs::File::options().write(true).open(file).unwrap();
+            f.set_modified(an_hour_ago).unwrap();
+        })
+        .await,
+        "an older-dated external change is still a change"
+    );
+    assert!(
+        !restored_flagged_external(|file| {
+            // Same bytes, newer mtime: nothing to warn about.
+            std::fs::write(file, "hello\n").unwrap();
+        })
+        .await,
+        "a touch is not a change"
+    );
+}
+
+/// Save looks at the file itself, not only at what the watcher reported: a change the watcher never
+/// delivered (failed to start, out of watches, a network mount, mid-debounce) is still refused
+/// without `overwrite`, instead of being overwritten.
+#[tokio::test]
+async fn save_refuses_a_disk_change_the_watcher_missed() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("one\n").await;
+    type_text_at_start(&mut ws, buffer_id, "x").await;
+    let path = server
+        .state
+        .lock()
+        .await
+        .doc_of(buffer_id)
+        .canonical_path
+        .clone()
+        .unwrap();
+    std::fs::write(&path, "changed elsewhere\n").unwrap();
+    // Whatever the watcher did with that, take it back: this is the event that never arrived.
+    server
+        .state
+        .lock()
+        .await
+        .try_doc_of_mut(buffer_id)
+        .unwrap()
+        .externally_modified = false;
+
+    let message = send_request_expect_err::<BufferSave>(
+        &mut ws,
+        &BufferSaveParams {
+            buffer_id,
+            path_index: None,
+            relative_path: None,
+            overwrite: false,
+        },
+    )
+    .await;
+    assert!(message.contains("modified"), "{message}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "changed elsewhere\n"
+    );
+    drop(server);
+}
+
+async fn type_text_at_start(ws: &mut Ws, buffer_id: u64, text: &str) {
+    set_cursor(ws, buffer_id, 0, 0).await;
+    let _: EditResult = send_request::<InputText>(
+        ws,
+        &InputTextParams {
+            buffer_id,
+            text: text.into(),
+            select_pasted: false,
+            replace_selection: false,
+            at: None,
+        },
+    )
+    .await;
 }

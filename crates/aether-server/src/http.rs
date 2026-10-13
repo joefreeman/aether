@@ -18,10 +18,12 @@
 //! cache-bust.
 //!
 //! Authorization: there is no token. The listener is loopback-only, and both transports reject any
-//! request whose `Host` (and, for browser clients, `Origin`) isn't our loopback authority — see
-//! [`is_loopback_authority`]. That defeats DNS-rebinding (a rebound request carries the attacker's
-//! hostname) and stops a cross-site page from connecting. The trade-off is no isolation between
-//! local users on a shared machine, which is acceptable for a single-user personal editor.
+//! request whose `Host` isn't our loopback authority — see [`is_loopback_authority`] — and the
+//! WebSocket also refuses a browser `Origin` that isn't a loopback page on our own port — see
+//! [`is_own_origin`]. That defeats DNS-rebinding (a rebound request carries the attacker's
+//! hostname) and stops a cross-site page, or a page from another localhost server, from
+//! connecting. The trade-off is no isolation between local users on a shared machine, which is
+//! acceptable for a single-user personal editor.
 
 use crate::state::SharedState;
 use anyhow::Context;
@@ -94,6 +96,28 @@ pub(crate) fn is_loopback_authority(value: &str) -> bool {
         .unwrap_or(without_scheme);
     let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
     host == "127.0.0.1" || host == "localhost"
+}
+
+/// True if a browser `Origin` is a page this server served: a loopback host on `port`, the port the
+/// connection arrived on. Without the port, any page from another localhost server (a dev server, a
+/// notebook, `python -m http.server`) could open a socket and drive the whole API, `shell/start`
+/// included. An Origin always carries a scheme; one with no port means the scheme's default.
+pub(crate) fn is_own_origin(value: &str, port: u16) -> bool {
+    let (authority, default_port) = match value.strip_prefix("http://") {
+        Some(rest) => (rest, 80),
+        None => match value.strip_prefix("https://") {
+            Some(rest) => (rest, 443),
+            None => return false,
+        },
+    };
+    if !is_loopback_authority(authority) {
+        return false;
+    }
+    let origin_port = match authority.rsplit_once(':') {
+        Some((_, p)) => p.parse::<u16>().ok(),
+        None => Some(default_port),
+    };
+    origin_port == Some(port)
 }
 
 /// True when the peeked head looks like a WebSocket upgrade. We match the mandatory
@@ -484,6 +508,24 @@ mod tests {
         // Sandboxed iframes send `Origin: null`.
         assert!(!is_loopback_authority("null"));
         assert!(!is_loopback_authority(""));
+    }
+
+    #[test]
+    fn own_origin_must_be_loopback_on_our_port() {
+        assert!(is_own_origin("http://127.0.0.1:2384", 2384));
+        assert!(is_own_origin("http://localhost:2384", 2384));
+        assert!(is_own_origin("http://localhost", 80));
+        // Another localhost server's page, e.g. a dev server or a notebook.
+        assert!(!is_own_origin("http://localhost:5173", 2384));
+        assert!(!is_own_origin("http://127.0.0.1:8888", 2384));
+        assert!(!is_own_origin("http://localhost", 2384));
+        assert!(!is_own_origin("http://evil.com:2384", 2384));
+        assert!(!is_own_origin("http://127.0.0.1:2384x", 2384));
+        assert!(
+            !is_own_origin("127.0.0.1:2384", 2384),
+            "an Origin carries a scheme"
+        );
+        assert!(!is_own_origin("null", 2384));
     }
 
     #[test]

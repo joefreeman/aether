@@ -30,6 +30,10 @@ pub(crate) fn char_display_width(c: char, current_col: u32, tab_width: u32) -> u
         } else {
             tab_width - (current_col % tab_width)
         }
+    } else if c == '\r' {
+        // A carriage return the document kept as content (a mixed-ending file's CRLF lines, a
+        // stray CR) is drawn as `␍` in one cell, and the cursor can stand on it.
+        1
     } else {
         UnicodeWidthChar::width(c).unwrap_or(0) as u32
     }
@@ -155,7 +159,10 @@ pub(crate) fn compute_rows(
         // Visual cols this char would add at this point in the row.
         let step = char_display_width(c, row_indent + row_cols, tab_width);
 
-        if row_cols + step > max_cols {
+        // A char that doesn't fit even on an empty row (a wide char or a tab on a narrow
+        // continuation) is taken anyway and overflows: breaking before it would push an empty row
+        // and re-evaluate the same char forever.
+        if row_cols + step > max_cols && byte_idx > row_start_byte {
             match last_break_byte {
                 Some(b) if b > row_start_byte => {
                     let slice = &line[row_start_byte..b];
@@ -259,6 +266,55 @@ mod tests {
 
     fn row_text(row: &WrappedRow) -> String {
         row.segments.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    /// Every line, at every narrow width, lays out in finite time and makes progress: each row
+    /// but the last starts strictly after the one before. A char wider than a continuation row
+    /// once pushed an empty row and re-evaluated itself forever, under the state lock.
+    #[test]
+    fn narrow_widths_always_make_progress() {
+        let lines = [
+            "中文中文",
+            "abcd\tx",
+            "                                    中文字",
+            "\t\tx\ty\tz",
+            "  a中b中c中d",
+            "e\u{301}e\u{301} 👨\u{200d}👩\u{200d}👧 x",
+            "word word word word",
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in lines {
+                for cols in 1..=40 {
+                    for marker in 0..=2 {
+                        for tab in 1..=8 {
+                            let rows = compute_rows(line, cols, marker, tab);
+                            assert!(!rows.is_empty());
+                            assert_eq!(rows[0].byte_offset, 0);
+                            for pair in rows.windows(2) {
+                                assert!(
+                                    pair[1].byte_offset > pair[0].byte_offset,
+                                    "{line:?} cols={cols} marker={marker} tab={tab}: offsets {:?}",
+                                    rows.iter().map(|r| r.byte_offset).collect::<Vec<_>>()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("compute_rows did not finish: a row made no progress");
+    }
+
+    /// A kept carriage return is one column, as every painter draws it (`␍`): measured as zero
+    /// (a control char), rows overflowed by one and the cursor's column disagreed with the screen.
+    #[test]
+    fn a_kept_carriage_return_is_one_column() {
+        assert_eq!(char_display_width('\r', 0, 4), 1);
+        let rows = compute_rows("abc\r", 4, 0, 4);
+        assert_eq!(rows.len(), 1, "four columns, four cells");
     }
 
     #[test]

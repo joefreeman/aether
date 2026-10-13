@@ -32,7 +32,8 @@ pub async fn input_text(
         client_id,
         params.buffer_id,
         EditKind::ReplaceWith {
-            text: params.text,
+            // A system-clipboard paste arrives here verbatim, CRLFs and all.
+            text: crate::state::normalize_line_breaks(&params.text).into_owned(),
             select_pasted: params.select_pasted,
             replace_selection: params.replace_selection,
             park_before: false,
@@ -200,7 +201,9 @@ pub async fn input_replace_line(
         state,
         client_id,
         params.buffer_id,
-        EditKind::ReplaceLine { text: params.text },
+        EditKind::ReplaceLine {
+            text: crate::state::normalize_line_breaks(&params.text).into_owned(),
+        },
     )
     .await
 }
@@ -389,31 +392,41 @@ pub async fn input_open_line(
     ctx: &mut ConnectionCtx,
     params: InputOpenLineParams,
 ) -> Result<EditResult, RpcError> {
-    let line = {
-        let s = state.lock().await;
+    // Park at the cursor line's end (below) or start (above), reading the line and placing the
+    // cursor under one lock: a line number carried from one lock to the next is stale once another
+    // client's edit lands in between, and the line opened beside the wrong one. Once parked, the
+    // cursor lives in the server's state and an edit in the meantime moves it with the text.
+    let col = match params.side {
+        LineSide::Below => u32::MAX,
+        LineSide::Above => 0,
+    };
+    let search_update = {
+        let mut s = state.lock().await;
         if !s.buffers.contains_key(&params.buffer_id) {
             return Err(RpcError::buffer_not_found(params.buffer_id));
         }
-        s.cursors
+        let line = s
+            .cursors
             .get(&(ctx.client_id, params.buffer_id))
             .copied()
             .unwrap_or_default()
             .position
-            .line
-    };
-    let park = |col: u32| {
+            .line;
         let target = LogicalPosition { line, col };
-        CursorSetParams {
+        let park = CursorSetParams {
             buffer_id: params.buffer_id,
             position: target,
             anchor: target,
             granularity: Granularity::Char,
-        }
+        };
+        cursor_set_locked(&mut s, ctx.client_id, &park)?.1
     };
+    if let Some((sender, notif)) = search_update {
+        let _ = sender.send(notif).await;
+    }
     match params.side {
         LineSide::Below => {
-            // Park at the line's end, then newline + smart indent; land on the opened line.
-            cursor_set(state, ctx, park(u32::MAX)).await?;
+            // Newline + smart indent from the line's end; land on the opened line.
             input_newline_and_indent(
                 state,
                 ctx,
@@ -425,12 +438,11 @@ pub async fn input_open_line(
             .await
         }
         LineSide::Above => {
-            // Park at col 0, then insert "\n" staying *before* it — the parked coordinates
+            // Parked at col 0 above; insert "\n" staying *before* it — the parked coordinates
             // address the new empty line after the insert, so the one edit both pushes the line
             // down and lands the cursor on the opened line. (Previously a post-edit cursor_move
             // stepped back up, but the edit's viewport pushes had already left carrying the
             // pre-step cursor — the same push/response disagreement un-join had.)
-            cursor_set(state, ctx, park(0)).await?;
             apply_edit(
                 state,
                 ctx.client_id,

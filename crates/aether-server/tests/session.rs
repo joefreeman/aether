@@ -614,3 +614,21 @@ async fn a_glanced_file_leaves_no_session_row() {
 
     drop(server);
 }
+
+/// No test server reads or writes the developer's own profile. `workspaces_dir` and
+/// `settings_path` fall back to the real profile when unset, so a test server that left them unset
+/// let `workspace/delete {name: "p"}` remove a real `p.toml`. Every spawn path goes through one
+/// function that points both at a per-server temp dir; this pins that.
+#[tokio::test]
+async fn test_servers_never_touch_the_real_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = aether_server::spawn_for_test("p", vec![dir.path().to_path_buf()])
+        .await
+        .unwrap();
+    let s = server.state.lock().await;
+    let temp = std::env::temp_dir();
+    let workspaces = s.workspaces_dir().unwrap();
+    let settings = s.app_settings_path().unwrap();
+    assert!(workspaces.starts_with(&temp), "{}", workspaces.display());
+    assert!(settings.starts_with(&temp), "{}", settings.display());
+}

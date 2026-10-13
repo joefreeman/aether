@@ -441,6 +441,11 @@ fn confirm_kind(k: &ConfirmKind) -> Value {
         ConfirmKind::Overwrite { path } => json!({ "kind": "overwrite", "path": path }),
         ConfirmKind::OverwriteModified => json!({ "kind": "overwrite_modified" }),
         ConfirmKind::RecreateDeleted => json!({ "kind": "recreate_deleted" }),
+        // Phrased by the core, so the file list reads the same in every shell.
+        ConfirmKind::SaveConflicts { modified, deleted } => json!({
+            "kind": "save_conflicts",
+            "phrase": aether_client::labels::save_conflicts_phrase(modified, deleted),
+        }),
         ConfirmKind::DiscardOnReload => json!({ "kind": "discard_reload" }),
         ConfirmKind::DiscardOnClose { label } => json!({ "kind": "discard_close", "label": label }),
         ConfirmKind::CloseRunningShell { title } => {

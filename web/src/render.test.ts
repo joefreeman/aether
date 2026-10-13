@@ -905,6 +905,31 @@ describe("the buffer painter", () => {
     expect(glyphs).toEqual(["", "··", "→·", "", ""]);
     expect(container.querySelector(".ws-dot")?.classList.contains("sel")).toBe(false);
   });
+
+  // A carriage return the document kept as content (a mixed-ending file's CRLF line, a stray CR)
+  // always draws as `␍`, unselected and mid-line too: it is a real character the cursor can stand
+  // on. Raw, the browser drew nothing and the columns after it slid left of the cursor's.
+  it("always shows a kept carriage return as ␍", () => {
+    const w = windowOf(editor(0, 0, [line(0, "crlf\r"), line(1, "x\ry"), line(2, "plain")]));
+    const container = renderOnly(w);
+    const rows = [...container.querySelectorAll(".row")];
+    expect(rows.map((row) => [...row.querySelectorAll(".ws-cr")].map((s) => s.textContent).join(""))).toEqual([
+      "\u240D",
+      "\u240D",
+      "",
+    ]);
+    expect(rows[1].textContent).toBe("x\u240Dy");
+  });
+
+  // The CR ends a CRLF line rather than hiding its trailing whitespace: the spaces before it are
+  // still the line's trailing run.
+  it("marks the trailing spaces before a kept carriage return", () => {
+    const w = windowOf(editor(0, 0, [line(0, "end:  \r")]));
+    const row = renderOnly(w).querySelector(".row")!;
+    expect([...row.querySelectorAll(".ws-dot, .ws-cr")].map((s) => s.textContent).join("")).toBe(
+      "··\u240D",
+    );
+  });
 });
 
 const replyBlocks = (heading: string, body: string): MdBlock[] =>

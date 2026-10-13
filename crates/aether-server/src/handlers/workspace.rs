@@ -913,7 +913,9 @@ pub fn delete_buffer_backups(
 /// it.
 pub(crate) async fn flush_backups(state: &SharedState) {
     enum Action {
-        Write(String, aether_protocol::Revision),
+        /// The content, its revision, and — for a file — the hash of the disk text it diverged
+        /// from (see `backup::write_with_base`).
+        Write(String, aether_protocol::Revision, Option<u64>),
         Delete,
         /// A shell's snapshot, stamped with the generation and input revision it captured.
         Shell(String, (u64, aether_protocol::Revision)),
@@ -1043,10 +1045,14 @@ pub(crate) async fn flush_backups(state: &SharedState) {
             if doc.dirty {
                 if doc.backed_up_revision != Some(doc.revision) {
                     let content: String = doc.text.chunks().collect();
+                    let base = doc
+                        .disk_blob
+                        .as_deref()
+                        .map(|blob| crate::backup::content_hash([blob]));
                     jobs.push(Job {
                         doc: doc.id,
                         path,
-                        action: Action::Write(content, doc.revision),
+                        action: Action::Write(content, doc.revision, base),
                     });
                 }
             } else if doc.backed_up_revision.is_some() {
@@ -1067,12 +1073,14 @@ pub(crate) async fn flush_backups(state: &SharedState) {
     let mut agent_stamps: Vec<(DocumentId, (u64, aether_protocol::Revision))> = Vec::new();
     for job in jobs {
         match job.action {
-            Action::Write(content, rev) => match crate::backup::write(&job.path, &content) {
-                Ok(()) => stamps.push((job.doc, Some(rev))),
-                Err(e) => {
-                    tracing::warn!(document = job.doc.0, error = %e, "failed to write document backup")
+            Action::Write(content, rev, base) => {
+                match crate::backup::write_with_base(&job.path, &content, base) {
+                    Ok(()) => stamps.push((job.doc, Some(rev))),
+                    Err(e) => {
+                        tracing::warn!(document = job.doc.0, error = %e, "failed to write document backup")
+                    }
                 }
-            },
+            }
             Action::Delete => {
                 crate::backup::delete(&job.path);
                 stamps.push((job.doc, None));
@@ -2212,6 +2220,13 @@ pub async fn workspace_rename(
     let entry_paths = s
         .rename_workspace(&old_name, &new_name)
         .ok_or_else(|| RpcError::internal("workspace vanished during rename"))?;
+    // Under the same lock as the re-key, so no backup flush computes a path from either name
+    // in between.
+    if let Some(root) = s.backups_path.clone() {
+        if let Err(e) = crate::backup::rename_workspace(&root, &old_name, &new_name) {
+            tracing::warn!(old = %old_name, new = %new_name, error = %e, "failed to move workspace backups");
+        }
+    }
 
     // The re-key above already moved every other connected client on this workspace to the new name
     // server-side; push `workspace/renamed` so each can update its *local* name (display + reconnect

@@ -3880,6 +3880,37 @@ async fn counted_join_parks_cursor_on_last_seam() {
     drop(server);
 }
 
+/// Joining lines on the last line has no line below to pull up: the phantom line after the final
+/// newline isn't one, and joining into it deleted the file's final newline.
+#[tokio::test]
+async fn join_on_the_last_line_keeps_the_final_newline() {
+    let (server, mut ws, buffer_id) = setup_with_buffer("a\nb\n").await;
+    set_cursor(&mut ws, buffer_id, 1, 0).await;
+    for _ in 0..2 {
+        let _: EditResult = send_request::<InputJoinLines>(
+            &mut ws,
+            &CountedEditParams {
+                buffer_id,
+                count: 1,
+            },
+        )
+        .await;
+        assert_eq!(buffer_text(&mut ws, buffer_id).await, "a\nb\n");
+    }
+    // Joining from the line above still pulls the last line up.
+    set_cursor(&mut ws, buffer_id, 0, 0).await;
+    let _: EditResult = send_request::<InputJoinLines>(
+        &mut ws,
+        &CountedEditParams {
+            buffer_id,
+            count: 1,
+        },
+    )
+    .await;
+    assert_eq!(buffer_text(&mut ws, buffer_id).await, "ab\n");
+    drop(server);
+}
+
 #[tokio::test]
 async fn join_then_unjoin_round_trips() {
     let (server, mut ws, buffer_id) = setup_with_buffer("    foo\n    bar\n").await;

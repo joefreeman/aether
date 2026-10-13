@@ -10,7 +10,7 @@
 
 use crate::error::RpcError;
 use crate::handlers::{self, ConnectionCtx};
-use crate::state::{ClientSession, SharedState};
+use crate::state::{ClientSession, Outbound, SharedState};
 use aether_protocol::activity::ActivityCancel;
 use aether_protocol::agent::{AgentCancel, AgentDelete, AgentPrompt, AgentRespond, AgentStart};
 use aether_protocol::app::AppInfoGet;
@@ -116,8 +116,10 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
     // traffic can't reach it; the remaining browser threat is a malicious site connecting (or, via
     // DNS rebinding, reading our page). We defend with two header checks:
     //   * `Host` must name our loopback authority — a rebound request carries the attacker's host.
-    //   * `Origin`, if present, must be our loopback origin. Browsers set `Origin` honestly and
-    //     can't forge it cross-site; the native TUI sends none, which is allowed.
+    //   * `Origin`, if present, must be a loopback page on the port this connection arrived on.
+    //     Browsers set `Origin` honestly and can't forge it cross-site; the native TUI sends none,
+    //     which is allowed.
+    let own_port = stream.local_addr().ok().map(|a| a.port());
     let mut query = ConnectQuery::default();
     let ws = tokio_tungstenite::accept_hdr_async(
         stream,
@@ -130,14 +132,16 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
                 .is_some_and(crate::http::is_loopback_authority);
             let origin_ok = match headers.get("origin") {
                 None => true,
-                Some(o) => o.to_str().is_ok_and(crate::http::is_loopback_authority),
+                Some(o) => o.to_str().is_ok_and(|o| {
+                    own_port.is_some_and(|port| crate::http::is_own_origin(o, port))
+                }),
             };
             if !(host_ok && origin_ok) {
                 tracing::warn!(
                     ?peer,
                     host_ok,
                     origin_ok,
-                    "rejecting connection: non-loopback host/origin"
+                    "rejecting connection: non-loopback host, or an origin that isn't our page"
                 );
                 let mut err = HsErr::new(Some("forbidden".into()));
                 *err.status_mut() = StatusCode::FORBIDDEN;
@@ -178,13 +182,15 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
 
     let client_id: ClientId = Uuid::new_v4();
     let pushes_written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let outbound = Outbound::new(outbound_tx.clone());
+    let lag = outbound.lag();
     {
         let mut s = state.lock().await;
         s.clients.insert(
             client_id,
             ClientSession {
                 client_id,
-                outbound: outbound_tx.clone(),
+                outbound,
                 pushes_written: pushes_written.clone(),
                 active_workspace: None,
             },
@@ -237,7 +243,16 @@ pub async fn handle(stream: TcpStream, state: SharedState) -> anyhow::Result<()>
     });
 
     loop {
-        let Some(msg) = reader.next().await else {
+        // A client that has stopped reading its pushes is dropped rather than left to park every
+        // producer pushing to it (see `Outbound`). It reconnects and resubscribes.
+        let next = tokio::select! {
+            next = reader.next() => next,
+            () = lag.wait() => {
+                tracing::info!(%client_id, "client stalled on its pushes; tearing down");
+                break;
+            }
+        };
+        let Some(msg) = next else {
             break;
         };
         // A read error is an abrupt disconnect (process killed, TCP reset, a native-client
@@ -420,7 +435,18 @@ async fn process_request(
     tracing::trace!(%method, "request");
 
     let workspace_before = client_workspace(state, ctx.client_id).await;
-    let result = dispatch(state, ctx, &method, params).await;
+    // A handler that panics answers its request with an error and leaves the connection standing.
+    // Unwinding out of here used to skip the disconnect teardown in `handle`, so the client stayed
+    // registered for good — its viewports, transient buffers and pins leaked, and the idle reaper,
+    // which waits for the client list to empty, never fired again. Shared state may be half-updated
+    // either way; ending the connection wouldn't have repaired it.
+    let result = handlers::contain_panic(&method, dispatch(state, ctx, &method, params))
+        .await
+        .unwrap_or_else(|| {
+            Err(RpcError::internal(format!(
+                "{method} failed with an internal error"
+            )))
+        });
     // A client that has changed workspace was told about the work of the one it left: tell it the
     // new one's. Here rather than in each handler that can switch, so no route can forget.
     if client_workspace(state, ctx.client_id).await != workspace_before {

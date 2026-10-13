@@ -928,9 +928,9 @@ fn space_alt_q_saves_then_quits_on_success() {
     s.workspace_paths = vec!["/p".into()];
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
     let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None);
-    // Saves in place (overwrite:false), and does NOT quit yet.
+    // Saves in place, confirming nothing, and does NOT quit yet.
     let params = find_request(&fx, "view/save").expect("Space Alt-q saves first");
-    assert_eq!(params["overwrite"], json!(false));
+    assert!(params.get("confirmed").is_none(), "{params}");
     assert!(!quits(&fx), "quit is deferred until the save succeeds");
     let token = save_token(&fx);
 
@@ -959,51 +959,87 @@ fn space_alt_q_does_not_quit_when_the_save_fails() {
     assert!(has_error_toast(&fx), "the failure is surfaced");
 }
 
-/// The quit intent survives the overwrite/external-change confirm detour: if the save is refused
-/// pending confirmation, accepting retries and — on success — still quits.
+/// The quit intent survives the external-change confirm detour: a save that left a file unsaved
+/// because it changed on disk asks first, and accepting retries — and on success still quits.
 #[test]
 fn space_alt_q_survives_the_external_modify_confirm() {
     use aether_client::session::{ConfirmKind, Prompt};
     use aether_client::update::Event;
-    use aether_protocol::error::ErrorCode;
     let mut s = session();
     s.workspace_paths = vec!["/p".into()];
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
     let fx = s.on_key(KeyCode::Char('q'), Mods::ALT, None);
     let token = save_token(&fx);
 
-    // The file changed on disk → the server refuses; a confirm is raised, still no quit.
-    let _ = s.on_rpc_result(
+    // The file changed on disk → left unsaved and reported; a confirm is raised, still no quit.
+    let fx = s.on_rpc_result(
         token,
-        Err(RpcError {
-            method: "buffer/save",
-            code: ErrorCode::EXTERNALLY_MODIFIED.code(),
-            message: "changed".into(),
-        }),
+        Ok(json!({
+            "saved": 0,
+            "conflicts": [{ "buffer_id": 1, "path": "notes.md", "deleted": false }],
+        })),
     );
-    assert!(
-        matches!(
-            &s.prompt,
-            Some(Prompt::Confirm {
-                kind: ConfirmKind::OverwriteModified,
-                ..
-            })
-        ),
-        "external-modify confirm, got {:?}",
-        s.prompt
-    );
+    assert!(!quits(&fx));
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::SaveConflicts { modified, deleted },
+            ..
+        }) => {
+            assert_eq!(modified, &vec!["notes.md".to_string()]);
+            assert!(deleted.is_empty());
+        }
+        other => panic!("expected the save-conflicts confirm, got {other:?}"),
+    }
 
-    // Accept → retry carries overwrite:true; the quit intent is threaded through, so still no
-    // quit until the retry lands.
+    // Accept → the retry confirms that document by id; the quit intent is threaded through, so
+    // still no quit until the retry lands.
     let fx = s.on_event(Event::PromptAccept);
     let params = find_request(&fx, "view/save").expect("the confirmed save retries");
-    assert_eq!(params["overwrite"], json!(true));
+    assert_eq!(params["confirmed"], json!([1]));
     assert!(!quits(&fx), "no quit until the retry succeeds");
     let token = save_token(&fx);
 
     // Retry succeeds → now it quits.
     let fx = s.on_rpc_result(token, Ok(view_saved(1)));
     assert!(quits(&fx), "save-and-quit survives the confirm detour");
+}
+
+/// One confirmation covers exactly the files it named. A view save that met two changed files and
+/// one removed one asks once, naming all three, and the retry confirms those three by id — not
+/// "overwrite everything", which also overwrote any file that changed after the question.
+#[test]
+fn a_view_save_confirms_each_conflicted_file_by_id() {
+    use aether_client::session::{ConfirmKind, Prompt};
+    use aether_client::update::Event;
+    let mut s = session();
+    s.workspace_paths = vec!["/p".into()];
+    let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
+    let fx = s.on_key(KeyCode::Char('s'), Mods::NONE, None);
+    let token = save_token(&fx);
+    let _ = s.on_rpc_result(
+        token,
+        Ok(json!({
+            "saved": 2,
+            "conflicts": [
+                { "buffer_id": 3, "path": "src/a.rs", "deleted": false },
+                { "buffer_id": 5, "path": "src/b.rs", "deleted": true },
+                { "buffer_id": 8, "path": "src/c.rs", "deleted": false },
+            ],
+        })),
+    );
+    match &s.prompt {
+        Some(Prompt::Confirm {
+            kind: ConfirmKind::SaveConflicts { modified, deleted },
+            ..
+        }) => assert_eq!(
+            aether_client::labels::save_conflicts_phrase(modified, deleted),
+            "Changed on disk: src/a.rs, src/c.rs; removed: src/b.rs — save anyway"
+        ),
+        other => panic!("expected the save-conflicts confirm, got {other:?}"),
+    }
+    let fx = s.on_event(Event::PromptAccept);
+    let params = find_request(&fx, "view/save").expect("the confirmed save retries");
+    assert_eq!(params["confirmed"], json!([3, 5, 8]));
 }
 
 /// Declining the overwrite confirm re-opens the save-as prompt pre-filled, so a tweak and re-save
@@ -10575,7 +10611,7 @@ fn space_alt_x_saves_closes_and_exits_the_tethered_session() {
     let _ = s.on_key(KeyCode::Char(' '), Mods::NONE, Some(" ".into()));
     let fx = s.on_key(KeyCode::Char('x'), Mods::ALT, None);
     let params = find_request(&fx, "view/save").expect("Space Alt-x saves first");
-    assert_eq!(params["overwrite"], json!(false));
+    assert!(params.get("confirmed").is_none(), "{params}");
     assert!(!quits(&fx), "no exit before the save lands");
     let token = save_token(&fx);
 

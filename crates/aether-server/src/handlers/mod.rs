@@ -124,11 +124,30 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 /// Notifications collected while holding the state lock, paired with their target senders —
 /// emitted by the caller after the lock drops so a slow client can't stall the lock.
-pub(crate) type PendingPushes = Vec<(mpsc::Sender<Notification>, Notification)>;
+pub(crate) type PendingPushes = Vec<(crate::state::Outbound, Notification)>;
+
+/// Run `work` to completion, or — if it panics — log the panic and return `None` instead of
+/// unwinding further. For the server's long-lived loops, where one bad request or event must not
+/// end the connection or loop it ran in: an unwind there skipped a disconnect's teardown, and
+/// stopped the file watcher or the cursor-follow work until the next restart.
+pub async fn contain_panic<T>(what: &str, work: impl std::future::Future<Output = T>) -> Option<T> {
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(work).catch_unwind().await {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            let panic = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into());
+            tracing::error!(%what, %panic, "panicked; carrying on");
+            None
+        }
+    }
+}
 
 /// Per-connection context handed to handlers. Mutable bits live here; the durable state is in
 /// [`SharedState`].

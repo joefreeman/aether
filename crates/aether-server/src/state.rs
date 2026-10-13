@@ -1718,13 +1718,20 @@ impl ServerState {
     /// there and a document that doesn't accept edits, which folds the two checks every edit
     /// handler opens with into one call.
     pub fn editable_doc(&mut self, buffer_id: BufferId) -> Result<Editable<'_>, RpcError> {
+        let attached = self.doc_siblings(buffer_id);
         let doc = self
-            .try_doc_of_mut(buffer_id)
+            .buffers
+            .get(&buffer_id)
+            .and_then(|b| self.documents.get_mut(&b.document))
             .ok_or_else(|| RpcError::buffer_not_found(buffer_id))?;
         if doc.read_only() {
             return Err(RpcError::read_only_buffer(buffer_id));
         }
-        Ok(Editable(doc))
+        Ok(Editable {
+            doc,
+            cursors: &mut self.cursors,
+            attached,
+        })
     }
 
     /// The live document loaded from `canonical`, if any — the cross-workspace sharing lookup.
@@ -1876,6 +1883,18 @@ impl ServerState {
             &c.cwd,
             self.roots_for_buffer(buffer_id),
         ))
+    }
+
+    /// A file buffer's path as a person reads it: relative to the workspace root holding it, or
+    /// absolute when none does. `None` for a buffer with no path.
+    pub fn display_path(&self, buffer_id: BufferId) -> Option<String> {
+        let path = self.try_doc_of(buffer_id)?.canonical_path.as_deref()?;
+        Some(
+            match root_relative(self.roots_for_buffer(buffer_id), path) {
+                Some((_, rel)) => rel,
+                None => path.display().to_string(),
+            },
+        )
     }
 
     /// The roots of the workspace a buffer belongs to — empty when it has none.
@@ -2303,9 +2322,13 @@ impl ServerState {
         // An internal document is never dirty (see `Document::internal`), so it cannot pin the
         // reaper — a half-typed shell command is not work to rescue. What *does* pin it is a
         // running command; that lives with the reaper, beside this.
+        // Protected means *written*, not "backups are on": a backup that failed (a full disk, a
+        // permission error) only logs, and the reaper used to exit over the unsaved text anyway.
+        // A document waiting on its first flush holds the reaper for one flush interval.
         self.documents.values().any(|d| {
             d.dirty
                 && !(backups_enabled
+                    && d.backed_up_revision == Some(d.revision)
                     && (d.canonical_path.is_some()
                         || self.buffers.iter().any(|(id, b)| {
                             b.document == d.id
@@ -4118,13 +4141,45 @@ pub enum LineEnding {
     Crlf,
 }
 
-/// A file's text as a document holds it — CRLF normalized to LF — and the ending it had on disk.
+/// Carry a saved file's owner and mode over to the temp file that replaces it. Ownership is best
+/// effort — only root, or an owner changing to one of their own groups, may `chown` — and goes
+/// first, because a `chown` clears the setuid and setgid bits the mode then restores.
+fn preserve_file_identity(
+    file: &std::fs::File,
+    original: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = std::os::unix::fs::fchown(file, Some(original.uid()), Some(original.gid()));
+    }
+    file.set_permissions(original.permissions())
+}
+
+/// A file's text as a document holds it, and the ending it had on disk.
+///
+/// Only a file whose every line break is CRLF is a CRLF file: its breaks are held as LF and put
+/// back on save. Anything else keeps its bytes exactly, the `\r` of any CRLF lines included as
+/// ordinary content. A single CRLF used to mark the whole file CRLF, so saving a mostly-LF file
+/// rewrote every one of its lines.
 fn read_normalized(path: &std::path::Path) -> std::io::Result<(String, LineEnding)> {
     let content = std::fs::read_to_string(path)?;
-    if content.contains("\r\n") {
+    let breaks = content.matches('\n').count();
+    if breaks > 0 && content.matches("\r\n").count() == breaks {
         Ok((content.replace("\r\n", "\n"), LineEnding::Crlf))
     } else {
         Ok((content, LineEnding::Lf))
+    }
+}
+
+/// Text arriving from outside the document — a client's paste, an agent's write — with its line
+/// breaks as a document holds them: CRLF and a lone CR both become LF. A CRLF document puts the CR
+/// back on save; left in, a pasted `\r\n` was saved as `\r\r\n`.
+pub fn normalize_line_breaks(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
     }
 }
 
@@ -4519,6 +4574,12 @@ impl Document {
         kind: EditKindTag,
         cursors_before_edit: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Revision {
+        // Nothing removed and nothing inserted — Backspace at the buffer's start, Delete in an
+        // empty buffer — is no edit: it must not open an undo group, wipe redo, or mark the
+        // document dirty by moving its revision.
+        if start_char >= end_char && insert_text.is_empty() {
+            return self.revision;
+        }
         self.snapshot_disk_text();
         let now = Instant::now();
 
@@ -4677,17 +4738,37 @@ impl Document {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("aether");
-        let tmp_path = parent.join(format!(".aether-tmp-{}-{file_name}", std::process::id()));
+        // Unpredictable and created exclusively, so a name planted in a shared directory (a
+        // symlink aimed at someone else's file) makes the open fail rather than redirect the write.
+        let tmp_path = parent.join(format!(".aether-tmp-{}-{file_name}", uuid::Uuid::new_v4()));
+        // The rename replaces the target's inode, so whatever the original carried has to be put
+        // on the new one by hand. Without this a saved script lost `+x` and a `0600` secrets file
+        // came back world-readable.
+        let original = std::fs::metadata(&target).ok();
 
-        // Write to tmp.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Owner-only until the original's mode is applied below, so the contents are never more
+        // readable than the file they replace, even for the moment the temp file exists.
+        #[cfg(unix)]
+        if original.is_some() {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp_path)?;
+        let written = (|| {
+            file.write_all(text.as_bytes())?;
+            if let Some(original) = &original {
+                preserve_file_identity(&file, original)?;
+            }
+            file.sync_all()
+        })();
         drop(file);
+        if let Err(e) = written {
+            // A full disk mid-write must not leave a partial temp file in the user's tree.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
 
         // Atomic rename.
         if let Err(e) = std::fs::rename(&tmp_path, &target) {
@@ -4974,18 +5055,33 @@ impl Document {
 /// Reads go through `Deref`, so the usual "edit, then measure the result" call sites keep working
 /// off the same binding. Field-level bookkeeping that isn't an edit (`dirty`, `backed_up_revision`,
 /// the external-change flags) still goes through [`ServerState::doc_of_mut`].
-pub struct Editable<'a>(&'a mut Document);
+///
+/// It also carries every cursor on the document, so that an edit moves them all — the editor's
+/// own, another client's, and the same client's in a sibling workspace's buffer. A handler only
+/// sets the cursor of the client it is answering; before this lived here, every other cursor kept
+/// its old line and column, landing on unrelated text and, after a large delete, past the end of
+/// the rope, where the next line-indexed edit panicked.
+pub struct Editable<'a> {
+    doc: &'a mut Document,
+    cursors: &'a mut HashMap<(ClientId, BufferId), CursorState>,
+    /// Every buffer attached to the document: whose cursors an edit has to move.
+    attached: Vec<BufferId>,
+}
 
 impl std::ops::Deref for Editable<'_> {
     type Target = Document;
 
     fn deref(&self) -> &Document {
-        self.0
+        self.doc
     }
 }
 
 impl Editable<'_> {
-    /// See [`Document::apply_edit`] — the one text replacement primitive.
+    /// See [`Document::apply_edit`] — the one text replacement primitive. Every cursor on the
+    /// document follows the edit: one before it stays, one after it shifts by the length change,
+    /// and one inside the replaced range keeps its offset into the replacement, clamped to it. A
+    /// replacement of the whole document (format, revert, an agent's write) keeps line and column
+    /// instead, since a char offset into a reformatted file means nothing.
     pub fn apply_edit(
         &mut self,
         start_char: usize,
@@ -4994,8 +5090,47 @@ impl Editable<'_> {
         kind: EditKindTag,
         cursors_before_edit: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Revision {
-        self.0
-            .apply_edit(start_char, end_char, insert_text, kind, cursors_before_edit)
+        let whole = start_char == 0 && end_char >= self.doc.text.len_chars();
+        let attached = &self.attached;
+        let followers: Vec<((ClientId, BufferId), usize, usize)> = self
+            .cursors
+            .iter()
+            .filter(|((_, b), _)| attached.contains(b))
+            .map(|(key, c)| {
+                (
+                    *key,
+                    crate::cursor::pos_to_char(self.doc, c.position),
+                    crate::cursor::pos_to_char(self.doc, c.anchor),
+                )
+            })
+            .collect();
+
+        let revision =
+            self.doc
+                .apply_edit(start_char, end_char, insert_text, kind, cursors_before_edit);
+
+        let inserted = insert_text.chars().count();
+        let shift = |offset: usize| {
+            if offset < start_char {
+                offset
+            } else if offset >= end_char {
+                offset - (end_char - start_char) + inserted
+            } else {
+                start_char + (offset - start_char).min(inserted)
+            }
+        };
+        for (key, position, anchor) in followers {
+            let Some(cursor) = self.cursors.get_mut(&key) else {
+                continue;
+            };
+            if !whole {
+                cursor.position = crate::cursor::char_to_pos(self.doc, shift(position));
+                cursor.anchor = crate::cursor::char_to_pos(self.doc, shift(anchor));
+            }
+            cursor.position = crate::cursor::clamp_position(self.doc, cursor.position);
+            cursor.anchor = crate::cursor::clamp_position(self.doc, cursor.anchor);
+        }
+        revision
     }
 
     /// See [`Document::undo`].
@@ -5003,7 +5138,7 @@ impl Editable<'_> {
         &mut self,
         current_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Option<UndoOutcome> {
-        self.0.undo(current_cursors)
+        self.doc.undo(current_cursors)
     }
 
     /// See [`Document::redo`].
@@ -5011,12 +5146,12 @@ impl Editable<'_> {
         &mut self,
         current_cursors: std::collections::HashMap<(ClientId, BufferId), CursorState>,
     ) -> Option<UndoOutcome> {
-        self.0.redo(current_cursors)
+        self.doc.redo(current_cursors)
     }
 
     /// See [`Document::reload_from_disk`].
     pub fn reload_from_disk(&mut self) -> std::io::Result<u64> {
-        self.0.reload_from_disk()
+        self.doc.reload_from_disk()
     }
 }
 
@@ -5105,11 +5240,84 @@ fn rope_byte_to_point(rope: &ropey::Rope, byte_idx: usize) -> Point {
     }
 }
 
+/// How long a push may wait for room in a client's queue before that client is judged stalled and
+/// disconnected. The wait is for a single free slot, which a client that is reading at all frees
+/// at network speed; five seconds without one means it has stopped reading (a suspended terminal,
+/// a frozen tab), not that it is slow.
+const PUSH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A client's push queue. Pushes are sent from whichever task produced them — another client's
+/// request handler, the file watcher, a language server's diagnostics — so a queue that never
+/// drains used to park every one of those producers on it: one suspended client froze editing in
+/// every other client and stopped the background loops. A push that can't get a slot within
+/// [`PUSH_DEADLINE`] instead marks the client lagged, which ends its connection (the client
+/// reconnects and resubscribes), and every later push to it fails at once.
+#[derive(Clone)]
+pub struct Outbound {
+    tx: mpsc::Sender<Notification>,
+    lag: Arc<Lag>,
+}
+
+/// Shared between a client's [`Outbound`] handles and its connection task, which watches it.
+#[derive(Default)]
+pub struct Lag {
+    lagged: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Lag {
+    /// Resolves once a push to this client has missed its deadline.
+    pub async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.lagged.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Outbound {
+    pub fn new(tx: mpsc::Sender<Notification>) -> Self {
+        Self {
+            tx,
+            lag: Arc::default(),
+        }
+    }
+
+    /// What the connection task waits on to learn its client has stalled.
+    pub fn lag(&self) -> Arc<Lag> {
+        self.lag.clone()
+    }
+
+    /// Queue a push. Fails when the connection is gone or the client has stalled; callers ignore
+    /// that, as they did when this was a bare channel — a client that can't take the push is
+    /// leaving.
+    pub async fn send(&self, notification: Notification) -> Result<(), ()> {
+        use std::sync::atomic::Ordering;
+        if self.lag.lagged.load(Ordering::Acquire) {
+            return Err(());
+        }
+        match self.tx.send_timeout(notification, PUSH_DEADLINE).await {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+                if !self.lag.lagged.swap(true, Ordering::AcqRel) {
+                    tracing::warn!("client stopped reading its pushes; disconnecting it");
+                }
+                self.lag.notify.notify_waiters();
+                Err(())
+            }
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => Err(()),
+        }
+    }
+}
+
 pub struct ClientSession {
     #[allow(dead_code)]
     pub client_id: ClientId,
-    /// Channel for sending notifications to this client's connection task.
-    pub outbound: mpsc::Sender<Notification>,
+    /// This client's push queue, drained by its connection task.
+    pub outbound: Outbound,
     /// Notifications actually written to this client's socket. Observability, and the only way to
     /// tell "the server pushed nothing" apart from "the writer kept up" when a test is trying to
     /// establish backpressure — the channel's own capacity reads the same either way.
@@ -6949,7 +7157,7 @@ mod workspace_state_tests {
             id,
             ClientSession {
                 client_id: id,
-                outbound: tx,
+                outbound: crate::state::Outbound::new(tx),
                 pushes_written: Default::default(),
                 active_workspace: Some(active.to_string()),
             },
@@ -7803,6 +8011,12 @@ mod workspace_state_tests {
         );
         s.backups_path = Some(dir.path().to_path_buf());
         assert!(
+            s.has_unprotected_unsaved_buffers(),
+            "backups on but this revision not yet written — a failed or pending flush is no cover"
+        );
+        let revision = s.doc_of(named).revision;
+        s.doc_of_mut(named).backed_up_revision = Some(revision);
+        assert!(
             !s.has_unprotected_unsaved_buffers(),
             "a named workspace's dirty buffer is on disk; the reaper may proceed"
         );
@@ -7814,6 +8028,7 @@ mod workspace_state_tests {
         s.insert_buffer_with_document(temp, Some(1), false, |d| {
             let mut doc = Document::scratch(d, None);
             doc.dirty = true;
+            doc.backed_up_revision = Some(doc.revision);
             doc
         });
         s.buffer_workspaces.insert(temp, ephemeral.clone());
@@ -7827,6 +8042,7 @@ mod workspace_state_tests {
         s.insert_buffer_with_document(tether, None, false, |d| {
             let mut doc = Document::new_at_path(d, PathBuf::from("/tmp/tethered.txt"), None);
             doc.dirty = true;
+            doc.backed_up_revision = Some(doc.revision);
             doc
         });
         s.buffer_workspaces.insert(tether, ephemeral);
@@ -8099,5 +8315,60 @@ mod layout_cache_tests {
         assert_eq!(d.max_line_width(4), 10);
         edit(&mut d, 0, 11, "");
         assert_eq!(d.max_line_width(4), 4);
+    }
+}
+
+#[cfg(test)]
+mod outbound_tests {
+    use super::*;
+    use aether_protocol::envelope::JsonRpc;
+
+    fn push() -> Notification {
+        Notification {
+            jsonrpc: JsonRpc,
+            method: "test/push".into(),
+            params: serde_json::Value::Null,
+        }
+    }
+
+    /// A client that stops draining its queue costs a producer one deadline, not forever: the push
+    /// that can't get a slot fails, the client is marked lagged (which ends its connection), and
+    /// every later push fails at once instead of waiting out a deadline of its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_client_fails_pushes_instead_of_parking_them() {
+        let (tx, _rx) = mpsc::channel(1);
+        let outbound = Outbound::new(tx);
+        let lag = outbound.lag();
+
+        assert!(outbound.send(push()).await.is_ok(), "room for one");
+        let started = tokio::time::Instant::now();
+        assert!(
+            outbound.send(push()).await.is_err(),
+            "the queue never drains"
+        );
+        assert_eq!(started.elapsed(), PUSH_DEADLINE);
+
+        // The connection task's wait resolves, and nothing waits again.
+        tokio::time::timeout(std::time::Duration::from_millis(1), lag.wait())
+            .await
+            .expect("lag is signalled");
+        let started = tokio::time::Instant::now();
+        assert!(outbound.send(push()).await.is_err());
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// A client that drains its queue, however slowly, is never judged stalled.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_draining_client_keeps_its_pushes() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let outbound = Outbound::new(tx);
+        tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                tokio::time::sleep(PUSH_DEADLINE / 2).await;
+            }
+        });
+        for _ in 0..5 {
+            assert!(outbound.send(push()).await.is_ok());
+        }
     }
 }

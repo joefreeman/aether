@@ -1124,31 +1124,51 @@ async fn write_text_file(state: &SharedState, path: &Path, content: &str) -> Res
     let canonical = crate::handlers::buffer::canonicalize_partial(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
 
-    let open = {
-        let s = state.lock().await;
-        s.document_for_path(&canonical)
-            .and_then(|id| s.buffers.values().find(|b| b.document == id).map(|b| b.id))
-    };
+    // One lock from finding the buffer to applying the edit, so a view closing in between can't
+    // leave a buffer id that no longer resolves.
+    let mut s = state.lock().await;
+    let open = s
+        .document_for_path(&canonical)
+        .and_then(|id| s.buffers.values().find(|b| b.document == id).map(|b| b.id));
 
     if let Some(buffer) = open {
-        let mut s = state.lock().await;
         let cursors = document_cursor_snapshot(&s, buffer);
+        let was_dirty = s.doc_of(buffer).dirty;
         let end = s.doc_of(buffer).text.len_chars();
         // Through `editable_doc`, so a read-only document refuses this by construction rather
         // than by a check this function has to remember.
         s.editable_doc(buffer)
             .map_err(|e| e.message.clone())?
-            .apply_edit(0, end, content, EditKindTag::Agent, cursors);
+            .apply_edit(
+                0,
+                end,
+                &crate::state::normalize_line_breaks(content),
+                EditKindTag::Agent,
+                cursors,
+            );
+        // Then everything a whole-document replacement owes the rest of the server — the same
+        // follow-up `lsp/format` makes. Without it the language server kept the old text until the
+        // next keystroke, and searches and viewport ranges still measured the old rope.
+        s.clear_motion_history_for_buffer(buffer);
+        s.clear_tree_selection_history_for_buffer(buffer);
+        s.clear_virtual_col_for_buffer(buffer);
+        let promoted_pushes = promote_transient(&mut s, buffer);
+        refresh_searches_for_buffer(&mut s, buffer);
+        refresh_viewport_ranges_for_buffer(&mut s, buffer);
+        notify_lsp_change(&mut s, buffer);
+        let pushes = collect_doc_lines_changed_pushes(&s, buffer);
+        let picker_pushes = maybe_refresh_dirty(&mut s, buffer, was_dirty);
         drop(s);
-        let pushes = {
-            let s = state.lock().await;
-            collect_doc_lines_changed_pushes(&s, buffer)
-        };
-        for (sender, notif) in pushes {
+        for (sender, notif) in pushes
+            .into_iter()
+            .chain(promoted_pushes)
+            .chain(picker_pushes)
+        {
             let _ = sender.send(notif).await;
         }
         return Ok(());
     }
+    drop(s);
 
     if let Some(parent) = canonical.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;

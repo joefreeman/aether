@@ -779,6 +779,13 @@ pub enum ConfirmKind {
     OverwriteModified,
     /// The file was removed on disk since it was loaded; saving recreates it.
     RecreateDeleted,
+    /// A view save left these files unsaved because they changed (`modified`) or were removed
+    /// (`deleted`) on disk; accepting overwrites or recreates exactly these. Each is a path as a
+    /// person reads it. See [`crate::labels::save_conflicts_phrase`].
+    SaveConflicts {
+        modified: Vec<String>,
+        deleted: Vec<String>,
+    },
     /// Reloading a buffer with unsaved changes.
     DiscardOnReload,
     /// Closing a buffer with unsaved changes. `label` is the buffer's display label.
@@ -865,6 +872,12 @@ pub enum ConfirmAction {
     /// confirm, so the retry still follows through on success.
     Save {
         target: Option<(u32, String)>,
+        after: AfterSave,
+    },
+    /// Retry `view/save`, confirming exactly the documents the refusal named — never the whole
+    /// view, so a file that changed on disk after the question was asked is asked about again.
+    SaveView {
+        confirmed: Vec<BufferId>,
         after: AfterSave,
     },
     /// Retry `buffer/reload` with `force: true`.

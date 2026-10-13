@@ -11449,7 +11449,7 @@ async fn saving_a_composed_view_writes_every_file_it_windows() {
         &mut ws,
         &ViewSaveParams {
             view_id: patch.view_id,
-            overwrite: false,
+            confirmed: Vec::new(),
         },
     )
     .await;
@@ -11475,11 +11475,70 @@ async fn saving_a_composed_view_writes_every_file_it_windows() {
         &mut ws,
         &ViewSaveParams {
             view_id: patch.view_id,
-            overwrite: false,
+            confirmed: Vec::new(),
         },
     )
     .await;
     assert_eq!(again.saved, 0, "nothing dirty left: {again:?}");
+
+    // Both files changed on disk under fresh edits: the save writes neither and names both, and a
+    // confirmation covers only the file it names — the other is still asked about, not clobbered.
+    for buffer_id in &distinct {
+        let _: EditResult = send_request::<InputText>(
+            &mut ws,
+            &InputTextParams {
+                buffer_id: *buffer_id,
+                text: "// again\n".into(),
+                select_pasted: false,
+                replace_selection: false,
+                at: None,
+            },
+        )
+        .await;
+    }
+    for name in ["aaa.rs", "zzz.rs"] {
+        std::fs::write(root.join(name), "changed elsewhere\n").unwrap();
+    }
+    let refused: ViewSaveResult = send_request::<ViewSave>(
+        &mut ws,
+        &ViewSaveParams {
+            view_id: patch.view_id,
+            confirmed: Vec::new(),
+        },
+    )
+    .await;
+    assert_eq!(refused.saved, 0);
+    let mut named: Vec<(u64, String)> = refused
+        .conflicts
+        .iter()
+        .map(|c| (c.buffer_id, c.path.clone()))
+        .collect();
+    named.sort();
+    assert_eq!(named.len(), 2, "{refused:?}");
+    let paths: Vec<&str> = named.iter().map(|(_, p)| p.as_str()).collect();
+    assert!(
+        paths.contains(&"aaa.rs") && paths.contains(&"zzz.rs"),
+        "{paths:?}"
+    );
+
+    let (first, _) = &named[0];
+    let partly: ViewSaveResult = send_request::<ViewSave>(
+        &mut ws,
+        &ViewSaveParams {
+            view_id: patch.view_id,
+            confirmed: vec![*first],
+        },
+    )
+    .await;
+    assert_eq!(partly.saved, 1, "{partly:?}");
+    assert_eq!(partly.conflicts.len(), 1, "the other is still asked about");
+    assert_ne!(partly.conflicts[0].buffer_id, *first);
+    let untouched = &partly.conflicts[0].path;
+    assert_eq!(
+        std::fs::read_to_string(root.join(untouched)).unwrap(),
+        "changed elsewhere\n",
+        "the unconfirmed file keeps its external change"
+    );
 
     drop(server);
 }

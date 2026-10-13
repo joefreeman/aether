@@ -3210,6 +3210,9 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
         ConfirmKind::Overwrite { path: None } => "Overwrite".into(),
         ConfirmKind::OverwriteModified => "File changed on disk — overwrite".into(),
         ConfirmKind::RecreateDeleted => "File removed on disk — recreate".into(),
+        ConfirmKind::SaveConflicts { modified, deleted } => {
+            aether_client::labels::save_conflicts_phrase(modified, deleted)
+        }
         ConfirmKind::DiscardOnReload => "Discard local changes and reload".into(),
         ConfirmKind::DiscardOnClose { label } => format!("Discard unsaved changes in {label}"),
         // Closing kills the process group, so this asks about what stops rather than what is lost.

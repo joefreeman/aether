@@ -110,7 +110,7 @@ const SYMBOL_TAG: Record<SymbolKind, string> = {
 
 interface Config {
   wsBase: string;
-  /** HTTP origin of the daemon, derived from `wsBase` (ws→http, wss→https), for the `/status` probe. */
+  /** HTTP origin of the daemon (the page's own), for the `/status` probe. */
   httpBase: string;
   /** The version that served this page, from the `aether-version` meta tag (null under Vite dev). */
   buildVersion: string | null;
@@ -118,10 +118,12 @@ interface Config {
 }
 
 function resolveConfig(): Config {
-  // No token: the daemon authorizes by loopback Host/Origin (served same-origin; Vite dev points
-  // VITE_AETHER_WS at the daemon, whose origin check accepts localhost).
-  const wsBase = import.meta.env.VITE_AETHER_WS ?? `ws://${location.host}`;
-  const httpBase = wsBase.replace(/^ws/, "http"); // ws://→http://, wss://→https://
+  // Always same-origin: the daemon accepts a browser socket only from a page on its own port. It
+  // serves the page itself; under Vite dev, Vite proxies `/aether-ws` and the daemon's HTTP routes
+  // to it (see vite.config.ts).
+  const wsOrigin = location.origin.replace(/^http/, "ws"); // http→ws, https→wss
+  const wsBase = import.meta.env.DEV ? `${wsOrigin}/aether-ws` : wsOrigin;
+  const httpBase = location.origin;
   const buildVersion =
     document.querySelector('meta[name="aether-version"]')?.getAttribute("content") ?? null;
   return { wsBase, httpBase, buildVersion, workspace: import.meta.env.VITE_AETHER_WORKSPACE };
@@ -275,6 +277,7 @@ type ConfirmKind =
   | { kind: "overwrite"; path: string | null }
   | { kind: "overwrite_modified" }
   | { kind: "recreate_deleted" }
+  | { kind: "save_conflicts"; phrase: string }
   | { kind: "discard_reload" }
   | { kind: "discard_close"; label: string }
   | { kind: "close_running_shell"; title: string }
@@ -323,6 +326,8 @@ function confirmMessage(c: ConfirmKind): string {
       return "File changed on disk — overwrite?";
     case "recreate_deleted":
       return "File removed on disk — recreate?";
+    case "save_conflicts":
+      return `${c.phrase}?`;
     case "discard_reload":
       return "Discard local changes and reload?";
     case "discard_close":

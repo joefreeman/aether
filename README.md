@@ -356,6 +356,10 @@ npm run build   # tsc (typecheck + compile), then Vite bundles to web/dist
 Release builds embed `web/dist` in the binary, so a released `ae` is self-contained; debug builds
 read it from disk, so a rebuilt bundle is served without restarting the server.
 
+`npm run dev` serves the page from Vite on port 5173 instead, proxying to a running server
+(`AETHER_DAEMON=http://127.0.0.1:2385` to pick one other than the default). The server only
+accepts a page served from its own port, so the page always goes through that proxy.
+
 ## License
 
 [MIT](LICENSE)

@@ -52,6 +52,21 @@ pub fn search_count(s: &aether_protocol::search::SearchSummary) -> String {
 /// belt-and-braces is cheap).
 const MAX_DEPTH: usize = 16;
 
+/// The question a view save asks about the files it left unsaved because they changed or were
+/// removed on disk — every one named, since accepting overwrites (or recreates) exactly these.
+/// Shells append their own `?`.
+pub fn save_conflicts_phrase(modified: &[String], deleted: &[String]) -> String {
+    match (modified.is_empty(), deleted.is_empty()) {
+        (false, true) => format!("Changed on disk: {} — overwrite", modified.join(", ")),
+        (true, false) => format!("Removed on disk: {} — recreate", deleted.join(", ")),
+        _ => format!(
+            "Changed on disk: {}; removed: {} — save anyway",
+            modified.join(", "),
+            deleted.join(", ")
+        ),
+    }
+}
+
 /// One label per input path, aligned by index. Identical inputs produce identical labels (we
 /// can't disambiguate them); otherwise every label is unique within the result.
 ///

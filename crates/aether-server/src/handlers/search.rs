@@ -610,7 +610,7 @@ pub fn collect_cursor_search_update(
     s: &mut ServerState,
     client_id: ClientId,
     buffer_id: BufferId,
-) -> Option<(mpsc::Sender<Notification>, Notification)> {
+) -> Option<(crate::state::Outbound, Notification)> {
     let view_id = view_moving(s, client_id, buffer_id)?;
     let key = (client_id, view_id);
     let current = {
