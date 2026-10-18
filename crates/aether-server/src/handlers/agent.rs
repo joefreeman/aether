@@ -391,6 +391,7 @@ pub async fn agent_prompt(
         &format!("{text}\n"),
     )
     .await;
+    push_lines_changed(state, view_buffer).await;
 
     let sent = {
         let mut s = state.lock().await;
@@ -592,21 +593,49 @@ async fn pump(
     mut events: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
 ) {
     while let Some(event) = events.recv().await {
-        // The view closed under us: nothing left to write into.
-        {
-            let s = state.lock().await;
-            if s.try_doc_of(view_buffer)
-                .and_then(|d| d.conversation())
-                .is_none()
+        // Apply everything already queued, then render once. A render is the whole conversation,
+        // so one per event made a fast agent's stream cost a render per few characters; draining
+        // first lets a flush cover however much arrived while the last one was being made. An
+        // agent slower than the renders loses nothing: its queue is empty, and each event goes
+        // out on its own as before.
+        let mut owed = false;
+        let mut next = Some(event);
+        let mut applied = 0;
+        while let Some(event) = next.take() {
+            // The view closed under us: nothing left to write into.
             {
-                return;
+                let s = state.lock().await;
+                if s.try_doc_of(view_buffer)
+                    .and_then(|d| d.conversation())
+                    .is_none()
+                {
+                    return;
+                }
+            }
+            owed |= apply(&state, view_buffer, view_id, event).await;
+            applied += 1;
+            if applied < DRAIN_LIMIT {
+                next = events.try_recv().ok();
             }
         }
-        apply(&state, view_buffer, view_id, event).await;
+        if owed {
+            push_lines_changed(&state, view_buffer).await;
+        }
     }
 }
 
-async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, event: AgentEvent) {
+/// The most events one flush waits for: an agent that never lets its queue empty still reaches the
+/// screen, a few hundred chunks at a time.
+const DRAIN_LIMIT: usize = 256;
+
+/// Apply one agent event to the conversation. Returns whether it changed what the view shows — its
+/// viewports are then owed a render, which [`pump`] sends once for everything it drained.
+async fn apply(
+    state: &SharedState,
+    view_buffer: BufferId,
+    view_id: ViewId,
+    event: AgentEvent,
+) -> bool {
     match event {
         AgentEvent::Ready { session, resumed } => {
             // A conversation we restored but could not resume is showing a record this agent has
@@ -615,7 +644,7 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
             let asked = {
                 let mut s = state.lock().await;
                 let Some(c) = conversation_mut(&mut s, view_buffer) else {
-                    return;
+                    return false;
                 };
                 c.session = Some(session);
                 let asked = c.resuming.take();
@@ -634,6 +663,7 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
                 .await;
             }
             refresh(state, view_buffer).await;
+            true
         }
 
         AgentEvent::Chunk {
@@ -648,6 +678,7 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
             };
             let key = message_id.map(BlockKey::Message);
             append_to_block(state, view_buffer, key, block_kind, Some("markdown"), &text).await;
+            true
         }
 
         AgentEvent::ToolCall {
@@ -662,7 +693,7 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
             let created = {
                 let mut s = state.lock().await;
                 let Some(c) = conversation_mut(&mut s, view_buffer) else {
-                    return;
+                    return false;
                 };
                 match c.find(&key) {
                     // **Merge**, never replace: an update carries only the fields that changed, so
@@ -718,10 +749,10 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
             // to a call that is no longer the last one an append rather than a splice.
             if let Some(text) = text {
                 append_to_key(state, view_buffer, &key, &text).await;
-                push_lines_changed(state, view_buffer).await;
             }
             refresh(state, view_buffer).await;
             push_turn_state(state, view_buffer, view_id).await;
+            true
         }
 
         AgentEvent::Diff {
@@ -774,7 +805,7 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
                 }
             }
             refresh(state, view_buffer).await;
-            push_lines_changed(state, view_buffer).await;
+            true
         }
 
         AgentEvent::Plan { entries } => {
@@ -807,7 +838,7 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
                 }
             }
             refresh(state, view_buffer).await;
-            push_lines_changed(state, view_buffer).await;
+            true
         }
 
         AgentEvent::Permission {
@@ -823,7 +854,7 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
             let known = {
                 let s = state.lock().await;
                 let Some(c) = s.try_doc_of(view_buffer).and_then(|d| d.conversation()) else {
-                    return;
+                    return false;
                 };
                 key.as_ref().and_then(|k| c.find(k)).is_some()
             };
@@ -851,7 +882,7 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
             {
                 let mut s = state.lock().await;
                 let Some(c) = conversation_mut(&mut s, view_buffer) else {
-                    return;
+                    return false;
                 };
                 // The named block, or the last tool call if the request named none at all.
                 let index = match &key {
@@ -874,6 +905,7 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
             // conversation has no turn.
             push_agent_rows(state).await;
             push_turn_state(state, view_buffer, view_id).await;
+            true
         }
 
         // The two requests that make this an editor's agent rather than a chat pane.
@@ -885,6 +917,7 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
         } => {
             let answer = read_text_file(state, &path, line, limit).await;
             let _ = reply.send(answer);
+            false
         }
         AgentEvent::WriteFile {
             path,
@@ -894,14 +927,17 @@ async fn apply(state: &SharedState, view_buffer: BufferId, view_id: ViewId, even
             let answer = write_text_file(state, &path, &content).await;
             let _ = reply.send(answer);
             refresh(state, view_buffer).await;
+            true
         }
 
         AgentEvent::TurnEnded(reason) => {
             clear_turn(state, view_buffer, view_id, reason).await;
+            true
         }
 
         AgentEvent::Failed(message) => {
             clear_turn(state, view_buffer, view_id, StopReason::Failed { message }).await;
+            true
         }
     }
 }
@@ -997,7 +1033,6 @@ async fn append_to_block(
             s.extend_block(view_buffer, buffer, text);
         }
     }
-    push_lines_changed(state, view_buffer).await;
 }
 
 /// Append to a block that is known to exist, by key.
@@ -1015,7 +1050,8 @@ async fn append_to_key(state: &SharedState, view_buffer: BufferId, key: &BlockKe
     }
 }
 
-/// A block written by us rather than by the agent — the prompt.
+/// A block written by us rather than by the agent — the prompt. Pushes nothing: the caller owes
+/// the view its render, as it does for anything else it changed.
 async fn push_block(
     state: &SharedState,
     view_buffer: BufferId,
@@ -1028,7 +1064,6 @@ async fn push_block(
         let mut s = state.lock().await;
         s.extend_block(view_buffer, buffer, text);
     }
-    push_lines_changed(state, view_buffer).await;
 }
 
 /// Whether this conversation has taken as much text as it is allowed to hold.
@@ -1186,19 +1221,19 @@ async fn refresh(state: &SharedState, view_buffer: BufferId) {
     s.rebind_viewports_of(view_buffer);
 }
 
-/// The content push for a block that just grew — the same one an edit sends, because to everything
-/// downstream this *is* an edit to a document somebody is viewing.
+/// The content push for a conversation that changed — the same one an edit sends, because to
+/// everything downstream a block growing *is* an edit to a document somebody is viewing. One per
+/// viewport on the conversation, whichever of its blocks moved.
 async fn push_lines_changed(state: &SharedState, view_buffer: BufferId) {
     let pushes = {
         let s = state.lock().await;
         let Some(c) = s.try_doc_of(view_buffer).and_then(|d| d.conversation()) else {
             return;
         };
-        let mut pushes = PendingPushes::new();
-        for block in &c.blocks {
-            pushes.extend(collect_doc_lines_changed_pushes(&s, block.buffer));
-        }
-        pushes
+        collect_lines_changed_pushes(
+            &s,
+            std::iter::once(view_buffer).chain(c.blocks.iter().map(|b| b.buffer)),
+        )
     };
     for (sender, notif) in pushes {
         let _ = sender.send(notif).await;

@@ -1457,13 +1457,31 @@ pub fn clamp_doc_cursors(s: &mut ServerState, buffer_id: BufferId) {
 }
 
 pub fn collect_doc_lines_changed_pushes(s: &ServerState, buffer_id: BufferId) -> PendingPushes {
+    collect_lines_changed_pushes(s, [buffer_id])
+}
+
+/// The `view/lines_changed` pushes owed after `buffers` changed: **one per viewport** showing any
+/// of their documents, however many of them it shows.
+///
+/// A push is the viewport's whole rendered window, so a viewport is the unit it is owed in. Asking
+/// per buffer instead — once for each block of a conversation that had just grown — rendered and
+/// shipped the same conversation once per block it held.
+pub fn collect_lines_changed_pushes(
+    s: &ServerState,
+    buffers: impl IntoIterator<Item = BufferId>,
+) -> PendingPushes {
     let mut pushes: PendingPushes = Vec::new();
-    if s.try_doc_of(buffer_id).is_none() {
+    let attached: Vec<BufferId> = buffers
+        .into_iter()
+        .filter(|b| s.try_doc_of(*b).is_some())
+        .flat_map(|b| s.doc_siblings(b))
+        .collect();
+    if attached.is_empty() {
         return pushes;
     }
-    let attached = s.doc_siblings(buffer_id);
     for vp in s.viewports.values() {
-        if !attached.iter().any(|id| vp.shows(s.view_of(vp), *id)) {
+        let view = s.view_of(vp);
+        if !attached.iter().any(|id| vp.shows(view, *id)) {
             continue;
         }
         let Some(sender) = s.clients.get(&vp.client_id).map(|c| c.outbound.clone()) else {

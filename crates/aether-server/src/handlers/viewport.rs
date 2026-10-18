@@ -2907,10 +2907,7 @@ fn element_prose(
             .collect(),
         ElementMatches::Symbols(_) | ElementMatches::None => Vec::new(),
     };
-    (
-        aether_markdown::parse_marked(&text, &marks),
-        SourceLines::of(&text),
-    )
+    doc.prose.parse(text, marks)
 }
 
 /// How an element's rows are counted: the viewport's wrapping and the element's phantom rows for

@@ -298,6 +298,95 @@ async fn chunks_without_an_id_append_to_the_open_block() {
     assert_eq!(agent[0].1, "one two\n");
 }
 
+/// A turn's pushes grow with its events, not with its events times its blocks — and the last one
+/// still carries everything.
+///
+/// Each push is the viewport's whole window, so it is owed once per viewport: one asked for per
+/// *block* re-rendered and re-sent the conversation once for every block it held, which made a long
+/// conversation's stream cost grow with its square. The bound here is loose on purpose (how many
+/// events one flush drains depends on timing); the quadratic count it rules out is ten times it.
+#[tokio::test]
+async fn a_streamed_turn_pushes_once_per_flush_not_once_per_block() {
+    const IDS: [&str; 20] = [
+        "m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10", "m11", "m12", "m13", "m14",
+        "m15", "m16", "m17", "m18", "m19", "m20",
+    ];
+    let script = Script {
+        steps: IDS
+            .iter()
+            .map(|id| Step::Say {
+                message_id: Some(id),
+                text: "A reply.\n",
+            })
+            .chain([Step::Say {
+                message_id: Some("last"),
+                text: "The last word.\n",
+            }])
+            .collect(),
+        ..Script::default()
+    };
+    let events = script.steps.len();
+    let (server, mut ws, _dir, _t) = setup(script).await;
+    let open = start_agent(&mut ws).await;
+    let (viewport_id, _) = window_of(&mut ws, open.opened.view_id).await;
+    let input = input_buffer_of(&server, &open).await;
+    type_prompt(&mut ws, input, "go").await;
+    ws.clear_seen();
+    let _: AgentPromptResult = send_request::<AgentPrompt>(
+        &mut ws,
+        &AgentPromptParams {
+            view_id: open.opened.view_id,
+        },
+    )
+    .await;
+    wait_for_idle(&server, open.opened.view_id).await;
+
+    // The turn ending is applied before its flush goes out, so read until a push carries the end.
+    let carries_the_end = |p: &ViewportLinesChangedParams| {
+        p.viewport_id == viewport_id
+            && p.window.root.content().iter().any(|e| {
+                matches!(e, aether_protocol::viewport::Element::Prose { blocks, .. }
+                    if serde_json::to_string(blocks).unwrap().contains("The last word."))
+            })
+    };
+    for _ in 0..400 {
+        if ws.saw::<ViewportLinesChanged>().iter().any(carries_the_end) {
+            break;
+        }
+        let _ = input_text(&mut ws, input).await;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let pushes: Vec<_> = ws
+        .saw::<ViewportLinesChanged>()
+        .into_iter()
+        .filter(|p| p.viewport_id == viewport_id)
+        .collect();
+    let last = pushes.last().expect("the turn pushed nothing");
+    assert!(
+        carries_the_end(last),
+        "the last push is missing the end of the turn"
+    );
+    // The prompt's own block and the input clearing, then at most one per event.
+    assert!(
+        pushes.len() <= events + 4,
+        "{} pushes for {events} events",
+        pushes.len()
+    );
+    // However many events a flush drained, it renders each viewport once: a render asked for per
+    // block arrives as a run of identical windows. One repeat is honest — the turn ending can
+    // change nothing a conversation of plain replies shows.
+    let raw: Vec<serde_json::Value> = ws
+        .seen_raw(ViewportLinesChanged::NAME)
+        .into_iter()
+        .filter(|p| p["viewport_id"] == serde_json::json!(viewport_id))
+        .collect();
+    let repeats = raw.windows(2).filter(|w| w[0] == w[1]).count();
+    assert!(
+        repeats <= 1,
+        "{repeats} pushes repeated the window before them: a push per block, not per viewport"
+    );
+}
+
 #[tokio::test]
 async fn a_thought_and_a_message_are_different_blocks() {
     let script = Script {

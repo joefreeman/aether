@@ -3959,6 +3959,109 @@ pub struct Document {
     /// itself is one per document, and a second client's edit landing mid-bracket has nowhere else
     /// to go anyway. Released by the closing bracket or by the holder's disconnect.
     undo_group_held_by: Option<ClientId>,
+    /// The last markdown parse rendered from this document — see [`ProseCache`].
+    pub prose: ProseCache,
+}
+
+/// The last markdown parse of a span of a document, and the exact input it was made from.
+///
+/// A conversation renders every reply on every push, and all but the one being written are the
+/// same text they were last time; parsing them again was most of what a push cost. Keyed by the
+/// **input itself** — the source and the search marks folded into the parse — rather than by
+/// revision: a hit is a parse of these very bytes, so nothing that changes the text without
+/// moving the revision can be served a stale one. Comparing the source costs a copy of it, which
+/// is far less than the parse it saves.
+///
+/// Behind a mutex because a render reads the document through `&`, and this is the one thing a
+/// render writes. One entry, since a document rendered as prose is one element over all of it;
+/// two clients searching one reader for different things take turns at it, uncached but correct.
+#[derive(Default)]
+pub struct ProseCache(std::sync::Mutex<Option<ProseParse>>);
+
+struct ProseParse {
+    source: String,
+    marks: Vec<(aether_markdown::Span, u32)>,
+    blocks: Vec<aether_markdown::Block>,
+    lines: aether_protocol::ui::SourceLines,
+}
+
+impl ProseCache {
+    /// `source` parsed with `marks` on it, and the line table of that same text.
+    pub fn parse(
+        &self,
+        source: String,
+        marks: Vec<(aether_markdown::Span, u32)>,
+    ) -> (
+        Vec<aether_markdown::Block>,
+        aether_protocol::ui::SourceLines,
+    ) {
+        let mut cached = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hit) = cached
+            .as_ref()
+            .filter(|c| c.source == source && c.marks == marks)
+        {
+            return (hit.blocks.clone(), hit.lines.clone());
+        }
+        let parse = ProseParse {
+            blocks: aether_markdown::parse_marked(&source, &marks),
+            lines: aether_protocol::ui::SourceLines::of(&source),
+            source,
+            marks,
+        };
+        let out = (parse.blocks.clone(), parse.lines.clone());
+        *cached = Some(parse);
+        out
+    }
+}
+
+#[cfg(test)]
+mod prose_cache_tests {
+    use super::*;
+    use aether_markdown::Span;
+
+    fn headings(blocks: &[aether_markdown::Block]) -> usize {
+        blocks
+            .iter()
+            .filter(|b| matches!(b, aether_markdown::Block::Heading { .. }))
+            .count()
+    }
+
+    #[test]
+    fn a_hit_is_the_parse_a_miss_would_have_made() {
+        let cache = ProseCache::default();
+        let first = cache.parse("# One\n".into(), Vec::new());
+        let again = cache.parse("# One\n".into(), Vec::new());
+        assert_eq!(first, again);
+        assert_eq!(first.0, aether_markdown::parse_marked("# One\n", &[]));
+    }
+
+    #[test]
+    fn new_text_is_parsed_again() {
+        let cache = ProseCache::default();
+        cache.parse("# One\n".into(), Vec::new());
+        let (blocks, lines) = cache.parse("# One\n\n# Two\n".into(), Vec::new());
+        assert_eq!(headings(&blocks), 2, "served the parse of the old text");
+        assert_eq!(
+            lines,
+            aether_protocol::ui::SourceLines::of("# One\n\n# Two\n")
+        );
+    }
+
+    #[test]
+    fn new_marks_are_parsed_again() {
+        // The search marks are folded into the parse, so the same text under a different search is
+        // a different parse — the case a revision-keyed cache would have got wrong.
+        let cache = ProseCache::default();
+        let text = "find me\n";
+        let plain = cache.parse(text.into(), Vec::new());
+        let marks = vec![(Span { start: 0, end: 4 }, 1)];
+        let marked = cache.parse(text.into(), marks.clone());
+        assert_ne!(plain.0, marked.0, "served the unmarked parse to a search");
+        assert_eq!(marked.0, aether_markdown::parse_marked(text, &marks));
+    }
 }
 
 pub struct BufferSyntax {
@@ -4222,6 +4325,7 @@ impl Document {
         let indent_style = resolve_indent_style(&text, language.as_deref());
         Ok(Document {
             id,
+            prose: ProseCache::default(),
             canonical_path: Some(canonical),
             text,
             revision: 0,
@@ -4263,6 +4367,7 @@ impl Document {
         let indent_style = resolve_indent_style(&text, language.as_deref());
         Document {
             id,
+            prose: ProseCache::default(),
             canonical_path: Some(canonical),
             text,
             revision: 0,
@@ -4327,6 +4432,7 @@ impl Document {
         let indent_style = resolve_indent_style(&text, language.as_deref());
         Document {
             id,
+            prose: ProseCache::default(),
             canonical_path: None,
             virtual_source: Some(source),
             text,
@@ -4423,6 +4529,7 @@ impl Document {
         let indent_style = resolve_indent_style(&text, language.as_deref());
         Document {
             id,
+            prose: ProseCache::default(),
             canonical_path: None,
             text,
             revision: 0,
