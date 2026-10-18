@@ -610,6 +610,7 @@ mod tests {
         };
         let chrome = Element::chrome(vec![aether_protocol::ui::Element::text("a.rs", vec![])]);
         let w = Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,

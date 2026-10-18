@@ -335,8 +335,13 @@ pub struct Highlight {
 /// since a prose element's height is measured there. So the view's total height, where a slice
 /// sits on screen and how far the view may scroll are all the client's arithmetic over the tree,
 /// not numbers the server sends.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Window {
+    /// Which window this is, counting every one this viewport has been sent — what a
+    /// [`WindowPatch`] names as the window it was made against. Stamped as the window goes out,
+    /// answers and pushes alike, so no path can send one the next patch does not know about.
+    #[serde(default)]
+    pub generation: u64,
     /// Display width (in cols) of the widest line among the view's buffers, for sizing a native
     /// horizontal scroll container under `WrapMode::None`. `0` under soft wrap (content always
     /// fits `cols`).
@@ -375,6 +380,82 @@ pub struct Window {
     /// and hunks interleaved for a generated patch. Use [`Element::lines`] where the structure is
     /// irrelevant and every rendered line is what's wanted.
     pub root: Element,
+}
+
+impl Window {
+    /// Apply `patch`, if it was made against this window. `false`, with nothing changed, when it
+    /// was not — another generation, or a content element this window does not have.
+    ///
+    /// Shared by the client, which applies what it is sent, and by the server, which checks in
+    /// debug builds that what it sent applies to the window it last sent and reproduces the one it
+    /// just rendered.
+    #[must_use]
+    pub fn apply(&mut self, patch: WindowPatch) -> bool {
+        let held: std::collections::HashSet<FieldId> = self
+            .root
+            .content()
+            .iter()
+            .filter_map(|e| e.field_id())
+            .collect();
+        let fits = patch.base == self.generation
+            && patch
+                .elements
+                .iter()
+                .all(|e| e.field_id().is_some_and(|id| held.contains(&id)));
+        if !fits {
+            return false;
+        }
+        let WindowPatch {
+            base: _,
+            generation,
+            max_line_width,
+            git_status,
+            other_elements_dirty,
+            search,
+            elements,
+        } = patch;
+        let mut elements: std::collections::HashMap<FieldId, Element> = elements
+            .into_iter()
+            .filter_map(|e| Some((e.field_id()?, e)))
+            .collect();
+        self.root.walk_mut(&mut |node| {
+            if let Some(new) = node.field_id().and_then(|id| elements.remove(&id)) {
+                *node = new;
+            }
+        });
+        self.generation = generation;
+        self.max_line_width = max_line_width;
+        self.git_status = git_status;
+        self.other_elements_dirty = other_elements_dirty;
+        self.search = search;
+        true
+    }
+}
+
+/// The content elements of a window that changed since the window `base`, and the view-wide facts
+/// as of now — what a push sends instead of the whole window when the tree kept its shape (see
+/// [`Element::same_shape`]).
+///
+/// A conversation is the case it exists for: a reply grows a few characters at a time, and the
+/// window around it — every earlier turn, parsed — went out whole every time it did. Only content
+/// elements are ever sent: they are what change while the tree keeps its shape, and the unit a
+/// shell measures and paints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowPatch {
+    /// The [`Window::generation`] this was made against.
+    pub base: u64,
+    /// The generation the window has once this is applied.
+    pub generation: u64,
+    /// As on [`Window`].
+    pub max_line_width: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<GitBufferStatus>,
+    #[serde(default)]
+    pub other_elements_dirty: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<crate::search::SearchSummary>,
+    /// The content elements that changed, each replacing the one with its field id.
+    pub elements: Vec<Element>,
 }
 
 // ---- view/save ----------------------------------------------------------------------------------
@@ -837,14 +918,39 @@ pub struct ViewportLinesChangedParams {
     pub buffer: crate::BufferId,
     pub revision: Revision,
     /// The window after the change: the same shape a geometry request answers with, re-rendered
-    /// over the slices the viewport had loaded. A whole replacement rather than a splice — the
-    /// client rebuilds from it, and a patch regenerates wholesale anyway.
+    /// over the slices the viewport had loaded. Whole — a change that left the tree its shape and
+    /// most of it untouched goes out as [`ViewportElementsChanged`] instead.
     pub window: Window,
     /// The authoritative cursor for the receiving client after the change, decorated like an RPC
     /// response (`match_bracket`, `jumplist_position`). Lets the client adopt server-side cursor
     /// moves that have no request in flight — e.g. the clamp a watcher reload applies when the
     /// file shrank under the cursor. `None` when the client has no cursor on the buffer; the
     /// client then keeps its local state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<CursorState>,
+}
+
+// ---- view/elements_changed (notification) -------------------------------------------------------
+
+/// `view/lines_changed`, for a change that left the tree its shape: the content elements that moved,
+/// not the whole window. The rest of what a push says is the same, and means the same.
+///
+/// Its own method rather than a second shape of `window` on the first: what a client does with one
+/// is apply it to the window it holds, which a whole window never asks of it — and a patch that no
+/// longer fits that window is something only this one can be.
+pub struct ViewportElementsChanged;
+impl NotificationMethod for ViewportElementsChanged {
+    const NAME: &'static str = "view/elements_changed";
+    type Params = ViewportElementsChangedParams;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewportElementsChangedParams {
+    pub viewport_id: ViewportId,
+    /// As on [`ViewportLinesChangedParams`].
+    pub buffer: crate::BufferId,
+    pub revision: Revision,
+    pub patch: WindowPatch,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<CursorState>,
 }

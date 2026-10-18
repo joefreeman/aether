@@ -5498,6 +5498,32 @@ pub struct Viewport {
     /// element's index moves every time a block is appended. An index would have quietly folded
     /// the wrong block as the turn went on.
     pub expanded: std::collections::HashSet<BufferId>,
+
+    /// The window this viewport's client holds — see [`SentWindow`].
+    pub sent: SentWindow,
+}
+
+/// The window a viewport's client holds: the last one it was sent, as an answer or as a push.
+///
+/// What a push is worked out against. A conversation's reply grows while every other element of
+/// the view stays what it was, and the client already has those; comparing the new render with
+/// this is what lets the push carry only what moved ([`aether_protocol::viewport::WindowPatch`]).
+/// It is the *output* that is compared, not a list of what might have changed, so there is no
+/// input to a render that could be forgotten and leave a client showing a stale element.
+///
+/// Behind a mutex because pushes are built from `&ServerState`, and recording what went out is the
+/// one write a send makes. Written only by `handlers::viewport::sent_whole` and `sent_update`,
+/// which every window a client is sent passes through.
+#[derive(Default)]
+pub struct SentWindow(pub(crate) std::sync::Mutex<Option<aether_protocol::viewport::Window>>);
+
+/// A copy of a viewport has sent nothing: what it sends first goes out whole, which is always
+/// right, where sharing the record would let two viewports each think the client holds their last
+/// window.
+impl Clone for SentWindow {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// What a view is composed of: its elements, in order, each windowing some buffer.
@@ -6531,6 +6557,7 @@ mod view_layout_tests {
             // Only `a`'s hunk is on screen.
             loaded: vec![Some(10..14), None, None],
             anchor: ScrollPosition::default(),
+            sent: Default::default(),
             focused: 0,
         };
         let view = s.view(view_id);
@@ -6618,6 +6645,7 @@ mod view_layout_tests {
             // The client has the first hunk and the last one loaded.
             loaded: vec![Some(10..14), None, Some(10..14)],
             anchor: ScrollPosition::default(),
+            sent: Default::default(),
             focused: 0,
         };
         s.viewports.insert(1, vp);
@@ -6966,6 +6994,7 @@ mod transcript_tests {
             continuation_marker_width: 0,
             loaded: vec![None],
             anchor: ScrollPosition::default(),
+            sent: Default::default(),
             focused,
         };
         s.viewports.insert(1, viewport(1, 0));
@@ -8249,6 +8278,7 @@ mod workspace_state_tests {
                 continuation_marker_width: 0,
                 loaded: vec![Some(0..1)],
                 anchor: ScrollPosition::default(),
+                sent: Default::default(),
             },
         );
         s.open_view(viewed_buffer, None);

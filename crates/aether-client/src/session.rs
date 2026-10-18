@@ -2459,6 +2459,7 @@ mod tests {
         };
         let mut s = Session::placeholder();
         s.view.window = Some(aether_protocol::viewport::Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,

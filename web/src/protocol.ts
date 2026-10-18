@@ -858,6 +858,9 @@ export const changePatchSide = (c?: LineChange): PatchLine | null =>
  *  loaded slice's place within its element, plus the view-wide facts riding along. No geometry of
  *  the view as a whole: the shell lays it out from the tree (`paintedRows`, `totalRows`). */
 export interface BufferWindow {
+  /** Which window this is, counting every one the viewport has been sent — what a pushed patch
+   *  names as its base. The core applies patches; the shell never reads this. */
+  generation?: number;
   /** Display cols of the widest line — sizes the native horizontal scroller (no-wrap). 0 under soft wrap. */
   max_line_width: number;
   /** Buffer-level Git status (branch + staged/unstaged counts) for the status bar; absent outside a repo. */

@@ -256,6 +256,7 @@ fn window_with_a_box(element: u32) -> aether_protocol::viewport::Window {
         lines: vec![],
     };
     aether_protocol::viewport::Window {
+        generation: 0,
         search: None,
         other_elements_dirty: false,
         max_line_width: 0,
@@ -282,6 +283,7 @@ fn window_with_a_box(element: u32) -> aether_protocol::viewport::Window {
 
 fn window_with_an_input(element: u32) -> aether_protocol::viewport::Window {
     aether_protocol::viewport::Window {
+        generation: 0,
         search: None,
         other_elements_dirty: false,
         max_line_width: 0,
@@ -302,11 +304,106 @@ fn window_with_an_input(element: u32) -> aether_protocol::viewport::Window {
     }
 }
 
+/// Two editors, the second `rows` tall, as generation `generation` of viewport 7's window.
+fn two_editors(generation: u64, rows: u32) -> aether_protocol::viewport::Window {
+    let editor = |element: u32, rows: u32| aether_protocol::viewport::Element::Editor {
+        collapsed: false,
+        element,
+        buffer: 10 + element as u64,
+        rows,
+        first_row: aether_protocol::coords::ElementRow(0),
+        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+        role: aether_protocol::ui::ElementRole::Field,
+        first_buffer_line: 0,
+        lines: vec![],
+    };
+    aether_protocol::viewport::Window {
+        generation,
+        search: None,
+        other_elements_dirty: false,
+        max_line_width: 0,
+        git_status: None,
+        root: aether_protocol::viewport::Element::column(vec![editor(0, 1), editor(1, rows)]),
+    }
+}
+
+/// `view/elements_changed` for viewport 7: the second editor of [`two_editors`], `rows` tall, made
+/// against generation `base`.
+fn elements_changed(base: u64, rows: u32) -> aether_client::update::Event {
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::viewport::{ViewportElementsChanged, ViewportElementsChangedParams};
+    let mut elements = two_editors(0, rows)
+        .root
+        .content()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let patch = aether_protocol::viewport::WindowPatch {
+        base,
+        generation: base + 1,
+        max_line_width: 0,
+        git_status: None,
+        other_elements_dirty: false,
+        search: None,
+        elements: vec![elements.remove(1)],
+    };
+    aether_client::update::Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: ViewportElementsChanged::NAME.into(),
+        params: serde_json::to_value(ViewportElementsChangedParams {
+            viewport_id: 7,
+            buffer: 0,
+            revision: 0,
+            patch,
+            cursor: None,
+        })
+        .unwrap(),
+    })
+}
+
+#[test]
+fn a_pushed_patch_replaces_the_elements_it_names() {
+    use aether_client::effect::Effect;
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    s.view.window = Some(two_editors(5, 1));
+
+    let fx = s.on_event(elements_changed(5, 4));
+    assert_eq!(
+        s.view.window,
+        Some(two_editors(6, 4)),
+        "the patched element, and nothing else, should have changed"
+    );
+    assert!(
+        fx.0.iter().any(|e| matches!(e, Effect::WindowAdopted)),
+        "a patched window is a new window to the shells"
+    );
+}
+
+#[test]
+fn a_patch_made_against_another_window_starts_the_view_over() {
+    // Applying it anyway would show a window the server never rendered — some elements from one
+    // generation, some from another.
+    use aether_client::effect::Effect;
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    s.view.window = Some(two_editors(5, 1));
+
+    let fx = s.on_event(elements_changed(4, 4));
+    assert_eq!(
+        s.view.window,
+        Some(two_editors(5, 1)),
+        "the window held is untouched"
+    );
+    assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
+}
+
 #[test]
 fn goto_line_from_end_counts_up_from_the_bottom() {
     use aether_protocol::viewport::Window;
     let mut s = session();
     s.view.window = Some(Window {
+        generation: 0,
         search: None,
         other_elements_dirty: false,
         max_line_width: 0,
@@ -3453,6 +3550,7 @@ fn diff_toggle_toast_is_grouped() {
     // updates one toast instead of stacking on/off pairs.
     let mut s = session();
     let window = Window {
+        generation: 0,
         search: None,
         other_elements_dirty: false,
         max_line_width: 0,
@@ -7574,6 +7672,7 @@ fn abandoning_a_stopped_operation_confirms_and_names_it() {
     use aether_protocol::viewport::Window;
 
     let window = |operation| Window {
+        generation: 0,
         search: None,
         other_elements_dirty: false,
         max_line_width: 0,
@@ -8429,6 +8528,7 @@ fn space_k_refuses_a_view_with_another_element_dirty() {
     s.view.buffer.saved_revision = 3;
     // ...but the view knows something else in it is not.
     s.view.window = Some(aether_protocol::viewport::Window {
+        generation: 0,
         search: None,
         other_elements_dirty: true,
         max_line_width: 0,
@@ -12029,6 +12129,7 @@ fn reader_subscribe(
         buffer_status: Default::default(),
         focus: focus_on(0, buffer_id, 0),
         window: Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
@@ -12051,6 +12152,7 @@ fn editor_subscribe(buffer_id: u64) -> aether_protocol::viewport::ViewportSubscr
         buffer_status: Default::default(),
         focus: focus_on(0, buffer_id, 0),
         window: Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
@@ -14375,6 +14477,7 @@ fn subscribe_over(
         buffer_status: Default::default(),
         focus,
         window: Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,

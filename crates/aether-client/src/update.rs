@@ -139,9 +139,10 @@ use aether_protocol::view::{
 };
 use aether_protocol::viewport::{
     DiagnosticSeverity, Element, FocusStep, FocusTarget, NavigateGrain, ViewSave, ViewSaveParams,
-    ViewportFocusElement, ViewportFocusElementParams, ViewportFocusElementResult,
-    ViewportLinesChanged, ViewportLinesChangedParams, ViewportNavigateChange,
-    ViewportNavigateChangeParams, ViewportSubscribeResult, ViewportWindowResult, WrapMode,
+    ViewportElementsChanged, ViewportElementsChangedParams, ViewportFocusElement,
+    ViewportFocusElementParams, ViewportFocusElementResult, ViewportLinesChanged,
+    ViewportLinesChangedParams, ViewportNavigateChange, ViewportNavigateChangeParams,
+    ViewportSubscribeResult, ViewportWindowResult, WrapMode,
 };
 use aether_protocol::workspace::{
     WorkspaceActivate, WorkspaceActivateParams, WorkspaceActivateResult, WorkspaceAddProject,
@@ -4281,6 +4282,50 @@ impl Session {
         self.search_landing_ready(waiting)
     }
 
+    /// [`Self::replace_window`] for a patch: the content elements that moved, applied to the window
+    /// on screen. `None`, with nothing changed, when the patch was made against another window.
+    ///
+    /// No caret to carry: a patch never changes the tree's shape, so the input is the element it
+    /// was.
+    #[must_use]
+    fn patch_window(&mut self, patch: aether_protocol::viewport::WindowPatch) -> Option<Effects> {
+        let waiting = self.view.search_landing().is_none();
+        let search = patch.search.clone();
+        if !self.view.window.as_mut()?.apply(patch) {
+            return None;
+        }
+        self.adopt_search_summary(search);
+        Some(self.search_landing_ready(waiting))
+    }
+
+    /// What a window push says besides the window, adopted before it lands.
+    ///
+    /// `buffer` is the focused element's buffer as the server saw it — the one buffer this client
+    /// tracks a revision for. It can still differ from ours: a push rendered before a focus move
+    /// landed names the element focus just left, and filing its revision against the new buffer
+    /// would make the next push for it look stale.
+    ///
+    /// Server-side cursor moves with no request in flight (e.g. the clamp a watcher reload applies
+    /// when the file shrank under the cursor) ride the push; adopted before the shells reveal
+    /// against the new window.
+    fn adopt_pushed_state(&mut self, buffer: BufferId, revision: u64, cursor: Option<CursorState>) {
+        if buffer == self.view.buffer.buffer_id {
+            self.view.buffer.revision = revision;
+        }
+        if let Some(cursor) = cursor {
+            self.view.buffer.cursor = cursor;
+        }
+    }
+
+    /// The effects of a pushed window having landed: the shells re-derive their geometry, and a
+    /// reader re-parses — its lines are all in the window.
+    fn window_pushed(&mut self, landed_fx: Effects) -> Effects {
+        let read_fx = self.sync_read_presentation();
+        Effects::one(Effect::WindowAdopted)
+            .and(read_fx)
+            .and(landed_fx)
+    }
+
     /// The reveal a search landing owes now that the window on screen marks it — when it was still
     /// `waiting` for one before. Revealing at the answer would have aimed at the previous search's
     /// marks; this is the first moment the match has a place.
@@ -7521,26 +7566,31 @@ impl Session {
                 // — apply it directly, keep the revision fresh (edits that only arrive this
                 // way, e.g. another client's), and keep the cursor in view under the new
                 // geometry (the shell clamps + reveals).
-                //
-                // `p.buffer` is the focused element's buffer as the server saw it — the one buffer
-                // this client tracks a revision for. It can still differ from ours: a push rendered
-                // before a focus move landed names the element focus just left, and filing its
-                // revision against the new buffer would make the next push for it look stale.
-                if p.buffer == self.view.buffer.buffer_id {
-                    self.view.buffer.revision = p.revision;
-                }
-                // Server-side cursor moves with no request in flight (e.g. the clamp a watcher
-                // reload applies when the file shrank under the cursor) ride the push; adopt
-                // before the shells reveal against the new window.
-                if let Some(cursor) = p.cursor {
-                    self.view.buffer.cursor = cursor;
-                }
+                self.adopt_pushed_state(p.buffer, p.revision, p.cursor);
                 let landed_fx = self.replace_window(p.window);
-                // A reader's lines are all in the window, so this is also its re-parse.
-                let read_fx = self.sync_read_presentation();
-                Effects::one(Effect::WindowAdopted)
-                    .and(read_fx)
-                    .and(landed_fx)
+                self.window_pushed(landed_fx)
+            }
+            // The same push for a change that left the view its shape: only the content elements
+            // that moved, applied to the window this client holds.
+            ViewportElementsChanged::NAME => {
+                let Ok(p) = serde_json::from_value::<ViewportElementsChangedParams>(n.params)
+                else {
+                    return Effects::none();
+                };
+                if Some(p.viewport_id) != self.view.viewport_id {
+                    return Effects::none();
+                }
+                self.adopt_pushed_state(p.buffer, p.revision, p.cursor);
+                match self.patch_window(p.patch) {
+                    Some(landed_fx) => self.window_pushed(landed_fx),
+                    // Made against a window this client does not hold, which only a window it
+                    // dropped could cause. Nothing here can say what the server meant, so the view
+                    // starts over from a fresh subscribe rather than showing a mix of the two.
+                    None => {
+                        tracing::warn!("a window patch did not fit the window held; resubscribing");
+                        Effects::one(Effect::Resubscribe)
+                    }
+                }
             }
             GitBlameChanged::NAME => {
                 // The blame-follow push (`git/set_blame_follow`): the settled cursor line's
@@ -13233,6 +13283,7 @@ mod tests {
     fn prose_window(text: &str) -> aether_protocol::viewport::Window {
         use aether_protocol::viewport::Window;
         Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
@@ -13249,6 +13300,7 @@ mod tests {
     /// loaded — enough to be recognised as not the reader.
     fn editor_window(buffer: BufferId) -> aether_protocol::viewport::Window {
         aether_protocol::viewport::Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,

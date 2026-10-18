@@ -1496,7 +1496,7 @@ async fn a_reply_is_searched_as_it_reads() {
     let open = start_agent(&mut ws).await;
     prompt_and_wait(&mut ws, &server, &open, "hi").await;
     let view = open.opened.view_id;
-    let _: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
+    let sub: ViewportSubscribeResult = send_request::<ViewportSubscribe>(
         &mut ws,
         &ViewportSubscribeParams {
             view_id: view,
@@ -1545,7 +1545,7 @@ async fn a_reply_is_searched_as_it_reads() {
         "a reply holds no cursor to move into it"
     );
     // Marked in the parse the search's repaint carried — prose goes out whole, loaded or not.
-    let window = searched_window(&mut ws).await;
+    let window = searched_window(&mut ws, sub.viewport_id, sub.window).await;
     let marked: Vec<String> = window
         .root
         .content()
@@ -1560,12 +1560,16 @@ async fn a_reply_is_searched_as_it_reads() {
     drop(server);
 }
 
-/// The first repaint carrying a search.
-async fn searched_window(ws: &mut Ws) -> aether_protocol::viewport::Window {
+/// The first repaint carrying a search, brought up from `window` — the one the subscribe answered.
+async fn searched_window(
+    ws: &mut Ws,
+    viewport_id: u64,
+    mut window: aether_protocol::viewport::Window,
+) -> aether_protocol::viewport::Window {
     loop {
-        let p = expect_notification_or_backlog::<ViewportLinesChanged>(ws).await;
-        if p.window.search.is_some() {
-            return p.window;
+        next_pushed_window(ws, viewport_id, &mut window).await;
+        if window.search.is_some() {
+            return window;
         }
     }
 }

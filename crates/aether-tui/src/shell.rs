@@ -3825,6 +3825,7 @@ mod scroll_tests {
             children.push(Element::column(vec![heading, editor]));
         }
         Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
@@ -4353,6 +4354,7 @@ mod scroll_tests {
     fn a_conversation_opens_with_its_input_on_screen() {
         let text: String = (0..40).map(|i| format!("Paragraph {i}.\n\n")).collect();
         let window = Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
@@ -4542,6 +4544,7 @@ mod scroll_tests {
     fn the_readers_measurement_comes_back_with_its_cached_layout() {
         let text = "# Title\n\nFirst para.\n\nSecond para.\n";
         let window = Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,

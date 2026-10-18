@@ -2091,6 +2091,7 @@ mod tests {
     fn window(first_logical: u32, first_row: u32, lines: Vec<LogicalLineRender>) -> Window {
         let loaded: u32 = lines.iter().map(line_rows).sum();
         Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
@@ -4026,6 +4027,7 @@ mod prose_tests {
     /// shell drew. Lines inside one block share that block's offset.
     fn measured_reader() -> (Window, Measured) {
         let window = Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
@@ -4104,6 +4106,7 @@ mod prose_tests {
 
         // The editor of the same file, at the same resolution: line 3 is its fourth wire row.
         let editor = Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,

@@ -520,6 +520,50 @@ pub async fn expect_notification_or_backlog<N: NotificationMethod>(ws: &mut Ws) 
     expect_notification::<N>(ws).await
 }
 
+/// Bring `held` — the window this test holds of `viewport_id` — up to the next window pushed to it,
+/// taking first what a reply-wait read past, as [`expect_notification_or_backlog`] does. A whole
+/// window replaces it; a patch is applied to it the way a client applies one, and a patch that
+/// does not fit it fails the test.
+pub async fn next_pushed_window(ws: &mut Ws, viewport_id: u64, held: &mut Window) {
+    use aether_protocol::viewport::{ViewportElementsChanged, ViewportElementsChangedParams};
+    let mut land = |method: &str, params: serde_json::Value| -> bool {
+        if method == ViewportLinesChanged::NAME {
+            let p: ViewportLinesChangedParams = serde_json::from_value(params).expect("typed");
+            if p.viewport_id == viewport_id {
+                *held = p.window;
+                return true;
+            }
+        } else if method == ViewportElementsChanged::NAME {
+            let p: ViewportElementsChangedParams = serde_json::from_value(params).expect("typed");
+            if p.viewport_id == viewport_id {
+                assert!(
+                    held.apply(p.patch),
+                    "a pushed patch did not fit the window the test held"
+                );
+                return true;
+            }
+        }
+        false
+    };
+    while let Some((method, params)) = ws.backlog.pop_front() {
+        if land(&method, params) {
+            return;
+        }
+    }
+    let wait = async {
+        loop {
+            if let ClientInbound::Notification(n) = ws.next_inbound().await {
+                if land(&n.method, n.params) {
+                    return;
+                }
+            }
+        }
+    };
+    tokio::time::timeout(NOTIFICATION_TIMEOUT, wait)
+        .await
+        .expect("timed out waiting for a window push");
+}
+
 // -------- cursor + input ------------------------------------------------------------------------
 
 pub async fn setup_with_buffer(

@@ -7135,6 +7135,7 @@ fn round_trips<T: serde::Serialize + serde::de::DeserializeOwned>(value: &T) {
 fn sample_window() -> aether_protocol::viewport::Window {
     use aether_protocol::viewport::{Highlight, Segment, Window, WrappedRow};
     Window {
+        generation: 0,
         other_elements_dirty: false,
         search: None,
         max_line_width: 88,
@@ -7170,6 +7171,148 @@ fn sample_window() -> aether_protocol::viewport::Window {
             }],
         },
     }
+}
+
+/// A window says which one it is, and a patch says which window it was made against and what the
+/// window then becomes. Pinned because the web shell receives both through the wasm core and the
+/// browser mirror declares the window's fields by hand.
+#[test]
+fn window_patch_wire_shape() {
+    use aether_protocol::viewport::{
+        ViewportElementsChanged, ViewportElementsChangedParams, Window, WindowPatch,
+    };
+    assert_eq!(ViewportElementsChanged::NAME, "view/elements_changed");
+    let window = Window {
+        generation: 3,
+        ..sample_window()
+    };
+    let v = to_value(&window).unwrap();
+    assert_eq!(v["generation"], 3);
+    assert_eq!(
+        from_value::<Window>(v).unwrap(),
+        window,
+        "the generation survives the round trip"
+    );
+
+    let editor = window.root.clone();
+    let params = ViewportElementsChangedParams {
+        viewport_id: 9,
+        buffer: 7,
+        revision: 2,
+        patch: WindowPatch {
+            base: 3,
+            generation: 4,
+            max_line_width: 88,
+            git_status: None,
+            other_elements_dirty: false,
+            search: None,
+            elements: vec![editor],
+        },
+        cursor: None,
+    };
+    let v = to_value(&params).unwrap();
+    assert_eq!(v["patch"]["base"], 3);
+    assert_eq!(v["patch"]["generation"], 4);
+    assert_eq!(v["patch"]["elements"][0]["node"], "editor");
+    assert!(
+        v["patch"].get("search").is_none(),
+        "absent rather than null"
+    );
+    assert!(v.get("cursor").is_none());
+    let back: ViewportElementsChangedParams = from_value(v).unwrap();
+    assert_eq!(back.patch, params.patch);
+
+    // The browser hand-mirrors the window; `tsc` cannot see a Rust rename.
+    let ts = include_str!("../../../web/src/protocol.ts");
+    assert!(
+        ts.contains("generation?: number"),
+        "web/src/protocol.ts must declare the window's `generation`"
+    );
+}
+
+#[test]
+fn a_patch_applies_only_to_the_window_it_names() {
+    use aether_protocol::viewport::{Window, WindowPatch};
+    let editor = |element: u32, rows: u32| Element::Editor {
+        collapsed: false,
+        element,
+        buffer: 7,
+        rows,
+        first_row: ElementRow(0),
+        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+        role: aether_protocol::ui::ElementRole::Field,
+        first_buffer_line: 0,
+        lines: Vec::new(),
+    };
+    let held = Window {
+        generation: 3,
+        root: Element::column(vec![editor(0, 1), editor(1, 1)]),
+        ..sample_window()
+    };
+    let patch = |base: u64, element: u32| WindowPatch {
+        base,
+        generation: base + 1,
+        max_line_width: 1,
+        git_status: None,
+        other_elements_dirty: true,
+        search: None,
+        elements: vec![editor(element, 5)],
+    };
+
+    let mut window = held.clone();
+    assert!(window.apply(patch(3, 1)));
+    assert_eq!(
+        window,
+        Window {
+            generation: 4,
+            max_line_width: 1,
+            other_elements_dirty: true,
+            root: Element::column(vec![editor(0, 1), editor(1, 5)]),
+            ..held.clone()
+        },
+        "the element it names and the view-wide facts; nothing else"
+    );
+
+    let mut window = held.clone();
+    assert!(
+        !window.apply(patch(2, 1)),
+        "made against another generation"
+    );
+    assert!(
+        !window.apply(patch(3, 9)),
+        "names an element this window does not have"
+    );
+    assert_eq!(window, held, "a patch that does not fit changes nothing");
+}
+
+#[test]
+fn shape_ignores_what_content_elements_hold_and_nothing_else() {
+    let editor = |element: u32, rows: u32| Element::Editor {
+        collapsed: false,
+        element,
+        buffer: 7,
+        rows,
+        first_row: ElementRow(0),
+        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+        role: aether_protocol::ui::ElementRole::Field,
+        first_buffer_line: 0,
+        lines: Vec::new(),
+    };
+    let tree = |rows: u32, heading: &str| {
+        Element::column(vec![Element::text(heading, Vec::new()), editor(0, rows)])
+    };
+    assert!(tree(1, "a.rs").same_shape(&tree(9, "a.rs")));
+    assert!(
+        !tree(1, "a.rs").same_shape(&tree(1, "b.rs")),
+        "chrome is shape"
+    );
+    assert!(
+        !tree(1, "a.rs").same_shape(&Element::column(vec![
+            Element::text("a.rs", Vec::new()),
+            editor(1, 1)
+        ])),
+        "so is which element sits where"
+    );
 }
 
 /// Every rendered row, highlight and diff marker a client ever sees rides this type, and until now
@@ -7588,6 +7731,7 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
 
     let ts = include_str!("../../../web/src/protocol.ts");
     let window = Window {
+        generation: 0,
         other_elements_dirty: false,
         search: Some(aether_protocol::search::SearchSummary {
             view_id: aether_protocol::ViewId(1),
@@ -7653,6 +7797,7 @@ fn the_typescript_mirror_declares_every_field_the_window_puts_on_the_wire() {
 fn every_subscribe_carries_the_focus_it_resolved() {
     use aether_protocol::viewport::{ViewportFocusElementResult, ViewportSubscribeResult, Window};
     let window = || Window {
+        generation: 0,
         other_elements_dirty: false,
         search: None,
         max_line_width: 0,

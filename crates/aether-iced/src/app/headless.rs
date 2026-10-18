@@ -293,6 +293,7 @@ fn folded(element: u32, title: &str) -> ViewElement {
 
 fn window_of(children: Vec<ViewElement>) -> Window {
     Window {
+        generation: 0,
         search: None,
         other_elements_dirty: false,
         max_line_width: 0,

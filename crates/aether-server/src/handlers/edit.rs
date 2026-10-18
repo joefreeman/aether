@@ -1495,8 +1495,9 @@ pub fn collect_lines_changed_pushes(
     pushes
 }
 
-/// The `view/lines_changed` push for one viewport: the whole rendered view, plus **whose** revision
-/// moved.
+/// The push for one viewport after a change: the rendered view — whole as `view/lines_changed`, or
+/// as `view/elements_changed` when only some of its content elements moved — plus **whose**
+/// revision moved.
 ///
 /// `buffer` and `revision` are the **focused element's** — the same buffer the `cursor` beside them
 /// is about. A view is not one buffer, so "the view's revision" is not a well-formed idea, and the
@@ -1518,16 +1519,31 @@ pub fn build_lines_changed_notif(
     let revision = s.doc_of(buffer_id).revision;
     // Over the slices the viewport has loaded, which the edit's line shift has already moved.
     let window = render_window(s, vp, sneak_labels);
-    let params = ViewportLinesChangedParams {
-        viewport_id: vp.id,
-        buffer: buffer_id,
-        revision,
-        window,
-        cursor,
+    let (method, params) = match sent_update(vp, window) {
+        WindowUpdate::Whole(window) => (
+            ViewportLinesChanged::NAME,
+            serde_json::to_value(ViewportLinesChangedParams {
+                viewport_id: vp.id,
+                buffer: buffer_id,
+                revision,
+                window,
+                cursor,
+            }),
+        ),
+        WindowUpdate::Patch(patch) => (
+            aether_protocol::viewport::ViewportElementsChanged::NAME,
+            serde_json::to_value(aether_protocol::viewport::ViewportElementsChangedParams {
+                viewport_id: vp.id,
+                buffer: buffer_id,
+                revision,
+                patch,
+                cursor,
+            }),
+        ),
     };
     Notification {
         jsonrpc: JsonRpc,
-        method: ViewportLinesChanged::NAME.into(),
-        params: serde_json::to_value(params).expect("infallible"),
+        method: method.into(),
+        params: params.expect("infallible"),
     }
 }

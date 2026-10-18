@@ -12161,8 +12161,8 @@ async fn stepping_the_outline_of_a_patch_visits_each_change() {
     drop(server);
 }
 
-/// A `view/lines_changed` push names the buffer under the client's cursor — the focused element's —
-/// and carries that buffer's revision.
+/// A window push names the buffer under the client's cursor — the focused element's — and carries
+/// that buffer's revision. And an edit to one hunk of a patch sends that hunk, not the patch.
 ///
 /// The client tracks a revision for exactly one buffer: the one it is editing. The push used to
 /// name the *view*, which for a composed view is the generated patch, so the client never adopted a
@@ -12171,8 +12171,9 @@ async fn stepping_the_outline_of_a_patch_visits_each_change() {
 /// wrong the other way round: an edit to an unfocused element would file that file's revision
 /// against the focused one.
 #[tokio::test]
-async fn a_lines_changed_push_names_the_focused_elements_buffer() {
+async fn a_window_push_names_the_focused_elements_buffer() {
     use aether_protocol::input::{InputText, InputTextParams};
+    use aether_protocol::viewport::{ViewportElementsChanged, ViewportElementsChangedParams};
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -12232,12 +12233,32 @@ async fn a_lines_changed_push_names_the_focused_elements_buffer() {
         },
     )
     .await;
-    let push: ViewportLinesChangedParams = expect_notification_within::<ViewportLinesChanged>(
-        &mut ws,
-        std::time::Duration::from_secs(5),
-    )
-    .await;
+    let push: ViewportElementsChangedParams =
+        expect_notification_within::<ViewportElementsChanged>(
+            &mut ws,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
     assert_eq!(push.viewport_id, sub.viewport_id);
+    // Only the edited file's element: the other file's hunk is what the client already holds.
+    let sent: Vec<u64> = push
+        .patch
+        .elements
+        .iter()
+        .map(|e| match e {
+            aether_protocol::viewport::Element::Editor { buffer, .. } => *buffer,
+            other => panic!("a patch of an editor view sent {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        vec![focused],
+        "the push re-sent hunks the edit did not touch"
+    );
+    assert!(
+        sub.window.root.content().len() > 1,
+        "the view under test has only one element, which goes out whole"
+    );
     assert_eq!(
         push.buffer, focused,
         "the push is about the buffer under the cursor, not the view it was opened as"

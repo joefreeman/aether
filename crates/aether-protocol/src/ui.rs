@@ -527,6 +527,67 @@ impl Element {
         out
     }
 
+    /// Whether `self` and `other` are the same tree **but for what their content elements hold**:
+    /// the same boxes, chrome and titles in the same places, and a content element wherever the
+    /// other has one, under the same field id.
+    ///
+    /// The question a [`crate::viewport::WindowPatch`] depends on. A patch replaces content
+    /// elements by field id and touches nothing else, so it can only describe a change between two
+    /// trees of the same shape; anything else — a block appended, a title that changed — is a
+    /// different tree, and goes out whole.
+    pub fn same_shape(&self, other: &Element) -> bool {
+        match (self, other) {
+            (
+                Element::Column {
+                    edges,
+                    band,
+                    title,
+                    children,
+                },
+                Element::Column {
+                    edges: other_edges,
+                    band: other_band,
+                    title: other_title,
+                    children: other_children,
+                },
+            ) => {
+                edges == other_edges
+                    && band == other_band
+                    && title == other_title
+                    && same_shapes(children, other_children)
+            }
+            (
+                Element::Row {
+                    edges,
+                    band,
+                    children,
+                },
+                Element::Row {
+                    edges: other_edges,
+                    band: other_band,
+                    children: other_children,
+                },
+            ) => {
+                edges == other_edges && band == other_band && same_shapes(children, other_children)
+            }
+            _ => match (self.field_id(), other.field_id()) {
+                (Some(id), Some(other_id)) => id == other_id,
+                (None, None) => self == other,
+                _ => false,
+            },
+        }
+    }
+
+    /// [`Self::walk`], mutably: every node, parents before their children.
+    pub(crate) fn walk_mut(&mut self, f: &mut impl FnMut(&mut Element)) {
+        f(self);
+        if let Element::Column { children, .. } | Element::Row { children, .. } = self {
+            for child in children {
+                child.walk_mut(f);
+            }
+        }
+    }
+
     fn walk<'a>(&'a self, f: &mut impl FnMut(&'a Element)) {
         f(self);
         match self {
@@ -538,6 +599,14 @@ impl Element {
             _ => {}
         }
     }
+}
+
+fn same_shapes(children: &[Element], others: &[Element]) -> bool {
+    children.len() == others.len()
+        && children
+            .iter()
+            .zip(others)
+            .all(|(child, other)| child.same_shape(other))
 }
 
 /// The cells a container spends on itself: a border, and padding inside it.

@@ -110,6 +110,7 @@ pub async fn viewport_subscribe(
             continuation_marker_width: params.continuation_marker_width,
             loaded,
             anchor,
+            sent: Default::default(),
         },
     );
     // Gutter markers ride `hunks` regardless of the diff toggle; the inline view honours the
@@ -1521,7 +1522,98 @@ pub fn render_viewport(
     viewport_id: aether_protocol::ViewportId,
     sneak_labels: SneakLabels,
 ) -> Window {
-    render_window(s, &s.viewports[&viewport_id], sneak_labels)
+    let vp = &s.viewports[&viewport_id];
+    sent_whole(vp, render_window(s, vp, sneak_labels))
+}
+
+/// What a push sends: the whole window, or only the content elements that changed.
+pub enum WindowUpdate {
+    Whole(Window),
+    Patch(aether_protocol::viewport::WindowPatch),
+}
+
+/// Stamp `window` as the next one `vp`'s client is sent, whole, and record it — what an answer
+/// sends, since the client asked for a window and may hold none.
+pub fn sent_whole(vp: &Viewport, mut window: Window) -> Window {
+    let mut sent = vp
+        .sent
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    window.generation = next_generation(sent.as_ref());
+    *sent = Some(window.clone());
+    window
+}
+
+/// Stamp `window` as the next one `vp`'s client is sent, and say how to send it: only the content
+/// elements that differ from the window the client holds, when the tree kept its shape and that
+/// leaves something out — whole otherwise.
+pub fn sent_update(vp: &Viewport, mut window: Window) -> WindowUpdate {
+    let mut sent = vp
+        .sent
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    window.generation = next_generation(sent.as_ref());
+    let patch = sent
+        .as_ref()
+        .and_then(|before| patch_between(before, &window));
+    match patch {
+        Some(patch) => {
+            // The patch has to rebuild exactly this render from exactly what the client holds:
+            // checked by applying it, as the client will, rather than by reasoning about the diff.
+            #[cfg(debug_assertions)]
+            if let Some(before) = sent.as_ref() {
+                let mut applied = before.clone();
+                assert!(
+                    applied.apply(patch.clone()),
+                    "a patch that does not fit the window it was made against"
+                );
+                assert!(
+                    applied == window,
+                    "a patch that does not rebuild the window it was made from"
+                );
+            }
+            *sent = Some(window);
+            WindowUpdate::Patch(patch)
+        }
+        None => {
+            *sent = Some(window.clone());
+            WindowUpdate::Whole(window)
+        }
+    }
+}
+
+fn next_generation(sent: Option<&Window>) -> u64 {
+    sent.map_or(1, |w| w.generation + 1)
+}
+
+/// The patch that turns `before` into `now`, when one is worth sending: the tree kept its shape,
+/// and some of its content elements are unchanged. A view of one element has nothing to leave out,
+/// and neither does a change that touched every element.
+fn patch_between(before: &Window, now: &Window) -> Option<aether_protocol::viewport::WindowPatch> {
+    if !before.root.same_shape(&now.root) {
+        return None;
+    }
+    let (was, is) = (before.root.content(), now.root.content());
+    let changed: Vec<Element> = was
+        .iter()
+        .zip(&is)
+        .filter(|(was, is)| was != is)
+        .map(|(_, is)| (*is).clone())
+        .collect();
+    if is.len() < 2 || changed.len() == is.len() {
+        return None;
+    }
+    Some(aether_protocol::viewport::WindowPatch {
+        base: before.generation,
+        generation: now.generation,
+        max_line_width: now.max_line_width,
+        git_status: now.git_status.clone(),
+        other_elements_dirty: now.other_elements_dirty,
+        search: now.search.clone(),
+        elements: changed,
+    })
 }
 
 /// Consume the edit's line shift into every view's extents and every viewport's loaded slices,
@@ -2855,6 +2947,9 @@ pub fn render_window(s: &ServerState, vp: &Viewport, sneak_labels: SneakLabels) 
     };
 
     Window {
+        // Stamped as it goes out (`sent_whole`, `sent_update`): a render is not yet a window any
+        // client holds.
+        generation: 0,
         search: search
             .map(|search| crate::view_search::summary(search, vp.view_id, s.view_of(vp), Some(vp))),
         max_line_width,
@@ -3872,8 +3967,127 @@ mod tests {
             // Everything loaded; the render clips each slice to what the element has.
             loaded: vec![Some(0..u32::MAX); elements],
             anchor: ScrollPosition::default(),
+            sent: Default::default(),
             focused: 0,
         }
+    }
+
+    // ---- what a push sends ---------------------------------------------------------------------
+
+    fn set_text(s: &mut ServerState, buffer: BufferId, text: &str) {
+        s.doc_of_mut(buffer).text = ropey::Rope::from_str(text);
+    }
+
+    #[test]
+    fn a_push_after_one_element_changed_sends_only_that_element() {
+        let mut s = ServerState::new();
+        let buffers = vec![
+            buffer_with(&mut s, "/a", "a\n"),
+            buffer_with(&mut s, "/b", "b\n"),
+            buffer_with(&mut s, "/c", "c\n"),
+        ];
+        let vp = viewport_over(&mut s, buffers.clone());
+        let held = sent_whole(&vp, render_window(&s, &vp, SneakLabels::Hidden));
+
+        set_text(&mut s, buffers[1], "B\n");
+        let WindowUpdate::Patch(patch) =
+            sent_update(&vp, render_window(&s, &vp, SneakLabels::Hidden))
+        else {
+            panic!("one element of three changed, and the push sent the window whole");
+        };
+        assert_eq!(
+            patch.base, held.generation,
+            "made against the window the client holds"
+        );
+        let sent: Vec<_> = patch
+            .elements
+            .iter()
+            .filter_map(Element::field_id)
+            .collect();
+        assert_eq!(sent, vec![1], "only the element that changed");
+
+        // And it rebuilds the render exactly, as the client applies it.
+        let mut applied = held.clone();
+        assert!(applied.apply(patch));
+        let mut now = render_window(&s, &vp, SneakLabels::Hidden);
+        now.generation = applied.generation;
+        assert_eq!(applied, now);
+    }
+
+    #[test]
+    fn a_view_of_one_element_goes_out_whole() {
+        let mut s = ServerState::new();
+        let buffer = buffer_with(&mut s, "/a", "a\n");
+        let vp = viewport_over(&mut s, vec![buffer]);
+        let _ = sent_whole(&vp, render_window(&s, &vp, SneakLabels::Hidden));
+        set_text(&mut s, buffer, "A\n");
+        assert!(matches!(
+            sent_update(&vp, render_window(&s, &vp, SneakLabels::Hidden)),
+            WindowUpdate::Whole(_)
+        ));
+    }
+
+    #[test]
+    fn a_tree_that_changed_shape_goes_out_whole() {
+        // Chrome is not a content element, so no patch can carry it: a heading appearing between
+        // two files is a different tree.
+        let mut s = ServerState::new();
+        let buffers = vec![
+            buffer_with(&mut s, "/a", "a\n"),
+            buffer_with(&mut s, "/b", "b\n"),
+            buffer_with(&mut s, "/c", "c\n"),
+        ];
+        let vp = viewport_over(&mut s, buffers);
+        let _ = sent_whole(&vp, render_window(&s, &vp, SneakLabels::Hidden));
+        elements_mut(&mut s, &vp)[1].chrome_before =
+            std::sync::Arc::new(vec![Element::text("b.rs", Vec::new())]);
+        assert!(matches!(
+            sent_update(&vp, render_window(&s, &vp, SneakLabels::Hidden)),
+            WindowUpdate::Whole(_)
+        ));
+    }
+
+    #[test]
+    fn every_window_sent_counts_and_a_patch_names_the_last() {
+        // Answers and pushes share one count: a patch made after an answer is against the answer.
+        let mut s = ServerState::new();
+        let buffers = vec![
+            buffer_with(&mut s, "/a", "a\n"),
+            buffer_with(&mut s, "/b", "b\n"),
+        ];
+        let vp = viewport_over(&mut s, buffers.clone());
+        let first = sent_whole(&vp, render_window(&s, &vp, SneakLabels::Hidden));
+        let answer = sent_whole(&vp, render_window(&s, &vp, SneakLabels::Hidden));
+        assert_eq!(answer.generation, first.generation + 1);
+        set_text(&mut s, buffers[0], "A\n");
+        let WindowUpdate::Patch(patch) =
+            sent_update(&vp, render_window(&s, &vp, SneakLabels::Hidden))
+        else {
+            panic!("expected a patch");
+        };
+        assert_eq!(patch.base, answer.generation);
+        assert_eq!(patch.generation, answer.generation + 1);
+        assert!(
+            !first.clone().apply(patch),
+            "a patch fits only the window it names"
+        );
+    }
+
+    #[test]
+    fn a_copied_viewport_has_sent_nothing() {
+        let mut s = ServerState::new();
+        let buffers = vec![
+            buffer_with(&mut s, "/a", "a\n"),
+            buffer_with(&mut s, "/b", "b\n"),
+        ];
+        let vp = viewport_over(&mut s, buffers.clone());
+        let _ = sent_whole(&vp, render_window(&s, &vp, SneakLabels::Hidden));
+        let copy = vp.clone();
+        set_text(&mut s, buffers[0], "A\n");
+        assert!(matches!(
+            sent_update(&copy, render_window(&s, &copy, SneakLabels::Hidden)),
+            WindowUpdate::Whole(_)
+        ));
     }
 
     /// The elements of the view `vp` presents, to set a test's shape up.

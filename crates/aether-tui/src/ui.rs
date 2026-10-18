@@ -12253,6 +12253,7 @@ mod painter_tests {
             .collect();
         let chrome = |text: &str| UiElement::chrome(vec![UiElement::text(text, Vec::new())]);
         let window = aether_protocol::viewport::Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
@@ -12380,6 +12381,7 @@ mod painter_tests {
     fn two_files_starting_at_the_same_line_each_keep_their_heading() {
         let chrome = |text: &str| UiElement::chrome(vec![UiElement::text(text, Vec::new())]);
         let window = aether_protocol::viewport::Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
@@ -12438,6 +12440,7 @@ mod painter_tests {
         let chrome = |text: &str| UiElement::chrome(vec![UiElement::text(text, Vec::new())]);
         // Both files show lines 10 and 11 — the collision that made one cursor into two.
         let window = aether_protocol::viewport::Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
@@ -12518,6 +12521,7 @@ mod painter_tests {
         let a: Vec<LogicalLineRender> = (16..20).map(|n| line(n, &format!("a{n}"))).collect();
         let b: Vec<LogicalLineRender> = (0..3).map(|n| line(n, &format!("b{n}"))).collect();
         let window = aether_protocol::viewport::Window {
+            generation: 0,
             search: None,
             other_elements_dirty: false,
             max_line_width: 0,
