@@ -7179,7 +7179,7 @@ fn sample_window() -> aether_protocol::viewport::Window {
 #[test]
 fn window_patch_wire_shape() {
     use aether_protocol::viewport::{
-        ViewportElementsChanged, ViewportElementsChangedParams, Window, WindowPatch,
+        ViewportElementsChanged, ViewportElementsChangedParams, Window, WindowChange, WindowPatch,
     };
     assert_eq!(ViewportElementsChanged::NAME, "view/elements_changed");
     let window = Window {
@@ -7206,14 +7206,17 @@ fn window_patch_wire_shape() {
             git_status: None,
             other_elements_dirty: false,
             search: None,
-            elements: vec![editor],
+            change: WindowChange::Elements {
+                elements: vec![editor],
+            },
         },
         cursor: None,
     };
     let v = to_value(&params).unwrap();
     assert_eq!(v["patch"]["base"], 3);
     assert_eq!(v["patch"]["generation"], 4);
-    assert_eq!(v["patch"]["elements"][0]["node"], "editor");
+    assert_eq!(v["patch"]["change"]["kind"], "elements");
+    assert_eq!(v["patch"]["change"]["elements"][0]["node"], "editor");
     assert!(
         v["patch"].get("search").is_none(),
         "absent rather than null"
@@ -7232,7 +7235,7 @@ fn window_patch_wire_shape() {
 
 #[test]
 fn a_patch_applies_only_to_the_window_it_names() {
-    use aether_protocol::viewport::{Window, WindowPatch};
+    use aether_protocol::viewport::{Window, WindowChange, WindowPatch};
     let editor = |element: u32, rows: u32| Element::Editor {
         collapsed: false,
         element,
@@ -7256,7 +7259,9 @@ fn a_patch_applies_only_to_the_window_it_names() {
         git_status: None,
         other_elements_dirty: true,
         search: None,
-        elements: vec![editor(element, 5)],
+        change: WindowChange::Elements {
+            elements: vec![editor(element, 5)],
+        },
     };
 
     let mut window = held.clone();
@@ -7283,6 +7288,155 @@ fn a_patch_applies_only_to_the_window_it_names() {
         "names an element this window does not have"
     );
     assert_eq!(window, held, "a patch that does not fit changes nothing");
+}
+
+#[test]
+fn splices_replace_runs_of_children_and_renumber_the_rest() {
+    use aether_protocol::viewport::{Splice, Window, WindowChange, WindowPatch};
+    let editor = |element: u32| Element::Editor {
+        collapsed: false,
+        element,
+        buffer: 7,
+        rows: 1,
+        first_row: ElementRow(0),
+        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+        role: aether_protocol::ui::ElementRole::Field,
+        first_buffer_line: 0,
+        lines: Vec::new(),
+    };
+    let heading = |text: &str| Element::text(text, Vec::new());
+    let held = Window {
+        generation: 3,
+        root: Element::column(vec![
+            heading("a.rs"),
+            editor(0),
+            heading("b.rs"),
+            editor(1),
+            heading("c.rs"),
+            editor(2),
+        ]),
+        ..sample_window()
+    };
+    // b.rs grew a second hunk and its header changed, and so did the heading above everything.
+    let splice = WindowChange::Splices {
+        splices: vec![
+            Splice {
+                at: 0,
+                remove: 1,
+                insert: vec![heading("a.rs +1")],
+            },
+            Splice {
+                at: 2,
+                remove: 2,
+                insert: vec![heading("b.rs +2"), editor(1), editor(2)],
+            },
+        ],
+    };
+    let v = to_value(&splice).unwrap();
+    assert_eq!(v["kind"], "splices");
+    assert_eq!(v["splices"][1]["at"], 2);
+    assert_eq!(v["splices"][1]["remove"], 2);
+    let patch = |base: u64, change: WindowChange| WindowPatch {
+        base,
+        generation: base + 1,
+        max_line_width: 88,
+        git_status: None,
+        other_elements_dirty: false,
+        search: None,
+        change,
+    };
+
+    let mut window = held.clone();
+    assert!(window.apply(patch(3, splice)));
+    assert_eq!(
+        window.root,
+        Element::column(vec![
+            heading("a.rs +1"),
+            editor(0),
+            heading("b.rs +2"),
+            editor(1),
+            editor(2),
+            heading("c.rs"),
+            editor(3),
+        ]),
+        "c.rs is the element it was, one id along"
+    );
+
+    let mut window = held.clone();
+    let splices = |at: &[(u32, u32)]| WindowChange::Splices {
+        splices: at
+            .iter()
+            .map(|&(at, remove)| Splice {
+                at,
+                remove,
+                insert: Vec::new(),
+            })
+            .collect(),
+    };
+    assert!(
+        !window.apply(patch(3, splices(&[(5, 2)]))),
+        "reaches past the children"
+    );
+    assert!(
+        !window.apply(patch(3, splices(&[(2, 2), (1, 1)]))),
+        "out of order"
+    );
+    assert!(
+        !window.apply(patch(3, splices(&[(1, 2), (2, 1)]))),
+        "overlapping"
+    );
+    assert_eq!(window, held);
+}
+
+/// Windows land in the order they were rendered: older ones are dropped, a patch ahead of its
+/// window waits for it, and a chain of waiting patches lands in turn once the window they start
+/// from arrives.
+#[test]
+fn windows_land_in_the_order_they_were_rendered() {
+    use aether_protocol::viewport::{Landed, Window, WindowChange, WindowOrder, WindowPatch};
+    let editor = |rows: u32| Element::Editor {
+        collapsed: false,
+        element: 0,
+        buffer: 7,
+        rows,
+        first_row: ElementRow(0),
+        laid_out_by: aether_protocol::ui::LayoutOwner::Server,
+        role: aether_protocol::ui::ElementRole::Field,
+        first_buffer_line: 0,
+        lines: Vec::new(),
+    };
+    let window = |generation: u64, rows: u32| Window {
+        generation,
+        root: Element::column(vec![editor(rows), Element::text("x", Vec::new())]),
+        ..sample_window()
+    };
+    let patch = |base: u64, rows: u32| WindowPatch {
+        base,
+        generation: base + 1,
+        max_line_width: 88,
+        git_status: None,
+        other_elements_dirty: false,
+        search: None,
+        change: WindowChange::Elements {
+            elements: vec![editor(rows)],
+        },
+    };
+
+    let mut order = WindowOrder::default();
+    let mut held = Some(window(5, 1));
+    assert_eq!(order.whole(&mut held, window(4, 9)), Landed::Stale);
+    assert_eq!(order.patch(&mut held, patch(4, 9)), Landed::Stale);
+    assert_eq!(held, Some(window(5, 1)));
+
+    // Two patches overtake the window they build on, the later one first.
+    assert_eq!(order.patch(&mut held, patch(7, 3)), Landed::Waiting);
+    assert_eq!(order.patch(&mut held, patch(6, 2)), Landed::Waiting);
+    assert_eq!(order.whole(&mut held, window(6, 1)), Landed::Changed);
+    assert_eq!(held, Some(window(8, 3)), "both, in turn");
+
+    // A window with no generation was never stamped, and always lands.
+    assert_eq!(order.whole(&mut held, window(0, 4)), Landed::Changed);
+    assert_eq!(held, Some(window(0, 4)));
 }
 
 #[test]

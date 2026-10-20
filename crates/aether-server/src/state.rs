@@ -60,6 +60,11 @@ pub struct ServerState {
     /// Whether [`crate::watcher::schedule_working_changes_refresh`]'s drain task is running; it
     /// owns [`Self::working_changes_pending`] until it finds it empty.
     pub working_changes_draining: bool,
+    /// Each repo's per-file diffs from its working-changes view's last generation, kept so the next
+    /// one diffs only the files that changed — see [`crate::patch::DiffCache`]. Shared with the
+    /// blocking task that generates, hence the mutex; dropped once no view of the repo is open.
+    pub working_changes_diffs:
+        HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<crate::patch::DiffCache>>>,
     /// Long-running git operations currently in flight, keyed by canonicalized workdir — at most
     /// one per repo, since they all contend for the same refs anyway.
     ///
@@ -843,6 +848,7 @@ impl ServerState {
             watcher: None,
             git_suppressed: std::collections::HashSet::new(),
             working_changes_pending: std::collections::HashSet::new(),
+            working_changes_diffs: HashMap::new(),
             working_changes_draining: false,
             git_operations: HashMap::new(),
             worktree_locks: HashMap::new(),
@@ -2737,6 +2743,11 @@ impl ServerState {
         self.diagnostics.remove(&id);
         self.document_symbols.remove(&id);
         self.drop_buffer_from_mru(id);
+        // A repo whose last working-changes view this was keeps no diffs: its next view generates
+        // from scratch. Here rather than on a rebuild, which a repo with no view open never gets.
+        let open = crate::handlers::working_changes_repos(self);
+        self.working_changes_diffs
+            .retain(|workdir, _| open.contains(workdir));
         stopped_server
     }
 

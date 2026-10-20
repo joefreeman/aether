@@ -12241,9 +12241,10 @@ async fn a_window_push_names_the_focused_elements_buffer() {
         .await;
     assert_eq!(push.viewport_id, sub.viewport_id);
     // Only the edited file's element: the other file's hunk is what the client already holds.
-    let sent: Vec<u64> = push
-        .patch
-        .elements
+    let aether_protocol::viewport::WindowChange::Elements { elements } = &push.patch.change else {
+        panic!("typing kept the view's shape, and the push spliced it");
+    };
+    let sent: Vec<u64> = elements
         .iter()
         .map(|e| match e {
             aether_protocol::viewport::Element::Editor { buffer, .. } => *buffer,
@@ -13750,4 +13751,49 @@ async fn a_version_is_named_by_its_working_files_root() {
     assert_eq!(row, ("src/x.rs".into(), Some(1), None, None));
 
     drop(server);
+}
+
+#[tokio::test]
+async fn closing_the_working_changes_view_drops_its_diffs() {
+    // Each file's diff is kept between rebuilds of the view. With the view gone nothing rebuilds,
+    // so nothing else would ever let go of them.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = init_repo_at(&root);
+    commit_file(&repo, "a.rs", "fn a() {}\n");
+    std::fs::write(root.join("a.rs"), "fn A() {}\n").unwrap();
+    let (server, mut ws) = setup_repos_workspace(vec![root.clone()]).await;
+    let patch = show_buffer(
+        &mut ws,
+        &GitShowParams {
+            repo_id: Some(root.to_string_lossy().into_owned()),
+            buffer_id: None,
+            target: ShowTarget::WorkingChanges,
+            focus_path: None,
+            record_nav_from: None,
+        },
+    )
+    .await;
+    assert!(
+        server
+            .state
+            .lock()
+            .await
+            .working_changes_diffs
+            .contains_key(&root),
+        "the open view keeps its diffs"
+    );
+
+    let _: ViewCloseResult = send_request::<ViewClose>(
+        &mut ws,
+        &ViewCloseParams {
+            view_id: patch.view_id,
+            open_next: true,
+        },
+    )
+    .await;
+    assert!(
+        server.state.lock().await.working_changes_diffs.is_empty(),
+        "a closed view's diffs outlived it"
+    );
 }

@@ -328,10 +328,11 @@ async fn a_streamed_turn_pushes_once_per_flush_not_once_per_block() {
     let events = script.steps.len();
     let (server, mut ws, _dir, _t) = setup(script).await;
     let open = start_agent(&mut ws).await;
-    let (viewport_id, _) = window_of(&mut ws, open.opened.view_id).await;
+    let (viewport_id, window) = window_of(&mut ws, open.opened.view_id).await;
+    ws.clear_seen();
+    let mut held = HeldWindow::new(viewport_id, window);
     let input = input_buffer_of(&server, &open).await;
     type_prompt(&mut ws, input, "go").await;
-    ws.clear_seen();
     let _: AgentPromptResult = send_request::<AgentPrompt>(
         &mut ws,
         &AgentPromptParams {
@@ -339,50 +340,31 @@ async fn a_streamed_turn_pushes_once_per_flush_not_once_per_block() {
         },
     )
     .await;
-    wait_for_idle(&server, open.opened.view_id).await;
 
-    // The turn ending is applied before its flush goes out, so read until a push carries the end.
-    let carries_the_end = |p: &ViewportLinesChangedParams| {
-        p.viewport_id == viewport_id
-            && p.window.root.content().iter().any(|e| {
-                matches!(e, aether_protocol::viewport::Element::Prose { blocks, .. }
-                    if serde_json::to_string(blocks).unwrap().contains("The last word."))
-            })
+    // Every window the viewport is pushed, rebuilt as a client rebuilds it, until one carries the
+    // end of the turn — which a dropped flush would never deliver.
+    let carries_the_end = |w: &aether_protocol::viewport::Window| {
+        w.root.content().iter().any(|e| {
+            matches!(e, aether_protocol::viewport::Element::Prose { blocks, .. }
+                if serde_json::to_string(blocks).unwrap().contains("The last word."))
+        })
     };
-    for _ in 0..400 {
-        if ws.saw::<ViewportLinesChanged>().iter().any(carries_the_end) {
-            break;
+    let (mut pushes, mut repeats) = (0, 0);
+    while !carries_the_end(held.window()) {
+        let mut before = held.window().clone();
+        held.next_push(&mut ws).await;
+        pushes += 1;
+        // However many events a flush drained, it renders each viewport once: a render asked for
+        // per block arrives as a run of windows that differ in nothing but their generation.
+        before.generation = held.window().generation;
+        if &before == held.window() {
+            repeats += 1;
         }
-        let _ = input_text(&mut ws, input).await;
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    let pushes: Vec<_> = ws
-        .saw::<ViewportLinesChanged>()
-        .into_iter()
-        .filter(|p| p.viewport_id == viewport_id)
-        .collect();
-    let last = pushes.last().expect("the turn pushed nothing");
-    assert!(
-        carries_the_end(last),
-        "the last push is missing the end of the turn"
-    );
-    // The prompt's own block and the input clearing, then at most one per event.
-    assert!(
-        pushes.len() <= events + 4,
-        "{} pushes for {events} events",
-        pushes.len()
-    );
-    // However many events a flush drained, it renders each viewport once: a render asked for per
-    // block arrives as a run of identical windows. One repeat is honest — the turn ending can
-    // change nothing a conversation of plain replies shows.
-    let raw: Vec<serde_json::Value> = ws
-        .seen_raw(ViewportLinesChanged::NAME)
-        .into_iter()
-        .filter(|p| p["viewport_id"] == serde_json::json!(viewport_id))
-        .collect();
-    let repeats = raw.windows(2).filter(|w| w[0] == w[1]).count();
-    assert!(
-        repeats <= 1,
+    // The input taking the prompt and giving it up, then at most one per event.
+    assert!(pushes <= events + 4, "{pushes} pushes for {events} events");
+    assert_eq!(
+        repeats, 0,
         "{repeats} pushes repeated the window before them: a push per block, not per viewport"
     );
 }
@@ -1564,12 +1546,13 @@ async fn a_reply_is_searched_as_it_reads() {
 async fn searched_window(
     ws: &mut Ws,
     viewport_id: u64,
-    mut window: aether_protocol::viewport::Window,
+    window: aether_protocol::viewport::Window,
 ) -> aether_protocol::viewport::Window {
+    let mut held = HeldWindow::new(viewport_id, window);
     loop {
-        next_pushed_window(ws, viewport_id, &mut window).await;
-        if window.search.is_some() {
-            return window;
+        held.next_push(ws).await;
+        if held.window().search.is_some() {
+            return held.window().clone();
         }
     }
 }

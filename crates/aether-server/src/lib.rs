@@ -58,6 +58,16 @@ pub use server::{
 };
 pub use status::{app_info, fetch_status};
 
+/// The internals `tests/push_cost.rs` times directly: what one push costs to build, render and
+/// diff, measured where it happens rather than inferred from round trips. Not an API.
+#[doc(hidden)]
+pub mod bench {
+    pub use crate::handlers::{
+        collect_lines_changed_pushes, refresh_working_changes_views, render_window, sent_whole,
+        SneakLabels,
+    };
+}
+
 /// **Test seam.** Run one background fetch — the periodic fetcher's exact path — without waiting
 /// for its timer.
 ///

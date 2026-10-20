@@ -948,7 +948,10 @@ fn close_last_box(layout: &mut [crate::state::ElementLayout]) {
 /// The shape of a diff: which files it touches, and which line ranges of each.
 #[cfg(test)]
 pub fn plan_diff(diff: &git2::Diff<'_>) -> Result<PatchPlan, String> {
-    plan_diff_keeping_patches(diff).map(|(plan, _)| plan)
+    let files = read_diff(diff, None)?;
+    Ok(PatchPlan {
+        files: files.iter().map(|f| f.planned.clone()).collect(),
+    })
 }
 
 /// The order a patch shows its deltas in: **directory by directory**, each directory's own files
@@ -988,112 +991,420 @@ pub fn split_dir(path: &str) -> (&str, &str) {
     }
 }
 
-/// [`plan_diff`], handing back the per-delta [`git2::Patch`] it walked as well, each with the index
-/// of the delta it is for — planned in [`delta_order`], which is not the diff's own.
+/// One delta, read out of libgit2 into data this module owns: its plan, and every line of every
+/// hunk with what rendering needs to know about the delta itself.
 ///
-/// Materialising a patch is where libgit2 runs the file's line diff, so it is the expensive half
-/// of planning — and rendering needs the same patches for the same deltas, in the same order.
-/// Planning keeps them rather than have rendering diff every file a second time.
-#[allow(clippy::type_complexity)]
-fn plan_diff_keeping_patches<'d>(
-    diff: &'d git2::Diff<'_>,
-) -> Result<(PatchPlan, Vec<(usize, Option<git2::Patch<'d>>)>), String> {
-    let mut files = Vec::new();
-    let mut patches = Vec::new();
-    for idx in delta_order(diff) {
-        let delta = diff.get_delta(idx).expect("an index under the delta count");
-        let patch = git2::Patch::from_diff(diff, idx).map_err(|e| e.message().to_string())?;
-        let hunk_count = patch.as_ref().map(|p| p.num_hunks()).unwrap_or(0);
-        let (_, added, removed) = patch
-            .as_ref()
-            .and_then(|p| p.line_stats().ok())
-            .unwrap_or((0, 0, 0));
-        let binary = delta.flags().is_binary();
+/// Owned so it can outlive the diff it came from. Reading a delta is where libgit2 runs the file's
+/// line diff — nearly all of what generating a patch costs — and a working-changes view is
+/// regenerated on every write under the repo, almost always with one file different. A
+/// [`DiffCache`] keeps these between rebuilds so the other files are not diffed again.
+#[derive(Debug)]
+pub struct FileDiff {
+    planned: PlannedFile,
+    old_id: git2::Oid,
+    new_id: git2::Oid,
+    old_mode: git2::FileMode,
+    new_mode: git2::FileMode,
+    old_size: u64,
+    new_size: u64,
+    binary: bool,
+    hunks: Vec<HunkLines>,
+}
 
-        let mut status = match delta.status() {
-            git2::Delta::Added => PatchFileStatus::Added,
-            git2::Delta::Deleted => PatchFileStatus::Deleted,
-            git2::Delta::Renamed => PatchFileStatus::Renamed,
-            git2::Delta::Copied => PatchFileStatus::Copied,
-            _ => PatchFileStatus::Modified,
-        };
-        // Refined by what the diff actually produced, which the delta's own status doesn't say: a
-        // `chmod` and a binary swap both arrive as plain `Modified` with nothing to show.
-        if binary {
-            status = PatchFileStatus::Binary;
-        } else if hunk_count == 0
-            && delta.old_file().mode() != delta.new_file().mode()
-            && matches!(status, PatchFileStatus::Modified)
-        {
-            status = PatchFileStatus::ModeChanged;
+/// One hunk of a [`FileDiff`]: libgit2's header and its lines, `+`, `-` and context only.
+#[derive(Debug)]
+struct HunkLines {
+    header: String,
+    old_start: u32,
+    old_lines: u32,
+    new_start: u32,
+    new_lines: u32,
+    lines: Vec<HunkLine>,
+}
+
+/// Per-file diffs kept between rebuilds of a working-changes view — see [`FileDiff`].
+///
+/// Keyed by everything a file's diff is a function of (see [`DeltaKey`]), so a hit is the diff
+/// libgit2 would have produced and nothing has to say which files changed: a write the watcher
+/// missed, a stage, a commit, a baseline moved — each changes a key or it changes nothing. Holds
+/// only what the last rebuild used, so it is never larger than the current set of changes.
+#[derive(Default)]
+pub struct DiffCache {
+    files: HashMap<DeltaKey, std::sync::Arc<FileDiff>>,
+    index_attributes: Option<IndexAttributes>,
+}
+
+/// What a working-tree delta's diff depends on: which change it is, between which paths, from
+/// which blob to which content, under which modes.
+///
+/// The working-tree side has no id from libgit2 (it never hashes the files it diffs), so it is
+/// keyed by its bytes, read and hashed here. That is the bytes libgit2 diffs only when no filter
+/// rewrites them on the way in — line-ending conversion, `ident`, a filter driver, a textconv —
+/// so a file one could apply to has no key, and is diffed afresh every time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DeltaKey {
+    status: u8,
+    old_path: Option<String>,
+    new_path: Option<String>,
+    old_id: git2::Oid,
+    old_mode: i32,
+    new_mode: i32,
+    content: git2::Oid,
+}
+
+impl DeltaKey {
+    /// The key of the working-tree delta `delta`, or `None` when its diff could depend on
+    /// something the key cannot see. `env` is what the repository says about filtering as a whole
+    /// — see [`FilterEnv`].
+    fn of(repo: &git2::Repository, delta: &git2::DiffDelta<'_>, env: FilterEnv) -> Option<Self> {
+        if env == FilterEnv::ConvertsEverything {
+            return None;
         }
-
-        let mut regions = Vec::with_capacity(hunk_count);
-        if let Some(patch) = patch.as_ref() {
-            for h in 0..hunk_count {
-                let (hunk, _) = patch.hunk(h).map_err(|e| e.message().to_string())?;
-                let mut added = Vec::new();
-                let mut removed: Vec<(u32, String)> = Vec::new();
-                // Removals have no line of their own on the new side, so each waits for the next
-                // line that does and anchors above it.
-                let mut pending: Vec<String> = Vec::new();
-                let line_count = patch
-                    .num_lines_in_hunk(h)
-                    .map_err(|e| e.message().to_string())?;
-                for l in 0..line_count {
-                    let line = patch
-                        .line_in_hunk(h, l)
-                        .map_err(|e| e.message().to_string())?;
-                    let text = || {
-                        String::from_utf8_lossy(line.content())
-                            .trim_end_matches('\n')
-                            .to_string()
-                    };
-                    match line.origin() {
-                        '+' => {
-                            if let Some(n) = line.new_lineno() {
-                                added.push(n);
-                                removed.extend(pending.drain(..).map(|t| (n, t)));
-                            }
-                        }
-                        ' ' => {
-                            if let Some(n) = line.new_lineno() {
-                                removed.extend(pending.drain(..).map(|t| (n, t)));
-                            }
-                        }
-                        '-' => pending.push(text()),
-                        // `=`, `>`, `<` are "\ No newline at end of file" markers — an artefact of
-                        // the patch *format*, which this view deliberately isn't.
-                        _ => {}
-                    }
+        let new_path = path_of(&delta.new_file());
+        let content = match delta.status() {
+            git2::Delta::Deleted => git2::Oid::ZERO_SHA1,
+            _ => {
+                let path = new_path.as_deref()?;
+                let filtered = env == FilterEnv::AttributesExist
+                    && FILTERING_ATTRIBUTES.iter().any(|attr| {
+                        repo.get_attr(
+                            std::path::Path::new(path),
+                            attr,
+                            git2::AttrCheckFlags::FILE_THEN_INDEX,
+                        )
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    });
+                if filtered {
+                    return None;
                 }
-                // Anything still pending was removed from the end of the hunk, so it anchors one
-                // past the last new-side line it could sit above.
-                let tail = hunk.new_start() + hunk.new_lines();
-                removed.extend(pending.into_iter().map(|t| (tail, t)));
+                let on_disk = repo.workdir()?.join(path);
+                // A symlink's content is where it points, which is what libgit2 diffs — not the
+                // bytes of the file it points at.
+                let bytes = if delta.new_file().mode() == git2::FileMode::Link {
+                    std::fs::read_link(&on_disk)
+                        .ok()?
+                        .to_str()?
+                        .as_bytes()
+                        .to_vec()
+                } else {
+                    std::fs::read(&on_disk).ok()?
+                };
+                git2::Oid::hash_object(git2::ObjectType::Blob, &bytes).ok()?
+            }
+        };
+        Some(DeltaKey {
+            status: delta.status() as u8,
+            old_path: path_of(&delta.old_file()),
+            new_path,
+            old_id: delta.old_file().id(),
+            old_mode: i32::from(delta.old_file().mode()),
+            new_mode: i32::from(delta.new_file().mode()),
+            content,
+        })
+    }
+}
 
-                regions.push(PlannedRegion {
-                    old_start: hunk.old_start(),
-                    old_lines: hunk.old_lines(),
-                    new_start: hunk.new_start(),
-                    new_lines: hunk.new_lines(),
-                    added,
-                    removed,
+/// The attributes that make a file's diff something other than a diff of its bytes on disk: the
+/// ones that convert it on the way in (`text`, `eol`, `crlf`, `ident`, `filter`) and the one that
+/// chooses how it is diffed (`diff`: binary, a textconv, a hunk-header driver).
+const FILTERING_ATTRIBUTES: [&str; 6] = ["text", "eol", "crlf", "ident", "filter", "diff"];
+
+/// What a repository says about filtering for every file at once, decided once per generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterEnv {
+    /// `core.autocrlf` is on: every file's bytes are converted before they are diffed.
+    ConvertsEverything,
+    /// Some attributes file exists where libgit2 would read one, so each file's own attributes
+    /// have to be asked for.
+    AttributesExist,
+    /// Neither: no file's diff is anything but a diff of its bytes.
+    Plain,
+}
+
+impl FilterEnv {
+    /// Decided from files rather than by asking libgit2 for each file's attributes, which costs a
+    /// lookup per attribute per file — most of what a rebuild of a large view cost once the diffs
+    /// themselves were cached — to learn, nearly always, that there are none.
+    ///
+    /// Attributes come from the files libgit2 reads them from: the repository's own
+    /// `info/attributes`, the user's (`core.attributesFile`, else the XDG one), the system's (beside
+    /// the system config), and a `.gitattributes` in any directory above a file — on disk or in the
+    /// index. With none of those present, no attribute is set for any path.
+    ///
+    /// `index` remembers the answer for the index, which is a walk of every entry; it is asked
+    /// again only once the index file has changed.
+    fn of<'a>(
+        repo: &git2::Repository,
+        paths: impl Iterator<Item = &'a str>,
+        index: &mut Option<IndexAttributes>,
+    ) -> Self {
+        let Ok(config) = repo.config() else {
+            return FilterEnv::ConvertsEverything;
+        };
+        match config.get_string("core.autocrlf") {
+            Ok(value) if !value.eq_ignore_ascii_case("false") => {
+                return FilterEnv::ConvertsEverything
+            }
+            Err(e) if e.code() != git2::ErrorCode::NotFound => {
+                return FilterEnv::ConvertsEverything
+            }
+            _ => {}
+        }
+        let exists = |p: &std::path::Path| p.exists();
+        let user = config.get_path("core.attributesFile").ok().or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config"))
+                })
+                .map(|d| d.join("git").join("attributes"))
+        });
+        let system = git2::Config::find_system()
+            .ok()
+            .and_then(|c| c.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| std::path::PathBuf::from("/etc"))
+            .join("gitattributes");
+        // `info/` is shared by every worktree of a repository: a linked one's own git directory
+        // has none, and libgit2 reads the main one's.
+        if exists(&repo.commondir().join("info").join("attributes"))
+            || user.as_deref().is_some_and(exists)
+            || exists(&system)
+        {
+            return FilterEnv::AttributesExist;
+        }
+        let stamp = std::fs::metadata(repo.path().join("index"))
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len())));
+        let in_index = match (*index, stamp) {
+            (Some(known), Some((modified, len)))
+                if (known.modified, known.len) == (modified, len) =>
+            {
+                known.found
+            }
+            _ => {
+                let found = repo.index().ok().is_some_and(|index| {
+                    index.iter().any(|e| {
+                        let path = String::from_utf8_lossy(&e.path);
+                        path == ".gitattributes" || path.ends_with("/.gitattributes")
+                    })
                 });
+                *index = stamp.map(|(modified, len)| IndexAttributes {
+                    modified,
+                    len,
+                    found,
+                });
+                found
+            }
+        };
+        if in_index {
+            return FilterEnv::AttributesExist;
+        }
+        let Some(workdir) = repo.workdir() else {
+            return FilterEnv::AttributesExist;
+        };
+        let mut checked = std::collections::HashSet::new();
+        for path in paths {
+            let mut dir = std::path::Path::new(path).parent();
+            while let Some(d) = dir {
+                if !checked.insert(d.to_path_buf()) {
+                    break; // this directory and everything above it are already known
+                }
+                if exists(&workdir.join(d).join(".gitattributes")) {
+                    return FilterEnv::AttributesExist;
+                }
+                dir = d.parent();
             }
         }
+        FilterEnv::Plain
+    }
+}
 
-        files.push(PlannedFile {
+/// Whether the index holds a `.gitattributes` anywhere, as of the index file's modification time
+/// and size — see [`FilterEnv::of`].
+#[derive(Debug, Clone, Copy)]
+struct IndexAttributes {
+    modified: std::time::SystemTime,
+    len: u64,
+    found: bool,
+}
+
+/// Every delta of `diff`, read in [`delta_order`] — from `cache` where it holds the delta's diff
+/// already, which it is then left holding exactly the deltas of this diff.
+fn read_diff(
+    diff: &git2::Diff<'_>,
+    cache: Option<(&git2::Repository, &mut DiffCache)>,
+) -> Result<Vec<std::sync::Arc<FileDiff>>, String> {
+    let mut files = Vec::with_capacity(diff.deltas().len());
+    match cache {
+        None => {
+            for idx in delta_order(diff) {
+                files.push(std::sync::Arc::new(read_delta(diff, idx)?));
+            }
+        }
+        Some((repo, cache)) => {
+            let env = FilterEnv::of(
+                repo,
+                diff.deltas()
+                    .filter_map(|d| d.new_file().path().and_then(|p| p.to_str())),
+                &mut cache.index_attributes,
+            );
+            let mut kept = HashMap::with_capacity(diff.deltas().len());
+            for idx in delta_order(diff) {
+                let delta = diff.get_delta(idx).expect("an index under the delta count");
+                let mut key = DeltaKey::of(repo, &delta, env);
+                let file = match key.as_ref().and_then(|k| cache.files.get(k)) {
+                    Some(file) => file.clone(),
+                    None => {
+                        let file = std::sync::Arc::new(read_delta(diff, idx)?);
+                        // The key hashed the file's bytes, and libgit2 then read them again to
+                        // diff them: a write between the two would file this diff under bytes it
+                        // is not of. libgit2 names what it read, so the two are compared, and a
+                        // diff they disagree on is not kept.
+                        if key
+                            .as_ref()
+                            .is_some_and(|k| !k.content.is_zero() && k.content != file.new_id)
+                        {
+                            key = None;
+                        }
+                        file
+                    }
+                };
+                if let Some(key) = key {
+                    kept.insert(key, file.clone());
+                }
+                files.push(file);
+            }
+            cache.files = kept;
+        }
+    }
+    Ok(files)
+}
+
+/// Read delta `idx` of `diff`: run its line diff and keep what came out.
+fn read_delta(diff: &git2::Diff<'_>, idx: usize) -> Result<FileDiff, String> {
+    let delta = diff.get_delta(idx).expect("an index under the delta count");
+    let patch = git2::Patch::from_diff(diff, idx).map_err(|e| e.message().to_string())?;
+    let hunk_count = patch.as_ref().map(|p| p.num_hunks()).unwrap_or(0);
+    let (_, added, removed) = patch
+        .as_ref()
+        .and_then(|p| p.line_stats().ok())
+        .unwrap_or((0, 0, 0));
+    let binary = delta.flags().is_binary();
+
+    let mut status = match delta.status() {
+        git2::Delta::Added => PatchFileStatus::Added,
+        git2::Delta::Deleted => PatchFileStatus::Deleted,
+        git2::Delta::Renamed => PatchFileStatus::Renamed,
+        git2::Delta::Copied => PatchFileStatus::Copied,
+        _ => PatchFileStatus::Modified,
+    };
+    // Refined by what the diff actually produced, which the delta's own status doesn't say: a
+    // `chmod` and a binary swap both arrive as plain `Modified` with nothing to show.
+    if binary {
+        status = PatchFileStatus::Binary;
+    } else if hunk_count == 0
+        && delta.old_file().mode() != delta.new_file().mode()
+        && matches!(status, PatchFileStatus::Modified)
+    {
+        status = PatchFileStatus::ModeChanged;
+    }
+
+    let mut regions = Vec::with_capacity(hunk_count);
+    let mut hunks = Vec::with_capacity(hunk_count);
+    if let Some(patch) = patch.as_ref() {
+        for h in 0..hunk_count {
+            let (hunk, _) = patch.hunk(h).map_err(|e| e.message().to_string())?;
+            let mut lines: Vec<HunkLine> = Vec::new();
+            let mut added = Vec::new();
+            let mut removed: Vec<(u32, String)> = Vec::new();
+            // Removals have no line of their own on the new side, so each waits for the next
+            // line that does and anchors above it.
+            let mut pending: Vec<String> = Vec::new();
+            let line_count = patch
+                .num_lines_in_hunk(h)
+                .map_err(|e| e.message().to_string())?;
+            for l in 0..line_count {
+                let line = patch
+                    .line_in_hunk(h, l)
+                    .map_err(|e| e.message().to_string())?;
+                let text = String::from_utf8_lossy(line.content())
+                    .trim_end_matches('\n')
+                    .to_string();
+                let side = match line.origin() {
+                    '+' => {
+                        if let Some(n) = line.new_lineno() {
+                            added.push(n);
+                            removed.extend(pending.drain(..).map(|t| (n, t)));
+                        }
+                        Some(PatchLine::Added)
+                    }
+                    ' ' => {
+                        if let Some(n) = line.new_lineno() {
+                            removed.extend(pending.drain(..).map(|t| (n, t)));
+                        }
+                        None
+                    }
+                    '-' => {
+                        pending.push(text.clone());
+                        Some(PatchLine::Removed)
+                    }
+                    // `=`, `>`, `<` are "\ No newline at end of file" markers — an artefact of
+                    // the patch *format*, which this view deliberately isn't.
+                    _ => continue,
+                };
+                lines.push(HunkLine {
+                    text,
+                    side,
+                    old_lineno: line.old_lineno(),
+                    new_lineno: line.new_lineno(),
+                });
+            }
+            // Anything still pending was removed from the end of the hunk, so it anchors one
+            // past the last new-side line it could sit above.
+            let tail = hunk.new_start() + hunk.new_lines();
+            removed.extend(pending.into_iter().map(|t| (tail, t)));
+
+            regions.push(PlannedRegion {
+                old_start: hunk.old_start(),
+                old_lines: hunk.old_lines(),
+                new_start: hunk.new_start(),
+                new_lines: hunk.new_lines(),
+                added,
+                removed,
+            });
+            hunks.push(HunkLines {
+                header: String::from_utf8_lossy(hunk.header())
+                    .trim_end_matches('\n')
+                    .to_string(),
+                old_start: hunk.old_start(),
+                old_lines: hunk.old_lines(),
+                new_start: hunk.new_start(),
+                new_lines: hunk.new_lines(),
+                lines,
+            });
+        }
+    }
+
+    Ok(FileDiff {
+        planned: PlannedFile {
             old_path: path_of(&delta.old_file()),
             new_path: path_of(&delta.new_file()),
             status,
             added: added as u32,
             removed: removed as u32,
             regions,
-        });
-        patches.push((idx, patch));
-    }
-    Ok((PatchPlan { files }, patches))
+        },
+        old_id: delta.old_file().id(),
+        new_id: delta.new_file().id(),
+        old_mode: delta.old_file().mode(),
+        new_mode: delta.new_file().mode(),
+        old_size: delta.old_file().size(),
+        new_size: delta.new_file().size(),
+        binary,
+        hunks,
+    })
 }
 
 /// The patch's opening caption — `N files changed  +A  −B`, plus `since <rev>` when the working
@@ -1146,23 +1457,28 @@ fn emit_summary(b: &mut PatchBuilder, plan: &PatchPlan, since: Option<&str>) {
 ///
 /// An empty diff renders nothing at all — not even the caption — so a caller with something to say
 /// about the emptiness says it in place of the diff.
+/// `cache` keeps each file's diff between calls (see [`DiffCache`]): the working-changes view passes
+/// one, since it is regenerated on every write under the repo; a commit, shown once, passes none.
 pub fn render_diff(
     repo: &git2::Repository,
     diff: &git2::Diff<'_>,
     b: &mut PatchBuilder,
     against_worktree: bool,
     since: Option<&str>,
+    cache: Option<&mut DiffCache>,
 ) -> Result<(), String> {
     // The shape first, then the text. One source of truth for what each delta *is*: the driver will
     // build its elements from this same plan, and a second copy of the status refinement here is
     // exactly the kind of thing that drifts.
-    let (plan, patches) = plan_diff_keeping_patches(diff)?;
+    let files = read_diff(diff, cache.map(|c| (repo, c)))?;
+    let plan = PatchPlan {
+        files: files.iter().map(|f| f.planned.clone()).collect(),
+    };
     if !plan.files.is_empty() {
         emit_summary(b, &plan, since);
     }
     let mut parsed_files = 0usize;
-    for (planned, (idx, patch)) in plan.files.iter().zip(patches) {
-        let delta = diff.get_delta(idx).expect("an index under the delta count");
+    for (planned, file) in plan.files.iter().zip(&files) {
         let old_path = planned.old_path.clone();
         let new_path = planned.new_path.clone();
         let hunk_count = planned.regions.len();
@@ -1182,10 +1498,10 @@ pub fn render_diff(
             changes: Vec::new(),
         });
 
-        emit_file_header(b, &delta, status, added, removed);
+        emit_file_header(b, planned);
 
         if hunk_count == 0 {
-            emit_placeholder(b, &delta, status, file_idx);
+            emit_placeholder(b, file, file_idx);
         } else {
             // Highlights, for the lines that will be read here. A file the driver binds shows the
             // real buffer's lines under that buffer's own tree, and what is generated for it is
@@ -1196,8 +1512,8 @@ pub fn render_diff(
                 if planned.bound_path().is_none() && parsed_files < MAX_HIGHLIGHTED_FILES {
                     parsed_files += 1;
                     (
-                        ParsedBlob::parse(repo, delta.old_file().id(), old_path.as_ref()),
-                        ParsedBlob::parse(repo, delta.new_file().id(), new_path.as_ref()),
+                        ParsedBlob::parse(repo, file.old_id, old_path.as_ref()),
+                        ParsedBlob::parse(repo, file.new_id, new_path.as_ref()),
                     )
                 } else {
                     (None, None)
@@ -1208,14 +1524,13 @@ pub fn render_diff(
                 .then(|| {
                     new_path
                         .as_deref()
-                        .and_then(|p| StageIndex::for_file(repo, p, delta.old_file().id()))
+                        .and_then(|p| StageIndex::for_file(repo, p, file.old_id))
                 })
                 .flatten();
-            let patch = patch.as_ref().expect("hunks imply a patch");
-            for h in 0..hunk_count {
+            for (h, hunk) in file.hunks.iter().enumerate() {
                 emit_hunk(
                     b,
-                    patch,
+                    hunk,
                     h,
                     file_idx,
                     old_blob.as_ref(),
@@ -1231,18 +1546,12 @@ pub fn render_diff(
 }
 
 /// The file block's opening: a full-width rule, then `path  +N −M` (or `old → new` for a rename).
-fn emit_file_header(
-    b: &mut PatchBuilder,
-    delta: &git2::DiffDelta<'_>,
-    status: PatchFileStatus,
-    added: u32,
-    removed: u32,
-) {
+fn emit_file_header(b: &mut PatchBuilder, planned: &PlannedFile) {
+    let (status, added, removed) = (planned.status, planned.added, planned.removed);
     // No rule here: the file block's box draws it as its top border, and `collapse` makes the
     // boundary between two files one rule rather than two. Emitting one as well would double it.
 
-    let old_path = path_of(&delta.old_file());
-    let new_path = path_of(&delta.new_file());
+    let (old_path, new_path) = (&planned.old_path, &planned.new_path);
     let mut text = String::new();
     let mut spans: Vec<Span> = Vec::new();
 
@@ -1294,17 +1603,11 @@ fn emit_file_header(
 /// Real (focusable) buffer text rather than more chrome, and that is the point: without a cursor
 /// position the file could not be staged with `Space g Alt-s`, could not be followed into with
 /// `Enter`, and would have no row in the changes picker.
-fn emit_placeholder(
-    b: &mut PatchBuilder,
-    delta: &git2::DiffDelta<'_>,
-    status: PatchFileStatus,
-    file_idx: u32,
-) {
-    let old_mode = delta.old_file().mode();
-    let new_mode = delta.new_file().mode();
-    let text = if delta.flags().is_binary() {
-        let old_size = delta.old_file().size();
-        let new_size = delta.new_file().size();
+fn emit_placeholder(b: &mut PatchBuilder, file: &FileDiff, file_idx: u32) {
+    let status = file.planned.status;
+    let (old_mode, new_mode) = (file.old_mode, file.new_mode);
+    let text = if file.binary {
+        let (old_size, new_size) = (file.old_size, file.new_size);
         match status {
             PatchFileStatus::Added => format!("Binary file · {}", human_size(new_size)),
             PatchFileStatus::Deleted => format!("Binary file · {}", human_size(old_size)),
@@ -1361,6 +1664,7 @@ fn emit_placeholder(
 /// Buffered rather than pushed as it arrives because intra-line emphasis has to pair a removal
 /// with the addition that replaced it, and the addition hasn't been seen yet when the removal
 /// arrives.
+#[derive(Debug)]
 struct HunkLine {
     text: String,
     side: Option<PatchLine>,
@@ -1416,16 +1720,14 @@ fn intraline_for_hunk(lines: &[HunkLine]) -> Vec<Vec<EmphasisRange>> {
 
 fn emit_hunk(
     b: &mut PatchBuilder,
-    patch: &git2::Patch<'_>,
+    hunk: &HunkLines,
     h: usize,
     file_idx: u32,
     old_blob: Option<&ParsedBlob>,
     new_blob: Option<&ParsedBlob>,
     stages: Option<&StageIndex>,
 ) -> Result<(), String> {
-    let (hunk, _) = patch.hunk(h).map_err(|e| e.message().to_string())?;
-    let header = String::from_utf8_lossy(hunk.header());
-    let header = header.trim_end_matches('\n');
+    let header = hunk.header.as_str();
 
     // git prints `@@ -a,b +c,d @@ <enclosing signature>`. Only the signature is kept: it says
     // *where you are*, which is what a section heading is for. The line ranges were the one place
@@ -1468,39 +1770,13 @@ fn emit_hunk(
     }
 
     let start_line = b.next_line();
-    let line_count = patch
-        .num_lines_in_hunk(h)
-        .map_err(|e| e.message().to_string())?;
-    let mut lines: Vec<HunkLine> = Vec::with_capacity(line_count);
-    for l in 0..line_count {
-        let line = patch
-            .line_in_hunk(h, l)
-            .map_err(|e| e.message().to_string())?;
-        let side = match line.origin() {
-            '+' => Some(PatchLine::Added),
-            '-' => Some(PatchLine::Removed),
-            ' ' => None,
-            // `=`, `>`, `<` are the "\ No newline at end of file" markers. Dropped: they are an
-            // artefact of the patch *format*, and this view deliberately isn't one.
-            _ => continue,
-        };
-        // The origin character is not part of `content` for these origins, so the text is already
-        // exactly the file's own line — which is the property the whole design rests on.
-        let content = String::from_utf8_lossy(line.content());
-        lines.push(HunkLine {
-            text: content.trim_end_matches('\n').to_string(),
-            side,
-            old_lineno: line.old_lineno(),
-            new_lineno: line.new_lineno(),
-        });
-    }
-
-    let emphasis = intraline_for_hunk(&lines);
+    let lines = &hunk.lines;
+    let emphasis = intraline_for_hunk(lines);
     let old_spans = old_blob
-        .map(|p| p.spans_for_lines(hunk.old_start(), hunk.old_lines()))
+        .map(|p| p.spans_for_lines(hunk.old_start, hunk.old_lines))
         .unwrap_or_default();
     let new_spans = new_blob
-        .map(|p| p.spans_for_lines(hunk.new_start(), hunk.new_lines()))
+        .map(|p| p.spans_for_lines(hunk.new_start, hunk.new_lines))
         .unwrap_or_default();
 
     // Blocks first, so each line can be pushed already knowing which layer it sits in: the block
@@ -1585,10 +1861,10 @@ fn emit_hunk(
         start_line,
         end_line,
         signature: signature.to_string(),
-        old_start: hunk.old_start(),
-        old_lines: hunk.old_lines(),
-        new_start: hunk.new_start(),
-        new_lines: hunk.new_lines(),
+        old_start: hunk.old_start,
+        old_lines: hunk.old_lines,
+        new_start: hunk.new_start,
+        new_lines: hunk.new_lines,
     });
     Ok(())
 }
@@ -1690,6 +1966,271 @@ mod tests {
         repo
     }
 
+    /// The working-changes render of `repo` — text, and everything generated beside it — through
+    /// `cache` when given one.
+    fn working_render(repo: &git2::Repository, cache: Option<&mut DiffCache>) -> (String, String) {
+        let head = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let mut diff = repo
+            .diff_tree_to_workdir_with_index(Some(&head), None)
+            .unwrap();
+        let _ = diff.find_similar(None);
+        let mut b = PatchBuilder::default();
+        render_diff(repo, &diff, &mut b, true, None, cache).expect("renders");
+        let (text, generated) = b.finish();
+        (text, format!("{generated:?}"))
+    }
+
+    fn cached_paths(cache: &DiffCache) -> Vec<String> {
+        let mut paths: Vec<String> = cache
+            .files
+            .keys()
+            .filter_map(|k| k.new_path.clone().or(k.old_path.clone()))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// A render through the cache is the render without it, change after change: an edit, a
+    /// second file, staging, an edit undone, a file put back as it was, a deletion, a mode
+    /// change. Nothing tells the cache which files moved, so each step is also a check that its
+    /// key sees the change.
+    #[test]
+    fn a_cached_render_is_the_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_every_delta_shape(&root);
+        let mut cache = DiffCache::default();
+        let write = |name: &str, body: &str| std::fs::write(root.join(name), body).unwrap();
+        let steps: Vec<Box<dyn Fn()>> = vec![
+            Box::new(|| {
+                write(
+                    "a.rs",
+                    "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\n",
+                )
+            }),
+            Box::new(|| write("new.txt", "changed\n")),
+            Box::new(|| {
+                let mut index = repo.index().unwrap();
+                index.add_path(std::path::Path::new("a.rs")).unwrap();
+                index.write().unwrap();
+            }),
+            Box::new(|| {
+                write(
+                    "a.rs",
+                    "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn E() {}\n",
+                )
+            }),
+            Box::new(|| write("new.txt", "same\n")),
+            Box::new(|| write("new.txt", "changed\n")),
+            Box::new(|| std::fs::remove_file(root.join("new.txt")).unwrap()),
+            Box::new(|| {
+                use std::os::unix::fs::PermissionsExt;
+                let path = root.join("a.rs");
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms).unwrap();
+            }),
+        ];
+        for (i, step) in steps.iter().enumerate() {
+            step();
+            assert_eq!(
+                working_render(&repo, Some(&mut cache)),
+                working_render(&repo, None),
+                "step {i}: the cached render differs"
+            );
+        }
+    }
+
+    /// A file the change did not touch is not diffed again — its entry is the one the last
+    /// render made — and the cache holds exactly the files of the current diff.
+    #[test]
+    fn an_untouched_file_is_not_diffed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_every_delta_shape(&root);
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("new.txt"), "changed\n").unwrap();
+        let mut cache = DiffCache::default();
+        let _ = working_render(&repo, Some(&mut cache));
+        let entry = |cache: &DiffCache, path: &str| {
+            cache
+                .files
+                .iter()
+                .find(|(k, _)| k.new_path.as_deref() == Some(path))
+                .map(|(_, f)| f.clone())
+                .expect("cached")
+        };
+        let before = entry(&cache, "new.txt");
+
+        std::fs::write(root.join("a.rs"), "fn A() {}\n").unwrap();
+        let _ = working_render(&repo, Some(&mut cache));
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &entry(&cache, "new.txt")),
+            "new.txt did not change and was diffed again"
+        );
+        assert_eq!(cached_paths(&cache), vec!["a.rs", "new.txt"]);
+
+        // Put back, a file leaves the diff — and the cache with it.
+        std::fs::write(root.join("new.txt"), "same\n").unwrap();
+        let _ = working_render(&repo, Some(&mut cache));
+        assert_eq!(cached_paths(&cache), vec!["a.rs"]);
+    }
+
+    /// A file a filter could rewrite before it is diffed is never cached: its bytes on disk are
+    /// not what libgit2 diffs, so they cannot be what says its diff is unchanged.
+    #[test]
+    fn a_file_a_filter_could_rewrite_is_never_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_every_delta_shape(&root);
+        std::fs::write(root.join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("new.txt"), "changed\n").unwrap();
+        let mut cache = DiffCache::default();
+        let _ = working_render(&repo, Some(&mut cache));
+        assert_eq!(cached_paths(&cache), vec!["a.rs"], "new.txt is filtered");
+
+        // And a repo converting line endings everywhere caches nothing at all.
+        repo.config()
+            .unwrap()
+            .set_str("core.autocrlf", "input")
+            .unwrap();
+        let _ = working_render(&repo, Some(&mut cache));
+        assert!(cached_paths(&cache).is_empty());
+    }
+
+    /// The gate in front of the per-file attribute lookups finds an attributes file wherever
+    /// libgit2 would read one for these paths — or the cache could key a filtered file by bytes
+    /// libgit2 never diffs.
+    #[test]
+    fn an_attributes_file_anywhere_libgit2_reads_one_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_every_delta_shape(&root);
+        let env = |paths: &[&str]| FilterEnv::of(&repo, paths.iter().copied(), &mut None);
+        // The machine's own attributes files would answer for every repo; only without them is
+        // "nothing anywhere" a thing this test can see.
+        let machine_has_attributes = env(&["a.rs"]) == FilterEnv::AttributesExist;
+
+        std::fs::create_dir_all(root.join("src/deep")).unwrap();
+        std::fs::write(root.join("src/.gitattributes"), "*.rs diff=rust\n").unwrap();
+        assert_eq!(
+            env(&["src/deep/x.rs"]),
+            FilterEnv::AttributesExist,
+            "in a parent"
+        );
+        if !machine_has_attributes {
+            assert_eq!(env(&["a.rs"]), FilterEnv::Plain, "not above this file");
+        }
+
+        // Committed to the index and gone from disk: libgit2 reads the index's copy.
+        let mut index = repo.index().unwrap();
+        index
+            .add_path(std::path::Path::new("src/.gitattributes"))
+            .unwrap();
+        index.write().unwrap();
+        std::fs::remove_file(root.join("src/.gitattributes")).unwrap();
+        assert_eq!(env(&["a.rs"]), FilterEnv::AttributesExist, "in the index");
+        index
+            .remove_path(std::path::Path::new("src/.gitattributes"))
+            .unwrap();
+        index.write().unwrap();
+
+        std::fs::create_dir_all(repo.path().join("info")).unwrap();
+        std::fs::write(repo.path().join("info/attributes"), "* -text\n").unwrap();
+        assert_eq!(env(&["a.rs"]), FilterEnv::AttributesExist, "the repo's own");
+    }
+
+    /// A symlink's diff is of where it points, so that is what its key hashes: pointed somewhere
+    /// else with the same bytes, it is a different diff.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_keyed_by_where_it_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_every_delta_shape(&root);
+        for twin in ["one.txt", "two.txt", "three.txt"] {
+            std::fs::write(root.join(twin), "twin\n").unwrap();
+        }
+        let point = |target: &str| {
+            let _ = std::fs::remove_file(root.join("link"));
+            std::os::unix::fs::symlink(target, root.join("link")).unwrap();
+        };
+        point("one.txt");
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("link")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "link", &tree, &[&head])
+            .unwrap();
+
+        let mut cache = DiffCache::default();
+        for target in ["two.txt", "three.txt"] {
+            point(target);
+            assert_eq!(
+                working_render(&repo, Some(&mut cache)),
+                working_render(&repo, None),
+                "pointed at {target}: the cached render differs"
+            );
+        }
+    }
+
+    /// A linked worktree's own git directory has no `info/`: libgit2 reads the main repository's,
+    /// and so does the gate.
+    #[test]
+    fn a_linked_worktree_reads_the_main_repositorys_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("main");
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = repo_with_every_delta_shape(&root);
+        let linked_at = dir.path().canonicalize().unwrap().join("linked");
+        let linked = repo.worktree("linked", &linked_at, None).unwrap();
+        let linked = git2::Repository::open_from_worktree(&linked).unwrap();
+        let env = |repo: &git2::Repository| FilterEnv::of(repo, ["a.rs"].into_iter(), &mut None);
+        if env(&linked) == FilterEnv::AttributesExist {
+            return; // the machine's own attributes answer for every repo
+        }
+
+        std::fs::create_dir_all(repo.path().join("info")).unwrap();
+        std::fs::write(repo.path().join("info/attributes"), "* -text\n").unwrap();
+        assert_eq!(env(&linked), FilterEnv::AttributesExist);
+    }
+
+    /// The index is walked for a `.gitattributes` once, and again only once it has changed.
+    #[test]
+    fn the_index_is_asked_again_once_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = repo_with_every_delta_shape(&root);
+        let mut known = None;
+        let mut env = || FilterEnv::of(&repo, std::iter::empty(), &mut known);
+        if env() == FilterEnv::AttributesExist {
+            return; // the machine's own attributes answer for every repo
+        }
+        assert_eq!(env(), FilterEnv::Plain, "remembered");
+
+        std::fs::write(root.join(".gitattributes"), "*.rs diff=rust\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_path(std::path::Path::new(".gitattributes"))
+            .unwrap();
+        index.write().unwrap();
+        std::fs::remove_file(root.join(".gitattributes")).unwrap();
+        assert_eq!(
+            FilterEnv::of(&repo, std::iter::empty(), &mut known),
+            FilterEnv::AttributesExist,
+            "the index changed, and the remembered answer was kept"
+        );
+    }
+
     /// The caption used to come from `git2::Diff::stats`, which diffs every file a second time.
     /// It comes from the plan now, and has to say exactly what libgit2 would have said — across a
     /// modification, a deletion, a rename and a binary swap, which each count differently.
@@ -1730,7 +2271,7 @@ mod tests {
         let mut diff = head_diff(&repo);
         let _ = diff.find_similar(None);
         let mut b = PatchBuilder::default();
-        render_diff(&repo, &diff, &mut b, false, None).expect("renders");
+        render_diff(&repo, &diff, &mut b, false, None, None).expect("renders");
         let (text, generated) = b.finish();
 
         let line_at = |want: &str| {
@@ -1923,7 +2464,7 @@ mod tests {
         let plan = plan_diff(&diff).expect("plans");
 
         let mut b = PatchBuilder::default();
-        render_diff(&repo, &diff, &mut b, false, None).expect("renders");
+        render_diff(&repo, &diff, &mut b, false, None, None).expect("renders");
         let (_, generated) = b.finish();
 
         let planned_regions: usize = plan.files.iter().map(|f| f.regions.len()).sum();

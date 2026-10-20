@@ -1121,6 +1121,9 @@ pub struct ViewState {
     /// you at its end, where the input is.
     pub(crate) tail_total: u32,
     pub window: Option<Window>,
+    /// Puts [`Self::window`]'s answers and pushes back in the order they were rendered — see
+    /// [`aether_protocol::viewport::WindowOrder`]. Every window this view lands goes through it.
+    pub(crate) window_order: aether_protocol::viewport::WindowOrder,
     /// The markdown reading view of the current buffer, when active.
     pub read: Option<ReadView>,
     /// The reading view just left, with the cursor it was showing — kept for **painting** until
@@ -1444,6 +1447,7 @@ impl ViewState {
             focused_element: 0,
             focus: Default::default(),
             window: None,
+            window_order: Default::default(),
             read: None,
             held_read: None,
             diagnostics: DiagnosticCounts::default(),

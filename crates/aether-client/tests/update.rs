@@ -345,7 +345,9 @@ fn elements_changed(base: u64, rows: u32) -> aether_client::update::Event {
         git_status: None,
         other_elements_dirty: false,
         search: None,
-        elements: vec![elements.remove(1)],
+        change: aether_protocol::viewport::WindowChange::Elements {
+            elements: vec![elements.remove(1)],
+        },
     };
     aether_client::update::Event::ServerPush(Notification {
         jsonrpc: JsonRpc,
@@ -380,21 +382,77 @@ fn a_pushed_patch_replaces_the_elements_it_names() {
     );
 }
 
+/// `view/lines_changed` for viewport 7, carrying `window` whole.
+fn lines_changed(window: aether_protocol::viewport::Window) -> aether_client::update::Event {
+    use aether_protocol::envelope::{JsonRpc, Notification, NotificationMethod};
+    use aether_protocol::viewport::{ViewportLinesChanged, ViewportLinesChangedParams};
+    aether_client::update::Event::ServerPush(Notification {
+        jsonrpc: JsonRpc,
+        method: ViewportLinesChanged::NAME.into(),
+        params: serde_json::to_value(ViewportLinesChangedParams {
+            viewport_id: 7,
+            buffer: 0,
+            revision: 0,
+            window,
+            cursor: None,
+        })
+        .unwrap(),
+    })
+}
+
 #[test]
-fn a_patch_made_against_another_window_starts_the_view_over() {
-    // Applying it anyway would show a window the server never rendered — some elements from one
-    // generation, some from another.
+fn a_window_older_than_the_one_held_is_dropped() {
+    // Rendered first, arrived last — overtaken by an answer. The answer already has whatever the
+    // older one said; landing it would put the view back.
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    s.view.window = Some(two_editors(5, 1));
+
+    let _ = s.on_event(elements_changed(3, 4));
+    let _ = s.on_event(lines_changed(two_editors(4, 9)));
+    assert_eq!(
+        s.view.window,
+        Some(two_editors(5, 1)),
+        "nothing older lands"
+    );
+}
+
+#[test]
+fn a_patch_ahead_of_its_window_waits_for_it() {
+    // Made against a window still on its way — an answer the patch overtook. It lands once that
+    // window does, rather than being thrown away with the view.
     use aether_client::effect::Effect;
     let mut s = session();
     s.view.viewport_id = Some(7);
     s.view.window = Some(two_editors(5, 1));
 
-    let fx = s.on_event(elements_changed(4, 4));
+    let fx = s.on_event(elements_changed(6, 4));
+    assert!(!fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
+    assert_eq!(s.view.window, Some(two_editors(5, 1)), "still waiting");
+
+    let _ = s.on_event(lines_changed(two_editors(6, 2)));
     assert_eq!(
         s.view.window,
-        Some(two_editors(5, 1)),
-        "the window held is untouched"
+        Some(two_editors(7, 4)),
+        "the window it waited for, and the patch on it"
     );
+}
+
+#[test]
+fn a_patch_that_does_not_fit_its_window_starts_the_view_over() {
+    // Applying it anyway would show a window the server never rendered — some elements from one
+    // generation, some from another.
+    use aether_client::effect::Effect;
+    let mut s = session();
+    s.view.viewport_id = Some(7);
+    let mut held = two_editors(5, 1);
+    if let aether_protocol::viewport::Element::Column { children, .. } = &mut held.root {
+        children.truncate(1);
+    }
+    s.view.window = Some(held.clone());
+
+    let fx = s.on_event(elements_changed(5, 4));
+    assert_eq!(s.view.window, Some(held), "the window held is untouched");
     assert!(fx.0.iter().any(|e| matches!(e, Effect::Resubscribe)));
 }
 

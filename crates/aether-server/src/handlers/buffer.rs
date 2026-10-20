@@ -1905,6 +1905,12 @@ pub async fn git_show(
     // so the view and the gutters of the files in it can't disagree. Read before the spawn, since
     // the generation runs off the lock.
     let baseline = baseline_choice(state, &workdir).await;
+    let diffs = match what {
+        aether_protocol::git::ShowTarget::WorkingChanges => {
+            Some(crate::handlers::working_changes_diffs(state, &workdir).await)
+        }
+        _ => None,
+    };
     // The repo-level status rides along with the generation, off the lock and out of one repo
     // open: the buffer has no file to hang a baseline off, but the status bar still has to say
     // which checkout is in front of you.
@@ -1915,9 +1921,11 @@ pub async fn git_show(
             let content = match &what {
                 ShowTarget::Commit { rev } => crate::git::show_commit(&workdir, rev),
                 ShowTarget::File { rev, path } => crate::git::show_file(&workdir, rev, path),
-                ShowTarget::WorkingChanges => {
-                    crate::git::show_working_changes(&workdir, baseline.as_ref())
-                }
+                ShowTarget::WorkingChanges => crate::git::show_working_changes(
+                    &workdir,
+                    baseline.as_ref(),
+                    &diffs.expect("made for the working changes"),
+                ),
             };
             (
                 content,

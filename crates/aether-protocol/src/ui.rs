@@ -578,6 +578,25 @@ impl Element {
         }
     }
 
+    /// Number this subtree's content elements in tree order, from `first`, and answer the number
+    /// after the last.
+    ///
+    /// Field ids *are* those numbers: an element's id is its position among the view's elements,
+    /// and the tree holds them in that order. So a splice that added or dropped one renumbers
+    /// everything after it — which is all this is, applied to the whole tree once the splice is
+    /// in — and two subtrees that differ only in where they sit are equal once both are numbered
+    /// from zero.
+    pub fn renumber_field_ids(&mut self, first: FieldId) -> FieldId {
+        let mut next = first;
+        self.walk_mut(&mut |node| {
+            if let Element::Editor { element, .. } | Element::Prose { element, .. } = node {
+                *element = next;
+                next += 1;
+            }
+        });
+        next
+    }
+
     /// [`Self::walk`], mutably: every node, parents before their children.
     pub(crate) fn walk_mut(&mut self, f: &mut impl FnMut(&mut Element)) {
         f(self);

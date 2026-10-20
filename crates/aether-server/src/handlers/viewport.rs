@@ -1588,23 +1588,32 @@ fn next_generation(sent: Option<&Window>) -> u64 {
     sent.map_or(1, |w| w.generation + 1)
 }
 
-/// The patch that turns `before` into `now`, when one is worth sending: the tree kept its shape,
-/// and some of its content elements are unchanged. A view of one element has nothing to leave out,
-/// and neither does a change that touched every element.
+/// The patch that turns `before` into `now`, when one is worth sending — whole otherwise.
+///
+/// A tree that kept its shape sends the content elements that changed, when some did not. One
+/// that changed shape sends the stretch of the root's children between the longest unchanged run
+/// at its start and the longest at its end, when there is one of either. A view of one element
+/// has nothing to leave out.
 fn patch_between(before: &Window, now: &Window) -> Option<aether_protocol::viewport::WindowPatch> {
-    if !before.root.same_shape(&now.root) {
-        return None;
-    }
+    use aether_protocol::viewport::WindowChange;
     let (was, is) = (before.root.content(), now.root.content());
-    let changed: Vec<Element> = was
-        .iter()
-        .zip(&is)
-        .filter(|(was, is)| was != is)
-        .map(|(_, is)| (*is).clone())
-        .collect();
-    if is.len() < 2 || changed.len() == is.len() {
+    if is.len() < 2 {
         return None;
     }
+    let change = if before.root.same_shape(&now.root) {
+        let changed: Vec<Element> = was
+            .iter()
+            .zip(&is)
+            .filter(|(was, is)| was != is)
+            .map(|(_, is)| (*is).clone())
+            .collect();
+        if changed.len() == is.len() {
+            return None;
+        }
+        WindowChange::Elements { elements: changed }
+    } else {
+        splice_between(&before.root, &now.root)?
+    };
     Some(aether_protocol::viewport::WindowPatch {
         base: before.generation,
         generation: now.generation,
@@ -1612,8 +1621,136 @@ fn patch_between(before: &Window, now: &Window) -> Option<aether_protocol::viewp
         git_status: now.git_status.clone(),
         other_elements_dirty: now.other_elements_dirty,
         search: now.search.clone(),
-        elements: changed,
+        change,
     })
+}
+
+/// The splices of the root's children that turn `before` into `now`: the runs of children that
+/// differ, found by comparing each child **numbered from zero** — so a file's block that only moved
+/// down because a hunk appeared above it is the same block, and is not sent. `None` when the roots
+/// are not the same column, or the children differ in too many places for splicing to be worth it.
+fn splice_between(
+    before: &Element,
+    now: &Element,
+) -> Option<aether_protocol::viewport::WindowChange> {
+    use aether_protocol::viewport::{Splice, WindowChange};
+    let (
+        Element::Column {
+            edges,
+            band,
+            title,
+            children: was,
+        },
+        Element::Column {
+            edges: now_edges,
+            band: now_band,
+            title: now_title,
+            children: is,
+        },
+    ) = (before, now)
+    else {
+        return None;
+    };
+    if (edges, band, title) != (now_edges, now_band, now_title) {
+        return None;
+    }
+    let placeless = |children: &[Element]| -> Vec<Element> {
+        children
+            .iter()
+            .map(|c| {
+                let mut c = c.clone();
+                c.renumber_field_ids(0);
+                c
+            })
+            .collect()
+    };
+    let runs = differing_runs(&placeless(was), &placeless(is), MAX_SPLICES)?;
+    Some(WindowChange::Splices {
+        splices: runs
+            .into_iter()
+            .map(|(was, is_range)| Splice {
+                at: was.start as u32,
+                remove: was.len() as u32,
+                insert: is[is_range].to_vec(),
+            })
+            .collect(),
+    })
+}
+
+/// How many separate edits a window's children may differ by and still go as splices. Past it the
+/// window has mostly changed, and the whole one is as small and simpler to apply.
+const MAX_SPLICES: usize = 64;
+
+/// The runs where `a` and `b` differ, as a range of each, in order — by Myers' O(ND) difference,
+/// giving up (`None`) past `max_edits` single insertions and removals.
+fn differing_runs<T: PartialEq>(
+    a: &[T],
+    b: &[T],
+    max_edits: usize,
+) -> Option<Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
+    let (n, m) = (a.len() as isize, b.len() as isize);
+    let limit = (n + m).min(max_edits as isize);
+    let offset = limit + 1;
+    let at = |k: isize| (k + offset) as usize;
+    // `v[k]`: the furthest `x` reached on diagonal `k = x - y`, kept for every edit count so the
+    // path can be walked back.
+    let mut v = vec![0isize; 2 * offset as usize + 1];
+    let mut trace: Vec<Vec<isize>> = Vec::new();
+    let mut found = None;
+    'search: for d in 0..=limit {
+        trace.push(v.clone());
+        for k in (-d..=d).step_by(2) {
+            let mut x = if k == -d || (k != d && v[at(k - 1)] < v[at(k + 1)]) {
+                v[at(k + 1)]
+            } else {
+                v[at(k - 1)] + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            v[at(k)] = x;
+            if x >= n && y >= m {
+                found = Some(d);
+                break 'search;
+            }
+        }
+    }
+    let found = found?;
+
+    // Walk back, collecting the pairs the path ran along a diagonal for — the elements in common.
+    let mut common: Vec<(usize, usize)> = Vec::new();
+    let (mut x, mut y) = (n, m);
+    for d in (0..=found).rev() {
+        let v = &trace[d as usize];
+        let k = x - y;
+        let prev_k = if k == -d || (k != d && v[at(k - 1)] < v[at(k + 1)]) {
+            k + 1
+        } else {
+            k - 1
+        };
+        let prev_x = if d == 0 { 0 } else { v[at(prev_k)] };
+        let prev_y = if d == 0 { 0 } else { prev_x - prev_k };
+        while x > prev_x && y > prev_y {
+            x -= 1;
+            y -= 1;
+            common.push((x as usize, y as usize));
+        }
+        x = prev_x;
+        y = prev_y;
+    }
+    common.reverse();
+
+    let mut runs = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    for (x, y) in common.into_iter().chain([(a.len(), b.len())]) {
+        if x > i || y > j {
+            runs.push((i..x, j..y));
+        }
+        (i, j) = (x + 1, y + 1);
+    }
+    Some(runs)
 }
 
 /// Consume the edit's line shift into every view's extents and every viewport's loaded slices,
@@ -3999,11 +4136,10 @@ mod tests {
             patch.base, held.generation,
             "made against the window the client holds"
         );
-        let sent: Vec<_> = patch
-            .elements
-            .iter()
-            .filter_map(Element::field_id)
-            .collect();
+        let aether_protocol::viewport::WindowChange::Elements { elements } = &patch.change else {
+            panic!("the tree kept its shape, and the patch spliced it");
+        };
+        let sent: Vec<_> = elements.iter().filter_map(Element::field_id).collect();
         assert_eq!(sent, vec![1], "only the element that changed");
 
         // And it rebuilds the render exactly, as the client applies it.
@@ -4028,9 +4164,9 @@ mod tests {
     }
 
     #[test]
-    fn a_tree_that_changed_shape_goes_out_whole() {
-        // Chrome is not a content element, so no patch can carry it: a heading appearing between
-        // two files is a different tree.
+    fn chrome_that_changed_splices_the_stretch_around_it() {
+        // Chrome is not a content element, so no replacement of elements can carry it: a heading
+        // appearing between two files changes the tree's shape — at one place in it.
         let mut s = ServerState::new();
         let buffers = vec![
             buffer_with(&mut s, "/a", "a\n"),
@@ -4041,10 +4177,99 @@ mod tests {
         let _ = sent_whole(&vp, render_window(&s, &vp, SneakLabels::Hidden));
         elements_mut(&mut s, &vp)[1].chrome_before =
             std::sync::Arc::new(vec![Element::text("b.rs", Vec::new())]);
-        assert!(matches!(
-            sent_update(&vp, render_window(&s, &vp, SneakLabels::Hidden)),
-            WindowUpdate::Whole(_)
-        ));
+        let WindowUpdate::Patch(patch) =
+            sent_update(&vp, render_window(&s, &vp, SneakLabels::Hidden))
+        else {
+            panic!("one heading changed, and the push sent the window whole");
+        };
+        let aether_protocol::viewport::WindowChange::Splices { splices } = patch.change else {
+            panic!("the tree changed shape, and the patch replaced elements");
+        };
+        assert_eq!(
+            splices,
+            vec![aether_protocol::viewport::Splice {
+                at: 1,
+                remove: 0,
+                insert: vec![Element::text("b.rs", Vec::new())],
+            }],
+            "the heading, inserted before b"
+        );
+    }
+
+    #[test]
+    fn an_element_inserted_renumbers_what_follows_it() {
+        // A hunk appearing in the second file: every element after it is the same element one
+        // field id further along, and the splice says so rather than sending them again.
+        let mut s = ServerState::new();
+        let buffers = vec![
+            buffer_with(&mut s, "/a", "a\n"),
+            buffer_with(&mut s, "/b", "b\n"),
+            buffer_with(&mut s, "/c", "c\n"),
+            buffer_with(&mut s, "/d", "d\n"),
+        ];
+        let vp = viewport_over(&mut s, buffers.clone());
+        let held = sent_whole(&vp, render_window(&s, &vp, SneakLabels::Hidden));
+        let extra = buffer_with(&mut s, "/b2", "b2\n");
+        let mut binding = elements_mut(&mut s, &vp)[1].clone();
+        binding.buffer_id = extra;
+        elements_mut(&mut s, &vp).insert(2, binding);
+        let mut vp = vp;
+        vp.loaded.insert(2, Some(0..u32::MAX));
+
+        let WindowUpdate::Patch(patch) =
+            sent_update(&vp, render_window(&s, &vp, SneakLabels::Hidden))
+        else {
+            panic!("one element was added, and the push sent the window whole");
+        };
+        let aether_protocol::viewport::WindowChange::Splices { ref splices } = patch.change else {
+            panic!("expected splices");
+        };
+        let [splice] = &splices[..] else {
+            panic!("one element added is one splice: {splices:?}");
+        };
+        assert_eq!((splice.at, splice.remove, splice.insert.len()), (2, 0, 1));
+        assert_eq!(
+            splice.insert[0].field_id(),
+            Some(2),
+            "the new element, under its new id"
+        );
+        let mut applied = held;
+        assert!(applied.apply(patch));
+        let ids: Vec<_> = applied
+            .root
+            .content()
+            .iter()
+            .filter_map(|e| e.field_id())
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4], "c and d moved along by one");
+    }
+
+    #[test]
+    fn differing_runs_finds_each_place_two_sequences_part() {
+        let runs = |a: &str, b: &str| {
+            let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+            differing_runs(&a, &b, 64)
+        };
+        assert_eq!(runs("abc", "abc"), Some(vec![]));
+        assert_eq!(runs("", "ab"), Some(vec![(0..0, 0..2)]));
+        assert_eq!(runs("ab", ""), Some(vec![(0..2, 0..0)]));
+        assert_eq!(runs("abc", "xbc"), Some(vec![(0..1, 0..1)]), "at the start");
+        assert_eq!(runs("abc", "abx"), Some(vec![(2..3, 2..3)]), "at the end");
+        assert_eq!(
+            runs("abc", "abbc"),
+            Some(vec![(2..2, 2..3)]),
+            "an insertion"
+        );
+        // The caption and one file far below it: two runs, not everything between them.
+        assert_eq!(
+            runs("Cabcdefgh", "Xabcdefyh"),
+            Some(vec![(0..1, 0..1), (7..8, 7..8)])
+        );
+        assert_eq!(
+            differing_runs(&['a', 'b', 'c'], &['x', 'y', 'z'], 2),
+            None,
+            "more edits than allowed"
+        );
     }
 
     #[test]

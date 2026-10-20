@@ -3915,9 +3915,10 @@ async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
         let baseline = s.git_baseline_choices.get(&workdir).cloned();
         (workdir, baseline)
     };
+    let diffs = working_changes_diffs(state, &workdir).await;
     let Ok(content) = tokio::task::spawn_blocking({
         let baseline = baseline.clone();
-        move || crate::git::show_working_changes(&workdir, baseline.as_ref())
+        move || crate::git::show_working_changes(&workdir, baseline.as_ref(), &diffs)
     })
     .await
     else {
@@ -4011,6 +4012,20 @@ async fn regenerate_patch_buffer(state: &SharedState, buffer_id: BufferId) {
     }
 }
 
+/// The per-file diff cache of `workdir`'s working-changes view, made on first use.
+pub(crate) async fn working_changes_diffs(
+    state: &SharedState,
+    workdir: &std::path::Path,
+) -> std::sync::Arc<std::sync::Mutex<crate::patch::DiffCache>> {
+    state
+        .lock()
+        .await
+        .working_changes_diffs
+        .entry(workdir.to_path_buf())
+        .or_default()
+        .clone()
+}
+
 /// The repos that currently have a working-changes view open, by workdir.
 ///
 /// Nearly always empty, which is what makes [`refresh_working_changes_views`] free to call from
@@ -4033,7 +4048,7 @@ pub(crate) fn working_changes_repos(
 /// — all change what the view is *of*, and a patch left on the old answer quietly lies about the
 /// tree. Every path that moves a tree funnels through here rather than growing a rebuild of its
 /// own, and the ones that don't move anything the view can see cost a hash lookup.
-pub(crate) async fn refresh_working_changes_views(
+pub async fn refresh_working_changes_views(
     state: &SharedState,
     workdirs: &std::collections::HashSet<std::path::PathBuf>,
 ) {

@@ -384,25 +384,15 @@ pub struct Window {
 
 impl Window {
     /// Apply `patch`, if it was made against this window. `false`, with nothing changed, when it
-    /// was not — another generation, or a content element this window does not have.
+    /// was not — another generation, a content element this window does not have, a splice
+    /// reaching past the children it has.
     ///
     /// Shared by the client, which applies what it is sent, and by the server, which checks in
     /// debug builds that what it sent applies to the window it last sent and reproduces the one it
     /// just rendered.
     #[must_use]
     pub fn apply(&mut self, patch: WindowPatch) -> bool {
-        let held: std::collections::HashSet<FieldId> = self
-            .root
-            .content()
-            .iter()
-            .filter_map(|e| e.field_id())
-            .collect();
-        let fits = patch.base == self.generation
-            && patch
-                .elements
-                .iter()
-                .all(|e| e.field_id().is_some_and(|id| held.contains(&id)));
-        if !fits {
+        if patch.base != self.generation || !self.fits(&patch.change) {
             return false;
         }
         let WindowPatch {
@@ -412,17 +402,32 @@ impl Window {
             git_status,
             other_elements_dirty,
             search,
-            elements,
+            change,
         } = patch;
-        let mut elements: std::collections::HashMap<FieldId, Element> = elements
-            .into_iter()
-            .filter_map(|e| Some((e.field_id()?, e)))
-            .collect();
-        self.root.walk_mut(&mut |node| {
-            if let Some(new) = node.field_id().and_then(|id| elements.remove(&id)) {
-                *node = new;
+        match change {
+            WindowChange::Elements { elements } => {
+                let mut elements: std::collections::HashMap<FieldId, Element> = elements
+                    .into_iter()
+                    .filter_map(|e| Some((e.field_id()?, e)))
+                    .collect();
+                self.root.walk_mut(&mut |node| {
+                    if let Some(new) = node.field_id().and_then(|id| elements.remove(&id)) {
+                        *node = new;
+                    }
+                });
             }
-        });
+            WindowChange::Splices { splices } => {
+                let Element::Column { children, .. } = &mut self.root else {
+                    unreachable!("checked by `fits`");
+                };
+                // Last first, so each splice's place is still where it was measured.
+                for Splice { at, remove, insert } in splices.into_iter().rev() {
+                    let at = at as usize;
+                    children.splice(at..at + remove as usize, insert);
+                }
+                self.root.renumber_field_ids(0);
+            }
+        }
         self.generation = generation;
         self.max_line_width = max_line_width;
         self.git_status = git_status;
@@ -430,16 +435,130 @@ impl Window {
         self.search = search;
         true
     }
+
+    /// Whether `change` can be applied to this window as it stands — checked whole before any of
+    /// it is, so a change that does not fit leaves the window exactly as it was.
+    fn fits(&self, change: &WindowChange) -> bool {
+        match change {
+            WindowChange::Elements { elements } => {
+                let held: std::collections::HashSet<FieldId> = self
+                    .root
+                    .content()
+                    .iter()
+                    .filter_map(|e| e.field_id())
+                    .collect();
+                elements
+                    .iter()
+                    .all(|e| e.field_id().is_some_and(|id| held.contains(&id)))
+            }
+            WindowChange::Splices { splices } => match &self.root {
+                // In order, apart, and inside the children there are.
+                Element::Column { children, .. } => {
+                    let mut from = 0usize;
+                    splices.iter().all(|s| {
+                        let (at, end) = (s.at as usize, s.at as usize + s.remove as usize);
+                        let fits = at >= from && end <= children.len();
+                        from = end.max(at + 1);
+                        fits
+                    })
+                }
+                _ => false,
+            },
+        }
+    }
 }
 
-/// The content elements of a window that changed since the window `base`, and the view-wide facts
-/// as of now — what a push sends instead of the whole window when the tree kept its shape (see
-/// [`Element::same_shape`]).
+/// The order a client lands the windows of one viewport in: the order they were **rendered**, which
+/// is not always the order they arrive.
 ///
-/// A conversation is the case it exists for: a reply grows a few characters at a time, and the
-/// window around it — every earlier turn, parsed — went out whole every time it did. Only content
-/// elements are ever sent: they are what change while the tree keeps its shape, and the unit a
-/// shell measures and paints.
+/// Answers and pushes reach a client by different routes — an answer is written as its request
+/// finishes, a push whenever its producer gets to it — so a push rendered just before an answer can
+/// arrive just after it, and the other way round. Each window carries its place in the render
+/// order ([`Window::generation`]), so this puts them back: a window or patch older than the one held
+/// is already in it and is dropped, and a patch made against a window that has not arrived yet waits
+/// for it.
+#[derive(Debug, Default)]
+pub struct WindowOrder {
+    waiting: Vec<WindowPatch>,
+}
+
+/// What became of a window or patch handed to [`WindowOrder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landed {
+    /// The window held changed.
+    Changed,
+    /// Older than the window held, which already has whatever it said.
+    Stale,
+    /// A patch made against a window not yet here, kept until it is.
+    Waiting,
+    /// A patch that does not fit the window it names — nothing reordering can mend.
+    Misfit,
+}
+
+impl WindowOrder {
+    /// Land a whole window — an answer or a push — in `held`, unless it is older than what is
+    /// there; then any patch that was waiting for it. A window with no generation (`0`, one no
+    /// server stamped) is always taken.
+    pub fn whole(&mut self, held: &mut Option<Window>, window: Window) -> Landed {
+        let current = held.as_ref().map_or(0, |w| w.generation);
+        if window.generation != 0 && window.generation < current {
+            return Landed::Stale;
+        }
+        *held = Some(window);
+        self.catch_up(held)
+    }
+
+    /// Land a patch on `held`: now if it was made against the window held, later if against one
+    /// still on its way, never if the window held is already newer.
+    pub fn patch(&mut self, held: &mut Option<Window>, patch: WindowPatch) -> Landed {
+        let Some(window) = held.as_mut() else {
+            self.waiting.push(patch);
+            return Landed::Waiting;
+        };
+        if patch.generation <= window.generation {
+            return Landed::Stale;
+        }
+        if patch.base > window.generation {
+            self.waiting.push(patch);
+            return Landed::Waiting;
+        }
+        if !window.apply(patch) {
+            return Landed::Misfit;
+        }
+        self.catch_up(held)
+    }
+
+    /// Forget every waiting patch — for a new viewport, whose windows start a count of their own.
+    pub fn clear(&mut self) {
+        self.waiting.clear();
+    }
+
+    /// Apply whatever was waiting for the window `held` now is, in turn, dropping what it outdates.
+    fn catch_up(&mut self, held: &mut Option<Window>) -> Landed {
+        while let Some(window) = held.as_mut() {
+            let generation = window.generation;
+            self.waiting.retain(|p| p.generation > generation);
+            let Some(next) = self.waiting.iter().position(|p| p.base == generation) else {
+                break;
+            };
+            let patch = self.waiting.remove(next);
+            if !window.apply(patch) {
+                return Landed::Misfit;
+            }
+        }
+        Landed::Changed
+    }
+}
+
+/// What changed in a window since the window `base`, and the view-wide facts as of now — what a
+/// push sends instead of the whole window when most of it is what the client already holds.
+///
+/// A conversation is the case it was made for: a reply grows a few characters at a time, and the
+/// window around it — every earlier turn, parsed — went out whole every time it did. A
+/// working-changes view is the case that made it a splice as well: one file changing on disk
+/// rewrites that file's header and the caption's totals, and can add or drop a hunk so that every
+/// element after it is renumbered — a change to the tree's shape that is still only a few rows of
+/// it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowPatch {
     /// The [`Window::generation`] this was made against.
@@ -454,8 +573,32 @@ pub struct WindowPatch {
     pub other_elements_dirty: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<crate::search::SearchSummary>,
-    /// The content elements that changed, each replacing the one with its field id.
-    pub elements: Vec<Element>,
+    pub change: WindowChange,
+}
+
+/// The two ways a window changes without being sent whole. One per patch, never both: each is
+/// whole on its own terms, and a client never has to work out how two compose.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WindowChange {
+    /// The tree kept its shape ([`Element::same_shape`]): these content elements changed, each
+    /// replacing the one with its field id. A reply growing, a hunk being typed into.
+    Elements { elements: Vec<Element> },
+    /// Runs of the root's children replaced, and then every content element renumbered in tree
+    /// order ([`Element::renumber_field_ids`]) — ids are positions, so a hunk appearing renumbers
+    /// everything below it without anything below it being sent. A file's section of a patch
+    /// rewritten with the caption above it, a block or a run appended.
+    Splices { splices: Vec<Splice> },
+}
+
+/// One run of a window's top-level children replaced: `remove` of them from `at` — counted in the
+/// children as they were before any splice of the patch — by `insert`. A patch's splices are in
+/// order and apart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Splice {
+    pub at: u32,
+    pub remove: u32,
+    pub insert: Vec<Element>,
 }
 
 // ---- view/save ----------------------------------------------------------------------------------

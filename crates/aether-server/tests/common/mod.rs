@@ -209,6 +209,12 @@ impl Ws {
             .collect()
     }
 
+    /// Every notification seen so far, whatever its method, in arrival order — for replaying a mix
+    /// of pushes against a client in the order it would have received them.
+    pub fn seen_all(&self) -> &[(String, serde_json::Value)] {
+        &self.seen
+    }
+
     /// Forget the notifications seen so far, so a later [`Ws::saw`] speaks only about what follows.
     pub fn clear_seen(&mut self) {
         self.seen.clear();
@@ -520,48 +526,78 @@ pub async fn expect_notification_or_backlog<N: NotificationMethod>(ws: &mut Ws) 
     expect_notification::<N>(ws).await
 }
 
-/// Bring `held` — the window this test holds of `viewport_id` — up to the next window pushed to it,
-/// taking first what a reply-wait read past, as [`expect_notification_or_backlog`] does. A whole
-/// window replaces it; a patch is applied to it the way a client applies one, and a patch that
-/// does not fit it fails the test.
-pub async fn next_pushed_window(ws: &mut Ws, viewport_id: u64, held: &mut Window) {
-    use aether_protocol::viewport::{ViewportElementsChanged, ViewportElementsChangedParams};
-    let mut land = |method: &str, params: serde_json::Value| -> bool {
-        if method == ViewportLinesChanged::NAME {
-            let p: ViewportLinesChangedParams = serde_json::from_value(params).expect("typed");
-            if p.viewport_id == viewport_id {
-                *held = p.window;
-                return true;
-            }
-        } else if method == ViewportElementsChanged::NAME {
-            let p: ViewportElementsChangedParams = serde_json::from_value(params).expect("typed");
-            if p.viewport_id == viewport_id {
-                assert!(
-                    held.apply(p.patch),
-                    "a pushed patch did not fit the window the test held"
-                );
-                return true;
-            }
-        }
-        false
-    };
-    while let Some((method, params)) = ws.backlog.pop_front() {
-        if land(&method, params) {
-            return;
+/// The window a test holds of one viewport, kept the way a client keeps it: whole pushes replace
+/// it, patches apply to it, and both land in the order they were rendered rather than the order
+/// they arrived ([`aether_protocol::viewport::WindowOrder`]).
+pub struct HeldWindow {
+    pub viewport_id: u64,
+    window: Option<Window>,
+    order: aether_protocol::viewport::WindowOrder,
+}
+
+impl HeldWindow {
+    /// Start from `window`, the last answer this viewport's client was given.
+    pub fn new(viewport_id: u64, window: Window) -> Self {
+        Self {
+            viewport_id,
+            window: Some(window),
+            order: Default::default(),
         }
     }
-    let wait = async {
-        loop {
-            if let ClientInbound::Notification(n) = ws.next_inbound().await {
-                if land(&n.method, n.params) {
-                    return;
+
+    pub fn window(&self) -> &Window {
+        self.window.as_ref().expect("a window is held")
+    }
+
+    /// Bring the window up to the next push that changes it, taking first what a reply-wait read
+    /// past, as [`expect_notification_or_backlog`] does. A patch that does not fit fails the test.
+    pub async fn next_push(&mut self, ws: &mut Ws) {
+        use aether_protocol::viewport::{
+            Landed, ViewportElementsChanged, ViewportElementsChangedParams,
+        };
+        let viewport_id = self.viewport_id;
+        let mut land = |method: &str, params: serde_json::Value| -> bool {
+            let landed = if method == ViewportLinesChanged::NAME {
+                let p: ViewportLinesChangedParams = serde_json::from_value(params).expect("typed");
+                if p.viewport_id != viewport_id {
+                    return false;
                 }
+                self.order.whole(&mut self.window, p.window)
+            } else if method == ViewportElementsChanged::NAME {
+                let p: ViewportElementsChangedParams =
+                    serde_json::from_value(params).expect("typed");
+                if p.viewport_id != viewport_id {
+                    return false;
+                }
+                self.order.patch(&mut self.window, p.patch)
+            } else {
+                return false;
+            };
+            assert_ne!(
+                landed,
+                Landed::Misfit,
+                "a pushed patch did not fit the window it names"
+            );
+            landed == Landed::Changed
+        };
+        while let Some((method, params)) = ws.backlog.pop_front() {
+            if land(&method, params) {
+                return;
             }
         }
-    };
-    tokio::time::timeout(NOTIFICATION_TIMEOUT, wait)
-        .await
-        .expect("timed out waiting for a window push");
+        let wait = async {
+            loop {
+                if let ClientInbound::Notification(n) = ws.next_inbound().await {
+                    if land(&n.method, n.params) {
+                        return;
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(NOTIFICATION_TIMEOUT, wait)
+            .await
+            .expect("timed out waiting for a window push");
+    }
 }
 
 // -------- cursor + input ------------------------------------------------------------------------

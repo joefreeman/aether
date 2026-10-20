@@ -4223,6 +4223,8 @@ impl Session {
         self.view.viewport_id = Some(res.viewport_id);
         let waiting = self.view.search_landing().is_none();
         self.adopt_search_summary(res.window.search.clone());
+        // A new viewport counts its windows afresh: nothing waiting for the old one's applies.
+        self.view.window_order.clear();
         self.view.window = Some(res.window);
         // The server decides which element holds the cursor (from the scroll the subscribe named,
         // today), so the mirror starts from its answer — whichever element that is, including
@@ -4268,12 +4270,21 @@ impl Session {
     ///
     /// Answers with the reveal a search landing was waiting on, if this is the window that carries
     /// its marks (see [`ViewState::search_landing`]).
+    ///
+    /// A window older than the one held is dropped (see [`ViewState::window_order`]): it was
+    /// rendered first and only arrived later, and the window held already has whatever it said.
     #[must_use]
     fn replace_window(&mut self, window: aether_protocol::viewport::Window) -> Effects {
+        use aether_protocol::viewport::Landed;
         let on_input = self.shell_input_focused();
         let waiting = self.view.search_landing().is_none();
-        self.adopt_search_summary(window.search.clone());
-        self.view.window = Some(window);
+        match self.view.window_order.whole(&mut self.view.window, window) {
+            Landed::Changed => {}
+            Landed::Stale | Landed::Waiting => return Effects::none(),
+            Landed::Misfit => return self.window_lost(),
+        }
+        let search = self.view.window.as_ref().and_then(|w| w.search.clone());
+        self.adopt_search_summary(search);
         if on_input {
             if let Some(input) = self.shell_input() {
                 self.view.focused_element = input;
@@ -4282,20 +4293,24 @@ impl Session {
         self.search_landing_ready(waiting)
     }
 
-    /// [`Self::replace_window`] for a patch: the content elements that moved, applied to the window
-    /// on screen. `None`, with nothing changed, when the patch was made against another window.
-    ///
-    /// No caret to carry: a patch never changes the tree's shape, so the input is the element it
-    /// was.
-    #[must_use]
-    fn patch_window(&mut self, patch: aether_protocol::viewport::WindowPatch) -> Option<Effects> {
-        let waiting = self.view.search_landing().is_none();
-        let search = patch.search.clone();
-        if !self.view.window.as_mut()?.apply(patch) {
-            return None;
-        }
-        self.adopt_search_summary(search);
-        Some(self.search_landing_ready(waiting))
+    /// Whether a window of `generation` is older than the one held — rendered before it, and
+    /// arriving after. Generation 0 is a window no server stamped, and always lands.
+    fn window_is_stale(&self, generation: u64) -> bool {
+        generation != 0
+            && self
+                .view
+                .window
+                .as_ref()
+                .is_some_and(|w| generation < w.generation)
+    }
+
+    /// A window the order could not mend — a patch that does not fit the window it names, which
+    /// only a window this client dropped could cause. Nothing here can say what the server meant,
+    /// so the view starts over from a fresh subscribe rather than showing a mix of the two.
+    fn window_lost(&mut self) -> Effects {
+        tracing::warn!("a window patch did not fit the window held; resubscribing");
+        self.view.window_order.clear();
+        Effects::one(Effect::Resubscribe)
     }
 
     /// What a window push says besides the window, adopted before it lands.
@@ -7566,6 +7581,12 @@ impl Session {
                 // — apply it directly, keep the revision fresh (edits that only arrive this
                 // way, e.g. another client's), and keep the cursor in view under the new
                 // geometry (the shell clamps + reveals).
+                //
+                // A push rendered before the window held — overtaken by an answer — is dropped
+                // whole: its cursor and revision are as old as its window.
+                if self.window_is_stale(p.window.generation) {
+                    return Effects::none();
+                }
                 self.adopt_pushed_state(p.buffer, p.revision, p.cursor);
                 let landed_fx = self.replace_window(p.window);
                 self.window_pushed(landed_fx)
@@ -7580,16 +7601,29 @@ impl Session {
                 if Some(p.viewport_id) != self.view.viewport_id {
                     return Effects::none();
                 }
-                self.adopt_pushed_state(p.buffer, p.revision, p.cursor);
-                match self.patch_window(p.patch) {
-                    Some(landed_fx) => self.window_pushed(landed_fx),
-                    // Made against a window this client does not hold, which only a window it
-                    // dropped could cause. Nothing here can say what the server meant, so the view
-                    // starts over from a fresh subscribe rather than showing a mix of the two.
-                    None => {
-                        tracing::warn!("a window patch did not fit the window held; resubscribing");
-                        Effects::one(Effect::Resubscribe)
+                // A patch that has to wait for its window lands with the one that frees it, and
+                // its cursor and revision with neither — the push after it says where they are.
+                use aether_protocol::viewport::Landed;
+                let on_input = self.shell_input_focused();
+                let waiting = self.view.search_landing().is_none();
+                match self.view.window_order.patch(&mut self.view.window, p.patch) {
+                    Landed::Changed => {
+                        // A splice renumbers what follows it — a run appended above a shell's
+                        // input moves the input along — so a caret there follows it, as
+                        // `replace_window` has it do.
+                        if on_input {
+                            if let Some(input) = self.shell_input() {
+                                self.view.focused_element = input;
+                            }
+                        }
+                        self.adopt_pushed_state(p.buffer, p.revision, p.cursor);
+                        let search = self.view.window.as_ref().and_then(|w| w.search.clone());
+                        self.adopt_search_summary(search);
+                        let landed_fx = self.search_landing_ready(waiting);
+                        self.window_pushed(landed_fx)
                     }
+                    Landed::Stale | Landed::Waiting => Effects::none(),
+                    Landed::Misfit => self.window_lost(),
                 }
             }
             GitBlameChanged::NAME => {

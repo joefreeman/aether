@@ -2611,7 +2611,7 @@ pub fn show_commit(repo_path: &Path, rev: &str) -> Result<RevisionContent, Strin
     // above everything.
     b.header_line("", &[]);
     // A commit's diff is against its own parent; no baseline applies.
-    crate::patch::render_diff(&repo, &diff, &mut b, false, None)?;
+    crate::patch::render_diff(&repo, &diff, &mut b, false, None, None)?;
 
     let (text, generated) = b.finish();
     Ok(RevisionContent {
@@ -2646,9 +2646,13 @@ pub fn show_commit(repo_path: &Path, rev: &str) -> Result<RevisionContent, Strin
 /// - **the saved file** — nothing. That baseline names each file's own content *on disk*, which is
 ///   this view's right-hand side; there is no comparison to make, and saying so beats reporting a
 ///   clean tree it never looked at.
+///
+/// `diffs` holds each file's diff from the last generation of this repo's view, and is left holding
+/// this one's (see [`crate::patch::DiffCache`]).
 pub fn show_working_changes(
     repo_path: &Path,
     baseline: Option<&GitBaselineSource>,
+    diffs: &std::sync::Mutex<crate::patch::DiffCache>,
 ) -> Result<RevisionContent, String> {
     let repo = git2::Repository::discover(repo_path).map_err(|e| e.message().to_string())?;
     let mut b = PatchBuilder::default();
@@ -2714,7 +2718,17 @@ pub fn show_working_changes(
     }
 
     // Only the default baseline has a staged layer to resolve — see this function's own doc.
-    crate::patch::render_diff(&repo, &diff, &mut b, label.is_none(), label)?;
+    let mut diffs = diffs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::patch::render_diff(
+        &repo,
+        &diff,
+        &mut b,
+        label.is_none(),
+        label,
+        Some(&mut diffs),
+    )?;
 
     let (text, generated) = b.finish();
     Ok(RevisionContent {

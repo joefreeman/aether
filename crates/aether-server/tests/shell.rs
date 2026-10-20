@@ -851,10 +851,11 @@ async fn output_arrives_in_more_than_one_push() {
 async fn a_run_appears_before_it_prints_anything() {
     let (server, mut ws, _dir) = setup().await;
     let shell = start_shell(&mut ws).await;
-    let (viewport_id, _) = shell_window(&mut ws, &shell).await;
+    let (viewport_id, window) = shell_window(&mut ws, &shell).await;
+    ws.clear_seen();
+    let mut held = HeldWindow::new(viewport_id, window);
     let input = input_buffer_of(&server, &shell).await;
     type_command(&mut ws, &shell, input, "sleep 30").await;
-    ws.clear_seen();
     let _: ShellRunResult = send_request::<ShellRun>(
         &mut ws,
         &ShellRunParams {
@@ -862,17 +863,28 @@ async fn a_run_appears_before_it_prints_anything() {
         },
     )
     .await;
-    // The start's own push; the content push goes out ahead of it on the one ordered stream.
-    let started = expect_notification_or_backlog::<ShellRunChanged>(&mut ws).await;
-    assert!(started.run.is_some_and(|r| r.is_running()));
-    // Clearing the input pushes a window too, but from before the run existed — so look for one
-    // that shows the run's command.
-    let shown = ws
-        .saw::<ViewportLinesChanged>()
-        .into_iter()
-        .filter(|p| p.viewport_id == viewport_id)
-        .any(|p| headers(&p.window).iter().any(|h| h.trim() == "sleep 30"));
+    // Typing and clearing the input push windows too, from before the run existed — so bring the
+    // window up push by push, as a client does, until one shows the run's command.
+    let mut shown = false;
+    for _ in 0..8 {
+        held.next_push(&mut ws).await;
+        if headers(held.window())
+            .iter()
+            .any(|h| h.trim() == "sleep 30")
+        {
+            shown = true;
+            break;
+        }
+    }
     assert!(shown, "the new run's box was never pushed");
+    // And the start's own push — read already, or still to come.
+    let running = |p: &aether_protocol::shell::ShellRunChangedParams| {
+        p.run.as_ref().is_some_and(|r| r.is_running())
+    };
+    if !ws.saw::<ShellRunChanged>().iter().any(running) {
+        let started = expect_notification::<ShellRunChanged>(&mut ws).await;
+        assert!(running(&started), "the run's start was never pushed");
+    }
 
     let _: ShellCancelResult = send_request::<ShellCancel>(
         &mut ws,
