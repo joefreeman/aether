@@ -22,8 +22,39 @@
 
 use aether_protocol::git::GitStatus;
 use aether_protocol::lsp::{LspProgress, LspServerStatus, LspStatus};
-use aether_protocol::settings::ThemeMode;
+use aether_protocol::settings::ThemePreference;
 use aether_protocol::viewport::{DiagnosticSeverity, DiffStage, PatchLine};
+
+/// The theme a shell actually paints with: the [`ThemePreference`] setting resolved against what
+/// the shell can see of its surroundings. Never on the wire — `Auto` resolves differently per
+/// client, so only the preference is shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeMode {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    /// Resolve the setting. `surroundings` is what the shell detected — the terminal's colours,
+    /// the desktop's or browser's appearance — and `None` when it couldn't tell, which falls back
+    /// to dark.
+    pub fn resolve(preference: ThemePreference, surroundings: Option<ThemeMode>) -> ThemeMode {
+        match preference {
+            ThemePreference::Dark => ThemeMode::Dark,
+            ThemePreference::Light => ThemeMode::Light,
+            ThemePreference::Auto => surroundings.unwrap_or_default(),
+        }
+    }
+
+    /// The lowercase name the web shell stamps onto `<html data-theme>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeMode::Dark => "dark",
+            ThemeMode::Light => "light",
+        }
+    }
+}
 
 /// A palette colour, sRGB 8-bit. The core stays shell-agnostic: shells convert to their own
 /// colour type at the draw boundary.
@@ -865,6 +896,26 @@ mod tests {
         assert!(em.italic);
         // Comments are italic in every theme.
         assert!(t.syntax("comment").unwrap().italic);
+    }
+
+    /// An explicit choice ignores the surroundings; auto follows them, and is dark when the shell
+    /// couldn't tell.
+    #[test]
+    fn preference_resolves_against_the_surroundings() {
+        use ThemePreference::*;
+        for seen in [None, Some(ThemeMode::Dark), Some(ThemeMode::Light)] {
+            assert_eq!(ThemeMode::resolve(Dark, seen), ThemeMode::Dark);
+            assert_eq!(ThemeMode::resolve(Light, seen), ThemeMode::Light);
+        }
+        assert_eq!(ThemeMode::resolve(Auto, None), ThemeMode::Dark);
+        assert_eq!(
+            ThemeMode::resolve(Auto, Some(ThemeMode::Light)),
+            ThemeMode::Light
+        );
+        assert_eq!(
+            ThemeMode::resolve(Auto, Some(ThemeMode::Dark)),
+            ThemeMode::Dark
+        );
     }
 
     /// Both tables answer every role: spot-check that light diverges where it must (backgrounds

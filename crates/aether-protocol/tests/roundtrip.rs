@@ -6325,7 +6325,7 @@ fn app_settings_wire_shape_and_defaults() {
         hints: false,
         markdown_read: false,
         markdown_width: aether_protocol::settings::MarkdownWidth::Full,
-        theme: aether_protocol::settings::ThemeMode::Light,
+        theme: aether_protocol::settings::ThemePreference::Light,
         git_auto_fetch: true,
         worktree_store: String::new(),
     };
@@ -6387,9 +6387,22 @@ fn app_settings_wire_shape_and_defaults() {
     }
     assert_eq!(
         parsed.theme,
-        aether_protocol::settings::ThemeMode::Dark,
-        "theme defaults dark"
+        aether_protocol::settings::ThemePreference::Auto,
+        "theme defaults to auto"
     );
+    for (theme, tag) in [
+        (aether_protocol::settings::ThemePreference::Auto, "auto"),
+        (aether_protocol::settings::ThemePreference::Dark, "dark"),
+        (aether_protocol::settings::ThemePreference::Light, "light"),
+    ] {
+        assert_eq!(to_value(theme).unwrap(), json!(tag));
+        assert_eq!(
+            from_value::<AppSettings>(json!({ "theme": tag }))
+                .unwrap()
+                .theme,
+            theme
+        );
+    }
 
     // The pre-split `font_size` key is not read back as either size — it's gone, and a file still
     // carrying it lands on the defaults rather than silently applying the old value to one of them.

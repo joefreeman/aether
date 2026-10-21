@@ -1410,7 +1410,9 @@ export class Shell {
    *  tab's stand-in for the status bar's dirty marker). The clean mark is monochrome, so its ink
    *  follows the tab's light/dark theme. */
   private readonly faviconEl: HTMLLinkElement;
-  private readonly faviconDark = window.matchMedia("(prefers-color-scheme: dark)");
+  /** The browser's light/dark preference: the clean favicon's ink, and what the `auto` theme
+   *  follows (handed to every adopted session, and again on each change). */
+  private readonly prefersDark = window.matchMedia("(prefers-color-scheme: dark)");
   /** Last-applied (state, theme) key, so the <link> is only rewritten when it actually changes
    *  (this runs on every status render). */
   private faviconKey = "";
@@ -1799,7 +1801,11 @@ export class Shell {
     this.faviconEl = document.createElement("link");
     this.faviconEl.rel = "icon";
     document.head.appendChild(this.faviconEl);
-    this.faviconDark.addEventListener("change", () => this.updateFavicon());
+    this.prefersDark.addEventListener("change", () => {
+      this.session?.set_prefers_dark(this.prefersDark.matches);
+      this.updateFavicon();
+      if (this.session) this.render();
+    });
     // The workspace-settings overlay: a persistent modal whose name + add-root fields are
     // native <input>s (so they keep focus + caret across re-renders and handle IME); only the
     // labels + root rows are rebuilt each render. A backdrop click is swallowed (editor stays put).
@@ -3371,6 +3377,7 @@ export class Shell {
    *  its first window, and the painter's mirror of its measured table starts empty. */
   private adoptSession(session: WasmSession): void {
     session.set_resolution(UNITS_PER_ROW);
+    session.set_prefers_dark(this.prefersDark.matches);
     this.session = session;
     this.measured = { units_per_row: UNITS_PER_ROW, elements: {} };
   }
@@ -5791,7 +5798,7 @@ export class Shell {
   private updateFavicon(v?: CoreView): void {
     if (!this.session) return;
     const color = bufferStateColor(v ?? this.view());
-    const dark = this.faviconDark.matches;
+    const dark = this.prefersDark.matches;
     const key = `${color ?? "ae"}:${dark ? "d" : "l"}`;
     if (key === this.faviconKey) return;
     this.faviconKey = key;

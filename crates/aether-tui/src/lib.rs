@@ -15,6 +15,7 @@ mod save_prompt;
 mod scroll;
 mod shell;
 mod stderr_capture;
+mod terminal_theme;
 mod text_input;
 mod ui;
 
@@ -77,7 +78,7 @@ pub async fn run(
         .with_writer(writer)
         .init();
 
-    let mut terminal = setup_terminal()?;
+    let (mut terminal, terminal_theme) = setup_terminal()?;
     install_panic_hook();
 
     // Launch connectionless: the editor chrome comes up immediately in a `Connecting` state
@@ -92,14 +93,22 @@ pub async fn run(
         tether,
         version,
         server_url,
+        terminal_theme,
     )
     .await;
     restore_terminal(&mut terminal)?;
     run_result
 }
 
-fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
+/// Raw mode, the alternate screen and our input modes — plus the terminal's light/dark theme,
+/// asked for while nothing else is reading the tty yet: raw mode is on (so the reply is neither
+/// echoed nor line-buffered), and mouse capture is still off, so no report interleaves with it.
+fn setup_terminal() -> anyhow::Result<(
+    Terminal<CrosstermBackend<Stdout>>,
+    Option<aether_client::theme::ThemeMode>,
+)> {
     enable_raw_mode()?;
+    let theme = terminal_theme::detect();
     let mut out = stdout();
     // Bracketed paste: terminal-level pastes (middle-click, the terminal's own paste shortcut)
     // arrive as one `Event::Paste` instead of replayed keystrokes — replayed, a Normal-mode paste
@@ -121,7 +130,7 @@ fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
         )
     );
     let backend = CrosstermBackend::new(out);
-    Ok(Terminal::new(backend)?)
+    Ok((Terminal::new(backend)?, theme))
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
@@ -145,10 +154,10 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow
     Ok(())
 }
 
-/// How long [`drain_terminal_input`] waits for the terminal to answer its fence. Every terminal
-/// answers a device-attributes query at once; this only bounds exit on one that never does, or on
-/// a reply something else read first.
-const DRAIN_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long [`fenced_query`] waits for the terminal to answer its fence. Every terminal answers a
+/// device-attributes query at once; this only bounds startup and exit on one that never does, or
+/// on a reply something else read first.
+const FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Discard every byte the terminal sent us that we never read. Call it with raw mode still on, and
 /// after mouse capture is disabled.
@@ -166,45 +175,65 @@ const DRAIN_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_milli
 /// macOS's `poll` doesn't support devices, answering `POLLNVAL` at once, so a blocking read
 /// behind it waited forever for a reply that wasn't coming and the client hung on exit.
 fn drain_terminal_input() {
-    use std::io::{Read, Write};
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open("/dev/tty");
-    if let Ok(mut tty) = tty {
-        if tty.write_all(b"\x1b[c").and_then(|()| tty.flush()).is_ok() {
-            let deadline = std::time::Instant::now() + DRAIN_FENCE_TIMEOUT;
-            let mut seen = Vec::new();
-            let mut buf = [0u8; 512];
-            loop {
-                match tty.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        seen.extend_from_slice(&buf[..n]);
-                        if ends_with_device_attributes(&seen) {
-                            break;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if std::time::Instant::now() >= deadline {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    }
+    let _ = fenced_query(b"");
     // SAFETY: `tcflush` on the stdin fd is a simple libc call with no memory effects; TCIFLUSH
     // discards unread input only (never our already-written output).
     unsafe {
         libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
     }
+}
+
+/// Send `query` to the terminal, then a primary device attributes request as a fence, and return
+/// everything it sends back up to and including the fence's reply. Terminals answer in order, so
+/// whatever `query` was going to get is in by then — and a terminal that ignores `query` costs
+/// nothing more than the fence's round trip. Raw mode must be on, and nothing else may be reading
+/// the tty (crossterm's event reader would take the replies).
+///
+/// The tty is read non-blocking and the deadline checked between reads, never left to `poll`:
+/// macOS's `poll` doesn't support devices, answering `POLLNVAL` at once, so a blocking read
+/// behind it waited forever for a reply that wasn't coming and the client hung on exit.
+fn fenced_query(query: &[u8]) -> Vec<u8> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut seen = Vec::new();
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open("/dev/tty");
+    let Ok(mut tty) = tty else {
+        return seen;
+    };
+    let sent = tty
+        .write_all(query)
+        .and_then(|()| tty.write_all(b"\x1b[c"))
+        .and_then(|()| tty.flush());
+    if sent.is_err() {
+        return seen;
+    }
+    let deadline = std::time::Instant::now() + FENCE_TIMEOUT;
+    let mut buf = [0u8; 512];
+    loop {
+        match tty.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                seen.extend_from_slice(&buf[..n]);
+                if ends_with_device_attributes(&seen) {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(_) => break,
+        }
+    }
+    seen
 }
 
 /// Whether `input` ends in a primary device attributes reply, `ESC [ ? Ps ; … c`. Nothing else a

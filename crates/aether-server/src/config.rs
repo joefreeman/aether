@@ -2082,7 +2082,7 @@ mod tests {
                 ligatures: false,
                 editor_font_size: 18,
                 ui_font_size: 11,
-                theme: aether_protocol::settings::ThemeMode::Light,
+                theme: aether_protocol::settings::ThemePreference::Light,
                 ..AppSettings::default()
             },
         )
@@ -2092,7 +2092,7 @@ mod tests {
         assert!(!s.ligatures);
         assert_eq!(s.editor_font_size, 18);
         assert_eq!(s.ui_font_size, 11);
-        assert_eq!(s.theme, aether_protocol::settings::ThemeMode::Light);
+        assert_eq!(s.theme, aether_protocol::settings::ThemePreference::Light);
     }
 
     #[test]

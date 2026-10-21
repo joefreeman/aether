@@ -28,7 +28,7 @@ use aether_protocol::cursor::Granularity;
 use aether_protocol::envelope::RpcMethod;
 use aether_protocol::view::{ViewOpen, ViewOpenParams, ViewOpenResult};
 
-use aether_client::theme::LspDot;
+use aether_client::theme::{LspDot, ThemeMode};
 use aether_protocol::lsp::LspStatus;
 use aether_protocol::picker::PickerKind;
 use aether_protocol::settings::MarkdownWidth;
@@ -483,6 +483,9 @@ pub struct App {
     boot_attempt: u32,
     /// The window's one editing context (one connection — the server's client).
     session: Session,
+    /// The desktop's light/dark appearance, as last reported (`None`: not reported yet). Held here rather than on the session because the session is swapped wholesale on
+    /// reconnect and workspace switch; the window's surroundings outlive every one.
+    system_theme: Option<ThemeMode>,
     /// The session's transport — shell-owned (native sockets don't exist on every shell;
     /// the core receives the handle per call rather than storing it).
     handle: Handle,
@@ -633,6 +636,7 @@ impl App {
             boot_args: None,
             boot_attempt: 0,
             session,
+            system_theme: None,
             handle,
             inbound,
             inflight: std::collections::HashMap::new(),
@@ -3430,10 +3434,15 @@ impl App {
         theme::Ui::new(self.session.ui_font_size)
     }
 
-    /// The resolved colour roles for the session's theme mode. Resolved once per view pass and
+    /// The theme this window paints with: the setting, resolved against the desktop's appearance.
+    fn theme_mode(&self) -> ThemeMode {
+        self.session.theme_mode(self.system_theme)
+    }
+
+    /// The resolved colour roles for the window's theme mode. Resolved once per view pass and
     /// threaded alongside [`theme::Ui`]; `&'static`, so style closures capture it freely.
     fn palette(&self) -> &'static theme::Palette {
-        theme::palette(self.session.theme)
+        theme::palette(self.theme_mode())
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -5008,7 +5017,7 @@ impl App {
     /// Buffer-state accent colour, in the web client's precedence order: deleted-on-disk →
     /// changed-on-disk → unsaved edits → `None` when clean.
     fn buffer_state_color(&self) -> Option<iced::Color> {
-        session_state_color(&self.session)
+        session_state_color(&self.session, self.palette())
     }
 
     /// Cursor `line:col`, or the selection span in Normal mode (1-based) — the web client's
@@ -6396,7 +6405,7 @@ impl App {
         // A selected block draws itself and everything in it from the selection's palette, whose
         // raised surfaces are the selection's deeper shade.
         let p = if span_selected(sel, b.span()) {
-            theme::selected_palette(self.session.theme)
+            theme::selected_palette(self.theme_mode())
         } else {
             self.palette()
         };
@@ -7732,8 +7741,7 @@ fn reveal_target(p: &PickerState, scroll_y: f32, reveal: Reveal, ui: theme::Ui) 
 }
 
 /// Buffer-state dot colour for the session, shown in the status bar.
-fn session_state_color(s: &Session) -> Option<iced::Color> {
-    let p = theme::palette(s.theme);
+fn session_state_color(s: &Session, p: &theme::Palette) -> Option<iced::Color> {
     if s.view.externally_deleted {
         return Some(p.state_deleted);
     }
@@ -7826,10 +7834,10 @@ fn confirm_phrase(kind: &ConfirmKind) -> String {
     }
 }
 
-/// The base widget theme, by session mode — dark keeps the built-in `Nord`, light is a custom
+/// The base widget theme, by the window's mode — dark keeps the built-in `Nord`, light is a custom
 /// theme generated from the core light palette (see [`theme::base_iced_theme`]).
 fn base_theme(app: &App) -> iced::Theme {
-    theme::base_iced_theme(app.session.theme)
+    theme::base_iced_theme(app.theme_mode())
 }
 
 /// Dial the daemon and bootstrap once, landing the outcome as [`Message::Booted`]. Used for the
@@ -8099,6 +8107,9 @@ fn canonicalize_partial(path: &std::path::Path) -> std::io::Result<std::path::Pa
 /// wire; the sharing is per-document and already handled there.
 struct Shell {
     windows: std::collections::HashMap<window::Id, App>,
+    /// The desktop's light/dark appearance — handed to every window as it opens, and to all of
+    /// them when it changes.
+    system_theme: Option<ThemeMode>,
     /// Carried for the windows opened later, which dial the same daemon on the same handshake.
     client_version: String,
     server_url: String,
@@ -8122,6 +8133,8 @@ enum ShellMessage {
     OpenFromOs(std::path::PathBuf),
     /// The hint engine's clock ticked — one subscription for the process, fanned out in `update`.
     HintTick,
+    /// The desktop's light/dark appearance, at boot and on every change.
+    SystemTheme(iced::theme::Mode),
 }
 
 impl Shell {
@@ -8133,11 +8146,13 @@ impl Shell {
         };
         let mut shell = Shell {
             windows: std::collections::HashMap::new(),
+            system_theme: None,
             client_version,
             server_url,
         };
         let open = shell.open(bootstrap);
-        (shell, open)
+        let system_theme = iced::system::theme().map(ShellMessage::SystemTheme);
+        (shell, Task::batch([open, system_theme]))
     }
 
     /// Open a window on `bootstrap` and register its app. The window id exists as soon as
@@ -8145,7 +8160,8 @@ impl Shell {
     /// when the window is actually on screen, which nothing here has to wait for.
     fn open(&mut self, bootstrap: Bootstrap) -> Task<ShellMessage> {
         let (id, open) = iced::window::open(window_settings());
-        let (app, task) = App::new(id, bootstrap);
+        let (mut app, task) = App::new(id, bootstrap);
+        app.system_theme = self.system_theme;
         let _ = self.windows.insert(id, app);
         Task::batch([
             open.discard(),
@@ -8214,6 +8230,20 @@ impl Shell {
                     .collect();
                 Task::batch(ticks)
             }
+            ShellMessage::SystemTheme(mode) => {
+                self.system_theme = match mode {
+                    iced::theme::Mode::Dark => Some(ThemeMode::Dark),
+                    // The desktop said "no preference", which is not the same as not knowing:
+                    // it is what GNOME's light style reports (`color-scheme 'default'`, portal
+                    // value 0), and every GTK and libadwaita app draws light on it. macOS and
+                    // Windows always answer one way or the other.
+                    iced::theme::Mode::Light | iced::theme::Mode::None => Some(ThemeMode::Light),
+                };
+                for app in self.windows.values_mut() {
+                    app.system_theme = self.system_theme;
+                }
+                Task::none()
+            }
             ShellMessage::Closed(id) => {
                 // Dropping the app drops its connection, which ends its inbound pump.
                 let _ = self.windows.remove(&id);
@@ -8246,7 +8276,7 @@ impl Shell {
         self.windows
             .get(&window)
             .map(base_theme)
-            .unwrap_or_else(|| theme::base_iced_theme(aether_protocol::settings::ThemeMode::Dark))
+            .unwrap_or_else(|| theme::base_iced_theme(ThemeMode::Dark))
     }
 
     /// Subscriptions are per-*program*, not per-window, so everything here is global and routed by
@@ -8256,6 +8286,7 @@ impl Shell {
         let mut subs = vec![
             App::input_subscription(),
             iced::window::close_events().map(ShellMessage::Closed),
+            iced::system::theme_changes().map(ShellMessage::SystemTheme),
         ];
         // Files the desktop asks us to open (macOS "Open With"). Unconditional and window-blind —
         // the delegate can deliver at any moment, including during the boot connect, and this is
@@ -8537,7 +8568,7 @@ mod tests {
         weight: iced::font::Weight,
         family: iced::font::Family,
     ) -> Vec<(String, Option<iced::Font>)> {
-        let p = theme::palette(aether_protocol::settings::ThemeMode::Dark);
+        let p = theme::palette(ThemeMode::Dark);
         let mut spans = Vec::new();
         md_spans(
             inlines, weight, false, None, p.fg, MD_TEXT, family, None, 0, p, &mut spans,

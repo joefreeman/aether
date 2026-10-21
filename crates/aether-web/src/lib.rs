@@ -38,6 +38,9 @@ pub struct WasmSession {
     /// What the shell has measured of elements it lays out itself — see
     /// [`aether_client::grid::Measured`]; set through [`WasmSession::set_measured`].
     measured: aether_client::grid::Measured,
+    /// The browser's light/dark preference (`prefers-color-scheme`), which the `auto` theme
+    /// follows; set through [`WasmSession::set_prefers_dark`].
+    prefers: Option<aether_client::theme::ThemeMode>,
 }
 
 #[wasm_bindgen]
@@ -93,6 +96,7 @@ impl WasmSession {
         WasmSession {
             inner: Session::placeholder(),
             measured: aether_client::grid::Measured::default(),
+            prefers: None,
         }
     }
 
@@ -129,7 +133,18 @@ impl WasmSession {
     /// The render view: a JSON projection of the session for the shell to paint. Read after every
     /// batch of effects, before rendering.
     pub fn view(&self) -> Result<JsValue, JsValue> {
-        to_js(&view::build_view(&self.inner))
+        to_js(&view::build_view(&self.inner, self.prefers))
+    }
+
+    /// The browser's `prefers-color-scheme`, at adoption and on every change. The next `view()`
+    /// carries the theme it resolves to.
+    pub fn set_prefers_dark(&mut self, dark: bool) {
+        use aether_client::theme::ThemeMode;
+        self.prefers = Some(if dark {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        });
     }
 
     /// Build a real session from the bootstrap landing buffer. `workspace` is the activation's
@@ -146,6 +161,7 @@ impl WasmSession {
         Ok(WasmSession {
             inner: Session::new(workspace, open),
             measured: aether_client::grid::Measured::default(),
+            prefers: None,
         })
     }
 
@@ -1412,7 +1428,7 @@ mod tests {
         let mut s = WasmSession::new();
         let buffer_id = s.inner.view.buffer.buffer_id;
         s.inner.on_event(blame_push(buffer_id, 0, "ada"));
-        let v = view::build_view(&s.inner);
+        let v = view::build_view(&s.inner, s.prefers);
         assert_eq!(v["blame"]["line"], 0);
         assert_eq!(v["blame"]["author"], "ada");
         assert_eq!(v["blame"]["is_uncommitted"], false);
@@ -1425,7 +1441,7 @@ mod tests {
         let mut s = WasmSession::new();
         let other = s.inner.view.buffer.buffer_id + 1;
         s.inner.on_event(blame_push(other, 0, "grace"));
-        assert!(view::build_view(&s.inner)["blame"].is_null());
+        assert!(view::build_view(&s.inner, s.prefers)["blame"].is_null());
     }
 
     #[test]

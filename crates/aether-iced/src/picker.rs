@@ -2354,7 +2354,7 @@ mod tests {
     fn row_badge_shades_come_from_the_core_table() {
         use aether_client::labels::RowBadgeTone;
         use aether_client::theme::Theme;
-        use aether_protocol::settings::ThemeMode;
+        use aether_client::theme::ThemeMode;
         for mode in [ThemeMode::Dark, ThemeMode::Light] {
             let p = theme::palette(mode);
             let t = Theme::of(mode);

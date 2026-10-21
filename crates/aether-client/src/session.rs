@@ -5,7 +5,7 @@
 use super::effect::{Effects, ToastKind};
 use super::keymap::Action;
 use super::picker::PickerState;
-use super::theme::LspDot;
+use super::theme::{LspDot, ThemeMode};
 use aether_protocol::buffer::{BufferReloadResult, BufferSaveResult};
 use aether_protocol::coords::VisualRow;
 use aether_protocol::cursor::{CursorState, Direction, Granularity, Motion};
@@ -16,7 +16,7 @@ use aether_protocol::lsp::{DiagnosticCounts, LspServerRef, LspServerStatus, Symb
 use aether_protocol::picker::PickerItem;
 use aether_protocol::picker::{CaseMode, MatchOptions};
 use aether_protocol::search::SearchSummary;
-use aether_protocol::settings::{MarkdownWidth, ThemeMode};
+use aether_protocol::settings::{MarkdownWidth, ThemePreference};
 use aether_protocol::view::{BufferDescription, ViewOpenResult};
 use aether_protocol::viewport::{DiagnosticSeverity, ScrollPosition, Window, WrapMode};
 use aether_protocol::workspace::{WorkspaceInfo, WorkspaceProject};
@@ -653,7 +653,7 @@ pub enum AppSettingId {
     MarkdownRead,
     /// How wide the reading view's text column runs.
     MarkdownWidth,
-    /// Light vs dark colour theme (the toggle is "light on/off"; off is dark).
+    /// Colour theme: auto, dark or light.
     Theme,
     /// Periodic background `git fetch`.
     GitAutoFetch,
@@ -720,6 +720,29 @@ pub fn step_markdown_width(current: MarkdownWidth, up: bool, wrap: bool) -> Mark
     let opts = MARKDOWN_WIDTHS;
     let idx = opts.iter().position(|&v| v == current).unwrap_or(0);
     opts[step_index(idx, opts.len(), up, wrap)]
+}
+
+/// The theme options, in the order the settings row cycles through them.
+pub const THEME_PREFERENCES: &[ThemePreference] = &[
+    ThemePreference::Auto,
+    ThemePreference::Dark,
+    ThemePreference::Light,
+];
+
+/// Step `current` to an adjacent theme option. Mirrors [`step_markdown_width`].
+pub fn step_theme(current: ThemePreference, up: bool, wrap: bool) -> ThemePreference {
+    let opts = THEME_PREFERENCES;
+    let idx = opts.iter().position(|&v| v == current).unwrap_or(0);
+    opts[step_index(idx, opts.len(), up, wrap)]
+}
+
+/// The settings row's label for a theme option.
+pub fn theme_label(theme: ThemePreference) -> &'static str {
+    match theme {
+        ThemePreference::Auto => "Auto",
+        ThemePreference::Dark => "Dark",
+        ThemePreference::Light => "Light",
+    }
 }
 
 /// The settings row's label for a reading width. Presentation, so it lives here rather than on the
@@ -1542,9 +1565,9 @@ pub struct Session {
     /// preferences.
     pub ui_font_size: u32,
     /// Colour theme — an app-wide setting (`Space,`), seeded from `settings/get` at boot and
-    /// synced via `settings/changed`. The shells resolve it to a role→shade table
-    /// ([`crate::theme::Theme::of`]) each render; the core just holds the mode.
-    pub theme: ThemeMode,
+    /// synced via `settings/changed`. Shells paint with [`Self::theme_mode`], never this: `Auto`
+    /// only means something once resolved against what the shell detected.
+    pub theme_preference: ThemePreference,
     /// Hints on/off — an app-wide setting (`Space,`), seeded from `settings/get` at boot and synced
     /// via `settings/changed`. Gates the hint engine; the corner hint disappears (and observation
     /// stops) when off.
@@ -2033,7 +2056,7 @@ impl Session {
             ligatures: true,
             editor_font_size: aether_protocol::settings::default_editor_font_size(),
             ui_font_size: aether_protocol::settings::default_ui_font_size(),
-            theme: aether_protocol::settings::default_theme(),
+            theme_preference: aether_protocol::settings::default_theme(),
             hints_enabled: true,
             git_auto_fetch: false,
             worktree_store: String::new(),
@@ -2055,6 +2078,14 @@ impl Session {
             hints: crate::hints::HintEngine::default(),
             view,
         }
+    }
+
+    /// The theme to paint with: the setting, resolved against `detected` — what the shell sees of
+    /// its surroundings (the terminal's colours, the desktop's or browser's appearance), `None`
+    /// when it can't tell. The detection is held by the shell, not here: shells swap sessions
+    /// wholesale (reconnect, chooser, workspace switch), and their surroundings outlive every one.
+    pub fn theme_mode(&self, detected: Option<ThemeMode>) -> ThemeMode {
+        ThemeMode::resolve(self.theme_preference, detected)
     }
 
     /// The application-settings groups for the overlay, in display order. Built against the live
@@ -2112,9 +2143,10 @@ impl Session {
                     },
                     AppSettingRow {
                         id: AppSettingId::Theme,
-                        label: "Light theme",
-                        control: AppSettingControl::Toggle(self.theme == ThemeMode::Light),
-                        hint: "Render every client in the light colour theme (off is dark)",
+                        label: "Theme",
+                        control: AppSettingControl::Choice(theme_label(self.theme_preference)),
+                        hint: "Auto follows each client's surroundings: the terminal's colours, \
+                               or the desktop's or browser's appearance",
                     },
                 ],
             },

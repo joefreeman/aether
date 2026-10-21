@@ -16,9 +16,9 @@
 
 use super::tests::connecting_bootstrap;
 use super::*;
+use aether_client::theme::ThemeMode;
 use aether_protocol::coords::ElementRow;
 use aether_protocol::picker::{PickerItem, PickerUpdateParams};
-use aether_protocol::settings::ThemeMode;
 use aether_protocol::ui::{Element as ViewElement, LayoutOwner};
 use aether_protocol::viewport::{
     DiffMarker, DiffStage, LogicalLineRender, Segment, Window, WrappedRow,
@@ -745,7 +745,7 @@ fn a_boxs_fills_land_in_the_boxs_own_columns() {
     let y = ((row.bounds.y + row.bounds.height / 2.0) * scale) as usize;
     let px = |x: f32| (x * scale) as usize;
 
-    let p = crate::theme::palette(app.session.theme);
+    let p = crate::theme::palette(app.theme_mode());
     let rgb = |c: iced::Color| {
         let b = c.into_rgba8();
         [b[0], b[1], b[2]]
@@ -824,7 +824,8 @@ fn editor_rows_are_the_well_and_the_pane_around_them_is_the_ground() {
         (ThemeMode::Light, "plain-file-light"),
     ] {
         let mut app = app_showing(plain_file());
-        app.session.theme = mode;
+        // Through the default auto preference, so the desktop's appearance is what picks it.
+        app.system_theme = Some(mode);
         let p = crate::theme::palette(mode);
         let rgb = |c: iced::Color| {
             let b = c.into_rgba8();
@@ -905,7 +906,7 @@ fn only_an_ordinary_buffer_has_breathing_room_and_it_is_the_well() {
         composed.y
     );
 
-    let p = crate::theme::palette(app.session.theme);
+    let p = crate::theme::palette(app.theme_mode());
     let rgb = |c: iced::Color| {
         let b = c.into_rgba8();
         [b[0], b[1], b[2]]
@@ -958,7 +959,7 @@ fn the_reading_view_is_one_ground_from_edge_to_edge() {
     session.view.read = Some(read);
     let app = app_with(session);
 
-    let p = crate::theme::palette(app.session.theme);
+    let p = crate::theme::palette(app.theme_mode());
     let rgb = |c: iced::Color| {
         let b = c.into_rgba8();
         [b[0], b[1], b[2]]
@@ -1855,7 +1856,7 @@ fn a_quote_paints_one_panel() {
     let mut session = session_showing(plain_file());
     session.view.read = Some(read);
     let app = app_with(session);
-    let p = crate::theme::palette(app.session.theme);
+    let p = crate::theme::palette(app.theme_mode());
     let rgb = |c: iced::Color| {
         let b = c.into_rgba8();
         [b[0], b[1], b[2]]

@@ -14,6 +14,7 @@ use aether_client::chips::{ChipEditor, ChipEditorField};
 use aether_client::path_editor::PathEditor;
 use aether_client::picker::PickerState;
 use aether_client::session::{ConfirmKind, ConnState, Mode, Pending, Prompt, Session};
+use aether_client::theme::ThemeMode;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -28,7 +29,8 @@ fn name<T: std::fmt::Debug>(v: &T) -> String {
 }
 
 /// Build the render view from the session. The TS shell reads this each frame.
-pub fn build_view(s: &Session) -> Value {
+/// `detected_theme` is the browser's light/dark preference, which the `auto` theme follows.
+pub fn build_view(s: &Session, detected_theme: Option<ThemeMode>) -> Value {
     json!({
         "mode": mode(s.view.mode),
         "conn": conn(&s.conn),
@@ -72,9 +74,9 @@ pub fn build_view(s: &Session) -> Value {
         // The reading view's column width, in ems of the reading size (the core's shared measure
         // table) — the shell stamps it as `--md-measure`. `null` is the full-width setting: no cap.
         "markdown_measure_em": aether_client::read_layout::measure_em(s.markdown_width),
-        // "dark" | "light" (ThemeMode's lowercase wire form): the shell stamps this onto
+        // "dark" | "light", the setting already resolved: the shell stamps this onto
         // `<html data-theme>` and theme.css switches its role variables on it.
-        "theme": jv(&s.theme),
+        "theme": s.theme_mode(detected_theme).as_str(),
         "diagnostics": jv(&s.view.diagnostics),
         "lsp": s.view.lsp.as_ref().map(jv),
         "externally_modified": s.view.externally_modified,
@@ -571,7 +573,7 @@ mod tests {
     #[test]
     fn placeholder_view_has_the_core_shape() {
         let s = WasmSession::new();
-        let v = build_view(s.session());
+        let v = build_view(s.session(), None);
         assert_eq!(v["mode"], "normal");
         assert_eq!(v["conn"]["state"], "connected");
         assert_eq!(v["picker"], Value::Null);
@@ -654,7 +656,7 @@ mod tests {
         // What `render()` does, in order.
         for top in [0u32, 3, 5, 6, 99] {
             s.set_visible_lines(top, 40);
-            let v = build_view(s.session());
+            let v = build_view(s.session(), None);
             assert!(v["window"].is_object(), "top={top}");
         }
     }
@@ -663,6 +665,6 @@ mod tests {
     fn mode_tracks_session_state() {
         let mut s = WasmSession::new();
         s.dispatch_key(",", "Comma", false, false, false);
-        assert_eq!(build_view(s.session())["mode"], "insert");
+        assert_eq!(build_view(s.session(), None)["mode"], "insert");
     }
 }

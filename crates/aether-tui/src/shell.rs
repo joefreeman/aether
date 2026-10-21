@@ -25,7 +25,7 @@ use aether_client::session::{
     boot_backoff, reconnect_backoff, ConfirmKind, ConnState, HoverText, Mode, Pending, Prompt,
     Session,
 };
-use aether_client::theme::{spinner_frame, SPINNER_FRAME_MS};
+use aether_client::theme::{spinner_frame, ThemeMode, SPINNER_FRAME_MS};
 use aether_client::update::Event as CoreEvent;
 use aether_protocol::coords::VisualRow;
 
@@ -183,6 +183,9 @@ pub struct Shell {
     /// Server messages — replies and pushes — in wire order (see `connection.rs`).
     inbound: mpsc::UnboundedReceiver<Inbound>,
     pub session: Session,
+    /// The terminal's light/dark theme, asked for once at startup (`None`: it didn't say). Held
+    /// here, not on the session, because the session is swapped wholesale on boot and reconnect.
+    terminal_theme: Option<ThemeMode>,
     pub state: AppState,
     pending: FuturesUnordered<DoneFuture>,
     /// In-flight RPCs by request id: the reply arrives on `inbound` and dispatches its
@@ -295,6 +298,7 @@ pub struct Shell {
     read_hscroll: std::collections::HashMap<usize, u16>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     workspace: Option<String>,
@@ -303,6 +307,7 @@ pub async fn run(
     tether: bool,
     version: String,
     server_url: String,
+    terminal_theme: Option<ThemeMode>,
 ) -> Result<()> {
     let (event_tx, event_rx) = mpsc::unbounded_channel::<std::io::Result<Event>>();
     let reader = tokio::spawn(async move {
@@ -314,7 +319,15 @@ pub async fn run(
         }
     });
     let result = run_events(
-        terminal, event_rx, workspace, file, jump, tether, version, server_url,
+        terminal,
+        event_rx,
+        workspace,
+        file,
+        jump,
+        tether,
+        version,
+        server_url,
+        terminal_theme,
     )
     .await;
     // Stop reading the terminal before the caller restores it. Left running, the reader would sit
@@ -336,6 +349,7 @@ async fn run_events(
     tether: bool,
     version: String,
     server_url: String,
+    terminal_theme: Option<ThemeMode>,
 ) -> Result<()> {
     let term = crossterm::terminal::size()?;
     // Launch connectionless: a placeholder session flagged `Connecting` and dummy transport that's
@@ -349,6 +363,7 @@ async fn run_events(
         handle: crate::connection::dummy_handle(),
         inbound: crate::connection::dummy_inbound(),
         session,
+        terminal_theme,
         state: connecting_state(term.0, term.1),
         pending: FuturesUnordered::new(),
         inflight: std::collections::HashMap::new(),
@@ -394,7 +409,7 @@ async fn run_events(
     crate::app::apply_cursor_style(&shell.state);
     // The theme mode is thread-local in `ui`; stamp it from the session before every paint so
     // a settings toggle (or the boot-time restore) takes effect on the next frame.
-    ui::set_theme_mode(shell.session.theme);
+    ui::set_theme_mode(shell.session.theme_mode(shell.terminal_theme));
     ui::set_spin_frame(spinner_frame(now_unix_ms()));
     terminal.draw(|f| ui::draw(f, &shell.state))?;
     crate::app::refresh_terminal_title(&mut shell.state);
@@ -459,7 +474,7 @@ async fn run_events(
         }
         shell.sync();
         crate::app::apply_cursor_style(&shell.state);
-        ui::set_theme_mode(shell.session.theme);
+        ui::set_theme_mode(shell.session.theme_mode(shell.terminal_theme));
         ui::set_spin_frame(spinner_frame(now_unix_ms()));
         terminal.draw(|f| ui::draw(f, &shell.state))?;
         crate::app::refresh_terminal_title(&mut shell.state);
@@ -3852,6 +3867,7 @@ mod scroll_tests {
             handle: crate::connection::dummy_handle(),
             inbound: crate::connection::dummy_inbound(),
             session,
+            terminal_theme: None,
             state: connecting_state(80, ROWS),
             pending: FuturesUnordered::new(),
             inflight: std::collections::HashMap::new(),

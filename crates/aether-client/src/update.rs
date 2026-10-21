@@ -25,11 +25,11 @@ use super::path_editor::{PathBase, PathEditor};
 const HOME_PREFIX: &str = "~/";
 use super::picker::{GroupLanding, PickerLevel, PickerState, Reveal, FETCH_LIMIT, VISIBLE_ROWS};
 use super::session::{
-    buffer_info, min_pos, severity_label, step_font_size, step_markdown_width, strip_longest_root,
-    AfterSave, AppSettingId, AppSettingsOverlay, Change, CommitDetails, ConfirmAction, ConfirmKind,
-    ConnState, HoverBlock, HoverText, Mode, PasteKind, Pending, PendingCommit, Prompt, ReadView,
-    ReloadTry, RepeatTarget, SaveTry, SearchSnapshot, Session, SettingsRow, SneakState, TextField,
-    ViewState, WorkspaceSettings,
+    buffer_info, min_pos, severity_label, step_font_size, step_markdown_width, step_theme,
+    strip_longest_root, AfterSave, AppSettingId, AppSettingsOverlay, Change, CommitDetails,
+    ConfirmAction, ConfirmKind, ConnState, HoverBlock, HoverText, Mode, PasteKind, Pending,
+    PendingCommit, Prompt, ReadView, ReloadTry, RepeatTarget, SaveTry, SearchSnapshot, Session,
+    SettingsRow, SneakState, TextField, ViewState, WorkspaceSettings,
 };
 use super::transport::RpcError;
 use aether_protocol::app::{AppInfoGet, AppInfoParams};
@@ -125,7 +125,7 @@ use aether_protocol::search::{
 };
 use aether_protocol::settings::{
     AppSettings, MarkdownWidth, SettingsChanged, SettingsGet, SettingsGetParams, SettingsSet,
-    ThemeMode,
+    ThemePreference,
 };
 use aether_protocol::sneak::{
     SneakCancel, SneakCancelParams, SneakSelect, SneakSelectParams, SneakUpdate, SneakUpdateParams,
@@ -9635,6 +9635,9 @@ impl Session {
                 Some(AppSettingId::MarkdownWidth) => {
                     self.set_markdown_width(step_markdown_width(self.markdown_width, right, false))
                 }
+                Some(AppSettingId::Theme) => {
+                    self.set_theme(step_theme(self.theme_preference, right, false))
+                }
                 _ => Effects::none(),
             });
         }
@@ -9684,9 +9687,9 @@ impl Session {
         // measure table every frame, so adopting the value is enough. The TUI's layout cache keys
         // off the resolved column count, so it re-lays out on its own.
         self.markdown_width = settings.markdown_width;
-        // Theme is shell-render-only too: the shells resolve `self.theme` to a role table each
-        // frame (web also stamps `data-theme`), so adopting the mode is enough.
-        self.theme = settings.theme;
+        // Theme is shell-render-only too: the shells resolve `self.theme_mode(..)` to a role table
+        // each frame (web also stamps `data-theme`), so adopting the preference is enough.
+        self.theme_preference = settings.theme;
         // Nothing to apply client-side: the server reads this off disk when its timer fires, so
         // adopting the value only keeps the overlay row showing the truth.
         self.git_auto_fetch = settings.git_auto_fetch;
@@ -9774,15 +9777,9 @@ impl Session {
                     "git-auto-fetch",
                 ))
             }
-            // Theme: shell-render-only like ligatures — flip the mode + persist; every shell
-            // re-resolves its role table on the next render.
-            AppSettingId::Theme => {
-                self.theme = match self.theme {
-                    ThemeMode::Dark => ThemeMode::Light,
-                    ThemeMode::Light => ThemeMode::Dark,
-                };
-                self.persist_app_settings()
-            }
+            // Theme: cycles like the reading width. Shell-render-only — every shell re-resolves
+            // its role table on the next render.
+            AppSettingId::Theme => self.set_theme(step_theme(self.theme_preference, true, true)),
         }
     }
 
@@ -9812,7 +9809,7 @@ impl Session {
             hints: self.hints_enabled,
             markdown_read: self.markdown_read_default,
             markdown_width: self.markdown_width,
-            theme: self.theme,
+            theme: self.theme_preference,
             git_auto_fetch: self.git_auto_fetch,
             worktree_store: self.worktree_store.clone(),
         }
@@ -9849,6 +9846,14 @@ impl Session {
     /// Persist a new reading-view width + apply it. No-op when unchanged (the Left/Right stepper
     /// clamps at the ends, so it lands here repeatedly). Nothing to reflow: the reading view is
     /// laid out shell-side from the measure, so the next frame is the new width.
+    fn set_theme(&mut self, theme: ThemePreference) -> Effects {
+        if theme == self.theme_preference {
+            return Effects::none();
+        }
+        self.theme_preference = theme;
+        self.persist_app_settings()
+    }
+
     fn set_markdown_width(&mut self, width: MarkdownWidth) -> Effects {
         if width == self.markdown_width {
             return Effects::none();

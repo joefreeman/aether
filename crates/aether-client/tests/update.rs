@@ -8884,38 +8884,73 @@ fn app_settings_apply_and_toggle_ligatures() {
 }
 
 #[test]
-fn app_settings_apply_and_toggle_theme() {
+fn app_settings_apply_and_cycle_theme() {
+    use aether_client::session::AppSettingControl;
+    use aether_client::theme::ThemeMode;
     use aether_client::update::Event;
-    use aether_protocol::settings::{AppSettings, ThemeMode};
+    use aether_protocol::settings::{AppSettings, ThemePreference};
 
-    // Theme defaults dark; a persisted `light` is adopted with no shell effect (render-only —
-    // the shells re-resolve their role table on the next frame).
+    // Theme defaults to auto, which paints dark until the shell has detected anything, and
+    // follows what it detects after.
     let mut s = session();
-    assert_eq!(s.theme, ThemeMode::Dark);
+    assert_eq!(s.theme_preference, ThemePreference::Auto);
+    assert_eq!(
+        s.theme_mode(None),
+        ThemeMode::Dark,
+        "auto with nothing detected is dark"
+    );
+    assert_eq!(
+        s.theme_mode(Some(ThemeMode::Light)),
+        ThemeMode::Light,
+        "auto follows the surroundings"
+    );
+
+    // A persisted explicit theme is adopted with no shell effect (render-only — the shells
+    // re-resolve their role table on the next frame), and overrides the surroundings.
     let fx = s.on_event(Event::AppSettingsLoaded(Ok(AppSettings {
-        theme: ThemeMode::Light,
+        theme: ThemePreference::Dark,
         ..AppSettings::default()
     })));
-    assert_eq!(s.theme, ThemeMode::Light, "persisted theme is adopted");
+    assert_eq!(
+        s.theme_preference,
+        ThemePreference::Dark,
+        "persisted theme is adopted"
+    );
+    assert_eq!(
+        s.theme_mode(Some(ThemeMode::Light)),
+        ThemeMode::Dark,
+        "an explicit theme ignores the surroundings"
+    );
     assert!(fx.0.is_empty(), "theme is render-only — no shell action");
 
-    // The row renders as a "Light theme" toggle whose checked state tracks the mode, and
-    // toggling flips the mode back to dark + persists via settings/set.
+    // The row is a three-way choice: activating cycles auto → dark → light → auto, persisting
+    // each step via settings/set.
     s.open_app_settings();
-    let rows = s.app_setting_rows();
-    let idx = rows
+    let idx = s
+        .app_setting_rows()
         .iter()
         .position(|r| matches!(r.id, aether_client::session::AppSettingId::Theme))
         .expect("a Theme row");
     assert_eq!(
-        rows[idx].control,
-        aether_client::session::AppSettingControl::Toggle(true),
-        "checked while light"
+        s.app_setting_rows()[idx].control,
+        AppSettingControl::Choice("Dark")
     );
     let fx = s.app_settings_toggle(idx);
-    assert_eq!(s.theme, ThemeMode::Dark, "toggle flips back to dark");
+    assert_eq!(s.theme_preference, ThemePreference::Light);
     let params = find_request(&fx, "settings/set").expect("settings/set fired");
-    assert_eq!(params["theme"], json!("dark"));
+    assert_eq!(params["theme"], json!("light"));
+    let fx = s.app_settings_toggle(idx);
+    assert_eq!(
+        s.theme_preference,
+        ThemePreference::Auto,
+        "cycling wraps back to auto"
+    );
+    let params = find_request(&fx, "settings/set").expect("settings/set fired");
+    assert_eq!(params["theme"], json!("auto"));
+    assert_eq!(
+        s.app_setting_rows()[idx].control,
+        AppSettingControl::Choice("Auto")
+    );
 }
 
 /// The reading-view width setting: a three-way choice, so the row cycles on activate and steps

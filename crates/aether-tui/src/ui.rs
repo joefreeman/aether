@@ -6,13 +6,14 @@ use crate::app::{
 };
 use aether_client::markdown::{Block as MdBlock, Inline as MdInline};
 use aether_client::session::{AppSettingControl, ConnState};
+use aether_client::theme::ThemeMode;
 use aether_client::theme::{LspDot, Rgb, Theme, SPINNER_FRAMES};
 use aether_protocol::cursor::CursorState;
 use aether_protocol::git::{CommitRef, CommitRefKind, GitStatus};
 use aether_protocol::lsp::{LspProgress, LspStatus, SymbolCrumb};
 use aether_protocol::picker::{BufferDirtyState, GroupHeader, GroupSpan, PickerItem, PickerKind};
 use aether_protocol::search::SearchMatchRange;
-use aether_protocol::settings::{MarkdownWidth, ThemeMode};
+use aether_protocol::settings::MarkdownWidth;
 use aether_protocol::sneak::SneakTarget;
 // `Layout` is aliased: ratatui has one of its own, and this file uses both.
 use aether_protocol::ui::{Band, Element, RailJoin};

@@ -57,10 +57,10 @@ pub struct AppSettings {
     #[serde(default = "default_markdown_width")]
     pub markdown_width: MarkdownWidth,
     /// Colour theme, app-wide across every client. Purely a client-side render choice the server
-    /// only stores: shells resolve the mode to a role→shade table (the client core's `theme`
-    /// module) at draw time.
+    /// only stores: shells resolve it to a role→shade table (the client core's `theme` module) at
+    /// draw time — [`ThemePreference::Auto`] through whatever each one can see of its surroundings.
     #[serde(default = "default_theme")]
-    pub theme: ThemeMode,
+    pub theme: ThemePreference,
     /// Periodically `git fetch` the workspaces' repos, so the status bar's ahead/behind counts
     /// stay current instead of reporting whenever the user last fetched by hand.
     ///
@@ -143,16 +143,21 @@ pub const fn default_markdown_width() -> MarkdownWidth {
 }
 
 /// Which colour theme the clients render with. One value for the whole app, like every other app
-/// setting — there is deliberately no per-client override.
+/// setting — there is deliberately no per-client override. [`Self::Auto`] is how clients come to
+/// differ: each follows its own surroundings (the terminal's colours, the desktop's or browser's
+/// appearance), so a light GUI and a dark terminal can both be right at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ThemeMode {
+pub enum ThemePreference {
+    Auto,
     Dark,
     Light,
 }
 
-pub const fn default_theme() -> ThemeMode {
-    ThemeMode::Dark
+/// Auto: a client that can see its surroundings matches them, and one that can't falls back to
+/// dark — what the editor always rendered before it had a choice.
+pub const fn default_theme() -> ThemePreference {
+    ThemePreference::Auto
 }
 
 /// Off. Unattended network access is opt-in — see [`AppSettings::git_auto_fetch`].

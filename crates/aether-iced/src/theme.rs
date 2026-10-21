@@ -4,8 +4,7 @@
 //! the core owns both tables and the semantic mappings (syntax kind / diagnostic severity /
 //! LSP status → role); this module is only the `Rgb → Color` edge.
 
-use aether_client::theme::{LspDot, Theme};
-use aether_protocol::settings::ThemeMode;
+use aether_client::theme::{LspDot, Theme, ThemeMode};
 use iced::Color;
 use std::sync::LazyLock;
 
