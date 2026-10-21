@@ -8387,7 +8387,8 @@ pub(crate) fn settings() -> iced::Settings {
                 .into(),
             // Source Serif 4 (OFL, see fonts/OFL-SourceSerif4.txt): the reading view's body face.
             // Regular/Italic for prose, Bold so strong runs resolve inside the family rather than
-            // falling back; Semibold keeps the family complete for a 600-weight prose run.
+            // falling back, and Bold-Italic for a strong run that is also emphasised; Semibold
+            // keeps the family complete for a 600-weight prose run.
             include_bytes!("../fonts/SourceSerif4-Regular.ttf")
                 .as_slice()
                 .into(),
@@ -8398,6 +8399,9 @@ pub(crate) fn settings() -> iced::Settings {
                 .as_slice()
                 .into(),
             include_bytes!("../fonts/SourceSerif4-Bold.ttf")
+                .as_slice()
+                .into(),
+            include_bytes!("../fonts/SourceSerif4-BoldIt.ttf")
                 .as_slice()
                 .into(),
             // Source Sans 3 (OFL, see fonts/OFL-SourceSans3.txt): the reading view's label face

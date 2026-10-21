@@ -315,7 +315,21 @@ fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
     }
     let full: PathBuf = Path::new(WEB_DIST).join(rel);
     let bytes = std::fs::read(&full).ok()?;
-    let content_type = match full.extension().and_then(|e| e.to_str()) {
+    Some((Cow::Owned(bytes), asset_content_type(rel)))
+}
+
+/// Release: the bundle is embedded in the executable at compile time — the binary is fully
+/// self-contained and `web/dist` need not exist on the running machine. The asset set is
+/// the `embedded_assets!` list below; a missing dist fails the release build loudly. Cargo tracks the included
+/// files, so a rebuilt bundle triggers a daemon rebuild on its own.
+#[cfg(not(debug_assertions))]
+fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
+    let bytes = embedded_asset(rel)?;
+    Some((Cow::Borrowed(bytes), asset_content_type(rel)))
+}
+
+fn asset_content_type(rel: &str) -> &'static str {
+    match rel.rsplit_once('.').map(|(_, ext)| ext) {
         Some("js") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("wasm") => "application/wasm",
@@ -324,104 +338,52 @@ fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
         Some("woff2") => "font/woff2",
         Some("woff") => "font/woff",
         _ => "application/octet-stream",
-    };
-    Some((Cow::Owned(bytes), content_type))
+    }
 }
 
-/// Release: the bundle is embedded in the executable at compile time — the binary is fully
-/// self-contained and `web/dist` need not exist on the running machine. The asset set is the
-/// stable two-file contract pinned in `web/vite.config.ts` (and referenced by `INDEX_HTML`); a
-/// new asset needs a new arm here, and a missing dist fails the release build loudly. Cargo
-/// tracks the included files, so a rebuilt bundle triggers a daemon rebuild on its own.
-#[cfg(not(debug_assertions))]
-fn load_asset(rel: &str) -> Option<(Cow<'static, [u8]>, &'static str)> {
-    let (bytes, content_type): (&'static [u8], &'static str) = match rel {
-        "assets/index.js" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/index.js"
-            )),
-            "text/javascript; charset=utf-8",
-        ),
-        "assets/index.css" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/index.css"
-            )),
-            "text/css; charset=utf-8",
-        ),
-        // The wasm core, loaded by index.js via `new URL(.., import.meta.url)`.
-        "assets/aether_web_bg.wasm" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/aether_web_bg.wasm"
-            )),
-            "application/wasm",
-        ),
-        // Bundled fonts (JetBrains Mono for code, Source Serif 4 for the reading view; both
-        // OFL). The stylesheet references them by stable name — `assetFileNames` in
-        // web/vite.config.ts keeps font filenames unhashed. The JetBrains faces were missing
-        // from this arm before the Source Serif addition: release builds silently fell back to
-        // the system monospace.
-        "assets/JetBrainsMono-Regular.woff2" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/JetBrainsMono-Regular.woff2"
-            )),
-            "font/woff2",
-        ),
-        "assets/JetBrainsMono-Bold.woff2" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/JetBrainsMono-Bold.woff2"
-            )),
-            "font/woff2",
-        ),
-        "assets/JetBrainsMono-Italic.woff2" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/JetBrainsMono-Italic.woff2"
-            )),
-            "font/woff2",
-        ),
-        "assets/JetBrainsMono-BoldItalic.woff2" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/JetBrainsMono-BoldItalic.woff2"
-            )),
-            "font/woff2",
-        ),
-        "assets/SourceSerif4-Regular.woff2" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/SourceSerif4-Regular.woff2"
-            )),
-            "font/woff2",
-        ),
-        "assets/SourceSerif4-It.woff2" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/SourceSerif4-It.woff2"
-            )),
-            "font/woff2",
-        ),
-        "assets/SourceSerif4-Semibold.woff2" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/SourceSerif4-Semibold.woff2"
-            )),
-            "font/woff2",
-        ),
-        "assets/SourceSerif4-Bold.woff2" => (
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../web/dist/assets/SourceSerif4-Bold.woff2"
-            )),
-            "font/woff2",
-        ),
-        _ => return None,
+/// One list for both the release embedding and the name table the dist-parity test checks, so an
+/// asset can't be added to the bundle without being served: debug serves straight from disk, which
+/// hid two rounds of fonts (JetBrains Mono, then Source Sans 3) missing from a hand-written release
+/// table. Names are stable — `assetFileNames` in web/vite.config.ts keeps them unhashed.
+macro_rules! embedded_assets {
+    ($($path:literal),* $(,)?) => {
+        /// Every file a release build embeds, by URL-relative path.
+        #[cfg(all(test, debug_assertions))]
+        const EMBEDDED_ASSETS: &[&str] = &[$($path),*];
+
+        #[cfg(not(debug_assertions))]
+        fn embedded_asset(rel: &str) -> Option<&'static [u8]> {
+            match rel {
+                $($path => Some(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../web/dist/",
+                    $path
+                )))),*,
+                _ => None,
+            }
+        }
     };
-    Some((Cow::Borrowed(bytes), content_type))
+}
+
+embedded_assets! {
+    "assets/index.js",
+    "assets/index.css",
+    // The wasm core, loaded by index.js via `new URL(.., import.meta.url)`.
+    "assets/aether_web_bg.wasm",
+    // Bundled fonts, all OFL: JetBrains Mono for code, Source Serif 4 for the reading view's
+    // prose, Source Sans 3 for its headings and labels.
+    "assets/JetBrainsMono-Regular.woff2",
+    "assets/JetBrainsMono-Bold.woff2",
+    "assets/JetBrainsMono-Italic.woff2",
+    "assets/JetBrainsMono-BoldItalic.woff2",
+    "assets/SourceSerif4-Regular.woff2",
+    "assets/SourceSerif4-It.woff2",
+    "assets/SourceSerif4-Semibold.woff2",
+    "assets/SourceSerif4-Bold.woff2",
+    "assets/SourceSans3-Semibold.woff2",
+    "assets/SourceSans3-SemiboldIt.woff2",
+    "assets/SourceSans3-Bold.woff2",
+    "assets/SourceSans3-BoldIt.woff2",
 }
 
 /// Read until the end of the HTTP header block (`\r\n\r\n`). We only serve GETs with no body, so
@@ -484,6 +446,30 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A release build serves only [`EMBEDDED_ASSETS`]; debug serves anything in `web/dist`, so a
+    /// bundle file missing from the list works in development and 404s in a release.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn every_built_asset_is_embedded_in_release() {
+        let dir = std::path::Path::new(WEB_DIST).join("assets");
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+            panic!(
+                "{} unreadable ({e}): run `npm run build` in web/",
+                dir.display()
+            )
+        });
+        let mut built: Vec<String> = entries
+            .map(|e| format!("assets/{}", e.unwrap().file_name().to_string_lossy()))
+            .collect();
+        built.sort();
+        let mut embedded: Vec<String> = EMBEDDED_ASSETS.iter().map(|s| s.to_string()).collect();
+        embedded.sort();
+        assert_eq!(
+            built, embedded,
+            "web/dist/assets and EMBEDDED_ASSETS disagree"
+        );
+    }
 
     #[test]
     fn loopback_authority_accepts_local_host_and_origin() {
